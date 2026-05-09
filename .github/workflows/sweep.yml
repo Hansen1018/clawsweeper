@@ -1561,7 +1561,7 @@ jobs:
           min_age_minutes="${{ github.event_name == 'workflow_dispatch' && github.event.inputs.apply_min_age_minutes || '' }}"
           apply_kind="${{ github.event_name == 'workflow_dispatch' && github.event.inputs.apply_kind || 'all' }}"
           apply_close_reasons="${{ github.event_name == 'workflow_dispatch' && github.event.inputs.apply_close_reasons || 'all' }}"
-          stale_min_age_days="${{ github.event_name == 'workflow_dispatch' && github.event.inputs.apply_stale_min_age_days || '30' }}"
+          stale_min_age_days="${{ github.event_name == 'workflow_dispatch' && github.event.inputs.apply_stale_min_age_days || '60' }}"
           close_delay_ms="${{ github.event_name == 'workflow_dispatch' && github.event.inputs.apply_close_delay_ms || '2000' }}"
           progress_every="${{ github.event_name == 'workflow_dispatch' && github.event.inputs.apply_progress_every || '10' }}"
           checkpoint_size="${{ github.event_name == 'workflow_dispatch' && github.event.inputs.apply_checkpoint_size || '50' }}"

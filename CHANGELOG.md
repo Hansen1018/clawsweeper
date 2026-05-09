@@ -24,6 +24,9 @@ checkpoint, and status-only commits are intentionally omitted.
 
 ### Fixed
 
+- Rendered deterministic close comments during review even when the model omits
+  `closeComment`, while keeping apply strict about requiring a stored usable
+  close comment before mutating GitHub.
 - Counted live normal and hot review capacity from active `Review shard` jobs
   instead of reserving an entire 35-70 shard lane for every planning or
   publishing background run, so saturated backlog runs keep using available

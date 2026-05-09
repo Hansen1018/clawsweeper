@@ -40,6 +40,12 @@ Important source files:
 - `records/<repo-slug>/items/<number>.md`: open item reports
 - `records/<repo-slug>/closed/<number>.md`: archived closed reports
 
+Generated state is published to the `state` branch of
+`openclaw/clawsweeper-state`. Its `main` branch contains dashboard renderer
+source only. For local record inspection, switch that checkout to `state` or run
+`scripts/hydrate-state.ts` from a `state`-branch checkout before using
+`records/`.
+
 The workflow has one concurrency group per lane and target repository. Scheduled
 normal review cannot overlap another normal review for the same target repo.
 GitHub may keep one pending run for a concurrency group; newer scheduled runs
