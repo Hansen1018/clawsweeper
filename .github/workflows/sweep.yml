@@ -38,7 +38,7 @@ on:
       apply_stale_min_age_days:
         description: "Minimum item age in days before stale-insufficient-info issue closes"
         required: false
-        default: "60"
+        default: "30"
       apply_item_numbers:
         description: "Optional comma-separated item numbers to sync/apply first"
         required: false
