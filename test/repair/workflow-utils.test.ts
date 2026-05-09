@@ -19,7 +19,7 @@ import {
 import { workerLimit } from "../../dist/repair/limits.js";
 
 test("workflow utilities expose automation limits", () => {
-  assert.equal(automationLimit("review_shards.normal_default"), 70);
+  assert.equal(automationLimit("review_shards.normal_default"), 100);
   assert.equal(automationLimit("repair_live_runs.default"), 40);
   assert.throws(() => automationLimit("missing.default"), /unknown automation limit/);
 });
@@ -30,11 +30,11 @@ test("workflow utilities accept positional automation limit CLI paths", () => {
     ["dist/repair/workflow-utils.js", "limit", "review_shards.normal_default"],
     { cwd: process.cwd(), encoding: "utf8" },
   );
-  assert.equal(output, "70");
+  assert.equal(output, "100");
 });
 
 test("worker scheduler lets background lanes yield to active work", () => {
-  assert.equal(workerLimit("normal_review"), 70);
+  assert.equal(workerLimit("normal_review"), 90);
   assert.equal(workerLimit("normal_review", { activeCritical: 30, activeBackground: 20 }), 40);
   assert.equal(workerLimit("commit_review"), 5);
   assert.equal(workerLimit("commit_review", { activeCritical: 90 }), 1);
@@ -184,19 +184,49 @@ test("workflow utilities select eligible proposed close records", () => {
       "",
     ].join("\n"),
   );
+  write(
+    path.join(root, "records/openclaw-openclaw/items/openclaw-openclaw-12.md"),
+    [
+      "---",
+      "repository: openclaw/openclaw",
+      "type: pull_request",
+      "decision: close",
+      "confidence: high",
+      "action_taken: proposed_close",
+      "close_reason: mostly_implemented_on_main",
+      `item_created_at: ${oldDate}`,
+      "---",
+      "",
+    ].join("\n"),
+  );
+  write(
+    path.join(root, "records/openclaw-openclaw/items/openclaw-openclaw-13.md"),
+    [
+      "---",
+      "repository: openclaw/openclaw",
+      "type: pull_request",
+      "decision: close",
+      "confidence: high",
+      "action_taken: proposed_close",
+      "close_reason: mostly_implemented_on_main",
+      "item_created_at: 2026-05-01T00:00:00Z",
+      "---",
+      "",
+    ].join("\n"),
+  );
 
   const selected = withCwd(root, () =>
     proposedItemNumbers({
       targetRepo: "openclaw/openclaw",
       applyKind: "all",
       applyCloseReasons: "all",
-      staleMinAgeDays: 30,
+      staleMinAgeDays: 60,
       minAgeDays: 0,
       minAgeMinutes: null,
     }),
   );
 
-  assert.deepEqual(selected, [5]);
+  assert.deepEqual(selected, [5, 12]);
 });
 
 function withCwd(cwd, callback) {
