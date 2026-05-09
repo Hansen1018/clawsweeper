@@ -211,10 +211,12 @@ normal reviews keep the larger default batch size for targeted catch-up runs.
 
 The quiet-system ceiling is not a promise that every scheduled run dispatches
 that many shards. The `mode` step checks active repair workers, exact-item sweep
-runs, and commit-review pages, then asks `worker-limit normal_review` or
-`worker-limit hot_intake` for the current allowance. If repair/automerge is
-busy, background sweep dispatches fewer shards and leaves capacity for the
-specific work that is closest to a merge or maintainer request.
+runs, commit-review pages, and live normal/hot review shard jobs, then asks
+`worker-limit normal_review` or `worker-limit hot_intake` for the current
+allowance. Planning, publish, queued, and not-yet-expanded background runs
+reserve one worker slot instead of a whole quiet-system lane. If
+repair/automerge is busy, background sweep dispatches fewer shards and leaves
+capacity for the specific work that is closest to a merge or maintainer request.
 
 The active floor is not a separate lane and does not change close/apply safety.
 It only changes normal planning when due backlog is below the desired floor:
@@ -335,9 +337,10 @@ The live scheduler estimate happens before planning and is intentionally coarse:
 it counts active repair-cluster workflow runs as priority work, active exact-item
 sweep runs as priority work, active commit-review workflow runs as background
 work weighted by the configured commit page size, and other active normal/hot
-sweep runs as background work weighted by their quiet-system ceilings. GitHub
-Actions can start or finish jobs after that estimate, so the scheduler is a
-throttle, not a distributed lock.
+sweep runs by their live active `Review shard` jobs. Runs that are only
+planning, publishing, queued, or waiting for matrix expansion count as one
+background worker. GitHub Actions can start or finish jobs after that estimate,
+so the scheduler is a throttle, not a distributed lock.
 
 Planning status intentionally does not run `pnpm run reconcile`. Reconciliation
 can scan many live GitHub pages and has delayed review shard startup. The
