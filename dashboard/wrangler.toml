@@ -4,6 +4,10 @@ account_id = "91b59577e757131d68d55a471fe32aca"
 compatibility_date = "2026-05-11"
 workers_dev = true
 
+[[routes]]
+pattern = "clawsweeper.openclaw.ai"
+custom_domain = true
+
 [vars]
 CLAWSWEEPER_REPO = "openclaw/clawsweeper"
 TARGET_REPOS = "openclaw/openclaw,openclaw/clawhub,openclaw/clawsweeper,openclaw/fs-safe"

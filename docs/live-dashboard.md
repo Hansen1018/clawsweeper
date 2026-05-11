@@ -19,8 +19,8 @@ Cloudflare account:
 Worker:
 
 - name: `clawsweeper-status`
-- current deployment: `https://clawsweeper-status.services-91b.workers.dev/`
-- intended human dashboard: `https://clawsweeper-status.openclaw.ai/`
+- current deployment: `https://clawsweeper.openclaw.ai/`
+- fallback workers.dev deployment: `https://clawsweeper-status.services-91b.workers.dev/`
 - intended machine ingest: `https://clawsweeper-status-ingest.openclaw.ai/api/events`
 
 Deploy with the OpenClaw Cloudflare token:
