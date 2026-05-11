@@ -26,7 +26,7 @@ jobs:
       CLOUDFLARE_ACCOUNT_ID: 91b59577e757131d68d55a471fe32aca
       CLOUDFLARE_API_TOKEN: ${{ secrets.OPENCLAW_CLOUDFLARE_WORKERS_API_TOKEN || secrets.OPENCLAW_CLOUDFLARE_API_TOKEN }}
       CF_API_TOKEN: ${{ secrets.OPENCLAW_CLOUDFLARE_WORKERS_API_TOKEN || secrets.OPENCLAW_CLOUDFLARE_API_TOKEN }}
-      CLAWSWEEPER_STATUS_URL: https://clawsweeper-status.openclaw.workers.dev
+      CLAWSWEEPER_STATUS_URL: https://clawsweeper-status.services-91b.workers.dev
     steps:
       - uses: actions/checkout@v6
 
