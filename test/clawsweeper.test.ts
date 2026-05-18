@@ -69,10 +69,13 @@ import {
   prStatusLabelSchemeForTest,
   priorityLabelsForTest,
   priorityLabelSchemeForTest,
+  proofNudgeCandidateRecordsForTest,
+  proofNudgeEligibilityForTest,
   protectedLabels,
   realBehaviorProofMediaLabelsForTest,
   realBehaviorProofSufficientLabelsForTest,
   relatedTitleSearchTerms,
+  renderProofNudgeCommentForTest,
   renderReviewStartStatusComment,
   reviewArtifactDestination,
   reviewAutomationMarkersFromReport,
@@ -10232,6 +10235,333 @@ test("ClawSweeper proof label sync recognizes missing optional labels", () => {
   );
 });
 
+function proofNudgeReport(overrides = {}) {
+  const values = {
+    labels: JSON.stringify(["triage: needs-real-behavior-proof"]),
+    authorAssociation: "CONTRIBUTOR",
+    author: "contributor",
+    reviewStatus: "complete",
+    headSha: "abc123def456",
+    reviewedAt: "2026-01-01T00:00:00Z",
+    pullFiles: JSON.stringify(["src/app.ts"]),
+    proofStatus: "missing",
+    evidenceKind: "none",
+    needsContributorAction: "true",
+    proofSummary: "The PR needs after-fix proof from a real setup.",
+    ...overrides,
+  };
+  return `---
+repository: openclaw/openclaw
+number: 42
+type: pull_request
+title: Proof nudge sample
+author: ${values.author}
+author_association: ${values.authorAssociation}
+labels: ${values.labels}
+review_status: ${values.reviewStatus}
+pull_files: ${values.pullFiles}
+pull_files_truncated: false
+pull_head_sha: ${values.headSha}
+reviewed_at: ${values.reviewedAt}
+---
+
+## Real Behavior Proof
+
+Status: ${values.proofStatus}
+
+Evidence kind: ${values.evidenceKind}
+
+Needs contributor action: ${values.needsContributorAction}
+
+Summary: ${values.proofSummary}
+`;
+}
+
+function proofNudgeItem(overrides = {}) {
+  return item({
+    kind: "pull_request",
+    number: 42,
+    title: "Proof nudge sample",
+    author: "contributor",
+    authorAssociation: "CONTRIBUTOR",
+    labels: ["triage: needs-real-behavior-proof"],
+    locked: false,
+    activeLockReason: null,
+    ...overrides,
+  });
+}
+
+test("proof nudge candidate scan defers proof-label checks to live PR state", () => {
+  const root = mkdtempSync(tmpPrefix);
+  try {
+    writeFileSync(join(root, "41.md"), proofNudgeReport({ reviewedAt: "2026-01-05T00:00:00Z" }));
+    writeFileSync(
+      join(root, "42.md"),
+      `---
+repository: openclaw/openclaw
+number: 42
+type: pull_request
+labels: []
+review_status: complete
+reviewed_at: 2026-01-01T00:00:00Z
+---
+
+## Summary
+
+Stored report label snapshots can be older than the live PR labels.
+`,
+    );
+
+    const requestedCandidates = proofNudgeCandidateRecordsForTest(root, [42]);
+    const allCandidates = proofNudgeCandidateRecordsForTest(root);
+
+    assert.deepEqual(
+      requestedCandidates.map((candidate) => candidate.number),
+      [42],
+    );
+    assert.deepEqual(
+      allCandidates.map((candidate) => candidate.number),
+      [41, 42],
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("proof nudges become eligible only after proof policy and age gates pass", () => {
+  const result = proofNudgeEligibilityForTest({
+    item: proofNudgeItem(),
+    markdown: proofNudgeReport(),
+    headSha: "abc123def456",
+    headCommittedAt: "2026-01-01T00:00:00Z",
+    now: Date.parse("2026-01-10T00:00:00Z"),
+    minAgeDays: 5,
+    cooldownDays: 7,
+  });
+
+  assert.equal(result.eligible, true);
+  assert.equal(result.action, "proof_nudge_planned");
+});
+
+test("proof nudges skip recent reviews and recent author activity", () => {
+  assert.equal(
+    proofNudgeEligibilityForTest({
+      item: proofNudgeItem(),
+      markdown: proofNudgeReport({ reviewedAt: "2026-01-08T00:00:00Z" }),
+      headSha: "abc123def456",
+      headCommittedAt: "2026-01-01T00:00:00Z",
+      now: Date.parse("2026-01-10T00:00:00Z"),
+      minAgeDays: 5,
+      cooldownDays: 7,
+    }).action,
+    "skipped_recent_review",
+  );
+  assert.equal(
+    proofNudgeEligibilityForTest({
+      item: proofNudgeItem(),
+      markdown: proofNudgeReport(),
+      comments: [
+        {
+          author: "contributor",
+          body: "I'll add proof later.",
+          updatedAt: "2026-01-09T00:00:00Z",
+        },
+      ],
+      headSha: "abc123def456",
+      headCommittedAt: "2026-01-01T00:00:00Z",
+      now: Date.parse("2026-01-10T00:00:00Z"),
+      minAgeDays: 5,
+      cooldownDays: 7,
+    }).action,
+    "skipped_recent_author_activity",
+  );
+  assert.equal(
+    proofNudgeEligibilityForTest({
+      item: proofNudgeItem({ updatedAt: "2026-01-09T00:00:00Z" }),
+      markdown: proofNudgeReport(),
+      headSha: "abc123def456",
+      headCommittedAt: "2026-01-01T00:00:00Z",
+      now: Date.parse("2026-01-10T00:00:00Z"),
+      minAgeDays: 5,
+      cooldownDays: 7,
+    }).action,
+    "skipped_recent_author_activity",
+  );
+});
+
+test("proof nudges use same-head cooldown markers instead of label churn", () => {
+  const comment = renderProofNudgeCommentForTest({
+    number: 42,
+    author: "contributor",
+    headSha: "abc123def456",
+    timestamp: "2026-01-08T00:00:00.000Z",
+  });
+  const result = proofNudgeEligibilityForTest({
+    item: proofNudgeItem(),
+    markdown: proofNudgeReport(),
+    comments: [{ author: "clawsweeper[bot]", body: comment, updatedAt: "2026-01-08T00:00:00Z" }],
+    headSha: "abc123def456",
+    headCommittedAt: "2026-01-01T00:00:00Z",
+    now: Date.parse("2026-01-10T00:00:00Z"),
+    minAgeDays: 5,
+    cooldownDays: 7,
+  });
+
+  assert.equal(result.eligible, false);
+  assert.equal(result.action, "skipped_recent_nudge");
+  assert.match(comment, /<!-- clawsweeper-proof-nudge item="42" sha="abc123def456"/);
+
+  const spoofedMarker = proofNudgeEligibilityForTest({
+    item: proofNudgeItem(),
+    markdown: proofNudgeReport(),
+    comments: [{ author: "someoneelse", body: comment, updatedAt: "2026-01-08T00:00:00Z" }],
+    headSha: "abc123def456",
+    headCommittedAt: "2026-01-01T00:00:00Z",
+    now: Date.parse("2026-01-10T00:00:00Z"),
+    minAgeDays: 5,
+    cooldownDays: 7,
+  });
+
+  assert.equal(spoofedMarker.eligible, true);
+  assert.equal(spoofedMarker.action, "proof_nudge_planned");
+
+  const malformedMarker = proofNudgeEligibilityForTest({
+    item: proofNudgeItem(),
+    markdown: proofNudgeReport(),
+    comments: [
+      {
+        author: "clawsweeper[bot]",
+        body: `<!-- clawsweeper-proof-nudge ${"a".repeat(5000)} -->`,
+        updatedAt: "2026-01-08T00:00:00Z",
+      },
+    ],
+    headSha: "abc123def456",
+    headCommittedAt: "2026-01-01T00:00:00Z",
+    now: Date.parse("2026-01-10T00:00:00Z"),
+    minAgeDays: 5,
+    cooldownDays: 7,
+  });
+
+  assert.equal(malformedMarker.eligible, true);
+  assert.equal(malformedMarker.action, "proof_nudge_planned");
+});
+
+test("proof nudges skip stale report heads and proof-policy exemptions", () => {
+  assert.equal(
+    proofNudgeEligibilityForTest({
+      item: proofNudgeItem(),
+      markdown: proofNudgeReport({ headSha: "oldhead" }),
+      headSha: "newhead",
+      headCommittedAt: "2026-01-01T00:00:00Z",
+      now: Date.parse("2026-01-10T00:00:00Z"),
+    }).action,
+    "skipped_stale_report_head",
+  );
+  assert.equal(
+    proofNudgeEligibilityForTest({
+      item: proofNudgeItem(),
+      markdown: proofNudgeReport({ headSha: "unknown" }),
+      headSha: "abc123def456",
+      headCommittedAt: "2026-01-01T00:00:00Z",
+      now: Date.parse("2026-01-10T00:00:00Z"),
+    }).action,
+    "skipped_stale_report_head",
+  );
+  assert.equal(
+    proofNudgeEligibilityForTest({
+      item: proofNudgeItem({ labels: ["triage: needs-real-behavior-proof", "proof: override"] }),
+      markdown: proofNudgeReport({
+        labels: JSON.stringify(["triage: needs-real-behavior-proof", "proof: override"]),
+      }),
+      headSha: "abc123def456",
+      headCommittedAt: "2026-01-01T00:00:00Z",
+      now: Date.parse("2026-01-10T00:00:00Z"),
+    }).action,
+    "skipped_policy_exempt",
+  );
+  assert.equal(
+    proofNudgeEligibilityForTest({
+      item: proofNudgeItem(),
+      markdown: proofNudgeReport({
+        proofStatus: "not_applicable",
+        needsContributorAction: "false",
+        reviewStatus: "failed",
+      }),
+      headSha: "abc123def456",
+      headCommittedAt: "2026-01-01T00:00:00Z",
+      now: Date.parse("2026-01-10T00:00:00Z"),
+    }).action,
+    "skipped_policy_exempt",
+  );
+  assert.equal(
+    proofNudgeEligibilityForTest({
+      item: proofNudgeItem({ labels: ["triage: needs-real-behavior-proof", "proof: supplied"] }),
+      markdown: proofNudgeReport(),
+      headSha: "abc123def456",
+      headCommittedAt: "2026-01-01T00:00:00Z",
+      now: Date.parse("2026-01-10T00:00:00Z"),
+    }).action,
+    "skipped_policy_exempt",
+  );
+});
+
+test("proof nudges skip maintainer, bot, security, and release PRs", () => {
+  for (const [input, expected] of [
+    [proofNudgeItem({ authorAssociation: "MEMBER" }), "skipped_maintainer_authored"],
+    [proofNudgeItem({ author: "dependabot[bot]" }), "skipped_bot_authored"],
+    [
+      proofNudgeItem({
+        labels: ["triage: needs-real-behavior-proof", "clawsweeper:needs-security-review"],
+      }),
+      "skipped_protected_label",
+    ],
+    [proofNudgeItem({ title: "Release 1.2.3" }), "skipped_protected_label"],
+    [proofNudgeItem({ title: "chore(release): 1.2.3" }), "skipped_protected_label"],
+  ] as const) {
+    assert.equal(
+      proofNudgeEligibilityForTest({
+        item: input,
+        markdown: proofNudgeReport({
+          author: input.author,
+          authorAssociation: input.authorAssociation,
+          labels: JSON.stringify(input.labels),
+        }),
+        headSha: "abc123def456",
+        headCommittedAt: "2026-01-01T00:00:00Z",
+        now: Date.parse("2026-01-10T00:00:00Z"),
+      }).action,
+      expected,
+    );
+  }
+});
+
+test("proof nudges skip locked PR conversations before posting", () => {
+  const result = proofNudgeEligibilityForTest({
+    item: proofNudgeItem({ locked: true, activeLockReason: "resolved" }),
+    markdown: proofNudgeReport(),
+    headSha: "abc123def456",
+    headCommittedAt: "2026-01-01T00:00:00Z",
+    now: Date.parse("2026-01-10T00:00:00Z"),
+  });
+
+  assert.equal(result.eligible, false);
+  assert.equal(result.action, "skipped_locked_conversation");
+  assert.match(result.reason, /conversation is locked \(resolved\)/);
+});
+
+test("proof nudge copy asks for evidence without promising author-only re-review access", () => {
+  const comment = renderProofNudgeCommentForTest({
+    number: 42,
+    author: "contributor",
+    headSha: "abc123def456",
+  });
+
+  assert.match(comment, /^@contributor thanks for the PR\./);
+  assert.match(comment, /screenshot, short video, terminal output/);
+  assert.match(comment, /ClawSweeper or a maintainer can re-check it/);
+  assert.doesNotMatch(comment, /@clawsweeper re-review/);
+});
+
 test("ClawSweeper PR rating labels use one themed overall label", () => {
   assert.deepEqual(prRatingLabelsForTest(["bug"], "A"), ["bug", "rating: 🦞 diamond lobster"]);
   assert.deepEqual(
@@ -11058,6 +11388,25 @@ test("sweep target tokens fall back when an org app installation is missing", ()
     ),
   );
   assert.doesNotMatch(workflow, new RegExp("OPENCLAW_" + "GH_TOKEN"));
+});
+
+test("proof nudge workflow is manual-first and scheduled behind repo vars", () => {
+  const sweepWorkflow = readFileSync(".github/workflows/sweep.yml", "utf8");
+  const workflow = readFileSync(".github/workflows/proof-nudges.yml", "utf8");
+  const job = workflow.slice(workflow.indexOf("  proof-nudges:"), workflow.length);
+  const concurrency = workflow.slice(workflow.indexOf("concurrency:"), workflow.indexOf("\njobs:"));
+
+  assert.doesNotMatch(sweepWorkflow, /proof_nudges/);
+  assert.match(workflow, /execute:[\s\S]*?default: "false"/);
+  assert.match(workflow, /cron: "44 9 \* \* \*"/);
+  assert.match(concurrency, /clawsweeper-proof-nudges/);
+  assert.match(job, /github\.event_name == 'workflow_dispatch'/);
+  assert.match(job, /vars\.CLAWSWEEPER_PROOF_NUDGES_SCHEDULED == '1'/);
+  assert.match(job, /vars\.CLAWSWEEPER_PROOF_NUDGES_EXECUTE == '1'/);
+  assert.match(job, /execute_arg=\(\)/);
+  assert.match(job, /if \[ "\$execute" = "true" \]/);
+  assert.match(job, /pnpm run proof-nudges/);
+  assert.match(job, /vars\.CLAWSWEEPER_PROOF_NUDGES_LIMIT/);
 });
 
 test("read-only checkout mode restores file modes and leaves git metadata writable", () => {
