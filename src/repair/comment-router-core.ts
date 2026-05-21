@@ -4,6 +4,12 @@ import {
   clawsweeperCoAuthorKey,
   coAuthorKey,
 } from "./co-author-credit.js";
+import {
+  CRABBOX_PR_LEASE_INTENTS,
+  crabboxIntentForAction,
+  parseCrabboxPrLeaseCommand,
+  renderCrabboxRouterResponse,
+} from "./crabbox-pr-lease-core.js";
 import { renderJobIntentFrontmatter } from "./job-intent.js";
 import { compactText } from "./text-utils.js";
 export const REPAIR_INTENTS = new Set([
@@ -76,6 +82,8 @@ function commandReplyBadge(command: LooseRecord, dispatched: LooseRecord): strin
     return dispatched?.merge?.status === "executed"
       ? CLAWSWEEPER_REPLY_BADGES.done
       : CLAWSWEEPER_REPLY_BADGES.default;
+  if (CRABBOX_PR_LEASE_INTENTS.has(intent))
+    return dispatched?.crabbox ? CLAWSWEEPER_REPLY_BADGES.done : CLAWSWEEPER_REPLY_BADGES.default;
   return CLAWSWEEPER_REPLY_BADGES.default;
 }
 
@@ -1181,7 +1189,7 @@ export function renderResponse(command: LooseRecord, dispatched: LooseRecord) {
       marker,
       "ClawSweeper is here and listening for maintainer commands.",
       "",
-      "Supported commands: `/review`, `/clawsweeper status`, `/clawsweeper re-review`, `@clawsweeper hatch`, `/clawsweeper implement`, `@clawsweeper fix`, `/clawsweeper build`, `/clawsweeper ask <question>`, `/clawsweeper fix ci`, `/clawsweeper address review`, `/clawsweeper rebase`, `/clawsweeper autofix`, `/clawsweeper automerge`, `/clawsweeper approve`, `/autoclose <reason>`, `/clawsweeper explain`, `/clawsweeper stop`.",
+      "Supported commands: `/review`, `/clawsweeper status`, `/clawsweeper re-review`, `@clawsweeper hatch`, `/clawsweeper implement`, `@clawsweeper fix`, `/clawsweeper build`, `/clawsweeper ask <question>`, `/clawsweeper crabbox lease [linux|mac|windows] [duration]`, `/clawsweeper crabbox status [platform]`, `/clawsweeper crabbox stop [platform]`, `/clawsweeper crabbox reset-vnc [platform]`, `/clawsweeper fix ci`, `/clawsweeper address review`, `/clawsweeper rebase`, `/clawsweeper autofix`, `/clawsweeper automerge`, `/clawsweeper approve`, `/autoclose <reason>`, `/clawsweeper explain`, `/clawsweeper stop`.",
       "",
       "I only act for maintainers, or for trusted ClawSweeper feedback on a ClawSweeper PR or PR opted into `clawsweeper:autofix` or `clawsweeper:automerge`.",
     ].join("\n");
@@ -1282,6 +1290,9 @@ export function renderResponse(command: LooseRecord, dispatched: LooseRecord) {
           ].join("\n")
         : `Reason: ${command.reason ?? "hatch requires an open pull request from the PR author or a maintainer"}.`,
     ].join("\n");
+  }
+  if (CRABBOX_PR_LEASE_INTENTS.has(String(command.intent ?? ""))) {
+    return [marker, renderCrabboxRouterResponse(command, dispatched)].join("\n");
   }
   if (command.intent === "implement_issue") {
     return [
@@ -1515,6 +1526,13 @@ function commandFromText(trigger: JsonValue, value: JsonValue) {
   const parsedCommand =
     intent === "freeform_assist" || intent === "autoclose" ? rawNormalized : command;
   const parsed: LooseRecord = { trigger, command: parsedCommand, intent };
+  const crabbox = parseCrabboxPrLeaseCommand(rawCommand);
+  if (crabbox) {
+    parsed.intent = crabboxIntentForAction(crabbox.action);
+    parsed.crabbox_action = crabbox.action;
+    parsed.crabbox_platform = crabbox.platform;
+    parsed.crabbox_ttl_minutes = crabbox.ttlMinutes;
+  }
   if (intent === "autoclose") parsed.autoclose_message = autocloseReasonFromCommand(rawCommand);
   if (intent === "freeform_assist") parsed.freeform_prompt = assistPromptFromCommand(rawCommand);
   if (intent === "implement_issue")
@@ -1552,6 +1570,8 @@ function issueImplementationRestPrefix(command: LooseRecord) {
 
 function normalizeIntent(command: LooseRecord) {
   if (!command || command === "status") return "status";
+  const crabbox = parseCrabboxPrLeaseCommand(command);
+  if (crabbox) return crabboxIntentForAction(crabbox.action);
   if (["help", "?"].includes(command)) return "help";
   if (["explain", "why"].includes(command)) return "explain";
   if (

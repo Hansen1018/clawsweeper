@@ -782,6 +782,22 @@ test("parseCommand recognizes ClawSweeper bot mentions", () => {
     command: "hatch",
     intent: "hatch",
   });
+  assert.deepEqual(parseCommand("@clawsweeper crabbox lease mac 2h"), {
+    trigger: "mention",
+    command: "crabbox lease mac 2h",
+    intent: "crabbox_lease",
+    crabbox_action: "lease",
+    crabbox_platform: "mac",
+    crabbox_ttl_minutes: 120,
+  });
+  assert.deepEqual(parseCommand("@clawsweeper crabbox reset-vnc windows"), {
+    trigger: "mention",
+    command: "crabbox reset-vnc windows",
+    intent: "crabbox_reset_vnc",
+    crabbox_action: "reset-vnc",
+    crabbox_platform: "windows",
+    crabbox_ttl_minutes: 90,
+  });
   assert.deepEqual(parseCommand("@clawsweeper implement"), {
     trigger: "mention",
     command: "implement",

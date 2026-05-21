@@ -65,6 +65,7 @@ import {
   shouldClearMaintainerCommandReaction,
   usesSharedAutomergeStatus,
 } from "./comment-router-core.js";
+import { CRABBOX_PR_LEASE_INTENTS } from "./crabbox-pr-lease-core.js";
 import { mergeAutomergeTimelineSection } from "./automerge-status-timeline.js";
 import {
   appendLedger,
@@ -204,6 +205,9 @@ for (const comment of comments) {
       extractMarkdownSection(comment.body, "Automerge follow-up") ??
       extractMarkdownSection(comment.body, "Autofix follow-up"),
     freeform_prompt: parsed.freeform_prompt ?? null,
+    crabbox_action: parsed.crabbox_action ?? null,
+    crabbox_platform: parsed.crabbox_platform ?? null,
+    crabbox_ttl_minutes: parsed.crabbox_ttl_minutes ?? null,
     expected_head_sha: parsed.expected_head_sha ?? null,
     finding_id: parsed.finding_id ?? null,
     status: "pending",
@@ -469,6 +473,36 @@ function classifyCommand(command: LooseRecord): JsonValue {
         {
           action: "dispatch_hatch",
           workflow: reviewWorkflow,
+          status: execute ? "pending" : "planned",
+        },
+        { action: "comment", status: execute ? "pending" : "planned" },
+      ],
+    };
+  }
+  if (CRABBOX_PR_LEASE_INTENTS.has(String(command.intent ?? ""))) {
+    if (String(issue.state ?? "").toLowerCase() !== "open") {
+      return {
+        ...next,
+        status: "ready",
+        reason: "Crabbox lease commands require an open pull request",
+        actions: [{ action: "comment", status: execute ? "pending" : "planned" }],
+      };
+    }
+    if (!pull) {
+      return {
+        ...next,
+        status: "ready",
+        reason: "Crabbox lease commands require a pull request",
+        actions: [{ action: "comment", status: execute ? "pending" : "planned" }],
+      };
+    }
+    return {
+      ...next,
+      status: "ready",
+      actions: [
+        {
+          action: "dispatch_crabbox",
+          workflow: "crabbox-pr-lease.yml",
           status: execute ? "pending" : "planned",
         },
         { action: "comment", status: execute ? "pending" : "planned" },
@@ -1246,6 +1280,7 @@ function executeCommand(command: LooseRecord) {
     const shouldDispatchClawSweeper = commandHasAction(command, "dispatch_clawsweeper");
     const shouldDispatchAssist = commandHasAction(command, "dispatch_assist");
     const shouldDispatchHatch = commandHasAction(command, "dispatch_hatch");
+    const shouldDispatchCrabbox = commandHasAction(command, "dispatch_crabbox");
     const shouldMerge = commandHasAction(command, "merge");
     const shouldApplyHumanReviewLabel = commandHasAction(command, "label");
     if (!command.trusted_bot) reactToComment(command, "eyes");
@@ -1424,6 +1459,25 @@ function executeCommand(command: LooseRecord) {
             status: "executed",
             dispatched_at: new Date().toISOString(),
             ...hatch,
+          };
+        }
+        return action;
+      });
+    }
+    if (
+      CRABBOX_PR_LEASE_INTENTS.has(String(command.intent ?? "")) &&
+      command.issue_number &&
+      shouldDispatchCrabbox
+    ) {
+      const crabbox = dispatchCrabboxPrLease(command);
+      dispatched = { ...dispatched, crabbox };
+      command.actions = command.actions.map((action: JsonValue) => {
+        if (action.action === "dispatch_crabbox") {
+          return {
+            ...action,
+            status: "executed",
+            dispatched_at: new Date().toISOString(),
+            ...crabbox,
           };
         }
         return action;
@@ -1999,6 +2053,45 @@ function dispatchPrEggHatch(command: LooseRecord) {
     event: "repository_dispatch",
     repo: reviewRepo,
     item_number: command.issue_number,
+  };
+}
+
+function dispatchCrabboxPrLease(command: LooseRecord) {
+  const payload = JSON.stringify({
+    event_type: "clawsweeper_crabbox_pr_lease",
+    client_payload: {
+      target_repo: command.repo,
+      item_number: String(command.issue_number),
+      action: String(command.crabbox_action ?? ""),
+      platform: String(command.crabbox_platform ?? "linux"),
+      ttl_minutes: String(command.crabbox_ttl_minutes ?? ""),
+      comment_id: String(command.comment_id ?? ""),
+      comment_url: String(command.comment_url ?? ""),
+      author: String(command.author ?? ""),
+      head_sha: String(command.target?.head_sha ?? command.expected_head_sha ?? ""),
+    },
+  });
+  const result = ghSpawn(
+    ["api", `repos/${reviewRepo}/dispatches`, "--method", "POST", "--input", "-"],
+    {
+      env: dispatchTokenEnv(),
+      input: payload,
+    },
+  );
+  if (result.status !== 0) {
+    throw new Error(
+      `failed to dispatch Crabbox PR lease command for #${command.issue_number}: ${
+        result.stderr || result.stdout
+      }`,
+    );
+  }
+  return {
+    workflow: "crabbox-pr-lease.yml",
+    event: "repository_dispatch",
+    repo: reviewRepo,
+    item_number: command.issue_number,
+    platform: command.crabbox_platform,
+    action: command.crabbox_action,
   };
 }
 
