@@ -22,6 +22,7 @@ import {
   auditFromSnapshot,
   auditHasStrictFailures,
   auditHealthSection,
+  buildVisualExplainerRepairPromptForTest,
   canPatchReviewComment,
   closeReasonApplyAgeSkipReason,
   closeReasonsArg,
@@ -94,6 +95,7 @@ import {
   safeOutputTail,
   sameAuthorCounterpartApplyReason,
   sanitizePublicSelfReferences,
+  sanitizeVisualExplainerHtmlForTest,
   appendFloorBackfillCandidateNumbersForTest,
   applyVisualExplainerCsp,
   pullRequestFilePathsFromContextForTest,
@@ -9480,8 +9482,8 @@ test("safeOutputTail tolerates missing process output", () => {
   assert.equal(safeOutputTail("abcdef", 3), "def");
 });
 
-test("visual explainer sanitizer allows self-contained inline interactions", () => {
-  const html = `<!doctype html><html><head>${visualExplainerCspMeta()}<style>button{color:blue}</style></head><body><button id="toggle">Toggle</button><section hidden>Risk map</section><script>document.getElementById("toggle").addEventListener("click",()=>{document.querySelector("section").hidden=false;});</script></body></html>`;
+test("visual explainer sanitizer allows self-contained static HTML and CSS", () => {
+  const html = `<!doctype html><html><head>${visualExplainerCspMeta()}<style>button{color:blue}</style></head><body><section>Risk map</section><table><tr><td>CLI</td></tr></table></body></html>`;
   assert.deepEqual(validateVisualExplainerHtml(html), []);
 });
 
@@ -9499,15 +9501,56 @@ test("visual explainer sanitizer rejects network and external resources", () => 
   const html =
     '<!doctype html><html><head><script src="https://example.com/app.js"></script></head><body><img src="https://example.com/a.png"><script>fetch("https://example.com"); localStorage.setItem("x","y");</script></body></html>';
   const violations = validateVisualExplainerHtml(html);
+  assert.match(violations.join("\n"), /scripts are not allowed/);
   assert.match(violations.join("\n"), /external script sources/);
   assert.match(violations.join("\n"), /network APIs/);
   assert.match(violations.join("\n"), /browser storage/);
   assert.match(violations.join("\n"), /external resources/);
 });
 
+test("visual explainer sanitizer strips scripts before validation", () => {
+  const html = applyVisualExplainerCsp(
+    '<!doctype html><html><head></head><body><h1>PR</h1><p>Do not call Function("x").</p><button onclick="alert(1)" onmouseover=alert(2)>Open</button><script>const make = new Function("return 1");</script><script>document.body.dataset.ready="true";</script >Tail</body></html>',
+  );
+  assert.doesNotMatch(html, /<script\b/i);
+  assert.doesNotMatch(html, /onclick=/);
+  assert.doesNotMatch(html, /onmouseover=/);
+  assert.doesNotMatch(html, /new Function/);
+  assert.doesNotMatch(html, /Function\("/);
+  assert.match(html, /Tail/);
+  assert.deepEqual(validateVisualExplainerHtml(html), []);
+});
+
+test("visual explainer sanitizer helper neutralizes dynamic-code text tokens", () => {
+  assert.equal(sanitizeVisualExplainerHtmlForTest("Function("), "Function call ");
+  assert.equal(sanitizeVisualExplainerHtmlForTest("import("), "import call ");
+});
+
+test("visual explainer repair prompt feeds sanitizer violations back without weakening policy", () => {
+  const prompt = buildVisualExplainerRepairPromptForTest({
+    originalPrompt: "Focus: eli5",
+    html: '<!doctype html><html><body><script>new Function("return 1")()</script></body></html>',
+    violations: ["dynamic code execution is not allowed"],
+  });
+  assert.match(prompt, /dynamic code execution is not allowed/);
+  assert.match(prompt, /Focus: eli5/);
+  assert.match(prompt, /JavaScript is not allowed/);
+  assert.match(prompt, /Return only the complete HTML document/);
+});
+
 test("assist workflow leaves timeout buffer around visual Codex generation", () => {
   const workflow = readFileSync(".github/workflows/assist.yml", "utf8");
   const routerCore = readFileSync("src/repair/comment-router-core.ts", "utf8");
+  const router = readFileSync("src/repair/comment-router.ts", "utf8");
   assert.match(workflow, /timeout-minutes:\s+12/);
   assert.match(routerCore, /timeout_ms:\s+visual \? "480000" : "120000"/);
+  assert.match(
+    workflow,
+    /TIMEOUT_MS:\s+\$\{\{ github\.event\.client_payload\.timeout_ms \|\| \(\(github\.event\.client_payload\.mode \|\| inputs\.mode \|\| 'text'\) == 'visual' && '480000'\) \|\| '120000' \}\}/,
+  );
+  assert.match(
+    workflow,
+    /REASONING_EFFORT:\s+\$\{\{ github\.event\.client_payload\.reasoning_effort \|\| 'low' \}\}/,
+  );
+  assert.match(router, /visual_prompt:\s+parsed\.visual_prompt \?\? null/);
 });

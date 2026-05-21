@@ -5271,7 +5271,7 @@ function buildVisualExplainerPrompt(options: {
     "HTML contract:",
     "- Return only the complete HTML document, starting with <!doctype html> or <html>.",
     "- Inline CSS is allowed.",
-    "- Inline JavaScript is allowed only for local interactions such as filters, tabs, collapsible sections, sorting, and toggles.",
+    "- JavaScript is not allowed in the first visual explainer version. Do not include script tags or event-handler attributes.",
     "- Do not load external scripts, stylesheets, fonts, iframes, images, or other assets.",
     "- Do not make network requests.",
     "- Do not use eval, Function, dynamic import, workers, cookies, localStorage, sessionStorage, forms, or navigation-changing JavaScript.",
@@ -5285,7 +5285,7 @@ function buildVisualExplainerPrompt(options: {
     "- CI/check summary if available",
     "- review-comment grouping",
     "- timeline or commit list",
-    "- filters or toggles that help large PRs become skimmable",
+    "- static sections and tables that help large PRs become skimmable",
     "",
     "Maintainer focus prompt:",
     options.focusPrompt || "Create a balanced maintainer overview of this PR.",
@@ -5297,10 +5297,49 @@ function buildVisualExplainerPrompt(options: {
   ].join("\n");
 }
 
+function buildVisualExplainerRepairPrompt(options: {
+  originalPrompt: string;
+  html: string;
+  violations: readonly string[];
+}): string {
+  return [
+    "The previous ClawSweeper visual assist HTML did not pass safety checks.",
+    "",
+    "Rewrite it as one complete self-contained HTML document that preserves the same PR explanation and focus while fixing every violation.",
+    "",
+    "Safety violations to fix:",
+    ...options.violations.map((violation) => `- ${violation}`),
+    "",
+    "Hard requirements:",
+    "- Return only the complete HTML document, starting with <!doctype html> or <html>.",
+    "- Do not use script tags, event-handler attributes, external assets, network APIs, forms, storage, navigation-changing JavaScript, workers, dynamic imports, eval, or Function.",
+    "- Inline CSS is allowed. JavaScript is not allowed in the first visual explainer version.",
+    "- Keep the footer metadata from the original request.",
+    "",
+    "Original request:",
+    "```markdown",
+    options.originalPrompt,
+    "```",
+    "",
+    "Rejected HTML:",
+    "```html",
+    options.html,
+    "```",
+  ].join("\n");
+}
+
+export function buildVisualExplainerRepairPromptForTest(
+  options: Parameters<typeof buildVisualExplainerRepairPrompt>[0],
+): string {
+  return buildVisualExplainerRepairPrompt(options);
+}
+
 export function validateVisualExplainerHtml(html: string): string[] {
   const text = String(html ?? "");
   const violations: string[] = [];
   const checks: Array<[RegExp, string]> = [
+    [/<script\b/i, "scripts are not allowed"],
+    [/\s+on[a-z]+\s*=/i, "event-handler attributes are not allowed"],
     [/<script\b[^>]*\bsrc\s*=/i, "external script sources are not allowed"],
     [/<link\b[^>]*\bhref\s*=/i, "external stylesheets or linked resources are not allowed"],
     [/<iframe\b/i, "iframes are not allowed"],
@@ -5333,9 +5372,131 @@ export function visualExplainerCspMeta(): string {
   return `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'; connect-src 'none'; frame-ancestors 'none'">`;
 }
 
+function isAsciiWhitespace(char: string): boolean {
+  return char === " " || char === "\n" || char === "\r" || char === "\t" || char === "\f";
+}
+
+function isScriptOpenTagAt(lowerHtml: string, index: number): boolean {
+  if (!lowerHtml.startsWith("<script", index)) return false;
+  const next = lowerHtml[index + "<script".length] ?? "";
+  return next === "" || next === ">" || next === "/" || isAsciiWhitespace(next);
+}
+
+function stripScriptElements(html: string): string {
+  const lowerHtml = html.toLowerCase();
+  let cursor = 0;
+  let output = "";
+  while (cursor < html.length) {
+    const tagStart = lowerHtml.indexOf("<script", cursor);
+    if (tagStart < 0) return output + html.slice(cursor);
+    if (!isScriptOpenTagAt(lowerHtml, tagStart)) {
+      output += html.slice(cursor, tagStart + 1);
+      cursor = tagStart + 1;
+      continue;
+    }
+    output += html.slice(cursor, tagStart);
+    const openTagEnd = html.indexOf(">", tagStart);
+    if (openTagEnd < 0) return output;
+    const closeTagStart = lowerHtml.indexOf("</script", openTagEnd + 1);
+    if (closeTagStart < 0) return output;
+    const closeTagEnd = html.indexOf(">", closeTagStart);
+    if (closeTagEnd < 0) return output;
+    cursor = closeTagEnd + 1;
+  }
+  return output;
+}
+
+function stripEventHandlerAttributesFromTag(tag: string): string {
+  if (tag.startsWith("</") || tag.startsWith("<!") || tag.startsWith("<?")) return tag;
+  let cursor = 1;
+  while (cursor < tag.length && !isAsciiWhitespace(tag[cursor] ?? "") && tag[cursor] !== ">") {
+    cursor += 1;
+  }
+  let output = tag.slice(0, cursor);
+  while (cursor < tag.length) {
+    const attrStart = cursor;
+    while (cursor < tag.length && isAsciiWhitespace(tag[cursor] ?? "")) cursor += 1;
+    const leadingWhitespace = tag.slice(attrStart, cursor);
+    if (cursor >= tag.length || tag[cursor] === ">" || tag[cursor] === "/") {
+      output += tag.slice(attrStart);
+      break;
+    }
+    const nameStart = cursor;
+    while (
+      cursor < tag.length &&
+      !isAsciiWhitespace(tag[cursor] ?? "") &&
+      tag[cursor] !== "=" &&
+      tag[cursor] !== ">" &&
+      tag[cursor] !== "/"
+    ) {
+      cursor += 1;
+    }
+    const attrName = tag.slice(nameStart, cursor);
+    while (cursor < tag.length && isAsciiWhitespace(tag[cursor] ?? "")) cursor += 1;
+    if (tag[cursor] === "=") {
+      cursor += 1;
+      while (cursor < tag.length && isAsciiWhitespace(tag[cursor] ?? "")) cursor += 1;
+      const quote = tag[cursor];
+      if (quote === '"' || quote === "'") {
+        cursor += 1;
+        const valueEnd = tag.indexOf(quote, cursor);
+        cursor = valueEnd < 0 ? tag.length : valueEnd + 1;
+      } else {
+        while (
+          cursor < tag.length &&
+          !isAsciiWhitespace(tag[cursor] ?? "") &&
+          tag[cursor] !== ">"
+        ) {
+          cursor += 1;
+        }
+      }
+    }
+    if (!attrName.toLowerCase().startsWith("on"))
+      output += leadingWhitespace + tag.slice(nameStart, cursor);
+  }
+  return output;
+}
+
+function stripEventHandlerAttributes(html: string): string {
+  let cursor = 0;
+  let output = "";
+  while (cursor < html.length) {
+    const tagStart = html.indexOf("<", cursor);
+    if (tagStart < 0) return output + html.slice(cursor);
+    const tagEnd = html.indexOf(">", tagStart + 1);
+    if (tagEnd < 0) return output + html.slice(cursor);
+    output += html.slice(cursor, tagStart);
+    output += stripEventHandlerAttributesFromTag(html.slice(tagStart, tagEnd + 1));
+    cursor = tagEnd + 1;
+  }
+  return output;
+}
+
+function neutralizeDynamicCodeText(html: string): string {
+  let text = html;
+  for (const token of [
+    "eval(",
+    "Function(",
+    "importScripts(",
+    "import(",
+    "Worker(",
+    "SharedWorker(",
+    "ServiceWorker(",
+  ]) {
+    text = text.split(token).join(`${token.slice(0, -1)} call `);
+  }
+  return text;
+}
+
+export function sanitizeVisualExplainerHtmlForTest(html: string): string {
+  return neutralizeDynamicCodeText(
+    stripEventHandlerAttributes(stripScriptElements(String(html ?? ""))),
+  );
+}
+
 export function applyVisualExplainerCsp(html: string): string {
   const meta = visualExplainerCspMeta();
-  const withoutGeneratedCsp = html.replace(
+  const withoutGeneratedCsp = sanitizeVisualExplainerHtmlForTest(html).replace(
     /<meta\b[^>]*\bhttp-equiv\s*=\s*(?:"Content-Security-Policy"|'Content-Security-Policy'|Content-Security-Policy)[^>]*>\s*/gi,
     "",
   );
@@ -5347,23 +5508,20 @@ export function applyVisualExplainerCsp(html: string): string {
   );
 }
 
-function runCodexVisualExplainer(options: {
+function runCodexVisualExplainerAttempt(options: {
   item: Item;
-  context: ItemContext;
-  focusPrompt: string;
-  sourceCommentUrl: string;
-  author: string;
+  prompt: string;
+  outputStem: string;
   model: string;
   reasoningEffort: string;
   sandboxMode: string;
   timeoutMs: number;
   workDir: string;
-  generatedAt: string;
 }): string {
   ensureDir(options.workDir);
-  const promptPath = join(options.workDir, `${options.item.number}.visual.prompt.md`);
-  const outputPath = join(options.workDir, `${options.item.number}.visual.html`);
-  const prompt = buildVisualExplainerPrompt(options);
+  const promptPath = join(options.workDir, `${options.outputStem}.prompt.md`);
+  const outputPath = join(options.workDir, `${options.outputStem}.html`);
+  const prompt = options.prompt;
   writeFileSync(promptPath, prompt, "utf8");
   const codexConfig = [
     `model_reasoning_effort="${options.reasoningEffort}"`,
@@ -5402,6 +5560,32 @@ function runCodexVisualExplainer(options: {
     throw new Error(`Codex visual explainer failed for #${options.item.number}: ${detail}`);
   }
   return stripTextFence(readFileSync(outputPath, "utf8"));
+}
+
+function runCodexVisualExplainer(options: {
+  item: Item;
+  context: ItemContext;
+  focusPrompt: string;
+  sourceCommentUrl: string;
+  author: string;
+  model: string;
+  reasoningEffort: string;
+  sandboxMode: string;
+  timeoutMs: number;
+  workDir: string;
+  generatedAt: string;
+}): string {
+  const prompt = buildVisualExplainerPrompt(options);
+  return runCodexVisualExplainerAttempt({
+    item: options.item,
+    prompt,
+    outputStem: `${options.item.number}.visual`,
+    model: options.model,
+    reasoningEffort: options.reasoningEffort,
+    sandboxMode: options.sandboxMode,
+    timeoutMs: options.timeoutMs,
+    workDir: options.workDir,
+  });
 }
 
 function assistCommentMarker(commentId: string): string {
@@ -13608,8 +13792,34 @@ function assistCommand(args: Args): void {
         workDir,
         generatedAt,
       });
-      const html = applyVisualExplainerCsp(rawHtml);
-      const violations = validateVisualExplainerHtml(html);
+      let html = applyVisualExplainerCsp(rawHtml);
+      let violations = validateVisualExplainerHtml(html);
+      if (violations.length > 0) {
+        const repairPrompt = buildVisualExplainerRepairPrompt({
+          originalPrompt: buildVisualExplainerPrompt({
+            item,
+            context,
+            focusPrompt: question,
+            sourceCommentUrl,
+            author,
+            generatedAt,
+          }),
+          html,
+          violations,
+        });
+        const repairedHtml = runCodexVisualExplainerAttempt({
+          item,
+          prompt: repairPrompt,
+          outputStem: `${item.number}.visual.repair`,
+          model,
+          reasoningEffort,
+          sandboxMode,
+          timeoutMs: Math.max(30_000, Math.floor(timeoutMs / 2)),
+          workDir,
+        });
+        html = applyVisualExplainerCsp(repairedHtml);
+        violations = validateVisualExplainerHtml(html);
+      }
       if (violations.length > 0) {
         throw new Error(`generated HTML did not pass safety checks: ${violations.join("; ")}`);
       }

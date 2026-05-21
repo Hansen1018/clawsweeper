@@ -167,7 +167,7 @@ jobs:
           AUTHOR: ${{ github.event.client_payload.author || inputs.author || '' }}
           MODEL: ${{ github.event.client_payload.model || 'gpt-5.5' }}
           REASONING_EFFORT: ${{ github.event.client_payload.reasoning_effort || 'low' }}
-          TIMEOUT_MS: ${{ github.event.client_payload.timeout_ms || '120000' }}
+          TIMEOUT_MS: ${{ github.event.client_payload.timeout_ms || ((github.event.client_payload.mode || inputs.mode || 'text') == 'visual' && '480000') || '120000' }}
         run: |
           set -euo pipefail
           node dist/clawsweeper.js assist \

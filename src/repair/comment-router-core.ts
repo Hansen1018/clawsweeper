@@ -1581,7 +1581,7 @@ export function assistDispatchClientPayload(command: LooseRecord): LooseRecord {
       visual ? (command.visual_prompt ?? "") : (command.freeform_prompt ?? command.command ?? ""),
     ).slice(0, 3000),
     model: "gpt-5.5",
-    reasoning_effort: visual ? "medium" : "low",
+    reasoning_effort: "low",
     timeout_ms: visual ? "480000" : "120000",
   };
 }

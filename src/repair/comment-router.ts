@@ -205,6 +205,7 @@ for (const comment of comments) {
       extractMarkdownSection(comment.body, "Automerge follow-up") ??
       extractMarkdownSection(comment.body, "Autofix follow-up"),
     freeform_prompt: parsed.freeform_prompt ?? null,
+    visual_prompt: parsed.visual_prompt ?? null,
     expected_head_sha: parsed.expected_head_sha ?? null,
     finding_id: parsed.finding_id ?? null,
     status: "pending",

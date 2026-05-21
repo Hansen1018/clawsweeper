@@ -879,7 +879,7 @@ test("parseCommand recognizes ClawSweeper bot mentions", () => {
   assert.equal(Object.keys(visualPayload).length, 10);
   assert.equal(visualPayload.mode, "visual");
   assert.equal(visualPayload.question, "eli5");
-  assert.equal(visualPayload.reasoning_effort, "medium");
+  assert.equal(visualPayload.reasoning_effort, "low");
   assert.equal(visualPayload.timeout_ms, "480000");
   assert.deepEqual(parseCommand("/clawsweeper explain why this PR is not automerge-ready"), {
     trigger: "slash",
