@@ -86,11 +86,14 @@ jobs:
           build-script: build:repair
 
       - name: Configure Crabbox token
-        if: ${{ secrets.CRABBOX_TOKEN != '' }}
         env:
           CRABBOX_TOKEN: ${{ secrets.CRABBOX_TOKEN }}
         run: |
           set -euo pipefail
+          if [ -z "${CRABBOX_TOKEN:-}" ]; then
+            echo "CRABBOX_TOKEN is not configured; continuing with existing Crabbox auth if present."
+            exit 0
+          fi
           printf '%s' "$CRABBOX_TOKEN" | crabbox login --token-stdin
 
       - name: Run Crabbox PR lease command
