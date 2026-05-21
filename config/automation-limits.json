@@ -12,5 +12,17 @@
     "assist_visual": {
       "max": 2
     }
+  },
+  "assist_visual": {
+    "publish": {
+      "enabled": true,
+      "provider": "github_pages",
+      "repository": "openclaw/clawsweeper-state",
+      "branch": "state",
+      "base_url": "https://openclaw.github.io/clawsweeper-state",
+      "public_only": true,
+      "retention_days": 30,
+      "required": false
+    }
   }
 }

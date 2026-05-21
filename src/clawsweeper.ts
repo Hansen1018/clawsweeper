@@ -1560,6 +1560,10 @@ function gh(args: string[]): string {
   return run("gh", ["--repo", targetRepo(), ...args]);
 }
 
+function ghWithToken(args: string[], token: string): string {
+  return run("gh", args, { env: { ...process.env, GH_TOKEN: token } });
+}
+
 function sleepMs(milliseconds: number): void {
   if (milliseconds <= 0) return;
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
@@ -5219,6 +5223,98 @@ function visualExplainerArtifactName(repo: string, number: number, headSha: stri
   return `${slug}-${number}-${sha}.html`;
 }
 
+function visualExplainerPathSegment(value: string): string {
+  const segment = value.toLowerCase().replace(/[^a-z0-9_.-]+/g, "-");
+  return segment.replace(/^-+|-+$/g, "") || "unknown";
+}
+
+export function visualExplainerPublishPathsForTest(options: {
+  targetRepo: string;
+  itemNumber: number;
+  headSha: string;
+  commentId: string;
+}): { versionPath: string; latestPath: string } {
+  const [owner = "unknown", repo = "unknown"] = options.targetRepo.split("/");
+  const sha = /^[0-9a-f]{7,40}$/i.test(options.headSha)
+    ? options.headSha.slice(0, 12).toLowerCase()
+    : "unknown";
+  const commentId = visualExplainerPathSegment(options.commentId || "unknown");
+  const base = [
+    "visual",
+    visualExplainerPathSegment(owner),
+    visualExplainerPathSegment(repo),
+    `pr-${Math.max(0, Math.trunc(options.itemNumber)) || 0}`,
+  ].join("/");
+  return {
+    versionPath: `${base}/${sha}/${commentId}.html`,
+    latestPath: `${base}/latest.html`,
+  };
+}
+
+function visualExplainerPublishBaseUrl(): string {
+  const configured = process.env.CLAWSWEEPER_VISUAL_PUBLISH_BASE_URL?.trim();
+  if (configured) return configured.replace(/\/+$/g, "");
+  const repository = visualExplainerPublishRepo();
+  const [owner, repo] = repository.split("/");
+  if (!owner || !repo) return "";
+  return `https://${owner}.github.io/${repo}`;
+}
+
+export function visualExplainerHostedUrlForTest(baseUrl: string, path: string): string {
+  const base = baseUrl.trim().replace(/\/+$/g, "");
+  const cleanPath = path.replace(/^\/+/g, "");
+  return base && cleanPath ? `${base}/${cleanPath}` : "";
+}
+
+type VisualExplainerHostedUrlProbe = (url: string) => { ok: boolean; detail: string };
+
+function defaultVisualExplainerHostedUrlProbe(url: string): { ok: boolean; detail: string } {
+  const result = spawnSync("curl", ["-fsSIL", "--max-time", "10", url], {
+    encoding: "utf8",
+    maxBuffer: 1024 * 1024,
+  });
+  if (result.status === 0) return { ok: true, detail: "" };
+  const detail = safeOutputTail(result.stderr) || safeOutputTail(result.stdout);
+  return { ok: false, detail: detail || `curl exited ${result.status ?? "unknown"}` };
+}
+
+function sleepSync(ms: number): void {
+  if (ms <= 0) return;
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function visualExplainerHostedUrlIsAvailable(
+  url: string,
+  options: {
+    attempts?: number;
+    delayMs?: number;
+    probe?: VisualExplainerHostedUrlProbe;
+  } = {},
+): { ok: boolean; detail: string } {
+  const attempts = Math.max(1, Math.trunc(options.attempts ?? 8));
+  const delayMs = Math.max(0, Math.trunc(options.delayMs ?? 3_000));
+  const probe = options.probe ?? defaultVisualExplainerHostedUrlProbe;
+  let lastDetail = "";
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    const result = probe(url);
+    if (result.ok) return { ok: true, detail: "" };
+    lastDetail = result.detail;
+    if (attempt < attempts) sleepSync(delayMs);
+  }
+  return { ok: false, detail: lastDetail };
+}
+
+export function visualExplainerHostedUrlIsAvailableForTest(
+  url: string,
+  options: {
+    attempts?: number;
+    delayMs?: number;
+    probe?: VisualExplainerHostedUrlProbe;
+  } = {},
+): { ok: boolean; detail: string } {
+  return visualExplainerHostedUrlIsAvailable(url, options);
+}
+
 function visualExplainerRunUrl(): string {
   const server = process.env.GITHUB_SERVER_URL || "https://github.com";
   const repository = process.env.GITHUB_REPOSITORY || "";
@@ -5231,6 +5327,204 @@ function visualExplainerHeadSha(context: ItemContext): string {
   const head = asRecord(pull.head);
   const sha = head.sha;
   return typeof sha === "string" && sha ? sha : "unknown";
+}
+
+function visualExplainerPublishEnabled(): boolean {
+  return process.env.CLAWSWEEPER_VISUAL_PUBLISH_ENABLED !== "false";
+}
+
+function visualExplainerPublishPublicOnly(): boolean {
+  return process.env.CLAWSWEEPER_VISUAL_PUBLISH_PUBLIC_ONLY !== "false";
+}
+
+function visualExplainerPublishRepo(): string {
+  return process.env.CLAWSWEEPER_VISUAL_PUBLISH_REPO || "openclaw/clawsweeper-state";
+}
+
+function visualExplainerPublishBranch(): string {
+  return process.env.CLAWSWEEPER_VISUAL_PUBLISH_BRANCH || "state";
+}
+
+function visualExplainerPublishRetentionDays(): number {
+  const parsed = Number(process.env.CLAWSWEEPER_VISUAL_PUBLISH_RETENTION_DAYS ?? "30");
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 30;
+}
+
+function visualExplainerPublishToken(): string {
+  return process.env.CLAWSWEEPER_VISUAL_PUBLISH_TOKEN || process.env.GH_TOKEN || "";
+}
+
+function fetchTargetRepoIsPrivate(): boolean {
+  const repo = ghJson<{ private?: boolean }>([
+    "api",
+    `repos/${targetRepo()}`,
+    "--jq",
+    "{private:.private}",
+  ]);
+  return repo.private === true;
+}
+
+function visualPublishGh(args: string[], token: string): string {
+  return token ? ghWithToken(args, token) : ghWithRetry(args);
+}
+
+function visualPublishJson<T>(args: string[], token: string): T {
+  const output = visualPublishGh(args, token);
+  return parseGhJson<T>(output, args);
+}
+
+function visualPublishContentSha(
+  repo: string,
+  path: string,
+  branch: string,
+  token: string,
+): string | null {
+  try {
+    const result = visualPublishJson<{ sha?: string }>(
+      [
+        "api",
+        `repos/${repo}/contents/${path}?ref=${encodeURIComponent(branch)}`,
+        "--jq",
+        "{sha:(.sha // null)}",
+      ],
+      token,
+    );
+    return typeof result.sha === "string" && result.sha ? result.sha : null;
+  } catch {
+    return null;
+  }
+}
+
+function visualPublishBranchExists(repo: string, branch: string, token: string): boolean {
+  try {
+    visualPublishGh(["api", `repos/${repo}/git/ref/heads/${branch}`], token);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function ensureVisualPublishBranch(repo: string, branch: string, token: string): void {
+  if (visualPublishBranchExists(repo, branch, token)) return;
+  const repository = visualPublishJson<{ default_branch?: string }>(
+    ["api", `repos/${repo}`, "--jq", "{default_branch:.default_branch}"],
+    token,
+  );
+  const defaultBranch = repository.default_branch || "main";
+  const base = visualPublishJson<{ object?: { sha?: string } }>(
+    ["api", `repos/${repo}/git/ref/heads/${defaultBranch}`, "--jq", "{object:{sha:.object.sha}}"],
+    token,
+  );
+  const sha = base.object?.sha;
+  if (!sha)
+    throw new Error(`could not resolve ${defaultBranch} SHA for visual publish branch creation`);
+  visualPublishGh(
+    [
+      "api",
+      `repos/${repo}/git/refs`,
+      "--method",
+      "POST",
+      "-f",
+      `ref=refs/heads/${branch}`,
+      "-f",
+      `sha=${sha}`,
+    ],
+    token,
+  );
+}
+
+function putVisualPublishFile(options: {
+  repo: string;
+  path: string;
+  content: string;
+  branch: string;
+  message: string;
+  token: string;
+}): void {
+  const args = [
+    "api",
+    `repos/${options.repo}/contents/${options.path}`,
+    "--method",
+    "PUT",
+    "-f",
+    `message=${options.message}`,
+    "-f",
+    `branch=${options.branch}`,
+    "-f",
+    `content=${Buffer.from(options.content, "utf8").toString("base64")}`,
+  ];
+  const sha = visualPublishContentSha(options.repo, options.path, options.branch, options.token);
+  if (sha) args.push("-f", `sha=${sha}`);
+  visualPublishGh(args, options.token);
+}
+
+function pruneExpiredVisualExplainers(paths: readonly string[], now = Date.now()): string[] {
+  const retentionMs = visualExplainerPublishRetentionDays() * 24 * 60 * 60 * 1000;
+  const cutoff = now - retentionMs;
+  return paths.filter((path) => {
+    const normalized = path.replaceAll("\\", "/");
+    if (!normalized.startsWith("visual/")) return false;
+    const match = normalized.match(/\/(\d{4}-\d{2}-\d{2})\//);
+    if (!match?.[1]) return false;
+    const timestamp = Date.parse(`${match[1]}T00:00:00Z`);
+    return Number.isFinite(timestamp) && timestamp < cutoff;
+  });
+}
+
+export function pruneExpiredVisualExplainersForTest(
+  paths: readonly string[],
+  now?: number,
+): string[] {
+  return pruneExpiredVisualExplainers(paths, now);
+}
+
+function publishVisualExplainerHtml(options: {
+  item: Item;
+  context: ItemContext;
+  sourceCommentId: string;
+  html: string;
+}): { url: string; versionPath: string; latestPath: string } | null {
+  if (!visualExplainerPublishEnabled()) return null;
+  if (visualExplainerPublishPublicOnly() && fetchTargetRepoIsPrivate()) return null;
+  const baseUrl = visualExplainerPublishBaseUrl();
+  if (!baseUrl) throw new Error("visual explainer Pages base URL is unavailable");
+  const paths = visualExplainerPublishPathsForTest({
+    targetRepo: options.item.repo,
+    itemNumber: options.item.number,
+    headSha: visualExplainerHeadSha(options.context),
+    commentId: options.sourceCommentId,
+  });
+  const publishRepo = visualExplainerPublishRepo();
+  const branch = visualExplainerPublishBranch();
+  const token = visualExplainerPublishToken();
+  ensureVisualPublishBranch(publishRepo, branch, token);
+  const message = `chore: publish visual explainer for ${options.item.repo}#${options.item.number} [skip ci]`;
+  putVisualPublishFile({
+    repo: publishRepo,
+    path: paths.versionPath,
+    content: options.html,
+    branch,
+    message,
+    token,
+  });
+  putVisualPublishFile({
+    repo: publishRepo,
+    path: paths.latestPath,
+    content: options.html,
+    branch,
+    message,
+    token,
+  });
+  const url = visualExplainerHostedUrlForTest(baseUrl, paths.latestPath);
+  const available = visualExplainerHostedUrlIsAvailable(url);
+  if (!available.ok) {
+    throw new Error(`hosted visual explainer URL is not available: ${available.detail}`);
+  }
+  return {
+    url,
+    versionPath: paths.versionPath,
+    latestPath: paths.latestPath,
+  };
 }
 
 function buildVisualExplainerPrompt(options: {
@@ -5616,6 +5910,8 @@ function renderAssistComment(options: {
 function renderVisualExplainerComment(options: {
   artifactName: string;
   runUrl: string;
+  hostedUrl?: string | null;
+  publishError?: string | null;
   model: string;
   reasoningEffort: string;
   sourceCommentUrl: string;
@@ -5628,19 +5924,33 @@ function renderVisualExplainerComment(options: {
   const artifactLine = options.runUrl
     ? `Artifact: [${options.artifactName}](${options.runUrl})`
     : `Artifact: ${options.artifactName}`;
+  const openLine = options.hostedUrl ? `Open visual explainer: ${options.hostedUrl}` : null;
+  const publishLine = options.publishError
+    ? `Hosted page: unavailable (${truncateText(options.publishError, 220)}).`
+    : null;
   return [
-    "ClawSweeper visual assist: I generated a read-only interactive HTML explainer for this PR.",
+    "ClawSweeper visual assist: I generated a read-only HTML explainer for this PR.",
     "",
+    openLine,
+    publishLine,
     artifactLine,
     `Focus: ${options.focusPrompt || "default maintainer overview"}`,
     "",
-    "This artifact is explanatory only. It is not a ClawSweeper review verdict and it does not close, merge, label, push, repair, or approve this PR.",
+    "This explainer is explanatory only. It is not a ClawSweeper review verdict and it does not close, merge, label, push, repair, or approve this PR.",
     "",
     "---",
     `${sourceLine}`,
     `Visual assist model: ${options.model}, reasoning ${options.reasoningEffort}.`,
     assistCommentMarker(options.sourceCommentId),
-  ].join("\n");
+  ]
+    .filter((line) => line !== null)
+    .join("\n");
+}
+
+export function renderVisualExplainerCommentForTest(
+  options: Parameters<typeof renderVisualExplainerComment>[0],
+): string {
+  return renderVisualExplainerComment(options);
 }
 
 function renderVisualExplainerFallbackComment(options: {
@@ -13830,9 +14140,24 @@ function assistCommand(args: Args): void {
       );
       const artifactPath = join(outputDir, artifactName);
       writeFileSync(artifactPath, html, "utf8");
+      let hostedUrl: string | null = null;
+      let publishError: string | null = null;
+      try {
+        const published = publishVisualExplainerHtml({
+          item,
+          context,
+          sourceCommentId,
+          html,
+        });
+        hostedUrl = published?.url ?? null;
+      } catch (error) {
+        publishError = error instanceof Error ? error.message : String(error);
+      }
       const comment = renderVisualExplainerComment({
         artifactName,
         runUrl: visualExplainerRunUrl(),
+        hostedUrl,
+        publishError,
         model,
         reasoningEffort,
         sourceCommentUrl,
@@ -13848,6 +14173,8 @@ function assistCommand(args: Args): void {
           model,
           reasoningEffort,
           artifact: artifactPath,
+          hostedUrl,
+          publishError,
         }),
       );
       return;

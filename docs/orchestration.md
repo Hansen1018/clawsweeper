@@ -15,9 +15,22 @@ ClawSweeper should stay simple at the orchestration boundary:
    not independent sources of truth.
 
 Visual assist explainers are read-only generated artifacts. They may use an LLM
-to render self-contained HTML/CSS/inline-JS from deterministic PR context, but
-the sanitizer, artifact publication, permissions, and GitHub comments remain
-deterministic ClawSweeper responsibilities.
+to render self-contained HTML/CSS from deterministic PR context, but the
+sanitizer, hosted-page publication, artifact fallback, permissions, and GitHub
+comments remain deterministic ClawSweeper responsibilities.
+
+Visual explainers publish a directly clickable GitHub Pages URL through the
+generated state repository (`openclaw/clawsweeper-state`) when
+`assist_visual.publish.enabled` is true and the target repository is public.
+The workflow writes sanitized HTML to the state repo's `state` branch; it does
+not mutate the main ClawSweeper repository's Pages source or generated content.
+The canonical path shape is
+`visual/<owner>/<repo>/pr-<number>/<head-sha-short>/<comment-id>.html`, with
+`visual/<owner>/<repo>/pr-<number>/latest.html` updated to the newest generated
+page. Workflow artifacts remain the fallback/debug copy. Private target
+repositories, disabled publishing, missing Pages configuration, or publish
+errors must not block the read-only assist response; ClawSweeper posts the
+artifact link and a short hosted-page failure reason instead.
 
 ## Canonical Job Intent
 

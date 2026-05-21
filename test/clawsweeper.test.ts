@@ -82,6 +82,7 @@ import {
   reviewPromptForTest,
   renderReviewCommentFromReport,
   renderReviewContextBudgetForTest,
+  renderVisualExplainerCommentForTest,
   renderWorkPlanFromReport,
   restoreTreeModesForTest,
   reviewContextLedgerForTest,
@@ -110,6 +111,10 @@ import {
   validateVisualExplainerHtml,
   visualExplainerCspMeta,
   validateCloseDecision,
+  visualExplainerHostedUrlIsAvailableForTest,
+  visualExplainerHostedUrlForTest,
+  visualExplainerPublishPathsForTest,
+  pruneExpiredVisualExplainersForTest,
 } from "../dist/clawsweeper.js";
 import { checkConclusionForFrontMatter } from "../dist/commit-checks.js";
 import { skippedNonCodeReport } from "../dist/commit-classifier.js";
@@ -9538,11 +9543,117 @@ test("visual explainer repair prompt feeds sanitizer violations back without wea
   assert.match(prompt, /Return only the complete HTML document/);
 });
 
+test("visual explainer publish paths are deterministic and avoid prompt text", () => {
+  const paths = visualExplainerPublishPathsForTest({
+    targetRepo: "OpenClaw/OpenClaw",
+    itemNumber: 72343,
+    headSha: "DAE18659D42DCF2613990CA4895070BB94F63B1B",
+    commentId: "4512657637",
+  });
+  assert.equal(paths.versionPath, "visual/openclaw/openclaw/pr-72343/dae18659d42d/4512657637.html");
+  assert.equal(paths.latestPath, "visual/openclaw/openclaw/pr-72343/latest.html");
+  assert.doesNotMatch(JSON.stringify(paths), /eli5|fresh install|Tak/i);
+  assert.equal(
+    visualExplainerHostedUrlForTest(
+      "https://openclaw.github.io/clawsweeper-state/",
+      paths.latestPath,
+    ),
+    "https://openclaw.github.io/clawsweeper-state/visual/openclaw/openclaw/pr-72343/latest.html",
+  );
+});
+
+test("visual explainer success comment prefers hosted URL and keeps artifact fallback", () => {
+  const comment = renderVisualExplainerCommentForTest({
+    artifactName: "openclaw-openclaw-72343-dae18659d42d.html",
+    runUrl: "https://github.com/openclaw/clawsweeper/actions/runs/1",
+    hostedUrl:
+      "https://openclaw.github.io/clawsweeper-state/visual/openclaw/openclaw/pr-72343/latest.html",
+    model: "gpt-5.5",
+    reasoningEffort: "low",
+    sourceCommentUrl: "https://github.com/openclaw/openclaw/pull/72343#issuecomment-4512657637",
+    sourceCommentId: "4512657637",
+    focusPrompt: "eli5",
+  });
+  assert.match(comment, /Open visual explainer: https:\/\/openclaw\.github\.io/);
+  assert.match(comment, /Artifact: \[openclaw-openclaw-72343-dae18659d42d\.html\]/);
+  assert.match(comment, /Focus: eli5/);
+  assert.match(comment, /Visual assist model: gpt-5\.5, reasoning low/);
+});
+
+test("visual explainer success comment reports publish fallback without losing artifact", () => {
+  const comment = renderVisualExplainerCommentForTest({
+    artifactName: "openclaw-openclaw-72343-dae18659d42d.html",
+    runUrl: "https://github.com/openclaw/clawsweeper/actions/runs/1",
+    hostedUrl: null,
+    publishError: "state branch is unavailable",
+    model: "gpt-5.5",
+    reasoningEffort: "low",
+    sourceCommentUrl: "",
+    sourceCommentId: "4512657637",
+    focusPrompt: "eli5",
+  });
+  assert.match(comment, /Hosted page: unavailable \(state branch is unavailable\)/);
+  assert.match(comment, /Artifact:/);
+  assert.doesNotMatch(comment, /Open visual explainer:/);
+});
+
+test("visual explainer hosted URL probe retries before falling back", () => {
+  const attempts: string[] = [];
+  const available = visualExplainerHostedUrlIsAvailableForTest("https://example.test/visual.html", {
+    attempts: 2,
+    delayMs: 0,
+    probe: (url) => {
+      attempts.push(url);
+      return attempts.length === 2 ? { ok: true, detail: "" } : { ok: false, detail: "HTTP 404" };
+    },
+  });
+  assert.deepEqual(attempts, [
+    "https://example.test/visual.html",
+    "https://example.test/visual.html",
+  ]);
+  assert.deepEqual(available, { ok: true, detail: "" });
+});
+
+test("visual explainer hosted URL probe exposes final failure detail", () => {
+  const unavailable = visualExplainerHostedUrlIsAvailableForTest(
+    "https://example.test/missing.html",
+    {
+      attempts: 2,
+      delayMs: 0,
+      probe: () => ({ ok: false, detail: "HTTP 404" }),
+    },
+  );
+  assert.deepEqual(unavailable, { ok: false, detail: "HTTP 404" });
+});
+
+test("visual explainer cleanup candidates stay scoped to visual paths", () => {
+  const now = Date.parse("2026-05-21T12:00:00Z");
+  const expired = pruneExpiredVisualExplainersForTest(
+    [
+      "visual/openclaw/openclaw/pr-1/2026-04-01/abc.html",
+      "visual/openclaw/openclaw/pr-1/latest.html",
+      "assets/2026-04-01/abc.html",
+      "visual/openclaw/openclaw/pr-2/2026-05-20/abc.html",
+    ],
+    now,
+  );
+  assert.deepEqual(expired, ["visual/openclaw/openclaw/pr-1/2026-04-01/abc.html"]);
+});
+
 test("assist workflow leaves timeout buffer around visual Codex generation", () => {
   const workflow = readFileSync(".github/workflows/assist.yml", "utf8");
   const routerCore = readFileSync("src/repair/comment-router-core.ts", "utf8");
   const router = readFileSync("src/repair/comment-router.ts", "utf8");
   assert.match(workflow, /timeout-minutes:\s+12/);
+  assert.doesNotMatch(workflow, /pages:\s+write/);
+  assert.match(workflow, /uses:\s+\.\/\.github\/actions\/create-state-token/);
+  assert.match(workflow, /CLAWSWEEPER_VISUAL_PUBLISH_REPO:\s+openclaw\/clawsweeper-state/);
+  assert.match(workflow, /CLAWSWEEPER_VISUAL_PUBLISH_BRANCH:\s+state/);
+  assert.match(
+    workflow,
+    /CLAWSWEEPER_VISUAL_PUBLISH_BASE_URL:\s+https:\/\/openclaw\.github\.io\/clawsweeper-state/,
+  );
+  assert.doesNotMatch(workflow, /CLAWSWEEPER_PAGES_TOKEN/);
   assert.match(routerCore, /timeout_ms:\s+visual \? "480000" : "120000"/);
   assert.match(
     workflow,

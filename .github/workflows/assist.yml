@@ -45,7 +45,7 @@ on:
           - visual
 
 permissions:
-  contents: read
+  contents: write
   issues: write
   pull-requests: read
 
@@ -146,6 +146,14 @@ jobs:
           owner: ${{ vars.CLAWSWEEPER_ALLOWED_OWNER || github.repository_owner }}
           permission-issues: write
           permission-pull-requests: write
+          permission-contents: write
+
+      - name: Create state repository token
+        id: state_token
+        uses: ./.github/actions/create-state-token
+        with:
+          client-id: ${{ env.CLAWSWEEPER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
 
       - uses: ./.github/actions/setup-pnpm
         with:
@@ -158,6 +166,10 @@ jobs:
       - name: Answer maintainer question
         env:
           GH_TOKEN: ${{ steps.app_token.outputs.token }}
+          CLAWSWEEPER_VISUAL_PUBLISH_TOKEN: ${{ steps.state_token.outputs.token }}
+          CLAWSWEEPER_VISUAL_PUBLISH_REPO: openclaw/clawsweeper-state
+          CLAWSWEEPER_VISUAL_PUBLISH_BRANCH: state
+          CLAWSWEEPER_VISUAL_PUBLISH_BASE_URL: https://openclaw.github.io/clawsweeper-state
           TARGET_REPO: ${{ github.event.client_payload.target_repo || inputs.target_repo }}
           ITEM_NUMBER: ${{ github.event.client_payload.item_number || inputs.item_number }}
           QUESTION: ${{ github.event.client_payload.question || inputs.question }}

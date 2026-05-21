@@ -39,6 +39,12 @@ The mental model:
 | `workers.minimum_background` | 10 | Target floor for background progress when enough global capacity is available. |
 | `lanes.assist.max` | 5 | Maximum concurrent lightweight assist jobs. |
 | `lanes.assist_visual.max` | 2 | Maximum concurrent visual assist explainer jobs. |
+| `assist_visual.publish.enabled` | true | Enables direct GitHub Pages publishing for visual explainers. |
+| `assist_visual.publish.repository` | openclaw/clawsweeper-state | Generated-state repository that stores hosted visual explainer HTML. |
+| `assist_visual.publish.branch` | state | Generated-state branch used as the GitHub Pages source. |
+| `assist_visual.publish.base_url` | https://openclaw.github.io/clawsweeper-state | Public base URL for hosted visual explainer pages. |
+| `assist_visual.publish.public_only` | true | Publishes hosted pages only for public target repositories. |
+| `assist_visual.publish.retention_days` | 30 | Intended retention window for generated visual explainer pages. |
 
 ## Derived Limits
 
