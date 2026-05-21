@@ -146,7 +146,7 @@ function postStateComment(state: LooseRecord) {
   const bodyPath = path.join("results", "crabbox-leases", `comment-${Date.now()}.md`);
   fs.mkdirSync(path.dirname(bodyPath), { recursive: true });
   fs.writeFileSync(bodyPath, body);
-  gh(["issue", "comment", String(prNumber), "--repo", repo, "--body-file", bodyPath]);
+  gh(["api", `repos/${repo}/issues/${prNumber}/comments`, "-f", `body=@${bodyPath}`]);
 }
 
 function runCrabbox(args: string[], options: { allowFailure?: boolean } = {}) {
