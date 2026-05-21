@@ -81,7 +81,7 @@ jobs:
       - uses: ./.github/actions/setup-pnpm
 
       - name: Build repair tools
-        uses: ./.github/actions/setup-codex
+        uses: ./.github/actions/setup-pnpm
         with:
           build-script: build:repair
 
