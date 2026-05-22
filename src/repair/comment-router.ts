@@ -502,7 +502,7 @@ function classifyCommand(command: LooseRecord): JsonValue {
       actions: [
         {
           action: "dispatch_crabbox",
-          workflow: "crabbox-pr-lease.yml",
+          workflow: "mantis-pr-desktop-lease.yml",
           status: execute ? "pending" : "planned",
         },
         { action: "comment", status: execute ? "pending" : "planned" },
@@ -2057,6 +2057,9 @@ function dispatchPrEggHatch(command: LooseRecord) {
 }
 
 function dispatchCrabboxPrLease(command: LooseRecord) {
+  const leaseRepo = String(
+    process.env.CLAWSWEEPER_CRABBOX_LEASE_REPO || command.repo || targetRepo,
+  );
   const payload = JSON.stringify({
     event_type: "clawsweeper_crabbox_pr_lease",
     client_payload: {
@@ -2072,7 +2075,7 @@ function dispatchCrabboxPrLease(command: LooseRecord) {
     },
   });
   const result = ghSpawn(
-    ["api", `repos/${reviewRepo}/dispatches`, "--method", "POST", "--input", "-"],
+    ["api", `repos/${leaseRepo}/dispatches`, "--method", "POST", "--input", "-"],
     {
       env: dispatchTokenEnv(),
       input: payload,
@@ -2086,9 +2089,9 @@ function dispatchCrabboxPrLease(command: LooseRecord) {
     );
   }
   return {
-    workflow: "crabbox-pr-lease.yml",
+    workflow: "mantis-pr-desktop-lease.yml",
     event: "repository_dispatch",
-    repo: reviewRepo,
+    repo: leaseRepo,
     item_number: command.issue_number,
     platform: command.crabbox_platform,
     action: command.crabbox_action,
