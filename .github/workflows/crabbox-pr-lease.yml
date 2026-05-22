@@ -76,7 +76,7 @@ jobs:
           owner: ${{ vars.CLAWSWEEPER_ALLOWED_OWNER || github.repository_owner }}
           permission-contents: write
           permission-issues: write
-          permission-pull-requests: read
+          permission-pull-requests: write
 
       - name: Create target repository token
         id: target_token
@@ -87,7 +87,7 @@ jobs:
           owner: openclaw
           repositories: openclaw
           permission-issues: write
-          permission-pull-requests: read
+          permission-pull-requests: write
 
       - uses: ./.github/actions/setup-pnpm
 

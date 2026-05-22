@@ -117,7 +117,7 @@ function lease(headSha: string) {
     writeState(ready);
     postStateComment(ready);
   } catch (error) {
-    postStateComment({
+    const failure = {
       repo,
       pr_number: prNumber,
       platform,
@@ -126,7 +126,9 @@ function lease(headSha: string) {
       failed_step: leaseID ? "setup" : "warmup",
       failure_excerpt: error instanceof Error ? error.message : String(error),
       webvnc_url: leaseID ? portalURL(leaseID) : null,
-    });
+    };
+    console.error(`Crabbox PR lease failed during ${failure.failed_step}: ${failure.failure_excerpt}`);
+    postStateComment(failure);
   }
 }
 
@@ -146,7 +148,16 @@ function postStateComment(state: LooseRecord) {
   const bodyPath = path.join("results", "crabbox-leases", `comment-${Date.now()}.md`);
   fs.mkdirSync(path.dirname(bodyPath), { recursive: true });
   fs.writeFileSync(bodyPath, body);
-  gh(["api", `repos/${repo}/issues/${prNumber}/comments`, "-f", `body=@${bodyPath}`]);
+  try {
+    gh(["api", `repos/${repo}/issues/${prNumber}/comments`, "-f", `body=@${bodyPath}`]);
+  } catch (error) {
+    console.error(
+      `Failed to post Crabbox PR lease comment to ${repo}#${prNumber}: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+    throw error;
+  }
 }
 
 function runCrabbox(args: string[], options: { allowFailure?: boolean } = {}) {
