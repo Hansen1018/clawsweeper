@@ -166,9 +166,31 @@ function runCrabbox(args: string[], options: { allowFailure?: boolean } = {}) {
     maxBuffer: 20 * 1024 * 1024,
   });
   if (result.status !== 0 && !options.allowFailure) {
-    throw new Error(`${["crabbox", ...args].join(" ")} failed: ${result.stderr || result.stdout}`);
+    throw new Error(formatCrabboxFailure(args, result));
   }
   return { status: result.status ?? 1, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
+}
+
+function formatCrabboxFailure(
+  args: string[],
+  result: ReturnType<typeof spawnSync>,
+): string {
+  return [
+    `${["crabbox", ...args].join(" ")} failed`,
+    `status: ${result.status ?? "null"}`,
+    `signal: ${result.signal ?? "null"}`,
+    result.error ? `error: ${result.error.name}: ${result.error.message}` : "error: null",
+    "stdout:",
+    trimCommandOutput(result.stdout),
+    "stderr:",
+    trimCommandOutput(result.stderr),
+  ].join("\n");
+}
+
+function trimCommandOutput(value: unknown): string {
+  const text = String(value ?? "").trim();
+  if (!text) return "<empty>";
+  return text.length > 4000 ? `${text.slice(0, 4000)}\n...<truncated>` : text;
 }
 
 function gh(args: string[]) {
