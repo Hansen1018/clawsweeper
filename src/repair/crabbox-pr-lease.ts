@@ -149,7 +149,7 @@ function postStateComment(state: LooseRecord) {
   fs.mkdirSync(path.dirname(bodyPath), { recursive: true });
   fs.writeFileSync(bodyPath, body);
   try {
-    gh(["api", `repos/${repo}/issues/${prNumber}/comments`, "-f", `body=@${bodyPath}`]);
+    gh(["api", `repos/${repo}/issues/${prNumber}/comments`, "-F", `body=@${bodyPath}`]);
   } catch (error) {
     console.error(
       `Failed to post Crabbox PR lease comment to ${repo}#${prNumber}: ${
