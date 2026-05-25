@@ -44,6 +44,13 @@ import {
   renderOpenClawPrSurfaceTable,
   type PrSurfaceFile,
 } from "./pr-surface-stats.js";
+import { hasSecuritySignal } from "./repair/security-signals.js";
+import {
+  compactSupersessionProofView,
+  normalizedSupersessionProofModelResult,
+  parseSupersessionProofModelResult,
+  type SupersessionProofModelResult,
+} from "./supersession-proof.js";
 import {
   boolArg,
   itemNumbersArg,
@@ -818,6 +825,12 @@ const DEFAULT_SERVICE_TIER = "";
 const REVIEW_POLICY_VERSION = "2026-05-17-policy-v18";
 const REVIEW_ITEM_PROMPT_PATH = join(ROOT, "prompts", "review-item.md");
 const CLAWSWEEPER_DECISION_SCHEMA_PATH = join(ROOT, "schema", "clawsweeper-decision.schema.json");
+const CLAWSWEEPER_SUPERSESSION_PROOF_SCHEMA_PATH = join(
+  ROOT,
+  "schema",
+  "clawsweeper-supersession-proof.schema.json",
+);
+const SUPERSESSION_PROOF_PROMPT_PATH = join(ROOT, "prompts", "supersession-proof.md");
 const REVIEW_COMMENT_MARKER_PREFIX = "<!-- clawsweeper-review";
 const REVIEW_START_STATUS_MARKER_PREFIX = "<!-- clawsweeper-review-status";
 const AUTOMERGE_LABEL = "clawsweeper:automerge";
@@ -1769,6 +1782,7 @@ function sha256(text: string): string {
 
 let reviewPromptTemplateCache: string | undefined;
 let reviewDecisionSchemaCache: string | undefined;
+let supersessionProofPromptTemplateCache: string | undefined;
 
 function itemSnapshotHash(item: Item, context: ItemContext): string {
   const snapshotItem = {
@@ -5351,6 +5365,11 @@ function reviewTargetBranch(openclawDir: string): string {
 export function reviewPromptTemplate(): string {
   reviewPromptTemplateCache ??= readFileSync(REVIEW_ITEM_PROMPT_PATH, "utf8");
   return reviewPromptTemplateCache;
+}
+
+function supersessionProofPromptTemplate(): string {
+  supersessionProofPromptTemplateCache ??= readFileSync(SUPERSESSION_PROOF_PROMPT_PATH, "utf8");
+  return supersessionProofPromptTemplateCache;
 }
 
 export function reviewDecisionSchemaText(): string {
@@ -9820,6 +9839,44 @@ interface PullRequestClosePromotion {
   closeComment: string;
 }
 
+interface HydratedSupersessionPullRequest {
+  number: number;
+  title: string;
+  url: string;
+  state: string;
+  mergedAt: string | null;
+  body: string;
+  labels: string[];
+  headSha: string | null;
+  updatedAt: string | null;
+  filePaths: string[];
+  filesHydrated: number;
+  filesTruncated: boolean;
+}
+
+type SupersessionProofDecision = "close" | "link_only" | "keep_open";
+
+interface SupersessionProof {
+  sourceSummary: string;
+  replacementSummary: string;
+  coveredWork: string[];
+  uniqueSourceWork: string[];
+  securityBlocked: boolean;
+  decision: SupersessionProofDecision;
+  reason: string;
+  replacementUrl: string;
+  replacementStateText: string;
+}
+
+interface SupersessionProofRuntime {
+  model: string;
+  reasoningEffort: string;
+  sandboxMode: string;
+  serviceTier: string;
+  timeoutMs: number;
+  workDir: string;
+}
+
 function upgradePullRequestClosePromotionReport(
   markdown: string,
   item: Item,
@@ -9975,6 +10032,364 @@ function linkedPullRequestSupersession(
   return null;
 }
 
+function compactProofText(value: unknown, limit = 200): string {
+  if (typeof value !== "string") return "";
+  return truncateText(value.replace(/\s+/g, " ").trim(), limit);
+}
+
+function uniqueFilePaths(values: readonly string[]): string[] {
+  return [...new Set(values.filter((value) => value.trim()).map((value) => value.trim()))].sort();
+}
+
+function formatProofFileList(paths: readonly string[]): string {
+  if (!paths.length) return "no hydrated files";
+  const shown = paths.slice(0, 8).map((path) => `\`${path}\``);
+  const remaining = paths.length - shown.length;
+  return remaining > 0 ? `${shown.join(", ")} and ${remaining} more` : shown.join(", ");
+}
+
+function formatProofDetailList(values: readonly string[]): string {
+  if (!values.length) return "  - none";
+  return values.map((value) => `  - ${value}`).join("\n");
+}
+
+function labelRecords(labels: readonly string[]): Array<Record<string, string>> {
+  return labels.map((name) => ({ name }));
+}
+
+function sourcePullRequestHasSecuritySignal(
+  item: Item,
+  context: ItemContext,
+  markdown: string,
+): boolean {
+  return hasSecuritySignal({
+    labels: labelRecords(item.labels),
+    comments: [...context.comments, ...(context.pullReviewComments ?? [])],
+    text: [
+      context.issue,
+      context.pullRequest,
+      reviewSectionValue(markdown, "summary"),
+      reviewSectionValue(markdown, "securityReview"),
+    ],
+  });
+}
+
+function hydratedSourceSupersessionPullRequest(
+  item: Item,
+  context: ItemContext,
+): HydratedSupersessionPullRequest {
+  const issue = asRecord(context.issue);
+  const pull = asRecord(context.pullRequest);
+  return {
+    number: item.number,
+    title: item.title,
+    url: item.url,
+    state: "open",
+    mergedAt: null,
+    body: stringOrUndefined(pull.body) ?? stringOrUndefined(issue.body) ?? "",
+    labels: item.labels,
+    headSha: stringOrUndefined(asRecord(pull.head).sha) ?? null,
+    updatedAt: item.updatedAt,
+    filePaths: uniqueFilePaths(pullRequestFilePathsFromContext(context)),
+    filesHydrated: context.counts?.pullFilesHydrated ?? context.pullFiles?.length ?? 0,
+    filesTruncated: Boolean(context.counts?.pullFilesTruncated),
+  };
+}
+
+function hydrateReplacementSupersessionPullRequest(
+  number: number,
+): HydratedSupersessionPullRequest {
+  const pull = asRecord(ghJson<unknown>(["api", `repos/${targetRepo()}/pulls/${number}`]));
+  const issue = asRecord(ghJson<unknown>(["api", `repos/${targetRepo()}/issues/${number}`]));
+  const changedFiles = numberOrUndefined(pull.changed_files);
+  const filesWindow = ghPagedContextWindow<unknown>(
+    `repos/${targetRepo()}/pulls/${number}/files`,
+    changedFiles,
+    80,
+  );
+  return {
+    number,
+    title: stringOrUndefined(pull.title) ?? stringOrUndefined(issue.title) ?? `PR #${number}`,
+    url:
+      stringOrUndefined(pull.html_url) ??
+      stringOrUndefined(issue.html_url) ??
+      pullRequestUrlForNumber(number),
+    state: stringOrUndefined(pull.state)?.toLowerCase() ?? "",
+    mergedAt: stringOrUndefined(pull.merged_at) ?? null,
+    body: stringOrUndefined(pull.body) ?? stringOrUndefined(issue.body) ?? "",
+    labels: labelNames(issue.labels),
+    headSha: stringOrUndefined(asRecord(pull.head).sha) ?? null,
+    updatedAt: stringOrUndefined(pull.updated_at) ?? stringOrUndefined(issue.updated_at) ?? null,
+    filePaths: uniqueFilePaths(filesWindow.items.flatMap(compactPullFilePaths)),
+    filesHydrated: filesWindow.hydrated,
+    filesTruncated: filesWindow.truncated,
+  };
+}
+
+function summarizeSupersessionPullRequest(pull: HydratedSupersessionPullRequest): string {
+  const body = compactProofText(pull.body);
+  const bodyText = body ? ` Body: ${body}` : "";
+  const headText = pull.headSha ? ` Head: ${pull.headSha}.` : "";
+  const labelsText = pull.labels.length ? ` Labels: ${pull.labels.join(", ")}.` : "";
+  return `#${pull.number} ${pull.title}. Files: ${formatProofFileList(pull.filePaths)}.${headText}${labelsText}${bodyText}`;
+}
+
+function supersessionReplacementStateText(
+  replacement: Pick<HydratedSupersessionPullRequest, "mergedAt">,
+): string {
+  return replacement.mergedAt
+    ? `merged at ${replacement.mergedAt}`
+    : "still open as the candidate replacement";
+}
+
+function linkOnlySupersessionProof(options: {
+  source: HydratedSupersessionPullRequest;
+  replacementNumber: number;
+  replacement?: HydratedSupersessionPullRequest;
+  securityBlocked: boolean;
+  reason: string;
+  decision?: SupersessionProofDecision;
+  coveredWork?: string[];
+  uniqueSourceWork?: string[];
+}): SupersessionProof {
+  return {
+    sourceSummary: summarizeSupersessionPullRequest(options.source),
+    replacementSummary: options.replacement
+      ? summarizeSupersessionPullRequest(options.replacement)
+      : `#${options.replacementNumber} could not be hydrated from GitHub.`,
+    coveredWork: options.coveredWork ?? [],
+    uniqueSourceWork: options.uniqueSourceWork ?? options.source.filePaths,
+    securityBlocked: options.securityBlocked,
+    decision: options.decision ?? "link_only",
+    reason: options.reason,
+    replacementUrl: options.replacement?.url ?? pullRequestUrlForNumber(options.replacementNumber),
+    replacementStateText: options.replacement
+      ? supersessionReplacementStateText(options.replacement)
+      : "candidate replacement",
+  };
+}
+
+function supersessionSignalSnippets(
+  markdown: string,
+  currentNumber: number,
+  linkedNumber: number,
+): string[] {
+  const texts = [
+    ...frontMatterStringArray(markdown, "work_cluster_refs"),
+    ...mergeRiskOptionsFromReport(markdown).flatMap((option) => [option.title, option.body]),
+    reviewSectionValue(markdown, "bestSolution"),
+    reviewSectionValue(markdown, "evidence"),
+  ];
+  return texts
+    .filter((text) => textHasLinkedPullRequest(text, currentNumber, linkedNumber))
+    .map((text) => compactProofText(text, 500))
+    .filter(Boolean)
+    .slice(0, 4);
+}
+
+function buildSupersessionProofPrompt(options: {
+  source: HydratedSupersessionPullRequest;
+  replacement: HydratedSupersessionPullRequest;
+  reportMarkdown: string;
+}): string {
+  return [
+    supersessionProofPromptTemplate().trimEnd(),
+    "",
+    "Candidate report signal snippets:",
+    "```json",
+    JSON.stringify(
+      supersessionSignalSnippets(
+        options.reportMarkdown,
+        options.source.number,
+        options.replacement.number,
+      ),
+      null,
+      2,
+    ),
+    "```",
+    "",
+    "Compact hydrated PR context:",
+    "```json",
+    JSON.stringify(
+      {
+        sourcePrA: compactSupersessionProofView(options.source),
+        replacementPrB: compactSupersessionProofView(options.replacement),
+      },
+      null,
+      2,
+    ),
+    "```",
+  ].join("\n");
+}
+
+function runSupersessionProofModel(options: {
+  source: HydratedSupersessionPullRequest;
+  replacement: HydratedSupersessionPullRequest;
+  markdown: string;
+  runtime: SupersessionProofRuntime;
+}): SupersessionProofModelResult {
+  ensureDir(options.runtime.workDir);
+  const prefix = `${options.source.number}-${options.replacement.number}`;
+  const promptPath = join(options.runtime.workDir, `${prefix}.prompt.md`);
+  const outputPath = join(options.runtime.workDir, `${prefix}.json`);
+  const prompt = buildSupersessionProofPrompt({
+    source: options.source,
+    replacement: options.replacement,
+    reportMarkdown: options.markdown,
+  });
+  writeFileSync(promptPath, prompt, "utf8");
+  const codexConfig = [
+    `model_reasoning_effort="${options.runtime.reasoningEffort}"`,
+    'forced_login_method="api"',
+    'approval_policy="never"',
+  ];
+  if (options.runtime.serviceTier) {
+    codexConfig.splice(1, 0, `service_tier="${options.runtime.serviceTier}"`);
+  }
+  const result = spawnSync(
+    "codex",
+    [
+      "exec",
+      "-m",
+      options.runtime.model,
+      ...codexConfig.flatMap((config) => ["-c", config]),
+      "-C",
+      ROOT,
+      "--output-schema",
+      CLAWSWEEPER_SUPERSESSION_PROOF_SCHEMA_PATH,
+      "--output-last-message",
+      outputPath,
+      "--sandbox",
+      options.runtime.sandboxMode,
+      "-",
+    ],
+    {
+      cwd: ROOT,
+      encoding: "utf8",
+      env: codexEnv({ ghToken: process.env.CLAWSWEEPER_PROOF_INSPECTION_TOKEN }),
+      input: prompt,
+      maxBuffer: 64 * 1024 * 1024,
+      timeout: options.runtime.timeoutMs,
+    },
+  );
+  if (result.error) {
+    throw new Error(
+      `Codex supersession proof failed for #${options.source.number}: ${
+        result.error.message
+      }\n${safeOutputTail(result.stderr) || safeOutputTail(result.stdout) || "No output."}`,
+    );
+  }
+  if (result.status !== 0) {
+    throw new Error(
+      `Codex supersession proof failed for #${options.source.number} with exit ${
+        result.status ?? "unknown"
+      }.\n${safeOutputTail(result.stderr) || safeOutputTail(result.stdout) || "No output."}`,
+    );
+  }
+  if (!existsSync(outputPath)) {
+    throw new Error(`Codex supersession proof did not write ${outputPath}.`);
+  }
+  return normalizedSupersessionProofModelResult(
+    parseSupersessionProofModelResult(JSON.parse(readFileSync(outputPath, "utf8").trim())),
+  );
+}
+
+function supersessionProof(options: {
+  markdown: string;
+  item: Item;
+  context: ItemContext;
+  linkedNumber: number;
+  runtime: SupersessionProofRuntime;
+}): SupersessionProof {
+  const source = hydratedSourceSupersessionPullRequest(options.item, options.context);
+  const securityBlocked = sourcePullRequestHasSecuritySignal(
+    options.item,
+    options.context,
+    options.markdown,
+  );
+  let replacement: HydratedSupersessionPullRequest;
+  try {
+    replacement = hydrateReplacementSupersessionPullRequest(options.linkedNumber);
+  } catch {
+    return linkOnlySupersessionProof({
+      source,
+      replacementNumber: options.linkedNumber,
+      securityBlocked,
+      reason: "replacement PR context could not be fetched",
+    });
+  }
+
+  if (securityBlocked) {
+    return linkOnlySupersessionProof({
+      source,
+      replacement,
+      replacementNumber: options.linkedNumber,
+      securityBlocked,
+      reason: "source PR has security-sensitive labels, comments, or advisory markers",
+    });
+  }
+
+  if (source.filesTruncated || replacement.filesTruncated) {
+    return linkOnlySupersessionProof({
+      source,
+      replacement,
+      replacementNumber: options.linkedNumber,
+      securityBlocked,
+      reason: "source or replacement file context is truncated",
+    });
+  }
+
+  if (source.filePaths.length === 0 || replacement.filePaths.length === 0) {
+    return linkOnlySupersessionProof({
+      source,
+      replacement,
+      replacementNumber: options.linkedNumber,
+      securityBlocked,
+      reason: "source or replacement file context is missing",
+    });
+  }
+
+  let modelProof: SupersessionProofModelResult;
+  try {
+    modelProof = runSupersessionProofModel({
+      source,
+      replacement,
+      markdown: options.markdown,
+      runtime: options.runtime,
+    });
+  } catch (error) {
+    return linkOnlySupersessionProof({
+      source,
+      replacement,
+      replacementNumber: options.linkedNumber,
+      securityBlocked,
+      reason: `model supersession proof failed: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    });
+  }
+
+  if (modelProof.securityBlocked) {
+    modelProof = {
+      ...modelProof,
+      decision: "keep_open",
+      reason: modelProof.reason || "model found source PR security-sensitive context",
+    };
+  }
+
+  return {
+    sourceSummary: modelProof.sourceSummary,
+    replacementSummary: modelProof.replacementSummary,
+    coveredWork: modelProof.coveredWork,
+    uniqueSourceWork: modelProof.uniqueSourceWork,
+    securityBlocked: modelProof.securityBlocked,
+    decision: modelProof.decision === "superseded" ? "close" : "keep_open",
+    reason: modelProof.reason,
+    replacementUrl: replacement.url,
+    replacementStateText: supersessionReplacementStateText(replacement),
+  };
+}
+
 function recommendedPauseOrCloseOption(markdown: string): MergeRiskOption | null {
   return (
     mergeRiskOptionsFromReport(markdown).find(
@@ -10034,20 +10449,33 @@ function pauseOrClosePromotion(
 function linkedPullRequestSupersessionPromotion(
   markdown: string,
   item: Item,
-): PullRequestClosePromotion | null {
+  context: ItemContext,
+  runtime: SupersessionProofRuntime,
+): { candidateFound: boolean; promotion: PullRequestClosePromotion | null } {
   const linkedPull = linkedPullRequestSupersession(markdown, item);
-  if (!linkedPull) return null;
-  const stateText = linkedPull.mergedAt
-    ? `merged at ${linkedPull.mergedAt}`
-    : "still open as the canonical replacement";
+  if (!linkedPull) return { candidateFound: false, promotion: null };
+  const proof = supersessionProof({
+    markdown,
+    item,
+    context,
+    linkedNumber: linkedPull.number,
+    runtime,
+  });
+  if (proof.decision !== "close") return { candidateFound: true, promotion: null };
   return {
-    bestSolution: `Close this PR as superseded by ${linkedPull.url}.`,
-    evidence: [
-      `- **linked superseding PR:** ${linkedPull.url} (${linkedPull.title}) is ${stateText}.`,
-      "- **cluster evidence:** the durable review links that PR in the work cluster or recommended risk path.",
-      "- **no human follow-up:** live comments and timeline hydrated by apply contain no non-automation activity after the ClawSweeper review.",
-    ].join("\n"),
-    closeComment: `Thanks for the contribution. I’m closing this PR as superseded by ${linkedPull.url}, which is ${stateText}.`,
+    candidateFound: true,
+    promotion: {
+      bestSolution: `Close this PR as superseded by ${proof.replacementUrl}.`,
+      evidence: [
+        `- **source PR work:** ${proof.sourceSummary}`,
+        `- **replacement PR work:** ${proof.replacementSummary}`,
+        `- **coverage proof:** ${proof.reason}.\n${formatProofDetailList(proof.coveredWork)}`,
+        "- **unique source work:** none. PR A has no unique hydrated behavior, file, or proof that needs separate review.",
+        `- **linked superseding PR:** ${proof.replacementUrl} is ${proof.replacementStateText}.`,
+        "- **no human follow-up:** live comments and timeline hydrated by apply contain no non-automation activity after the ClawSweeper review.",
+      ].join("\n"),
+      closeComment: `Thanks for the contribution. I’m closing this PR as superseded by ${proof.replacementUrl}, which is ${proof.replacementStateText}.`,
+    },
   };
 }
 
@@ -10056,14 +10484,21 @@ function pullRequestClosePromotion(
   item: Item,
   context: ItemContext,
   staleMinAgeDays: number,
+  runtime: SupersessionProofRuntime,
 ): PullRequestClosePromotion | null {
   if (item.kind !== "pull_request") return null;
   if (frontMatterValue(markdown, "decision") !== "keep_open") return null;
   if (frontMatterValue(markdown, "action_taken") !== "kept_open") return null;
   if (frontMatterValue(markdown, "review_status") !== "complete") return null;
   if (closePromotionHasNonAutomationActivityAfterReview(markdown, context)) return null;
+  const linkedSupersession = linkedPullRequestSupersessionPromotion(
+    markdown,
+    item,
+    context,
+    runtime,
+  );
+  if (linkedSupersession.candidateFound) return linkedSupersession.promotion;
   return (
-    linkedPullRequestSupersessionPromotion(markdown, item) ??
     pauseOrClosePromotion(markdown, item, staleMinAgeDays) ??
     staleFRatedPullRequestPromotion(markdown, item, staleMinAgeDays)
   );
@@ -12690,6 +13125,15 @@ async function applyDecisionsCommand(args: Args): Promise<void> {
   const commentSyncMinAgeDays = numberArg(args.comment_sync_min_age_days, 0);
   const maxRuntimeMs = numberArg(args.max_runtime_ms, 0);
   const reportPath = resolve(stringArg(args.report_path, join(ROOT, "apply-report.json")));
+  const artifactDir = resolve(stringArg(args.artifact_dir, join(ROOT, "artifacts", "apply")));
+  const supersessionProofRuntime: SupersessionProofRuntime = {
+    model: stringArg(args.codex_model, DEFAULT_CODEX_MODEL),
+    reasoningEffort: stringArg(args.codex_reasoning_effort, DEFAULT_REASONING_EFFORT),
+    sandboxMode: stringArg(args.codex_sandbox, "read-only"),
+    serviceTier: stringArg(args.codex_service_tier, DEFAULT_SERVICE_TIER),
+    timeoutMs: numberArg(args.codex_timeout_ms, 600_000),
+    workDir: join(artifactDir, "supersession-proof"),
+  };
   const startedAtMs = Date.now();
   const requestedItemNumbers = itemNumbersArg(args.item_numbers, args.item_number);
   const requestedItemNumberSet = new Set(requestedItemNumbers);
@@ -13143,6 +13587,7 @@ async function applyDecisionsCommand(args: Args): Promise<void> {
         item,
         promotionContext,
         staleMinAgeDays,
+        supersessionProofRuntime,
       );
       if (promotion) {
         markdown = upgradePullRequestClosePromotionReport(

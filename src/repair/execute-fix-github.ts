@@ -8,6 +8,7 @@ import { runCommand as run } from "./command-runner.js";
 import { parsePullRequestUrl } from "./github-ref.js";
 import { repoRoot } from "./lib.js";
 import { repairGhEnv as ghEnv } from "./process-env.js";
+import { hasDeterministicSecuritySignal, hasSecuritySignalText } from "./security-signals.js";
 import { uniqueStrings } from "./validation-command-utils.js";
 import { closingReferencesFromMarkdown } from "./external-messages.js";
 
@@ -42,7 +43,15 @@ export function fetchSourcePullRequestView({
   return JSON.parse(
     run(
       "gh",
-      ["pr", "view", String(number), "--repo", repo, "--json", "author,state,mergedAt,title,url"],
+      [
+        "pr",
+        "view",
+        String(number),
+        "--repo",
+        repo,
+        "--json",
+        "author,state,mergedAt,title,url,body,labels,comments,files,headRefOid,updatedAt",
+      ],
       {
         cwd: targetDir,
         env: ghEnv(),
@@ -50,6 +59,19 @@ export function fetchSourcePullRequestView({
       },
     ),
   );
+}
+
+export function sourcePullRequestSecurityBlockReason(view: LooseRecord): string {
+  if (
+    hasDeterministicSecuritySignal({
+      labels: view.labels ?? [],
+      comments: view.comments ?? [],
+    }) ||
+    hasSecuritySignalText(view.title ?? "", view.body ?? "")
+  ) {
+    return "security-sensitive source PR requires maintainer security review";
+  }
+  return "";
 }
 
 export function sourceClosingReferences({

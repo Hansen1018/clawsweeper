@@ -5120,15 +5120,21 @@ function stalePullRequestReport(overrides = {}) {
 function promotionGhMock(options: {
   number: number;
   title?: string;
+  body?: string;
   itemCreatedAt?: string;
   itemUpdatedAt?: string;
   issueCommentCount?: number;
   comment: string;
   comments?: unknown[];
+  labels?: string[];
+  pullFiles?: unknown[];
   timeline?: unknown[];
   linkedPulls?: Record<number, unknown>;
+  linkedIssues?: Record<number, unknown>;
+  linkedPullFiles?: Record<number, unknown[]>;
 }) {
   const title = options.title ?? "Stale F PR";
+  const body = options.body ?? "Stale PR body.";
   const itemCreatedAt = options.itemCreatedAt ?? "2026-02-01T00:00:00Z";
   const itemUpdatedAt = options.itemUpdatedAt ?? "2026-05-01T00:00:00Z";
   const comments = options.comments ?? [
@@ -5143,19 +5149,27 @@ function promotionGhMock(options: {
       body: options.comment,
     },
   ];
+  const labels = options.labels ?? ["status: 📣 needs proof"];
+  const pullFiles = options.pullFiles ?? [];
   const issueCommentCount = options.issueCommentCount ?? comments.length;
   const timeline = options.timeline ?? [];
   const linkedPulls = options.linkedPulls ?? {};
+  const linkedIssues = options.linkedIssues ?? {};
+  const pullFilesByNumber = { [options.number]: pullFiles, ...options.linkedPullFiles };
   return `
 const rawArgs = process.argv.slice(2);
 const args = rawArgs[0] === "--repo" ? rawArgs.slice(2) : rawArgs;
 const path = args[1] || "";
 const slurp = args.includes("--slurp");
 const comments = ${JSON.stringify(comments)};
+const labels = ${JSON.stringify(labels)};
 const timeline = ${JSON.stringify(timeline)};
 const linkedPulls = ${JSON.stringify(linkedPulls)};
+const linkedIssues = ${JSON.stringify(linkedIssues)};
+const pullFilesByNumber = ${JSON.stringify(pullFilesByNumber)};
 const number = ${options.number};
 const title = ${JSON.stringify(title)};
+const body = ${JSON.stringify(body)};
 const itemCreatedAt = ${JSON.stringify(itemCreatedAt)};
 const itemUpdatedAt = ${JSON.stringify(itemUpdatedAt)};
 const issueCommentCount = ${issueCommentCount};
@@ -5170,7 +5184,7 @@ if (args[0] === "api" && args[1] === "-i" && new RegExp("/issues/" + number + "/
     number,
     title,
     html_url: "https://github.com/openclaw/openclaw/pull/" + number,
-    body: "Stale PR body.",
+    body,
     created_at: itemCreatedAt,
     updated_at: itemUpdatedAt,
     closed_at: null,
@@ -5179,10 +5193,17 @@ if (args[0] === "api" && args[1] === "-i" && new RegExp("/issues/" + number + "/
     active_lock_reason: null,
     author_association: "CONTRIBUTOR",
     user: { login: "reporter" },
-    labels: ["status: 📣 needs proof"],
+    labels,
     comments: issueCommentCount,
     pull_request: { url: "https://api.github.com/repos/openclaw/openclaw/pulls/" + number }
   }));
+} else if (args[0] === "api" && /\\/issues\\/(\\d+)$/.test(path)) {
+  const linkedNumber = Number((path.match(/\\/issues\\/(\\d+)$/) || [])[1]);
+  if (!linkedIssues[linkedNumber]) {
+    console.error("unexpected linked issue", linkedNumber);
+    process.exit(1);
+  }
+  console.log(JSON.stringify(linkedIssues[linkedNumber]));
 } else if (args[0] === "api" && new RegExp("/pulls/" + number + "$").test(path)) {
   console.log(JSON.stringify({
     number,
@@ -5192,11 +5213,14 @@ if (args[0] === "api" && args[1] === "-i" && new RegExp("/issues/" + number + "/
     changed_files: 2,
     commits: 1,
     review_comments: 0,
-    body: "Stale PR body.",
+    body,
     head: { sha: "head-sha", ref: "branch", repo: { full_name: "fork/openclaw" } },
     base: { sha: "base-sha", ref: "main", repo: { full_name: "openclaw/openclaw" } },
     user: { login: "reporter" }
   }));
+} else if (args[0] === "api" && /\\/pulls\\/(\\d+)\\/files(?:\\?|$)/.test(path)) {
+  const pullNumber = Number((path.match(/\\/pulls\\/(\\d+)\\/files/) || [])[1]);
+  console.log(JSON.stringify(pullFilesByNumber[pullNumber] || []));
 } else if (args[0] === "api" && /\\/pulls\\/(\\d+)$/.test(path)) {
   const linkedNumber = Number((path.match(/\\/pulls\\/(\\d+)$/) || [])[1]);
   if (!linkedPulls[linkedNumber]) {
@@ -5204,8 +5228,12 @@ if (args[0] === "api" && args[1] === "-i" && new RegExp("/issues/" + number + "/
     process.exit(1);
   }
   console.log(JSON.stringify(linkedPulls[linkedNumber]));
-} else if (args[0] === "api" && new RegExp("/pulls/" + number + "/(files|commits|comments)(?:\\\\?|$)").test(path)) {
-  console.log(JSON.stringify([[]]));
+} else if (args[0] === "api" && new RegExp("/pulls/" + number + "/(commits|comments)(?:\\\\?|$)").test(path)) {
+  console.log(JSON.stringify([]));
+} else if (args[0] === "api" && /\\/issues\\/comments\\/\\d+$/.test(path)) {
+  console.log(JSON.stringify({ id: 9000 + number }));
+} else if (args[0] === "pr" && (args[1] === "close" || args[1] === "comment")) {
+  console.log("");
 } else if (args[0] === "label" || args[0] === "issue") {
   console.log("");
 } else {
@@ -5264,6 +5292,37 @@ function withMockGh(root: string, script: string, run: () => void): void {
     else process.env.GH_BIN = originalGhBin;
     if (originalGhBinArgs === undefined) delete process.env.GH_BIN_ARGS;
     else process.env.GH_BIN_ARGS = originalGhBinArgs;
+  }
+}
+
+function withMockSupersessionProof(root: string, proof: unknown, run: () => void): void {
+  const binDir = join(root, "bin");
+  const codexPath = join(binDir, "codex");
+  const promptsPath = join(root, "codex-prompts.jsonl");
+  mkdirSync(binDir, { recursive: true });
+  writeFileSync(
+    codexPath,
+    `#!/usr/bin/env node
+const fs = require("node:fs");
+const outputIndex = process.argv.indexOf("--output-last-message");
+if (outputIndex === -1) process.exit(2);
+const input = fs.readFileSync(0, "utf8");
+fs.appendFileSync(${JSON.stringify(promptsPath)}, JSON.stringify({ args: process.argv.slice(2), input }) + "\\n");
+fs.writeFileSync(process.argv[outputIndex + 1], process.env.CLAWSWEEPER_SUPERSESSION_PROOF_JSON);
+`,
+  );
+  chmodSync(codexPath, 0o755);
+  const originalPath = process.env.PATH;
+  const originalProof = process.env.CLAWSWEEPER_SUPERSESSION_PROOF_JSON;
+  try {
+    process.env.PATH = `${binDir}${delimiter}${process.env.PATH ?? ""}`;
+    process.env.CLAWSWEEPER_SUPERSESSION_PROOF_JSON = JSON.stringify(proof);
+    run();
+  } finally {
+    if (originalPath === undefined) delete process.env.PATH;
+    else process.env.PATH = originalPath;
+    if (originalProof === undefined) delete process.env.CLAWSWEEPER_SUPERSESSION_PROOF_JSON;
+    else process.env.CLAWSWEEPER_SUPERSESSION_PROOF_JSON = originalProof;
   }
 }
 
@@ -7807,6 +7866,8 @@ test("apply-decisions promotes PRs superseded by linked pull requests", () => {
     const reportPath = join(root, "apply-report.json");
     mkdirSync(itemsDir, { recursive: true });
     mkdirSync(plansDir, { recursive: true });
+    const sourceBody = `${"source useful activity fix. ".repeat(10)}SOURCE_BODY_TAIL`;
+    const replacementBody = `${"replacement activity fix. ".repeat(10)}REPLACEMENT_BODY_TAIL`;
     const synced = reportWithSyncedReviewComment(
       stalePullRequestReport({
         number: 332,
@@ -7822,17 +7883,146 @@ test("apply-decisions promotes PRs superseded by linked pull requests", () => {
     );
     writeFileSync(join(itemsDir, "332.md"), synced.report, "utf8");
 
+    withMockSupersessionProof(
+      root,
+      {
+        sourceSummary: "PR A fixes the stale activity route in src/activity.ts.",
+        replacementSummary:
+          "PR B fixes the same activity route and adds replacement proof around it.",
+        coveredWork: ["PR B includes the activity route fix that PR A proposed."],
+        uniqueSourceWork: [],
+        securityBlocked: false,
+        decision: "superseded",
+        reason: "PR B covers PR A's useful behavior and PR A has no unique remaining work.",
+      },
+      () => {
+        withMockGh(
+          root,
+          promotionGhMock({
+            number: 332,
+            title: "Old activity PR",
+            body: sourceBody,
+            comment: synced.comment,
+            linkedPulls: {
+              400: {
+                number: 400,
+                title: "Canonical activity PR",
+                html_url: "https://github.com/openclaw/openclaw/pull/400",
+                state: "open",
+                merged_at: null,
+                body: replacementBody,
+                changed_files: 1,
+                head: { sha: "replacement-head-sha" },
+                updated_at: "2026-05-21T00:00:00Z",
+              },
+            },
+            linkedIssues: {
+              400: {
+                number: 400,
+                title: "Canonical activity PR",
+                html_url: "https://github.com/openclaw/openclaw/pull/400",
+                body: replacementBody,
+                updated_at: "2026-05-21T00:00:00Z",
+                labels: [],
+              },
+            },
+            pullFiles: [
+              { filename: "src/activity.ts", status: "modified", patch: "@@\n+fixActivity();" },
+            ],
+            linkedPullFiles: {
+              400: [
+                {
+                  filename: "src/activity.ts",
+                  status: "modified",
+                  patch: "@@\n+fixActivity();\n+addReplacementProof();",
+                },
+              ],
+            },
+          }),
+          () => {
+            runApplyDecisionsForTest({
+              itemsDir,
+              closedDir,
+              plansDir,
+              reportPath,
+              extraArgs: [
+                "--target-repo",
+                "openclaw/openclaw",
+                "--apply-kind",
+                "all",
+                "--processed-limit",
+                "3",
+              ],
+            });
+          },
+        );
+      },
+    );
+
+    const report = JSON.parse(readFileSync(reportPath, "utf8")) as Array<{
+      action: string;
+      reason: string;
+    }>;
+    assert.equal(
+      report.some((entry) => entry.action === "closed"),
+      true,
+    );
+    assert.match(
+      report.find((entry) => entry.action === "closed")?.reason ?? "",
+      /duplicate or superseded/,
+    );
+    assert.match(
+      readFileSync(join(closedDir, "332.md"), "utf8"),
+      /PR A has no unique hydrated behavior, file, or proof that needs separate review/,
+    );
+    const proofPrompt = readFileSync(join(root, "codex-prompts.jsonl"), "utf8");
+    assert.match(proofPrompt, /src\/activity\.ts/);
+    assert.match(proofPrompt, /source useful activity fix/);
+    assert.match(proofPrompt, /replacement activity fix/);
+    assert.doesNotMatch(proofPrompt, /SOURCE_BODY_TAIL/);
+    assert.doesNotMatch(proofPrompt, /REPLACEMENT_BODY_TAIL/);
+    assert.doesNotMatch(proofPrompt, /\[truncated/);
+    assert.doesNotMatch(proofPrompt, /fixActivity/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("apply-decisions keeps PRs open when linked supersession proof is incomplete", () => {
+  const root = mkdtempSync(tmpPrefix);
+  try {
+    const itemsDir = join(root, "items");
+    const closedDir = join(root, "closed");
+    const plansDir = join(root, "plans");
+    const reportPath = join(root, "apply-report.json");
+    mkdirSync(itemsDir, { recursive: true });
+    mkdirSync(plansDir, { recursive: true });
+    const synced = reportWithSyncedReviewComment(
+      stalePullRequestReport({
+        number: 335,
+        title: "Older auth PR",
+        pr_rating_overall: "D",
+        pr_rating_proof: "D",
+        work_cluster_refs: JSON.stringify([
+          "Superseded by https://github.com/openclaw/openclaw/pull/405",
+        ]),
+      }),
+      335,
+      "none",
+    );
+    writeFileSync(join(itemsDir, "335.md"), synced.report, "utf8");
+
     withMockGh(
       root,
       promotionGhMock({
-        number: 332,
-        title: "Old activity PR",
+        number: 335,
+        title: "Older auth PR",
         comment: synced.comment,
         linkedPulls: {
-          400: {
-            number: 400,
-            title: "Canonical activity PR",
-            html_url: "https://github.com/openclaw/openclaw/pull/400",
+          405: {
+            number: 405,
+            title: "Newer auth PR",
+            html_url: "https://github.com/openclaw/openclaw/pull/405",
             state: "open",
             merged_at: null,
           },
@@ -7857,17 +8047,312 @@ test("apply-decisions promotes PRs superseded by linked pull requests", () => {
       },
     );
 
-    const report = JSON.parse(readFileSync(reportPath, "utf8")) as Array<{
-      action: string;
-      reason: string;
-    }>;
+    const report = JSON.parse(readFileSync(reportPath, "utf8")) as Array<{ action: string }>;
     assert.equal(
       report.some((entry) => entry.action === "closed"),
-      true,
+      false,
     );
-    assert.match(
-      report.find((entry) => entry.action === "closed")?.reason ?? "",
-      /duplicate or superseded/,
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("apply-decisions keeps PRs open when model proof says same-file supersession is incomplete", () => {
+  const root = mkdtempSync(tmpPrefix);
+  try {
+    const itemsDir = join(root, "items");
+    const closedDir = join(root, "closed");
+    const plansDir = join(root, "plans");
+    const reportPath = join(root, "apply-report.json");
+    mkdirSync(itemsDir, { recursive: true });
+    mkdirSync(plansDir, { recursive: true });
+    const synced = reportWithSyncedReviewComment(
+      stalePullRequestReport({
+        number: 338,
+        title: "Older activity PR",
+        pr_rating_overall: "D",
+        pr_rating_proof: "D",
+        work_cluster_refs: JSON.stringify([
+          "Superseded by https://github.com/openclaw/openclaw/pull/408",
+        ]),
+      }),
+      338,
+      "none",
+    );
+    writeFileSync(join(itemsDir, "338.md"), synced.report, "utf8");
+
+    withMockSupersessionProof(
+      root,
+      {
+        sourceSummary: "PR A fixes activity by calling fixActivity.",
+        replacementSummary: "PR B changes the same file but uses differentFix for another path.",
+        coveredWork: [],
+        uniqueSourceWork: ["PR A's fixActivity behavior is not shown in PR B."],
+        securityBlocked: false,
+        decision: "keep_open",
+        reason: "The file overlap is not enough to prove PR B covers PR A.",
+      },
+      () => {
+        withMockGh(
+          root,
+          promotionGhMock({
+            number: 338,
+            title: "Older activity PR",
+            comment: synced.comment,
+            linkedPulls: {
+              408: {
+                number: 408,
+                title: "Different activity PR",
+                html_url: "https://github.com/openclaw/openclaw/pull/408",
+                state: "open",
+                merged_at: null,
+                body: "Supersedes #338.",
+                changed_files: 1,
+                head: { sha: "replacement-head-sha" },
+                updated_at: "2026-05-21T00:00:00Z",
+              },
+            },
+            linkedIssues: {
+              408: {
+                number: 408,
+                title: "Different activity PR",
+                html_url: "https://github.com/openclaw/openclaw/pull/408",
+                body: "Supersedes #338.",
+                updated_at: "2026-05-21T00:00:00Z",
+                labels: [],
+              },
+            },
+            pullFiles: [
+              { filename: "src/activity.ts", status: "modified", patch: "@@\n+fixActivity();" },
+            ],
+            linkedPullFiles: {
+              408: [
+                { filename: "src/activity.ts", status: "modified", patch: "@@\n+differentFix();" },
+              ],
+            },
+          }),
+          () => {
+            runApplyDecisionsForTest({
+              itemsDir,
+              closedDir,
+              plansDir,
+              reportPath,
+              extraArgs: [
+                "--target-repo",
+                "openclaw/openclaw",
+                "--dry-run",
+                "--apply-kind",
+                "all",
+                "--processed-limit",
+                "3",
+              ],
+            });
+          },
+        );
+      },
+    );
+
+    const report = JSON.parse(readFileSync(reportPath, "utf8")) as Array<{ action: string }>;
+    assert.equal(
+      report.some((entry) => entry.action === "closed"),
+      false,
+    );
+    const proofPrompt = readFileSync(join(root, "codex-prompts.jsonl"), "utf8");
+    assert.match(proofPrompt, /src\/activity\.ts/);
+    assert.doesNotMatch(proofPrompt, /differentFix/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("apply-decisions keeps security-labeled PRs open when linked PRs may supersede them", () => {
+  const root = mkdtempSync(tmpPrefix);
+  try {
+    const itemsDir = join(root, "items");
+    const closedDir = join(root, "closed");
+    const plansDir = join(root, "plans");
+    const reportPath = join(root, "apply-report.json");
+    mkdirSync(itemsDir, { recursive: true });
+    mkdirSync(plansDir, { recursive: true });
+    const synced = reportWithSyncedReviewComment(
+      stalePullRequestReport({
+        number: 336,
+        title: "Older security PR",
+        labels: JSON.stringify(["security"]),
+        pr_rating_overall: "D",
+        pr_rating_proof: "D",
+        work_cluster_refs: JSON.stringify([
+          "Superseded by https://github.com/openclaw/openclaw/pull/406",
+        ]),
+      }),
+      336,
+      "none",
+    );
+    writeFileSync(join(itemsDir, "336.md"), synced.report, "utf8");
+
+    withMockGh(
+      root,
+      promotionGhMock({
+        number: 336,
+        title: "Older security PR",
+        labels: ["security"],
+        comment: synced.comment,
+        linkedPulls: {
+          406: {
+            number: 406,
+            title: "Newer security PR",
+            html_url: "https://github.com/openclaw/openclaw/pull/406",
+            state: "open",
+            merged_at: null,
+            body: "Supersedes #336 by carrying the same security fix.",
+            changed_files: 1,
+            head: { sha: "replacement-head-sha" },
+            updated_at: "2026-05-21T00:00:00Z",
+          },
+        },
+        linkedIssues: {
+          406: {
+            number: 406,
+            title: "Newer security PR",
+            html_url: "https://github.com/openclaw/openclaw/pull/406",
+            body: "Supersedes #336 by carrying the same security fix.",
+            updated_at: "2026-05-21T00:00:00Z",
+            labels: [],
+          },
+        },
+        pullFiles: [{ filename: "src/auth.ts", status: "modified", patch: "@@\n+fixAuth();" }],
+        linkedPullFiles: {
+          406: [{ filename: "src/auth.ts", status: "modified", patch: "@@\n+fixAuth();" }],
+        },
+      }),
+      () => {
+        runApplyDecisionsForTest({
+          itemsDir,
+          closedDir,
+          plansDir,
+          reportPath,
+          extraArgs: [
+            "--target-repo",
+            "openclaw/openclaw",
+            "--dry-run",
+            "--apply-kind",
+            "all",
+            "--processed-limit",
+            "3",
+          ],
+        });
+      },
+    );
+
+    const report = JSON.parse(readFileSync(reportPath, "utf8")) as Array<{ action: string }>;
+    assert.equal(
+      report.some((entry) => entry.action === "closed"),
+      false,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("apply-decisions keeps PRs open when comments contain security markers", () => {
+  const root = mkdtempSync(tmpPrefix);
+  try {
+    const itemsDir = join(root, "items");
+    const closedDir = join(root, "closed");
+    const plansDir = join(root, "plans");
+    const reportPath = join(root, "apply-report.json");
+    mkdirSync(itemsDir, { recursive: true });
+    mkdirSync(plansDir, { recursive: true });
+    const synced = reportWithSyncedReviewComment(
+      stalePullRequestReport({
+        number: 337,
+        title: "Older routed PR",
+        pr_rating_overall: "D",
+        pr_rating_proof: "D",
+        work_cluster_refs: JSON.stringify([
+          "Superseded by https://github.com/openclaw/openclaw/pull/407",
+        ]),
+      }),
+      337,
+      "none",
+    );
+    writeFileSync(join(itemsDir, "337.md"), synced.report, "utf8");
+
+    withMockGh(
+      root,
+      promotionGhMock({
+        number: 337,
+        title: "Older routed PR",
+        comment: synced.comment,
+        comments: [
+          {
+            id: 9337,
+            html_url: "https://github.com/openclaw/openclaw/pull/337#issuecomment-9337",
+            created_at: "2026-05-01T01:00:00Z",
+            updated_at: "2026-05-01T01:00:00Z",
+            user: { login: "clawsweeper[bot]" },
+            body: synced.comment,
+          },
+          {
+            id: 9338,
+            html_url: "https://github.com/openclaw/openclaw/pull/337#issuecomment-9338",
+            created_at: "2026-05-01T01:05:00Z",
+            updated_at: "2026-05-01T01:05:00Z",
+            user: { login: "clawsweeper[bot]" },
+            body: "clawsweeper-security:security",
+          },
+        ],
+        linkedPulls: {
+          407: {
+            number: 407,
+            title: "Newer routed PR",
+            html_url: "https://github.com/openclaw/openclaw/pull/407",
+            state: "open",
+            merged_at: null,
+            body: "Supersedes #337 by carrying the same routed fix.",
+            changed_files: 1,
+            head: { sha: "replacement-head-sha" },
+            updated_at: "2026-05-21T00:00:00Z",
+          },
+        },
+        linkedIssues: {
+          407: {
+            number: 407,
+            title: "Newer routed PR",
+            html_url: "https://github.com/openclaw/openclaw/pull/407",
+            body: "Supersedes #337 by carrying the same routed fix.",
+            updated_at: "2026-05-21T00:00:00Z",
+            labels: [],
+          },
+        },
+        pullFiles: [{ filename: "src/router.ts", status: "modified", patch: "@@\n+fixRouter();" }],
+        linkedPullFiles: {
+          407: [{ filename: "src/router.ts", status: "modified", patch: "@@\n+fixRouter();" }],
+        },
+      }),
+      () => {
+        runApplyDecisionsForTest({
+          itemsDir,
+          closedDir,
+          plansDir,
+          reportPath,
+          extraArgs: [
+            "--target-repo",
+            "openclaw/openclaw",
+            "--dry-run",
+            "--apply-kind",
+            "all",
+            "--processed-limit",
+            "3",
+          ],
+        });
+      },
+    );
+
+    const report = JSON.parse(readFileSync(reportPath, "utf8")) as Array<{ action: string }>;
+    assert.equal(
+      report.some((entry) => entry.action === "closed"),
+      false,
     );
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -10153,6 +10638,21 @@ test("review prompt routes PR likely owners through feature history", () => {
   assert.match(prompt, /Do\s+not use `maintainer` as a likely-owner role/);
   assert.match(prompt, /Do not include email\s+addresses in `likelyOwners`/);
   assert.match(prompt, /use names without email addresses/);
+});
+
+test("supersession proof prompt requires general coverage proof", () => {
+  const prompt = readFileSync("prompts/supersession-proof.md", "utf8");
+
+  assert.match(prompt, /Compare the useful work generally/);
+  assert.match(prompt, /You only have two decisions: `superseded` or `keep_open`/);
+  assert.match(prompt, /Do not ask for more context/);
+  assert.match(prompt, /Do not require exact patch-line equality/);
+  assert.match(prompt, /Text such as `supersedes #A` is only a candidate signal/);
+  assert.match(
+    prompt,
+    /PR A has no unique behavior, file concern, proof, discussion, or review point/,
+  );
+  assert.doesNotMatch(prompt, /patchSignature/);
 });
 
 test("review prompt reads maintainer notes before PR diffs", () => {

@@ -111,8 +111,15 @@ import {
   publicContributorCredit,
   sourceClosingReferences,
   sourceContributorCredits,
+  sourcePullRequestSecurityBlockReason,
   supersededReplacementSources,
 } from "./execute-fix-github.js";
+import {
+  compactSupersessionFilePaths,
+  compactSupersessionProofView,
+  parseSupersessionProofModelResult,
+  supersessionProofCloseDecision,
+} from "../supersession-proof.js";
 
 const FIX_ACTIONS = new Set(["fix_needed", "build_fix_artifact", "open_fix_pr"]);
 const NON_EXECUTABLE_REPAIR_STRATEGIES = new Set(["already_fixed_on_main", "needs_human"]);
@@ -156,6 +163,12 @@ const installTargetDeps = process.env.CLAWSWEEPER_INSTALL_TARGET_DEPS !== "0";
 const allowBroadFixArtifacts = process.env.CLAWSWEEPER_ALLOW_BROAD_FIX_ARTIFACTS === "1";
 const closeSupersededSourcePrs = shouldCloseSupersededSourcePrs(
   process.env.CLAWSWEEPER_CLOSE_SUPERSEDED_SOURCE_PRS,
+);
+const replacementCloseoutProofPromptPath = path.join(
+  repoRoot(),
+  "prompts",
+  "repair",
+  "replacement-closeout-proof.md",
 );
 const maxAutonomousFixFiles = Math.max(
   1,
@@ -1727,6 +1740,109 @@ function addLabel(repo: string, number: JsonValue, name: string, targetDir: stri
   });
 }
 
+function replacementCloseoutProofAllowsClose({
+  sourceView,
+  replacementView,
+  sourcePrUrl,
+  replacementPrUrl,
+  provenance,
+}: LooseRecord) {
+  if (!Array.isArray(sourceView.files) || !Array.isArray(replacementView.files)) {
+    return { close: false, reason: "source or replacement PR file context is missing" };
+  }
+  const prompt = [
+    fs.readFileSync(replacementCloseoutProofPromptPath, "utf8").trimEnd(),
+    "",
+    "Hydrated PR context:",
+    "```json",
+    JSON.stringify(
+      {
+        sourcePrA: compactSupersessionProofView({
+          title: sourceView.title,
+          url: sourceView.url,
+          state: sourceView.state,
+          mergedAt: sourceView.mergedAt,
+          body: sourceView.body,
+          labels: sourceView.labels,
+          headRefOid: sourceView.headRefOid,
+          updatedAt: sourceView.updatedAt,
+          filePaths: compactSupersessionFilePaths(sourceView.files),
+        }),
+        replacementPrB: compactSupersessionProofView({
+          title: replacementView.title,
+          url: replacementView.url,
+          state: replacementView.state,
+          mergedAt: replacementView.mergedAt,
+          body: replacementView.body,
+          labels: replacementView.labels,
+          headRefOid: replacementView.headRefOid,
+          updatedAt: replacementView.updatedAt,
+          filePaths: compactSupersessionFilePaths(replacementView.files),
+        }),
+        sourcePrUrl,
+        replacementPrUrl,
+        provenance,
+      },
+      null,
+      2,
+    ),
+    "```",
+  ].join("\n");
+  const proofDir = path.join(workRoot, "replacement-closeout-proof");
+  fs.mkdirSync(proofDir, { recursive: true });
+  const sourceNumber = pullRequestNumberFromUrl(String(sourcePrUrl));
+  const replacementNumber = pullRequestNumberFromUrl(String(replacementPrUrl));
+  const proofName = `${sourceNumber ?? "source"}-${replacementNumber ?? "replacement"}`;
+  const promptPath = path.join(proofDir, `${proofName}.prompt.md`);
+  const outputPath = path.join(proofDir, `${proofName}.json`);
+  fs.writeFileSync(promptPath, prompt);
+  const child = spawnCodexSyncWithHeartbeat(
+    "replacement closeout proof",
+    [
+      "exec",
+      "-m",
+      model,
+      "--sandbox",
+      codexReviewSandbox,
+      ...codexReviewSandboxConfigArgs(),
+      ...codexConfigArgs(),
+      "-C",
+      targetDir,
+      "--output-schema",
+      path.join(repoRoot(), "schema", "clawsweeper-supersession-proof.schema.json"),
+      "--output-last-message",
+      outputPath,
+      "-",
+    ],
+    {
+      cwd: targetDir,
+      encoding: "utf8",
+      env: codexEnv(),
+      input: prompt,
+      maxBuffer: codexStdioMaxBuffer,
+      timeout: currentCodexTimeoutMs(),
+    },
+  );
+  if (child.error) {
+    return { close: false, reason: `replacement closeout proof failed: ${child.error.message}` };
+  }
+  if (child.status !== 0) {
+    return { close: false, reason: "replacement closeout proof failed" };
+  }
+  if (!fs.existsSync(outputPath)) {
+    return { close: false, reason: "replacement closeout proof did not produce output" };
+  }
+  let proofClose;
+  try {
+    proofClose = supersessionProofCloseDecision(
+      parseSupersessionProofModelResult(JSON.parse(fs.readFileSync(outputPath, "utf8"))),
+    );
+  } catch {
+    return { close: false, reason: "replacement closeout proof output was invalid JSON" };
+  }
+  return proofClose;
+}
+
 function linkReplacementSourcePr({
   source,
   parsed,
@@ -1734,9 +1850,12 @@ function linkReplacementSourcePr({
   targetDir,
   contributorCredits,
   provenance,
+  sourceView,
 }: LooseRecord) {
   const base = { source, pr: `#${parsed.number}`, action: "link_replacement_source" };
-  const view = fetchSourcePullRequestView({ repo: result.repo, number: parsed.number, targetDir });
+  const view =
+    sourceView ??
+    fetchSourcePullRequestView({ repo: result.repo, number: parsed.number, targetDir });
   if (view.mergedAt || view.state === "MERGED") {
     return {
       ...base,
@@ -1783,6 +1902,80 @@ function closeSupersededSourcePr({
   }
   if (view.state === "CLOSED") {
     return { ...base, status: "skipped", reason: "already closed" };
+  }
+  const securityBlock = sourcePullRequestSecurityBlockReason(view);
+  if (securityBlock) {
+    return {
+      ...linkReplacementSourcePr({
+        source,
+        parsed,
+        replacementPrUrl,
+        targetDir,
+        contributorCredits,
+        provenance,
+        sourceView: view,
+      }),
+      reason: securityBlock,
+    };
+  }
+  const replacementNumber = pullRequestNumberFromUrl(String(replacementPrUrl));
+  if (!replacementNumber) {
+    return {
+      ...linkReplacementSourcePr({
+        source,
+        parsed,
+        replacementPrUrl,
+        targetDir,
+        contributorCredits,
+        provenance,
+        sourceView: view,
+      }),
+      reason: "replacement PR context could not be fetched",
+    };
+  }
+  let replacementView: LooseRecord;
+  try {
+    replacementView = fetchSourcePullRequestView({
+      repo: result.repo,
+      number: replacementNumber,
+      targetDir,
+    });
+  } catch (error) {
+    return {
+      ...linkReplacementSourcePr({
+        source,
+        parsed,
+        replacementPrUrl,
+        targetDir,
+        contributorCredits,
+        provenance,
+        sourceView: view,
+      }),
+      reason: `replacement PR context could not be fetched: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    };
+  }
+  const proof = replacementCloseoutProofAllowsClose({
+    sourceView: view,
+    replacementView,
+    sourcePrUrl: source,
+    replacementPrUrl,
+    provenance,
+  });
+  if (!proof.close) {
+    return {
+      ...linkReplacementSourcePr({
+        source,
+        parsed,
+        replacementPrUrl,
+        targetDir,
+        contributorCredits,
+        provenance,
+        sourceView: view,
+      }),
+      reason: proof.reason,
+    };
   }
 
   const comment = replacementSourceCloseComment({

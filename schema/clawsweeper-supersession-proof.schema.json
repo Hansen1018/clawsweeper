@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "sourceSummary",
+    "replacementSummary",
+    "coveredWork",
+    "uniqueSourceWork",
+    "securityBlocked",
+    "decision",
+    "reason"
+  ],
+  "properties": {
+    "sourceSummary": {
+      "type": "string",
+      "description": "Concrete summary of the useful work in PR A."
+    },
+    "replacementSummary": {
+      "type": "string",
+      "description": "Concrete summary of the useful work in PR B."
+    },
+    "coveredWork": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Concrete PR A behavior, file concerns, proof, or review points that PR B covers."
+    },
+    "uniqueSourceWork": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Any PR A work that PR B does not cover and still needs separate review."
+    },
+    "securityBlocked": {
+      "type": "boolean",
+      "description": "True when PR A has security-sensitive context and must not be auto-closed."
+    },
+    "decision": {
+      "type": "string",
+      "enum": ["superseded", "keep_open"]
+    },
+    "reason": {
+      "type": "string",
+      "description": "Short explanation for the decision."
+    }
+  }
+}
