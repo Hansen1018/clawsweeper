@@ -32,7 +32,7 @@
     },
     "securityBlocked": {
       "type": "boolean",
-      "description": "True when PR A has security-sensitive context and must not be auto-closed."
+      "description": "True only when PR A has security-sensitive content that PR B does not prove it covers. Security-sensitive content is not a standalone close blocker when coverage is proven."
     },
     "decision": {
       "type": "string",

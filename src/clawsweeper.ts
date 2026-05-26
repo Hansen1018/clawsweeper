@@ -11791,7 +11791,7 @@ function canClose(decision: Decision): boolean {
 export function validateCloseDecision(
   item: Pick<Item, "kind" | "labels"> & Partial<Pick<Item, "repo">>,
   decision: Decision,
-  options: { requireCloseComment?: boolean } = {},
+  options: { requireCloseComment?: boolean; allowProtectedLabels?: boolean } = {},
 ): { ok: true } | { ok: false; actionTaken: ActionTaken; reason: string } {
   const requireCloseComment = options.requireCloseComment !== false;
   const profile = repositoryProfileFor(item.repo ?? targetRepo());
@@ -11802,7 +11802,10 @@ export function validateCloseDecision(
       reason: "not a close decision",
     };
   }
-  if (applyBlockingProtectedLabels(item.labels, decision.closeReason).length > 0) {
+  if (
+    !options.allowProtectedLabels &&
+    applyBlockingProtectedLabels(item.labels, decision.closeReason).length > 0
+  ) {
     return {
       ok: false,
       actionTaken: "skipped_protected_label",
@@ -13437,6 +13440,7 @@ async function applyDecisionsCommand(args: Args): Promise<void> {
     let currentClosingPullRequests: unknown[] | undefined;
     let clawSweeperLabelsChanged = false;
     let issueAdvisoryLabelsChanged = false;
+    let closeProposalHasSupersessionProof = false;
     const currentItemContext = (): ItemContext => {
       currentContext ??= collectItemContext(item, { fullTimelineForRelations: true });
       return currentContext;
@@ -13451,6 +13455,7 @@ async function applyDecisionsCommand(args: Args): Promise<void> {
           reportDecision(markdown, closeReason),
           {
             requireCloseComment: !isRetryableSkippedClose,
+            allowProtectedLabels: closeProposalHasSupersessionProof,
           },
         ).ok
       ) {
@@ -13704,6 +13709,7 @@ async function applyDecisionsCommand(args: Args): Promise<void> {
         storedHash = itemSnapshotHash(item, promotionContext);
         closeReason = "duplicate_or_superseded";
         isCloseProposal = true;
+        closeProposalHasSupersessionProof = true;
       } else if (promotionResult.checkedLinkedSupersession) {
         markdown = replaceFrontMatterValue(markdown, "apply_checked_at", new Date().toISOString());
         if (!dryRun) writeFileSync(path, markdown, "utf8");
@@ -13824,7 +13830,10 @@ async function applyDecisionsCommand(args: Args): Promise<void> {
         ? issueCommentWithMarker(number, hatchCommentMarker(number))
         : undefined;
     const protectedApplyReason = applyProtectedLabelReason(item.labels, closeReason);
-    if (applyBlockingProtectedLabels(item.labels, closeReason).length > 0) {
+    if (
+      !closeProposalHasSupersessionProof &&
+      applyBlockingProtectedLabels(item.labels, closeReason).length > 0
+    ) {
       if (isCloseProposal) {
         if (markApplySkipped("skipped_protected_label", protectedApplyReason)) break;
       }
@@ -14176,7 +14185,10 @@ async function applyDecisionsCommand(args: Args): Promise<void> {
     const currentReportValidation = validateCloseDecision(
       { repo, kind: item.kind, labels: item.labels },
       reportDecision(markdown, closeReason),
-      { requireCloseComment: !isRetryableSkippedClose },
+      {
+        requireCloseComment: !isRetryableSkippedClose,
+        allowProtectedLabels: closeProposalHasSupersessionProof,
+      },
     );
     if (!currentReportValidation.ok && currentReportValidation.actionTaken !== "kept_open") {
       if (markApplySkipped(currentReportValidation.actionTaken, currentReportValidation.reason))

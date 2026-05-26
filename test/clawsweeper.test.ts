@@ -8852,7 +8852,7 @@ test("apply-decisions keeps PRs open when model proof says same-file supersessio
   }
 });
 
-test("apply-decisions can close security-sensitive labeled PRs when proof covers them", () => {
+test("apply-decisions can close security-labeled PRs when proof covers them", () => {
   const root = mkdtempSync(tmpPrefix);
   try {
     const itemsDir = join(root, "items");
@@ -8865,7 +8865,7 @@ test("apply-decisions can close security-sensitive labeled PRs when proof covers
       stalePullRequestReport({
         number: 336,
         title: "Older security PR",
-        labels: JSON.stringify(["security-sensitive"]),
+        labels: JSON.stringify(["security"]),
         pr_rating_overall: "D",
         pr_rating_proof: "D",
         work_cluster_refs: JSON.stringify([
@@ -8894,7 +8894,7 @@ test("apply-decisions can close security-sensitive labeled PRs when proof covers
           promotionGhMock({
             number: 336,
             title: "Older security PR",
-            labels: ["security-sensitive"],
+            labels: ["security"],
             comment: synced.comment,
             linkedPulls: {
               406: {
@@ -11591,10 +11591,13 @@ test("supersession proof prompt requires general coverage proof", () => {
   assert.match(prompt, /Do not ask for more context/);
   assert.match(prompt, /Do not require exact patch-line equality/);
   assert.match(prompt, /Text such as `supersedes #A` is only a candidate signal/);
+  assert.match(prompt, /Security-sensitive work is not a separate close blocker/);
+  assert.match(prompt, /If PR B proves it covers that content, PR A can be `superseded`/);
   assert.match(
     prompt,
     /PR A has no unique behavior, file concern, proof, discussion, or review point/,
   );
+  assert.doesNotMatch(prompt, /must not be auto-closed/);
   assert.doesNotMatch(prompt, /patchSignature/);
 });
 
