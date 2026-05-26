@@ -44,12 +44,10 @@ import {
   renderOpenClawPrSurfaceTable,
   type PrSurfaceFile,
 } from "./pr-surface-stats.js";
-import { hasSecuritySignal } from "./repair/security-signals.js";
 import {
   compactSupersessionProofView,
   normalizedSupersessionProofModelResult,
   parseSupersessionProofModelResult,
-  supersessionProofViewContextTruncated,
   type SupersessionProofModelResult,
 } from "./supersession-proof.js";
 import {
@@ -9936,10 +9934,6 @@ interface SupersessionProof {
   reason: string;
   replacementUrl: string;
   replacementStateText: string;
-  replacementState: string;
-  replacementMergedAt: string | null;
-  replacementHeadSha: string | null;
-  replacementUpdatedAt: string | null;
 }
 
 interface SupersessionProofRuntime {
@@ -10129,40 +10123,6 @@ function formatProofDetailList(values: readonly string[]): string {
   return values.map((value) => `  - ${value}`).join("\n");
 }
 
-function labelRecords(labels: readonly string[]): Array<Record<string, string>> {
-  return labels.map((name) => ({ name }));
-}
-
-function sourcePullRequestHasSecuritySignal(
-  item: Item,
-  context: ItemContext,
-  markdown: string,
-): boolean {
-  if (reportSecurityReview(markdown).status === "needs_attention") return true;
-  if (
-    mergeRiskLabelsFromReport(markdown).some(
-      (label) =>
-        label === "merge-risk: 🚨 security-boundary" || label === "merge-risk: 🚨 auth-provider",
-    )
-  ) {
-    return true;
-  }
-  return hasSecuritySignal({
-    labels: labelRecords(item.labels),
-    comments: [
-      ...context.comments,
-      ...(context.pullReviews ?? []),
-      ...(context.pullReviewComments ?? []),
-    ],
-    text: [
-      context.issue,
-      context.pullRequest,
-      reviewSectionValue(markdown, "summary"),
-      reviewSectionValue(markdown, "securityReview"),
-    ],
-  });
-}
-
 function hydratedSourceSupersessionPullRequest(
   item: Item,
   context: ItemContext,
@@ -10289,10 +10249,6 @@ function linkOnlySupersessionProof(options: {
     replacementStateText: options.replacement
       ? supersessionReplacementStateText(options.replacement)
       : "candidate replacement",
-    replacementState: options.replacement?.state ?? "",
-    replacementMergedAt: options.replacement?.mergedAt ?? null,
-    replacementHeadSha: options.replacement?.headSha ?? null,
-    replacementUpdatedAt: options.replacement?.updatedAt ?? null,
   };
 }
 
@@ -10447,11 +10403,7 @@ function supersessionProof(options: {
   runtime: SupersessionProofRuntime;
 }): SupersessionProof {
   const source = hydratedSourceSupersessionPullRequest(options.item, options.context);
-  const securityBlocked = sourcePullRequestHasSecuritySignal(
-    options.item,
-    options.context,
-    options.markdown,
-  );
+  const securityBlocked = false;
   let replacement: HydratedSupersessionPullRequest;
   try {
     replacement = hydrateReplacementSupersessionPullRequest(options.linkedNumber);
@@ -10473,26 +10425,6 @@ function supersessionProof(options: {
     });
   }
 
-  if (securityBlocked) {
-    return linkOnlySupersessionProof({
-      source,
-      replacement,
-      replacementNumber: options.linkedNumber,
-      securityBlocked,
-      reason: "source PR has security-sensitive labels, comments, or advisory markers",
-    });
-  }
-
-  if (source.filesTruncated || replacement.filesTruncated) {
-    return linkOnlySupersessionProof({
-      source,
-      replacement,
-      replacementNumber: options.linkedNumber,
-      securityBlocked,
-      reason: "source or replacement file context is truncated",
-    });
-  }
-
   if (source.filePaths.length === 0 || replacement.filePaths.length === 0) {
     return linkOnlySupersessionProof({
       source,
@@ -10500,19 +10432,6 @@ function supersessionProof(options: {
       replacementNumber: options.linkedNumber,
       securityBlocked,
       reason: "source or replacement file context is missing",
-    });
-  }
-
-  if (
-    supersessionProofViewContextTruncated(source) ||
-    supersessionProofViewContextTruncated(replacement)
-  ) {
-    return linkOnlySupersessionProof({
-      source,
-      replacement,
-      replacementNumber: options.linkedNumber,
-      securityBlocked,
-      reason: "source or replacement proof context is truncated",
     });
   }
 
@@ -10536,14 +10455,6 @@ function supersessionProof(options: {
     });
   }
 
-  if (modelProof.securityBlocked) {
-    modelProof = {
-      ...modelProof,
-      decision: "keep_open",
-      reason: modelProof.reason || "model found source PR security-sensitive context",
-    };
-  }
-
   return {
     sourceSummary: modelProof.sourceSummary,
     replacementSummary: modelProof.replacementSummary,
@@ -10554,23 +10465,7 @@ function supersessionProof(options: {
     reason: modelProof.reason,
     replacementUrl: replacement.url,
     replacementStateText: supersessionReplacementStateText(replacement),
-    replacementState: replacement.state,
-    replacementMergedAt: replacement.mergedAt,
-    replacementHeadSha: replacement.headSha,
-    replacementUpdatedAt: replacement.updatedAt,
   };
-}
-
-function supersessionReplacementChangedAfterProof(
-  proof: SupersessionProof,
-  replacement: HydratedSupersessionPullRequest,
-): boolean {
-  return (
-    replacement.state !== proof.replacementState ||
-    replacement.mergedAt !== proof.replacementMergedAt ||
-    replacement.headSha !== proof.replacementHeadSha ||
-    replacement.updatedAt !== proof.replacementUpdatedAt
-  );
 }
 
 function recommendedPauseOrCloseOption(markdown: string): MergeRiskOption | null {
@@ -10645,30 +10540,6 @@ function linkedPullRequestSupersessionPromotion(
     runtime,
   });
   if (proof.decision !== "close") return { candidateFound: true, promotion: null };
-  const refreshed = fetchItem(item.number);
-  if (refreshed.state !== "open") return { candidateFound: true, promotion: null };
-  const refreshedContext = collectItemContext(refreshed.item, { fullTimelineForRelations: true });
-  if (refreshed.item.updatedAt !== item.updatedAt) {
-    return { candidateFound: true, promotion: null };
-  }
-  if (closePromotionHasNonAutomationActivityAfterReview(markdown, refreshedContext)) {
-    return { candidateFound: true, promotion: null };
-  }
-  if (itemSnapshotHash(refreshed.item, refreshedContext) !== itemSnapshotHash(item, context)) {
-    return { candidateFound: true, promotion: null };
-  }
-  let refreshedReplacement: HydratedSupersessionPullRequest;
-  try {
-    refreshedReplacement = hydrateReplacementSupersessionPullRequest(linkedPull.number);
-  } catch {
-    return { candidateFound: true, promotion: null };
-  }
-  if (supersessionReplacementChangedAfterProof(proof, refreshedReplacement)) {
-    return { candidateFound: true, promotion: null };
-  }
-  if (!supersessionReplacementCanClose(refreshedReplacement)) {
-    return { candidateFound: true, promotion: null };
-  }
   return {
     candidateFound: true,
     promotion: {

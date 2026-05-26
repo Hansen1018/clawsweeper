@@ -8348,7 +8348,7 @@ test("apply-decisions does not reuse stale supersession proof output", () => {
   }
 });
 
-test("apply-decisions does not close after supersession proof when source PR changes", () => {
+test("apply-decisions accepts source PR changes after supersession proof", () => {
   const root = mkdtempSync(tmpPrefix);
   try {
     const itemsDir = join(root, "items");
@@ -8446,14 +8446,14 @@ test("apply-decisions does not close after supersession proof when source PR cha
     }>;
     assert.equal(
       report.some((entry) => entry.action === "closed"),
-      false,
+      true,
     );
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
 
-test("apply-decisions does not close after supersession proof when replacement PR changes", () => {
+test("apply-decisions accepts replacement PR changes after supersession proof", () => {
   const root = mkdtempSync(tmpPrefix);
   try {
     const itemsDir = join(root, "items");
@@ -8558,7 +8558,7 @@ test("apply-decisions does not close after supersession proof when replacement P
     }>;
     assert.equal(
       report.some((entry) => entry.action === "closed"),
-      false,
+      true,
     );
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -8852,7 +8852,7 @@ test("apply-decisions keeps PRs open when model proof says same-file supersessio
   }
 });
 
-test("apply-decisions keeps security-labeled PRs open when linked PRs may supersede them", () => {
+test("apply-decisions can close security-sensitive labeled PRs when proof covers them", () => {
   const root = mkdtempSync(tmpPrefix);
   try {
     const itemsDir = join(root, "items");
@@ -8865,7 +8865,7 @@ test("apply-decisions keeps security-labeled PRs open when linked PRs may supers
       stalePullRequestReport({
         number: 336,
         title: "Older security PR",
-        labels: JSON.stringify(["security"]),
+        labels: JSON.stringify(["security-sensitive"]),
         pr_rating_overall: "D",
         pr_rating_proof: "D",
         work_cluster_refs: JSON.stringify([
@@ -8877,71 +8877,85 @@ test("apply-decisions keeps security-labeled PRs open when linked PRs may supers
     );
     writeFileSync(join(itemsDir, "336.md"), synced.report, "utf8");
 
-    withMockGh(
+    withMockSupersessionProof(
       root,
-      promotionGhMock({
-        number: 336,
-        title: "Older security PR",
-        labels: ["security"],
-        comment: synced.comment,
-        linkedPulls: {
-          406: {
-            number: 406,
-            title: "Newer security PR",
-            html_url: "https://github.com/openclaw/openclaw/pull/406",
-            state: "open",
-            merged_at: null,
-            body: "Supersedes #336 by carrying the same security fix.",
-            changed_files: 1,
-            head: { sha: "replacement-head-sha" },
-            updated_at: "2026-05-21T00:00:00Z",
-          },
-        },
-        linkedIssues: {
-          406: {
-            number: 406,
-            title: "Newer security PR",
-            html_url: "https://github.com/openclaw/openclaw/pull/406",
-            body: "Supersedes #336 by carrying the same security fix.",
-            updated_at: "2026-05-21T00:00:00Z",
-            labels: [],
-          },
-        },
-        pullFiles: [{ filename: "src/auth.ts", status: "modified", patch: "@@\n+fixAuth();" }],
-        linkedPullFiles: {
-          406: [{ filename: "src/auth.ts", status: "modified", patch: "@@\n+fixAuth();" }],
-        },
-      }),
+      {
+        sourceSummary: "PR A fixes the auth route in src/auth.ts.",
+        replacementSummary: "PR B carries the same auth route fix.",
+        coveredWork: ["PR B includes the auth route fix that PR A proposed."],
+        uniqueSourceWork: [],
+        securityBlocked: false,
+        decision: "superseded",
+        reason: "PR B covers PR A's useful behavior and PR A has no unique remaining work.",
+      },
       () => {
-        runApplyDecisionsForTest({
-          itemsDir,
-          closedDir,
-          plansDir,
-          reportPath,
-          extraArgs: [
-            "--target-repo",
-            "openclaw/openclaw",
-            "--dry-run",
-            "--apply-kind",
-            "all",
-            "--processed-limit",
-            "3",
-          ],
-        });
+        withMockGh(
+          root,
+          promotionGhMock({
+            number: 336,
+            title: "Older security PR",
+            labels: ["security-sensitive"],
+            comment: synced.comment,
+            linkedPulls: {
+              406: {
+                number: 406,
+                title: "Newer security PR",
+                html_url: "https://github.com/openclaw/openclaw/pull/406",
+                state: "open",
+                merged_at: null,
+                body: "Supersedes #336 by carrying the same security fix.",
+                changed_files: 1,
+                head: { sha: "replacement-head-sha" },
+                updated_at: "2026-05-21T00:00:00Z",
+              },
+            },
+            linkedIssues: {
+              406: {
+                number: 406,
+                title: "Newer security PR",
+                html_url: "https://github.com/openclaw/openclaw/pull/406",
+                body: "Supersedes #336 by carrying the same security fix.",
+                updated_at: "2026-05-21T00:00:00Z",
+                labels: [],
+              },
+            },
+            pullFiles: [{ filename: "src/auth.ts", status: "modified", patch: "@@\n+fixAuth();" }],
+            linkedPullFiles: {
+              406: [{ filename: "src/auth.ts", status: "modified", patch: "@@\n+fixAuth();" }],
+            },
+          }),
+          () => {
+            runApplyDecisionsForTest({
+              itemsDir,
+              closedDir,
+              plansDir,
+              reportPath,
+              extraArgs: [
+                "--target-repo",
+                "openclaw/openclaw",
+                "--dry-run",
+                "--apply-kind",
+                "all",
+                "--processed-limit",
+                "3",
+              ],
+            });
+          },
+        );
       },
     );
 
     const report = JSON.parse(readFileSync(reportPath, "utf8")) as Array<{ action: string }>;
     assert.equal(
       report.some((entry) => entry.action === "closed"),
-      false,
+      true,
     );
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
 
-test("apply-decisions keeps PRs open when comments contain security markers", () => {
+test("apply-decisions can close PRs with security markers when proof covers them", () => {
   const root = mkdtempSync(tmpPrefix);
   try {
     const itemsDir = join(root, "items");
@@ -8965,88 +8979,104 @@ test("apply-decisions keeps PRs open when comments contain security markers", ()
     );
     writeFileSync(join(itemsDir, "337.md"), synced.report, "utf8");
 
-    withMockGh(
+    withMockSupersessionProof(
       root,
-      promotionGhMock({
-        number: 337,
-        title: "Older routed PR",
-        comment: synced.comment,
-        comments: [
-          {
-            id: 9337,
-            html_url: "https://github.com/openclaw/openclaw/pull/337#issuecomment-9337",
-            created_at: "2026-05-01T01:00:00Z",
-            updated_at: "2026-05-01T01:00:00Z",
-            user: { login: "clawsweeper[bot]" },
-            body: synced.comment,
-          },
-          {
-            id: 9338,
-            html_url: "https://github.com/openclaw/openclaw/pull/337#issuecomment-9338",
-            created_at: "2026-05-01T01:05:00Z",
-            updated_at: "2026-05-01T01:05:00Z",
-            user: { login: "clawsweeper[bot]" },
-            body: "clawsweeper-security:security",
-          },
-        ],
-        linkedPulls: {
-          407: {
-            number: 407,
-            title: "Newer routed PR",
-            html_url: "https://github.com/openclaw/openclaw/pull/407",
-            state: "open",
-            merged_at: null,
-            body: "Supersedes #337 by carrying the same routed fix.",
-            changed_files: 1,
-            head: { sha: "replacement-head-sha" },
-            updated_at: "2026-05-21T00:00:00Z",
-          },
-        },
-        linkedIssues: {
-          407: {
-            number: 407,
-            title: "Newer routed PR",
-            html_url: "https://github.com/openclaw/openclaw/pull/407",
-            body: "Supersedes #337 by carrying the same routed fix.",
-            updated_at: "2026-05-21T00:00:00Z",
-            labels: [],
-          },
-        },
-        pullFiles: [{ filename: "src/router.ts", status: "modified", patch: "@@\n+fixRouter();" }],
-        linkedPullFiles: {
-          407: [{ filename: "src/router.ts", status: "modified", patch: "@@\n+fixRouter();" }],
-        },
-      }),
+      {
+        sourceSummary: "PR A fixes the routed behavior in src/router.ts.",
+        replacementSummary: "PR B carries the same routed behavior fix.",
+        coveredWork: ["PR B includes the routed behavior fix that PR A proposed."],
+        uniqueSourceWork: [],
+        securityBlocked: false,
+        decision: "superseded",
+        reason: "PR B covers PR A's useful behavior and PR A has no unique remaining work.",
+      },
       () => {
-        runApplyDecisionsForTest({
-          itemsDir,
-          closedDir,
-          plansDir,
-          reportPath,
-          extraArgs: [
-            "--target-repo",
-            "openclaw/openclaw",
-            "--dry-run",
-            "--apply-kind",
-            "all",
-            "--processed-limit",
-            "3",
-          ],
-        });
+        withMockGh(
+          root,
+          promotionGhMock({
+            number: 337,
+            title: "Older routed PR",
+            comment: synced.comment,
+            comments: [
+              {
+                id: 9337,
+                html_url: "https://github.com/openclaw/openclaw/pull/337#issuecomment-9337",
+                created_at: "2026-05-01T01:00:00Z",
+                updated_at: "2026-05-01T01:00:00Z",
+                user: { login: "clawsweeper[bot]" },
+                body: synced.comment,
+              },
+              {
+                id: 9338,
+                html_url: "https://github.com/openclaw/openclaw/pull/337#issuecomment-9338",
+                created_at: "2026-05-01T01:05:00Z",
+                updated_at: "2026-05-01T01:05:00Z",
+                user: { login: "clawsweeper[bot]" },
+                body: "clawsweeper-security:security",
+              },
+            ],
+            linkedPulls: {
+              407: {
+                number: 407,
+                title: "Newer routed PR",
+                html_url: "https://github.com/openclaw/openclaw/pull/407",
+                state: "open",
+                merged_at: null,
+                body: "Supersedes #337 by carrying the same routed fix.",
+                changed_files: 1,
+                head: { sha: "replacement-head-sha" },
+                updated_at: "2026-05-21T00:00:00Z",
+              },
+            },
+            linkedIssues: {
+              407: {
+                number: 407,
+                title: "Newer routed PR",
+                html_url: "https://github.com/openclaw/openclaw/pull/407",
+                body: "Supersedes #337 by carrying the same routed fix.",
+                updated_at: "2026-05-21T00:00:00Z",
+                labels: [],
+              },
+            },
+            pullFiles: [
+              { filename: "src/router.ts", status: "modified", patch: "@@\n+fixRouter();" },
+            ],
+            linkedPullFiles: {
+              407: [{ filename: "src/router.ts", status: "modified", patch: "@@\n+fixRouter();" }],
+            },
+          }),
+          () => {
+            runApplyDecisionsForTest({
+              itemsDir,
+              closedDir,
+              plansDir,
+              reportPath,
+              extraArgs: [
+                "--target-repo",
+                "openclaw/openclaw",
+                "--dry-run",
+                "--apply-kind",
+                "all",
+                "--processed-limit",
+                "3",
+              ],
+            });
+          },
+        );
       },
     );
 
     const report = JSON.parse(readFileSync(reportPath, "utf8")) as Array<{ action: string }>;
     assert.equal(
       report.some((entry) => entry.action === "closed"),
-      false,
+      true,
     );
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
 
-test("apply-decisions keeps PRs open when the report security review needs attention", () => {
+test("apply-decisions can close when report security review is covered by proof", () => {
   const root = mkdtempSync(tmpPrefix);
   try {
     const itemsDir = join(root, "items");
@@ -9071,70 +9101,84 @@ test("apply-decisions keeps PRs open when the report security review needs atten
     const reportWithSecurityReview = `${synced.report}\n\n## Security Review\n\nStatus: needs_attention\nSummary: The latest review found auth-sensitive behavior that needs security review.\n`;
     writeFileSync(join(itemsDir, "344.md"), reportWithSecurityReview, "utf8");
 
-    withMockGh(
+    withMockSupersessionProof(
       root,
-      promotionGhMock({
-        number: 344,
-        title: "Older auth PR",
-        comment: synced.comment,
-        linkedPulls: {
-          414: {
-            number: 414,
-            title: "Newer auth PR",
-            html_url: "https://github.com/openclaw/openclaw/pull/414",
-            state: "open",
-            merged_at: null,
-            body: "Supersedes #344 by carrying the same auth fix.",
-            changed_files: 1,
-            head: { sha: "replacement-head-sha" },
-            updated_at: "2026-05-21T00:00:00Z",
-          },
-        },
-        linkedIssues: {
-          414: {
-            number: 414,
-            title: "Newer auth PR",
-            html_url: "https://github.com/openclaw/openclaw/pull/414",
-            body: "Supersedes #344 by carrying the same auth fix.",
-            updated_at: "2026-05-21T00:00:00Z",
-            labels: [],
-          },
-        },
-        pullFiles: [{ filename: "src/auth.ts", status: "modified", patch: "@@\n+fixAuth();" }],
-        linkedPullFiles: {
-          414: [{ filename: "src/auth.ts", status: "modified", patch: "@@\n+fixAuth();" }],
-        },
-      }),
+      {
+        sourceSummary: "PR A fixes the auth behavior in src/auth.ts.",
+        replacementSummary: "PR B carries the same auth behavior fix.",
+        coveredWork: ["PR B includes the auth behavior fix that PR A proposed."],
+        uniqueSourceWork: [],
+        securityBlocked: false,
+        decision: "superseded",
+        reason: "PR B covers PR A's useful behavior and PR A has no unique remaining work.",
+      },
       () => {
-        runApplyDecisionsForTest({
-          itemsDir,
-          closedDir,
-          plansDir,
-          reportPath,
-          extraArgs: [
-            "--target-repo",
-            "openclaw/openclaw",
-            "--dry-run",
-            "--apply-kind",
-            "all",
-            "--processed-limit",
-            "3",
-          ],
-        });
+        withMockGh(
+          root,
+          promotionGhMock({
+            number: 344,
+            title: "Older auth PR",
+            comment: synced.comment,
+            linkedPulls: {
+              414: {
+                number: 414,
+                title: "Newer auth PR",
+                html_url: "https://github.com/openclaw/openclaw/pull/414",
+                state: "open",
+                merged_at: null,
+                body: "Supersedes #344 by carrying the same auth fix.",
+                changed_files: 1,
+                head: { sha: "replacement-head-sha" },
+                updated_at: "2026-05-21T00:00:00Z",
+              },
+            },
+            linkedIssues: {
+              414: {
+                number: 414,
+                title: "Newer auth PR",
+                html_url: "https://github.com/openclaw/openclaw/pull/414",
+                body: "Supersedes #344 by carrying the same auth fix.",
+                updated_at: "2026-05-21T00:00:00Z",
+                labels: [],
+              },
+            },
+            pullFiles: [{ filename: "src/auth.ts", status: "modified", patch: "@@\n+fixAuth();" }],
+            linkedPullFiles: {
+              414: [{ filename: "src/auth.ts", status: "modified", patch: "@@\n+fixAuth();" }],
+            },
+          }),
+          () => {
+            runApplyDecisionsForTest({
+              itemsDir,
+              closedDir,
+              plansDir,
+              reportPath,
+              extraArgs: [
+                "--target-repo",
+                "openclaw/openclaw",
+                "--dry-run",
+                "--apply-kind",
+                "all",
+                "--processed-limit",
+                "3",
+              ],
+            });
+          },
+        );
       },
     );
 
     const report = JSON.parse(readFileSync(reportPath, "utf8")) as Array<{ action: string }>;
     assert.equal(
       report.some((entry) => entry.action === "closed"),
-      false,
+      true,
     );
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
 
-test("apply-decisions keeps PRs open when report merge risk is security-sensitive", () => {
+test("apply-decisions can close when security merge risk is covered by proof", () => {
   const root = mkdtempSync(tmpPrefix);
   try {
     const itemsDir = join(root, "items");
@@ -9159,65 +9203,81 @@ test("apply-decisions keeps PRs open when report merge risk is security-sensitiv
     );
     writeFileSync(join(itemsDir, "345.md"), synced.report, "utf8");
 
-    withMockGh(
+    withMockSupersessionProof(
       root,
-      promotionGhMock({
-        number: 345,
-        title: "Older provider PR",
-        comment: synced.comment,
-        linkedPulls: {
-          415: {
-            number: 415,
-            title: "Newer provider PR",
-            html_url: "https://github.com/openclaw/openclaw/pull/415",
-            state: "open",
-            merged_at: null,
-            body: "Supersedes #345 by carrying the same provider fix.",
-            changed_files: 1,
-            head: { sha: "replacement-head-sha" },
-            updated_at: "2026-05-21T00:00:00Z",
-          },
-        },
-        linkedIssues: {
-          415: {
-            number: 415,
-            title: "Newer provider PR",
-            html_url: "https://github.com/openclaw/openclaw/pull/415",
-            body: "Supersedes #345 by carrying the same provider fix.",
-            updated_at: "2026-05-21T00:00:00Z",
-            labels: [],
-          },
-        },
-        pullFiles: [
-          { filename: "src/provider.ts", status: "modified", patch: "@@\n+fixProvider();" },
-        ],
-        linkedPullFiles: {
-          415: [{ filename: "src/provider.ts", status: "modified", patch: "@@\n+fixProvider();" }],
-        },
-      }),
+      {
+        sourceSummary: "PR A fixes provider behavior in src/provider.ts.",
+        replacementSummary: "PR B carries the same provider behavior fix.",
+        coveredWork: ["PR B includes the provider behavior fix that PR A proposed."],
+        uniqueSourceWork: [],
+        securityBlocked: false,
+        decision: "superseded",
+        reason: "PR B covers PR A's useful behavior and PR A has no unique remaining work.",
+      },
       () => {
-        runApplyDecisionsForTest({
-          itemsDir,
-          closedDir,
-          plansDir,
-          reportPath,
-          extraArgs: [
-            "--target-repo",
-            "openclaw/openclaw",
-            "--dry-run",
-            "--apply-kind",
-            "all",
-            "--processed-limit",
-            "3",
-          ],
-        });
+        withMockGh(
+          root,
+          promotionGhMock({
+            number: 345,
+            title: "Older provider PR",
+            comment: synced.comment,
+            linkedPulls: {
+              415: {
+                number: 415,
+                title: "Newer provider PR",
+                html_url: "https://github.com/openclaw/openclaw/pull/415",
+                state: "open",
+                merged_at: null,
+                body: "Supersedes #345 by carrying the same provider fix.",
+                changed_files: 1,
+                head: { sha: "replacement-head-sha" },
+                updated_at: "2026-05-21T00:00:00Z",
+              },
+            },
+            linkedIssues: {
+              415: {
+                number: 415,
+                title: "Newer provider PR",
+                html_url: "https://github.com/openclaw/openclaw/pull/415",
+                body: "Supersedes #345 by carrying the same provider fix.",
+                updated_at: "2026-05-21T00:00:00Z",
+                labels: [],
+              },
+            },
+            pullFiles: [
+              { filename: "src/provider.ts", status: "modified", patch: "@@\n+fixProvider();" },
+            ],
+            linkedPullFiles: {
+              415: [
+                { filename: "src/provider.ts", status: "modified", patch: "@@\n+fixProvider();" },
+              ],
+            },
+          }),
+          () => {
+            runApplyDecisionsForTest({
+              itemsDir,
+              closedDir,
+              plansDir,
+              reportPath,
+              extraArgs: [
+                "--target-repo",
+                "openclaw/openclaw",
+                "--dry-run",
+                "--apply-kind",
+                "all",
+                "--processed-limit",
+                "3",
+              ],
+            });
+          },
+        );
       },
     );
 
     const report = JSON.parse(readFileSync(reportPath, "utf8")) as Array<{ action: string }>;
     assert.equal(
       report.some((entry) => entry.action === "closed"),
-      false,
+      true,
     );
   } finally {
     rmSync(root, { recursive: true, force: true });

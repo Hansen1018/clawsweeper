@@ -8,7 +8,6 @@ import { runCommand as run } from "./command-runner.js";
 import { parsePullRequestUrl } from "./github-ref.js";
 import { repoRoot } from "./lib.js";
 import { repairGhEnv as ghEnv } from "./process-env.js";
-import { hasDeterministicSecuritySignal, hasSecuritySignalText } from "./security-signals.js";
 import { uniqueStrings } from "./validation-command-utils.js";
 import { closingReferencesFromMarkdown } from "./external-messages.js";
 
@@ -92,85 +91,9 @@ export function fetchSourcePullRequestView({
   });
 }
 
-export function sourcePullRequestSecurityBlockReason(view: LooseRecord): string {
-  if (
-    hasDeterministicSecuritySignal({
-      labels: view.labels ?? [],
-      comments: [
-        ...(Array.isArray(view.comments) ? view.comments : []),
-        ...(Array.isArray(view.reviews) ? view.reviews : []),
-        ...(Array.isArray(view.reviewComments) ? view.reviewComments : []),
-      ],
-    }) ||
-    hasSecuritySignalText(view.title ?? "", view.body ?? "")
-  ) {
-    return "security-sensitive source PR requires maintainer security review";
-  }
-  return "";
-}
-
 export function pullRequestFileContextBlockReason(view: LooseRecord): string {
   if (!Array.isArray(view.files)) return "source or replacement PR file context is missing";
-  const changedFiles = finiteNumber(view.changedFiles);
-  const filesHydrated = finiteNumber(view.filesHydrated) ?? view.files.length;
-  if (view.filesTruncated === true || (changedFiles !== null && changedFiles > filesHydrated)) {
-    return "source or replacement PR file context is truncated";
-  }
   return "";
-}
-
-export function pullRequestReviewCommentContextBlockReason(view: LooseRecord): string {
-  if (!Array.isArray(view.reviewComments)) {
-    return "source or replacement PR review comment context is missing";
-  }
-  if (view.reviewCommentsTruncated === true) {
-    return "source or replacement PR review comment context is truncated";
-  }
-  return "";
-}
-
-export function pullRequestReviewContextBlockReason(view: LooseRecord): string {
-  if (!Array.isArray(view.reviews)) {
-    return "source or replacement PR review context is missing";
-  }
-  if (view.reviewsTruncated === true) {
-    return "source or replacement PR review context is truncated";
-  }
-  return "";
-}
-
-export function pullRequestIssueCommentContextBlockReason(view: LooseRecord): string {
-  if (!Array.isArray(view.comments)) {
-    return "source or replacement PR comment context is missing";
-  }
-  if (view.commentsTruncated === true) {
-    return "source or replacement PR comment context is truncated";
-  }
-  return "";
-}
-
-export function pullRequestCloseoutDriftBlockReason(
-  beforeProof: LooseRecord,
-  afterProof: LooseRecord,
-  subject = "source PR",
-): string {
-  if (String(afterProof.state ?? "") !== String(beforeProof.state ?? "")) {
-    return `${subject} changed during replacement closeout proof`;
-  }
-  if (String(afterProof.updatedAt ?? "") !== String(beforeProof.updatedAt ?? "")) {
-    return `${subject} changed during replacement closeout proof`;
-  }
-  if (String(afterProof.headRefOid ?? "") !== String(beforeProof.headRefOid ?? "")) {
-    return `${subject} changed during replacement closeout proof`;
-  }
-  const securityBlock = sourcePullRequestSecurityBlockReason(afterProof);
-  if (securityBlock) return securityBlock;
-  return (
-    pullRequestFileContextBlockReason(afterProof) ||
-    pullRequestIssueCommentContextBlockReason(afterProof) ||
-    pullRequestReviewContextBlockReason(afterProof) ||
-    pullRequestReviewCommentContextBlockReason(afterProof)
-  );
 }
 
 function pullRequestViewWithFileContext(view: LooseRecord): LooseRecord {

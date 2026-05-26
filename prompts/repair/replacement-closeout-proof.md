@@ -10,7 +10,7 @@ Hard rules:
 - Do not require exact patch-line equality. A replacement can cover the same behavior with different code shape.
 - Return `superseded` only when PR B clearly covers PR A's useful work and PR A has no unique behavior, file concern, proof, discussion, or review point needing separate maintainer review.
 - Return `keep_open` for anything else, including related PRs, incomplete proof, thin context, or uncertainty.
-- If PR A looks security-sensitive, set `securityBlocked: true` and return `keep_open`.
+- If PR A looks security-sensitive, include that in your comparison. Set `securityBlocked: true` only when security-sensitive context prevents proving that PR B covers PR A.
 - Do not ask for more context.
 
 Return only JSON matching the supplied schema.

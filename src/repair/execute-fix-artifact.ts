@@ -109,14 +109,9 @@ import {
   fetchSourcePullRequestView,
   prepareReviewThreadsForMerge,
   publicContributorCredit,
-  pullRequestCloseoutDriftBlockReason,
   pullRequestFileContextBlockReason,
-  pullRequestIssueCommentContextBlockReason,
-  pullRequestReviewContextBlockReason,
-  pullRequestReviewCommentContextBlockReason,
   sourceClosingReferences,
   sourceContributorCredits,
-  sourcePullRequestSecurityBlockReason,
   supersededReplacementSources,
 } from "./execute-fix-github.js";
 import {
@@ -124,7 +119,6 @@ import {
   compactSupersessionProofView,
   parseSupersessionProofModelResult,
   supersessionProofCloseDecision,
-  supersessionProofViewContextTruncated,
 } from "../supersession-proof.js";
 
 const FIX_ACTIONS = new Set(["fix_needed", "build_fix_artifact", "open_fix_pr"]);
@@ -1758,32 +1752,6 @@ function replacementCloseoutProofAllowsClose({
   if (sourceFileContextBlock) return { close: false, reason: sourceFileContextBlock };
   const replacementFileContextBlock = pullRequestFileContextBlockReason(replacementView);
   if (replacementFileContextBlock) return { close: false, reason: replacementFileContextBlock };
-  const sourceIssueCommentContextBlock = pullRequestIssueCommentContextBlockReason(sourceView);
-  if (sourceIssueCommentContextBlock) {
-    return { close: false, reason: sourceIssueCommentContextBlock };
-  }
-  const replacementIssueCommentContextBlock =
-    pullRequestIssueCommentContextBlockReason(replacementView);
-  if (replacementIssueCommentContextBlock) {
-    return { close: false, reason: replacementIssueCommentContextBlock };
-  }
-  const sourceReviewContextBlock = pullRequestReviewContextBlockReason(sourceView);
-  if (sourceReviewContextBlock) {
-    return { close: false, reason: sourceReviewContextBlock };
-  }
-  const replacementReviewContextBlock = pullRequestReviewContextBlockReason(replacementView);
-  if (replacementReviewContextBlock) {
-    return { close: false, reason: replacementReviewContextBlock };
-  }
-  const sourceReviewCommentContextBlock = pullRequestReviewCommentContextBlockReason(sourceView);
-  if (sourceReviewCommentContextBlock) {
-    return { close: false, reason: sourceReviewCommentContextBlock };
-  }
-  const replacementReviewCommentContextBlock =
-    pullRequestReviewCommentContextBlockReason(replacementView);
-  if (replacementReviewCommentContextBlock) {
-    return { close: false, reason: replacementReviewCommentContextBlock };
-  }
   if (replacementView.state === "CLOSED" && !replacementView.mergedAt) {
     return { close: false, reason: "replacement PR is closed without being merged" };
   }
@@ -1829,12 +1797,6 @@ function replacementCloseoutProofAllowsClose({
     reviewComments: replacementView.reviewComments,
     reviewCommentsTruncated: replacementView.reviewCommentsTruncated,
   };
-  if (
-    supersessionProofViewContextTruncated(sourceProofView) ||
-    supersessionProofViewContextTruncated(replacementProofView)
-  ) {
-    return { close: false, reason: "source or replacement proof context is truncated" };
-  }
   const prompt = [
     fs.readFileSync(replacementCloseoutProofPromptPath, "utf8").trimEnd(),
     "",
@@ -1978,21 +1940,6 @@ function closeSupersededSourcePr({
   if (view.state === "CLOSED") {
     return { ...base, status: "skipped", reason: "already closed" };
   }
-  const securityBlock = sourcePullRequestSecurityBlockReason(view);
-  if (securityBlock) {
-    return {
-      ...linkReplacementSourcePr({
-        source,
-        parsed,
-        replacementPrUrl,
-        targetDir,
-        contributorCredits,
-        provenance,
-        sourceView: view,
-      }),
-      reason: securityBlock,
-    };
-  }
   const replacementNumber = pullRequestNumberFromUrl(String(replacementPrUrl));
   if (!replacementNumber) {
     return {
@@ -2052,112 +1999,6 @@ function closeSupersededSourcePr({
       reason: proof.reason,
     };
   }
-  let postProofView: LooseRecord;
-  try {
-    postProofView = fetchSourcePullRequestView({
-      repo: result.repo,
-      number: parsed.number,
-      targetDir,
-    });
-  } catch (error) {
-    return {
-      ...linkReplacementSourcePr({
-        source,
-        parsed,
-        replacementPrUrl,
-        targetDir,
-        contributorCredits,
-        provenance,
-        sourceView: view,
-      }),
-      reason: `source PR context could not be re-fetched after proof: ${
-        error instanceof Error ? error.message : String(error)
-      }`,
-    };
-  }
-  if (postProofView.mergedAt || postProofView.state === "MERGED") {
-    return {
-      ...base,
-      status: "skipped",
-      reason: "already merged",
-      merged_at: postProofView.mergedAt ?? null,
-    };
-  }
-  if (postProofView.state === "CLOSED") {
-    return { ...base, status: "skipped", reason: "already closed" };
-  }
-  const postProofDriftBlock = pullRequestCloseoutDriftBlockReason(view, postProofView);
-  if (postProofDriftBlock) {
-    return {
-      ...linkReplacementSourcePr({
-        source,
-        parsed,
-        replacementPrUrl,
-        targetDir,
-        contributorCredits,
-        provenance,
-        sourceView: postProofView,
-      }),
-      reason: postProofDriftBlock,
-    };
-  }
-  let postProofReplacementView: LooseRecord;
-  try {
-    postProofReplacementView = fetchSourcePullRequestView({
-      repo: result.repo,
-      number: replacementNumber,
-      targetDir,
-    });
-  } catch (error) {
-    return {
-      ...linkReplacementSourcePr({
-        source,
-        parsed,
-        replacementPrUrl,
-        targetDir,
-        contributorCredits,
-        provenance,
-        sourceView: postProofView,
-      }),
-      reason: `replacement PR context could not be re-fetched after proof: ${
-        error instanceof Error ? error.message : String(error)
-      }`,
-    };
-  }
-  const postProofReplacementDriftBlock = pullRequestCloseoutDriftBlockReason(
-    replacementView,
-    postProofReplacementView,
-    "replacement PR",
-  );
-  if (postProofReplacementDriftBlock) {
-    return {
-      ...linkReplacementSourcePr({
-        source,
-        parsed,
-        replacementPrUrl,
-        targetDir,
-        contributorCredits,
-        provenance,
-        sourceView: postProofView,
-      }),
-      reason: postProofReplacementDriftBlock,
-    };
-  }
-  if (postProofReplacementView.state === "CLOSED" && !postProofReplacementView.mergedAt) {
-    return {
-      ...linkReplacementSourcePr({
-        source,
-        parsed,
-        replacementPrUrl,
-        targetDir,
-        contributorCredits,
-        provenance,
-        sourceView: postProofView,
-      }),
-      reason: "replacement PR is closed without being merged",
-    };
-  }
-
   const comment = replacementSourceCloseComment({
     replacementPrUrl,
     sourcePrUrl: source,

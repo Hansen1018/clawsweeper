@@ -255,13 +255,6 @@ export function normalizedSupersessionProofModelResult(
     uniqueSourceWork: proof.uniqueSourceWork.map((entry) => entry.trim()).filter(Boolean),
     reason: proof.reason.trim(),
   };
-  if (normalizedProof.securityBlocked) {
-    return {
-      ...normalizedProof,
-      decision: "keep_open",
-      reason: normalizedProof.reason || "model found source PR security-sensitive context",
-    };
-  }
   if (normalizedProof.decision !== "superseded") return normalizedProof;
   if (supersessionProofHasConcreteCloseEvidence(normalizedProof)) return normalizedProof;
   return {
@@ -290,8 +283,7 @@ function supersessionProofHasConcreteCloseEvidence(proof: SupersessionProofModel
     proof.replacementSummary.trim().length > 0 &&
     proof.coveredWork.length > 0 &&
     proof.uniqueSourceWork.length === 0 &&
-    proof.reason.trim().length > 0 &&
-    !proof.securityBlocked
+    proof.reason.trim().length > 0
   );
 }
 

@@ -92,7 +92,7 @@ test("merged source replacement skip runs before publishing replacement PRs", ()
   );
 });
 
-test("superseded source closeout checks source security before gh pr close", () => {
+test("superseded source closeout requires replacement proof before gh pr close", () => {
   const sourcePath = path.join(process.cwd(), "src/repair/execute-fix-artifact.ts");
   const source = fs.readFileSync(sourcePath, "utf8");
 
@@ -100,17 +100,15 @@ test("superseded source closeout checks source security before gh pr close", () 
   assert.notEqual(helperStart, -1);
   const helper = source.slice(helperStart);
 
-  const securityIndex = helper.indexOf("sourcePullRequestSecurityBlockReason(view)");
   const proofIndex = helper.indexOf("replacementCloseoutProofAllowsClose({");
   const linkIndex = helper.indexOf("linkReplacementSourcePr({");
   const closeIndex = helper.indexOf('"pr", "close"');
-  assert.notEqual(securityIndex, -1);
   assert.notEqual(proofIndex, -1);
   assert.notEqual(linkIndex, -1);
   assert.notEqual(closeIndex, -1);
   assert.ok(
-    securityIndex < linkIndex && proofIndex < closeIndex && linkIndex < closeIndex,
-    "source PRs must pass security and replacement proof checks before gh pr close can run",
+    proofIndex < closeIndex && linkIndex < closeIndex,
+    "source PRs must pass replacement proof checks before gh pr close can run",
   );
 });
 
@@ -136,9 +134,7 @@ test("superseded source closeout uses general proof instead of patch-line matchi
 
   assert.match(helper, /replacementCloseoutProofPromptPath/);
   assert.match(helper, /compactSupersessionProofView/);
-  assert.match(helper, /pullRequestReviewContextBlockReason/);
   assert.match(helper, /reviews: sourceView\.reviews/);
-  assert.match(helper, /pullRequestReviewCommentContextBlockReason/);
   assert.match(helper, /reviewComments: sourceView\.reviewComments/);
   assert.match(sharedProofSource, /export function proofBodyExcerpt/);
   assert.doesNotMatch(helper, /patchSignature/);

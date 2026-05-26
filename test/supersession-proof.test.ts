@@ -23,6 +23,21 @@ test("supersession proof rejects blank covered work before closing", () => {
   assert.match(decision.reason, /incomplete/);
 });
 
+test("supersession proof can close security-sensitive work when coverage is concrete", () => {
+  const decision = supersessionProofCloseDecision({
+    sourceSummary: "PR A fixes the auth route.",
+    replacementSummary: "PR B fixes the same auth route.",
+    coveredWork: ["PR B includes the auth route fix that PR A proposed."],
+    uniqueSourceWork: [],
+    securityBlocked: true,
+    decision: "superseded",
+    reason: "PR B covers PR A's auth behavior and PR A has no unique remaining work.",
+  });
+
+  assert.equal(decision.close, true);
+  assert.equal(decision.proof.decision, "superseded");
+});
+
 test("supersession proof view includes bounded file and discussion context", () => {
   const view = compactSupersessionProofView({
     title: "Fix activity",
