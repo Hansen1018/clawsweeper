@@ -277,6 +277,76 @@ test("workflow utilities select eligible proposed close records", () => {
       "",
     ].join("\n"),
   );
+  write(
+    path.join(root, "records/openclaw-openclaw/items/openclaw-openclaw-17.md"),
+    [
+      "---",
+      "repository: openclaw/openclaw",
+      "type: pull_request",
+      "decision: keep_open",
+      "confidence: high",
+      "action_taken: kept_open",
+      "review_status: complete",
+      "item_snapshot_hash: reviewed-snapshot",
+      `item_created_at: ${oldDate}`,
+      'work_cluster_refs: ["Superseded by https://github.com/openclaw/openclaw/pull/400"]',
+      "---",
+      "",
+    ].join("\n"),
+  );
+  write(
+    path.join(root, "records/openclaw-openclaw/items/openclaw-openclaw-18.md"),
+    [
+      "---",
+      "repository: openclaw/openclaw",
+      "type: pull_request",
+      "decision: keep_open",
+      "confidence: high",
+      "action_taken: kept_open",
+      "review_status: complete",
+      "item_snapshot_hash: reviewed-snapshot",
+      `item_created_at: ${oldDate}`,
+      'work_cluster_refs: ["Related to https://github.com/openclaw/openclaw/pull/401"]',
+      "---",
+      "",
+    ].join("\n"),
+  );
+  write(
+    path.join(root, "records/openclaw-openclaw/items/openclaw-openclaw-19.md"),
+    [
+      "---",
+      "repository: openclaw/openclaw",
+      "type: pull_request",
+      "decision: keep_open",
+      "confidence: high",
+      "action_taken: kept_open",
+      "review_status: complete",
+      "item_snapshot_hash: reviewed-snapshot",
+      `item_created_at: ${oldDate}`,
+      "apply_checked_at: 2099-01-01T00:00:00Z",
+      'work_cluster_refs: ["Superseded by https://github.com/openclaw/openclaw/pull/402"]',
+      "---",
+      "",
+    ].join("\n"),
+  );
+  write(
+    path.join(root, "records/openclaw-openclaw/items/openclaw-openclaw-20.md"),
+    [
+      "---",
+      "repository: openclaw/openclaw",
+      "type: pull_request",
+      "decision: keep_open",
+      "confidence: high",
+      "action_taken: kept_open",
+      "review_status: complete",
+      "item_snapshot_hash: reviewed-snapshot",
+      `item_created_at: ${oldDate}`,
+      "summary: Replacement work is still under review.",
+      'work_cluster_refs: ["Related to https://github.com/openclaw/openclaw/pull/403"]',
+      "---",
+      "",
+    ].join("\n"),
+  );
 
   const selected = withCwd(root, () =>
     proposedItemNumbers({
@@ -289,7 +359,7 @@ test("workflow utilities select eligible proposed close records", () => {
     }),
   );
 
-  assert.deepEqual(selected, [5, 12, 15]);
+  assert.deepEqual(selected, [5, 12, 15, 17]);
 });
 
 test("workflow utilities allow ClawHub implemented-on-main issue proposals", () => {

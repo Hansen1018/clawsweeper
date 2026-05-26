@@ -27,9 +27,17 @@ export interface SupersessionProofViewInput {
   headSha?: unknown;
   headRefOid?: unknown;
   updatedAt?: unknown;
+  changedFiles?: unknown;
   filePaths?: readonly string[];
+  files?: readonly unknown[];
   filesHydrated?: unknown;
   filesTruncated?: unknown;
+  comments?: readonly unknown[];
+  commentsTruncated?: unknown;
+  reviews?: readonly unknown[];
+  reviewsTruncated?: unknown;
+  reviewComments?: readonly unknown[];
+  reviewCommentsTruncated?: unknown;
 }
 
 const SUPERSESSION_PROOF_DECISIONS = new Set<SupersessionProofModelDecision>([
@@ -47,6 +55,11 @@ const SUPERSESSION_PROOF_SCHEMA_KEYS = new Set([
   "reason",
 ]);
 
+const PROOF_PATCH_EXCERPT_LIMIT = 1600;
+const PROOF_COMMENT_EXCERPT_LIMIT = 800;
+const PROOF_FILE_CONTEXT_LIMIT = 80;
+const PROOF_COMMENT_CONTEXT_LIMIT = 40;
+
 export function proofBodyExcerpt(value: unknown, limit = 200): string {
   if (typeof value !== "string") return "";
   return value.replace(/\s+/g, " ").trim().slice(0, limit);
@@ -55,8 +68,111 @@ export function proofBodyExcerpt(value: unknown, limit = 200): string {
 export function compactSupersessionFilePaths(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
   return [
-    ...new Set(value.map((entry) => stringValue(recordValue(entry, "path"))).filter(Boolean)),
+    ...new Set(
+      value
+        .flatMap((entry) => [
+          stringValue(recordValue(entry, "path")),
+          stringValue(recordValue(entry, "filename")),
+          stringValue(recordValue(entry, "previous_filename")),
+        ])
+        .filter(Boolean),
+    ),
   ].sort();
+}
+
+export function compactSupersessionFiles(value: unknown): Array<Record<string, unknown>> {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((entry) =>
+      dropUndefinedValues({
+        path:
+          stringValue(recordValue(entry, "path")) || stringValue(recordValue(entry, "filename")),
+        previousPath:
+          stringValue(recordValue(entry, "previousPath")) ||
+          stringValue(recordValue(entry, "previous_filename")),
+        status:
+          stringValue(recordValue(entry, "status")) ||
+          stringValue(recordValue(entry, "changeType")),
+        additions: finiteNumber(recordValue(entry, "additions")),
+        deletions: finiteNumber(recordValue(entry, "deletions")),
+        changes: finiteNumber(recordValue(entry, "changes")),
+        patchExcerpt: proofBodyExcerpt(recordValue(entry, "patch"), PROOF_PATCH_EXCERPT_LIMIT),
+      }),
+    )
+    .filter((entry) => Object.keys(entry).length > 0)
+    .slice(0, PROOF_FILE_CONTEXT_LIMIT);
+}
+
+export function compactSupersessionComments(value: unknown): Array<Record<string, unknown>> {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((entry) =>
+      dropUndefinedValues({
+        author:
+          stringValue(recordValue(entry, "author")) ||
+          stringValue(recordValue(recordValue(entry, "user"), "login")),
+        authorAssociation: stringValue(recordValue(entry, "authorAssociation")),
+        url: stringValue(recordValue(entry, "url")) || stringValue(recordValue(entry, "html_url")),
+        createdAt:
+          stringValue(recordValue(entry, "createdAt")) ||
+          stringValue(recordValue(entry, "created_at")),
+        updatedAt:
+          stringValue(recordValue(entry, "updatedAt")) ||
+          stringValue(recordValue(entry, "updated_at")),
+        bodyExcerpt: proofBodyExcerpt(recordValue(entry, "body"), PROOF_COMMENT_EXCERPT_LIMIT),
+      }),
+    )
+    .filter((entry) => Object.keys(entry).length > 0)
+    .slice(0, PROOF_COMMENT_CONTEXT_LIMIT);
+}
+
+export function compactSupersessionReviews(value: unknown): Array<Record<string, unknown>> {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((entry) =>
+      dropUndefinedValues({
+        author:
+          stringValue(recordValue(entry, "author")) ||
+          stringValue(recordValue(recordValue(entry, "user"), "login")),
+        authorAssociation:
+          stringValue(recordValue(entry, "authorAssociation")) ||
+          stringValue(recordValue(entry, "author_association")),
+        state: stringValue(recordValue(entry, "state")),
+        url: stringValue(recordValue(entry, "url")) || stringValue(recordValue(entry, "html_url")),
+        submittedAt:
+          stringValue(recordValue(entry, "submittedAt")) ||
+          stringValue(recordValue(entry, "submitted_at")),
+        createdAt:
+          stringValue(recordValue(entry, "createdAt")) ||
+          stringValue(recordValue(entry, "created_at")),
+        updatedAt:
+          stringValue(recordValue(entry, "updatedAt")) ||
+          stringValue(recordValue(entry, "updated_at")),
+        bodyExcerpt: proofBodyExcerpt(recordValue(entry, "body"), PROOF_COMMENT_EXCERPT_LIMIT),
+      }),
+    )
+    .filter((entry) => Object.keys(entry).length > 0)
+    .slice(0, PROOF_COMMENT_CONTEXT_LIMIT);
+}
+
+export function supersessionProofViewContextTruncated(input: SupersessionProofViewInput): boolean {
+  return (
+    proofEntriesTruncated(input.files, PROOF_FILE_CONTEXT_LIMIT, [
+      { key: "patch", limit: PROOF_PATCH_EXCERPT_LIMIT },
+    ]) ||
+    proofEntriesTruncated(input.comments, PROOF_COMMENT_CONTEXT_LIMIT, [
+      { key: "body", limit: PROOF_COMMENT_EXCERPT_LIMIT },
+    ]) ||
+    input.commentsTruncated === true ||
+    proofEntriesTruncated(input.reviews, PROOF_COMMENT_CONTEXT_LIMIT, [
+      { key: "body", limit: PROOF_COMMENT_EXCERPT_LIMIT },
+    ]) ||
+    input.reviewsTruncated === true ||
+    proofEntriesTruncated(input.reviewComments, PROOF_COMMENT_CONTEXT_LIMIT, [
+      { key: "body", limit: PROOF_COMMENT_EXCERPT_LIMIT },
+    ]) ||
+    input.reviewCommentsTruncated === true
+  );
 }
 
 export function compactSupersessionLabels(value: unknown): string[] {
@@ -78,6 +194,7 @@ export function compactSupersessionLabels(value: unknown): string[] {
 export function compactSupersessionProofView(
   input: SupersessionProofViewInput,
 ): Record<string, unknown> {
+  const fileContext = compactSupersessionFiles(input.files);
   return dropUndefinedValues({
     number: finiteNumber(input.number),
     title: stringValue(input.title),
@@ -89,10 +206,17 @@ export function compactSupersessionProofView(
     headSha: nullableString(input.headSha),
     headRefOid: nullableString(input.headRefOid),
     updatedAt: nullableString(input.updatedAt),
-    changedFiles: input.filePaths?.length ?? 0,
+    changedFiles: finiteNumber(input.changedFiles) ?? input.filePaths?.length ?? fileContext.length,
     filePaths: [...(input.filePaths ?? [])],
+    fileContext,
     filesHydrated: finiteNumber(input.filesHydrated),
     filesTruncated: booleanOrUndefined(input.filesTruncated),
+    comments: compactSupersessionComments(input.comments),
+    commentsTruncated: booleanOrUndefined(input.commentsTruncated),
+    reviews: compactSupersessionReviews(input.reviews),
+    reviewsTruncated: booleanOrUndefined(input.reviewsTruncated),
+    reviewComments: compactSupersessionComments(input.reviewComments),
+    reviewCommentsTruncated: booleanOrUndefined(input.reviewCommentsTruncated),
   });
 }
 
@@ -123,20 +247,28 @@ export function parseSupersessionProofModelResult(value: unknown): SupersessionP
 export function normalizedSupersessionProofModelResult(
   proof: SupersessionProofModelResult,
 ): SupersessionProofModelResult {
-  if (proof.securityBlocked) {
+  const normalizedProof = {
+    ...proof,
+    sourceSummary: proof.sourceSummary.trim(),
+    replacementSummary: proof.replacementSummary.trim(),
+    coveredWork: proof.coveredWork.map((entry) => entry.trim()).filter(Boolean),
+    uniqueSourceWork: proof.uniqueSourceWork.map((entry) => entry.trim()).filter(Boolean),
+    reason: proof.reason.trim(),
+  };
+  if (normalizedProof.securityBlocked) {
     return {
-      ...proof,
+      ...normalizedProof,
       decision: "keep_open",
-      reason: proof.reason || "model found source PR security-sensitive context",
+      reason: normalizedProof.reason || "model found source PR security-sensitive context",
     };
   }
-  if (proof.decision !== "superseded") return proof;
-  if (supersessionProofHasConcreteCloseEvidence(proof)) return proof;
+  if (normalizedProof.decision !== "superseded") return normalizedProof;
+  if (supersessionProofHasConcreteCloseEvidence(normalizedProof)) return normalizedProof;
   return {
-    ...proof,
+    ...normalizedProof,
     decision: "keep_open",
     reason: `model supersession proof was incomplete: ${
-      proof.reason || "missing concrete coverage proof"
+      normalizedProof.reason || "missing concrete coverage proof"
     }`,
   };
 }
@@ -193,6 +325,22 @@ function finiteNumber(value: unknown): number | undefined {
 
 function booleanOrUndefined(value: unknown): boolean | undefined {
   return typeof value === "boolean" ? value : undefined;
+}
+
+function proofEntriesTruncated(
+  entries: readonly unknown[] | undefined,
+  entryLimit: number,
+  textLimits: ReadonlyArray<{ key: string; limit: number }>,
+): boolean {
+  if (!entries) return false;
+  if (entries.length > entryLimit) return true;
+  return entries.some((entry) =>
+    textLimits.some(({ key, limit }) => proofTextWasTruncated(recordValue(entry, key), limit)),
+  );
+}
+
+function proofTextWasTruncated(value: unknown, limit: number): boolean {
+  return typeof value === "string" && value.replace(/\s+/g, " ").trim().length > limit;
 }
 
 function requireRecord(value: unknown, path: string): Record<string, unknown> {

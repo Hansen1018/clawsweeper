@@ -49,6 +49,7 @@ import {
   compactSupersessionProofView,
   normalizedSupersessionProofModelResult,
   parseSupersessionProofModelResult,
+  supersessionProofViewContextTruncated,
   type SupersessionProofModelResult,
 } from "./supersession-proof.js";
 import {
@@ -439,6 +440,7 @@ interface ItemContext {
   pullRequest?: unknown;
   pullFiles?: unknown[];
   pullCommits?: unknown[];
+  pullReviews?: unknown[];
   pullReviewComments?: unknown[];
   counts?: {
     comments: number;
@@ -457,6 +459,11 @@ interface ItemContext {
     pullCommits?: number;
     pullCommitsHydrated?: number;
     pullCommitsTruncated?: boolean;
+    pullReviews?: number;
+    pullReviewsHydrated?: number;
+    pullReviewsTruncated?: boolean;
+    pullReviewsIncluded?: number;
+    pullReviewsFiltered?: number;
     pullReviewComments?: number;
     pullReviewCommentsHydrated?: number;
     pullReviewCommentsTruncated?: boolean;
@@ -2595,6 +2602,21 @@ function compactComment(value: unknown): unknown {
   };
 }
 
+function compactReview(value: unknown): unknown {
+  const review = asRecord(value);
+  return {
+    id: review.id,
+    author: login(review.user),
+    authorAssociation: normalizeAuthorAssociation(review.author_association),
+    state: review.state,
+    url: review.html_url,
+    createdAt: review.submitted_at,
+    updatedAt: review.submitted_at,
+    submittedAt: review.submitted_at,
+    body: truncateText(review.body, 6000),
+  };
+}
+
 const CLAWSWEEPER_BOT_AUTHORS = new Set(
   [
     "clawsweeper",
@@ -2906,6 +2928,7 @@ function compactPullRequest(value: unknown): unknown {
     mergedAt: pull.merged_at,
     mergeCommitSha: pull.merge_commit_sha,
     mergeable: pull.mergeable,
+    mergeableState: pull.mergeable_state,
     author: login(pull.user),
     head: {
       ref: head.ref,
@@ -3014,6 +3037,7 @@ function collectRelatedMentions(options: {
   comments: unknown[];
   timeline: unknown[];
   pullRequest?: unknown;
+  pullReviews?: unknown[];
   pullReviewComments?: unknown[];
 }): Map<number, string[]> {
   const mentions = new Map<number, string[]>();
@@ -3045,6 +3069,10 @@ function collectRelatedMentions(options: {
 
   options.pullReviewComments?.forEach((comment, index) => {
     scanText(asRecord(comment).body, `pull review comment ${index + 1}`);
+  });
+
+  options.pullReviews?.forEach((review, index) => {
+    scanText(asRecord(review).body, `pull review ${index + 1}`);
   });
 
   if (options.pullRequest) {
@@ -3572,6 +3600,7 @@ function relatedItemsContext(options: {
   comments: unknown[];
   timeline: unknown[];
   pullRequest?: unknown;
+  pullReviews?: unknown[];
   pullReviewComments?: unknown[];
 }): unknown[] {
   const mentions = collectRelatedMentions(options);
@@ -5183,6 +5212,8 @@ function collectItemContext(
   };
   if (previousClawSweeperReview) context.previousClawSweeperReview = previousClawSweeperReview;
   let pullRequest: unknown = null;
+  let pullReviews: unknown[] | null = null;
+  let filteredPullReviews: { included: unknown[]; filtered: number } | null = null;
   let pullReviewComments: unknown[] | null = null;
   let filteredPullReviewComments: { included: unknown[]; filtered: number } | null = null;
   if (item.kind === "issue") {
@@ -5218,6 +5249,12 @@ function collectItemContext(
       80,
     );
     const pullCommits = pullCommitsWindow.items;
+    const pullReviewsWindow = ghPagedLinkHeaderContextWindow<unknown>(
+      `repos/${targetRepo()}/pulls/${item.number}/reviews`,
+      40,
+    );
+    pullReviews = pullReviewsWindow.items;
+    filteredPullReviews = filterReviewContextComments(pullReviews, item.number);
     const pullReviewCommentsWindow = ghPagedContextWindow<unknown>(
       `repos/${targetRepo()}/pulls/${item.number}/comments`,
       pullRecord.review_comments,
@@ -5232,6 +5269,12 @@ function collectItemContext(
       pullCommitsWindow.total,
       80,
       compactPullCommit,
+    );
+    context.pullReviews = compactMappedWindow(
+      filteredPullReviews.included,
+      filteredPullReviews.included.length,
+      40,
+      compactReview,
     );
     context.pullReviewComments = compactMappedWindow(
       filteredPullReviewComments.included,
@@ -5255,6 +5298,11 @@ function collectItemContext(
       pullCommits: pullCommitsWindow.total,
       pullCommitsHydrated: pullCommitsWindow.hydrated,
       pullCommitsTruncated: pullCommitsWindow.truncated,
+      pullReviews: pullReviewsWindow.total,
+      pullReviewsHydrated: pullReviewsWindow.hydrated,
+      pullReviewsTruncated: pullReviewsWindow.truncated,
+      pullReviewsIncluded: filteredPullReviews.included.length,
+      pullReviewsFiltered: filteredPullReviews.filtered,
       pullReviewComments: pullReviewCommentsWindow.total,
       pullReviewCommentsHydrated: pullReviewCommentsWindow.hydrated,
       pullReviewCommentsTruncated: pullReviewCommentsWindow.truncated,
@@ -5273,6 +5321,7 @@ function collectItemContext(
     timeline: relationTimeline,
   };
   if (pullRequest) relatedOptions.pullRequest = pullRequest;
+  if (filteredPullReviews) relatedOptions.pullReviews = filteredPullReviews.included;
   if (filteredPullReviewComments)
     relatedOptions.pullReviewComments = filteredPullReviewComments.included;
   const relatedItems = relatedItemsContext(relatedOptions);
@@ -5301,6 +5350,15 @@ function collectItemContext(
       counts.pullCommitsHydrated = context.counts.pullCommitsHydrated;
     if (context.counts?.pullCommitsTruncated !== undefined)
       counts.pullCommitsTruncated = context.counts.pullCommitsTruncated;
+    if (context.counts?.pullReviews !== undefined) counts.pullReviews = context.counts.pullReviews;
+    if (context.counts?.pullReviewsHydrated !== undefined)
+      counts.pullReviewsHydrated = context.counts.pullReviewsHydrated;
+    if (context.counts?.pullReviewsTruncated !== undefined)
+      counts.pullReviewsTruncated = context.counts.pullReviewsTruncated;
+    if (context.counts?.pullReviewsIncluded !== undefined)
+      counts.pullReviewsIncluded = context.counts.pullReviewsIncluded;
+    if (context.counts?.pullReviewsFiltered !== undefined)
+      counts.pullReviewsFiltered = context.counts.pullReviewsFiltered;
     if (context.counts?.pullReviewComments !== undefined)
       counts.pullReviewComments = context.counts.pullReviewComments;
     if (context.counts?.pullReviewCommentsHydrated !== undefined)
@@ -9839,6 +9897,11 @@ interface PullRequestClosePromotion {
   closeComment: string;
 }
 
+interface PullRequestClosePromotionResult {
+  promotion: PullRequestClosePromotion | null;
+  checkedLinkedSupersession: boolean;
+}
+
 interface HydratedSupersessionPullRequest {
   number: number;
   title: string;
@@ -9850,8 +9913,15 @@ interface HydratedSupersessionPullRequest {
   headSha: string | null;
   updatedAt: string | null;
   filePaths: string[];
+  files: unknown[];
   filesHydrated: number;
   filesTruncated: boolean;
+  comments: unknown[];
+  commentsTruncated: boolean;
+  reviews: unknown[];
+  reviewsTruncated: boolean;
+  reviewComments: unknown[];
+  reviewCommentsTruncated: boolean;
 }
 
 type SupersessionProofDecision = "close" | "link_only" | "keep_open";
@@ -9866,6 +9936,10 @@ interface SupersessionProof {
   reason: string;
   replacementUrl: string;
   replacementStateText: string;
+  replacementState: string;
+  replacementMergedAt: string | null;
+  replacementHeadSha: string | null;
+  replacementUpdatedAt: string | null;
 }
 
 interface SupersessionProofRuntime {
@@ -9911,6 +9985,7 @@ function closePromotionHasNonAutomationActivityAfterReview(
   if (
     context.counts?.commentsTruncated ||
     context.counts?.timelineTruncated ||
+    context.counts?.pullReviewsTruncated ||
     context.counts?.pullReviewCommentsTruncated
   ) {
     return true;
@@ -9931,6 +10006,7 @@ function closePromotionHasNonAutomationActivityAfterReview(
   };
   return (
     context.comments.some(hasNonAutomationComment) ||
+    (context.pullReviews ?? []).some(hasNonAutomationComment) ||
     (context.pullReviewComments ?? []).some(hasNonAutomationComment) ||
     context.timeline.some(hasNonAutomationEvent)
   );
@@ -10062,9 +10138,22 @@ function sourcePullRequestHasSecuritySignal(
   context: ItemContext,
   markdown: string,
 ): boolean {
+  if (reportSecurityReview(markdown).status === "needs_attention") return true;
+  if (
+    mergeRiskLabelsFromReport(markdown).some(
+      (label) =>
+        label === "merge-risk: 🚨 security-boundary" || label === "merge-risk: 🚨 auth-provider",
+    )
+  ) {
+    return true;
+  }
   return hasSecuritySignal({
     labels: labelRecords(item.labels),
-    comments: [...context.comments, ...(context.pullReviewComments ?? [])],
+    comments: [
+      ...context.comments,
+      ...(context.pullReviews ?? []),
+      ...(context.pullReviewComments ?? []),
+    ],
     text: [
       context.issue,
       context.pullRequest,
@@ -10091,8 +10180,15 @@ function hydratedSourceSupersessionPullRequest(
     headSha: stringOrUndefined(asRecord(pull.head).sha) ?? null,
     updatedAt: item.updatedAt,
     filePaths: uniqueFilePaths(pullRequestFilePathsFromContext(context)),
+    files: context.pullFiles ?? [],
     filesHydrated: context.counts?.pullFilesHydrated ?? context.pullFiles?.length ?? 0,
     filesTruncated: Boolean(context.counts?.pullFilesTruncated),
+    comments: context.comments,
+    commentsTruncated: Boolean(context.counts?.commentsTruncated),
+    reviews: context.pullReviews ?? [],
+    reviewsTruncated: Boolean(context.counts?.pullReviewsTruncated),
+    reviewComments: context.pullReviewComments ?? [],
+    reviewCommentsTruncated: Boolean(context.counts?.pullReviewCommentsTruncated),
   };
 }
 
@@ -10106,6 +10202,20 @@ function hydrateReplacementSupersessionPullRequest(
     `repos/${targetRepo()}/pulls/${number}/files`,
     changedFiles,
     80,
+  );
+  const commentsWindow = ghPagedContextWindow<unknown>(
+    `repos/${targetRepo()}/issues/${number}/comments`,
+    numberOrUndefined(issue.comments),
+    40,
+  );
+  const reviewCommentsWindow = ghPagedContextWindow<unknown>(
+    `repos/${targetRepo()}/pulls/${number}/comments`,
+    numberOrUndefined(pull.review_comments),
+    40,
+  );
+  const reviewsWindow = ghPagedLinkHeaderContextWindow<unknown>(
+    `repos/${targetRepo()}/pulls/${number}/reviews`,
+    40,
   );
   return {
     number,
@@ -10121,8 +10231,15 @@ function hydrateReplacementSupersessionPullRequest(
     headSha: stringOrUndefined(asRecord(pull.head).sha) ?? null,
     updatedAt: stringOrUndefined(pull.updated_at) ?? stringOrUndefined(issue.updated_at) ?? null,
     filePaths: uniqueFilePaths(filesWindow.items.flatMap(compactPullFilePaths)),
+    files: filesWindow.items,
     filesHydrated: filesWindow.hydrated,
     filesTruncated: filesWindow.truncated,
+    comments: commentsWindow.items,
+    commentsTruncated: commentsWindow.truncated,
+    reviews: reviewsWindow.items,
+    reviewsTruncated: reviewsWindow.truncated,
+    reviewComments: reviewCommentsWindow.items,
+    reviewCommentsTruncated: reviewCommentsWindow.truncated,
   };
 }
 
@@ -10140,6 +10257,12 @@ function supersessionReplacementStateText(
   return replacement.mergedAt
     ? `merged at ${replacement.mergedAt}`
     : "still open as the candidate replacement";
+}
+
+function supersessionReplacementCanClose(
+  replacement: Pick<HydratedSupersessionPullRequest, "state" | "mergedAt">,
+): boolean {
+  return replacement.state === "open" || Boolean(replacement.mergedAt);
 }
 
 function linkOnlySupersessionProof(options: {
@@ -10166,6 +10289,10 @@ function linkOnlySupersessionProof(options: {
     replacementStateText: options.replacement
       ? supersessionReplacementStateText(options.replacement)
       : "candidate replacement",
+    replacementState: options.replacement?.state ?? "",
+    replacementMergedAt: options.replacement?.mergedAt ?? null,
+    replacementHeadSha: options.replacement?.headSha ?? null,
+    replacementUpdatedAt: options.replacement?.updatedAt ?? null,
   };
 }
 
@@ -10238,6 +10365,7 @@ function runSupersessionProofModel(options: {
     reportMarkdown: options.markdown,
   });
   writeFileSync(promptPath, prompt, "utf8");
+  if (existsSync(outputPath)) unlinkSync(outputPath);
   const codexConfig = [
     `model_reasoning_effort="${options.runtime.reasoningEffort}"`,
     'forced_login_method="api"',
@@ -10280,6 +10408,19 @@ function runSupersessionProofModel(options: {
     );
   }
   if (result.status !== 0) {
+    if (existsSync(outputPath)) {
+      try {
+        return readSupersessionProofModelOutput(outputPath);
+      } catch (error) {
+        throw new Error(
+          `Codex supersession proof failed for #${options.source.number} with exit ${
+            result.status ?? "unknown"
+          } and wrote invalid JSON or schema-invalid output to ${outputPath}: ${
+            error instanceof Error ? error.message : String(error)
+          }.\n${safeOutputTail(result.stderr) || safeOutputTail(result.stdout) || "No output."}`,
+        );
+      }
+    }
     throw new Error(
       `Codex supersession proof failed for #${options.source.number} with exit ${
         result.status ?? "unknown"
@@ -10289,6 +10430,10 @@ function runSupersessionProofModel(options: {
   if (!existsSync(outputPath)) {
     throw new Error(`Codex supersession proof did not write ${outputPath}.`);
   }
+  return readSupersessionProofModelOutput(outputPath);
+}
+
+function readSupersessionProofModelOutput(outputPath: string): SupersessionProofModelResult {
   return normalizedSupersessionProofModelResult(
     parseSupersessionProofModelResult(JSON.parse(readFileSync(outputPath, "utf8").trim())),
   );
@@ -10316,6 +10461,15 @@ function supersessionProof(options: {
       replacementNumber: options.linkedNumber,
       securityBlocked,
       reason: "replacement PR context could not be fetched",
+    });
+  }
+  if (!supersessionReplacementCanClose(replacement)) {
+    return linkOnlySupersessionProof({
+      source,
+      replacement,
+      replacementNumber: options.linkedNumber,
+      securityBlocked,
+      reason: "replacement PR is closed without being merged",
     });
   }
 
@@ -10346,6 +10500,19 @@ function supersessionProof(options: {
       replacementNumber: options.linkedNumber,
       securityBlocked,
       reason: "source or replacement file context is missing",
+    });
+  }
+
+  if (
+    supersessionProofViewContextTruncated(source) ||
+    supersessionProofViewContextTruncated(replacement)
+  ) {
+    return linkOnlySupersessionProof({
+      source,
+      replacement,
+      replacementNumber: options.linkedNumber,
+      securityBlocked,
+      reason: "source or replacement proof context is truncated",
     });
   }
 
@@ -10387,7 +10554,23 @@ function supersessionProof(options: {
     reason: modelProof.reason,
     replacementUrl: replacement.url,
     replacementStateText: supersessionReplacementStateText(replacement),
+    replacementState: replacement.state,
+    replacementMergedAt: replacement.mergedAt,
+    replacementHeadSha: replacement.headSha,
+    replacementUpdatedAt: replacement.updatedAt,
   };
+}
+
+function supersessionReplacementChangedAfterProof(
+  proof: SupersessionProof,
+  replacement: HydratedSupersessionPullRequest,
+): boolean {
+  return (
+    replacement.state !== proof.replacementState ||
+    replacement.mergedAt !== proof.replacementMergedAt ||
+    replacement.headSha !== proof.replacementHeadSha ||
+    replacement.updatedAt !== proof.replacementUpdatedAt
+  );
 }
 
 function recommendedPauseOrCloseOption(markdown: string): MergeRiskOption | null {
@@ -10462,6 +10645,30 @@ function linkedPullRequestSupersessionPromotion(
     runtime,
   });
   if (proof.decision !== "close") return { candidateFound: true, promotion: null };
+  const refreshed = fetchItem(item.number);
+  if (refreshed.state !== "open") return { candidateFound: true, promotion: null };
+  const refreshedContext = collectItemContext(refreshed.item, { fullTimelineForRelations: true });
+  if (refreshed.item.updatedAt !== item.updatedAt) {
+    return { candidateFound: true, promotion: null };
+  }
+  if (closePromotionHasNonAutomationActivityAfterReview(markdown, refreshedContext)) {
+    return { candidateFound: true, promotion: null };
+  }
+  if (itemSnapshotHash(refreshed.item, refreshedContext) !== itemSnapshotHash(item, context)) {
+    return { candidateFound: true, promotion: null };
+  }
+  let refreshedReplacement: HydratedSupersessionPullRequest;
+  try {
+    refreshedReplacement = hydrateReplacementSupersessionPullRequest(linkedPull.number);
+  } catch {
+    return { candidateFound: true, promotion: null };
+  }
+  if (supersessionReplacementChangedAfterProof(proof, refreshedReplacement)) {
+    return { candidateFound: true, promotion: null };
+  }
+  if (!supersessionReplacementCanClose(refreshedReplacement)) {
+    return { candidateFound: true, promotion: null };
+  }
   return {
     candidateFound: true,
     promotion: {
@@ -10485,23 +10692,34 @@ function pullRequestClosePromotion(
   context: ItemContext,
   staleMinAgeDays: number,
   runtime: SupersessionProofRuntime,
-): PullRequestClosePromotion | null {
-  if (item.kind !== "pull_request") return null;
-  if (frontMatterValue(markdown, "decision") !== "keep_open") return null;
-  if (frontMatterValue(markdown, "action_taken") !== "kept_open") return null;
-  if (frontMatterValue(markdown, "review_status") !== "complete") return null;
-  if (closePromotionHasNonAutomationActivityAfterReview(markdown, context)) return null;
+): PullRequestClosePromotionResult {
+  const noPromotion = {
+    promotion: null,
+    checkedLinkedSupersession: false,
+  };
+  if (item.kind !== "pull_request") return noPromotion;
+  if (frontMatterValue(markdown, "decision") !== "keep_open") return noPromotion;
+  if (frontMatterValue(markdown, "action_taken") !== "kept_open") return noPromotion;
+  if (frontMatterValue(markdown, "review_status") !== "complete") return noPromotion;
+  if (closePromotionHasNonAutomationActivityAfterReview(markdown, context)) return noPromotion;
   const linkedSupersession = linkedPullRequestSupersessionPromotion(
     markdown,
     item,
     context,
     runtime,
   );
-  if (linkedSupersession.candidateFound) return linkedSupersession.promotion;
-  return (
-    pauseOrClosePromotion(markdown, item, staleMinAgeDays) ??
-    staleFRatedPullRequestPromotion(markdown, item, staleMinAgeDays)
-  );
+  if (linkedSupersession.candidateFound) {
+    return {
+      promotion: linkedSupersession.promotion,
+      checkedLinkedSupersession: true,
+    };
+  }
+  return {
+    promotion:
+      pauseOrClosePromotion(markdown, item, staleMinAgeDays) ??
+      staleFRatedPullRequestPromotion(markdown, item, staleMinAgeDays),
+    checkedLinkedSupersession: false,
+  };
 }
 
 function workPlanPathForReport(file: string, plansDir = defaultPlansDir()): string {
@@ -11019,6 +11237,15 @@ function reviewContextLedger(context: ItemContext): ReviewContextLedgerEntry[] {
       total: counts?.pullCommits,
       hydrated: counts?.pullCommitsHydrated,
       truncated: counts?.pullCommitsTruncated,
+    }),
+    reviewContextLedgerEntry({
+      section: "pullReviews",
+      label: "PR reviews",
+      value: context.pullReviews ?? [],
+      entries: arrayEntries(context.pullReviews),
+      total: counts?.pullReviews,
+      hydrated: counts?.pullReviewsHydrated,
+      truncated: counts?.pullReviewsTruncated,
     }),
     reviewContextLedgerEntry({
       section: "pullReviewComments",
@@ -12869,6 +13096,12 @@ ${options.action.closeComment ? options.action.closeComment : "_No close comment
     options.context.counts?.pullCommitsHydrated,
     options.context.counts?.pullCommitsTruncated,
   )}
+- PR reviews: ${contextCountText(
+    options.context.counts?.pullReviews,
+    options.context.pullReviews?.length ?? 0,
+    options.context.counts?.pullReviewsHydrated,
+    options.context.counts?.pullReviewsTruncated,
+  )}
 - PR review comments: ${contextCountText(
     options.context.counts?.pullReviewComments,
     options.context.pullReviewComments?.length ?? 0,
@@ -13582,24 +13815,36 @@ async function applyDecisionsCommand(args: Args): Promise<void> {
       action === "kept_open"
     ) {
       const promotionContext = currentItemContext();
-      const promotion = pullRequestClosePromotion(
+      const promotionResult = pullRequestClosePromotion(
         markdown,
         item,
         promotionContext,
         staleMinAgeDays,
         supersessionProofRuntime,
       );
-      if (promotion) {
+      if (promotionResult.promotion) {
         markdown = upgradePullRequestClosePromotionReport(
           markdown,
           item,
           promotionContext,
-          promotion,
+          promotionResult.promotion,
         );
         storedUpdatedAt = item.updatedAt;
         storedHash = itemSnapshotHash(item, promotionContext);
         closeReason = "duplicate_or_superseded";
         isCloseProposal = true;
+      } else if (promotionResult.checkedLinkedSupersession) {
+        markdown = replaceFrontMatterValue(markdown, "apply_checked_at", new Date().toISOString());
+        if (!dryRun) writeFileSync(path, markdown, "utf8");
+        results.push({
+          number,
+          action: "kept_open",
+          reason: "linked supersession proof did not allow close",
+        });
+        processedCount += 1;
+        maybeLogProgress(`kept open #${number}: linked supersession proof did not allow close`);
+        if (processedCount >= processedLimit) break;
+        continue;
       }
     }
     let currentPrStatusKind: PrStatusLabelKind | null = null;

@@ -136,8 +136,65 @@ test("superseded source closeout uses general proof instead of patch-line matchi
 
   assert.match(helper, /replacementCloseoutProofPromptPath/);
   assert.match(helper, /compactSupersessionProofView/);
+  assert.match(helper, /pullRequestReviewContextBlockReason/);
+  assert.match(helper, /reviews: sourceView\.reviews/);
+  assert.match(helper, /pullRequestReviewCommentContextBlockReason/);
+  assert.match(helper, /reviewComments: sourceView\.reviewComments/);
   assert.match(sharedProofSource, /export function proofBodyExcerpt/);
   assert.doesNotMatch(helper, /patchSignature/);
+});
+
+test("replacement closeout proof uses a read-only Codex sandbox", () => {
+  const sourcePath = path.join(process.cwd(), "src/repair/execute-fix-artifact.ts");
+  const source = fs.readFileSync(sourcePath, "utf8");
+  const helperStart = source.indexOf("function replacementCloseoutProofAllowsClose(");
+  const helperEnd = source.indexOf("function linkReplacementSourcePr(", helperStart);
+  assert.notEqual(helperStart, -1);
+  assert.notEqual(helperEnd, -1);
+  const helper = source.slice(helperStart, helperEnd);
+
+  assert.match(source, /const replacementCloseoutProofSandbox = "read-only"/);
+  assert.match(helper, /"--sandbox",\s*replacementCloseoutProofSandbox/);
+  assert.doesNotMatch(helper, /"--sandbox",\s*codexReviewSandbox/);
+});
+
+test("replacement closeout proof accepts written output after nonzero Codex exit", () => {
+  const sourcePath = path.join(process.cwd(), "src/repair/execute-fix-artifact.ts");
+  const source = fs.readFileSync(sourcePath, "utf8");
+  const helperStart = source.indexOf("function replacementCloseoutProofAllowsClose(");
+  const helperEnd = source.indexOf("function linkReplacementSourcePr(", helperStart);
+  assert.notEqual(helperStart, -1);
+  assert.notEqual(helperEnd, -1);
+  const helper = source.slice(helperStart, helperEnd);
+  const statusIndex = helper.indexOf("if (child.status !== 0)");
+  const missingOutputIndex = helper.indexOf("if (!fs.existsSync(outputPath))");
+  assert.notEqual(statusIndex, -1);
+  assert.notEqual(missingOutputIndex, -1);
+  const nonzeroStatusBlock = helper.slice(statusIndex, missingOutputIndex);
+
+  assert.match(nonzeroStatusBlock, /fs\.existsSync\(outputPath\)/);
+  assert.match(nonzeroStatusBlock, /replacementCloseoutProofDecisionFromOutput\(outputPath\)/);
+});
+
+test("replacement closeout proof removes stale output before Codex runs", () => {
+  const sourcePath = path.join(process.cwd(), "src/repair/execute-fix-artifact.ts");
+  const source = fs.readFileSync(sourcePath, "utf8");
+  const helperStart = source.indexOf("function replacementCloseoutProofAllowsClose(");
+  const helperEnd = source.indexOf("function linkReplacementSourcePr(", helperStart);
+  assert.notEqual(helperStart, -1);
+  assert.notEqual(helperEnd, -1);
+  const helper = source.slice(helperStart, helperEnd);
+  const outputPathIndex = helper.indexOf("const outputPath =");
+  const spawnIndex = helper.indexOf("spawnCodexSyncWithHeartbeat(");
+  const unlinkIndex = helper.indexOf("fs.unlinkSync(outputPath)");
+
+  assert.notEqual(outputPathIndex, -1);
+  assert.notEqual(spawnIndex, -1);
+  assert.notEqual(unlinkIndex, -1);
+  assert.ok(
+    outputPathIndex < unlinkIndex && unlinkIndex < spawnIndex,
+    "stale replacement proof output must be removed before Codex can fail without writing",
+  );
 });
 
 test("source PR view hydrates labels comments and files for replacement closeout", () => {
@@ -151,6 +208,12 @@ test("source PR view hydrates labels comments and files for replacement closeout
 
   assert.match(
     helper,
-    /author,state,mergedAt,title,url,body,labels,comments,files,headRefOid,updatedAt/,
+    /author,state,mergedAt,title,url,body,labels,changedFiles,headRefOid,updatedAt/,
   );
+  assert.match(helper, /repos\/\$\{repo\}\/pulls\/\$\{number\}\/files\?per_page=100/);
+  assert.match(helper, /repos\/\$\{repo\}\/issues\/\$\{number\}\/comments\?per_page=100/);
+  assert.match(helper, /repos\/\$\{repo\}\/pulls\/\$\{number\}\/reviews\?per_page=100/);
+  assert.match(helper, /commentsTruncated/);
+  assert.match(helper, /reviewsTruncated/);
+  assert.match(helper, /filesTruncated/);
 });

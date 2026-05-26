@@ -1815,6 +1815,13 @@ jobs:
         with:
           build-script: build:all
 
+      - uses: ./.github/actions/setup-codex
+        if: ${{ !((github.event_name == 'repository_dispatch' && github.event.action == 'clawsweeper_hatch') || (github.event_name == 'workflow_dispatch' && github.event.inputs.apply_sync_comments_only == 'true') || (github.event_name == 'schedule' && github.event.schedule == '6,21,36,51 * * * *')) }}
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        with:
+          login-status: "true"
+
       - name: Sync before applying decisions
         run: git pull --rebase
 

@@ -11,6 +11,8 @@ type ApplyAction = {
   action: string;
 };
 
+const LINKED_SUPERSESSION_RECHECK_MS = 6 * 60 * 60 * 1000;
+
 const args = parseArgs(process.argv.slice(2));
 
 if (isCliEntrypoint()) runCli();
@@ -302,6 +304,11 @@ export function proposedItemNumbers(options: ProposedItemOptions): number[] {
       if (repoFor(markdown, name) !== options.targetRepo) return [];
       const type = frontMatterValue(markdown, "type");
       if (options.applyKind !== "all" && type && type !== options.applyKind) return [];
+      if (
+        linkedSupersessionApplyCandidate(markdown, options, allowedReasons, allowedCloseReasons)
+      ) {
+        return [numberFor(name)];
+      }
       if (frontMatterValue(markdown, "decision") !== "close") return [];
       if (frontMatterValue(markdown, "confidence") !== "high") return [];
       if (frontMatterValue(markdown, "action_taken") !== "proposed_close") return [];
@@ -321,6 +328,44 @@ export function proposedItemNumbers(options: ProposedItemOptions): number[] {
       return [numberFor(name)];
     })
     .sort((left, right) => left - right);
+}
+
+function linkedSupersessionApplyCandidate(
+  markdown: string,
+  options: ProposedItemOptions,
+  allowedReasons: ReadonlySet<string>,
+  allowedCloseReasons: ReadonlySet<string> | null,
+): boolean {
+  const type = frontMatterValue(markdown, "type");
+  const reason = "duplicate_or_superseded";
+  if (type !== "pull_request") return false;
+  if (frontMatterValue(markdown, "decision") !== "keep_open") return false;
+  if (frontMatterValue(markdown, "confidence") !== "high") return false;
+  if (frontMatterValue(markdown, "action_taken") !== "kept_open") return false;
+  if (frontMatterValue(markdown, "review_status") !== "complete") return false;
+  if (!frontMatterValue(markdown, "item_snapshot_hash")) return false;
+  if (!allowedForTarget(options.targetRepo, type, reason, allowedReasons)) return false;
+  if (allowedCloseReasons && !allowedCloseReasons.has(reason)) return false;
+  if (!olderThan(frontMatterValue(markdown, "item_created_at"), minAgeMsFor(options))) return false;
+  const lastCheckedAt = frontMatterValue(markdown, "apply_checked_at");
+  if (lastCheckedAt && !olderThan(lastCheckedAt, LINKED_SUPERSESSION_RECHECK_MS)) return false;
+  return hasLinkedSupersessionSignal(markdown, options.targetRepo);
+}
+
+function minAgeMsFor(options: ProposedItemOptions): number {
+  return options.minAgeMinutes === null
+    ? options.minAgeDays * 24 * 60 * 60 * 1000
+    : options.minAgeMinutes * 60 * 1000;
+}
+
+function hasLinkedSupersessionSignal(markdown: string, targetRepo: string): boolean {
+  const escapedRepo = targetRepo.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const linkedPull = new RegExp(`https://github\\.com/${escapedRepo}/pull/\\d+\\b`, "i");
+  const supersessionSignal =
+    /\b(supersed(?:e|ed|es|ing)|replace(?:s|d|ment)?|duplicate|duplicated|canonical|covered by|landed in)\b/i;
+  return markdown
+    .split(/\r?\n/)
+    .some((line) => linkedPull.test(line) && supersessionSignal.test(line));
 }
 
 export function commentSyncBatchOutput(options: CommentSyncBatchOptions): Record<string, string> {

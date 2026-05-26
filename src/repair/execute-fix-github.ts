@@ -31,6 +31,16 @@ export function fetchPullRequest(repo: string, number: JsonValue): LooseRecord {
   );
 }
 
+function fetchIssue(repo: string, number: JsonValue): LooseRecord {
+  return JSON.parse(
+    run("gh", ["api", `repos/${repo}/issues/${number}`], {
+      cwd: repoRoot(),
+      env: ghEnv(),
+      timeoutMs: ghCommandTimeoutMs,
+    }),
+  );
+}
+
 export function fetchSourcePullRequestView({
   repo,
   number,
@@ -40,7 +50,7 @@ export function fetchSourcePullRequestView({
   number: JsonValue;
   targetDir: string;
 }): LooseRecord {
-  return JSON.parse(
+  const view = JSON.parse(
     run(
       "gh",
       [
@@ -50,7 +60,7 @@ export function fetchSourcePullRequestView({
         "--repo",
         repo,
         "--json",
-        "author,state,mergedAt,title,url,body,labels,comments,files,headRefOid,updatedAt",
+        "author,state,mergedAt,title,url,body,labels,changedFiles,headRefOid,updatedAt",
       ],
       {
         cwd: targetDir,
@@ -59,19 +69,202 @@ export function fetchSourcePullRequestView({
       },
     ),
   );
+  const pull = fetchPullRequest(repo, number);
+  const issue = fetchIssue(repo, number);
+  const changedFiles = finiteNumber(pull.changed_files) ?? finiteNumber(view.changedFiles);
+  const issueCommentCount = finiteNumber(issue.comments);
+  const reviewCommentCount = finiteNumber(pull.review_comments);
+  const files = fetchPullRequestFiles({ repo, number, targetDir });
+  const comments = fetchIssueComments({ repo, number, targetDir });
+  const reviews = fetchPullRequestReviews({ repo, number, targetDir });
+  const reviewComments = fetchPullRequestReviewComments({ repo, number, targetDir });
+  return pullRequestViewWithFileContext({
+    ...view,
+    changedFiles,
+    comments,
+    commentsTruncated: issueCommentCount !== null && issueCommentCount > comments.length,
+    files,
+    reviews,
+    reviewsTruncated: false,
+    reviewComments,
+    reviewCommentsTruncated:
+      reviewCommentCount !== null && reviewCommentCount > reviewComments.length,
+  });
 }
 
 export function sourcePullRequestSecurityBlockReason(view: LooseRecord): string {
   if (
     hasDeterministicSecuritySignal({
       labels: view.labels ?? [],
-      comments: view.comments ?? [],
+      comments: [
+        ...(Array.isArray(view.comments) ? view.comments : []),
+        ...(Array.isArray(view.reviews) ? view.reviews : []),
+        ...(Array.isArray(view.reviewComments) ? view.reviewComments : []),
+      ],
     }) ||
     hasSecuritySignalText(view.title ?? "", view.body ?? "")
   ) {
     return "security-sensitive source PR requires maintainer security review";
   }
   return "";
+}
+
+export function pullRequestFileContextBlockReason(view: LooseRecord): string {
+  if (!Array.isArray(view.files)) return "source or replacement PR file context is missing";
+  const changedFiles = finiteNumber(view.changedFiles);
+  const filesHydrated = finiteNumber(view.filesHydrated) ?? view.files.length;
+  if (view.filesTruncated === true || (changedFiles !== null && changedFiles > filesHydrated)) {
+    return "source or replacement PR file context is truncated";
+  }
+  return "";
+}
+
+export function pullRequestReviewCommentContextBlockReason(view: LooseRecord): string {
+  if (!Array.isArray(view.reviewComments)) {
+    return "source or replacement PR review comment context is missing";
+  }
+  if (view.reviewCommentsTruncated === true) {
+    return "source or replacement PR review comment context is truncated";
+  }
+  return "";
+}
+
+export function pullRequestReviewContextBlockReason(view: LooseRecord): string {
+  if (!Array.isArray(view.reviews)) {
+    return "source or replacement PR review context is missing";
+  }
+  if (view.reviewsTruncated === true) {
+    return "source or replacement PR review context is truncated";
+  }
+  return "";
+}
+
+export function pullRequestIssueCommentContextBlockReason(view: LooseRecord): string {
+  if (!Array.isArray(view.comments)) {
+    return "source or replacement PR comment context is missing";
+  }
+  if (view.commentsTruncated === true) {
+    return "source or replacement PR comment context is truncated";
+  }
+  return "";
+}
+
+export function pullRequestCloseoutDriftBlockReason(
+  beforeProof: LooseRecord,
+  afterProof: LooseRecord,
+  subject = "source PR",
+): string {
+  if (String(afterProof.state ?? "") !== String(beforeProof.state ?? "")) {
+    return `${subject} changed during replacement closeout proof`;
+  }
+  if (String(afterProof.updatedAt ?? "") !== String(beforeProof.updatedAt ?? "")) {
+    return `${subject} changed during replacement closeout proof`;
+  }
+  if (String(afterProof.headRefOid ?? "") !== String(beforeProof.headRefOid ?? "")) {
+    return `${subject} changed during replacement closeout proof`;
+  }
+  const securityBlock = sourcePullRequestSecurityBlockReason(afterProof);
+  if (securityBlock) return securityBlock;
+  return (
+    pullRequestFileContextBlockReason(afterProof) ||
+    pullRequestIssueCommentContextBlockReason(afterProof) ||
+    pullRequestReviewContextBlockReason(afterProof) ||
+    pullRequestReviewCommentContextBlockReason(afterProof)
+  );
+}
+
+function pullRequestViewWithFileContext(view: LooseRecord): LooseRecord {
+  const files = Array.isArray(view.files) ? view.files : [];
+  const changedFiles = finiteNumber(view.changedFiles);
+  return {
+    ...view,
+    filesHydrated: files.length,
+    filesTruncated: changedFiles !== null && changedFiles > files.length,
+  };
+}
+
+function fetchPullRequestReviewComments({
+  repo,
+  number,
+  targetDir,
+}: {
+  repo: string;
+  number: JsonValue;
+  targetDir: string;
+}): JsonValue[] {
+  const value = JSON.parse(
+    run("gh", ["api", `repos/${repo}/pulls/${number}/comments?per_page=100`], {
+      cwd: targetDir,
+      env: ghEnv(),
+      timeoutMs: ghCommandTimeoutMs,
+    }),
+  );
+  return Array.isArray(value) ? value : [];
+}
+
+function fetchPullRequestReviews({
+  repo,
+  number,
+  targetDir,
+}: {
+  repo: string;
+  number: JsonValue;
+  targetDir: string;
+}): JsonValue[] {
+  const value = JSON.parse(
+    run(
+      "gh",
+      ["api", `repos/${repo}/pulls/${number}/reviews?per_page=100`, "--paginate", "--slurp"],
+      {
+        cwd: targetDir,
+        env: ghEnv(),
+        timeoutMs: ghCommandTimeoutMs,
+      },
+    ),
+  );
+  return Array.isArray(value) ? value.flatMap((page) => (Array.isArray(page) ? page : [])) : [];
+}
+
+function fetchIssueComments({
+  repo,
+  number,
+  targetDir,
+}: {
+  repo: string;
+  number: JsonValue;
+  targetDir: string;
+}): JsonValue[] {
+  const value = JSON.parse(
+    run("gh", ["api", `repos/${repo}/issues/${number}/comments?per_page=100`], {
+      cwd: targetDir,
+      env: ghEnv(),
+      timeoutMs: ghCommandTimeoutMs,
+    }),
+  );
+  return Array.isArray(value) ? value : [];
+}
+
+function fetchPullRequestFiles({
+  repo,
+  number,
+  targetDir,
+}: {
+  repo: string;
+  number: JsonValue;
+  targetDir: string;
+}): JsonValue[] {
+  const value = JSON.parse(
+    run("gh", ["api", `repos/${repo}/pulls/${number}/files?per_page=100`], {
+      cwd: targetDir,
+      env: ghEnv(),
+      timeoutMs: ghCommandTimeoutMs,
+    }),
+  );
+  return Array.isArray(value) ? value : [];
+}
+
+function finiteNumber(value: JsonValue): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
 export function sourceClosingReferences({

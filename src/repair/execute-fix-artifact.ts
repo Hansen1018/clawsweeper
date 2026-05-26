@@ -109,6 +109,11 @@ import {
   fetchSourcePullRequestView,
   prepareReviewThreadsForMerge,
   publicContributorCredit,
+  pullRequestCloseoutDriftBlockReason,
+  pullRequestFileContextBlockReason,
+  pullRequestIssueCommentContextBlockReason,
+  pullRequestReviewContextBlockReason,
+  pullRequestReviewCommentContextBlockReason,
   sourceClosingReferences,
   sourceContributorCredits,
   sourcePullRequestSecurityBlockReason,
@@ -119,6 +124,7 @@ import {
   compactSupersessionProofView,
   parseSupersessionProofModelResult,
   supersessionProofCloseDecision,
+  supersessionProofViewContextTruncated,
 } from "../supersession-proof.js";
 
 const FIX_ACTIONS = new Set(["fix_needed", "build_fix_artifact", "open_fix_pr"]);
@@ -213,6 +219,7 @@ const defaultCodexReviewSandbox =
 const codexReviewSandbox = String(
   process.env.CLAWSWEEPER_CODEX_REVIEW_SANDBOX ?? defaultCodexReviewSandbox,
 );
+const replacementCloseoutProofSandbox = "read-only";
 const codexWriteNetworkAccess = parseBooleanEnv(
   process.env.CLAWSWEEPER_CODEX_WRITE_NETWORK_ACCESS,
   process.env.GITHUB_ACTIONS === "true",
@@ -1747,8 +1754,86 @@ function replacementCloseoutProofAllowsClose({
   replacementPrUrl,
   provenance,
 }: LooseRecord) {
-  if (!Array.isArray(sourceView.files) || !Array.isArray(replacementView.files)) {
-    return { close: false, reason: "source or replacement PR file context is missing" };
+  const sourceFileContextBlock = pullRequestFileContextBlockReason(sourceView);
+  if (sourceFileContextBlock) return { close: false, reason: sourceFileContextBlock };
+  const replacementFileContextBlock = pullRequestFileContextBlockReason(replacementView);
+  if (replacementFileContextBlock) return { close: false, reason: replacementFileContextBlock };
+  const sourceIssueCommentContextBlock = pullRequestIssueCommentContextBlockReason(sourceView);
+  if (sourceIssueCommentContextBlock) {
+    return { close: false, reason: sourceIssueCommentContextBlock };
+  }
+  const replacementIssueCommentContextBlock =
+    pullRequestIssueCommentContextBlockReason(replacementView);
+  if (replacementIssueCommentContextBlock) {
+    return { close: false, reason: replacementIssueCommentContextBlock };
+  }
+  const sourceReviewContextBlock = pullRequestReviewContextBlockReason(sourceView);
+  if (sourceReviewContextBlock) {
+    return { close: false, reason: sourceReviewContextBlock };
+  }
+  const replacementReviewContextBlock = pullRequestReviewContextBlockReason(replacementView);
+  if (replacementReviewContextBlock) {
+    return { close: false, reason: replacementReviewContextBlock };
+  }
+  const sourceReviewCommentContextBlock = pullRequestReviewCommentContextBlockReason(sourceView);
+  if (sourceReviewCommentContextBlock) {
+    return { close: false, reason: sourceReviewCommentContextBlock };
+  }
+  const replacementReviewCommentContextBlock =
+    pullRequestReviewCommentContextBlockReason(replacementView);
+  if (replacementReviewCommentContextBlock) {
+    return { close: false, reason: replacementReviewCommentContextBlock };
+  }
+  if (replacementView.state === "CLOSED" && !replacementView.mergedAt) {
+    return { close: false, reason: "replacement PR is closed without being merged" };
+  }
+  const sourceProofView = {
+    title: sourceView.title,
+    url: sourceView.url,
+    state: sourceView.state,
+    mergedAt: sourceView.mergedAt,
+    body: sourceView.body,
+    labels: sourceView.labels,
+    headRefOid: sourceView.headRefOid,
+    updatedAt: sourceView.updatedAt,
+    changedFiles: sourceView.changedFiles,
+    filePaths: compactSupersessionFilePaths(sourceView.files),
+    files: sourceView.files,
+    filesHydrated: sourceView.filesHydrated,
+    filesTruncated: sourceView.filesTruncated,
+    comments: sourceView.comments,
+    commentsTruncated: sourceView.commentsTruncated,
+    reviews: sourceView.reviews,
+    reviewsTruncated: sourceView.reviewsTruncated,
+    reviewComments: sourceView.reviewComments,
+    reviewCommentsTruncated: sourceView.reviewCommentsTruncated,
+  };
+  const replacementProofView = {
+    title: replacementView.title,
+    url: replacementView.url,
+    state: replacementView.state,
+    mergedAt: replacementView.mergedAt,
+    body: replacementView.body,
+    labels: replacementView.labels,
+    headRefOid: replacementView.headRefOid,
+    updatedAt: replacementView.updatedAt,
+    changedFiles: replacementView.changedFiles,
+    filePaths: compactSupersessionFilePaths(replacementView.files),
+    files: replacementView.files,
+    filesHydrated: replacementView.filesHydrated,
+    filesTruncated: replacementView.filesTruncated,
+    comments: replacementView.comments,
+    commentsTruncated: replacementView.commentsTruncated,
+    reviews: replacementView.reviews,
+    reviewsTruncated: replacementView.reviewsTruncated,
+    reviewComments: replacementView.reviewComments,
+    reviewCommentsTruncated: replacementView.reviewCommentsTruncated,
+  };
+  if (
+    supersessionProofViewContextTruncated(sourceProofView) ||
+    supersessionProofViewContextTruncated(replacementProofView)
+  ) {
+    return { close: false, reason: "source or replacement proof context is truncated" };
   }
   const prompt = [
     fs.readFileSync(replacementCloseoutProofPromptPath, "utf8").trimEnd(),
@@ -1757,28 +1842,8 @@ function replacementCloseoutProofAllowsClose({
     "```json",
     JSON.stringify(
       {
-        sourcePrA: compactSupersessionProofView({
-          title: sourceView.title,
-          url: sourceView.url,
-          state: sourceView.state,
-          mergedAt: sourceView.mergedAt,
-          body: sourceView.body,
-          labels: sourceView.labels,
-          headRefOid: sourceView.headRefOid,
-          updatedAt: sourceView.updatedAt,
-          filePaths: compactSupersessionFilePaths(sourceView.files),
-        }),
-        replacementPrB: compactSupersessionProofView({
-          title: replacementView.title,
-          url: replacementView.url,
-          state: replacementView.state,
-          mergedAt: replacementView.mergedAt,
-          body: replacementView.body,
-          labels: replacementView.labels,
-          headRefOid: replacementView.headRefOid,
-          updatedAt: replacementView.updatedAt,
-          filePaths: compactSupersessionFilePaths(replacementView.files),
-        }),
+        sourcePrA: compactSupersessionProofView(sourceProofView),
+        replacementPrB: compactSupersessionProofView(replacementProofView),
         sourcePrUrl,
         replacementPrUrl,
         provenance,
@@ -1796,6 +1861,7 @@ function replacementCloseoutProofAllowsClose({
   const promptPath = path.join(proofDir, `${proofName}.prompt.md`);
   const outputPath = path.join(proofDir, `${proofName}.json`);
   fs.writeFileSync(promptPath, prompt);
+  if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
   const child = spawnCodexSyncWithHeartbeat(
     "replacement closeout proof",
     [
@@ -1803,8 +1869,8 @@ function replacementCloseoutProofAllowsClose({
       "-m",
       model,
       "--sandbox",
-      codexReviewSandbox,
-      ...codexReviewSandboxConfigArgs(),
+      replacementCloseoutProofSandbox,
+      ...codexWorkspaceSandboxConfigArgs(replacementCloseoutProofSandbox, codexReviewNetworkAccess),
       ...codexConfigArgs(),
       "-C",
       targetDir,
@@ -1827,20 +1893,29 @@ function replacementCloseoutProofAllowsClose({
     return { close: false, reason: `replacement closeout proof failed: ${child.error.message}` };
   }
   if (child.status !== 0) {
+    if (fs.existsSync(outputPath)) {
+      try {
+        return replacementCloseoutProofDecisionFromOutput(outputPath);
+      } catch {
+        return { close: false, reason: "replacement closeout proof output was invalid JSON" };
+      }
+    }
     return { close: false, reason: "replacement closeout proof failed" };
   }
   if (!fs.existsSync(outputPath)) {
     return { close: false, reason: "replacement closeout proof did not produce output" };
   }
-  let proofClose;
   try {
-    proofClose = supersessionProofCloseDecision(
-      parseSupersessionProofModelResult(JSON.parse(fs.readFileSync(outputPath, "utf8"))),
-    );
+    return replacementCloseoutProofDecisionFromOutput(outputPath);
   } catch {
     return { close: false, reason: "replacement closeout proof output was invalid JSON" };
   }
-  return proofClose;
+}
+
+function replacementCloseoutProofDecisionFromOutput(outputPath: string) {
+  return supersessionProofCloseDecision(
+    parseSupersessionProofModelResult(JSON.parse(fs.readFileSync(outputPath, "utf8"))),
+  );
 }
 
 function linkReplacementSourcePr({
@@ -1975,6 +2050,111 @@ function closeSupersededSourcePr({
         sourceView: view,
       }),
       reason: proof.reason,
+    };
+  }
+  let postProofView: LooseRecord;
+  try {
+    postProofView = fetchSourcePullRequestView({
+      repo: result.repo,
+      number: parsed.number,
+      targetDir,
+    });
+  } catch (error) {
+    return {
+      ...linkReplacementSourcePr({
+        source,
+        parsed,
+        replacementPrUrl,
+        targetDir,
+        contributorCredits,
+        provenance,
+        sourceView: view,
+      }),
+      reason: `source PR context could not be re-fetched after proof: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    };
+  }
+  if (postProofView.mergedAt || postProofView.state === "MERGED") {
+    return {
+      ...base,
+      status: "skipped",
+      reason: "already merged",
+      merged_at: postProofView.mergedAt ?? null,
+    };
+  }
+  if (postProofView.state === "CLOSED") {
+    return { ...base, status: "skipped", reason: "already closed" };
+  }
+  const postProofDriftBlock = pullRequestCloseoutDriftBlockReason(view, postProofView);
+  if (postProofDriftBlock) {
+    return {
+      ...linkReplacementSourcePr({
+        source,
+        parsed,
+        replacementPrUrl,
+        targetDir,
+        contributorCredits,
+        provenance,
+        sourceView: postProofView,
+      }),
+      reason: postProofDriftBlock,
+    };
+  }
+  let postProofReplacementView: LooseRecord;
+  try {
+    postProofReplacementView = fetchSourcePullRequestView({
+      repo: result.repo,
+      number: replacementNumber,
+      targetDir,
+    });
+  } catch (error) {
+    return {
+      ...linkReplacementSourcePr({
+        source,
+        parsed,
+        replacementPrUrl,
+        targetDir,
+        contributorCredits,
+        provenance,
+        sourceView: postProofView,
+      }),
+      reason: `replacement PR context could not be re-fetched after proof: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    };
+  }
+  const postProofReplacementDriftBlock = pullRequestCloseoutDriftBlockReason(
+    replacementView,
+    postProofReplacementView,
+    "replacement PR",
+  );
+  if (postProofReplacementDriftBlock) {
+    return {
+      ...linkReplacementSourcePr({
+        source,
+        parsed,
+        replacementPrUrl,
+        targetDir,
+        contributorCredits,
+        provenance,
+        sourceView: postProofView,
+      }),
+      reason: postProofReplacementDriftBlock,
+    };
+  }
+  if (postProofReplacementView.state === "CLOSED" && !postProofReplacementView.mergedAt) {
+    return {
+      ...linkReplacementSourcePr({
+        source,
+        parsed,
+        replacementPrUrl,
+        targetDir,
+        contributorCredits,
+        provenance,
+        sourceView: postProofView,
+      }),
+      reason: "replacement PR is closed without being merged",
     };
   }
 
