@@ -59,8 +59,14 @@ jobs:
 
       - name: Resolve target repository
         id: target
+        env:
+          TARGET_REPO_INPUT: ${{ github.event.inputs.target_repo || vars.CLAWSWEEPER_PROOF_NUDGES_TARGET_REPO || 'openclaw/openclaw' }}
         run: |
-          target_repo="${{ github.event.inputs.target_repo || vars.CLAWSWEEPER_PROOF_NUDGES_TARGET_REPO || 'openclaw/openclaw' }}"
+          target_repo="$TARGET_REPO_INPUT"
+          if [[ ! "$target_repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "::error::target_repo must be owner/repo with GitHub-safe characters"
+            exit 1
+          fi
           target_owner="${target_repo%%/*}"
           target_name="${target_repo#*/}"
           {
@@ -100,23 +106,37 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.target-proof-token.outputs.token }}
           TARGET_REPO: ${{ steps.target.outputs.target_repo }}
+          PROOF_NUDGES_EXECUTE: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.execute == 'true') || (github.event_name == 'schedule' && vars.CLAWSWEEPER_PROOF_NUDGES_EXECUTE == '1') }}
+          PROOF_NUDGES_ITEM_NUMBERS: ${{ github.event.inputs.item_numbers || '' }}
+          PROOF_NUDGES_LIMIT: ${{ github.event.inputs.limit || vars.CLAWSWEEPER_PROOF_NUDGES_LIMIT || '10' }}
+          PROOF_NUDGES_MIN_AGE_DAYS: ${{ github.event.inputs.min_age_days || vars.CLAWSWEEPER_PROOF_NUDGES_MIN_AGE_DAYS || '5' }}
+          PROOF_NUDGES_COOLDOWN_DAYS: ${{ github.event.inputs.cooldown_days || vars.CLAWSWEEPER_PROOF_NUDGES_COOLDOWN_DAYS || '7' }}
         run: |
           set -euo pipefail
-          execute="${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.execute == 'true') || (github.event_name == 'schedule' && vars.CLAWSWEEPER_PROOF_NUDGES_EXECUTE == '1') }}"
+          for numeric_input in PROOF_NUDGES_LIMIT PROOF_NUDGES_MIN_AGE_DAYS PROOF_NUDGES_COOLDOWN_DAYS; do
+            if [[ ! "${!numeric_input}" =~ ^[0-9]+$ ]]; then
+              echo "::error::$numeric_input must be a non-negative integer"
+              exit 1
+            fi
+          done
+
           execute_arg=()
-          if [ "$execute" = "true" ]; then
+          if [ "$PROOF_NUDGES_EXECUTE" = "true" ]; then
             execute_arg=(--execute)
           fi
-          item_numbers="${{ github.event.inputs.item_numbers || '' }}"
           item_numbers_arg=()
-          if [ -n "$item_numbers" ]; then
-            item_numbers_arg=(--item-numbers "$item_numbers")
+          if [ -n "$PROOF_NUDGES_ITEM_NUMBERS" ]; then
+            if [[ ! "$PROOF_NUDGES_ITEM_NUMBERS" =~ ^[0-9]+([[:space:]]*,[[:space:]]*[0-9]+)*$ ]]; then
+              echo "::error::item_numbers must be a comma-separated list of pull request numbers"
+              exit 1
+            fi
+            item_numbers_arg=(--item-numbers "$PROOF_NUDGES_ITEM_NUMBERS")
           fi
           pnpm run proof-nudges -- \
             --target-repo "$TARGET_REPO" \
-            --limit "${{ github.event.inputs.limit || vars.CLAWSWEEPER_PROOF_NUDGES_LIMIT || '10' }}" \
-            --min-age-days "${{ github.event.inputs.min_age_days || vars.CLAWSWEEPER_PROOF_NUDGES_MIN_AGE_DAYS || '5' }}" \
-            --cooldown-days "${{ github.event.inputs.cooldown_days || vars.CLAWSWEEPER_PROOF_NUDGES_COOLDOWN_DAYS || '7' }}" \
+            --limit "$PROOF_NUDGES_LIMIT" \
+            --min-age-days "$PROOF_NUDGES_MIN_AGE_DAYS" \
+            --cooldown-days "$PROOF_NUDGES_COOLDOWN_DAYS" \
             --report-path proof-nudge-report.json \
             "${item_numbers_arg[@]}" \
             "${execute_arg[@]}"
