@@ -100,6 +100,29 @@ test("automerge shepherd treats head movement as terminal for the current repair
   );
 });
 
+test("automerge shepherd treats protected-branch BLOCKED as ready for router dispatch", () => {
+  const headSha = "abc123";
+  assert.deepEqual(
+    automergeShepherdReadiness({
+      view: {
+        state: "OPEN",
+        headRefOid: headSha,
+        mergeable: "MERGEABLE",
+        mergeStateStatus: "BLOCKED",
+        statusCheckRollup: [{ name: "check", status: "COMPLETED", conclusion: "SUCCESS" }],
+      },
+      comments: [
+        {
+          user: { login: "clawsweeper" },
+          body: "passed\n<!-- clawsweeper-verdict:pass sha=abc123 -->",
+        },
+      ],
+      headSha,
+    }),
+    { status: "ready", reason: "checks and exact-head review are ready" },
+  );
+});
+
 test("automerge shepherd stops on terminal check failures before review pass", () => {
   const headSha = "abc123";
   assert.deepEqual(

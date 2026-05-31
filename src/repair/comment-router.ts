@@ -28,6 +28,7 @@ import {
   automergeGateBlockReason,
   automergeClusterId,
   automergeJobPath,
+  automergeMergeStateAllowsAutoMerge,
   automergeMergeFailureRepairReason,
   automergeRequestedByFromBody,
   automergeReadinessRepairReason,
@@ -2354,11 +2355,16 @@ function executeAutomerge(command: LooseRecord) {
     comments: issueCommentsFor(command.issue_number),
   });
   const bodyFile = writeAutomergeMergeBody(command, latestTarget, mergeMessage.body);
+  const useGitHubAutoMerge =
+    String(latestTarget.mergeStateStatus ?? "")
+      .trim()
+      .toUpperCase() === "BLOCKED";
   const result = ghSpawn(
     buildAutomergeMergeArgs({
       issueNumber: command.issue_number,
       repo: command.repo,
       expectedHeadSha: command.expected_head_sha,
+      auto: useGitHubAutoMerge,
       subject: mergeMessage.subject,
       bodyFile,
     }),
@@ -2393,6 +2399,22 @@ function executeAutomerge(command: LooseRecord) {
     };
   }
   const merged = fetchPullRequestView(command.issue_number);
+  if (String(merged.state ?? "").toUpperCase() === "OPEN") {
+    return {
+      action: "merge",
+      status: "waiting",
+      reason: merged.autoMergeRequest
+        ? "GitHub auto-merge enabled"
+        : "GitHub merge command completed but PR remains open",
+      merge_method: "squash",
+      prepared_head_sha: latestTarget.head_sha ?? null,
+      commit_subject: mergeMessage.subject,
+      summary_lines: mergeMessage.summaryLines,
+      fixup_lines: mergeMessage.fixupLines,
+      transient_wait_ms: waitedMs,
+      transient_observations: transientObservations,
+    };
+  }
   return {
     action: "merge",
     status: "executed",
@@ -2482,7 +2504,7 @@ function validateAutomergeReadiness({ command, view, target }: LooseRecord) {
   if (checks.total === 0) return "no PR checks found";
   const mergeStateStatus = String(view.mergeStateStatus ?? "");
   if (
-    !["CLEAN", "HAS_HOOKS"].includes(mergeStateStatus) &&
+    !automergeMergeStateAllowsAutoMerge(mergeStateStatus) &&
     !(mergeStateStatus === "UNSTABLE" && checks.blockers.length === 0)
   ) {
     return `merge state status is ${view.mergeStateStatus || "unknown"}`;
@@ -2846,6 +2868,7 @@ function fetchPullRequestView(number: JsonValue) {
         "mergeCommit",
         "mergeStateStatus",
         "mergedAt",
+        "autoMergeRequest",
         "reviewDecision",
         "state",
         "statusCheckRollup",
@@ -2881,6 +2904,7 @@ function fetchPullRequestViewAsync(number: JsonValue) {
         "mergeCommit",
         "mergeStateStatus",
         "mergedAt",
+        "autoMergeRequest",
         "reviewDecision",
         "state",
         "statusCheckRollup",

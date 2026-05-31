@@ -580,6 +580,13 @@ export function automergeReadinessRepairReason(reason: JsonValue): string | null
   return null;
 }
 
+export function automergeMergeStateAllowsAutoMerge(value: JsonValue): boolean {
+  const status = String(value ?? "")
+    .trim()
+    .toUpperCase();
+  return ["CLEAN", "HAS_HOOKS", "BLOCKED"].includes(status);
+}
+
 export function isCanonicalLandingNeedsHumanText(value: JsonValue) {
   const text = String(value ?? "");
   if (!text) return false;
@@ -704,10 +711,12 @@ export function buildAutomergeMergeArgs({
   issueNumber,
   repo,
   expectedHeadSha,
+  auto = false,
   subject = null,
   bodyFile = null,
 }: LooseRecord) {
   const args = ["pr", "merge", String(issueNumber), "--repo", repo, "--squash"];
+  if (auto) args.push("--auto");
   if (subject) args.push("--subject", String(subject));
   if (bodyFile) args.push("--body-file", String(bodyFile));
   if (expectedHeadSha && expectedHeadSha !== "unknown") {

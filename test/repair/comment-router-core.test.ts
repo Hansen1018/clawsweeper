@@ -18,6 +18,7 @@ import {
   automergeGateBlockReason,
   automergeJobBranch,
   automergeJobPath,
+  automergeMergeStateAllowsAutoMerge,
   automergeReadinessRepairReason,
   automergeTransientWaitConfig,
   buildClawSweeperAssistDispatchPayload,
@@ -2243,6 +2244,31 @@ test("renderResponse reports maintainer-approved automerge completion", () => {
   assert.match(body, /automerge loop is complete/);
 });
 
+test("renderResponse reports maintainer-approved GitHub auto-merge enablement", () => {
+  const body = renderResponse(
+    {
+      comment_id: "791",
+      intent: "maintainer_approve_automerge",
+      repo: "openclaw/openclaw",
+      author: "steipete",
+      expected_head_sha: "abc791",
+      target: { head_sha: "abc791" },
+    },
+    {
+      merge: {
+        status: "waiting",
+        reason: "GitHub auto-merge enabled",
+        summary_lines: ["Enabled the protected-branch auto-merge request."],
+      },
+    },
+  );
+
+  assert.match(body, /Maintainer-approved ClawSweeper automerge is not merged yet/);
+  assert.match(body, /Merge status: GitHub auto-merge enabled/);
+  assert.match(body, /I left the PR open for the remaining gate instead of bypassing it/);
+  assert.doesNotMatch(body, /automerge loop is complete/);
+});
+
 test("repair intent set documents executable repair commands", () => {
   assert.deepEqual([...REPAIR_INTENTS].sort(), [
     "address_review",
@@ -2308,6 +2334,14 @@ test("automerge live readiness blocks become repair reasons", () => {
   assert.equal(automergeReadinessRepairReason("pull request is draft"), null);
 });
 
+test("automerge merge states allow protected-branch auto-merge setup", () => {
+  assert.equal(automergeMergeStateAllowsAutoMerge("CLEAN"), true);
+  assert.equal(automergeMergeStateAllowsAutoMerge("HAS_HOOKS"), true);
+  assert.equal(automergeMergeStateAllowsAutoMerge("BLOCKED"), true);
+  assert.equal(automergeMergeStateAllowsAutoMerge("DIRTY"), false);
+  assert.equal(automergeMergeStateAllowsAutoMerge("BEHIND"), false);
+});
+
 test("autoclose intent set documents destructive maintainer commands", () => {
   assert.deepEqual([...AUTOCLOSE_INTENTS], ["autoclose"]);
 });
@@ -2332,6 +2366,28 @@ test("automerge merge args pin the reviewed head SHA", () => {
       "fix: test (#123)",
       "--body-file",
       "/tmp/body.txt",
+      "--match-head-commit",
+      "abc123",
+    ],
+  );
+});
+
+test("automerge merge args use GitHub auto-merge only when requested", () => {
+  assert.deepEqual(
+    buildAutomergeMergeArgs({
+      issueNumber: 123,
+      repo: "openclaw/openclaw",
+      expectedHeadSha: "abc123",
+      auto: true,
+    }),
+    [
+      "pr",
+      "merge",
+      "123",
+      "--repo",
+      "openclaw/openclaw",
+      "--squash",
+      "--auto",
       "--match-head-commit",
       "abc123",
     ],

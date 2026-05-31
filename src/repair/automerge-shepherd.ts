@@ -1,4 +1,5 @@
 import type { JsonValue, LooseRecord } from "./json-types.js";
+import { automergeMergeStateAllowsAutoMerge } from "./comment-router-core.js";
 
 const DEFAULT_WAIT_MS = 10 * 60 * 1000;
 const DEFAULT_POLL_MS = 15 * 1000;
@@ -56,7 +57,7 @@ export function automergeShepherdReadiness({
   const mergeStateStatus = String(view.mergeStateStatus ?? "");
   if (
     mergeStateStatus &&
-    !["CLEAN", "HAS_HOOKS"].includes(mergeStateStatus) &&
+    !automergeMergeStateAllowsAutoMerge(mergeStateStatus) &&
     mergeStateStatus !== "UNSTABLE"
   ) {
     return { status: "waiting", reason: `merge state status is ${mergeStateStatus}` };
