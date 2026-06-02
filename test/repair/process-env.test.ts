@@ -7,6 +7,7 @@ import {
   codexSubprocessEnv,
   repairCodexReasoningEffort,
   repairCodexServiceTier,
+  targetToolchainEnv,
 } from "../../dist/repair/process-env.js";
 
 test("codexSubprocessEnv forces ClawSweeper git identity and strips tokens", () => {
@@ -33,6 +34,36 @@ test("codexSubprocessEnv forces ClawSweeper git identity and strips tokens", () 
       assert.equal(env.CLAWSWEEPER_TARGET_GH_TOKEN, undefined);
       assert.equal(env.OPENAI_API_KEY, undefined);
       assert.equal(env.CODEX_API_KEY, undefined);
+    },
+  );
+});
+
+test("targetToolchainEnv strips repair secrets before package manager commands", () => {
+  withEnv(
+    {
+      CLAWSWEEPER_APP_PRIVATE_KEY: "secret",
+      CLAWSWEEPER_DISPATCH_TOKEN: "secret",
+      CLAWSWEEPER_TARGET_GH_TOKEN: "secret",
+      GH_TOKEN: "secret",
+      GITHUB_TOKEN: "secret",
+      OPENAI_API_KEY: "secret",
+      CODEX_API_KEY: "secret",
+      PROXY_API_KEY: "secret",
+      CI: "",
+    },
+    () => {
+      const env = targetToolchainEnv({ CI: "true", OPENCLAW_LOCAL_CHECK: "0" });
+
+      assert.equal(env.GH_TOKEN, undefined);
+      assert.equal(env.GITHUB_TOKEN, undefined);
+      assert.equal(env.CLAWSWEEPER_APP_PRIVATE_KEY, undefined);
+      assert.equal(env.CLAWSWEEPER_DISPATCH_TOKEN, undefined);
+      assert.equal(env.CLAWSWEEPER_TARGET_GH_TOKEN, undefined);
+      assert.equal(env.OPENAI_API_KEY, undefined);
+      assert.equal(env.CODEX_API_KEY, undefined);
+      assert.equal(env.PROXY_API_KEY, undefined);
+      assert.equal(env.CI, "true");
+      assert.equal(env.OPENCLAW_LOCAL_CHECK, "0");
     },
   );
 });

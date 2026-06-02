@@ -407,6 +407,37 @@ test("repair execution provisions pinned Bun before target validation can invoke
   assert.match(setupBunStep, /bun-version: 1\.3\.10/);
 });
 
+test("repair execution scopes OpenAI key to Codex setup before third-party Bun setup", () => {
+  const workflow = fs.readFileSync(".github/workflows/repair-cluster-worker.yml", "utf8");
+  const executeJobIndex = workflow.indexOf("  execute:");
+  const setupBunIndex = workflow.indexOf("- name: Setup pinned Bun for target validation");
+  const setupCodexIndex = workflow.indexOf("- uses: ./.github/actions/setup-codex", setupBunIndex);
+  const downloadArtifactsIndex = workflow.indexOf(
+    "- name: Download worker artifacts",
+    setupCodexIndex,
+  );
+
+  assert.ok(executeJobIndex >= 0, "expected execute job");
+  assert.ok(setupBunIndex >= 0, "expected Bun setup step");
+  assert.ok(setupCodexIndex >= 0, "expected Codex setup step");
+  assert.ok(
+    downloadArtifactsIndex > setupCodexIndex,
+    "expected artifact download after Codex setup",
+  );
+
+  const executeJobBeforeBun = workflow.slice(executeJobIndex, setupBunIndex);
+  assert.doesNotMatch(
+    executeJobBeforeBun,
+    /OPENAI_API_KEY:\s*\$\{\{\s*secrets\.OPENAI_API_KEY\s*\}\}/,
+  );
+
+  const setupCodexStep = workflow.slice(setupCodexIndex, downloadArtifactsIndex);
+  assert.match(
+    setupCodexStep,
+    /env:\s*\n\s+OPENAI_API_KEY:\s*\$\{\{\s*secrets\.OPENAI_API_KEY\s*\}\}/,
+  );
+});
+
 test("bun-based target toolchain installs deps and runs configured validation", () => {
   const cwd = gitBunPackageFixture({ check: "bun x tsc --noEmit" });
   git(cwd, "add", ".");
@@ -436,6 +467,71 @@ test("bun-based target toolchain installs deps and runs configured validation", 
     "install --frozen-lockfile",
     "run check",
   ]);
+});
+
+test("bun-based target toolchain strips repair secrets from install and validation commands", () => {
+  const cwd = gitBunPackageFixture({ check: "bun x tsc --noEmit" });
+  git(cwd, "add", ".");
+  git(cwd, "commit", "-m", "initial");
+  attachOrigin(cwd);
+
+  const envKeys = [
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "OPENAI_API_KEY",
+    "CODEX_API_KEY",
+    "CLAWSWEEPER_APP_PRIVATE_KEY",
+    "CLAWSWEEPER_DISPATCH_TOKEN",
+    "CLAWSWEEPER_TARGET_GH_TOKEN",
+    "CI",
+    "OPENCLAW_LOCAL_CHECK",
+  ];
+  const { binDir, logPath } = fakeBunFixture(cwd, envKeys);
+  withEnv(
+    {
+      GH_TOKEN: "secret",
+      GITHUB_TOKEN: "secret",
+      OPENAI_API_KEY: "secret",
+      CODEX_API_KEY: "secret",
+      CLAWSWEEPER_APP_PRIVATE_KEY: "secret",
+      CLAWSWEEPER_DISPATCH_TOKEN: "secret",
+      CLAWSWEEPER_TARGET_GH_TOKEN: "secret",
+      CI: "",
+      OPENCLAW_LOCAL_CHECK: "",
+    },
+    () => {
+      withPathPrefix(binDir, () => {
+        prepareTargetToolchain(cwd, {
+          ...validationOptions("openclaw/clawhub", clawhubToolchain()),
+          installTargetDeps: true,
+          installTimeoutMs: 5000,
+          setupTimeoutMs: 5000,
+        });
+        runAllowedValidationCommands(
+          ["bun run check"],
+          cwd,
+          validationOptions("openclaw/clawhub", clawhubToolchain()),
+        );
+      });
+    },
+  );
+
+  const records = fs.readFileSync(logPath, "utf8").trim().split(/\r?\n/).map(JSON.parse);
+  assert.deepEqual(
+    records.map((record) => record.args.join(" ")),
+    ["--version", "install --frozen-lockfile", "run check"],
+  );
+  for (const record of records) {
+    assert.equal(record.env.GH_TOKEN, null);
+    assert.equal(record.env.GITHUB_TOKEN, null);
+    assert.equal(record.env.OPENAI_API_KEY, null);
+    assert.equal(record.env.CODEX_API_KEY, null);
+    assert.equal(record.env.CLAWSWEEPER_APP_PRIVATE_KEY, null);
+    assert.equal(record.env.CLAWSWEEPER_DISPATCH_TOKEN, null);
+    assert.equal(record.env.CLAWSWEEPER_TARGET_GH_TOKEN, null);
+    assert.equal(record.env.CI, "true");
+    assert.equal(record.env.OPENCLAW_LOCAL_CHECK, "0");
+  }
 });
 
 test("bun-based target repos still report unrelated missing scripts as blocked", () => {
@@ -627,7 +723,7 @@ function gitBunPackageFixture(scripts) {
   return cwd;
 }
 
-function fakeBunFixture(cwd) {
+function fakeBunFixture(cwd, envKeys = []) {
   const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-fake-bun-bin-"));
   const logPath = path.join(cwd, "fake-bun.log");
   const bunPath = path.join(binDir, "bun");
@@ -635,7 +731,13 @@ function fakeBunFixture(cwd) {
     bunPath,
     `#!/usr/bin/env node
 const fs = require("node:fs");
-fs.appendFileSync(${JSON.stringify(logPath)}, process.argv.slice(2).join(" ") + "\\n");
+const envKeys = ${JSON.stringify(envKeys)};
+if (envKeys.length > 0) {
+  const env = Object.fromEntries(envKeys.map((key) => [key, process.env[key] ?? null]));
+  fs.appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ args: process.argv.slice(2), env }) + "\\n");
+} else {
+  fs.appendFileSync(${JSON.stringify(logPath)}, process.argv.slice(2).join(" ") + "\\n");
+}
 if (process.argv[2] === "--version") console.log("1.3.10");
 `,
   );
@@ -651,6 +753,23 @@ function withPathPrefix(binDir, callback) {
   } finally {
     if (previousPath === undefined) delete process.env.PATH;
     else process.env.PATH = previousPath;
+  }
+}
+
+function withEnv(values, callback) {
+  const previous = {};
+  for (const [key, value] of Object.entries(values)) {
+    previous[key] = process.env[key];
+    if (value) process.env[key] = value;
+    else delete process.env[key];
+  }
+  try {
+    callback();
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
   }
 }
 

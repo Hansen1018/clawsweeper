@@ -20,6 +20,21 @@ export function codexSubprocessEnv(): NodeJS.ProcessEnv {
   return withoutColor(env);
 }
 
+export function targetToolchainEnv(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+  const env = { ...process.env, ...overrides };
+  delete env.GH_TOKEN;
+  delete env.GITHUB_TOKEN;
+  delete env.OPENAI_API_KEY;
+  delete env.CODEX_API_KEY;
+  delete env.PROXY_API_KEY;
+  for (const key of Object.keys(env)) {
+    if (/^CLAWSWEEPER_.*(?:GH_TOKEN|GITHUB_TOKEN|TOKEN|PRIVATE_KEY|API_KEY)$/.test(key)) {
+      delete env[key];
+    }
+  }
+  return withoutColor(env);
+}
+
 export function repairCodexReasoningEffort(value = process.env.CLAWSWEEPER_CODEX_REASONING_EFFORT) {
   const effort = String(value ?? "high").trim() || "high";
   return effort.toLowerCase() === "xhigh" ? "high" : effort;

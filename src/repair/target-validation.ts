@@ -10,6 +10,7 @@ import {
 } from "./git-repo-utils.js";
 import { parsePullRequestUrl } from "./github-ref.js";
 import type { JsonValue, LooseRecord } from "./json-types.js";
+import { targetToolchainEnv } from "./process-env.js";
 import {
   resolveTargetRepoToolchain,
   type TargetChangedGate,
@@ -446,11 +447,10 @@ function shouldRetryValidationCommand({ parts, error, attempts, options }: Loose
 }
 
 function targetValidationEnv() {
-  return {
-    ...process.env,
+  return targetToolchainEnv({
     CI: process.env.CI ?? "true",
     OPENCLAW_LOCAL_CHECK: process.env.OPENCLAW_LOCAL_CHECK ?? "0",
-  };
+  });
 }
 
 function targetValidationTimeoutMs(name: string, fallback: number, cap?: number) {
