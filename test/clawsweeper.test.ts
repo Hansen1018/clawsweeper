@@ -64,6 +64,9 @@ import {
   parseGhJson,
   parseGhJsonLines,
   parseDecision,
+  pluginSdkImpactFromPullFilesForTest,
+  pluginSdkImpactLabelsForTest,
+  pluginSdkImpactLabelSchemeForTest,
   mergeRiskLabelsForTest,
   mergeRiskLabelSchemeForTest,
   prRatingLabelsForTest,
@@ -13046,6 +13049,58 @@ ${securitySection}
   assert.doesNotMatch(automergeMarkers, /clawsweeper-verdict:needs-human/);
 });
 
+test("pull request automation markers include exact-head Plugin SDK impact marker", () => {
+  const paths = ["src/plugin-sdk/runtime.ts", "src/plugins/types.ts"].toSorted();
+  const pathHash = createHash("sha256").update(paths.join("\n")).digest("hex");
+  const headSha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const baseSha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+  const markers = reviewAutomationMarkersFromReport(
+    `${reportFrontMatter({
+      type: "pull_request",
+      number: "74125",
+      pull_head_sha: headSha,
+      pull_base_sha: baseSha,
+      decision: "keep_open",
+      confidence: "high",
+      review_status: "complete",
+      work_candidate: "none",
+      plugin_sdk_impact_classification: "plugin-sdk:behavior-change",
+      plugin_sdk_impact_paths: JSON.stringify(paths),
+      plugin_sdk_impact_paths_hash: pathHash,
+      plugin_sdk_impact_paths_truncated: "false",
+    })}`,
+  );
+
+  assert.match(
+    markers,
+    new RegExp(
+      `clawsweeper-plugin-sdk-impact sha=${headSha} base=${baseSha} paths=${pathHash} classification=plugin-sdk:behavior-change`,
+    ),
+  );
+  assert.match(markers, /clawsweeper-verdict:needs-human/);
+});
+
+test("pull request automation markers suppress Plugin SDK impact marker when file list is truncated", () => {
+  const markers = reviewAutomationMarkersFromReport(
+    `${reportFrontMatter({
+      type: "pull_request",
+      number: "74126",
+      pull_head_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      pull_base_sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      decision: "keep_open",
+      confidence: "high",
+      review_status: "complete",
+      work_candidate: "none",
+      plugin_sdk_impact_classification: "plugin-sdk:behavior-change",
+      plugin_sdk_impact_paths_hash: "c".repeat(64),
+      plugin_sdk_impact_paths_truncated: "true",
+    })}`,
+  );
+
+  assert.doesNotMatch(markers, /clawsweeper-plugin-sdk-impact/);
+  assert.match(markers, /clawsweeper-verdict:needs-human/);
+});
+
 test("pull request keep-open review comments suppress duplicate remaining risk text", () => {
   const duplicateRisk = "Run the automerge smoke after the repair lane is green.";
   const comment = renderReviewCommentFromReport(
@@ -16090,6 +16145,207 @@ test("ClawSweeper impact labels remove stale owned labels and preserve unrelated
     ["bug", "proof: sufficient", "P1", "impact:message-loss", "impact:other"],
   );
   assert.deepEqual(impactLabelsForTest(["bug", "impact:auth-provider"], []), ["bug"]);
+});
+
+test("ClawSweeper Plugin SDK impact labels expose the CI classification taxonomy", () => {
+  const labels = pluginSdkImpactLabelSchemeForTest();
+  assert.deepEqual(
+    labels.map((label) => label.name),
+    [
+      "plugin-sdk:private-only",
+      "plugin-sdk:test-only",
+      "plugin-sdk:additive-api",
+      "plugin-sdk:behavior-change",
+      "plugin-sdk:breaking-change",
+      "plugin-sdk:architecture-change",
+    ],
+  );
+  for (const label of labels) {
+    assert.ok(
+      label.description.length <= 100,
+      `${label.name} description is ${label.description.length} characters`,
+    );
+  }
+});
+
+test("ClawSweeper Plugin SDK impact labels remove stale owned labels and preserve unrelated labels", () => {
+  assert.deepEqual(
+    pluginSdkImpactLabelsForTest(
+      ["plugin-sdk:private-only", "plugin-sdk:behavior-change", "bug"],
+      "plugin-sdk:breaking-change",
+    ),
+    ["bug", "plugin-sdk:breaking-change"],
+  );
+  assert.deepEqual(pluginSdkImpactLabelsForTest(["bug", "plugin-sdk:test-only"], ""), ["bug"]);
+  assert.deepEqual(
+    pluginSdkImpactLabelsForTest(
+      ["bug", "plugin-sdk:architecture-change"],
+      "",
+      "openclaw/clawsweeper",
+    ),
+    ["bug", "plugin-sdk:architecture-change"],
+  );
+});
+
+test("ClawSweeper classifies Plugin SDK impact from PR files", () => {
+  assert.equal(
+    pluginSdkImpactFromPullFilesForTest({
+      pullFiles: [
+        {
+          filename: "scripts/lib/plugin-sdk-entrypoints.json",
+          patch: '@@\n+  "new-runtime",',
+        },
+      ],
+    }).classification,
+    "plugin-sdk:additive-api",
+  );
+  assert.equal(
+    pluginSdkImpactFromPullFilesForTest({
+      pullFiles: [
+        {
+          filename: "scripts/lib/plugin-sdk-entrypoints.json",
+          patch: '@@\n-  "old-runtime",',
+        },
+      ],
+    }).classification,
+    "plugin-sdk:breaking-change",
+  );
+  assert.equal(
+    pluginSdkImpactFromPullFilesForTest({
+      pullFiles: [
+        {
+          filename: "scripts/lib/plugin-sdk-entrypoints.json",
+          patch: "",
+        },
+      ],
+    }).classification,
+    "plugin-sdk:breaking-change",
+  );
+  assert.equal(
+    pluginSdkImpactFromPullFilesForTest({
+      pullFiles: [
+        {
+          filename: "scripts/lib/plugin-sdk-entrypoints.json",
+          patch: '@@\n+  "new-runtime",\n\n[truncated 120 chars]',
+        },
+      ],
+    }).classification,
+    "plugin-sdk:breaking-change",
+  );
+  assert.equal(
+    pluginSdkImpactFromPullFilesForTest({
+      pullFiles: [{ filename: "src/plugin-sdk/runtime.ts", patch: "@@\n+export const value = 1;" }],
+    }).classification,
+    "plugin-sdk:behavior-change",
+  );
+  for (const filename of [
+    "packages/acp-core/src/runtime/types.ts",
+    "packages/gateway-client/src/readiness.ts",
+    "packages/media-core/src/mime.ts",
+    "packages/media-generation-core/src/model-ref.ts",
+    "packages/net-policy/src/ip.ts",
+  ]) {
+    assert.equal(
+      pluginSdkImpactFromPullFilesForTest({
+        pullFiles: [{ filename, patch: "@@\n+export const value = 1;" }],
+      }).classification,
+      "plugin-sdk:behavior-change",
+      filename,
+    );
+  }
+  assert.equal(
+    pluginSdkImpactFromPullFilesForTest({
+      pullFiles: [
+        {
+          filename: "src/internal/runtime.ts",
+          previous_filename: "src/plugin-sdk/runtime.ts",
+          status: "renamed",
+          patch: "",
+        },
+      ],
+    }).classification,
+    "plugin-sdk:breaking-change",
+  );
+  assert.equal(
+    pluginSdkImpactFromPullFilesForTest({
+      pullFiles: [
+        {
+          filename: "src/plugin-sdk/internal/runtime.ts",
+          previous_filename: "src/plugin-sdk/runtime.ts",
+          status: "renamed",
+          patch: "",
+        },
+      ],
+    }).classification,
+    "plugin-sdk:breaking-change",
+  );
+  assert.equal(
+    pluginSdkImpactFromPullFilesForTest({
+      pullFiles: [
+        {
+          filename: "src/plugin-sdk/runtime-v2.ts",
+          previous_filename: "src/plugin-sdk/runtime.ts",
+          status: "renamed",
+          patch: "",
+        },
+      ],
+    }).classification,
+    "plugin-sdk:breaking-change",
+  );
+  assert.equal(
+    pluginSdkImpactFromPullFilesForTest({
+      pullFiles: [
+        {
+          filename: "src/plugin-sdk/internal/helper.ts",
+          status: "removed",
+          patch: "",
+        },
+      ],
+    }).classification,
+    "plugin-sdk:private-only",
+  );
+  assert.equal(
+    pluginSdkImpactFromPullFilesForTest({
+      pullFiles: [
+        { filename: "src/plugin-sdk/runtime.test.ts", patch: "@@\n+test('x', () => {})" },
+      ],
+    }).classification,
+    "plugin-sdk:test-only",
+  );
+  assert.equal(
+    pluginSdkImpactFromPullFilesForTest({
+      pullFiles: [
+        {
+          filename: "packages/net-policy/src/ip-test-fixtures.ts",
+          patch: "@@\n+export const ip = '127.0.0.1';",
+        },
+      ],
+    }).classification,
+    "plugin-sdk:test-only",
+  );
+  assert.equal(
+    pluginSdkImpactFromPullFilesForTest({
+      pullFiles: [{ filename: "docs/readme.md", patch: "@@\n+Docs" }],
+      pullFilesTruncated: true,
+    }).classification,
+    "plugin-sdk:behavior-change",
+  );
+  const truncatedWithExisting = pluginSdkImpactFromPullFilesForTest({
+    labels: ["plugin-sdk:architecture-change"],
+    pullFiles: [{ filename: "docs/readme.md", patch: "@@\n+Docs" }],
+    pullFilesTruncated: true,
+  });
+  assert.equal(truncatedWithExisting.classification, "plugin-sdk:architecture-change");
+  assert.equal(truncatedWithExisting.source, "existing-label");
+});
+
+test("ClawSweeper Plugin SDK classification preserves a higher existing label", () => {
+  const impact = pluginSdkImpactFromPullFilesForTest({
+    labels: ["plugin-sdk:architecture-change"],
+    pullFiles: [{ filename: "src/plugin-sdk/runtime.ts", patch: "@@\n+export const value = 1;" }],
+  });
+  assert.equal(impact.classification, "plugin-sdk:architecture-change");
+  assert.equal(impact.source, "existing-label");
 });
 
 test("ClawSweeper impact labels do not alter PR review finding priorities", () => {

@@ -116,6 +116,13 @@ type MergeRiskLabelName =
   | "merge-risk: 🚨 availability"
   | "merge-risk: 🚨 automation"
   | "merge-risk: 🚨 other";
+type PluginSdkImpactLabelName =
+  | "plugin-sdk:private-only"
+  | "plugin-sdk:test-only"
+  | "plugin-sdk:additive-api"
+  | "plugin-sdk:behavior-change"
+  | "plugin-sdk:breaking-change"
+  | "plugin-sdk:architecture-change";
 type MergeRiskOptionCategory = "fix_before_merge" | "accept_risk" | "pause_or_close";
 type ReviewLabelName = Exclude<TriagePriority, "none"> | ImpactLabelName | MergeRiskLabelName;
 type ItemCategory =
@@ -1314,6 +1321,45 @@ const MERGE_RISK_LABELS = [
 const MERGE_RISK_LABEL_NAMES: ReadonlySet<string> = new Set(
   MERGE_RISK_LABELS.map((label) => label.name),
 );
+const PLUGIN_SDK_IMPACT_LABELS = [
+  {
+    name: "plugin-sdk:private-only",
+    color: "C5DEF5",
+    description: "Plugin SDK impact is limited to private or internal files.",
+  },
+  {
+    name: "plugin-sdk:test-only",
+    color: "BFDADC",
+    description: "Plugin SDK impact is limited to tests or fixtures.",
+  },
+  {
+    name: "plugin-sdk:additive-api",
+    color: "2DA44E",
+    description: "Plugin SDK public API adds a non-breaking surface.",
+  },
+  {
+    name: "plugin-sdk:behavior-change",
+    color: "FBCA04",
+    description: "Plugin SDK behavior or contract-adjacent surface changed.",
+  },
+  {
+    name: "plugin-sdk:breaking-change",
+    color: "D93F0B",
+    description: "Plugin SDK public API may break existing plugins and needs RFC.",
+  },
+  {
+    name: "plugin-sdk:architecture-change",
+    color: "B60205",
+    description: "Plugin SDK architecture changed and needs RFC.",
+  },
+] as const satisfies readonly {
+  name: PluginSdkImpactLabelName;
+  color: string;
+  description: string;
+}[];
+const PLUGIN_SDK_IMPACT_LABEL_NAMES: ReadonlySet<string> = new Set(
+  PLUGIN_SDK_IMPACT_LABELS.map((label) => label.name),
+);
 const ISSUE_ADVISORY_LABELS = [
   {
     name: "issue-rating: 🦀 challenger crab",
@@ -1500,6 +1546,17 @@ const IMPACT_LABEL_VALUES = new Set<ImpactLabelName>(IMPACT_LABELS.map((label) =
 const MERGE_RISK_LABEL_VALUES = new Set<MergeRiskLabelName>(
   MERGE_RISK_LABELS.map((label) => label.name),
 );
+const PLUGIN_SDK_IMPACT_LABEL_VALUES = new Set<PluginSdkImpactLabelName>(
+  PLUGIN_SDK_IMPACT_LABELS.map((label) => label.name),
+);
+const PLUGIN_SDK_IMPACT_LABEL_SEVERITY = new Map<PluginSdkImpactLabelName, number>([
+  ["plugin-sdk:private-only", 1],
+  ["plugin-sdk:test-only", 1],
+  ["plugin-sdk:additive-api", 2],
+  ["plugin-sdk:behavior-change", 2],
+  ["plugin-sdk:breaking-change", 3],
+  ["plugin-sdk:architecture-change", 4],
+]);
 const REVIEW_LABEL_VALUES = new Set<ReviewLabelName>([
   "P0",
   "P1",
@@ -8263,6 +8320,19 @@ function mergeRiskLabelsFromReport(markdown: string): MergeRiskLabelName[] {
   );
 }
 
+function pluginSdkImpactClassificationFromReport(markdown: string): PluginSdkImpactLabelName | "" {
+  const value = frontMatterValue(markdown, "plugin_sdk_impact_classification");
+  if (!value || value === "none") return "";
+  return pluginSdkImpactLabelFromName(value) ?? "";
+}
+
+function pluginSdkImpactReasonFromReport(markdown: string): string {
+  return (
+    frontMatterValue(markdown, "plugin_sdk_impact_reason") ??
+    "Current review selected this Plugin SDK impact label."
+  );
+}
+
 function mergeRiskOptionsFromReport(markdown: string): MergeRiskOption[] {
   return frontMatterJsonArray(markdown, "merge_risk_options")
     .map((entry, index) => {
@@ -9182,6 +9252,378 @@ export function configSurfaceChangeFromPullFilesForTest(options: {
   return configSurfaceChangeFromContext(options.repo ?? "openclaw/openclaw", context);
 }
 
+interface PluginSdkImpactFile {
+  path: string;
+  previousPath: string;
+  status: string;
+  patch: string;
+  hasPatch: boolean;
+}
+
+interface PluginSdkImpact {
+  classification: PluginSdkImpactLabelName | "";
+  reason: string;
+  source: "none" | "deterministic" | "existing-label" | "truncated";
+  triggeredPaths: string[];
+  pathsHash: string;
+  truncated: boolean;
+}
+
+function normalizePluginSdkImpactPath(value: unknown): string {
+  return typeof value === "string" ? value.replaceAll("\\", "/").trim() : "";
+}
+
+function pluginSdkImpactFile(entry: unknown): PluginSdkImpactFile {
+  const file = asRecord(entry);
+  const path = normalizePluginSdkImpactPath(file.filename);
+  const previousPath = normalizePluginSdkImpactPath(file.previous_filename);
+  const status = typeof file.status === "string" ? file.status.trim().toLowerCase() : "";
+  const patch = typeof file.patch === "string" ? file.patch : "";
+  return {
+    path,
+    previousPath,
+    status,
+    patch,
+    hasPatch: patch.trim().length > 0,
+  };
+}
+
+function pluginSdkImpactPatchTouchesPackageExport(patch: string): boolean {
+  return /\bplugin-sdk\b/i.test(patch);
+}
+
+function isPluginSdkImpactScriptPath(path: string): boolean {
+  const name = basename(path);
+  return (
+    path.startsWith("scripts/") &&
+    (/\bplugin-sdk\b/i.test(name) || path.startsWith("scripts/lib/plugin-sdk-"))
+  );
+}
+
+function pluginSdkImpactCandidatePaths(file: PluginSdkImpactFile): string[] {
+  return [file.path, file.previousPath].filter(Boolean);
+}
+
+function isPluginSdkImpactRepoPath(path: string, file: PluginSdkImpactFile): boolean {
+  if (path.startsWith("src/plugin-sdk/")) return true;
+  if (path.startsWith("packages/plugin-sdk/")) return true;
+  if (path === "docs/.generated/plugin-sdk-api-baseline.sha256") return true;
+  if (isPluginSdkImpactScriptPath(path)) return true;
+  if (path === "package.json") {
+    return !file.hasPatch || pluginSdkImpactPatchTouchesPackageExport(file.patch);
+  }
+  if (path === "src/plugins/types.ts" || path === "src/plugins/runtime/types.ts") {
+    return true;
+  }
+  if (path.startsWith("src/channels/plugins/")) return true;
+  return isPluginSdkPublicDependencyPath(path);
+}
+
+function pluginSdkImpactPaths(file: PluginSdkImpactFile): string[] {
+  return pluginSdkImpactCandidatePaths(file).filter((path) =>
+    isPluginSdkImpactRepoPath(path, file),
+  );
+}
+
+function isPluginSdkImpactPath(file: PluginSdkImpactFile): boolean {
+  return pluginSdkImpactPaths(file).length > 0;
+}
+
+function pluginSdkImpactPatchIsUnknown(file: PluginSdkImpactFile): boolean {
+  return !file.hasPatch || configSurfacePatchIsTruncated(file.patch);
+}
+
+function isPluginSdkPublicOrContractPath(path: string): boolean {
+  if (isTestOnlyPluginSdkImpactPath(path)) return false;
+  if (isPluginSdkPublicSurfaceMetadataPath(path)) return true;
+  if (/^src\/plugin-sdk\/[^/]+\.ts$/u.test(path)) return true;
+  if (path.startsWith("packages/plugin-sdk/")) return true;
+  if (path === "src/plugins/types.ts" || path === "src/plugins/runtime/types.ts") return true;
+  if (path.startsWith("src/channels/plugins/")) return true;
+  return isPluginSdkPublicDependencyPath(path);
+}
+
+function pluginSdkImpactRemovesSurface(file: PluginSdkImpactFile): boolean {
+  const currentPathStillImpacts = file.path !== "" && isPluginSdkImpactRepoPath(file.path, file);
+  const previousPathImpacted =
+    file.previousPath !== "" && isPluginSdkImpactRepoPath(file.previousPath, file);
+  const currentPathStillPublic = file.path !== "" && isPluginSdkPublicOrContractPath(file.path);
+  const previousPathPublic =
+    file.previousPath !== "" && isPluginSdkPublicOrContractPath(file.previousPath);
+  return (
+    (previousPathPublic && !currentPathStillPublic) ||
+    (previousPathPublic && currentPathStillPublic && file.previousPath !== file.path) ||
+    (previousPathImpacted && !currentPathStillImpacts) ||
+    (file.status === "removed" && currentPathStillPublic)
+  );
+}
+
+function isPluginSdkPublicDependencyPath(path: string): boolean {
+  return (
+    path.startsWith("packages/acp-core/src/") ||
+    path.startsWith("packages/agent-core/src/") ||
+    path.startsWith("packages/gateway-client/src/") ||
+    path.startsWith("packages/gateway-protocol/src/") ||
+    path.startsWith("packages/llm-core/src/") ||
+    path.startsWith("packages/markdown-core/src/") ||
+    path.startsWith("packages/media-core/src/") ||
+    path.startsWith("packages/media-generation-core/src/") ||
+    path.startsWith("packages/memory-host-sdk/src/") ||
+    path.startsWith("packages/model-catalog-core/src/") ||
+    path.startsWith("packages/net-policy/src/") ||
+    path.startsWith("packages/normalization-core/src/") ||
+    path.startsWith("packages/speech-core/") ||
+    path.startsWith("packages/terminal-core/src/") ||
+    path.startsWith("packages/tool-call-repair/src/")
+  );
+}
+
+function isTestOnlyPluginSdkImpactPath(path: string): boolean {
+  return (
+    /(?:^|\/)(?:test|tests|__tests__|fixtures?)(?:\/|$)/u.test(path) ||
+    /(?:^|\/)[^/]*[-_.]fixtures?\.[cm]?[jt]sx?$/u.test(path) ||
+    /\.(?:test|spec|fixture|fixtures)\.[cm]?[jt]sx?$/u.test(path) ||
+    path.startsWith("test/")
+  );
+}
+
+function isPluginSdkPublicSurfaceMetadataPath(path: string): boolean {
+  return (
+    path === "docs/.generated/plugin-sdk-api-baseline.sha256" ||
+    path === "scripts/lib/plugin-sdk-entrypoints.json" ||
+    path === "scripts/lib/plugin-sdk-entries.mjs" ||
+    path === "scripts/lib/plugin-sdk-private-local-only-subpaths.json" ||
+    path === "src/plugin-sdk/entrypoints.ts" ||
+    path === "package.json" ||
+    path === "packages/plugin-sdk/package.json"
+  );
+}
+
+function pluginSdkImpactPathHash(paths: readonly string[]): string {
+  return createHash("sha256").update(paths.join("\n")).digest("hex");
+}
+
+function pluginSdkImpactLabelSeverity(label: PluginSdkImpactLabelName): number {
+  return PLUGIN_SDK_IMPACT_LABEL_SEVERITY.get(label) ?? 0;
+}
+
+function pluginSdkImpactLabelFromName(label: string): PluginSdkImpactLabelName | null {
+  const normalized = label.trim().toLowerCase();
+  return PLUGIN_SDK_IMPACT_LABEL_VALUES.has(normalized as PluginSdkImpactLabelName)
+    ? (normalized as PluginSdkImpactLabelName)
+    : null;
+}
+
+function highestPluginSdkImpactLabel(labels: readonly string[]): PluginSdkImpactLabelName | null {
+  return (
+    labels
+      .map(pluginSdkImpactLabelFromName)
+      .filter((label): label is PluginSdkImpactLabelName => Boolean(label))
+      .sort(
+        (left, right) => pluginSdkImpactLabelSeverity(right) - pluginSdkImpactLabelSeverity(left),
+      )[0] ?? null
+  );
+}
+
+function classifyPluginSdkImpactFiles(files: readonly PluginSdkImpactFile[]): {
+  classification: PluginSdkImpactLabelName;
+  reason: string;
+} {
+  const paths = files.flatMap(pluginSdkImpactPaths);
+  if (paths.every(isTestOnlyPluginSdkImpactPath)) {
+    return {
+      classification: "plugin-sdk:test-only",
+      reason: "All known Plugin SDK impact paths are tests or fixtures.",
+    };
+  }
+  if (files.some(pluginSdkImpactRemovesSurface)) {
+    return {
+      classification: "plugin-sdk:breaking-change",
+      reason: "Plugin SDK public or contract-adjacent surface was removed or moved away.",
+    };
+  }
+
+  const metadataFiles = files.filter((file) =>
+    pluginSdkImpactPaths(file).some(isPluginSdkPublicSurfaceMetadataPath),
+  );
+  if (metadataFiles.some(pluginSdkImpactPatchIsUnknown)) {
+    return {
+      classification: "plugin-sdk:breaking-change",
+      reason: "Plugin SDK public surface metadata changed without complete patch text.",
+    };
+  }
+
+  const structuralMetadataFiles = metadataFiles.filter(
+    (file) =>
+      !pluginSdkImpactPaths(file).includes("docs/.generated/plugin-sdk-api-baseline.sha256"),
+  );
+  const privateOnlyMetadataFiles = structuralMetadataFiles.filter((file) =>
+    pluginSdkImpactPaths(file).includes("scripts/lib/plugin-sdk-private-local-only-subpaths.json"),
+  );
+  if (privateOnlyMetadataFiles.some((file) => patchHasAddedLines(file.patch))) {
+    return {
+      classification: "plugin-sdk:breaking-change",
+      reason: "Plugin SDK public metadata made a subpath private.",
+    };
+  }
+
+  const publicMetadataFiles = structuralMetadataFiles.filter(
+    (file) =>
+      !pluginSdkImpactPaths(file).includes(
+        "scripts/lib/plugin-sdk-private-local-only-subpaths.json",
+      ),
+  );
+  if (publicMetadataFiles.some((file) => patchHasRemovedLines(file.patch))) {
+    return {
+      classification: "plugin-sdk:breaking-change",
+      reason: "Plugin SDK public metadata removed surface lines.",
+    };
+  }
+  if (
+    publicMetadataFiles.some((file) => patchHasAddedLines(file.patch)) ||
+    privateOnlyMetadataFiles.some((file) => patchHasRemovedLines(file.patch))
+  ) {
+    return {
+      classification: "plugin-sdk:additive-api",
+      reason: "Plugin SDK public metadata added surface lines.",
+    };
+  }
+  if (
+    metadataFiles.some((file) =>
+      pluginSdkImpactPaths(file).includes("docs/.generated/plugin-sdk-api-baseline.sha256"),
+    )
+  ) {
+    return {
+      classification: "plugin-sdk:breaking-change",
+      reason: "Plugin SDK API baseline hash changed without additive metadata evidence.",
+    };
+  }
+  if (
+    paths.some(
+      (path) =>
+        /^src\/plugin-sdk\/[^/]+\.ts$/u.test(path) ||
+        path === "src/plugins/types.ts" ||
+        path === "src/plugins/runtime/types.ts" ||
+        path.startsWith("src/channels/plugins/") ||
+        path.startsWith("packages/plugin-sdk/") ||
+        isPluginSdkPublicDependencyPath(path),
+    )
+  ) {
+    return {
+      classification: "plugin-sdk:behavior-change",
+      reason: "Plugin SDK public or contract-adjacent implementation changed.",
+    };
+  }
+  return {
+    classification: "plugin-sdk:private-only",
+    reason: "Only private Plugin SDK support paths changed.",
+  };
+}
+
+function pluginSdkImpactFromContext(
+  repo: string,
+  context: ItemContext,
+  labels: readonly string[] = [],
+): PluginSdkImpact {
+  const truncated = Boolean(context.counts?.pullFilesTruncated);
+  const triggeredFiles = (context.pullFiles ?? [])
+    .map(pluginSdkImpactFile)
+    .filter(isPluginSdkImpactPath);
+  const triggeredPaths = triggeredFiles.flatMap(pluginSdkImpactPaths).toSorted();
+  const pathsHash = pluginSdkImpactPathHash(triggeredPaths);
+  if (!isPluginSdkImpactTargetRepo(repo)) {
+    return {
+      classification: "",
+      reason: "No OpenClaw Plugin SDK impact paths changed.",
+      source: "none",
+      triggeredPaths,
+      pathsHash,
+      truncated,
+    };
+  }
+  const existing = highestPluginSdkImpactLabel(labels);
+  if (truncated) {
+    const truncatedClassification = "plugin-sdk:behavior-change";
+    if (
+      existing &&
+      pluginSdkImpactLabelSeverity(existing) > pluginSdkImpactLabelSeverity(truncatedClassification)
+    ) {
+      return {
+        classification: existing,
+        reason: `Existing Plugin SDK impact label ${existing} is higher than truncated fallback ${truncatedClassification}.`,
+        source: "existing-label",
+        triggeredPaths,
+        pathsHash,
+        truncated,
+      };
+    }
+    return {
+      classification: truncatedClassification,
+      reason: "The PR file list was truncated, so Plugin SDK impact needs maintainer review.",
+      source: "truncated",
+      triggeredPaths,
+      pathsHash,
+      truncated,
+    };
+  }
+  if (triggeredPaths.length === 0) {
+    return {
+      classification: "",
+      reason: "No OpenClaw Plugin SDK impact paths changed.",
+      source: "none",
+      triggeredPaths,
+      pathsHash,
+      truncated,
+    };
+  }
+
+  const deterministic = classifyPluginSdkImpactFiles(triggeredFiles);
+  if (
+    existing &&
+    pluginSdkImpactLabelSeverity(existing) >
+      pluginSdkImpactLabelSeverity(deterministic.classification)
+  ) {
+    return {
+      classification: existing,
+      reason: `Existing Plugin SDK impact label ${existing} is higher than deterministic ${deterministic.classification}.`,
+      source: "existing-label",
+      triggeredPaths,
+      pathsHash,
+      truncated,
+    };
+  }
+  return {
+    classification: deterministic.classification,
+    reason: deterministic.reason,
+    source: "deterministic",
+    triggeredPaths,
+    pathsHash,
+    truncated,
+  };
+}
+
+export function pluginSdkImpactFromPullFilesForTest(options: {
+  repo?: string;
+  labels?: readonly string[];
+  pullFiles?: unknown[];
+  pullFilesTruncated?: boolean;
+}): PluginSdkImpact {
+  const counts: ItemContext["counts"] = { comments: 0, timeline: 0 };
+  if (options.pullFilesTruncated !== undefined)
+    counts.pullFilesTruncated = options.pullFilesTruncated;
+  return pluginSdkImpactFromContext(
+    options.repo ?? "openclaw/openclaw",
+    {
+      issue: {},
+      comments: [],
+      timeline: [],
+      pullFiles: options.pullFiles ?? [],
+      counts,
+    },
+    options.labels ?? [],
+  );
+}
+
 function isOpenClawConfigSurfacePath(path: string): boolean {
   return (
     /^src\/config\/(?:zod-schema[^/]*|types[^/]*|schema(?:[-.][^/]*)?)\.ts$/.test(path) ||
@@ -9200,6 +9642,14 @@ function changedPatchLines(patch: string): string[] {
         (line.startsWith("-") && !line.startsWith("---")),
     )
     .map((line) => line.slice(1).trim());
+}
+
+function patchHasRemovedLines(patch: string): boolean {
+  return /^-(?!-)/mu.test(patch);
+}
+
+function patchHasAddedLines(patch: string): boolean {
+  return /^\+(?!\+)/mu.test(patch);
 }
 
 function configSurfaceLineNeedsUnknownMarker(line: string): boolean {
@@ -9517,6 +9967,21 @@ function nextMergeRiskLabels(
   return nextLabels;
 }
 
+function nextPluginSdkImpactLabels(
+  repo: string,
+  labels: readonly string[],
+  classification: PluginSdkImpactLabelName | "",
+): string[] {
+  if (!isPluginSdkImpactTargetRepo(repo)) return [...labels];
+  const nextLabels = labels.filter((label) => !PLUGIN_SDK_IMPACT_LABEL_NAMES.has(label));
+  if (classification) nextLabels.push(classification);
+  return nextLabels;
+}
+
+function isPluginSdkImpactTargetRepo(repo: string): boolean {
+  return normalizeRepo(repo) === "openclaw/openclaw";
+}
+
 export function mergeRiskLabelSchemeForTest(): {
   name: string;
   color: string;
@@ -9538,6 +10003,30 @@ export function mergeRiskLabelsForTest(
     mergeRiskLabels.filter((label): label is MergeRiskLabelName =>
       MERGE_RISK_LABEL_NAMES.has(label),
     ),
+  );
+}
+
+export function pluginSdkImpactLabelSchemeForTest(): {
+  name: string;
+  color: string;
+  description: string;
+}[] {
+  return PLUGIN_SDK_IMPACT_LABELS.map(({ name, color, description }) => ({
+    name,
+    color,
+    description,
+  }));
+}
+
+export function pluginSdkImpactLabelsForTest(
+  labels: readonly string[],
+  classification: string,
+  repo = "openclaw/openclaw",
+): string[] {
+  return nextPluginSdkImpactLabels(
+    repo,
+    labels,
+    pluginSdkImpactLabelFromName(classification) ?? "",
   );
 }
 
@@ -9577,6 +10066,28 @@ function ensureImpactLabel(name: ImpactLabelName): void {
 
 function ensureMergeRiskLabel(name: MergeRiskLabelName): void {
   const definition = MERGE_RISK_LABELS.find((label) => label.name === name);
+  if (!definition) return;
+  try {
+    ghWithRetry(
+      [
+        "label",
+        "create",
+        definition.name,
+        "--color",
+        definition.color,
+        "--description",
+        definition.description,
+      ],
+      2,
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (!/already exists/i.test(message)) throw error;
+  }
+}
+
+function ensurePluginSdkImpactLabel(name: PluginSdkImpactLabelName): void {
+  const definition = PLUGIN_SDK_IMPACT_LABELS.find((label) => label.name === name);
   if (!definition) return;
   try {
     ghWithRetry(
@@ -9861,6 +10372,40 @@ function syncMergeRiskLabels(options: {
   if (options.dryRun) return { labels: nextLabels, changed };
   for (const label of labelsToAdd) {
     ensureMergeRiskLabel(label);
+    ghWithRetry(["issue", "edit", String(options.number), "--add-label", label]);
+  }
+  for (const label of labelsToRemove) {
+    ghWithRetry(["issue", "edit", String(options.number), "--remove-label", label]);
+  }
+  return { labels: nextLabels, changed };
+}
+
+function syncPluginSdkImpactLabel(options: {
+  repo: string;
+  number: number;
+  labels: readonly string[];
+  classification: PluginSdkImpactLabelName | "";
+  dryRun: boolean;
+}): { labels: string[]; changed: boolean } {
+  const nextLabels = nextPluginSdkImpactLabels(
+    options.repo,
+    options.labels,
+    options.classification,
+  );
+  const currentLabelKeys = new Set(options.labels.map((label) => label.toLowerCase()));
+  const nextLabelKeys = new Set(nextLabels.map((label) => label.toLowerCase()));
+  const labelsToAdd = nextLabels.filter(
+    (label): label is PluginSdkImpactLabelName =>
+      PLUGIN_SDK_IMPACT_LABEL_NAMES.has(label) && !currentLabelKeys.has(label.toLowerCase()),
+  );
+  const labelsToRemove = options.labels.filter(
+    (label) => PLUGIN_SDK_IMPACT_LABEL_NAMES.has(label) && !nextLabelKeys.has(label.toLowerCase()),
+  );
+  const changed = labelsToAdd.length > 0 || labelsToRemove.length > 0;
+  if (!changed) return { labels: nextLabels, changed };
+  if (options.dryRun) return { labels: nextLabels, changed };
+  for (const label of labelsToAdd) {
+    ensurePluginSdkImpactLabel(label);
     ghWithRetry(["issue", "edit", String(options.number), "--add-label", label]);
   }
   for (const label of labelsToRemove) {
@@ -12031,6 +12576,7 @@ function isClawSweeperOwnedLabel(label: string): boolean {
     PRIORITY_LABEL_NAMES.has(label) ||
     IMPACT_LABEL_NAMES.has(label) ||
     MERGE_RISK_LABEL_NAMES.has(label) ||
+    PLUGIN_SDK_IMPACT_LABEL_NAMES.has(label) ||
     PR_RATING_LABEL_NAMES.has(label) ||
     PR_STATUS_LABEL_NAMES.has(label) ||
     label === FEATURE_SHOWCASE_LABEL ||
@@ -12052,6 +12598,11 @@ function desiredClawSweeperLabelsFromPublicReport(
   if (isPullRequest) {
     const realBehaviorProof = reportRealBehaviorProof(markdown);
     labels = nextMergeRiskLabels(labels, mergeRiskLabelsFromReport(markdown));
+    labels = nextPluginSdkImpactLabels(
+      markdownRepository(markdown),
+      labels,
+      pluginSdkImpactClassificationFromReport(markdown),
+    );
     labels = nextRealBehaviorProofSufficientLabels(labels, realBehaviorProof);
     labels = nextRealBehaviorProofMediaLabels(labels, realBehaviorProof);
     labels = nextPrRatingLabels(labels, reportPrRating(markdown));
@@ -12117,6 +12668,14 @@ function labelTransitionReason(
       : labels.length
         ? `Current PR review merge-risk labels are ${labels.map(inlineCode).join(", ")}.`
         : "Current PR review selected no merge-risk labels.";
+  }
+  if (PLUGIN_SDK_IMPACT_LABEL_NAMES.has(label)) {
+    const classification = pluginSdkImpactClassificationFromReport(markdown);
+    return action === "add"
+      ? pluginSdkImpactReasonFromReport(markdown)
+      : classification
+        ? `Current Plugin SDK impact label is ${inlineCode(classification)}.`
+        : "Current review selected no Plugin SDK impact label.";
   }
   if (PR_RATING_LABEL_NAMES.has(label)) {
     const rating = reportPrRating(markdown);
@@ -12277,6 +12836,10 @@ function labelJustificationsFromPublicReport(
         TELEGRAM_VISIBLE_PROOF_LABEL,
         `${TELEGRAM_VISIBLE_PROOF_LABEL_DESCRIPTION} ${sentence(telegramProof.summary)}`,
       );
+    }
+    const pluginSdkImpactClassification = pluginSdkImpactClassificationFromReport(markdown);
+    if (pluginSdkImpactClassification) {
+      add(pluginSdkImpactClassification, pluginSdkImpactReasonFromReport(markdown));
     }
   }
   return [...byLabel.values()];
@@ -13374,13 +13937,50 @@ function pullHeadShaFromContext(context: ItemContext): string | null {
   return typeof sha === "string" && sha.trim() ? sha.trim() : null;
 }
 
+function pullBaseShaFromContext(context: ItemContext): string | null {
+  const pull = asRecord(context.pullRequest);
+  const base = asRecord(pull.base);
+  const sha = base.sha;
+  return typeof sha === "string" && sha.trim() ? sha.trim() : null;
+}
+
 function pullHeadShaFromReport(markdown: string): string | null {
   const value = frontMatterValue(markdown, "pull_head_sha");
   return value && value !== "unknown" ? value : null;
 }
 
+function pullBaseShaFromReport(markdown: string): string | null {
+  const value = frontMatterValue(markdown, "pull_base_sha");
+  return value && value !== "unknown" ? value : null;
+}
+
 function markerAttributeValue(value: string): string {
   return value.trim().replace(/[^\w./:@-]/g, "_") || "unknown";
+}
+
+function isFullGitSha(value: string | null): value is string {
+  return Boolean(value && /^[0-9a-f]{40}$/iu.test(value));
+}
+
+function pluginSdkImpactMarkerFromReport(markdown: string): string {
+  const classification = pluginSdkImpactClassificationFromReport(markdown);
+  if (!classification || frontMatterBoolean(markdown, "plugin_sdk_impact_paths_truncated")) {
+    return "";
+  }
+  const headSha = pullHeadShaFromReport(markdown);
+  const baseSha = pullBaseShaFromReport(markdown);
+  const pathsHash = frontMatterValue(markdown, "plugin_sdk_impact_paths_hash") ?? "";
+  if (!isFullGitSha(headSha) || !isFullGitSha(baseSha) || !/^[0-9a-f]{64}$/iu.test(pathsHash)) {
+    return "";
+  }
+  return [
+    "<!-- clawsweeper-plugin-sdk-impact",
+    `sha=${markerAttributeValue(headSha)}`,
+    `base=${markerAttributeValue(baseSha)}`,
+    `paths=${markerAttributeValue(pathsHash)}`,
+    `classification=${markerAttributeValue(classification)}`,
+    "-->",
+  ].join(" ");
 }
 
 export function reviewAutomationMarkersFromReport(markdown: string): string {
@@ -13396,13 +13996,16 @@ export function reviewAutomationMarkersFromReport(markdown: string): string {
     `confidence=${markerAttributeValue(confidence)}`,
   ].join(" ");
   const securityNeedsAttention = reportSecurityReview(markdown).status === "needs_attention";
+  const pluginSdkImpactMarker = pluginSdkImpactMarkerFromReport(markdown);
+  const withPluginSdkImpactMarker = (markers: string): string =>
+    [pluginSdkImpactMarker, markers].filter(Boolean).join("\n");
   const humanReviewMarkers = (): string => {
     const markers = [];
     if (securityNeedsAttention) {
       markers.push(`<!-- clawsweeper-security:security-sensitive ${baseAttrs} -->`);
     }
     markers.push(`<!-- clawsweeper-verdict:needs-human ${baseAttrs} -->`);
-    return markers.join("\n");
+    return withPluginSdkImpactMarker(markers.join("\n"));
   };
 
   if (frontMatterValue(markdown, "review_status") === "failed") {
@@ -13425,33 +14028,37 @@ export function reviewAutomationMarkersFromReport(markdown: string): string {
     } else {
       markers.push(`<!-- clawsweeper-verdict:needs-human ${baseAttrs} -->`);
     }
-    return markers.join("\n");
+    return withPluginSdkImpactMarker(markers.join("\n"));
   }
   if (hasRealBehaviorProofBlocker) {
-    return `<!-- clawsweeper-verdict:needs-human ${baseAttrs} -->`;
+    return withPluginSdkImpactMarker(`<!-- clawsweeper-verdict:needs-human ${baseAttrs} -->`);
   }
   if (decision === "keep_open") {
     if (repairLoopPassModeFromReport(markdown)) {
-      return `<!-- clawsweeper-verdict:pass ${baseAttrs} -->`;
+      return withPluginSdkImpactMarker(`<!-- clawsweeper-verdict:pass ${baseAttrs} -->`);
     }
     if (repairLoopFindingRepairAllowed(markdown)) {
-      return [
-        `<!-- clawsweeper-verdict:needs-changes ${baseAttrs} -->`,
-        `<!-- clawsweeper-action:fix-required ${baseAttrs} finding=review-feedback -->`,
-      ].join("\n");
+      return withPluginSdkImpactMarker(
+        [
+          `<!-- clawsweeper-verdict:needs-changes ${baseAttrs} -->`,
+          `<!-- clawsweeper-action:fix-required ${baseAttrs} finding=review-feedback -->`,
+        ].join("\n"),
+      );
     }
     if (frontMatterValue(markdown, "work_candidate") !== "queue_fix_pr") {
-      return `<!-- clawsweeper-verdict:needs-human ${baseAttrs} -->`;
+      return withPluginSdkImpactMarker(`<!-- clawsweeper-verdict:needs-human ${baseAttrs} -->`);
     }
-    return [
-      `<!-- clawsweeper-verdict:needs-changes ${baseAttrs} -->`,
-      `<!-- clawsweeper-action:fix-required ${baseAttrs} finding=review-feedback -->`,
-    ].join("\n");
+    return withPluginSdkImpactMarker(
+      [
+        `<!-- clawsweeper-verdict:needs-changes ${baseAttrs} -->`,
+        `<!-- clawsweeper-action:fix-required ${baseAttrs} finding=review-feedback -->`,
+      ].join("\n"),
+    );
   }
   if (decision === "close") {
-    return `<!-- clawsweeper-verdict:needs-human ${baseAttrs} -->`;
+    return withPluginSdkImpactMarker(`<!-- clawsweeper-verdict:needs-human ${baseAttrs} -->`);
   }
-  return `<!-- clawsweeper-verdict:needs-human ${baseAttrs} -->`;
+  return withPluginSdkImpactMarker(`<!-- clawsweeper-verdict:needs-human ${baseAttrs} -->`);
 }
 
 function repairLoopPassModeFromReport(markdown: string): "" | "autofix" | "automerge" {
@@ -14133,6 +14740,11 @@ function markdownFor(options: {
   const pullFiles = pullRequestFilePathsFromContext(options.context);
   const pullFilesTruncated = Boolean(options.context.counts?.pullFilesTruncated);
   const configSurfaceChange = configSurfaceChangeFromContext(options.item.repo, options.context);
+  const pluginSdkImpact = pluginSdkImpactFromContext(
+    options.item.repo,
+    options.context,
+    options.item.labels,
+  );
   const prSurfaceFiles = prSurfaceFilesFromContext(options.context);
   return `---
 number: ${options.item.number}
@@ -14149,6 +14761,7 @@ labels: ${JSON.stringify(options.item.labels)}
 reviewed_at: ${new Date().toISOString()}
 main_sha: ${options.git.mainSha}
 pull_head_sha: ${pullHeadShaFromContext(options.context) ?? "unknown"}
+pull_base_sha: ${pullBaseShaFromContext(options.context) ?? "unknown"}
 latest_release: ${options.git.latestRelease?.tagName ?? "unknown"}
 latest_release_sha: ${options.git.latestRelease?.sha ?? "unknown"}
 fixed_release: ${options.decision.fixedRelease ?? "unknown"}
@@ -14204,6 +14817,12 @@ pull_files: ${jsonFrontMatterValue(pullFiles)}
 pull_files_truncated: ${pullFilesTruncated}
 config_surface_change: ${configSurfaceChange.change}
 config_surface_keys: ${jsonFrontMatterValue(configSurfaceChange.keys)}
+plugin_sdk_impact_classification: ${pluginSdkImpact.classification || "none"}
+plugin_sdk_impact_source: ${pluginSdkImpact.source}
+plugin_sdk_impact_reason: ${JSON.stringify(pluginSdkImpact.reason)}
+plugin_sdk_impact_paths: ${jsonFrontMatterValue(pluginSdkImpact.triggeredPaths)}
+plugin_sdk_impact_paths_hash: ${pluginSdkImpact.pathsHash}
+plugin_sdk_impact_paths_truncated: ${pluginSdkImpact.truncated}
 pr_surface_files: ${jsonFrontMatterValue(prSurfaceFiles)}
 pr_surface_files_truncated: ${pullFilesTruncated}
 item_category: ${options.decision.itemCategory}
@@ -15701,6 +16320,7 @@ async function applyDecisionsCommand(args: Args): Promise<void> {
         clawSweeperLabelsChanged ||= impactSyncResult.changed;
         markdown = replaceFrontMatterValue(markdown, "labels", JSON.stringify(item.labels));
         let mergeRiskLabelsChanged = false;
+        let pluginSdkImpactLabelChanged = false;
         if (item.kind === "pull_request") {
           const mergeRiskSyncResult = syncMergeRiskLabels({
             number,
@@ -15712,8 +16332,24 @@ async function applyDecisionsCommand(args: Args): Promise<void> {
           mergeRiskLabelsChanged = mergeRiskSyncResult.changed;
           clawSweeperLabelsChanged ||= mergeRiskSyncResult.changed;
           markdown = replaceFrontMatterValue(markdown, "labels", JSON.stringify(item.labels));
+          const pluginSdkImpactSyncResult = syncPluginSdkImpactLabel({
+            repo: markdownRepository(markdown),
+            number,
+            labels: item.labels,
+            classification: pluginSdkImpactClassificationFromReport(markdown),
+            dryRun,
+          });
+          item.labels = pluginSdkImpactSyncResult.labels;
+          pluginSdkImpactLabelChanged = pluginSdkImpactSyncResult.changed;
+          clawSweeperLabelsChanged ||= pluginSdkImpactSyncResult.changed;
+          markdown = replaceFrontMatterValue(markdown, "labels", JSON.stringify(item.labels));
         }
-        if (syncResult.changed || impactSyncResult.changed || mergeRiskLabelsChanged) {
+        if (
+          syncResult.changed ||
+          impactSyncResult.changed ||
+          mergeRiskLabelsChanged ||
+          pluginSdkImpactLabelChanged
+        ) {
           rememberSelfMutationUpdatedAt();
         }
       } catch (error) {
