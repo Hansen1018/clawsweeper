@@ -237,7 +237,9 @@ jobs:
           owner: ${{ steps.target.outputs.target_repo_owner }}
           repositories: ${{ steps.target.outputs.target_repo_name }}
           permission-contents: write
+          permission-checks: write
           permission-issues: write
+          permission-members: read
           permission-pull-requests: write
 
       - name: React to target item review start
@@ -1194,7 +1196,9 @@ jobs:
           owner: ${{ needs.plan.outputs.target_repo_owner }}
           repositories: ${{ needs.plan.outputs.target_repo_name }}
           permission-contents: write
+          permission-checks: write
           permission-issues: write
+          permission-members: read
           permission-pull-requests: write
 
       - name: Create state token
@@ -1876,7 +1880,9 @@ jobs:
           owner: ${{ steps.target.outputs.target_repo_owner }}
           repositories: ${{ steps.target.outputs.target_repo_name }}
           permission-contents: write
+          permission-checks: write
           permission-issues: write
+          permission-members: read
           permission-pull-requests: write
 
       - name: Create state token

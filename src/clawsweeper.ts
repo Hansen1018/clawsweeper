@@ -123,6 +123,7 @@ type PluginSdkImpactLabelName =
   | "plugin-sdk:behavior-change"
   | "plugin-sdk:breaking-change"
   | "plugin-sdk:architecture-change";
+type PluginSdkImpactCheckConclusion = "success" | "failure";
 type MergeRiskOptionCategory = "fix_before_merge" | "accept_risk" | "pause_or_close";
 type ReviewLabelName = Exclude<TriagePriority, "none"> | ImpactLabelName | MergeRiskLabelName;
 type ItemCategory =
@@ -219,6 +220,7 @@ type ActionTaken =
   | "retry_pr_close_coverage_proof"
   | "skipped_invalid_decision"
   | "skipped_missing_record"
+  | "plugin_sdk_impact_check_synced"
   | "skipped_runtime_budget";
 
 const MAINTAINER_AUTHOR_ASSOCIATIONS = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
@@ -1360,6 +1362,19 @@ const PLUGIN_SDK_IMPACT_LABELS = [
 const PLUGIN_SDK_IMPACT_LABEL_NAMES: ReadonlySet<string> = new Set(
   PLUGIN_SDK_IMPACT_LABELS.map((label) => label.name),
 );
+const PLUGIN_SDK_IMPACT_CHECK_NAME = "Plugin SDK impact gate";
+const PLUGIN_SDK_IMPACT_MAINTAINER_APPROVAL_LABELS: ReadonlySet<PluginSdkImpactLabelName> = new Set(
+  [
+    "plugin-sdk:additive-api",
+    "plugin-sdk:behavior-change",
+    "plugin-sdk:breaking-change",
+    "plugin-sdk:architecture-change",
+  ],
+);
+const PLUGIN_SDK_IMPACT_RFC_LABELS: ReadonlySet<PluginSdkImpactLabelName> = new Set([
+  "plugin-sdk:breaking-change",
+  "plugin-sdk:architecture-change",
+]);
 const ISSUE_ADVISORY_LABELS = [
   {
     name: "issue-rating: 🦀 challenger crab",
@@ -13962,6 +13977,410 @@ function isFullGitSha(value: string | null): value is string {
   return Boolean(value && /^[0-9a-f]{40}$/iu.test(value));
 }
 
+interface GitHubPullRequestReview {
+  state?: string;
+  commit_id?: string | null;
+  submitted_at?: string | null;
+  user?: GitHubUser | null;
+}
+
+interface GitHubTeamMembership {
+  state?: string;
+}
+
+interface GitHubPullRequestDetails {
+  body?: string | null;
+  html_url?: string;
+}
+
+interface GitHubCheckRun {
+  id?: number;
+}
+
+interface PluginSdkImpactRequirementStatus {
+  maintainerApprovalRequired: boolean;
+  maintainerApprovalSatisfied: boolean;
+  maintainerApprovers: string[];
+  rfcRequired: boolean;
+  rfcSatisfied: boolean;
+  mergedRfcPulls: number[];
+}
+
+interface PluginSdkImpactCheckState {
+  repo: string;
+  number: number;
+  headSha: string;
+  classification: PluginSdkImpactLabelName;
+  reason: string;
+  source: string;
+  triggeredPaths: string[];
+  pathsTruncated: boolean;
+  detailsUrl: string;
+  requirements: PluginSdkImpactRequirementStatus;
+}
+
+interface PluginSdkImpactCheckPayload {
+  name: string;
+  head_sha: string;
+  status: "completed";
+  conclusion: PluginSdkImpactCheckConclusion;
+  completed_at?: string;
+  details_url: string;
+  output: {
+    title: string;
+    summary: string;
+    text: string;
+  };
+}
+
+function pluginSdkImpactRequiresMaintainerApproval(
+  classification: PluginSdkImpactLabelName,
+): boolean {
+  return PLUGIN_SDK_IMPACT_MAINTAINER_APPROVAL_LABELS.has(classification);
+}
+
+function pluginSdkImpactRequiresRfc(classification: PluginSdkImpactLabelName): boolean {
+  return PLUGIN_SDK_IMPACT_RFC_LABELS.has(classification);
+}
+
+function pluginSdkImpactRequirementStatus(
+  classification: PluginSdkImpactLabelName,
+  options: {
+    maintainerApprovers?: readonly string[];
+    mergedRfcPulls?: readonly number[];
+  } = {},
+): PluginSdkImpactRequirementStatus {
+  const maintainerApprovers = [...(options.maintainerApprovers ?? [])].toSorted();
+  const mergedRfcPulls = [...(options.mergedRfcPulls ?? [])].toSorted(
+    (left, right) => left - right,
+  );
+  const maintainerApprovalRequired = pluginSdkImpactRequiresMaintainerApproval(classification);
+  const rfcRequired = pluginSdkImpactRequiresRfc(classification);
+  return {
+    maintainerApprovalRequired,
+    maintainerApprovalSatisfied: !maintainerApprovalRequired || maintainerApprovers.length > 0,
+    maintainerApprovers,
+    rfcRequired,
+    rfcSatisfied: !rfcRequired || mergedRfcPulls.length > 0,
+    mergedRfcPulls,
+  };
+}
+
+function pluginSdkImpactCheckConclusion(
+  requirements: PluginSdkImpactRequirementStatus,
+): PluginSdkImpactCheckConclusion {
+  return requirements.maintainerApprovalSatisfied && requirements.rfcSatisfied
+    ? "success"
+    : "failure";
+}
+
+function pluginSdkImpactCheckText(state: PluginSdkImpactCheckState): string {
+  const requirements = state.requirements;
+  const missing: string[] = [];
+  if (!requirements.maintainerApprovalSatisfied) {
+    missing.push("current-head approval from an active openclaw/maintainer member");
+  }
+  if (!requirements.rfcSatisfied) {
+    missing.push("a merged openclaw/rfcs PR linked from the PR body");
+  }
+  const displayedPaths = state.triggeredPaths.slice(0, 25);
+  const extraPathCount = Math.max(0, state.triggeredPaths.length - displayedPaths.length);
+  const pathLines = displayedPaths.length
+    ? displayedPaths.map((path) => `- ${path}`)
+    : ["- No triggered paths were recorded in the report metadata."];
+  if (extraPathCount > 0) {
+    pathLines.push(`- ... ${extraPathCount} more`);
+  }
+
+  const maintainerLine = requirements.maintainerApprovalRequired
+    ? requirements.maintainerApprovalSatisfied
+      ? `Maintainer approval: satisfied by ${requirements.maintainerApprovers
+          .map((login) => `@${login}`)
+          .join(", ")}.`
+      : "Maintainer approval: required and missing."
+    : "Maintainer approval: not required for this classification.";
+  const rfcLine = requirements.rfcRequired
+    ? requirements.rfcSatisfied
+      ? `RFC: satisfied by openclaw/rfcs#${requirements.mergedRfcPulls.join(", #")}.`
+      : "RFC: required and missing."
+    : "RFC: not required for this classification.";
+  const statusLine = missing.length
+    ? `Status: blocked on ${missing.join(" and ")}.`
+    : "Status: passed.";
+
+  return [
+    `Plugin SDK impact label: ${state.classification}`,
+    `Classification source: ${state.source || "unknown"}`,
+    `Reason: ${state.reason}`,
+    `File list truncated: ${state.pathsTruncated ? "yes" : "no"}`,
+    "",
+    "Triggered files:",
+    ...pathLines,
+    "",
+    statusLine,
+    maintainerLine,
+    rfcLine,
+    "",
+    "How to clear this gate:",
+    "- Keep exactly one plugin-sdk:* label on the PR. ClawSweeper normally manages this label.",
+    "- For plugin-sdk:additive-api or plugin-sdk:behavior-change, get an approval on the current head SHA from an active openclaw/maintainer member.",
+    "- For plugin-sdk:breaking-change or plugin-sdk:architecture-change, link a merged openclaw/rfcs PR in the PR body.",
+    "- If the label is wrong, a maintainer should update the plugin-sdk:* label or rerun ClawSweeper so it republishes this check for the current head.",
+  ].join("\n");
+}
+
+function buildPluginSdkImpactCheckPayload(
+  state: PluginSdkImpactCheckState,
+): PluginSdkImpactCheckPayload {
+  const conclusion = pluginSdkImpactCheckConclusion(state.requirements);
+  const title =
+    conclusion === "success" ? "Plugin SDK impact gate passed" : "Plugin SDK impact gate blocked";
+  const summary =
+    conclusion === "success"
+      ? `${state.classification} is classified and all required review/RFC gates are satisfied.`
+      : `${state.classification} is classified but required maintainer review or RFC evidence is missing.`;
+  return {
+    name: PLUGIN_SDK_IMPACT_CHECK_NAME,
+    head_sha: state.headSha,
+    status: "completed",
+    conclusion,
+    details_url: state.detailsUrl,
+    output: {
+      title,
+      summary,
+      text: truncateText(pluginSdkImpactCheckText(state), 60_000),
+    },
+  };
+}
+
+export function pluginSdkImpactCheckPayloadForTest(options: {
+  repo?: string;
+  number?: number;
+  headSha?: string;
+  classification: PluginSdkImpactLabelName;
+  reason?: string;
+  source?: string;
+  triggeredPaths?: readonly string[];
+  pathsTruncated?: boolean;
+  maintainerApprovers?: readonly string[];
+  mergedRfcPulls?: readonly number[];
+}): PluginSdkImpactCheckPayload {
+  const classification = options.classification;
+  const requirementOptions: {
+    maintainerApprovers?: readonly string[];
+    mergedRfcPulls?: readonly number[];
+  } = {};
+  if (options.maintainerApprovers)
+    requirementOptions.maintainerApprovers = options.maintainerApprovers;
+  if (options.mergedRfcPulls) requirementOptions.mergedRfcPulls = options.mergedRfcPulls;
+  return buildPluginSdkImpactCheckPayload({
+    repo: options.repo ?? "openclaw/openclaw",
+    number: options.number ?? 1,
+    headSha: options.headSha ?? "a".repeat(40),
+    classification,
+    reason: options.reason ?? "Test classification reason.",
+    source: options.source ?? "deterministic",
+    triggeredPaths: [...(options.triggeredPaths ?? [])],
+    pathsTruncated: options.pathsTruncated ?? false,
+    detailsUrl: `https://github.com/${options.repo ?? "openclaw/openclaw"}/pull/${
+      options.number ?? 1
+    }`,
+    requirements: pluginSdkImpactRequirementStatus(classification, requirementOptions),
+  });
+}
+
+function pluginSdkImpactCheckPayloadHash(payload: PluginSdkImpactCheckPayload): string {
+  const { completed_at: _completedAt, ...stablePayload } = payload;
+  return sha256(stableJson(stablePayload));
+}
+
+function pluginSdkImpactCheckRunsForCommit(repo: string, sha: string): GitHubCheckRun[] {
+  const encodedName = encodeURIComponent(PLUGIN_SDK_IMPACT_CHECK_NAME);
+  try {
+    const runs = ghJson<unknown>([
+      "api",
+      `repos/${repo}/commits/${sha}/check-runs?check_name=${encodedName}`,
+      "--jq",
+      ".check_runs",
+    ]);
+    return Array.isArray(runs) ? (runs as GitHubCheckRun[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+function activeOpenClawMaintainer(login: string): boolean {
+  const membership = ghJson<GitHubTeamMembership>([
+    "api",
+    `orgs/openclaw/teams/maintainer/memberships/${login}`,
+  ]);
+  return membership.state === "active";
+}
+
+function pluginSdkImpactMaintainerApprovers(
+  repo: string,
+  number: number,
+  headSha: string,
+): string[] {
+  const reviews = ghJson<GitHubPullRequestReview[]>([
+    "api",
+    `repos/${repo}/pulls/${number}/reviews?per_page=100`,
+  ]);
+  const latestByLogin = new Map<string, GitHubPullRequestReview>();
+  for (const review of reviews) {
+    const login = review.user?.login;
+    const state = review.state?.toUpperCase();
+    if (!login || !state || !["APPROVED", "CHANGES_REQUESTED", "DISMISSED"].includes(state)) {
+      continue;
+    }
+    latestByLogin.set(login, review);
+  }
+  const approvers: string[] = [];
+  for (const [login, review] of latestByLogin) {
+    if (review.state?.toUpperCase() !== "APPROVED") continue;
+    if (review.commit_id !== headSha) continue;
+    if (activeOpenClawMaintainer(login)) approvers.push(login);
+  }
+  return approvers.toSorted();
+}
+
+function openClawRfcPullNumbers(text: string): number[] {
+  const numbers = new Set<number>();
+  const patterns = [
+    /https:\/\/github\.com\/openclaw\/rfcs\/pull\/(\d+)/giu,
+    /\bopenclaw\/rfcs#(\d+)\b/giu,
+  ];
+  for (const pattern of patterns) {
+    for (const match of text.matchAll(pattern)) {
+      const number = Number(match[1]);
+      if (Number.isInteger(number) && number > 0) numbers.add(number);
+    }
+  }
+  return [...numbers].toSorted((left, right) => left - right);
+}
+
+function mergedOpenClawRfcPulls(text: string): number[] {
+  return openClawRfcPullNumbers(text).filter((number) => {
+    const pull = ghJson<{ merged_at?: string | null }>([
+      "api",
+      `repos/openclaw/rfcs/pulls/${number}`,
+    ]);
+    return Boolean(pull.merged_at);
+  });
+}
+
+function pullRequestBody(repo: string, number: number): string {
+  const pull = ghJson<GitHubPullRequestDetails>(["api", `repos/${repo}/pulls/${number}`]);
+  return pull.body ?? "";
+}
+
+function pluginSdkImpactCheckStateFromReport(
+  markdown: string,
+  number: number,
+): PluginSdkImpactCheckState | null {
+  const classification = pluginSdkImpactClassificationFromReport(markdown);
+  if (!classification) return null;
+  const headSha = pullHeadShaFromReport(markdown);
+  if (!isFullGitSha(headSha)) return null;
+  const repo = markdownRepository(markdown);
+  const maintainerApprovers = pluginSdkImpactRequiresMaintainerApproval(classification)
+    ? pluginSdkImpactMaintainerApprovers(repo, number, headSha)
+    : [];
+  const prBody = pluginSdkImpactRequiresRfc(classification) ? pullRequestBody(repo, number) : "";
+  const mergedRfcPulls = prBody ? mergedOpenClawRfcPulls(prBody) : [];
+  return {
+    repo,
+    number,
+    headSha,
+    classification,
+    reason: pluginSdkImpactReasonFromReport(markdown),
+    source: frontMatterValue(markdown, "plugin_sdk_impact_source") ?? "unknown",
+    triggeredPaths: frontMatterStringArray(markdown, "plugin_sdk_impact_paths"),
+    pathsTruncated: frontMatterBoolean(markdown, "plugin_sdk_impact_paths_truncated"),
+    detailsUrl:
+      frontMatterValue(markdown, "review_comment_url") ??
+      frontMatterValue(markdown, "url") ??
+      `https://github.com/${repo}/pull/${number}`,
+    requirements: pluginSdkImpactRequirementStatus(classification, {
+      maintainerApprovers,
+      mergedRfcPulls,
+    }),
+  };
+}
+
+function syncPluginSdkImpactCheckRun(options: {
+  markdown: string;
+  number: number;
+  dryRun: boolean;
+}): { markdown: string; changed: boolean; reason: string } {
+  const state = pluginSdkImpactCheckStateFromReport(options.markdown, options.number);
+  if (!state) {
+    return { markdown: options.markdown, changed: false, reason: "no Plugin SDK impact check" };
+  }
+  const payload = buildPluginSdkImpactCheckPayload(state);
+  const desiredHash = pluginSdkImpactCheckPayloadHash(payload);
+  const existingHash = frontMatterValue(options.markdown, "plugin_sdk_impact_check_sha256");
+  const existing = pluginSdkImpactCheckRunsForCommit(state.repo, state.headSha).find((run) =>
+    Boolean(run.id),
+  );
+  const changed = !existing?.id || existingHash !== desiredHash;
+  if (!changed) {
+    return {
+      markdown: options.markdown,
+      changed: false,
+      reason: "Plugin SDK impact check already current",
+    };
+  }
+  if (!options.dryRun) {
+    const payloadWithTimestamp = { ...payload, completed_at: new Date().toISOString() };
+    const payloadDir = join(ROOT, ".artifacts");
+    ensureDir(payloadDir);
+    const payloadPath = join(
+      payloadDir,
+      `plugin-sdk-impact-check-${options.number}-${state.headSha}.json`,
+    );
+    writeFileSync(payloadPath, JSON.stringify(payloadWithTimestamp, null, 2), "utf8");
+    if (existing?.id) {
+      ghWithRetry([
+        "api",
+        `repos/${state.repo}/check-runs/${existing.id}`,
+        "--method",
+        "PATCH",
+        "--input",
+        payloadPath,
+      ]);
+    } else {
+      ghWithRetry([
+        "api",
+        `repos/${state.repo}/check-runs`,
+        "--method",
+        "POST",
+        "--input",
+        payloadPath,
+      ]);
+    }
+  }
+  let markdown = replaceFrontMatterValue(
+    options.markdown,
+    "plugin_sdk_impact_check_sha256",
+    desiredHash,
+  );
+  if (!options.dryRun) {
+    markdown = replaceFrontMatterValue(
+      markdown,
+      "plugin_sdk_impact_check_synced_at",
+      new Date().toISOString(),
+    );
+  }
+  const conclusion = pluginSdkImpactCheckConclusion(state.requirements);
+  const action = options.dryRun ? "would sync" : "synced";
+  return {
+    markdown,
+    changed: true,
+    reason: `${action} Plugin SDK impact check (${conclusion})`,
+  };
+}
+
 function pluginSdkImpactMarkerFromReport(markdown: string): string {
   const classification = pluginSdkImpactClassificationFromReport(markdown);
   if (!classification || frontMatterBoolean(markdown, "plugin_sdk_impact_paths_truncated")) {
@@ -16299,6 +16718,8 @@ async function applyDecisionsCommand(args: Args): Promise<void> {
     }
     const isCurrentCompleteReport =
       frontMatterValue(markdown, "review_status") === "complete" && unchangedSinceReview;
+    let pluginSdkImpactCheckChanged = false;
+    let pluginSdkImpactCheckReason = "";
     if (state === "open" && isCurrentCompleteReport) {
       try {
         const syncResult = syncPriorityLabel({
@@ -16343,6 +16764,14 @@ async function applyDecisionsCommand(args: Args): Promise<void> {
           pluginSdkImpactLabelChanged = pluginSdkImpactSyncResult.changed;
           clawSweeperLabelsChanged ||= pluginSdkImpactSyncResult.changed;
           markdown = replaceFrontMatterValue(markdown, "labels", JSON.stringify(item.labels));
+          const pluginSdkImpactCheckSyncResult = syncPluginSdkImpactCheckRun({
+            markdown,
+            number,
+            dryRun,
+          });
+          markdown = pluginSdkImpactCheckSyncResult.markdown;
+          pluginSdkImpactCheckChanged = pluginSdkImpactCheckSyncResult.changed;
+          pluginSdkImpactCheckReason = pluginSdkImpactCheckSyncResult.reason;
         }
         if (
           syncResult.changed ||
@@ -16351,6 +16780,13 @@ async function applyDecisionsCommand(args: Args): Promise<void> {
           pluginSdkImpactLabelChanged
         ) {
           rememberSelfMutationUpdatedAt();
+        }
+        if (pluginSdkImpactCheckChanged && !dryRun) {
+          markdown = replaceFrontMatterValue(
+            markdown,
+            "apply_checked_at",
+            new Date().toISOString(),
+          );
         }
       } catch (error) {
         if (!isGitHubRequiresAuthenticationError(error)) throw error;
@@ -16524,6 +16960,18 @@ async function applyDecisionsCommand(args: Args): Promise<void> {
     const labelSyncProgressMessage = issueAdvisoryLabelsChanged
       ? `synced advisory issue labels #${number}`
       : `synced ClawSweeper labels #${number}`;
+    const metadataSyncReasons = [
+      clawSweeperLabelsChanged ? labelSyncReason : "",
+      pluginSdkImpactCheckChanged ? pluginSdkImpactCheckReason : "",
+    ].filter(Boolean);
+    const metadataSyncAction: ActionTaken =
+      pluginSdkImpactCheckChanged && !clawSweeperLabelsChanged
+        ? "plugin_sdk_impact_check_synced"
+        : "kept_open";
+    const metadataSyncProgressMessage =
+      pluginSdkImpactCheckChanged && !clawSweeperLabelsChanged
+        ? `synced Plugin SDK impact check #${number}`
+        : labelSyncProgressMessage;
     if (needsReviewCommentSync) {
       const lockedReason = needsReviewCommentBodySync ? lockedConversationApplyReason(item) : null;
       if (lockedReason) {
@@ -16563,6 +17011,9 @@ async function applyDecisionsCommand(args: Args): Promise<void> {
       } else if (needsReviewCommentSync) {
         syncReasons.push("recorded existing durable comment metadata");
       }
+      if (pluginSdkImpactCheckChanged) {
+        syncReasons.push(pluginSdkImpactCheckReason);
+      }
       if (needsReviewCommentSync) {
         markdown = updateReviewCommentMetadata(markdown, syncedComment, markedReviewComment);
       }
@@ -16593,18 +17044,18 @@ async function applyDecisionsCommand(args: Args): Promise<void> {
       continue;
     }
     if (
-      clawSweeperLabelsChanged &&
+      (clawSweeperLabelsChanged || pluginSdkImpactCheckChanged) &&
       !needsReviewCommentSync &&
       (!isCloseProposal || syncCommentsOnly)
     ) {
       if (!dryRun) writeFileSync(path, markdown, "utf8");
       results.push({
         number,
-        action: "kept_open",
-        reason: labelSyncReason,
+        action: metadataSyncAction,
+        reason: metadataSyncReasons.join("; "),
       });
       processedCount += 1;
-      maybeLogProgress(labelSyncProgressMessage);
+      maybeLogProgress(metadataSyncProgressMessage);
       if (processedCount >= processedLimit) break;
     }
     if (syncCommentsOnly) continue;

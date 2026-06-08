@@ -64,6 +64,7 @@ import {
   parseGhJson,
   parseGhJsonLines,
   parseDecision,
+  pluginSdkImpactCheckPayloadForTest,
   pluginSdkImpactFromPullFilesForTest,
   pluginSdkImpactLabelsForTest,
   pluginSdkImpactLabelSchemeForTest,
@@ -5998,6 +5999,171 @@ if (args[0] === "api" && /\\/issues\\/74478$/.test(path)) {
           args.includes("feature: ✨ showcase"),
       ),
     );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("apply-decisions publishes Plugin SDK impact check runs with maintainer guidance", () => {
+  const root = mkdtempSync(tmpPrefix);
+  try {
+    const itemsDir = join(root, "items");
+    const closedDir = join(root, "closed");
+    const plansDir = join(root, "plans");
+    const reportPath = join(root, "apply-report.json");
+    const logPath = join(root, "gh.log");
+    const itemPath = join(itemsDir, "74480.md");
+    const headSha = "0123456789abcdef0123456789abcdef01234567";
+    mkdirSync(itemsDir, { recursive: true });
+    mkdirSync(plansDir, { recursive: true });
+    writeFileSync(
+      itemPath,
+      `${reportFrontMatter({
+        repository: "openclaw/openclaw",
+        type: "pull_request",
+        number: "74480",
+        title: "Update plugin SDK behavior",
+        url: "https://github.com/openclaw/openclaw/pull/74480",
+        decision: "keep_open",
+        close_reason: "none",
+        confidence: "high",
+        action_taken: "kept_open",
+        review_status: "complete",
+        local_checkout_access: "verified",
+        author: "contributor",
+        author_association: "CONTRIBUTOR",
+        labels: JSON.stringify(["plugin-sdk:behavior-change"]),
+        item_category: "feature",
+        item_snapshot_hash: "snapshot-a",
+        item_updated_at: "2026-05-19T20:00:00Z",
+        pull_head_sha: headSha,
+        plugin_sdk_impact_classification: "plugin-sdk:behavior-change",
+        plugin_sdk_impact_source: "deterministic",
+        plugin_sdk_impact_reason: JSON.stringify(
+          "Plugin SDK public or contract-adjacent implementation changed.",
+        ),
+        plugin_sdk_impact_paths: JSON.stringify(["src/plugin-sdk/runtime.ts"]),
+        plugin_sdk_impact_paths_truncated: "false",
+      })}
+
+## Summary
+
+This PR has complete review metadata and needs a Plugin SDK impact check.
+
+${realBehaviorProofReportSection({ status: "not_applicable", evidenceKind: "not_applicable" })}
+
+${prRatingReportSection({ overallTier: "A" })}
+
+## Review Findings
+
+Overall correctness: patch is correct
+
+Overall confidence: 0.9
+
+Full review comments:
+
+- none
+`,
+      "utf8",
+    );
+
+    const ghMock = `
+const { appendFileSync, readFileSync } = require("fs");
+const logPath = ${JSON.stringify(logPath)};
+const headSha = ${JSON.stringify(headSha)};
+const rawArgs = process.argv.slice(2);
+const args = rawArgs[0] === "--repo" ? rawArgs.slice(2) : rawArgs;
+appendFileSync(logPath, JSON.stringify(args) + "\\n");
+const path = args[1] || "";
+if (args[0] === "api" && /\\/issues\\/74480$/.test(path)) {
+  console.log(JSON.stringify({
+    number: 74480,
+    title: "Update plugin SDK behavior",
+    html_url: "https://github.com/openclaw/openclaw/pull/74480",
+    created_at: "2026-05-19T19:00:00Z",
+    updated_at: "2026-05-19T20:00:00Z",
+    closed_at: null,
+    state: "open",
+    locked: false,
+    active_lock_reason: null,
+    author_association: "CONTRIBUTOR",
+    user: { login: "contributor" },
+    labels: ["plugin-sdk:behavior-change"],
+    pull_request: {}
+  }));
+} else if (args[0] === "api" && args[1] === "-i" && /\\/issues\\/74480\\/timeline(?:\\?|$)/.test(args[2] || "")) {
+  console.log("HTTP/2 200\\n\\n[]");
+} else if (args[0] === "api" && /\\/issues\\/74480\\/timeline(?:\\?|$)/.test(path)) {
+  console.log(JSON.stringify([[]]));
+} else if (args[0] === "api" && /\\/pulls\\/74480\\/reviews(?:\\?|$)/.test(path)) {
+  console.log(JSON.stringify([{ state: "APPROVED", commit_id: headSha, user: { login: "maintainer" } }]));
+} else if (args[0] === "api" && /orgs\\/openclaw\\/teams\\/maintainer\\/memberships\\/maintainer$/.test(path)) {
+  console.log(JSON.stringify({ state: "active" }));
+} else if (args[0] === "api" && /\\/commits\\/${headSha}\\/check-runs/.test(path)) {
+  console.log(JSON.stringify([]));
+} else if (args[0] === "api" && /\\/check-runs$/.test(path) && args.includes("POST")) {
+  const input = args[args.indexOf("--input") + 1];
+  appendFileSync(logPath, JSON.stringify(["check-run-payload", JSON.parse(readFileSync(input, "utf8"))]) + "\\n");
+  console.log(JSON.stringify({ id: 1234 }));
+} else if (args[0] === "api" && /\\/pulls\\/74480$/.test(path)) {
+  console.log(JSON.stringify({
+    number: 74480,
+    html_url: "https://github.com/openclaw/openclaw/pull/74480",
+    state: "open",
+    changed_files: 1,
+    commits: 1,
+    review_comments: 0,
+    body: "",
+    head: { sha: headSha, ref: "branch", repo: { full_name: "fork/openclaw" } },
+    base: { sha: "base-sha", ref: "main", repo: { full_name: "openclaw/openclaw" } },
+    user: { login: "contributor" }
+  }));
+} else if (args[0] === "api" && /\\/pulls\\/74480\\/(files|commits|comments)(?:\\?|$)/.test(path)) {
+  console.log(JSON.stringify([[]]));
+} else if (args[0] === "api" && /\\/issues\\/74480\\/comments(?:\\?|$)/.test(path)) {
+  if (args.includes("--method") && args.includes("POST")) {
+    console.log(JSON.stringify({
+      id: 987480,
+      html_url: "https://github.com/openclaw/openclaw/pull/74480#issuecomment-987480"
+    }));
+  } else {
+    console.log(JSON.stringify([[]]));
+  }
+} else if (args[0] === "label" && args[1] === "create") {
+  console.log(JSON.stringify({ name: args[2] }));
+} else if (args[0] === "issue" && args[1] === "edit") {
+  console.log("");
+} else {
+  console.error("unexpected gh args", JSON.stringify(args));
+  process.exit(1);
+}
+`;
+    withMockGh(root, ghMock, () => {
+      runApplyDecisionsForTest({
+        targetRepo: "openclaw/openclaw",
+        itemsDir,
+        closedDir,
+        plansDir,
+        reportPath,
+        extraArgs: ["--sync-comments-only", "--item-numbers", "74480"],
+      });
+    });
+
+    const report = readFileSync(itemPath, "utf8");
+    assert.match(report, /^plugin_sdk_impact_check_sha256: [0-9a-f]{64}$/m);
+    assert.match(report, /^plugin_sdk_impact_check_synced_at: /m);
+    const calls = readFileSync(logPath, "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    const payloadCall = calls.find((call) => call[0] === "check-run-payload");
+    assert.ok(payloadCall, "missing check-run payload");
+    assert.equal(payloadCall[1].name, "Plugin SDK impact gate");
+    assert.equal(payloadCall[1].head_sha, headSha);
+    assert.equal(payloadCall[1].conclusion, "success");
+    assert.match(payloadCall[1].output.text, /How to clear this gate:/);
+    assert.match(payloadCall[1].output.text, /openclaw\/maintainer/);
+    assert.match(payloadCall[1].output.text, /src\/plugin-sdk\/runtime\.ts/);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -16187,6 +16353,32 @@ test("ClawSweeper Plugin SDK impact labels remove stale owned labels and preserv
   );
 });
 
+test("ClawSweeper Plugin SDK impact check explains blocked maintainer and RFC gates", () => {
+  const blocked = pluginSdkImpactCheckPayloadForTest({
+    classification: "plugin-sdk:architecture-change",
+    reason: "Plugin SDK architecture changed.",
+    source: "existing-label",
+    triggeredPaths: ["src/plugin-sdk/index.ts"],
+  });
+
+  assert.equal(blocked.conclusion, "failure");
+  assert.equal(blocked.output.title, "Plugin SDK impact gate blocked");
+  assert.match(blocked.output.text, /Maintainer approval: required and missing/);
+  assert.match(blocked.output.text, /RFC: required and missing/);
+  assert.match(blocked.output.text, /How to clear this gate:/);
+  assert.match(blocked.output.text, /link a merged openclaw\/rfcs PR/);
+
+  const satisfied = pluginSdkImpactCheckPayloadForTest({
+    classification: "plugin-sdk:architecture-change",
+    maintainerApprovers: ["alice"],
+    mergedRfcPulls: [7],
+  });
+
+  assert.equal(satisfied.conclusion, "success");
+  assert.match(satisfied.output.text, /Maintainer approval: satisfied by @alice/);
+  assert.match(satisfied.output.text, /RFC: satisfied by openclaw\/rfcs#7/);
+});
+
 test("ClawSweeper classifies Plugin SDK impact from PR files", () => {
   assert.equal(
     pluginSdkImpactFromPullFilesForTest({
@@ -17292,6 +17484,8 @@ test("sweep target write tokens can merge pull requests", () => {
   assert.equal(targetWriteTokenBlocks.length, 3);
   for (const block of targetWriteTokenBlocks) {
     assert.match(block, /permission-contents: write/);
+    assert.match(block, /permission-checks: write/);
+    assert.match(block, /permission-members: read/);
     assert.match(block, /permission-pull-requests: write/);
   }
 });
