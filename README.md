@@ -563,7 +563,9 @@ is active. Throughput defaults live in
 ### Worker Budget
 
 ClawSweeper has one main capacity knob:
-`config/automation-limits.json` -> `workers.max`. The current value is `10`.
+`config/automation-limits.json` -> `workers.max`. The checked-in value is `10`,
+and live GitHub Actions runs can override it with the
+`CLAWSWEEPER_WORKERS_MAX` repository variable.
 Lane limits are derived from that number: normal review defaults to 7 shards
 for manual/backstop runs, scheduled normal review gets up to 6 after reserves,
 hot intake up to 3 shards, commit review 1 commit per page, and existing
@@ -572,10 +574,11 @@ workers. Imported gitcrawl cluster repair stays at 1 live worker by default.
 Exact-item review, repair, and issue implementation are priority work; normal
 review, hot intake, and commit review are background work and automatically
 yield when priority work is active.
-Use `workers.max` first when turning total Codex usage up or down; use
-`lanes.repair.cluster_max_live_runs` to tune the imported legacy cluster-repair
-lane separately, and individual environment overrides only for temporary
-lane-specific exceptions.
+Use `workers.max` / `CLAWSWEEPER_WORKERS_MAX` first when turning total Codex
+usage up or down; use `lanes.repair.cluster_max_live_runs` /
+`CLAWSWEEPER_CLUSTER_REPAIR_MAX_LIVE_RUNS` to tune the imported legacy
+cluster-repair lane separately, and individual environment overrides only for
+temporary lane-specific exceptions.
 
 Target repositories can opt into event-level latency by installing the
 dispatcher workflow in [docs/target-dispatcher.md](docs/target-dispatcher.md).

@@ -57,7 +57,7 @@ export function readWorkerConfig(
   filePath = join(repoRoot(), "config", "automation-limits.json"),
 ): WorkerConfig {
   const parsed = JSON.parse(readFileSync(filePath, "utf8")) as unknown;
-  return validateWorkerConfig(parsed);
+  return applyWorkerConfigEnv(validateWorkerConfig(parsed));
 }
 
 export function deriveAutomationLimits(config: WorkerConfig): AutomationLimits {
@@ -162,6 +162,54 @@ function validateWorkerConfig(value: unknown): WorkerConfig {
       },
     },
   };
+}
+
+function applyWorkerConfigEnv(config: WorkerConfig): WorkerConfig {
+  return {
+    workers: {
+      max: positiveEnvInteger("CLAWSWEEPER_WORKERS_MAX", config.workers.max),
+      reserve_for_interactive: nonNegativeEnvInteger(
+        "CLAWSWEEPER_WORKERS_RESERVE_FOR_INTERACTIVE",
+        config.workers.reserve_for_interactive,
+      ),
+      expansion_reserve: nonNegativeEnvInteger(
+        "CLAWSWEEPER_WORKERS_EXPANSION_RESERVE",
+        config.workers.expansion_reserve,
+      ),
+      minimum_background: positiveEnvInteger(
+        "CLAWSWEEPER_WORKERS_MINIMUM_BACKGROUND",
+        config.workers.minimum_background,
+      ),
+    },
+    lanes: {
+      repair: {
+        cluster_max_live_runs: positiveEnvInteger(
+          "CLAWSWEEPER_CLUSTER_REPAIR_MAX_LIVE_RUNS",
+          config.lanes.repair.cluster_max_live_runs,
+        ),
+      },
+    },
+  };
+}
+
+function positiveEnvInteger(name: string, fallback: number): number {
+  const value = process.env[name]?.trim();
+  if (!value) return fallback;
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 1) {
+    throw new Error(`automation limit env ${name} must be a positive integer`);
+  }
+  return parsed;
+}
+
+function nonNegativeEnvInteger(name: string, fallback: number): number {
+  const value = process.env[name]?.trim();
+  if (!value) return fallback;
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    throw new Error(`automation limit env ${name} must be a non-negative integer`);
+  }
+  return parsed;
 }
 
 function percent(max: number, value: number): number {

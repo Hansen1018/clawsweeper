@@ -92,6 +92,81 @@ test("worker config defaults imported cluster repair capacity for older configs"
   assert.equal(readWorkerConfig(configPath).lanes.repair.cluster_max_live_runs, 1);
 });
 
+test("worker config accepts GitHub variable style env overrides", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-limits-"));
+  const configPath = path.join(root, "automation-limits.json");
+  write(
+    configPath,
+    JSON.stringify({
+      workers: {
+        max: 10,
+        reserve_for_interactive: 2,
+        expansion_reserve: 2,
+        minimum_background: 2,
+      },
+      lanes: {
+        assist: {
+          max: 5,
+        },
+        repair: {
+          cluster_max_live_runs: 1,
+        },
+      },
+    }),
+  );
+
+  withEnv(
+    {
+      CLAWSWEEPER_WORKERS_MAX: "57",
+      CLAWSWEEPER_WORKERS_RESERVE_FOR_INTERACTIVE: "10",
+      CLAWSWEEPER_WORKERS_EXPANSION_RESERVE: "20",
+      CLAWSWEEPER_WORKERS_MINIMUM_BACKGROUND: "10",
+      CLAWSWEEPER_ASSIST_MAX: "12",
+      CLAWSWEEPER_CLUSTER_REPAIR_MAX_LIVE_RUNS: "3",
+    },
+    () => {
+      const config = readWorkerConfig(configPath);
+      assert.equal(config.workers.max, 57);
+      assert.equal(config.workers.reserve_for_interactive, 10);
+      assert.equal(config.workers.expansion_reserve, 20);
+      assert.equal(config.workers.minimum_background, 10);
+      assert.equal(config.lanes.assist.max, 12);
+      assert.equal(config.lanes.repair.cluster_max_live_runs, 3);
+    },
+  );
+});
+
+test("worker config rejects invalid GitHub variable style env overrides", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-limits-"));
+  const configPath = path.join(root, "automation-limits.json");
+  write(
+    configPath,
+    JSON.stringify({
+      workers: {
+        max: 10,
+        reserve_for_interactive: 2,
+        expansion_reserve: 2,
+        minimum_background: 2,
+      },
+      lanes: {
+        assist: {
+          max: 5,
+        },
+        repair: {
+          cluster_max_live_runs: 1,
+        },
+      },
+    }),
+  );
+
+  withEnv({ CLAWSWEEPER_WORKERS_MAX: "0" }, () => {
+    assert.throws(
+      () => readWorkerConfig(configPath),
+      /CLAWSWEEPER_WORKERS_MAX must be a positive integer/,
+    );
+  });
+});
+
 test("workflow utilities derive artifact item numbers and action counts", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-workflow-"));
   write(path.join(root, "artifacts/shard-a/openclaw-openclaw-42.md"), "report\n");
@@ -849,6 +924,23 @@ function withCwd(cwd, callback) {
 function write(file, content) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, content);
+}
+
+function withEnv(values, callback) {
+  const previous = new Map();
+  for (const [key, value] of Object.entries(values)) {
+    previous.set(key, process.env[key]);
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+  try {
+    callback();
+  } finally {
+    for (const [key, value] of previous.entries()) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
 }
 
 function writeProposedRecord(root, number, type, actionTaken, closeReason, itemCreatedAt) {

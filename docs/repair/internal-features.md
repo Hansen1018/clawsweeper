@@ -618,6 +618,17 @@ Important defaults:
 - `CLAWSWEEPER_MAX_LIVE_WORKERS`: dispatch capacity guard. Existing repair
   lanes derive their checked-in default from `workers.max`; imported gitcrawl
   cluster jobs use `lanes.repair.cluster_max_live_runs`.
+- `CLAWSWEEPER_WORKERS_MAX`: live global worker budget override. Keep at `10`
+  for light mode, use `24` for medium catch-up, and use `57` only for high mode
+  when Codex TPM headroom is confirmed.
+- `CLAWSWEEPER_WORKERS_RESERVE_FOR_INTERACTIVE`,
+  `CLAWSWEEPER_WORKERS_EXPANSION_RESERVE`, and
+  `CLAWSWEEPER_WORKERS_MINIMUM_BACKGROUND`: live background scheduling reserves.
+  Pair them with the profile values in `docs/limits.md`; avoid changing just one
+  reserve unless debugging a specific scheduler pressure problem.
+- `CLAWSWEEPER_ASSIST_MAX` and `CLAWSWEEPER_CLUSTER_REPAIR_MAX_LIVE_RUNS`:
+  live lane-specific worker budget overrides for maintainer assist and imported
+  gitcrawl cluster repair.
 - `CLAWSWEEPER_DISPATCH_RECHECK_MS`: short active-worker recheck before
   dispatching a repair worker; default `5000` to avoid duplicate queued workers
   when parallel routers race GitHub run visibility.

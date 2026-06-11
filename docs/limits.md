@@ -3,14 +3,14 @@
 Read when changing ClawSweeper throughput, Codex fan-out, commit review paging,
 or repair dispatch capacity.
 
-`config/automation-limits.json` is the source of truth for the global worker
-budget. It deliberately has one main global knob, `workers.max`, because that is
-the number we normally tune when Codex or GitHub rate limits get tight. Most
-lane-specific limits are derived from that budget; imported cluster repair has
-a separate explicit knob so it can stay at one live worker unless a maintainer
-intentionally opens it wider. Safety thresholds such as
-close age floors, apply delays, retry counts, and comment caps stay near the
-code that owns those decisions.
+`config/automation-limits.json` is the checked-in safe default for the global
+worker budget. It deliberately has one main global knob, `workers.max`, because
+that is the number we normally tune when Codex or GitHub rate limits get tight.
+Most lane-specific limits are derived from that budget; imported cluster repair
+has a separate explicit knob so it can stay at one live worker unless a
+maintainer intentionally opens it wider. Safety thresholds such as close age
+floors, apply delays, retry counts, and comment caps stay near the code that
+owns those decisions.
 
 GitHub repository variables still override selected live limits. When a variable
 is unset, workflows read the checked-in budget after checkout. The one exception
@@ -128,13 +128,42 @@ pnpm run --silent workflow -- worker-limit commit_review --active-critical 64
 ```
 
 Change `workers.max` first when tuning review-side rate-limit pressure. For
-example, setting `workers.max` to `90` automatically makes normal review `63`,
-hot intake `31`, and commit review `4`. Existing repair lanes keep their
+example, setting `workers.max` to `57` automatically makes normal review `39`,
+hot intake `19`, and commit review `2`. Existing repair lanes keep their
 40% derived caps, while imported cluster repair remains at one live worker until
 `lanes.repair.cluster_max_live_runs` is raised.
 
+## GitHub Variable Profiles
+
+The live GitHub Actions lanes read these repository variables before falling
+back to `config/automation-limits.json`:
+
+| GitHub variable | Config field |
+| --- | --- |
+| `CLAWSWEEPER_WORKERS_MAX` | `workers.max` |
+| `CLAWSWEEPER_WORKERS_RESERVE_FOR_INTERACTIVE` | `workers.reserve_for_interactive` |
+| `CLAWSWEEPER_WORKERS_EXPANSION_RESERVE` | `workers.expansion_reserve` |
+| `CLAWSWEEPER_WORKERS_MINIMUM_BACKGROUND` | `workers.minimum_background` |
+| `CLAWSWEEPER_ASSIST_MAX` | `lanes.assist.max` |
+| `CLAWSWEEPER_CLUSTER_REPAIR_MAX_LIVE_RUNS` | `lanes.repair.cluster_max_live_runs` |
+
+Use named profiles instead of ad hoc edits:
+
+| Profile | Variables | Derived shape |
+| --- | --- | --- |
+| light | `CLAWSWEEPER_WORKERS_MAX=10`, `CLAWSWEEPER_WORKERS_RESERVE_FOR_INTERACTIVE=2`, `CLAWSWEEPER_WORKERS_EXPANSION_RESERVE=2`, `CLAWSWEEPER_WORKERS_MINIMUM_BACKGROUND=2`, `CLAWSWEEPER_ASSIST_MAX=5`, `CLAWSWEEPER_CLUSTER_REPAIR_MAX_LIVE_RUNS=1` | Current safe default: normal review 7, hot intake 3, commit page 1, repair 4. |
+| medium | `CLAWSWEEPER_WORKERS_MAX=24`, `CLAWSWEEPER_WORKERS_RESERVE_FOR_INTERACTIVE=4`, `CLAWSWEEPER_WORKERS_EXPANSION_RESERVE=4`, `CLAWSWEEPER_WORKERS_MINIMUM_BACKGROUND=3`, `CLAWSWEEPER_ASSIST_MAX=8`, `CLAWSWEEPER_CLUSTER_REPAIR_MAX_LIVE_RUNS=1` | Higher steady-state throughput: normal review 16, hot intake 8, commit page 1, repair 9. |
+| high | `CLAWSWEEPER_WORKERS_MAX=57`, `CLAWSWEEPER_WORKERS_RESERVE_FOR_INTERACTIVE=10`, `CLAWSWEEPER_WORKERS_EXPANSION_RESERVE=20`, `CLAWSWEEPER_WORKERS_MINIMUM_BACKGROUND=10`, `CLAWSWEEPER_ASSIST_MAX=12`, `CLAWSWEEPER_CLUSTER_REPAIR_MAX_LIVE_RUNS=1` | Close to the old large setup: normal review 39, hot intake 19, commit page 2, repair 22. |
+
+Prefer `light` after Codex TPM incidents, `medium` for normal catch-up when the
+queue is visibly behind, and `high` only when rate-limit headroom is confirmed.
+Changing these variables affects new workflow jobs; already-running jobs keep
+the environment they started with.
+
 ## Runtime Overrides
 
+- The GitHub variables above override the checked-in worker budget for live
+  workflow runs without a commit.
 - `CLAWSWEEPER_COMMIT_REVIEW_PAGE_SIZE` overrides
   `commit_review.page_size_default`.
 - `CLAWSWEEPER_FEATURE_CLUSTER_REPAIR_ENABLED=1` enables the scheduled
