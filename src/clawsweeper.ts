@@ -12320,6 +12320,29 @@ function contextHasNonAutomationActivityAfter(
   );
 }
 
+function isCompleteReportFreshEnoughForLabelSync(options: {
+  storedUpdatedAt: string | undefined;
+  itemUpdatedAt: string | undefined;
+  reviewCommentUpdatedAt: string | undefined;
+  context: () => ItemContext;
+  reviewCommentDriftToleranceMs?: number;
+}): boolean {
+  const { storedUpdatedAt, itemUpdatedAt, reviewCommentUpdatedAt } = options;
+  if (!storedUpdatedAt || !itemUpdatedAt) return false;
+  if (itemUpdatedAt === storedUpdatedAt || itemUpdatedAt === reviewCommentUpdatedAt) return true;
+  const reviewCommentUpdatedAtMs = timestampMs(reviewCommentUpdatedAt);
+  const itemUpdatedAtMs = timestampMs(itemUpdatedAt);
+  if (reviewCommentUpdatedAtMs === null || itemUpdatedAtMs === null) return false;
+  const toleranceMs = options.reviewCommentDriftToleranceMs ?? 5 * 60 * 1000;
+  if (Math.abs(itemUpdatedAtMs - reviewCommentUpdatedAtMs) > toleranceMs) return false;
+  const storedUpdatedAtMs = timestampMs(storedUpdatedAt);
+  if (storedUpdatedAtMs === null) return false;
+  return !contextHasNonAutomationActivityAfter(options.context(), storedUpdatedAtMs);
+}
+
+export const isCompleteReportFreshEnoughForLabelSyncForTest =
+  isCompleteReportFreshEnoughForLabelSync;
+
 function pullRequestUrlForNumber(number: number): string {
   return repoUrlFor(targetRepo(), `/pull/${number}`);
 }
@@ -16844,19 +16867,6 @@ async function applyDecisionsCommand(args: Args): Promise<void> {
     }
     const updatedSinceReview = Boolean(storedUpdatedAt && item.updatedAt !== storedUpdatedAt);
     const reviewCommentOnlyUpdate = item.updatedAt === commentUpdatedAt(existingReviewComment);
-    const labelSyncFreshEnough = (): boolean => {
-      if (!storedUpdatedAt) return false;
-      if (!updatedSinceReview || reviewCommentOnlyUpdate) return true;
-      const existingReviewCommentUpdatedAtMs = timestampMs(commentUpdatedAt(existingReviewComment));
-      const itemUpdatedAtMs = timestampMs(item.updatedAt);
-      if (existingReviewCommentUpdatedAtMs === null || itemUpdatedAtMs === null) return false;
-      if (Math.abs(itemUpdatedAtMs - existingReviewCommentUpdatedAtMs) > 5 * 60 * 1000) {
-        return false;
-      }
-      const storedUpdatedAtMs = timestampMs(storedUpdatedAt);
-      if (storedUpdatedAtMs === null) return false;
-      return !contextHasNonAutomationActivityAfter(currentItemContext(), storedUpdatedAtMs);
-    };
     const markChangedSinceReview = (options: {
       reason: string;
       currentUpdatedAt?: string | undefined;
@@ -17053,7 +17063,13 @@ async function applyDecisionsCommand(args: Args): Promise<void> {
       }
     }
     const isCurrentCompleteReport =
-      frontMatterValue(markdown, "review_status") === "complete" && labelSyncFreshEnough();
+      frontMatterValue(markdown, "review_status") === "complete" &&
+      isCompleteReportFreshEnoughForLabelSync({
+        storedUpdatedAt,
+        itemUpdatedAt: item.updatedAt,
+        reviewCommentUpdatedAt: commentUpdatedAt(existingReviewComment),
+        context: currentItemContext,
+      });
     if (state === "open" && isCurrentCompleteReport) {
       try {
         const syncResult = syncPriorityLabel({

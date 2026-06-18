@@ -53,6 +53,7 @@ import {
   hotIntakeRecencyMs,
   isCodexReviewCommentBody,
   isInfrastructureFailedReviewForTest,
+  isCompleteReportFreshEnoughForLabelSyncForTest,
   isGitHubLabelCapacityErrorForTest,
   isGitHubNotFoundError,
   isGitHubRequiresAuthenticationError,
@@ -514,6 +515,73 @@ test("review context comment filter keeps contributor text that only quotes mark
   assert.equal(result.filtered, 0);
   assert.equal(result.included.length, 1);
   assert.equal(extractLatestClawSweeperReviewForTest(comments, 123), null);
+});
+
+test("label sync freshness accepts unchanged reports without hydrating context", () => {
+  let contextCalls = 0;
+  const fresh = isCompleteReportFreshEnoughForLabelSyncForTest({
+    storedUpdatedAt: "2026-05-01T00:00:00Z",
+    itemUpdatedAt: "2026-05-01T00:00:00Z",
+    reviewCommentUpdatedAt: undefined,
+    context: () => {
+      contextCalls += 1;
+      return { issue: {}, comments: [], timeline: [] };
+    },
+  });
+
+  assert.equal(fresh, true);
+  assert.equal(contextCalls, 0);
+});
+
+test("label sync freshness accepts near review-comment drift with automation-only activity", () => {
+  const fresh = isCompleteReportFreshEnoughForLabelSyncForTest({
+    storedUpdatedAt: "2026-05-01T00:00:00Z",
+    itemUpdatedAt: "2026-05-01T00:01:01Z",
+    reviewCommentUpdatedAt: "2026-05-01T00:01:00Z",
+    context: () => ({
+      issue: {},
+      comments: [],
+      timeline: [
+        {
+          createdAt: "2026-05-01T00:01:00Z",
+          actor: "clawsweeper[bot]",
+        },
+      ],
+    }),
+  });
+
+  assert.equal(fresh, true);
+});
+
+test("label sync freshness blocks near review-comment drift with human activity", () => {
+  const fresh = isCompleteReportFreshEnoughForLabelSyncForTest({
+    storedUpdatedAt: "2026-05-01T00:00:00Z",
+    itemUpdatedAt: "2026-05-01T00:01:01Z",
+    reviewCommentUpdatedAt: "2026-05-01T00:01:00Z",
+    context: () => ({
+      issue: {},
+      comments: [{ createdAt: "2026-05-01T00:00:30Z", author: "reporter" }],
+      timeline: [],
+    }),
+  });
+
+  assert.equal(fresh, false);
+});
+
+test("label sync freshness blocks stale review-comment drift without hydrating context", () => {
+  let contextCalls = 0;
+  const fresh = isCompleteReportFreshEnoughForLabelSyncForTest({
+    storedUpdatedAt: "2026-05-01T00:00:00Z",
+    itemUpdatedAt: "2026-05-01T00:10:01Z",
+    reviewCommentUpdatedAt: "2026-05-01T00:01:00Z",
+    context: () => {
+      contextCalls += 1;
+      return { issue: {}, comments: [], timeline: [] };
+    },
+  });
+
+  assert.equal(fresh, false);
+  assert.equal(contextCalls, 0);
 });
 
 test("latest ClawSweeper durable review is extracted as compact previous review state", () => {
