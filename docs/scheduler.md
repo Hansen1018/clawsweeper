@@ -244,7 +244,7 @@ Planning is also the runtime build point for matrix review. The plan job install
 with pinned Node 24 and `pnpm@10.33.2`, builds `dist/` once, and uploads that
 runtime artifact. Review shards download the built `dist/` and run
 `node dist/clawsweeper.js review` directly instead of running a per-shard pnpm
-install and build. This keeps 11-28 shard waves from stampeding the npm
+install and build. This keeps 16-28 shard waves from stampeding the npm
 registry or Corepack metadata endpoints.
 
 Each review shard also wraps the review command in a shell timeout derived from
@@ -262,7 +262,7 @@ because they may rebase and push generated records.
 Normal backfill now runs every 5 minutes for `openclaw/openclaw`. Because its
 concurrency group allows only one running normal backfill per target repo, the
 effect is a continuous drain loop: when due backlog exists, the active run can
-hold up to 12 Codex review shards with up to three items per shard, and the next
+hold up to 28 Codex review shards with up to three items per shard, and the next
 scheduled tick is available as the backstop or pending continuation. Manual
 normal reviews keep the larger default batch size for targeted catch-up runs.
 
@@ -446,7 +446,7 @@ or syncs the durable ClawSweeper review comment.
 Broad normal review publishes records first, then dispatches durable review
 comment sync into the separate apply/comment-sync lane. This includes scheduled
 runs and workflow-dispatch continuations, so slow GitHub comment writes do not
-hold the normal review concurrency group or delay the next 12-shard backfill
+hold the normal review concurrency group or delay the next 28-shard backfill
 wave. Exact issue/PR reviews and repository-dispatch item runs still sync their
 selected comments inline before finishing.
 
