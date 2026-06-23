@@ -84,7 +84,13 @@ export function deriveAutomationLimits(config: WorkerConfig): AutomationLimits {
       default: Math.min(config.lanes.assist.max, max),
     },
     review_shards: {
-      normal_default: percent(max, 70),
+      normal_default: Math.min(
+        percent(max, 70),
+        Math.max(
+          1,
+          max - config.workers.reserve_for_interactive - config.workers.expansion_reserve,
+        ),
+      ),
       normal_active_floor: percent(max, 30),
       hot_intake_default: percent(max, 35),
       exact_item_default: 1,

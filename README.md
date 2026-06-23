@@ -554,7 +554,7 @@ source ~/.profile
 corepack enable
 pnpm install
 pnpm run build
-pnpm run plan -- --target-repo openclaw/openclaw --batch-size 5 --shard-count 33 --max-pages 250 --codex-model internal --codex-reasoning-effort high
+pnpm run plan -- --target-repo openclaw/openclaw --batch-size 5 --shard-count 28 --max-pages 250 --codex-model internal --codex-reasoning-effort high
 pnpm run review -- --target-repo openclaw/openclaw --target-dir ../openclaw --batch-size 5 --max-pages 250 --artifact-dir artifacts/reviews --codex-model internal --codex-reasoning-effort high --codex-timeout-ms 600000
 pnpm run apply-artifacts -- --target-repo openclaw/openclaw --artifact-dir artifacts/reviews --skip-dashboard
 pnpm run audit -- --target-repo openclaw/openclaw --max-pages 250 --sample-limit 25 --update-dashboard
@@ -617,7 +617,7 @@ live under `records/openclaw-clawhub/` without colliding with default repo
 records. `openclaw/clawsweeper` has a scheduled read-only audit row and is
 available for manual and event self-review smoke tests. Broad hot-intake sweeps
 cap scheduled fan-out at 16 one-item shards per run when quiet; manual normal
-backfill can use up to 33 shards, while exact event reviews still use one shard.
+backfill can use up to 28 shards, while exact event reviews still use one shard.
 Normal review, hot intake, and commit review are
 background lanes, so they shrink automatically while repair or exact-item work
 is active. Throughput defaults live in
@@ -627,7 +627,7 @@ is active. Throughput defaults live in
 
 ClawSweeper has one main capacity knob:
 `config/automation-limits.json` -> `workers.max`. The current value is `48`.
-Lane limits are derived from that number: normal review defaults to 33 shards
+Lane limits are derived from that number: normal review defaults to 28 shards
 for manual/backstop runs, scheduled normal review gets up to 28 after reserves,
 hot intake up to 16 shards, commit review 2 commits per page, and existing
 repair/issue implementation lanes use 40% of `workers.max`, currently 19 live

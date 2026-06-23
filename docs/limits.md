@@ -43,9 +43,10 @@ The mental model:
 
 ## Derived Limits
 
-Review, commit, and existing repair limits are intentionally percentages of
+Review, commit, and existing repair limits are intentionally derived from
 `workers.max`; imported cluster repair has its own lane knob. With
-`workers.max = 48`, normal review can use 33 workers, hot intake can use 16,
+`workers.max = 48`, normal review can use 28 workers after the interactive and
+expansion reserves, hot intake can use 16,
 commit review can use 2 commits per page, existing repair lanes dispatch 19
 live workers by default, and imported cluster repair dispatches two live workers
 by default.
@@ -54,7 +55,7 @@ by default.
 | --- | ---: | --- |
 | `exact_review.concurrent_max` | 4 | Exact-item review admission cap, clamped to `workers.max`. |
 | `assist.default` | 10 | Maintainer assist job cap. |
-| `review_shards.normal_default` | 33 | Quiet-system normal review shard ceiling. |
+| `review_shards.normal_default` | 28 | Quiet-system normal review shard ceiling. |
 | `review_shards.normal_active_floor` | 14 | Minimum active normal review shards to keep queued for `openclaw/openclaw`. |
 | `review_shards.hot_intake_default` | 16 | Quiet-system broad hot-intake review shard ceiling. |
 | `review_shards.exact_item_default` | 1 | Exact-item hot-intake shard count. |
@@ -70,7 +71,8 @@ by default.
 
 Formula summary:
 
-- normal review: 70% of `workers.max`
+- normal review: the smaller of 70% of `workers.max` and the capacity left
+  after interactive and expansion reserves
 - normal active floor: 30% of `workers.max`
 - hot intake: 35% of `workers.max`
 - commit review page size: 5% of `workers.max`
@@ -124,7 +126,7 @@ keeps capacity waiting and retry state out of GitHub Actions runners.
 
 Examples with the current config:
 
-- Quiet system: manual normal review can request 33 shards; scheduled normal
+- Quiet system: manual normal review can request 28 shards; scheduled normal
   review gets 28 after reserving 8 slots for exact/manual/urgent work and 12
   slots for in-flight matrix expansion.
 - 4 active repair workers and 8 active background workers: normal review gets
@@ -143,7 +145,7 @@ pnpm run --silent workflow -- worker-limit commit_review --active-critical 88
 ```
 
 Change `workers.max` first when tuning review-side rate-limit pressure. For
-example, setting `workers.max` to `48` makes normal review `33`, hot intake
+example, setting `workers.max` to `48` makes normal review `28`, hot intake
 `16`, and commit review `2`. Existing repair lanes use their 40% derived caps,
 while imported cluster repair remains separately bounded until
 `lanes.repair.cluster_max_live_runs` is raised.

@@ -23,7 +23,7 @@ ClawSweeper has three issue/PR scheduler paths:
 The lanes share report storage and apply rules, but they intentionally do not
 share throughput. Event review and hot intake keep new maintainer-visible work
 fast. Scheduled normal backfill keeps up to 28 concurrent Codex review shards
-when quiet; manual backfill can use up to 33 concurrent Codex review shards.
+when quiet; manual backfill can use up to 28 concurrent Codex review shards.
 Normal `openclaw/openclaw` review has an
 active floor of 14 shards for scheduled runs and workflow-dispatch
 continuations: due items win first, and if fewer than 14 items are due, the
@@ -227,7 +227,7 @@ Current defaults:
 - normal active floor: 14 shards for `openclaw/openclaw` scheduled runs and
   workflow-dispatch continuations; stale current-review backfill is eligible
   after 6 hours
-- manual normal backfill: defaults to 33 shards, batch size 3, scans up to 250
+- manual normal backfill: defaults to 28 shards, batch size 3, scans up to 250
   GitHub pages unless overridden, and stops early once scanned due candidates
   fill planned capacity
 
@@ -244,7 +244,7 @@ Planning is also the runtime build point for matrix review. The plan job install
 with pinned Node 24 and `pnpm@10.33.2`, builds `dist/` once, and uploads that
 runtime artifact. Review shards download the built `dist/` and run
 `node dist/clawsweeper.js review` directly instead of running a per-shard pnpm
-install and build. This keeps 11-33 shard waves from stampeding the npm
+install and build. This keeps 11-28 shard waves from stampeding the npm
 registry or Corepack metadata endpoints.
 
 Each review shard also wraps the review command in a shell timeout derived from

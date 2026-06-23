@@ -133,14 +133,14 @@ for (const [limitPath, value] of Object.entries(flattenLimits(limits))) {
   expectations.push({
     file: "docs/limits.md",
     label: `${limitPath} documented current value`,
-    pattern: new RegExp(`\\| \`${escapeRegExp(limitPath)}\` \\| ${value} \\|`),
+    pattern: new RegExp(`\\|\\s*\`${escapeRegExp(limitPath)}\`\\s*\\|\\s*${value}\\s*\\|`),
   });
 }
 for (const [limitPath, value] of Object.entries(flattenLimits(config))) {
   expectations.push({
     file: "docs/limits.md",
     label: `${limitPath} documented worker config value`,
-    pattern: new RegExp(`\\| \`${escapeRegExp(limitPath)}\` \\| ${value} \\|`),
+    pattern: new RegExp(`\\|\\s*\`${escapeRegExp(limitPath)}\`\\s*\\|\\s*${value}\\s*\\|`),
   });
 }
 
@@ -183,7 +183,15 @@ function deriveAutomationLimits(workerConfig: WorkerConfig): AutomationLimits {
       default: Math.min(workerConfig.lanes.assist.max, max),
     },
     review_shards: {
-      normal_default: percent(max, 70),
+      normal_default: Math.min(
+        percent(max, 70),
+        Math.max(
+          1,
+          max -
+            workerConfig.workers.reserve_for_interactive -
+            workerConfig.workers.expansion_reserve,
+        ),
+      ),
       normal_active_floor: percent(max, 30),
       hot_intake_default: percent(max, 35),
       exact_item_default: 1,

@@ -532,7 +532,7 @@ Current global and key lane limits:
 | Expansion reserve | 12 |
 | Existing repair, PR repair, and issue implementation default | 19 |
 | Imported GitCrawl cluster repair | 2 |
-| Quiet normal-review ceiling | 33 |
+| Quiet normal-review ceiling | 28 |
 | Quiet hot-intake ceiling | 16 |
 
 Important behavior:
