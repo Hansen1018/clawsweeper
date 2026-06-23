@@ -130,7 +130,7 @@ Examples with the current config:
 - 4 active repair workers and 8 active background workers: normal review gets
   16 because `48 - 8 interactive reserve - 12 expansion reserve - 4 priority
   - 8 background = 16`.
-- 24 active priority workers: commit review gets 1, so commit review yields but
+- 24 active priority workers: commit review gets 2, so commit review yields but
   does not fully stall.
 
 Use these commands to inspect the effective values from a checkout:

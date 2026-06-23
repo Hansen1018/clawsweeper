@@ -627,7 +627,7 @@ is active. Throughput defaults live in
 
 ClawSweeper has one main capacity knob:
 `config/automation-limits.json` -> `workers.max`. The current value is `48`.
-Lane limits are derived from that number: normal review defaults to 22 shards
+Lane limits are derived from that number: normal review defaults to 33 shards
 for manual/backstop runs, scheduled normal review gets up to 28 after reserves,
 hot intake up to 16 shards, commit review 2 commits per page, and existing
 repair/issue implementation lanes use 40% of `workers.max`, currently 19 live
