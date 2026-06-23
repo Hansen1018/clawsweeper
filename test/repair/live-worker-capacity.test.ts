@@ -14,7 +14,7 @@ import {
 
 test("live worker capacity refuses limits above the global Codex cap", () => {
   assert.equal(MAX_LIVE_WORKERS, 48);
-  assert.equal(readMaxLiveWorkers(), 12);
+  assert.equal(readMaxLiveWorkers(), 19);
   assert.equal(readMaxLiveWorkers({ "max-live-workers": "1" }), 1);
   assert.equal(readMaxLiveWorkers({ "max-live-workers": "48" }), 48);
   assert.throws(

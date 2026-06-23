@@ -274,7 +274,7 @@ pnpm run repair:import-gitcrawl -- --from-gitcrawl --limit 40 --mode autonomous 
 
 # Dispatch reviewed jobs. Dispatch derives its default live-worker cap from the
 # job's job_intent and config/automation-limits.json. Existing repair lanes
-# keep the normal 40%-of-workers.max cap, currently 12; imported gitcrawl
+# keep the normal 40%-of-workers.max cap, currently 19; imported gitcrawl
 # cluster jobs default to lanes.repair.cluster_max_live_runs, currently 2.
 # Use CLAWSWEEPER_MAX_LIVE_WORKERS/--max-live-workers for a one-lane override.
 # With --wait-for-capacity, dispatch can drain a larger file

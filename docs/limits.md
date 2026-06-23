@@ -124,12 +124,12 @@ keeps capacity waiting and retry state out of GitHub Actions runners.
 
 Examples with the current config:
 
-- Quiet system: manual normal review can request 22 shards; scheduled normal
-  review gets 12 after reserving 8 slots for exact/manual/urgent work and 12
+- Quiet system: manual normal review can request 33 shards; scheduled normal
+  review gets 28 after reserving 8 slots for exact/manual/urgent work and 12
   slots for in-flight matrix expansion.
 - 4 active repair workers and 8 active background workers: normal review gets
-  1 because `32 - 8 interactive reserve - 12 expansion reserve - 4 priority
-  - 8 background = 0`, and enabled background lanes keep one slow-progress worker.
+  16 because `48 - 8 interactive reserve - 12 expansion reserve - 4 priority
+  - 8 background = 16`.
 - 24 active priority workers: commit review gets 1, so commit review yields but
   does not fully stall.
 

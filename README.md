@@ -626,18 +626,18 @@ is active. Throughput defaults live in
 ### Worker Budget
 
 ClawSweeper has one main capacity knob:
-`config/automation-limits.json` -> `workers.max`. The current value is `32`.
+`config/automation-limits.json` -> `workers.max`. The current value is `48`.
 Lane limits are derived from that number: normal review defaults to 22 shards
-for manual/backstop runs, scheduled normal review gets up to 12 after reserves,
-hot intake up to 11 shards, commit review 1 commit per page, and existing
-repair/issue implementation lanes use 40% of `workers.max`, currently 12 live
+for manual/backstop runs, scheduled normal review gets up to 28 after reserves,
+hot intake up to 16 shards, commit review 2 commits per page, and existing
+repair/issue implementation lanes use 40% of `workers.max`, currently 19 live
 workers. Imported gitcrawl cluster repair allows 2 live workers by default.
 Exact-item review, repair, and issue implementation are priority work; normal
 review, hot intake, and commit review are background work and automatically
 yield when priority work is active. Exact-item runs use a durable Worker queue
 that coalesces item deliveries, leases at most 4 concurrent reviews, and admits
 at most one active exact review per target repository. Other lanes retain the
-checked-in 32-worker scheduling model.
+checked-in 48-worker scheduling model.
 Use `workers.max` first when turning total Codex usage up or down; use
 `lanes.repair.cluster_max_live_runs` to tune the imported legacy cluster-repair
 lane separately, and individual environment overrides only for temporary
