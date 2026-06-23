@@ -611,13 +611,13 @@ default, subject to the selected repository profile; pass `target_repo`,
 `apply_kind=issue`, or `apply_kind=pull_request` to narrow a manual run.
 
 Scheduled runs cover the configured product profiles. `openclaw/openclaw` runs
-normal backfill every 5 minutes with up to 12 review shards when the system is
+normal backfill every 5 minutes with up to 28 review shards when the system is
 quiet; `openclaw/clawhub` runs on offset review/apply/audit crons so its reports
 live under `records/openclaw-clawhub/` without colliding with default repo
 records. `openclaw/clawsweeper` has a scheduled read-only audit row and is
 available for manual and event self-review smoke tests. Broad hot-intake sweeps
-cap scheduled fan-out at 11 one-item shards per run when quiet; manual normal
-backfill can use up to 22 shards, while exact event reviews still use one shard.
+cap scheduled fan-out at 16 one-item shards per run when quiet; manual normal
+backfill can use up to 33 shards, while exact event reviews still use one shard.
 Normal review, hot intake, and commit review are
 background lanes, so they shrink automatically while repair or exact-item work
 is active. Throughput defaults live in
