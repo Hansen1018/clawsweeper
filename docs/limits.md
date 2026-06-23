@@ -33,7 +33,7 @@ The mental model:
 
 | Name | Current | Meaning |
 | --- | ---: | --- |
-| `workers.max` | 32 | Maximum global Codex worker budget used to derive lane limits. |
+| `workers.max` | 48 | Maximum global Codex worker budget used to derive lane limits. |
 | `workers.reserve_for_interactive` | 8 | Worker slots background lanes leave open for exact/manual/urgent work. |
 | `workers.expansion_reserve` | 12 | Extra slots background lanes leave open for independently planned matrix expansion. |
 | `workers.minimum_background` | 4 | Target floor for background progress when enough global capacity is available. |
@@ -45,8 +45,8 @@ The mental model:
 
 Review, commit, and existing repair limits are intentionally percentages of
 `workers.max`; imported cluster repair has its own lane knob. With
-`workers.max = 32`, normal review can use 22 workers, hot intake can use 11,
-commit review can use 1 commit per page, existing repair lanes dispatch 12
+`workers.max = 48`, normal review can use 33 workers, hot intake can use 16,
+commit review can use 2 commits per page, existing repair lanes dispatch 19
 live workers by default, and imported cluster repair dispatches two live workers
 by default.
 
@@ -54,17 +54,17 @@ by default.
 | --- | ---: | --- |
 | `exact_review.concurrent_max` | 4 | Exact-item review admission cap, clamped to `workers.max`. |
 | `assist.default` | 10 | Maintainer assist job cap. |
-| `review_shards.normal_default` | 22 | Quiet-system normal review shard ceiling. |
-| `review_shards.normal_active_floor` | 9 | Minimum active normal review shards to keep queued for `openclaw/openclaw`. |
-| `review_shards.hot_intake_default` | 11 | Quiet-system broad hot-intake review shard ceiling. |
+| `review_shards.normal_default` | 33 | Quiet-system normal review shard ceiling. |
+| `review_shards.normal_active_floor` | 14 | Minimum active normal review shards to keep queued for `openclaw/openclaw`. |
+| `review_shards.hot_intake_default` | 16 | Quiet-system broad hot-intake review shard ceiling. |
 | `review_shards.exact_item_default` | 1 | Exact-item hot-intake shard count. |
-| `review_shards.hard_cap` | 32 | Maximum accepted review shard count. |
-| `commit_review.page_size_default` | 1 | Commits selected per commit-review page. |
-| `commit_review.page_size_hard_cap` | 32 | Maximum commit-review page size. |
-| `repair_live_runs.default` | 12 | Default live repair workflow run cap for manual dispatch/requeue/self-heal. |
-| `repair_live_runs.hard_cap` | 32 | Absolute live repair run cap accepted by explicit CLI/env overrides with this config. |
-| `repair_live_runs.automerge_default` | 12 | Live repair run cap for automerge comment-router dispatches. |
-| `repair_live_runs.issue_implementation_default` | 12 | Live repair run cap for issue-to-PR implementation intake. |
+| `review_shards.hard_cap` | 48 | Maximum accepted review shard count. |
+| `commit_review.page_size_default` | 2 | Commits selected per commit-review page. |
+| `commit_review.page_size_hard_cap` | 48 | Maximum commit-review page size. |
+| `repair_live_runs.default` | 19 | Default live repair workflow run cap for manual dispatch/requeue/self-heal. |
+| `repair_live_runs.hard_cap` | 48 | Absolute live repair run cap accepted by explicit CLI/env overrides with this config. |
+| `repair_live_runs.automerge_default` | 19 | Live repair run cap for automerge comment-router dispatches. |
+| `repair_live_runs.issue_implementation_default` | 19 | Live repair run cap for issue-to-PR implementation intake. |
 | `repair_live_runs.cluster_default` | 2 | Live repair run cap for imported gitcrawl cluster dispatches. |
 | `issue_implementation.dispatches_per_sweep_default` | 1 | Maximum implementation intake jobs queued from one review publish run. |
 
@@ -143,9 +143,9 @@ pnpm run --silent workflow -- worker-limit commit_review --active-critical 88
 ```
 
 Change `workers.max` first when tuning review-side rate-limit pressure. For
-example, setting `workers.max` to `40` automatically makes normal review `28`,
-hot intake `14`, and commit review `2`. Existing repair lanes keep their
-40% derived caps, while imported cluster repair remains separately bounded until
+example, setting `workers.max` to `48` makes normal review `33`, hot intake
+`16`, and commit review `2`. Existing repair lanes use their 40% derived caps,
+while imported cluster repair remains separately bounded until
 `lanes.repair.cluster_max_live_runs` is raised.
 
 ## Runtime Overrides

@@ -1,6 +1,6 @@
 {
   "workers": {
-    "max": 32,
+    "max": 48,
     "reserve_for_interactive": 8,
     "expansion_reserve": 12,
     "minimum_background": 4

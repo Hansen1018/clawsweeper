@@ -23,10 +23,10 @@ ClawSweeper has three issue/PR scheduler paths:
 The lanes share report storage and apply rules, but they intentionally do not
 share throughput. Event review and hot intake keep new maintainer-visible work
 fast. Scheduled normal backfill keeps up to 12 concurrent Codex review shards
-when quiet; manual backfill can use up to 22 concurrent Codex review shards.
+when quiet; manual backfill can use up to 33 concurrent Codex review shards.
 Normal `openclaw/openclaw` review has an
-active floor of 9 shards for scheduled runs and workflow-dispatch
-continuations: due items win first, and if fewer than 9 items are due, the
+active floor of 14 shards for scheduled runs and workflow-dispatch
+continuations: due items win first, and if fewer than 14 items are due, the
 planner fills the floor with the stalest currently-reviewed eligible items so
 review capacity stays warm around the clock.
 
@@ -220,19 +220,19 @@ Current defaults:
 
 - exact event review: 1 shard, 1 item
 - exact manual hot intake: 1 shard, 1 item
-- broad hot intake: up to 11 shards when quiet, batch size 1, scans up to 10
+- broad hot intake: up to 16 shards when quiet, batch size 1, scans up to 10
   GitHub pages
 - scheduled normal backfill: up to 12 shards when quiet, batch size 3, scans up
   to 250 GitHub pages after reserving interactive and expansion capacity
-- normal active floor: 9 shards for `openclaw/openclaw` scheduled runs and
+- normal active floor: 14 shards for `openclaw/openclaw` scheduled runs and
   workflow-dispatch continuations; stale current-review backfill is eligible
   after 6 hours
-- manual normal backfill: defaults to 22 shards, batch size 3, scans up to 250
+- manual normal backfill: defaults to 33 shards, batch size 3, scans up to 250
   GitHub pages unless overridden, and stops early once scanned due candidates
   fill planned capacity
 
-The hard planner cap is 32 shards. The workflow clamps invalid or larger
-`shard_count` inputs to 32.
+The hard planner cap is 48 shards. The workflow clamps invalid or larger
+`shard_count` inputs to 48.
 
 Broad background review also clamps manual `shard_count` input to the current
 lane allowance from `worker-limit`. Pending or planning background sweeps reserve
@@ -244,7 +244,7 @@ Planning is also the runtime build point for matrix review. The plan job install
 with pinned Node 24 and `pnpm@10.33.2`, builds `dist/` once, and uploads that
 runtime artifact. Review shards download the built `dist/` and run
 `node dist/clawsweeper.js review` directly instead of running a per-shard pnpm
-install and build. This keeps 11-22 shard waves from stampeding the npm
+install and build. This keeps 11-33 shard waves from stampeding the npm
 registry or Corepack metadata endpoints.
 
 Each review shard also wraps the review command in a shell timeout derived from
@@ -280,10 +280,10 @@ live Codex count past the global budget.
 
 The active floor is not a separate lane and does not change close/apply safety.
 It only changes normal planning when due backlog is below the desired floor:
-after selecting all due candidates, the planner fills up to 9 nonempty shards
+after selecting all due candidates, the planner fills up to 14 nonempty shards
 with eligible items whose latest complete review is at least 6 hours old.
 Capacity status reports this as `floor: due backlog below active floor`. If the
-central worker scheduler returns fewer than 9 allowed shards, the smaller
+central worker scheduler returns fewer than 14 allowed shards, the smaller
 worker allowance wins.
 
 On saturated queues, normal planning stops scanning as soon as it has enough due

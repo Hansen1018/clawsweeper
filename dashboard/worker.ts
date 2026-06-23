@@ -1633,7 +1633,7 @@ async function statusSnapshot(env) {
     .split(",")
     .map((value) => value.trim())
     .filter(Boolean);
-  const budget = numberFrom(env.WORKER_BUDGET, 32);
+  const budget = numberFrom(env.WORKER_BUDGET, 48);
   const [runs, completedRuns, filteredActiveRuns] = await Promise.all([
     githubJson(env, `/repos/${repo}/actions/runs?per_page=100`).catch((error) => {
       errors.push(`workflow runs: ${error.message}`);
