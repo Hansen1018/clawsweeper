@@ -288,10 +288,11 @@ export function summarizeApplyReport(options: ApplyReportSummaryOptions): ApplyR
   for (const entry of actions) {
     if (entry.action === "closed") closed += 1;
     if (entry.action === "review_comment_synced") commentSynced += 1;
-    if (
-      entry.action.startsWith("skipped_") ||
-      (entry.action === "kept_open" && !isSuccessfulLabelSyncReason(entry.reason))
-    ) {
+    const productive =
+      entry.action === "closed" ||
+      entry.action === "review_comment_synced" ||
+      (entry.action === "kept_open" && isSuccessfulLabelSyncReason(entry.reason));
+    if (!productive) {
       skipped += 1;
       skipReasons[entry.action] = (skipReasons[entry.action] || 0) + 1;
     }

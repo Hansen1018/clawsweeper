@@ -289,6 +289,11 @@ test("workflow utilities flag operator-action skips when every result is blocked
         action: "kept_open",
         reason: "review lacks verified local checkout access",
       },
+      {
+        number: 100,
+        action: "retry_pr_close_coverage_proof",
+        reason: "linked canonical PR changed after coverage proof",
+      },
     ]),
   );
 
@@ -304,6 +309,7 @@ test("workflow utilities flag operator-action skips when every result is blocked
   assert.equal(summary.status, "needs_attention");
   assert.deepEqual(summary.attention_reasons, [
     "kept_open",
+    "retry_pr_close_coverage_proof",
     "skipped_changed_since_review",
     "skipped_invalid_decision",
     "skipped_maintainer_authored",
