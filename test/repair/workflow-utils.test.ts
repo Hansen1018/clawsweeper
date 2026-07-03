@@ -237,7 +237,10 @@ test("workflow utilities flag full-window close scans without the required curso
   });
 
   assert.equal(summary.status, "needs_attention");
-  assert.deepEqual(summary.attention_reasons, ["cursor_required_but_missing_after_full_window"]);
+  assert.deepEqual(summary.attention_reasons, [
+    "cursor_required_but_missing_after_full_window",
+    "skipped_changed_since_review",
+  ]);
   assert.match(summary.summary, /Attention:/);
 });
 
@@ -265,6 +268,33 @@ test("workflow utilities require the cursor after a full window that closed an i
   assert.equal(summary.status, "needs_attention");
   assert.equal(summary.closed, 1);
   assert.deepEqual(summary.attention_reasons, ["cursor_required_but_missing_after_full_window"]);
+});
+
+test("workflow utilities flag operator-action skips when every result is blocked", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-workflow-"));
+  const reportPath = path.join(root, "apply-report.json");
+  write(
+    reportPath,
+    JSON.stringify([
+      { number: 10, action: "skipped_changed_since_review" },
+      { number: 20, action: "skipped_pr_close_coverage_proof" },
+    ]),
+  );
+
+  const summary = summarizeApplyReport({
+    reportPath,
+    targetRepo: "openclaw/openclaw",
+    mode: "close",
+    processedLimit: 300,
+    closeLimit: 5,
+    cursorRequired: false,
+  });
+
+  assert.equal(summary.status, "needs_attention");
+  assert.deepEqual(summary.attention_reasons, [
+    "skipped_changed_since_review",
+    "skipped_pr_close_coverage_proof",
+  ]);
 });
 
 test("workflow utilities count nested command actions by status", () => {

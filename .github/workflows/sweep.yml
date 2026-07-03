@@ -2484,10 +2484,14 @@ jobs:
             fi
             publish_changes "chore: sync sweep review comments checkpoint $checkpoint" records apply-report.json results/comment-sync-cursors
             comment_sync_health_cursor_path=""
+            comment_sync_health_cursor_required="false"
+            comment_sync_health_processed_limit="$comment_sync_processed_limit"
             if [ "$sync_open_pr_batch" = "true" ]; then
               comment_sync_health_cursor_path="$cursor_path"
+              comment_sync_health_cursor_required="true"
+              comment_sync_health_processed_limit="$sync_batch_size"
             fi
-            write_apply_health ".artifacts/apply-reports/apply-report-$checkpoint.json" ".artifacts/apply-health-$checkpoint.json" "comment_sync" "$comment_sync_processed_limit" "$comment_sync_health_cursor_path" "false"
+            write_apply_health ".artifacts/apply-reports/apply-report-$checkpoint.json" ".artifacts/apply-health-$checkpoint.json" "comment_sync" "$comment_sync_health_processed_limit" "$comment_sync_health_cursor_path" "$comment_sync_health_cursor_required"
             pnpm run status -- \
               --target-repo "$TARGET_REPO" \
               --state "Apply comments synced" \
@@ -2588,6 +2592,8 @@ jobs:
             final_health_cursor_required="false"
             if [ "$sync_open_pr_batch" = "true" ]; then
               final_health_cursor_path="$cursor_path"
+              final_health_cursor_required="true"
+              final_health_processed_limit="$sync_batch_size"
             fi
           fi
           write_apply_health "apply-report.json" ".artifacts/apply-health-final.json" "$final_health_mode" "$final_health_processed_limit" "$final_health_cursor_path" "$final_health_cursor_required"

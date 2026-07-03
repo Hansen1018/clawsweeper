@@ -307,6 +307,11 @@ export function summarizeApplyReport(options: ApplyReportSummaryOptions): ApplyR
   for (const reason of ["skipped_runtime_budget", "skipped_live_fetch_failed"]) {
     if ((skipReasons[reason] || 0) > 0) attentionReasons.push(reason);
   }
+  if (actions.length > 0 && skipped === actions.length) {
+    for (const reason of ["skipped_changed_since_review", "skipped_pr_close_coverage_proof"]) {
+      if ((skipReasons[reason] || 0) > 0) attentionReasons.push(reason);
+    }
+  }
 
   const status =
     actions.length === 0 ? "idle" : attentionReasons.length > 0 ? "needs_attention" : "ok";
