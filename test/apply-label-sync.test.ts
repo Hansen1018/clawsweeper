@@ -444,6 +444,343 @@ if (args[0] === "api" && /\\/issues\\/74481$/.test(path)) {
   }
 });
 
+test("apply-decisions restores same-head PR review labels after stale strip and re-review", () => {
+  const root = mkdtempSync(tmpPrefix);
+  try {
+    const itemsDir = join(root, "items");
+    const closedDir = join(root, "closed");
+    const plansDir = join(root, "plans");
+    const reportPath = join(root, "apply-report.json");
+    const logPath = join(root, "gh.log");
+    const itemPath = join(itemsDir, "74482.md");
+    mkdirSync(itemsDir, { recursive: true });
+    mkdirSync(plansDir, { recursive: true });
+    const sourceReport = `${reportFrontMatter({
+      repository: "openclaw/openclaw",
+      type: "pull_request",
+      number: "74482",
+      title: "Restore fresh review labels",
+      url: "https://github.com/openclaw/openclaw/pull/74482",
+      decision: "keep_open",
+      close_reason: "none",
+      confidence: "high",
+      action_taken: "kept_open",
+      review_status: "complete",
+      local_checkout_access: "verified",
+      author: "contributor",
+      author_association: "CONTRIBUTOR",
+      labels: JSON.stringify([]),
+      item_snapshot_hash: "snapshot-fresh",
+      item_updated_at: "2026-05-19T20:00:00Z",
+      reviewed_at: "2026-05-19T20:00:00Z",
+      pull_head_sha: "fresh-head",
+      merge_risk_labels: JSON.stringify(["merge-risk: 🚨 automation"]),
+    })}
+
+## Summary
+
+This fresh same-head report should restore PR readiness labels.
+
+${realBehaviorProofReportSection()}
+
+${prRatingReportSection()}
+
+## Review Findings
+
+Overall correctness: patch is correct
+
+Overall confidence: 0.91
+
+Full review comments:
+
+- none
+`;
+    const synced = reportWithSyncedReviewComment(sourceReport, 74482);
+    writeFileSync(itemPath, synced.report, "utf8");
+
+    const ghMock = `
+const { appendFileSync, readFileSync } = require("fs");
+const logPath = ${JSON.stringify(logPath)};
+const comment = ${JSON.stringify(synced.comment)};
+const rawArgs = process.argv.slice(2);
+const args = rawArgs[0] === "--repo" ? rawArgs.slice(2) : rawArgs;
+appendFileSync(logPath, JSON.stringify(args) + "\\n");
+const path = args[1] || "";
+if (args[0] === "api" && /\\/issues\\/74482$/.test(path)) {
+  console.log(JSON.stringify({
+    number: 74482,
+    title: "Restore fresh review labels",
+    html_url: "https://github.com/openclaw/openclaw/pull/74482",
+    created_at: "2026-05-19T19:00:00Z",
+    updated_at: "2026-05-19T20:10:00Z",
+    closed_at: null,
+    state: "open",
+    locked: false,
+    active_lock_reason: null,
+    author_association: "CONTRIBUTOR",
+    user: { login: "contributor" },
+    labels: [],
+    pull_request: {}
+  }));
+} else if (args[0] === "api" && args[1] === "-i" && /\\/issues\\/74482\\/timeline(?:\\?|$)/.test(args[2] || "")) {
+  console.log("HTTP/2 200\\n\\n[]");
+} else if (args[0] === "api" && /\\/issues\\/74482\\/timeline(?:\\?|$)/.test(path)) {
+  console.log(JSON.stringify([[]]));
+} else if (args[0] === "api" && /\\/pulls\\/74482$/.test(path)) {
+  console.log(JSON.stringify({
+    number: 74482,
+    html_url: "https://github.com/openclaw/openclaw/pull/74482",
+    state: "open",
+    changed_files: 1,
+    commits: 1,
+    review_comments: 0,
+    head: { sha: "fresh-head", ref: "branch", repo: { full_name: "fork/openclaw" } },
+    base: { sha: "base-sha", ref: "main", repo: { full_name: "openclaw/openclaw" } },
+    user: { login: "contributor" }
+  }));
+} else if (args[0] === "api" && /\\/pulls\\/74482\\/(files|commits|comments)(?:\\?|$)/.test(path)) {
+  console.log(JSON.stringify([[]]));
+} else if (args[0] === "api" && /\\/issues\\/74482\\/comments(?:\\?|$)/.test(path)) {
+  console.log(JSON.stringify([[
+    {
+      id: 987482,
+      html_url: "https://github.com/openclaw/openclaw/pull/74482#issuecomment-987482",
+      body: comment,
+      user: { login: "clawsweeper[bot]" },
+      created_at: "2026-05-19T20:00:00Z",
+      updated_at: "2026-05-19T20:00:00Z"
+    }
+  ]]));
+} else if (args[0] === "api" && /\\/issues\\/comments\\/987482$/.test(path)) {
+  const input = args[args.indexOf("--input") + 1];
+  appendFileSync(logPath, JSON.stringify(["patched-review-body", JSON.parse(readFileSync(input, "utf8")).body]) + "\\n");
+  console.log(JSON.stringify({
+    id: 987482,
+    html_url: "https://github.com/openclaw/openclaw/pull/74482#issuecomment-987482",
+    updated_at: "2026-05-19T20:11:00Z"
+  }));
+} else if (args[0] === "issue" && args[1] === "edit") {
+  console.log("");
+} else if (args[0] === "label" && args[1] === "create") {
+  console.log(JSON.stringify({ name: args[2] }));
+} else {
+  console.error("unexpected gh args", JSON.stringify(args));
+  process.exit(1);
+}
+`;
+    withMockGh(root, ghMock, () => {
+      runApplyDecisionsForTest({
+        targetRepo: "openclaw/openclaw",
+        itemsDir,
+        closedDir,
+        plansDir,
+        reportPath,
+        extraArgs: ["--sync-comments-only", "--item-numbers", "74482"],
+      });
+    });
+
+    const calls = readFileSync(logPath, "utf8")
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as string[]);
+    const addedLabels = calls
+      .filter((args) => args[0] === "issue" && args[1] === "edit")
+      .map((args) => args[args.indexOf("--add-label") + 1])
+      .filter(Boolean);
+    assert(addedLabels.includes("proof: sufficient"));
+    assert(addedLabels.includes("rating: 🐚 platinum hermit"));
+    assert(addedLabels.includes("status: 👀 ready for maintainer look"));
+    assert(addedLabels.includes("merge-risk: 🚨 automation"));
+    const patchedBody = calls.find((args) => args[0] === "patched-review-body")?.[1] ?? "";
+    assert.match(patchedBody, /Label justifications:/);
+    assert.match(patchedBody, /`proof: sufficient`/);
+    assert.match(patchedBody, /`rating: 🐚 platinum hermit`/);
+    const updatedReport = readFileSync(itemPath, "utf8");
+    const labelsLine = updatedReport.match(/^labels: (.*)$/m)?.[1] ?? "[]";
+    const labels = JSON.parse(labelsLine) as string[];
+    assert(labels.includes("proof: sufficient"));
+    assert(labels.includes("rating: 🐚 platinum hermit"));
+    assert(labels.includes("status: 👀 ready for maintainer look"));
+    assert(labels.includes("merge-risk: 🚨 automation"));
+    assert.match(updatedReport, /^labels_synced_at: /m);
+    assert.deepEqual(JSON.parse(readFileSync(reportPath, "utf8")), [
+      {
+        number: 74482,
+        action: "review_comment_synced",
+        reason: "updated durable Codex review comment",
+      },
+    ]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("apply-decisions does not restore same-head PR review labels after human activity", () => {
+  const root = mkdtempSync(tmpPrefix);
+  try {
+    const itemsDir = join(root, "items");
+    const closedDir = join(root, "closed");
+    const plansDir = join(root, "plans");
+    const reportPath = join(root, "apply-report.json");
+    const logPath = join(root, "gh.log");
+    const itemPath = join(itemsDir, "74483.md");
+    mkdirSync(itemsDir, { recursive: true });
+    mkdirSync(plansDir, { recursive: true });
+    const sourceReport = `${reportFrontMatter({
+      repository: "openclaw/openclaw",
+      type: "pull_request",
+      number: "74483",
+      title: "Do not restore stale labels after human activity",
+      url: "https://github.com/openclaw/openclaw/pull/74483",
+      decision: "keep_open",
+      close_reason: "none",
+      confidence: "high",
+      action_taken: "kept_open",
+      review_status: "complete",
+      local_checkout_access: "verified",
+      author: "contributor",
+      author_association: "CONTRIBUTOR",
+      labels: JSON.stringify([]),
+      item_snapshot_hash: "snapshot-human",
+      item_updated_at: "2026-05-19T20:00:00Z",
+      reviewed_at: "2026-05-19T20:00:00Z",
+      pull_head_sha: "fresh-head",
+      merge_risk_labels: JSON.stringify(["merge-risk: 🚨 automation"]),
+    })}
+
+## Summary
+
+This same-head report has later human activity and should not drive labels.
+
+${realBehaviorProofReportSection()}
+
+${prRatingReportSection()}
+
+## Review Findings
+
+Overall correctness: patch is correct
+
+Overall confidence: 0.91
+
+Full review comments:
+
+- none
+`;
+    const synced = reportWithSyncedReviewComment(sourceReport, 74483);
+    writeFileSync(itemPath, synced.report, "utf8");
+
+    const ghMock = `
+const { appendFileSync, readFileSync } = require("fs");
+const logPath = ${JSON.stringify(logPath)};
+const comment = ${JSON.stringify(synced.comment)};
+const rawArgs = process.argv.slice(2);
+const args = rawArgs[0] === "--repo" ? rawArgs.slice(2) : rawArgs;
+appendFileSync(logPath, JSON.stringify(args) + "\\n");
+const path = args[1] || "";
+if (args[0] === "api" && /\\/issues\\/74483$/.test(path)) {
+  console.log(JSON.stringify({
+    number: 74483,
+    title: "Do not restore stale labels after human activity",
+    html_url: "https://github.com/openclaw/openclaw/pull/74483",
+    created_at: "2026-05-19T19:00:00Z",
+    updated_at: "2026-05-19T20:10:00Z",
+    closed_at: null,
+    state: "open",
+    locked: false,
+    active_lock_reason: null,
+    author_association: "CONTRIBUTOR",
+    user: { login: "contributor" },
+    labels: [],
+    pull_request: {}
+  }));
+} else if (args[0] === "api" && args[1] === "-i" && /\\/issues\\/74483\\/timeline(?:\\?|$)/.test(args[2] || "")) {
+  console.log("HTTP/2 200\\n\\n[]");
+} else if (args[0] === "api" && /\\/issues\\/74483\\/timeline(?:\\?|$)/.test(path)) {
+  console.log(JSON.stringify([[]]));
+} else if (args[0] === "api" && /\\/pulls\\/74483$/.test(path)) {
+  console.log(JSON.stringify({
+    number: 74483,
+    html_url: "https://github.com/openclaw/openclaw/pull/74483",
+    state: "open",
+    changed_files: 1,
+    commits: 1,
+    review_comments: 0,
+    head: { sha: "fresh-head", ref: "branch", repo: { full_name: "fork/openclaw" } },
+    base: { sha: "base-sha", ref: "main", repo: { full_name: "openclaw/openclaw" } },
+    user: { login: "contributor" }
+  }));
+} else if (args[0] === "api" && /\\/pulls\\/74483\\/(files|commits|comments)(?:\\?|$)/.test(path)) {
+  console.log(JSON.stringify([[]]));
+} else if (args[0] === "api" && /\\/issues\\/74483\\/comments(?:\\?|$)/.test(path)) {
+  console.log(JSON.stringify([[
+    {
+      id: 987483,
+      html_url: "https://github.com/openclaw/openclaw/pull/74483#issuecomment-987483",
+      body: comment,
+      user: { login: "clawsweeper[bot]" },
+      created_at: "2026-05-19T20:00:00Z",
+      updated_at: "2026-05-19T20:00:00Z"
+    },
+    {
+      id: 987484,
+      html_url: "https://github.com/openclaw/openclaw/pull/74483#issuecomment-987484",
+      body: "I have a follow-up question before labels should be restored.",
+      user: { login: "reviewer" },
+      author_association: "MEMBER",
+      created_at: "2026-05-19T20:06:00Z",
+      updated_at: "2026-05-19T20:06:00Z"
+    }
+  ]]));
+} else if (args[0] === "api" && /\\/issues\\/comments\\/987483$/.test(path)) {
+  const input = args[args.indexOf("--input") + 1];
+  appendFileSync(logPath, JSON.stringify(["patched-review-body", JSON.parse(readFileSync(input, "utf8")).body]) + "\\n");
+  console.log(JSON.stringify({
+    id: 987483,
+    html_url: "https://github.com/openclaw/openclaw/pull/74483#issuecomment-987483",
+    updated_at: "2026-05-19T20:11:00Z"
+  }));
+} else if (args[0] === "issue" && args[1] === "edit") {
+  console.log("");
+} else if (args[0] === "label" && args[1] === "create") {
+  console.log(JSON.stringify({ name: args[2] }));
+} else {
+  console.error("unexpected gh args", JSON.stringify(args));
+  process.exit(1);
+}
+`;
+    withMockGh(root, ghMock, () => {
+      runApplyDecisionsForTest({
+        targetRepo: "openclaw/openclaw",
+        itemsDir,
+        closedDir,
+        plansDir,
+        reportPath,
+        extraArgs: ["--sync-comments-only", "--item-numbers", "74483"],
+      });
+    });
+
+    const calls = readFileSync(logPath, "utf8")
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as string[]);
+    assert.equal(
+      calls.some((args) => args[0] === "issue" && args[1] === "edit"),
+      false,
+    );
+    assert.equal(
+      calls.some((args) => args[0] === "patched-review-body"),
+      false,
+    );
+    const updatedReport = readFileSync(itemPath, "utf8");
+    assert.match(updatedReport, /^labels: \[\]$/m);
+    assert.doesNotMatch(updatedReport, /^labels_synced_at: /m);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("apply-decisions routes parsed security owner acceptance to maintainer review", () => {
   const root = mkdtempSync(tmpPrefix);
   try {

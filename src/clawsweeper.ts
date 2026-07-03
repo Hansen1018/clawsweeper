@@ -17556,6 +17556,7 @@ async function applyDecisionsCommand(args: Args): Promise<void> {
     }
     const updatedSinceReview = Boolean(storedUpdatedAt && item.updatedAt !== storedUpdatedAt);
     const reviewCommentOnlyUpdate = item.updatedAt === commentUpdatedAt(existingReviewComment);
+    const storedUpdatedAtMs = timestampMs(storedUpdatedAt);
     const labelSyncFreshEnough = (): boolean => {
       if (!storedUpdatedAt) return false;
       if (!updatedSinceReview || reviewCommentOnlyUpdate) return true;
@@ -17565,7 +17566,6 @@ async function applyDecisionsCommand(args: Args): Promise<void> {
       if (Math.abs(itemUpdatedAtMs - existingReviewCommentUpdatedAtMs) > 5 * 60 * 1000) {
         return false;
       }
-      const storedUpdatedAtMs = timestampMs(storedUpdatedAt);
       if (storedUpdatedAtMs === null) return false;
       return !contextHasNonAutomationActivityAfter(currentItemContext(), storedUpdatedAtMs);
     };
@@ -17573,6 +17573,24 @@ async function applyDecisionsCommand(args: Args): Promise<void> {
       state === "open" && item.kind === "pull_request"
         ? stalePullRequestReviewHead(markdown, currentItemContext())
         : null;
+    const reportPullHeadSha =
+      state === "open" && item.kind === "pull_request" ? pullHeadShaFromReport(markdown) : null;
+    const currentPullHeadSha =
+      state === "open" && item.kind === "pull_request"
+        ? pullHeadShaFromContext(currentItemContext())
+        : null;
+    const isCompleteSameHeadPullRequestReport =
+      Boolean(storedUpdatedAt) &&
+      state === "open" &&
+      item.kind === "pull_request" &&
+      frontMatterValue(markdown, "review_status") === "complete" &&
+      !stalePrReviewHead &&
+      storedUpdatedAtMs !== null &&
+      !contextHasNonAutomationActivityAfter(currentItemContext(), storedUpdatedAtMs) &&
+      reportPullHeadSha !== null &&
+      reportPullHeadSha === currentPullHeadSha;
+    const shouldSyncCurrentPullRequestReviewLabels =
+      labelSyncFreshEnough() || (!isCloseProposal && isCompleteSameHeadPullRequestReport);
     let currentPrStatusKind: PrStatusLabelKind | null = null;
     if (state === "open" && item.kind === "pull_request") {
       if (stalePrReviewHead) {
@@ -17588,7 +17606,7 @@ async function applyDecisionsCommand(args: Args): Promise<void> {
           "current_pull_head_sha",
           stalePrReviewHead.liveHeadSha,
         );
-      } else if (labelSyncFreshEnough()) {
+      } else if (shouldSyncCurrentPullRequestReviewLabels) {
         const realBehaviorProof = reportRealBehaviorProof(markdown);
         const proofSufficientSyncResult = syncRealBehaviorProofSufficientLabel({
           number,
@@ -17906,7 +17924,9 @@ async function applyDecisionsCommand(args: Args): Promise<void> {
     const isCurrentCompleteReport =
       frontMatterValue(markdown, "review_status") === "complete" &&
       !stalePrReviewHead &&
-      labelSyncFreshEnough();
+      (item.kind === "pull_request"
+        ? shouldSyncCurrentPullRequestReviewLabels
+        : labelSyncFreshEnough());
     if (state === "open" && isCurrentCompleteReport) {
       try {
         const syncResult = syncPriorityLabel({
