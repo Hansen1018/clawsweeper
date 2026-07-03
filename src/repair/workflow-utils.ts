@@ -308,7 +308,12 @@ export function summarizeApplyReport(options: ApplyReportSummaryOptions): ApplyR
     if ((skipReasons[reason] || 0) > 0) attentionReasons.push(reason);
   }
   if (actions.length > 0 && skipped === actions.length) {
-    for (const reason of ["skipped_changed_since_review", "skipped_pr_close_coverage_proof"]) {
+    for (const reason of [
+      "skipped_changed_since_review",
+      "skipped_pr_close_coverage_proof",
+      "skipped_maintainer_authored",
+      "skipped_invalid_decision",
+    ]) {
       if ((skipReasons[reason] || 0) > 0) attentionReasons.push(reason);
     }
   }

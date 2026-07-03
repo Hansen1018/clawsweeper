@@ -278,6 +278,8 @@ test("workflow utilities flag operator-action skips when every result is blocked
     JSON.stringify([
       { number: 10, action: "skipped_changed_since_review" },
       { number: 20, action: "skipped_pr_close_coverage_proof" },
+      { number: 30, action: "skipped_maintainer_authored" },
+      { number: 40, action: "skipped_invalid_decision" },
     ]),
   );
 
@@ -294,6 +296,8 @@ test("workflow utilities flag operator-action skips when every result is blocked
   assert.deepEqual(summary.attention_reasons, [
     "skipped_changed_since_review",
     "skipped_pr_close_coverage_proof",
+    "skipped_maintainer_authored",
+    "skipped_invalid_decision",
   ]);
 });
 
