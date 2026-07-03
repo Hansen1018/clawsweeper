@@ -125,6 +125,8 @@ is absent or a cache event lands in another Cloudflare colo.
 - recent automerge command-to-merge timing samples
 - explicit workflow status events posted to the ingest API when KV ingest is
   enabled
+- problem-focused apply-health alerts from latest sweep status files when apply
+  runs report blocked or degraded pruning progress
 
 The Worker fetches job details only for the bounded active-run set, limits that
 GitHub fanout to 12 concurrent requests, and caches each run's jobs for 60

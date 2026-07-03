@@ -1764,7 +1764,7 @@ async function statusSnapshot(env) {
       TERMINAL_BAD_CONCLUSIONS.has(String(run.conclusion)),
   );
   const activeJobs = await activeWorkerSnapshot(env, repo, workerRuns);
-  const [workerHealth, pipeline, clusterRepair, automerge, closed, storedEvents] =
+  const [workerHealth, pipeline, clusterRepair, applyHealth, automerge, closed, storedEvents] =
     await Promise.all([
       withTimeout(
         recentWorkerHealth(env, repo, completedWorkflowRuns),
@@ -1789,6 +1789,14 @@ async function statusSnapshot(env) {
       ).catch((error) => {
         errors.push(error.message);
         return emptyClusterRepairStatus(targetRepos);
+      }),
+      withTimeout(
+        applyHealthStatus(env, targetRepos),
+        OPTIONAL_SECTION_TIMEOUT_MS,
+        "apply health",
+      ).catch((error) => {
+        errors.push(error.message);
+        return emptyApplyHealthStatus(targetRepos);
       }),
       withTimeout(
         recentAutomerge(env, targetRepos[0] || "openclaw/openclaw"),
@@ -1844,6 +1852,7 @@ async function statusSnapshot(env) {
     pipeline,
     recent: {
       cluster_repair: clusterRepair,
+      apply_health: applyHealth,
       automerge: automerge.items,
       closed_items: closed.items,
       closed_stats: closed.stats,
@@ -3525,6 +3534,128 @@ async function clusterRepairStatus(env, repo, targetRepos, activeRuns) {
       .filter((run) => workflowRunNameIncludes(run, "repair cluster worker"))
       .map(workflowRunSummary),
   };
+}
+
+async function applyHealthStatus(env, targetRepos) {
+  const items = await Promise.all(
+    targetRepos.map((targetRepo) => readApplyHealthMarker(env, targetRepo)),
+  );
+  const attention = items.filter((item) => applyHealthNeedsAttention(item.status));
+  return {
+    items,
+    attention_count: attention.length,
+    latest_attention_at: latestIso(attention.map((item) => item.updated_at)),
+  };
+}
+
+async function readApplyHealthMarker(env, targetRepo) {
+  const stateRepo = String(env.CLAWSWEEPER_STATE_REPO || CLAWSWEEPER_STATE_REPO);
+  const stateRef = String(env.CLAWSWEEPER_STATE_REF || CLAWSWEEPER_STATE_REF);
+  const repoSlug = String(targetRepo || "").replace(/\//g, "-");
+  const statusPath = `results/sweep-status/${repoSlug}.json`;
+  try {
+    const content = await githubJson(
+      env,
+      `/repos/${stateRepo}/contents/${githubPath(statusPath)}?ref=${encodeURIComponent(stateRef)}`,
+    );
+    const status = parseJsonObject(decodeGithubContent(content?.content)) || {};
+    const health = objectValue(status.apply_health);
+    const skipReasons = numericRecord(health.skip_reasons);
+    const cursor = objectValue(health.cursor);
+    return {
+      target_repo: nullableString(status.target_repo) || targetRepo,
+      status_path: statusPath,
+      state: nullableString(status.state),
+      detail: nullableString(status.detail),
+      run_url: nullableString(status.run_url),
+      updated_at: nullableString(health.generated_at) || nullableString(status.updated_at),
+      mode: nullableString(health.mode),
+      status: nullableString(health.status) || "unavailable",
+      summary: nullableString(health.summary),
+      processed: numberOrNull(health.processed),
+      processed_limit: numberOrNull(health.processed_limit),
+      close_limit: numberOrNull(health.close_limit),
+      closed: numberOrNull(health.closed),
+      comment_synced: numberOrNull(health.comment_synced),
+      skipped: numberOrNull(health.skipped),
+      skip_reasons: skipReasons,
+      attention_reasons: Array.isArray(health.attention_reasons)
+        ? health.attention_reasons
+            .map((reason) => String(reason))
+            .filter(Boolean)
+            .slice(0, 8)
+        : [],
+      cursor: cursor.next_after_number
+        ? {
+            next_after_number: numberOrNull(cursor.next_after_number),
+            next_after_apply_checked_at: nullableString(cursor.next_after_apply_checked_at),
+            updated_at: nullableString(cursor.updated_at),
+          }
+        : null,
+    };
+  } catch {
+    return {
+      target_repo: targetRepo,
+      status_path: statusPath,
+      state: null,
+      detail: null,
+      run_url: null,
+      updated_at: null,
+      mode: null,
+      status: "unavailable",
+      summary: null,
+      processed: null,
+      processed_limit: null,
+      close_limit: null,
+      closed: null,
+      comment_synced: null,
+      skipped: null,
+      skip_reasons: {},
+      attention_reasons: [],
+      cursor: null,
+    };
+  }
+}
+
+function emptyApplyHealthStatus(targetRepos) {
+  return {
+    items: targetRepos.map((targetRepo) => ({
+      target_repo: targetRepo,
+      status_path: `results/sweep-status/${String(targetRepo || "").replace(/\//g, "-")}.json`,
+      status: "unavailable",
+      updated_at: null,
+      skip_reasons: {},
+      attention_reasons: [],
+      cursor: null,
+    })),
+    attention_count: 0,
+    latest_attention_at: null,
+  };
+}
+
+function applyHealthNeedsAttention(status) {
+  return ["attention", "blocked", "degraded", "failed", "needs_attention", "warning"].includes(
+    String(status || "").toLowerCase(),
+  );
+}
+
+function latestIso(values) {
+  const timestamps = values
+    .map((value) => Date.parse(value || ""))
+    .filter((value) => Number.isFinite(value));
+  if (!timestamps.length) return null;
+  return new Date(Math.max(...timestamps)).toISOString();
+}
+
+function numericRecord(value) {
+  const record = objectValue(value);
+  return Object.fromEntries(
+    Object.entries(record)
+      .map(([key, count]) => ({ key, count: numberOrNull(count) }))
+      .filter((entry) => entry.count !== null && entry.count > 0)
+      .sort((left, right) => left.key.localeCompare(right.key))
+      .map((entry) => [entry.key, entry.count]),
+  );
 }
 
 async function readClusterRepairMarker(env, targetRepo) {
@@ -5717,6 +5848,28 @@ h2 {
 .status-dot.waiting { background: var(--amber); }
 .status-dot.done { background: var(--green); }
 .status-dot.failed { background: var(--red); }
+.apply-health-alert {
+  display: grid;
+  gap: 6px;
+  margin-top: 14px;
+  padding: 11px 12px;
+  border: 1px solid rgba(243,183,89,0.5);
+  border-left: 3px solid var(--amber);
+  border-radius: 12px;
+  background: rgba(243,183,89,0.08);
+}
+.apply-health-alert strong { color: #ffe0a8; }
+.apply-health-alert p { margin: 0; color: var(--muted); }
+.apply-health-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.apply-health-meta .pill {
+  min-height: 22px;
+  padding: 2px 8px;
+  font-size: 11px;
+}
 .automatic-head { margin-top: 24px; }
 .automatic-grid {
   display: grid;
@@ -6224,6 +6377,7 @@ a:hover { color: #89c8ff; text-decoration: underline; }
       <span><i class="waiting"></i>waiting</span>
       <span><i></i>available</span>
     </div>
+    <div id="apply-health"></div>
     <div class="automatic-head">
       <h2>Automatic Builds</h2>
       <span class="muted" id="automatic-summary"></span>
@@ -6596,6 +6750,7 @@ function renderDashboard(data, note) {
     metric("🎯 Capacity", fleet.budget_used_percent + "%", "fleet utilization", fleet.budget_used_percent, "var(--green)")
   ].join("");
   renderSystemMap(data);
+  renderApplyHealth(data);
   renderAutomaticWork(data.automatic_work || []);
   renderWorkers(data.workers || []);
   openWorkerFromHash();
@@ -6607,6 +6762,29 @@ function renderDashboard(data, note) {
   renderWorkerHealth(data.health);
   renderOperations(data.recent.operation_counts);
   renderEvents(data.recent.events || []);
+}
+function renderApplyHealth(data) {
+  const target = document.getElementById("apply-health");
+  if (!target) return;
+  const items = (data.recent?.apply_health?.items || []).filter(item => applyHealthNeedsAttention(item.status));
+  if (!items.length) {
+    target.innerHTML = "";
+    return;
+  }
+  target.innerHTML = items.map(item => {
+    const reasons = Object.entries(item.skip_reasons || {})
+      .sort((left, right) => Number(right[1]) - Number(left[1]))
+      .slice(0, 4)
+      .map(([reason, count]) => '<span class="pill">' + esc(reason.replace(/^skipped_/, "")) + " " + fmt.format(Number(count)) + '</span>')
+      .join("");
+    const cursor = item.cursor?.next_after_number ? "cursor #" + item.cursor.next_after_number : "cursor unavailable";
+    const processed = Number.isFinite(item.processed) ? fmt.format(item.processed) : "unknown";
+    const closed = Number.isFinite(item.closed) ? fmt.format(item.closed) : "unknown";
+    return '<div class="apply-health-alert"><strong>Apply needs attention · ' + esc(item.target_repo || "target repo") + '</strong><p>' + esc(item.summary || "The latest apply status reported an attention condition.") + '</p><div class="apply-health-meta"><span class="pill">' + esc(processed) + ' processed</span><span class="pill">' + esc(closed) + ' closed</span><span class="pill">' + esc(cursor) + '</span>' + reasons + linkClass(item.run_url, "run", "pill run-link") + '</div></div>';
+  }).join("");
+}
+function applyHealthNeedsAttention(status) {
+  return ["attention", "blocked", "degraded", "failed", "needs_attention", "warning"].includes(String(status || "").toLowerCase());
 }
 function renderPipeline(rows) {
   if (!rows.length) {
