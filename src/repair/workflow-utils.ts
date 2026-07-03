@@ -300,7 +300,6 @@ export function summarizeApplyReport(options: ApplyReportSummaryOptions): ApplyR
     options.cursorRequired &&
     processedLimit !== null &&
     actions.length >= processedLimit &&
-    closed === 0 &&
     !cursor
   ) {
     attentionReasons.push("cursor_required_but_missing_after_full_window");

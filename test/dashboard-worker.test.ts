@@ -1520,6 +1520,7 @@ test("dashboard exposes apply health from sweep status without broad scans", asy
       closed: 0,
       comment_synced: 0,
       skipped: 2,
+      cursor_required: true,
       skip_reasons: {
         skipped_changed_since_review: 2,
       },
@@ -1564,6 +1565,7 @@ test("dashboard exposes apply health from sweep status without broad scans", asy
     assert.equal(status.recent.apply_health.attention_count, 1);
     assert.equal(status.recent.apply_health.items[0].status, "needs_attention");
     assert.equal(status.recent.apply_health.items[0].processed, 2);
+    assert.equal(status.recent.apply_health.items[0].cursor_required, true);
     assert.deepEqual(status.recent.apply_health.items[0].skip_reasons, {
       skipped_changed_since_review: 2,
     });

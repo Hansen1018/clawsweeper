@@ -3579,6 +3579,7 @@ async function readApplyHealthMarker(env, targetRepo) {
       comment_synced: numberOrNull(health.comment_synced),
       skipped: numberOrNull(health.skipped),
       skip_reasons: skipReasons,
+      cursor_required: health.cursor_required === true,
       attention_reasons: Array.isArray(health.attention_reasons)
         ? health.attention_reasons
             .map((reason) => String(reason))
@@ -3611,6 +3612,7 @@ async function readApplyHealthMarker(env, targetRepo) {
       comment_synced: null,
       skipped: null,
       skip_reasons: {},
+      cursor_required: false,
       attention_reasons: [],
       cursor: null,
     };
@@ -3625,6 +3627,7 @@ function emptyApplyHealthStatus(targetRepos) {
       status: "unavailable",
       updated_at: null,
       skip_reasons: {},
+      cursor_required: false,
       attention_reasons: [],
       cursor: null,
     })),
@@ -6814,10 +6817,14 @@ function renderApplyHealth(data) {
       .slice(0, 4)
       .map(([reason, count]) => applyHealthReasonPill(reason, count))
       .join("");
+    const showCursor = item.cursor_required || Boolean(item.cursor?.next_after_number);
     const cursor = item.cursor?.next_after_number ? "cursor #" + item.cursor.next_after_number : "cursor missing";
     const cursorTitle = item.cursor?.next_after_number
       ? "Rotation cursor was recorded; the next pruning run should continue after this item."
       : "No rotation cursor was recorded. If this was a full scan window, the next pruning run can repeat the same records.";
+    const cursorPill = showCursor
+      ? '<span class="pill" title="' + esc(cursorTitle) + '">' + esc(cursor) + '</span>'
+      : "";
     const processed = Number.isFinite(item.processed) ? fmt.format(item.processed) : "unknown";
     const closed = Number.isFinite(item.closed) ? fmt.format(item.closed) : "unknown";
     const synced = Number.isFinite(item.comment_synced) ? fmt.format(item.comment_synced) : "unknown";
@@ -6826,7 +6833,7 @@ function renderApplyHealth(data) {
       '<p>' + esc(applyHealthOperatorSummary(item, topInfo)) + '</p>' +
       '<p class="apply-health-next"><strong>Next check:</strong> ' + esc(topInfo.action) + '</p>' +
       applyHealthActionHtml(action) +
-      '<div class="apply-health-meta"><span class="pill" title="Records checked in this pruning window.">' + esc(processed) + ' processed</span><span class="pill" title="Issues or pull requests closed by this window.">' + esc(closed) + ' closed</span><span class="pill" title="Review comments refreshed by this window.">' + esc(synced) + ' comments synced</span><span class="pill" title="' + esc(cursorTitle) + '">' + esc(cursor) + '</span>' + reasons + linkClass(item.run_url, "workflow run", "pill run-link") + '</div></div>';
+      '<div class="apply-health-meta"><span class="pill" title="Records checked in this pruning window.">' + esc(processed) + ' processed</span><span class="pill" title="Issues or pull requests closed by this window.">' + esc(closed) + ' closed</span><span class="pill" title="Review comments refreshed by this window.">' + esc(synced) + ' comments synced</span>' + cursorPill + reasons + linkClass(item.run_url, "workflow run", "pill run-link") + '</div></div>';
   }).join("");
 }
 function applyHealthNeedsAttention(status) {

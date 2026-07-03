@@ -149,6 +149,9 @@ test("apply workflow bounds checkpoints and requeues with a fresh token", () => 
   assert.match(applyStep, /apply_cursor_path="results\/apply-cursors\/\$\{target_slug\}\.json"/);
   assert.match(applyStep, /write_apply_health\(\)/);
   assert.match(applyStep, /pnpm run --silent workflow -- summarize-apply-report/);
+  assert.match(applyStep, /health_cursor_path="\$\{5:-\}"/);
+  assert.match(applyStep, /comment_sync_health_cursor_path="\$cursor_path"/);
+  assert.match(applyStep, /close_health_cursor_path="\$apply_cursor_path"/);
   assert.match(applyStep, /--apply-health-file "\.artifacts\/apply-health-\$checkpoint\.json"/);
   assert.match(applyStep, /--apply-health-file "\.artifacts\/apply-health-final\.json"/);
   assert.match(applyStep, /--state "Apply idle"/);

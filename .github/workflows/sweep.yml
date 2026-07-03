@@ -2331,7 +2331,8 @@ jobs:
             output_path="$2"
             health_mode="$3"
             health_processed_limit="$4"
-            health_cursor_required="${5:-false}"
+            health_cursor_path="${5:-}"
+            health_cursor_required="${6:-false}"
             health_args=(
               --target-repo "$TARGET_REPO"
               --report "$report_path"
@@ -2339,8 +2340,8 @@ jobs:
               --processed-limit "$health_processed_limit"
               --close-limit "$limit"
             )
-            if [ "$health_mode" = "close" ] && { [ "$health_cursor_required" = "true" ] || [ -f "$apply_cursor_path" ]; }; then
-              health_args+=(--cursor-path "$apply_cursor_path")
+            if [ -n "$health_cursor_path" ]; then
+              health_args+=(--cursor-path "$health_cursor_path")
             fi
             if [ "$health_cursor_required" = "true" ]; then
               health_args+=(--cursor-required true)
@@ -2482,7 +2483,11 @@ jobs:
                 --target-repo "$TARGET_REPO"
             fi
             publish_changes "chore: sync sweep review comments checkpoint $checkpoint" records apply-report.json results/comment-sync-cursors
-            write_apply_health ".artifacts/apply-reports/apply-report-$checkpoint.json" ".artifacts/apply-health-$checkpoint.json" "comment_sync" "$comment_sync_processed_limit" "false"
+            comment_sync_health_cursor_path=""
+            if [ "$sync_open_pr_batch" = "true" ]; then
+              comment_sync_health_cursor_path="$cursor_path"
+            fi
+            write_apply_health ".artifacts/apply-reports/apply-report-$checkpoint.json" ".artifacts/apply-health-$checkpoint.json" "comment_sync" "$comment_sync_processed_limit" "$comment_sync_health_cursor_path" "false"
             pnpm run status -- \
               --target-repo "$TARGET_REPO" \
               --state "Apply comments synced" \
@@ -2535,7 +2540,11 @@ jobs:
               apply_publish_paths+=(results/apply-cursors)
             fi
             publish_changes "chore: apply sweep decisions checkpoint $checkpoint" "${apply_publish_paths[@]}"
-            write_apply_health ".artifacts/apply-reports/apply-report-$checkpoint.json" ".artifacts/apply-health-$checkpoint.json" "close" "$close_processed_limit" "$auto_selected_apply_batch"
+            close_health_cursor_path=""
+            if [ "$auto_selected_apply_batch" = "true" ]; then
+              close_health_cursor_path="$apply_cursor_path"
+            fi
+            write_apply_health ".artifacts/apply-reports/apply-report-$checkpoint.json" ".artifacts/apply-health-$checkpoint.json" "close" "$close_processed_limit" "$close_health_cursor_path" "$auto_selected_apply_batch"
             pnpm run status -- \
               --target-repo "$TARGET_REPO" \
               --state "Apply in progress" \
@@ -2568,11 +2577,20 @@ jobs:
           done
           final_health_mode="close"
           final_health_processed_limit="$close_processed_limit"
+          final_health_cursor_path=""
+          final_health_cursor_required="$auto_selected_apply_batch"
+          if [ "$auto_selected_apply_batch" = "true" ]; then
+            final_health_cursor_path="$apply_cursor_path"
+          fi
           if [ "$sync_comments_only" = "true" ]; then
             final_health_mode="comment_sync"
             final_health_processed_limit="$comment_sync_processed_limit"
+            final_health_cursor_required="false"
+            if [ "$sync_open_pr_batch" = "true" ]; then
+              final_health_cursor_path="$cursor_path"
+            fi
           fi
-          write_apply_health "apply-report.json" ".artifacts/apply-health-final.json" "$final_health_mode" "$final_health_processed_limit" "$auto_selected_apply_batch"
+          write_apply_health "apply-report.json" ".artifacts/apply-health-final.json" "$final_health_mode" "$final_health_processed_limit" "$final_health_cursor_path" "$final_health_cursor_required"
           pnpm run status -- \
             --target-repo "$TARGET_REPO" \
             --state "Apply finished" \

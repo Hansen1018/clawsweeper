@@ -241,6 +241,32 @@ test("workflow utilities flag full-window close scans without the required curso
   assert.match(summary.summary, /Attention:/);
 });
 
+test("workflow utilities require the cursor after a full window that closed an item", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-workflow-"));
+  const reportPath = path.join(root, "apply-report.json");
+  write(
+    reportPath,
+    JSON.stringify([
+      { number: 10, action: "closed" },
+      { number: 20, action: "skipped_changed_since_review" },
+    ]),
+  );
+
+  const summary = summarizeApplyReport({
+    reportPath,
+    targetRepo: "openclaw/openclaw",
+    mode: "close",
+    processedLimit: 2,
+    closeLimit: 5,
+    cursorPath: path.join(root, "missing-cursor.json"),
+    cursorRequired: true,
+  });
+
+  assert.equal(summary.status, "needs_attention");
+  assert.equal(summary.closed, 1);
+  assert.deepEqual(summary.attention_reasons, ["cursor_required_but_missing_after_full_window"]);
+});
+
 test("workflow utilities count nested command actions by status", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-workflow-"));
   const report = path.join(root, "comment-router-latest.json");
