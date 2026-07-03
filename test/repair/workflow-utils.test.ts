@@ -284,6 +284,11 @@ test("workflow utilities flag operator-action skips when every result is blocked
       { number: 60, action: "skipped_same_author_pair" },
       { number: 70, action: "skipped_protected_label" },
       { number: 80, action: "skipped_already_closed" },
+      {
+        number: 90,
+        action: "kept_open",
+        reason: "review lacks verified local checkout access",
+      },
     ]),
   );
 
@@ -298,6 +303,7 @@ test("workflow utilities flag operator-action skips when every result is blocked
 
   assert.equal(summary.status, "needs_attention");
   assert.deepEqual(summary.attention_reasons, [
+    "kept_open",
     "skipped_changed_since_review",
     "skipped_invalid_decision",
     "skipped_maintainer_authored",
@@ -316,6 +322,7 @@ test("workflow utilities keep all-benign skip windows quiet", () => {
     JSON.stringify([
       { number: 10, action: "skipped_already_closed" },
       { number: 20, action: "skipped_not_open" },
+      { number: 30, action: "kept_open", reason: "synced ClawSweeper labels" },
     ]),
   );
 
@@ -329,6 +336,11 @@ test("workflow utilities keep all-benign skip windows quiet", () => {
   });
 
   assert.equal(summary.status, "ok");
+  assert.equal(summary.skipped, 2);
+  assert.deepEqual(summary.skip_reasons, {
+    skipped_already_closed: 1,
+    skipped_not_open: 1,
+  });
   assert.deepEqual(summary.attention_reasons, []);
 });
 

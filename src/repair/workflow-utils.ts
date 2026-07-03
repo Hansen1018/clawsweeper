@@ -10,6 +10,7 @@ import { AUTOMATION_LIMITS, WORKER_CONFIG, workerLimit, type WorkerLane } from "
 type ApplyAction = {
   action: string;
   number?: number;
+  reason?: string;
 };
 
 type ApplyReportSummaryOptions = {
@@ -287,7 +288,10 @@ export function summarizeApplyReport(options: ApplyReportSummaryOptions): ApplyR
   for (const entry of actions) {
     if (entry.action === "closed") closed += 1;
     if (entry.action === "review_comment_synced") commentSynced += 1;
-    if (entry.action.startsWith("skipped_")) {
+    if (
+      entry.action.startsWith("skipped_") ||
+      (entry.action === "kept_open" && !isSuccessfulLabelSyncReason(entry.reason))
+    ) {
       skipped += 1;
       skipReasons[entry.action] = (skipReasons[entry.action] || 0) + 1;
     }
@@ -872,10 +876,18 @@ function readApplyActions(reportPath: string): ApplyAction[] {
   if (!Array.isArray(parsed)) throw new Error(`${reportPath} must contain an array`);
   return parsed.map((entry) => {
     if (!isJsonObject(entry) || typeof entry.action !== "string") return { action: "" };
+    const action: ApplyAction = { action: entry.action };
+    if (typeof entry.reason === "string") action.reason = entry.reason;
     const number = Number(entry.number);
-    if (!Number.isInteger(number) || number <= 0) return { action: entry.action };
-    return { action: entry.action, number };
+    if (Number.isInteger(number) && number > 0) action.number = number;
+    return action;
   });
+}
+
+function isSuccessfulLabelSyncReason(reason: string | undefined): boolean {
+  return /^(?:synced|dry-run: would sync) (?:advisory issue|ClawSweeper) labels$/.test(
+    reason || "",
+  );
 }
 
 function resultFiles(reportDir: string): string[] {
