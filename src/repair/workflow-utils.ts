@@ -308,13 +308,15 @@ export function summarizeApplyReport(options: ApplyReportSummaryOptions): ApplyR
     if ((skipReasons[reason] || 0) > 0) attentionReasons.push(reason);
   }
   if (actions.length > 0 && skipped === actions.length) {
-    for (const reason of [
-      "skipped_changed_since_review",
-      "skipped_pr_close_coverage_proof",
-      "skipped_maintainer_authored",
-      "skipped_invalid_decision",
-    ]) {
-      if ((skipReasons[reason] || 0) > 0) attentionReasons.push(reason);
+    const benignSkipReasons = new Set([
+      "skipped_already_closed",
+      "skipped_closed",
+      "skipped_not_open",
+    ]);
+    for (const reason of Object.keys(skipReasons).sort()) {
+      if (!benignSkipReasons.has(reason) && !attentionReasons.includes(reason)) {
+        attentionReasons.push(reason);
+      }
     }
   }
 

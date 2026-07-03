@@ -280,6 +280,10 @@ test("workflow utilities flag operator-action skips when every result is blocked
       { number: 20, action: "skipped_pr_close_coverage_proof" },
       { number: 30, action: "skipped_maintainer_authored" },
       { number: 40, action: "skipped_invalid_decision" },
+      { number: 50, action: "skipped_open_closing_pr" },
+      { number: 60, action: "skipped_same_author_pair" },
+      { number: 70, action: "skipped_protected_label" },
+      { number: 80, action: "skipped_already_closed" },
     ]),
   );
 
@@ -295,10 +299,37 @@ test("workflow utilities flag operator-action skips when every result is blocked
   assert.equal(summary.status, "needs_attention");
   assert.deepEqual(summary.attention_reasons, [
     "skipped_changed_since_review",
-    "skipped_pr_close_coverage_proof",
-    "skipped_maintainer_authored",
     "skipped_invalid_decision",
+    "skipped_maintainer_authored",
+    "skipped_open_closing_pr",
+    "skipped_pr_close_coverage_proof",
+    "skipped_protected_label",
+    "skipped_same_author_pair",
   ]);
+});
+
+test("workflow utilities keep all-benign skip windows quiet", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-workflow-"));
+  const reportPath = path.join(root, "apply-report.json");
+  write(
+    reportPath,
+    JSON.stringify([
+      { number: 10, action: "skipped_already_closed" },
+      { number: 20, action: "skipped_not_open" },
+    ]),
+  );
+
+  const summary = summarizeApplyReport({
+    reportPath,
+    targetRepo: "openclaw/openclaw",
+    mode: "close",
+    processedLimit: 300,
+    closeLimit: 5,
+    cursorRequired: false,
+  });
+
+  assert.equal(summary.status, "ok");
+  assert.deepEqual(summary.attention_reasons, []);
 });
 
 test("workflow utilities count nested command actions by status", () => {
