@@ -287,7 +287,7 @@ export function summarizeApplyReport(options: ApplyReportSummaryOptions): ApplyR
   let skipped = 0;
   for (const entry of actions) {
     if (entry.action === "closed") closed += 1;
-    if (entry.action === "review_comment_synced") commentSynced += 1;
+    if (reportsReviewCommentSync(entry)) commentSynced += 1;
     const productive =
       entry.action === "closed" ||
       entry.action === "review_comment_synced" ||
@@ -888,6 +888,13 @@ function readApplyActions(reportPath: string): ApplyAction[] {
 function isSuccessfulLabelSyncReason(reason: string | undefined): boolean {
   return /^(?:synced|dry-run: would sync) (?:advisory issue|ClawSweeper) labels$/.test(
     reason || "",
+  );
+}
+
+function reportsReviewCommentSync(entry: ApplyAction): boolean {
+  return (
+    entry.action === "review_comment_synced" ||
+    (entry.reason || "").split("; ").includes("updated durable Codex review comment")
   );
 }
 

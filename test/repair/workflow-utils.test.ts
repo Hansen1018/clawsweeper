@@ -277,7 +277,11 @@ test("workflow utilities flag operator-action skips when every result is blocked
     reportPath,
     JSON.stringify([
       { number: 10, action: "skipped_changed_since_review" },
-      { number: 20, action: "skipped_pr_close_coverage_proof" },
+      {
+        number: 20,
+        action: "skipped_pr_close_coverage_proof",
+        reason: "close proof kept this open; updated durable Codex review comment",
+      },
       { number: 30, action: "skipped_maintainer_authored" },
       { number: 40, action: "skipped_invalid_decision" },
       { number: 50, action: "skipped_open_closing_pr" },
@@ -307,6 +311,7 @@ test("workflow utilities flag operator-action skips when every result is blocked
   });
 
   assert.equal(summary.status, "needs_attention");
+  assert.equal(summary.comment_synced, 1);
   assert.deepEqual(summary.attention_reasons, [
     "kept_open",
     "retry_pr_close_coverage_proof",
