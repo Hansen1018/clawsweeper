@@ -748,6 +748,13 @@ test("dashboard HTML preserves UTF-8 emoji labels", async () => {
   assert.match(html, /System Overview/);
   assert.match(html, /id="apply-health"/);
   assert.match(html, /function renderApplyHealth/);
+  assert.match(html, /Pruning sweep/);
+  assert.match(html, /Copy command/);
+  assert.match(html, /applyHealthRecommendedAction/);
+  assert.match(html, /Rotation cursor missing/);
+  assert.match(html, /Inspect the cursor-write and state-publish steps/);
+  assert.match(html, /const skipCount = skipReasons\[reason\]/);
+  assert.doesNotMatch(html, /Apply needs attention/);
   assert.match(html, /Automatic Builds/);
   assert.match(html, /id="automatic-work"/);
   assert.match(html, /Lifecycle Timeline/);
