@@ -20,6 +20,7 @@ checkpoint, and status-only commits are intentionally omitted.
 
 ### Changed
 
+- Raised scheduled close-apply throughput to four serial 20-close checkpoints per run while retaining the 20-close manual default, per-checkpoint state publication, and fresh-token continuation only for post-checkpoint eligible work.
 - Upgraded Codex review and repair workers to GPT-5.6 Sol with high reasoning, invalidating cached reviews from the prior model policy.
 - Raised durable exact-review admission from 20 to 28 global leases and from 16 to 24 leases per target while preserving four slots for other repositories.
 - Redesigned the live dashboard and triage pages: an editorial status headline, borderless stat ticker, pipeline stepper, single capacity bar, and dense worker rows replace the boxed card layout, with a warm theme that follows the system light/dark preference, one lobster-coral accent, quiet outline pills, GitHub label colors as neutral dot-pills, and emoji-free metric and section labels.

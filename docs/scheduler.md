@@ -463,10 +463,14 @@ hold the planner concurrency group or delay the next 89-shard backfill
 wave. Exact issue/PR reviews and repository-dispatch item runs still sync their
 selected comments inline before finishing.
 
-Long apply runs commit checkpoints every 20 fresh closes and dispatch a
-continuation with a fresh GitHub App token after any checkpoint that closes at
-least one item. A saturated scan that closes nothing stops without chaining so
-the same records cannot create an unbounded runner loop.
+Long scheduled apply runs process up to four serial checkpoints of 20 fresh
+closes, publishing each checkpoint independently before continuing in the same
+job. This amortizes setup and hydration while retaining one mutation writer and
+the 20-close manual-dispatch default. A fresh-token continuation is dispatched
+only when the cursor, runtime budget, or checkpoint cap stops a run and a
+post-checkpoint probe still finds eligible work. A saturated scan that closes
+nothing stops without chaining so the same records cannot create an unbounded
+runner loop.
 
 Untargeted cursor-based close apply starts with a 300-record scan window. If
 the previous cursor window was a full close-mode scan, closed nothing, skipped

@@ -2634,7 +2634,7 @@ jobs:
           set -euo pipefail
           test -n "$GH_TOKEN"
           source scripts/apply-workflow-helpers.sh
-          limit="${{ github.event_name == 'workflow_dispatch' && github.event.inputs.apply_limit || '20' }}"
+          limit="${{ github.event_name == 'workflow_dispatch' && github.event.inputs.apply_limit || '80' }}"
           min_age_days="${{ github.event_name == 'workflow_dispatch' && github.event.inputs.apply_min_age_days || '0' }}"
           min_age_minutes="${{ github.event_name == 'workflow_dispatch' && github.event.inputs.apply_min_age_minutes || '' }}"
           apply_kind="${{ github.event_name == 'workflow_dispatch' && github.event.inputs.apply_kind || 'all' }}"
@@ -2676,6 +2676,7 @@ jobs:
           next_cursor=""
           apply_ready_count=""
           cursor_advance_count=""
+          cursor_advance_total=0
           coverage_proof_item_numbers=""
           if [ "$sync_open_pr_batch" = "true" ]; then
             sync_comments_only="true"
@@ -2751,7 +2752,7 @@ jobs:
               --min-age-days "$min_age_days" \
               --min-age-minutes "$min_age_minutes" \
               --batch-size "$close_processed_limit" \
-              --close-limit "$((limit < checkpoint_size ? limit : checkpoint_size))" \
+              --close-limit "$limit" \
               --coverage-proof-limit "$coverage_proof_limit" \
               --cursor-path "$apply_cursor_path")"
             if [ -n "$item_numbers" ]; then
@@ -2805,7 +2806,7 @@ jobs:
           pnpm run status -- \
             --target-repo "$TARGET_REPO" \
             --state "Apply in progress" \
-            --detail "Starting apply/comment-sync run for up to $limit fresh $apply_kind closes. Close reasons: $apply_close_reasons.$candidate_quality_detail Scan window: $close_processed_limit records ($adaptive_apply_scan_reason). Existing Codex automated review comments are updated in place when closing or when comment-only sync is stale by ${comment_sync_min_age_days} day(s); checkpoints commit every $checkpoint_size fresh closes; close delay is ${close_delay_ms}ms; sync-comments-only=$sync_comments_only; item numbers=${item_numbers:-all}." \
+            --detail "Applying up to $limit $apply_kind closes. Reasons: $apply_close_reasons.$candidate_quality_detail Scan window: $close_processed_limit records ($adaptive_apply_scan_reason); comment staleness=${comment_sync_min_age_days}d; checkpoint=$checkpoint_size; delay=${close_delay_ms}ms; comment-only=$sync_comments_only; items=${item_numbers:-all}." \
             --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           if ! publish_changes "chore: mark sweep apply in progress" records results/sweep-status; then
             echo "Best-effort apply start status update failed"
@@ -2861,7 +2862,7 @@ jobs:
             publish_status "chore: update sweep comment sync status"
             echo "::endgroup::"
           fi
-          while [ "$closed_total" -lt "$limit" ]; do
+          while [ "$closed_total" -lt "$limit" ] && [ "$checkpoint" -lt "$max_apply_checkpoints" ]; do
             if [ "$sync_comments_only" = "true" ]; then
               break
             fi
@@ -2914,6 +2915,7 @@ jobs:
                 --report ".artifacts/apply-reports/apply-report-$checkpoint.json" \
                 --item-numbers "$item_numbers" \
                 --cursor-trace "$cursor_trace_path")"
+              cursor_advance_total=$((cursor_advance_total + cursor_advance_count))
               apply_publish_paths+=(results/apply-cursors)
             fi
             examined_count="$(apply_checkpoint_examined_count)"
@@ -2931,7 +2933,6 @@ jobs:
               --apply-health-file ".artifacts/apply-health-$checkpoint.json"
             publish_status "chore: update sweep apply checkpoint $checkpoint status"
             echo "::endgroup::"
-            drop_bounded_coverage_proof_tail "$cursor_trace_path"
             if automatic_apply_runtime_reached ".artifacts/apply-reports/apply-report-$checkpoint.json"; then break; fi
             if [ "$result_count" -ge "$close_processed_limit" ]; then
               if [ "$closed_in_chunk" -gt 0 ]; then
@@ -2952,9 +2953,9 @@ jobs:
               echo "Checkpoint made no fresh closes; stopping to avoid a retry loop."
               break
             fi
-            continue_apply=true
-            break
+            if ! drop_examined_apply_items "$cursor_trace_path"; then break; fi
           done
+          select_apply_continuation
           final_health_mode="close"
           final_health_processed_limit="$close_processed_limit"
           final_health_cursor_path=""
@@ -2966,7 +2967,7 @@ jobs:
             final_health_cursor_path="$apply_cursor_path"
             final_health_candidate_count="$apply_ready_count"
             final_health_scheduled_interval_minutes="15"
-            final_health_cursor_advance_count="$cursor_advance_count"
+            final_health_cursor_advance_count="$cursor_advance_total"
           fi
           if [ "$sync_comments_only" = "true" ]; then
             final_health_mode="comment_sync"
@@ -3050,7 +3051,7 @@ jobs:
           can_share_apply_continuation=false
           if [ "${APPLY_AUTO_SELECTED_BATCH:-false}" = "true" ] &&
             [ -z "${APPLY_ITEM_NUMBERS:-}" ] &&
-            [ "${APPLY_LIMIT:-20}" = "20" ] &&
+            [[ "${APPLY_LIMIT:-20}" =~ ^(20|80)$ ]] &&
             [ "${APPLY_MIN_AGE_DAYS:-0}" = "0" ] &&
             [ -z "${APPLY_MIN_AGE_MINUTES:-}" ] &&
             [ "${APPLY_KIND:-all}" = "all" ] &&

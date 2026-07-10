@@ -453,6 +453,10 @@ test("apply workflow bounds checkpoints and requeues with a fresh token", () => 
   assert.match(workflow, /github\.event\.inputs\.apply_limit != '20'/);
   assert.match(workflow, /github\.event\.inputs\.apply_checkpoint_size != '20'/);
   assert.match(applyStep, /Capping apply checkpoint size at 20/);
+  assert.match(
+    applyStep,
+    /limit="\$\{\{ github\.event_name == 'workflow_dispatch' && github\.event\.inputs\.apply_limit \|\| '80' \}\}"/,
+  );
   assert.match(applyStep, /base_close_processed_limit=300/);
   assert.match(applyHelper, /coverage_proof_limit=2/);
   assert.match(applyHelper, /max_runtime_arg=\(--max-runtime-ms 600000\)/);
@@ -477,6 +481,12 @@ test("apply workflow bounds checkpoints and requeues with a fresh token", () => 
   assert.match(applyStep, /proposed-item-count/);
   assert.match(applyStep, /apply-cursor-advance-count/);
   assert.match(applyStep, /examined_count="\$\(apply_checkpoint_examined_count\)"/);
+  assert.match(applyStep, /cursor_advance_total=0/);
+  assert.match(
+    applyStep,
+    /cursor_advance_total=\$\(\(cursor_advance_total \+ cursor_advance_count\)\)/,
+  );
+  assert.match(applyStep, /final_health_cursor_advance_count="\$cursor_advance_total"/);
   assert.match(applyHelper, /apply_checkpoint_examined_count\(\)/);
   assert.match(applyHelper, /printf '%s\\n' "unavailable"/);
   assert.match(applyStep, /Candidates examined: \$examined_count\. Action records: \$result_count/);
@@ -510,16 +520,17 @@ test("apply workflow bounds checkpoints and requeues with a fresh token", () => 
   assert.ok(qualitySummaryIndex > applyReconcileIndex);
   assert.ok(proposedNumbersIndex > qualitySummaryIndex);
   assert.match(applyStep, /--batch-size "\$close_processed_limit"/);
-  assert.match(
-    applyStep,
-    /--close-limit "\$\(\(limit < checkpoint_size \? limit : checkpoint_size\)\)"/,
-  );
+  assert.match(applyStep, /--close-limit "\$limit"/);
   assert.match(applyStep, /--coverage-proof-limit "\$coverage_proof_limit"/);
   assert.match(applyStep, /select_bounded_coverage_proof_tail/);
   assert.match(applyHelper, /select_bounded_coverage_proof_tail\(\)/);
   assert.match(applyHelper, /proposed-pr-close-coverage-item-numbers/);
-  assert.match(applyHelper, /drop_bounded_coverage_proof_tail\(\)/);
-  assert.match(applyStep, /drop_bounded_coverage_proof_tail "\$cursor_trace_path"/);
+  assert.match(applyHelper, /drop_examined_apply_items\(\)/);
+  const dropExaminedItemsIndex = applyStep.indexOf(
+    'if ! drop_examined_apply_items "$cursor_trace_path"; then break; fi',
+  );
+  assert.ok(dropExaminedItemsIndex > applyStep.indexOf('if [ "$result_count" -ge'));
+  assert.ok(dropExaminedItemsIndex > applyStep.indexOf('if [ "$closed_in_chunk" -eq 0 ]'));
   assert.match(
     applyStep,
     /Scan window: \$close_processed_limit records \(\$adaptive_apply_scan_reason\)/,
@@ -549,8 +560,23 @@ test("apply workflow bounds checkpoints and requeues with a fresh token", () => 
     /if \[ "\$result_count" -ge "\$close_processed_limit" \] && \[ "\$closed_in_chunk" -gt 0 \]/,
   );
   assert.match(applyStep, /sync_comments_only" != "true" .*apply_close_reasons/);
-  assert.match(applyStep, /continue_apply=true/);
-  assert.match(applyStep, /break\n\s+done/);
+  assert.doesNotMatch(applyStep, /continue_apply=true\n\s+break\n\s+done/);
+  assert.match(applyHelper, /max_apply_checkpoints=4/);
+  assert.match(
+    applyStep,
+    /while \[ "\$closed_total" -lt "\$limit" \] && \[ "\$checkpoint" -lt "\$max_apply_checkpoints" \]; do/,
+  );
+  assert.match(applyStep, /chunk_limit="\$checkpoint_size"/);
+  assert.match(applyStep, /publish_changes "chore: apply sweep decisions checkpoint \$checkpoint"/);
+  assert.match(applyStep, /select_apply_continuation/);
+  assert.match(
+    applyHelper,
+    /has_remaining_apply_candidates\(\)[\s\S]*--batch-size 1[\s\S]*proposed-item-numbers/,
+  );
+  assert.match(
+    applyHelper,
+    /\[ "\$checkpoint" -ge "\$max_apply_checkpoints" \][\s\S]*\[ "\$last_closed" -gt 0 \][\s\S]*has_remaining_apply_candidates/,
+  );
   assert.match(applyStep, /next_apply_item_numbers="\$item_numbers"/);
   assert.match(applyStep, /next_apply_item_numbers=""/);
   assert.match(applyStep, /echo "APPLY_CONTINUE=\$continue_apply"/);
@@ -560,7 +586,7 @@ test("apply workflow bounds checkpoints and requeues with a fresh token", () => 
   assert.match(continueStep, /can_share_apply_continuation=false/);
   assert.match(continueStep, /\[ "\$\{APPLY_AUTO_SELECTED_BATCH:-false\}" = "true" \]/);
   assert.match(continueStep, /\[ -z "\$\{APPLY_ITEM_NUMBERS:-\}" \]/);
-  assert.match(continueStep, /\[ "\$\{APPLY_LIMIT:-20\}" = "20" \]/);
+  assert.match(continueStep, /\[\[ "\$\{APPLY_LIMIT:-20\}" =~ \^\(20\|80\)\$ \]\]/);
   assert.match(continueStep, /\[ "\$\{APPLY_CHECKPOINT_SIZE:-20\}" = "20" \]/);
   assert.match(continueStep, /\[ "\$\{APPLY_COMMENT_SYNC_MIN_AGE_DAYS:-7\}" = "7" \]/);
   assert.match(continueStep, /preserving exact continuation dispatch/);
@@ -580,6 +606,63 @@ test("apply workflow bounds checkpoints and requeues with a fresh token", () => 
   assert.match(continueStep, /-f apply_item_numbers="\$APPLY_ITEM_NUMBERS"/);
   assert.doesNotMatch(continueStep, /-f item_numbers=/);
   assert.doesNotMatch(continueStep, /APPLY_CLOSED_TOTAL:-0.*APPLY_LIMIT:-0/);
+});
+
+test("apply continuation requires measured or checkpoint-bounded remaining work", () => {
+  const script = `
+    set -euo pipefail
+    source scripts/apply-workflow-helpers.sh
+    continue_apply=false
+    sync_comments_only="$1"
+    closed_total="$2"
+    limit="$3"
+    checkpoint="$4"
+    closed_in_chunk="$5"
+    remaining="$6"
+    has_remaining_apply_candidates() { [ "$remaining" = "true" ]; }
+    select_apply_continuation >/dev/null
+    printf '%s' "$continue_apply"
+  `;
+  const scenarios = [
+    {
+      name: "post-checkpoint backlog after requested closes",
+      args: ["false", "80", "80", "4", "20", "true"],
+      expected: "true",
+    },
+    {
+      name: "stale pre-run count but post-checkpoint queue exhausted",
+      args: ["false", "80", "80", "4", "20", "false"],
+      expected: "false",
+    },
+    {
+      name: "zero-progress stop before checkpoint cap",
+      args: ["false", "60", "80", "3", "0", "true"],
+      expected: "false",
+    },
+    {
+      name: "productive checkpoint cap",
+      args: ["false", "60", "100", "4", "20", "true"],
+      expected: "true",
+    },
+    {
+      name: "productive checkpoint cap exhausted the queue",
+      args: ["false", "60", "100", "4", "20", "false"],
+      expected: "false",
+    },
+    {
+      name: "comment sync never continues",
+      args: ["true", "80", "80", "4", "20", "true"],
+      expected: "false",
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    const actual = execFileSync("bash", ["-c", script, scenario.name, ...scenario.args], {
+      cwd: process.cwd(),
+      encoding: "utf8",
+    });
+    assert.equal(actual, scenario.expected, scenario.name);
+  }
 });
 
 test("apply workflow finalization retries only target status after checkpointed state", () => {
@@ -676,7 +759,7 @@ test("apply workflow does not queue runtime-yield continuation without cursor pr
   }
 });
 
-test("apply workflow drops a coverage-proof tail only after exact trace examination", () => {
+test("apply workflow drops only exactly examined items between checkpoints", () => {
   const root = mkdtempSync(tmpPrefix);
   const fastOnlyTrace = join(root, "fast-only.json");
   const firstProofTrace = join(root, "proof-first.json");
@@ -705,11 +788,11 @@ test("apply workflow drops a coverage-proof tail only after exact trace examinat
           "item_numbers=10,20,30,40",
           "coverage_proof_item_numbers=30,40",
           'item_numbers_arg=(--item-numbers "$item_numbers")',
-          'drop_bounded_coverage_proof_tail "$FAST_ONLY_TRACE"',
+          'drop_examined_apply_items "$FAST_ONLY_TRACE"',
           'printf \'%s|%s|%s\\n\' "$item_numbers" "$coverage_proof_item_numbers" "${item_numbers_arg[*]}"',
-          'drop_bounded_coverage_proof_tail "$FIRST_PROOF_TRACE"',
+          'drop_examined_apply_items "$FIRST_PROOF_TRACE"',
           'printf \'%s|%s|%s\\n\' "$item_numbers" "$coverage_proof_item_numbers" "${item_numbers_arg[*]}"',
-          'drop_bounded_coverage_proof_tail "$SECOND_PROOF_TRACE"',
+          'drop_examined_apply_items "$SECOND_PROOF_TRACE" || true',
           'printf \'%s|%s|%s\\n\' "$item_numbers" "$coverage_proof_item_numbers" "${item_numbers_arg[*]}"',
         ].join("\n"),
       ],
@@ -725,9 +808,9 @@ test("apply workflow drops a coverage-proof tail only after exact trace examinat
       },
     );
     assert.deepEqual(output.trim().split("\n"), [
-      "10,20,30,40|30,40|--item-numbers 10,20,30,40",
-      "10,20,40|40|--item-numbers 10,20,40",
-      "10,20||--item-numbers 10,20",
+      "30,40|30,40|--item-numbers 30,40",
+      "40|40|--item-numbers 40",
+      "||",
     ]);
   } finally {
     rmSync(root, { recursive: true, force: true });

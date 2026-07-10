@@ -7,6 +7,7 @@
 max_close_processed_limit=900
 coverage_proof_limit=2
 progress_every=10
+max_apply_checkpoints=4
 
 publish_changes_with_strategy() {
   local rebase_strategy="$1"
@@ -169,6 +170,57 @@ automatic_apply_runtime_reached() {
   return 0
 }
 
+has_remaining_apply_candidates() {
+  local candidate_args=(
+    --target-repo "$TARGET_REPO"
+    --apply-kind "$apply_kind"
+    --apply-close-reasons "$apply_close_reasons"
+    --stale-min-age-days "$stale_min_age_days"
+    --min-age-days "$min_age_days"
+    --min-age-minutes "$min_age_minutes"
+    --batch-size 1
+    --close-limit 1
+    --coverage-proof-limit 1
+    --cursor-path "$apply_cursor_path"
+  )
+  if [ -n "${explicit_item_numbers:-}" ]; then
+    candidate_args+=(--item-numbers "$explicit_item_numbers")
+  fi
+  local remaining
+  remaining="$(pnpm run --silent workflow -- proposed-item-numbers "${candidate_args[@]}")"
+  [ -n "$remaining" ]
+}
+
+select_apply_continuation() {
+  local last_closed="${closed_in_chunk:-0}"
+  local continuation_reason=""
+
+  if [ "$sync_comments_only" = "true" ]; then
+    continue_apply=false
+    return 0
+  fi
+  if [ "$continue_apply" = "true" ]; then
+    continuation_reason="the cursor or runtime budget stopped this run"
+  elif [ "$closed_total" -ge "$limit" ]; then
+    continuation_reason="this run reached its close limit"
+  elif [ "$sync_comments_only" != "true" ] &&
+    [ "$checkpoint" -ge "$max_apply_checkpoints" ] &&
+    [ "$closed_total" -lt "$limit" ] &&
+    [ "$last_closed" -gt 0 ]; then
+    continuation_reason="this run reached its checkpoint token budget"
+  else
+    return 0
+  fi
+
+  continue_apply=false
+  if has_remaining_apply_candidates; then
+    echo "Apply still has eligible work after checkpoints because $continuation_reason; queueing a fresh-token continuation."
+    continue_apply=true
+  else
+    echo "Post-checkpoint eligibility is empty; not queueing an apply continuation."
+  fi
+}
+
 select_adaptive_apply_batch() {
   if [ "$sync_comments_only" = "true" ] || [ -n "$item_numbers" ]; then
     return
@@ -198,24 +250,22 @@ select_bounded_coverage_proof_tail() {
   coverage_proof_count="$(pnpm run --silent workflow -- count-csv --items "$coverage_proof_item_numbers")"
 }
 
-drop_bounded_coverage_proof_tail() {
-  if [ "$auto_selected_apply_batch" != "true" ] || [ -z "$coverage_proof_item_numbers" ]; then
-    return
+drop_examined_apply_items() {
+  if [ "$auto_selected_apply_batch" != "true" ]; then
+    return 0
   fi
   local cursor_trace_path="$1"
   local examined_item_numbers
   examined_item_numbers="$(pnpm run --silent workflow -- apply-cursor-trace-item-numbers --cursor-trace "$cursor_trace_path")"
   if [ -z "$examined_item_numbers" ]; then
-    return
+    return 0
   fi
   local remaining=",${item_numbers},"
   local remaining_proof=",${coverage_proof_item_numbers},"
   local number
-  for number in ${coverage_proof_item_numbers//,/ }; do
-    if [[ ",${examined_item_numbers}," == *",${number},"* ]]; then
-      remaining="${remaining//,${number},/,}"
-      remaining_proof="${remaining_proof//,${number},/,}"
-    fi
+  for number in ${examined_item_numbers//,/ }; do
+    remaining="${remaining//,${number},/,}"
+    remaining_proof="${remaining_proof//,${number},/,}"
   done
   item_numbers="${remaining#,}"
   item_numbers="${item_numbers%,}"
@@ -225,6 +275,7 @@ drop_bounded_coverage_proof_tail() {
   fi
   coverage_proof_item_numbers="${remaining_proof#,}"
   coverage_proof_item_numbers="${coverage_proof_item_numbers%,}"
+  [ -n "$item_numbers" ]
 }
 
 summarize_apply_candidate_quality() {
