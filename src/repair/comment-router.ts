@@ -724,7 +724,6 @@ function classifyCommand(command: LooseRecord): JsonValue {
       };
     }
   }
-
   if (
     existingCommandStatusBlocksReplay({
       hasExistingResponse: hasExistingResponse(
@@ -1187,6 +1186,51 @@ function classifyAutoclose(command: LooseRecord, issue: LooseRecord, pull: Loose
       comments,
       reviews,
       reviewComments,
+      sourceCommentId: command.comment_id,
+      trustedAuthors: trustedBots,
+    });
+    if (trustedCloseBlock) {
+      return {
+        ...command,
+        autoclose_reason: reason,
+        status: "skipped",
+        reason: trustedCloseBlock,
+      };
+    }
+  }
+  if (
+    command.trusted_bot &&
+    !pull &&
+    String(command.close_reason ?? "") === "unsponsored_feature_request"
+  ) {
+    const linkedPrBlock = unsponsoredFeatureLinkedPrBlockReason(command.issue_number);
+    if (linkedPrBlock) {
+      return {
+        ...command,
+        autoclose_reason: reason,
+        status: "skipped",
+        reason: linkedPrBlock,
+      };
+    }
+    const comments = cachedIssueComments(command.issue_number);
+    const trustedCloseBlock = trustedCloseBlockReason({
+      repo: command.repo,
+      kind: "issue",
+      labels: issue.labels,
+      closeReason: command.close_reason,
+      closeConfidence: command.close_confidence,
+      closeActionTaken: command.close_action_taken,
+      createdAt: issue.created_at,
+      expectedItemUpdatedAt: command.expected_item_updated_at,
+      currentItemUpdatedAt: issue.updated_at,
+      expectedSourceRevision: command.expected_source_revision,
+      currentSourceRevision: issueSourceRevisionSha256(issue, comments),
+      authorAssociation: issue.author_association,
+      reviewedAt: command.reviewed_at ?? command.expected_item_updated_at,
+      assignees: issue.assignees,
+      milestone: issue.milestone,
+      reactions: issue.reactions,
+      comments,
       sourceCommentId: command.comment_id,
       trustedAuthors: trustedBots,
     });
@@ -3110,6 +3154,10 @@ function liveTrustedCloseBlockReason(command: LooseRecord, liveTarget: LooseReco
       trustedAuthors: trustedBots,
     });
   }
+  if (String(command.close_reason ?? "") === "unsponsored_feature_request") {
+    const linkedPrBlock = unsponsoredFeatureLinkedPrBlockReason(liveTarget.number);
+    if (linkedPrBlock) return linkedPrBlock;
+  }
   const issue = fetchIssue(liveTarget.number);
   const comments = cachedIssueComments(liveTarget.number);
   return trustedCloseBlockReason({
@@ -3119,6 +3167,7 @@ function liveTrustedCloseBlockReason(command: LooseRecord, liveTarget: LooseReco
     closeReason: command.close_reason,
     closeConfidence: command.close_confidence,
     closeActionTaken: command.close_action_taken,
+    createdAt: issue.created_at,
     expectedHeadSha: null,
     currentHeadSha: null,
     expectedItemUpdatedAt: command.expected_item_updated_at,
@@ -3127,10 +3176,41 @@ function liveTrustedCloseBlockReason(command: LooseRecord, liveTarget: LooseReco
     currentSourceRevision: issueSourceRevisionSha256(issue, comments),
     authorAssociation: issue.author_association,
     reviewedAt: command.reviewed_at ?? command.expected_item_updated_at,
+    assignees: issue.assignees,
+    milestone: issue.milestone,
+    reactions: issue.reactions,
     comments,
     sourceCommentId: command.comment_id,
     trustedAuthors: trustedBots,
   });
+}
+
+function unsponsoredFeatureLinkedPrBlockReason(number: JsonValue): string | null {
+  try {
+    const result = ghJson<{ closedByPullRequestsReferences?: unknown }>(
+      [
+        "issue",
+        "view",
+        String(number),
+        "--repo",
+        targetRepo,
+        "--json",
+        "closedByPullRequestsReferences",
+      ],
+      { attempts: TARGET_LOOKUP_RETRY_ATTEMPTS },
+    );
+    if (!Array.isArray(result.closedByPullRequestsReferences)) {
+      return "unsponsored feature linked-PR state could not be verified";
+    }
+    const openReference = result.closedByPullRequestsReferences.find(
+      (reference) => String((reference as LooseRecord).state ?? "").toUpperCase() === "OPEN",
+    ) as LooseRecord | undefined;
+    if (!openReference) return null;
+    const ref = openReference.url ?? openReference.number ?? "an open pull request";
+    return `open closing pull request ${ref} blocks unsponsored feature auto-close`;
+  } catch (error) {
+    return `unsponsored feature linked-PR check failed: ${compactGhError(error)}`;
+  }
 }
 
 function collectAutocloseCandidateNumbers({ command }: LooseRecord): number[] {

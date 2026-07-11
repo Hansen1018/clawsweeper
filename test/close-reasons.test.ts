@@ -8,6 +8,7 @@ import {
   closeReasonsArg,
   compactReferencingMergedPullRequestForTest,
   formatRecentClosedRows,
+  issueRecentHumanCommentBlockReasonFromComments,
   openClosingPullRequestApplyReason,
   referencingMergedPullRequestCandidatesForTest,
   referencingMergedPullRequestsForIssueForTest,
@@ -18,6 +19,9 @@ import {
   stalledUnprovenProofRequestBlockReason,
   unconfirmedProductDirectionAgeSkipReason,
   unconfirmedProductDirectionCloseEnabled,
+  unsponsoredFeatureAgeSkipReason,
+  unsponsoredFeatureCloseEnabled,
+  unsponsoredFeatureDecisionBlockReason,
   validateCloseDecision,
 } from "../dist/clawsweeper.js";
 import { closeDecision, git, item, tmpPrefix, withMockGh } from "./helpers.ts";
@@ -232,6 +236,112 @@ test("unconfirmed product direction apply policy is default-off and age-gated", 
       now,
     ) ?? "",
     /7 days without source activity/,
+  );
+});
+
+const unsponsoredMaintainerDecision = {
+  required: true,
+  kind: "product_direction",
+  question: "Should OpenClaw sponsor this feature direction?",
+  rationale: "The request needs an explicit product decision before core work starts.",
+  options: [
+    {
+      title: "Sponsor the direction",
+      body: "Keep the issue open and assign a maintainer owner.",
+      recommended: false,
+    },
+    {
+      title: "Leave unsponsored",
+      body: "Close as not planned unless a maintainer sponsors it later.",
+      recommended: true,
+    },
+  ],
+  likelyOwner: {
+    person: "@alice",
+    reason: "Recent ownership covers this product area.",
+    confidence: "high",
+  },
+};
+
+test("unsponsored feature requests are issue-only feature decisions without security labels", () => {
+  const decision = closeDecision({
+    closeReason: "unsponsored_feature_request",
+    itemCategory: "feature",
+    requiresProductDecision: true,
+    maintainerDecision: unsponsoredMaintainerDecision,
+  });
+
+  assert.equal(unsponsoredFeatureDecisionBlockReason(item(), decision), null);
+  assert.match(
+    unsponsoredFeatureDecisionBlockReason(item({ kind: "pull_request" }), decision) ?? "",
+    /allowed only for issues/,
+  );
+  assert.match(
+    unsponsoredFeatureDecisionBlockReason(item(), { ...decision, itemCategory: "bug" }) ?? "",
+    /feature item category/,
+  );
+  assert.match(
+    unsponsoredFeatureDecisionBlockReason(item(), {
+      ...decision,
+      requiresProductDecision: false,
+    }) ?? "",
+    /requires a product decision/,
+  );
+  assert.match(
+    unsponsoredFeatureDecisionBlockReason(item(), {
+      ...decision,
+      maintainerDecision: { ...unsponsoredMaintainerDecision, kind: "implementation" },
+    }) ?? "",
+    /product-direction maintainer decision/,
+  );
+  for (const label of ["impact:security", "CLAWSWEEPER:NEEDS-SECURITY-REVIEW"]) {
+    assert.match(
+      unsponsoredFeatureDecisionBlockReason(item({ labels: [label] }), decision) ?? "",
+      /blocks unsponsored feature auto-close/,
+    );
+  }
+  assert.deepEqual(validateCloseDecision(item(), decision), { ok: true });
+  assert.equal(validateCloseDecision(item({ kind: "pull_request" }), decision).ok, false);
+  assert.deepEqual(
+    closeReasonsArg("unsponsored_feature_request"),
+    new Set(["unsponsored_feature_request"]),
+  );
+});
+
+test("unsponsored feature apply policy is default-off and age-gated", () => {
+  assert.equal(unsponsoredFeatureCloseEnabled({}), false);
+  assert.equal(
+    unsponsoredFeatureCloseEnabled({ CLAWSWEEPER_UNSPONSORED_FEATURE_CLOSE_ENABLED: "true" }),
+    true,
+  );
+  const now = Date.parse("2026-07-11T00:00:00Z");
+  assert.equal(unsponsoredFeatureAgeSkipReason({ createdAt: "2026-04-11T23:59:59Z" }, now), null);
+  assert.equal(
+    unsponsoredFeatureAgeSkipReason({ createdAt: "2026-05-01T00:00:00Z" }, now),
+    "unsponsored_feature_request requires issue older than 90 days",
+  );
+});
+
+test("issue inactivity ignores bot-only and old comment history", () => {
+  const now = Date.parse("2026-07-11T00:00:00Z");
+  assert.match(
+    issueRecentHumanCommentBlockReasonFromComments(
+      [{ created_at: "2026-07-01T00:00:00Z", user: { type: "User" } }],
+      60,
+      now,
+    ) ?? "",
+    /non-bot comment within the last 60 days/,
+  );
+  assert.equal(
+    issueRecentHumanCommentBlockReasonFromComments(
+      [
+        { created_at: "2026-07-10T00:00:00Z", user: { type: "Bot" } },
+        { created_at: "2026-01-01T00:00:00Z", user: { type: "User" } },
+      ],
+      60,
+      now,
+    ),
+    null,
   );
 });
 

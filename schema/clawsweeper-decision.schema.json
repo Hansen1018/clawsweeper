@@ -74,6 +74,7 @@
         "stalled_unproven_pr",
         "abandoned_pr",
         "unconfirmed_product_direction",
+        "unsponsored_feature_request",
         "not_actionable_in_repo",
         "incoherent",
         "stale_insufficient_info",

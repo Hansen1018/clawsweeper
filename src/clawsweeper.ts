@@ -317,6 +317,7 @@ type CloseReason =
   | "stalled_unproven_pr"
   | "abandoned_pr"
   | "unconfirmed_product_direction"
+  | "unsponsored_feature_request"
   | "not_actionable_in_repo"
   | "incoherent"
   | "stale_insufficient_info"
@@ -1210,8 +1211,11 @@ const DEFAULT_BACKFILL_REVIEW_AGE_MINUTES = 360;
 const DAILY_REVIEW_DAYS = 1;
 const WEEKLY_REVIEW_DAYS = 7;
 const STALE_INSUFFICIENT_INFO_MIN_AGE_DAYS = 60;
+const STALE_INSUFFICIENT_INFO_MIN_INACTIVE_DAYS = 60;
 const UNCONFIRMED_PRODUCT_DIRECTION_MIN_AGE_DAYS = 14;
 const UNCONFIRMED_PRODUCT_DIRECTION_MIN_INACTIVE_DAYS = 7;
+const UNSPONSORED_FEATURE_MIN_AGE_DAYS = 90;
+const UNSPONSORED_FEATURE_MIN_INACTIVE_DAYS = 60;
 const STALLED_UNPROVEN_PR_MIN_AGE_DAYS = 14;
 const STALLED_UNPROVEN_PR_MIN_INACTIVE_DAYS = 14;
 const ABANDONED_PR_MIN_AGE_DAYS = 30;
@@ -1671,6 +1675,7 @@ const ALLOWED_REASONS = new Set<CloseReason>([
   "stalled_unproven_pr",
   "abandoned_pr",
   "unconfirmed_product_direction",
+  "unsponsored_feature_request",
   "not_actionable_in_repo",
   "incoherent",
   "stale_insufficient_info",
@@ -3692,6 +3697,16 @@ export function unconfirmedProductDirectionAgeSkipReason(
   return null;
 }
 
+export function unsponsoredFeatureAgeSkipReason(
+  item: Pick<Item, "createdAt">,
+  now = Date.now(),
+): string | null {
+  if (!isOlderThanDays(item.createdAt, UNSPONSORED_FEATURE_MIN_AGE_DAYS, now)) {
+    return `unsponsored_feature_request requires issue older than ${UNSPONSORED_FEATURE_MIN_AGE_DAYS} days`;
+  }
+  return null;
+}
+
 function maintainerAssociatedEntries(entries: readonly unknown[]): unknown[] {
   return entries.filter((entry) =>
     isMaintainerAuthorAssociation(asRecord(entry).author_association),
@@ -3953,6 +3968,89 @@ function unconfirmedProductDirectionApplyBlockReasonSafe(
   }
 }
 
+export function issueRecentHumanCommentBlockReasonFromComments(
+  comments: readonly unknown[],
+  days: number,
+  now = Date.now(),
+): string | null {
+  for (const comment of comments) {
+    const record = asRecord(comment);
+    if (asRecord(record.user).type === "Bot") continue;
+    const createdAt = typeof record.created_at === "string" ? record.created_at : "";
+    if (!isOlderThanDays(createdAt, days, now)) {
+      return `issue has a non-bot comment within the last ${days} days`;
+    }
+  }
+  return null;
+}
+
+function issueRecentHumanCommentBlockReason(number: number, days: number): string | null {
+  return issueRecentHumanCommentBlockReasonFromComments(
+    ghPaged<unknown>(`repos/${targetRepo()}/issues/${number}/comments`),
+    days,
+  );
+}
+
+function issueRecentHumanCommentBlockReasonSafe(number: number, days: number): string | null {
+  try {
+    return issueRecentHumanCommentBlockReason(number, days);
+  } catch (error) {
+    return `issue comment activity check failed: ${
+      error instanceof Error ? error.message : String(error)
+    }`;
+  }
+}
+
+function unsponsoredFeatureApplyBlockReason(
+  number: number,
+  item: Pick<Item, "createdAt">,
+): string | null {
+  if (!unsponsoredFeatureCloseEnabled()) {
+    return "unsponsored feature-request apply policy is disabled";
+  }
+  const ageBlock = unsponsoredFeatureAgeSkipReason(item);
+  if (ageBlock) return ageBlock;
+
+  const issue = ghJson<{
+    assignees?: unknown[];
+    labels?: unknown[];
+    milestone?: unknown;
+    reactions?: { total_count?: number };
+    state?: string;
+  }>(["api", `repos/${targetRepo()}/issues/${number}`]);
+  if (issue.state !== "open") return "live issue is not open";
+  if ((issue.assignees ?? []).length > 0) return "assigned issue has maintainer engagement";
+  if (issue.milestone) return "milestoned issue has maintainer engagement";
+  if ((issue.reactions?.total_count ?? 0) >= 20) {
+    return "issue has strong community traction (20 or more reactions)";
+  }
+  if (labelNames(issue.labels).map(normalizeLabelName).includes("clawsweeper:linked-pr-open")) {
+    return "clawsweeper:linked-pr-open blocks unsponsored feature auto-close";
+  }
+
+  const comments = ghPaged<unknown>(`repos/${targetRepo()}/issues/${number}/comments`);
+  if (maintainerAssociatedEntries(comments).length > 0) {
+    return "maintainer issue comment confirms engagement";
+  }
+  return issueRecentHumanCommentBlockReasonFromComments(
+    comments,
+    UNSPONSORED_FEATURE_MIN_INACTIVE_DAYS,
+  );
+}
+
+function unsponsoredFeatureApplyBlockReasonSafe(
+  number: number,
+  item: Pick<Item, "createdAt">,
+): string | null {
+  try {
+    return unsponsoredFeatureApplyBlockReason(number, item);
+  } catch (error) {
+    return `unsponsored feature-request liveness check failed: ${
+      error instanceof Error ? error.message : String(error)
+    }`;
+  }
+}
+
 function pullRequestHumanEngagementBlockReason(number: number): string | null {
   const issue = ghJson<{ assignees?: unknown[] }>([
     "api",
@@ -3996,6 +4094,7 @@ interface PullRequestLiveActivity {
   headSha: string;
   headActivityAtMs: number | null;
   headChecksFailing: boolean;
+  headConflicted: boolean;
 }
 
 const FAILING_CHECK_RUN_CONCLUSIONS = new Set(["failure", "timed_out"]);
@@ -4064,6 +4163,8 @@ function pullRequestLiveActivity(number: number): PullRequestLiveActivity {
   const pull = ghJson<{
     created_at?: string;
     draft?: boolean;
+    mergeable?: boolean | null;
+    mergeable_state?: string | null;
     head?: { ref?: string; repo?: { full_name?: string; id?: unknown }; sha?: string };
   }>(["api", `repos/${targetRepo()}/pulls/${number}`]);
   const { headSha, headActivityAtMs } = pullRequestHeadActivity(number, pull);
@@ -4088,7 +4189,14 @@ function pullRequestLiveActivity(number: number): PullRequestLiveActivity {
       }
     }
   }
-  return { draft: pull.draft === true, headSha, headActivityAtMs, headChecksFailing };
+  const headConflicted = pull.mergeable === false || pull.mergeable_state === "dirty";
+  return {
+    draft: pull.draft === true,
+    headSha,
+    headActivityAtMs,
+    headChecksFailing,
+    headConflicted,
+  };
 }
 
 function prAutoCloseExemptLabel(labels: readonly string[]): string | undefined {
@@ -4236,9 +4344,10 @@ function abandonedPrApplyBlockReason(
   const waitingOnAuthor = item.labels
     .map(normalizeLabelName)
     .includes(normalizeLabelName(WAITING_ON_AUTHOR_LABEL));
-  const stalledState = activity.draft || waitingOnAuthor || activity.headChecksFailing;
+  const stalledState =
+    activity.draft || waitingOnAuthor || activity.headChecksFailing || activity.headConflicted;
   if (!stalledState) {
-    return "live PR is not draft, waiting-on-author, or failing checks; abandonment is not confirmed";
+    return "live PR is not draft, waiting-on-author, failing checks, or merge-conflicted; abandonment is not confirmed";
   }
   return pullRequestHumanEngagementBlockReason(number);
 }
@@ -5126,6 +5235,12 @@ export function unconfirmedProductDirectionCloseEnabled(
   env: Record<string, string | undefined> = process.env,
 ): boolean {
   return envFlagEnabled(env.CLAWSWEEPER_UNCONFIRMED_PRODUCT_DIRECTION_CLOSE_ENABLED);
+}
+
+export function unsponsoredFeatureCloseEnabled(
+  env: Record<string, string | undefined> = process.env,
+): boolean {
+  return envFlagEnabled(env.CLAWSWEEPER_UNSPONSORED_FEATURE_CLOSE_ENABLED);
 }
 
 function quoteGitHubSearchTerm(term: string): string {
@@ -8840,6 +8955,8 @@ function closeReasonText(reason: CloseReason): string {
       return "abandoned inactive PR";
     case "unconfirmed_product_direction":
       return "feature-like PR without confirmed product direction";
+    case "unsponsored_feature_request":
+      return "feature request without maintainer sponsorship";
     case "not_actionable_in_repo":
       return "not actionable in this repository";
     case "incoherent":
@@ -10056,6 +10173,8 @@ function closeIntro(reason: CloseReason): string {
       return "Thanks for the contribution. This PR has been inactive for a while and still is not in a landable state.";
     case "unconfirmed_product_direction":
       return "Thanks for the contribution. ClawSweeper proposes closing this for now: the implementation may be reasonable, but passing review and proof does not establish that OpenClaw should add this product surface.";
+    case "unsponsored_feature_request":
+      return "Thanks for sharing this idea. ClawSweeper proposes closing it as not planned unless a maintainer sponsors the direction, because no maintainer has confirmed this product direction.";
     case "not_actionable_in_repo":
       return "Thanks for writing this up. I checked the repo boundary, and this lives outside the OpenClaw source shell.";
     case "incoherent":
@@ -10087,6 +10206,8 @@ function closeOutro(reason: CloseReason, canonicalLinks: string[] = []): string 
       return "So I’m closing this as inactive for now. If you pick the work back up, push a rebased branch with green checks and reopen (or open a fresh PR) and it will be reviewed again.";
     case "unconfirmed_product_direction":
       return "This is a proposal only until the separate default-off apply policy is enabled and all live maintainer-signal checks pass. A maintainer can sponsor the direction, request a narrower version, or apply `clawsweeper:human-review` to keep it open.";
+    case "unsponsored_feature_request":
+      return `So I’m closing this as not planned unless a maintainer sponsors the direction. A maintainer can sponsor it and reopen this issue, or anyone can ask to reopen if the situation changes. When the idea fits an extension, ${markdownLink("ClawHub.com", targetProfile().communityUrl ?? "https://clawhub.ai/")} remains the self-serve path.`;
     case "not_actionable_in_repo":
       return "So I’m closing this as outside the OpenClaw source repository rather than keeping it open as core work.";
     default:
@@ -16480,7 +16601,9 @@ export function renderReviewCommentFromReport(
   const decision = frontMatterValue(markdown, "decision");
   const requiresMaintainerDecision = maintainerDecisionFromReport(markdown)?.required === true;
   const body =
-    decision === "close" && reason !== "none" && !requiresMaintainerDecision
+    decision === "close" &&
+    reason !== "none" &&
+    (!requiresMaintainerDecision || reason === "unsponsored_feature_request")
       ? renderCloseCommentFromReport(markdown, reason)
       : renderKeepOpenCommentFromReport(markdown, options);
   const markers = reviewAutomationMarkersFromReport(markdown);
@@ -16576,6 +16699,34 @@ function unconfirmedProductDirectionDecisionBlockReason(
   }
   if (!["S", "A", "B", "C"].includes(decision.prRating.overallTier)) {
     return "unconfirmed_product_direction requires a quality-ready PR rating";
+  }
+  return null;
+}
+
+export function unsponsoredFeatureDecisionBlockReason(
+  item: Pick<Item, "kind" | "labels">,
+  decision: Pick<Decision, "itemCategory" | "maintainerDecision" | "requiresProductDecision">,
+): string | null {
+  if (item.kind !== "issue") {
+    return "unsponsored_feature_request is allowed only for issues";
+  }
+  if (decision.itemCategory !== "feature") {
+    return "unsponsored_feature_request requires feature item category";
+  }
+  if (!decision.requiresProductDecision) {
+    return "unsponsored_feature_request requires a product decision";
+  }
+  if (
+    decision.maintainerDecision.required !== true ||
+    decision.maintainerDecision.kind !== "product_direction"
+  ) {
+    return "unsponsored_feature_request requires a product-direction maintainer decision";
+  }
+  const securityLabel = item.labels
+    .map(normalizeLabelName)
+    .find((label) => label === "impact:security" || label === "clawsweeper:needs-security-review");
+  if (securityLabel) {
+    return `${securityLabel} blocks unsponsored feature auto-close`;
   }
   return null;
 }
@@ -16702,6 +16853,16 @@ export function validateCloseDecision(
         ok: false,
         actionTaken: "skipped_invalid_decision",
         reason: productDirectionBlock,
+      };
+    }
+  }
+  if (decision.closeReason === "unsponsored_feature_request") {
+    const unsponsoredFeatureBlock = unsponsoredFeatureDecisionBlockReason(item, decision);
+    if (unsponsoredFeatureBlock) {
+      return {
+        ok: false,
+        actionTaken: "skipped_invalid_decision",
+        reason: unsponsoredFeatureBlock,
       };
     }
   }
@@ -16953,6 +17114,24 @@ function reviewVersionMarkerFromReport(markdown: string): string {
 
 export function reviewAutomationMarkersFromReport(markdown: string): string {
   const itemKind = frontMatterValue(markdown, "type");
+  if (itemKind === "issue") {
+    const decision = frontMatterValue(markdown, "decision");
+    const closeReason = frontMatterValue(markdown, "close_reason");
+    if (decision !== "close" || closeReason !== "unsponsored_feature_request") return "";
+    const attrs = [
+      `item=${markerAttributeValue(frontMatterValue(markdown, "number") ?? "unknown")}`,
+      `confidence=${markerAttributeValue(frontMatterValue(markdown, "confidence") ?? "unknown")}`,
+      `updated_at=${markerAttributeValue(frontMatterValue(markdown, "item_updated_at") ?? "unknown")}`,
+      `reviewed_at=${markerAttributeValue(frontMatterValue(markdown, "reviewed_at") ?? "unknown")}`,
+      `source_revision=${markerAttributeValue(frontMatterValue(markdown, "item_source_revision") ?? "unknown")}`,
+      `action_taken=${markerAttributeValue(frontMatterValue(markdown, "action_taken") ?? "unknown")}`,
+      `reason=${markerAttributeValue(closeReason)}`,
+    ].join(" ");
+    return [
+      `<!-- clawsweeper-verdict:close ${attrs} -->`,
+      `<!-- clawsweeper-action:close-required ${attrs} -->`,
+    ].join("\n");
+  }
   if (itemKind !== "pull_request") return "";
   const number = frontMatterValue(markdown, "number") ?? "unknown";
   const decision = frontMatterValue(markdown, "decision");
@@ -20919,7 +21098,8 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
     };
     const sameAuthorPairStartCloseable = new Map<string, boolean>();
     const currentCloseGatesPassed = (): boolean => {
-      if (requiredMaintainerDecision?.required) return false;
+      if (requiredMaintainerDecision?.required && closeReason !== "unsponsored_feature_request")
+        return false;
       if (!closeReason || !closeReasonEnabled(closeReason, applyCloseReasons)) return false;
       if (needsReviewCommentSync) return false;
       if (
@@ -20963,6 +21143,18 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
           storedUpdatedAt,
           frontMatterValue(markdown, "reviewed_at"),
         )
+      ) {
+        return false;
+      }
+      if (
+        closeReason === "unsponsored_feature_request" &&
+        unsponsoredFeatureApplyBlockReasonSafe(number, item)
+      ) {
+        return false;
+      }
+      if (
+        closeReason === "stale_insufficient_info" &&
+        issueRecentHumanCommentBlockReasonSafe(number, STALE_INSUFFICIENT_INFO_MIN_INACTIVE_DAYS)
       ) {
         return false;
       }
@@ -21263,6 +21455,45 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
         closeReason = promotion.closeReason;
         isCloseProposal = true;
         cachedPrCloseCoverageProofGateResult = undefined;
+      }
+    }
+    if (
+      state === "open" &&
+      isCloseProposal &&
+      closeReason === "unsponsored_feature_request" &&
+      !syncCommentsOnly &&
+      (applyKind === "all" || item.kind === applyKind) &&
+      closeReasonEnabled(closeReason, applyCloseReasons)
+    ) {
+      if (!unsponsoredFeatureCloseEnabled()) {
+        if (
+          recordApplySkipped("kept_open", "unsponsored feature-request apply policy is disabled")
+        ) {
+          break;
+        }
+        continue;
+      }
+      const unsponsoredFeatureBlockReason = unsponsoredFeatureApplyBlockReasonSafe(number, item);
+      if (unsponsoredFeatureBlockReason) {
+        if (markApplySkipped("kept_open", unsponsoredFeatureBlockReason)) break;
+        continue;
+      }
+    }
+    if (
+      state === "open" &&
+      isCloseProposal &&
+      closeReason === "stale_insufficient_info" &&
+      !syncCommentsOnly &&
+      (applyKind === "all" || item.kind === applyKind) &&
+      closeReasonEnabled(closeReason, applyCloseReasons)
+    ) {
+      const staleCommentBlockReason = issueRecentHumanCommentBlockReasonSafe(
+        number,
+        STALE_INSUFFICIENT_INFO_MIN_INACTIVE_DAYS,
+      );
+      if (staleCommentBlockReason) {
+        if (markApplySkipped("kept_open", staleCommentBlockReason)) break;
+        continue;
       }
     }
     const promotedCanonicalCommentSyncGuard = applyCanonicalCommentSyncGuard();
@@ -22311,7 +22542,7 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
       if (!isCloseProposal && attemptedPullRequestClosePromotion) markApplyChecked();
       continue;
     }
-    if (requiredMaintainerDecision?.required) {
+    if (requiredMaintainerDecision?.required && closeReason !== "unsponsored_feature_request") {
       if (
         markApplySkipped(
           "kept_open",
@@ -22430,7 +22661,14 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
         ? stalledUnprovenPrApplyBlockReasonSafe(number, item)
         : closeReason === "abandoned_pr"
           ? abandonedPrApplyBlockReasonSafe(number, item)
-          : null;
+          : closeReason === "unsponsored_feature_request"
+            ? unsponsoredFeatureApplyBlockReasonSafe(number, item)
+            : closeReason === "stale_insufficient_info"
+              ? issueRecentHumanCommentBlockReasonSafe(
+                  number,
+                  STALE_INSUFFICIENT_INFO_MIN_INACTIVE_DAYS,
+                )
+              : null;
     if (inactivityCloseBlockReason) {
       if (markApplySkipped("kept_open", inactivityCloseBlockReason)) break;
       continue;

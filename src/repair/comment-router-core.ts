@@ -53,6 +53,8 @@ const MAINTAINER_AUTHOR_ASSOCIATIONS = new Set(["OWNER", "MEMBER", "COLLABORATOR
 const DAY_MS = 24 * 60 * 60 * 1000;
 const UNCONFIRMED_PRODUCT_DIRECTION_MIN_AGE_DAYS = 14;
 const UNCONFIRMED_PRODUCT_DIRECTION_MIN_INACTIVE_DAYS = 7;
+const UNSPONSORED_FEATURE_MIN_AGE_DAYS = 90;
+const UNSPONSORED_FEATURE_MIN_INACTIVE_DAYS = 60;
 const UNCONFIRMED_PRODUCT_DIRECTION_EXEMPT_LABELS = new Set([
   HUMAN_REVIEW_LABEL,
   MANUAL_ONLY_LABEL,
@@ -1086,6 +1088,8 @@ export function trustedCloseBlockReason({
   authorAssociation,
   reviewedAt,
   assignees,
+  milestone,
+  reactions,
   requestedReviewers,
   requestedTeams,
   comments,
@@ -1095,19 +1099,19 @@ export function trustedCloseBlockReason({
   trustedAuthors = new Set(),
   now,
 }: LooseRecord): string | null {
-  const headBlock = reviewedHeadShaBlockReason({
-    expectedHeadSha,
-    currentHeadSha,
-    markerName: "close",
-  });
-  if (headBlock) return headBlock;
-
   const closeKind = normalizedCloseKind(kind);
   if (!closeKind) return "trusted close marker requires an issue or pull request target";
-
   const reason = String(closeReason ?? "").trim() as RepositoryCloseReason;
   if (!reason || reason === "none")
     return "trusted close marker must include an apply close reason";
+  if (closeKind === "pull_request" || reason !== "unsponsored_feature_request") {
+    const headBlock = reviewedHeadShaBlockReason({
+      expectedHeadSha,
+      currentHeadSha,
+      markerName: "close",
+    });
+    if (headBlock) return headBlock;
+  }
   const confidence = String(closeConfidence ?? "")
     .trim()
     .toLowerCase();
@@ -1131,6 +1135,13 @@ export function trustedCloseBlockReason({
   ) {
     return "unconfirmed product-direction apply policy is disabled";
   }
+  if (
+    closeKind === "issue" &&
+    reason === "unsponsored_feature_request" &&
+    !unsponsoredFeatureTrustedCloseEnabled()
+  ) {
+    return "unsponsored feature-request apply policy is disabled";
+  }
   const reasonSpecificBlock = trustedCloseReasonSpecificBlockReason({
     reason,
     closeKind,
@@ -1139,6 +1150,8 @@ export function trustedCloseBlockReason({
     reviewedAt,
     labels,
     assignees,
+    milestone,
+    reactions,
     requestedReviewers,
     requestedTeams,
     comments,
@@ -1190,6 +1203,10 @@ function unconfirmedProductDirectionTrustedCloseEnabled(env: LooseRecord = proce
   return envFlagEnabled(env.CLAWSWEEPER_UNCONFIRMED_PRODUCT_DIRECTION_CLOSE_ENABLED);
 }
 
+function unsponsoredFeatureTrustedCloseEnabled(env: LooseRecord = process.env): boolean {
+  return envFlagEnabled(env.CLAWSWEEPER_UNSPONSORED_FEATURE_CLOSE_ENABLED);
+}
+
 function trustedCloseReasonSpecificBlockReason({
   reason,
   closeKind,
@@ -1198,6 +1215,8 @@ function trustedCloseReasonSpecificBlockReason({
   reviewedAt,
   labels,
   assignees,
+  milestone,
+  reactions,
   requestedReviewers,
   requestedTeams,
   comments,
@@ -1205,6 +1224,33 @@ function trustedCloseReasonSpecificBlockReason({
   reviewComments,
   now,
 }: LooseRecord): string | null {
+  if (closeKind === "issue" && reason === "unsponsored_feature_request") {
+    if (!isOlderThanDays(createdAt, UNSPONSORED_FEATURE_MIN_AGE_DAYS, Number(now) || Date.now())) {
+      return `unsponsored_feature_request requires issue older than ${UNSPONSORED_FEATURE_MIN_AGE_DAYS} days`;
+    }
+    const normalized = normalizedLabels(labels);
+    const securityLabel = normalized.find(
+      (label) => label === "impact:security" || label === "clawsweeper:needs-security-review",
+    );
+    if (securityLabel) return `${securityLabel} blocks unsponsored feature auto-close`;
+    if (normalized.includes("clawsweeper:linked-pr-open")) {
+      return "clawsweeper:linked-pr-open blocks unsponsored feature auto-close";
+    }
+    if (nonEmptyArray(assignees)) return "assigned issue has maintainer engagement";
+    if (milestone) return "milestoned issue has maintainer engagement";
+    if (Number((reactions as LooseRecord | undefined)?.total_count ?? 0) >= 20) {
+      return "issue has strong community traction (20 or more reactions)";
+    }
+    if (maintainerAssociatedEntries(comments).length > 0) {
+      return "maintainer issue comment confirms engagement";
+    }
+    if (
+      recentHumanComment(comments, UNSPONSORED_FEATURE_MIN_INACTIVE_DAYS, Number(now) || Date.now())
+    ) {
+      return `issue has a non-bot comment within the last ${UNSPONSORED_FEATURE_MIN_INACTIVE_DAYS} days`;
+    }
+    return null;
+  }
   if (closeKind !== "pull_request") return null;
   if (reason === "unconfirmed_product_direction") {
     const ageBlock = unconfirmedProductDirectionTrustedCloseAgeBlock({
@@ -1242,6 +1288,15 @@ function trustedCloseReasonSpecificBlockReason({
     return "low_signal_unmergeable_pr closes require apply-decisions live conflict and author-activity proof";
   }
   return null;
+}
+
+function recentHumanComment(comments: JsonValue, days: number, now: number): boolean {
+  if (!Array.isArray(comments)) return true;
+  return comments.some((entry) => {
+    const comment = entry as LooseRecord;
+    if ((comment.user as LooseRecord | undefined)?.type === "Bot") return false;
+    return !isOlderThanDays(comment.created_at, days, now);
+  });
 }
 
 function unconfirmedProductDirectionTrustedCloseAgeBlock({

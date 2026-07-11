@@ -115,6 +115,8 @@ function stalledPrApplyGhMock(
     forcePushCommitId?: string;
     maintainerComment?: boolean;
     proofRequestedAt?: string;
+    mergeable?: boolean | null;
+    mergeableState?: string | null;
   } = {},
 ): string {
   const draft = options.draft === true;
@@ -131,6 +133,8 @@ function stalledPrApplyGhMock(
   const combinedStatusState = options.combinedStatusState ?? "failure";
   const checkRunConclusion =
     options.checkRunConclusion === undefined ? "failure" : options.checkRunConclusion;
+  const mergeable = options.mergeable === undefined ? true : options.mergeable;
+  const mergeableState = options.mergeableState === undefined ? "clean" : options.mergeableState;
   const checkRunStartedAt = options.checkRunStartedAt ?? headCommittedAt;
   const checkRunCompletedAt = options.checkRunCompletedAt ?? checkRunStartedAt;
   const forcePushEvent = options.forcePushAt
@@ -201,6 +205,8 @@ if (args[0] === "api" && args[1] === "-i" && /\\/issues\\/321\\/timeline(?:\\?|$
     html_url: "https://github.com/openclaw/openclaw/pull/321",
     state: "open",
     draft: ${draft},
+    mergeable: ${JSON.stringify(mergeable)},
+    mergeable_state: ${JSON.stringify(mergeableState)},
     created_at: "2026-05-01T00:00:00Z",
     changed_files: 1,
     commits: 1,
@@ -509,8 +515,37 @@ test("abandoned apply keeps a live healthy PR open", () => {
       number: 321,
       action: "kept_open",
       reason:
-        "live PR is not draft, waiting-on-author, or failing checks; abandonment is not confirmed",
+        "live PR is not draft, waiting-on-author, failing checks, or merge-conflicted; abandonment is not confirmed",
     },
   ]);
+  assert.equal(result.closedExists, false);
+});
+
+test("abandoned apply treats a merge-conflicted head as stalled", () => {
+  const result = runStalledPrApply({
+    report: abandonedCloseReport(),
+    closeReason: "abandoned_pr",
+    ghOptions: {
+      combinedStatusState: "success",
+      checkRunConclusion: "success",
+      mergeable: false,
+      mergeableState: "dirty",
+    },
+  });
+  assert.equal(result.entries[0]?.action, "closed");
+});
+
+test("abandoned apply keeps unknown mergeability open when no other stalled state exists", () => {
+  const result = runStalledPrApply({
+    report: abandonedCloseReport(),
+    closeReason: "abandoned_pr",
+    ghOptions: {
+      combinedStatusState: "success",
+      checkRunConclusion: "success",
+      mergeable: null,
+      mergeableState: "unknown",
+    },
+  });
+  assert.match(result.entries[0]?.reason ?? "", /not draft.*merge-conflicted/);
   assert.equal(result.closedExists, false);
 });

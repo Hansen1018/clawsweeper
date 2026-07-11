@@ -1297,6 +1297,7 @@ const ALLOWED_CLOSE_REASONS = new Set([
   "stalled_unproven_pr",
   "stale_insufficient_info",
   "unconfirmed_product_direction",
+  "unsponsored_feature_request",
 ]);
 
 function prioritizeFastCloseCandidates(
@@ -1649,7 +1650,11 @@ function proposedItemQualityBucket(options: {
 }): ProposedItemQualityBucket {
   if (options.promotionProbe) return "promotion_probe";
   if (options.prCloseCoverageProofCanRun) return "needs_pr_close_coverage";
-  if (options.closeReason === "unconfirmed_product_direction") return "policy_sensitive";
+  if (
+    options.closeReason === "unconfirmed_product_direction" ||
+    options.closeReason === "unsponsored_feature_request"
+  )
+    return "policy_sensitive";
   if (
     options.closeReason === "abandoned_pr" ||
     options.closeReason === "stale_insufficient_info" ||
@@ -2395,6 +2400,7 @@ function allowedForTarget(
       (type === "pull_request" && reason === "mostly_implemented_on_main")
     );
   if (type !== "pull_request" && reason === "unconfirmed_product_direction") return false;
+  if (type === "pull_request" && reason === "unsponsored_feature_request") return false;
   if (type === "pull_request" && reason === "stale_insufficient_info") return false;
   if (type !== "pull_request" && reason === "mostly_implemented_on_main") return false;
   if (type !== "pull_request" && reason === "low_signal_unmergeable_pr") return false;

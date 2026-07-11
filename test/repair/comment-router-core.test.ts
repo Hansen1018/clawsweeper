@@ -1393,6 +1393,18 @@ test("parseTrustedAutomation accepts trusted ClawSweeper close markers for autoc
   assert.equal(parsed.expected_head_sha, "abc123");
   assert.equal(parsed.close_reason, "duplicate_or_superseded");
   assert.match(parsed.autoclose_message, /close-required/);
+
+  const issueParsed = parseTrustedAutomation(
+    {
+      user: { login: "clawsweeper[bot]" },
+      body: "<!-- clawsweeper-action:close-required item=321 confidence=high updated_at=2026-01-01T00:00:00Z reviewed_at=2026-07-11T00:00:00Z source_revision=0123456789abcdef action_taken=proposed_close reason=unsponsored_feature_request -->",
+    },
+    { trustedAuthors },
+  );
+  assert.equal(issueParsed.intent, "autoclose");
+  assert.equal(issueParsed.expected_head_sha, null);
+  assert.equal(issueParsed.close_reason, "unsponsored_feature_request");
+  assert.equal(issueParsed.expected_source_revision, "0123456789abcdef");
 });
 
 test("trusted close markers carry close policy metadata into autoclose commands", () => {
@@ -1985,6 +1997,9 @@ test("trusted autoclose markers are live close gated before close execution", ()
   assert.match(trustedCloseGate, /reviewedHeadShaBlockReason\(\{/);
   assert.match(trustedCloseGate, /markerName:\s*"close"/);
   assert.match(autocloseClassifier, /status:\s*"skipped"/);
+  assert.match(autocloseClassifier, /unsponsoredFeatureLinkedPrBlockReason/);
+  assert.match(source, /"closedByPullRequestsReferences"/);
+  assert.ok((source.match(/unsponsoredFeatureLinkedPrBlockReason\(/g) ?? []).length >= 3);
 });
 
 test("trusted close gates block protected labels, source drift, and unsupported reasons", () => {
@@ -2168,6 +2183,46 @@ test("trusted close gates block protected labels, source drift, and unsupported 
     } else {
       process.env.CLAWSWEEPER_UNCONFIRMED_PRODUCT_DIRECTION_CLOSE_ENABLED =
         originalProductDirectionPolicy;
+    }
+  }
+  const originalUnsponsoredPolicy = process.env.CLAWSWEEPER_UNSPONSORED_FEATURE_CLOSE_ENABLED;
+  delete process.env.CLAWSWEEPER_UNSPONSORED_FEATURE_CLOSE_ENABLED;
+  const unsponsoredBase = {
+    ...base,
+    kind: "issue",
+    closeReason: "unsponsored_feature_request",
+    createdAt: "2026-01-01T00:00:00Z",
+    comments: [],
+    assignees: [],
+    milestone: null,
+    reactions: { total_count: 0 },
+    now: Date.parse("2026-07-11T00:00:00Z"),
+  };
+  try {
+    assert.match(
+      trustedCloseBlockReason(unsponsoredBase),
+      /unsponsored feature-request apply policy is disabled/,
+    );
+    process.env.CLAWSWEEPER_UNSPONSORED_FEATURE_CLOSE_ENABLED = "true";
+    assert.equal(trustedCloseBlockReason(unsponsoredBase), null);
+    assert.match(
+      trustedCloseBlockReason({
+        ...unsponsoredBase,
+        comments: [
+          {
+            author_association: "NONE",
+            created_at: "2026-07-01T00:00:00Z",
+            user: { type: "User" },
+          },
+        ],
+      }),
+      /non-bot comment within the last 60 days/,
+    );
+  } finally {
+    if (originalUnsponsoredPolicy === undefined) {
+      delete process.env.CLAWSWEEPER_UNSPONSORED_FEATURE_CLOSE_ENABLED;
+    } else {
+      process.env.CLAWSWEEPER_UNSPONSORED_FEATURE_CLOSE_ENABLED = originalUnsponsoredPolicy;
     }
   }
   assert.match(

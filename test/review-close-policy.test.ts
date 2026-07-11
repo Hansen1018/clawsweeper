@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import {
@@ -8,6 +9,7 @@ import {
   parseGhJsonLines,
   parseGhJsonWithRetry,
   protectedLabels,
+  reviewAutomationMarkersFromReport,
   renderReviewCommentFromReport,
   reviewActionForDecision,
   shouldPlanItem,
@@ -22,6 +24,36 @@ import {
   parseCoAuthors,
 } from "../dist/commit-sweeper.js";
 import { closeDecision, git, item, reportFrontMatter } from "./helpers.ts";
+
+test("review prompt documents unsponsored features, wider stale issues, and conflicted PRs", () => {
+  const prompt = readFileSync(new URL("../prompts/review-item.md", import.meta.url), "utf8");
+  assert.match(prompt, /`unsponsored_feature_request`/);
+  assert.match(prompt, /not planned unless a maintainer sponsors the direction/);
+  assert.match(prompt, /no human comment in the last 60 days/);
+  assert.match(prompt, /significantly outdated version or behavior/);
+  assert.match(prompt, /not cleanly mergeable \(merge conflicts\) on its current head/);
+});
+
+test("unsponsored feature issue proposals emit source-bound trusted close markers", () => {
+  const markers = reviewAutomationMarkersFromReport(
+    reportFrontMatter({
+      type: "issue",
+      number: 321,
+      decision: "close",
+      confidence: "high",
+      close_reason: "unsponsored_feature_request",
+      action_taken: "proposed_close",
+      item_updated_at: "2026-01-01T00:00:00Z",
+      reviewed_at: "2026-07-11T00:00:00Z",
+      item_source_revision: "0123456789abcdef",
+    }),
+  );
+  assert.match(markers, /clawsweeper-verdict:close/);
+  assert.match(markers, /clawsweeper-action:close-required/);
+  assert.match(markers, /reason=unsponsored_feature_request/);
+  assert.match(markers, /source_revision=0123456789abcdef/);
+  assert.doesNotMatch(markers, /needs-human/);
+});
 
 test("protected labels are normalized and only maintainer-only items stay plannable", () => {
   assert.deepEqual(protectedLabels(["Security", "bug", "maintainer", "SECURITY"]), [

@@ -13,6 +13,7 @@ export type RepositoryCloseReason =
   | "stalled_unproven_pr"
   | "abandoned_pr"
   | "unconfirmed_product_direction"
+  | "unsponsored_feature_request"
   | "not_actionable_in_repo"
   | "incoherent"
   | "stale_insufficient_info"
@@ -63,6 +64,7 @@ const OPENCLAW_CLOSE_REASONS: readonly RepositoryCloseReason[] = [
   "stalled_unproven_pr",
   "abandoned_pr",
   "unconfirmed_product_direction",
+  "unsponsored_feature_request",
   "not_actionable_in_repo",
   "incoherent",
   "stale_insufficient_info",
@@ -85,7 +87,9 @@ const CORE_OPENCLAW_PROFILE: RepositoryProfile = {
     "Use the OpenClaw source tree, docs, changelog, and current main branch. Close proposals may use the normal OpenClaw stale/duplicate/not-in-repo/implemented-on-main policy when evidence is strong. For OpenClaw PR reviews, ClawSweeper renders deterministic PR surface stats separately; do not repeat changed-file counts, additions/deletions, or area totals in Review metrics unless adding a new interpretation not present in the deterministic surface block. Use Review metrics for new review-relevant facts, especially user-facing configuration additions, new flags/options/env vars, new protocol/API params, default changes, migrations, persisted settings, or compatibility paths.",
   applyCloseRules: {
     issue: OPENCLAW_CLOSE_REASONS,
-    pull_request: OPENCLAW_CLOSE_REASONS.filter((reason) => reason !== "stale_insufficient_info"),
+    pull_request: OPENCLAW_CLOSE_REASONS.filter(
+      (reason) => reason !== "stale_insufficient_info" && reason !== "unsponsored_feature_request",
+    ),
   },
 };
 

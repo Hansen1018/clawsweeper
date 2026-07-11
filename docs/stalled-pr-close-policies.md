@@ -59,7 +59,8 @@ Apply additionally verifies live state:
   using the same push-safe, rerun-stable inactivity clock as
   `stalled_unproven_pr`;
 - the live PR is still stalled: a draft, labeled
-  `status: ⏳ waiting on author`, or failing checks
+  `status: ⏳ waiting on author`, failing checks, or not cleanly mergeable due
+  to conflicts on its current head
   (combined status failure/error, or a check run concluding
   `failure`/`timed_out`) on its current head;
 - no human engagement, same checks as above.

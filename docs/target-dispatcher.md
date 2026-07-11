@@ -248,7 +248,8 @@ The receiver keeps the review lane proposal-only, then runs exact apply for the
 selected item with only immediate-safe close reasons enabled:
 `implemented_on_main` and `duplicate_or_superseded`. Normal scheduled apply
 still handles the broader backlog, with `stale_insufficient_info` and
-`mostly_implemented_on_main` blocked until the item is at least 60 days old.
+`mostly_implemented_on_main` blocked until the item is at least 60 days old;
+stale-insufficient-info issues also require 60 days without a non-bot comment.
 
 `openclaw/clawhub` dispatches are intentionally skipped while the receiver
 variable `CLAWSWEEPER_ENABLE_CLAWHUB` is not `1`. Enable it only after the
