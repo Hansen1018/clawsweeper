@@ -7,9 +7,11 @@ import test from "node:test";
 
 import {
   canSkipInternalCodexReviewForRepairDelta,
+  classifyExternalBaseValidationFailure,
   preflightTargetValidationPlan,
   prepareTargetToolchain,
   repairDeltaValidationPlan,
+  reproduceValidationFailureAtPinnedBase,
   requiredValidationCommands,
   runAllowedValidationCommands,
 } from "../../dist/repair/target-validation.js";
@@ -603,6 +605,265 @@ test("adopted OpenClaw PR repairs keep full changed gate for code repair deltas"
   assert.equal(canSkipInternalCodexReviewForRepairDelta(plan), false);
 });
 
+test("base-identical validation failures outside the repair delta are external blockers", () => {
+  const cwd = gitPackageFixture({ "check:changed": "node check.js" });
+  fs.mkdirSync(path.join(cwd, "src"));
+  fs.writeFileSync(path.join(cwd, "src/base.ts"), "export const base = true;\n");
+  fs.writeFileSync(path.join(cwd, "src/repair.ts"), "export const value = 1;\n");
+  git(cwd, "add", ".");
+  git(cwd, "commit", "-m", "base");
+  const pinnedBaseRef = git(cwd, "rev-parse", "HEAD");
+
+  fs.writeFileSync(path.join(cwd, "src/repair.ts"), "export const value = 2;\n");
+  git(cwd, "add", "src/repair.ts");
+  git(cwd, "commit", "-m", "source change");
+  const repairBaseRef = git(cwd, "rev-parse", "HEAD");
+  fs.writeFileSync(path.join(cwd, "src/repair.ts"), "export const value = 3;\n");
+  git(cwd, "add", "src/repair.ts");
+  git(cwd, "commit", "-m", "repair change");
+
+  assert.deepEqual(
+    classifyExternalBaseValidationFailure({
+      targetDir: cwd,
+      pinnedBaseRef,
+      repairBaseRef,
+      error: new Error(`${path.join(cwd, "src/base.ts")}:1: lint failed`),
+      baseError: new Error(`${path.join(cwd, "src/base.ts")}:1: lint failed`),
+    }),
+    {
+      paths: ["src/base.ts"],
+      reason: "validation failed only in base-identical files outside the repair delta",
+    },
+  );
+  assert.deepEqual(
+    classifyExternalBaseValidationFailure({
+      targetDir: cwd,
+      pinnedBaseRef,
+      repairBaseRef,
+      error: new Error("package.json:1: configuration lint failed"),
+      baseError: new Error("package.json:1: configuration lint failed"),
+    })?.paths,
+    ["package.json"],
+  );
+  assert.equal(
+    classifyExternalBaseValidationFailure({
+      targetDir: cwd,
+      pinnedBaseRef,
+      repairBaseRef,
+      error: new Error("src/base.ts:1: newly introduced type error"),
+      baseError: new Error("src/base.ts:1: pre-existing lint error"),
+    }),
+    null,
+  );
+});
+
+test("validation failures in repair-changed files remain repair scope", () => {
+  const cwd = gitPackageFixture({ "check:changed": "node check.js" });
+  fs.mkdirSync(path.join(cwd, "src"));
+  fs.writeFileSync(path.join(cwd, "src/repair.ts"), "export const value = 1;\n");
+  git(cwd, "add", ".");
+  git(cwd, "commit", "-m", "base");
+  const pinnedBaseRef = git(cwd, "rev-parse", "HEAD");
+  const repairBaseRef = pinnedBaseRef;
+  fs.writeFileSync(path.join(cwd, "src/repair.ts"), "export const value = 2;\n");
+  git(cwd, "add", "src/repair.ts");
+  git(cwd, "commit", "-m", "repair change");
+
+  assert.equal(
+    classifyExternalBaseValidationFailure({
+      targetDir: cwd,
+      pinnedBaseRef,
+      repairBaseRef,
+      error: new Error("src/repair.ts:1: lint failed"),
+      baseError: new Error("src/repair.ts:1: lint failed"),
+    }),
+    null,
+  );
+});
+
+test("final-sync classification excludes files changed only by advanced main", () => {
+  const cwd = gitPackageFixture({ "check:changed": "node check.js" });
+  fs.mkdirSync(path.join(cwd, "src"));
+  fs.writeFileSync(path.join(cwd, "src/base.ts"), "export const base = 1;\n");
+  fs.writeFileSync(path.join(cwd, "src/repair.ts"), "export const repair = 1;\n");
+  git(cwd, "add", ".");
+  git(cwd, "commit", "-m", "base");
+  const preSyncBaseRef = git(cwd, "rev-parse", "HEAD");
+  git(cwd, "checkout", "-b", "repair");
+  fs.writeFileSync(path.join(cwd, "src/repair.ts"), "export const repair = 2;\n");
+  git(cwd, "add", "src/repair.ts");
+  git(cwd, "commit", "-m", "repair delta");
+  const repairDeltaPaths = git(cwd, "diff", "--name-only", `${preSyncBaseRef}..HEAD`).split(
+    /\r?\n/,
+  );
+
+  git(cwd, "checkout", "main");
+  fs.writeFileSync(path.join(cwd, "src/base.ts"), "export const base = 2;\n");
+  git(cwd, "add", "src/base.ts");
+  git(cwd, "commit", "-m", "advanced main");
+  const synchronizedBaseRef = git(cwd, "rev-parse", "HEAD");
+  git(cwd, "checkout", "repair");
+  git(cwd, "rebase", "main");
+
+  const diagnostic = new Error("src/base.ts:1: lint failed");
+  assert.equal(
+    classifyExternalBaseValidationFailure({
+      targetDir: cwd,
+      pinnedBaseRef: synchronizedBaseRef,
+      repairBaseRef: preSyncBaseRef,
+      error: diagnostic,
+      baseError: diagnostic,
+    }),
+    null,
+  );
+  assert.deepEqual(
+    classifyExternalBaseValidationFailure({
+      targetDir: cwd,
+      pinnedBaseRef: synchronizedBaseRef,
+      repairBaseRef: preSyncBaseRef,
+      repairDeltaPaths,
+      error: diagnostic,
+      baseError: diagnostic,
+    }),
+    {
+      paths: ["src/base.ts"],
+      reason: "validation failed only in base-identical files outside the repair delta",
+    },
+  );
+});
+
+test("pinned-base validation reproduction proves the same base failure", () => {
+  const cwd = gitPackageFixture({ "check:changed": "node check.js" });
+  fs.mkdirSync(path.join(cwd, "src"));
+  fs.writeFileSync(
+    path.join(cwd, "check.js"),
+    "console.error('src/base.ts:1: lint failed'); process.exit(1);\n",
+  );
+  fs.writeFileSync(path.join(cwd, "src/base.ts"), "export const base = true;\n");
+  fs.writeFileSync(path.join(cwd, "src/repair.ts"), "export const value = 1;\n");
+  git(cwd, "add", ".");
+  git(cwd, "commit", "-m", "base");
+  const pinnedBaseRef = git(cwd, "rev-parse", "HEAD");
+  fs.writeFileSync(path.join(cwd, "src/repair.ts"), "export const value = 2;\n");
+  git(cwd, "add", "src/repair.ts");
+  git(cwd, "commit", "-m", "repair change");
+
+  const baseError = reproduceValidationFailureAtPinnedBase({
+    commands: ["pnpm check:changed"],
+    targetDir: cwd,
+    options: validationOptions("openclaw/openclaw", { pinnedBaseRef }),
+  });
+
+  assert.match(String(baseError), /src\/base\.ts:1: lint failed/);
+});
+
+test("pinned-base reproduction fails closed when dependency inputs changed", () => {
+  const cwd = gitPackageFixture({ "check:changed": "node check.js" });
+  fs.writeFileSync(
+    path.join(cwd, "check.js"),
+    "console.error('src/base.ts:1: lint failed'); process.exit(1);\n",
+  );
+  fs.mkdirSync(path.join(cwd, "src"));
+  fs.writeFileSync(path.join(cwd, "src/base.ts"), "export const base = true;\n");
+  git(cwd, "add", ".");
+  git(cwd, "commit", "-m", "base");
+  const pinnedBaseRef = git(cwd, "rev-parse", "HEAD");
+  const packageJson = JSON.parse(fs.readFileSync(path.join(cwd, "package.json"), "utf8"));
+  packageJson.dependencies = { "fixture-dependency": "1.0.0" };
+  fs.writeFileSync(path.join(cwd, "package.json"), `${JSON.stringify(packageJson, null, 2)}\n`);
+
+  assert.equal(
+    reproduceValidationFailureAtPinnedBase({
+      commands: ["pnpm check:changed"],
+      targetDir: cwd,
+      options: validationOptions("openclaw/openclaw", { pinnedBaseRef }),
+    }),
+    null,
+  );
+  git(cwd, "add", "package.json");
+  assert.equal(
+    reproduceValidationFailureAtPinnedBase({
+      commands: ["pnpm check:changed"],
+      targetDir: cwd,
+      options: validationOptions("openclaw/openclaw", { pinnedBaseRef }),
+    }),
+    null,
+  );
+  git(cwd, "commit", "-m", "change dependency inputs");
+  assert.equal(
+    reproduceValidationFailureAtPinnedBase({
+      commands: ["pnpm check:changed"],
+      targetDir: cwd,
+      options: validationOptions("openclaw/openclaw", { pinnedBaseRef }),
+    }),
+    null,
+  );
+});
+
+test("pinned-base reproduction does not reuse a mutable dependency runtime", () => {
+  const cwd = gitPackageFixture({ "check:changed": "node check.js" });
+  fs.writeFileSync(
+    path.join(cwd, "check.js"),
+    "const fs = require('node:fs'); if (fs.existsSync('node_modules/fixture-dependency/state.js')) { console.error('src/base.ts:1: lint failed'); process.exit(1); }\n",
+  );
+  git(cwd, "add", ".");
+  git(cwd, "commit", "-m", "base");
+  const pinnedBaseRef = git(cwd, "rev-parse", "HEAD");
+  fs.mkdirSync(path.join(cwd, "node_modules", "fixture-dependency"), { recursive: true });
+  fs.writeFileSync(path.join(cwd, "node_modules", "fixture-dependency", "state.js"), "mutated\n");
+
+  assert.equal(
+    reproduceValidationFailureAtPinnedBase({
+      commands: ["pnpm check:changed"],
+      targetDir: cwd,
+      options: validationOptions("openclaw/openclaw", { pinnedBaseRef }),
+    }),
+    null,
+  );
+});
+
+test("pinned-base reproduction prepares an independent runtime after normal setup", () => {
+  const cwd = gitBunPackageFixture({ check: "bun run check" });
+  git(cwd, "add", ".");
+  git(cwd, "commit", "-m", "base");
+  const pinnedBaseRef = git(cwd, "rev-parse", "HEAD");
+  const { binDir } = fakeBunFixture(cwd, { failRun: true });
+  const options = validationOptions("openclaw/clawhub", {
+    ...clawhubToolchain(),
+    pinnedBaseRef,
+    installTargetDeps: true,
+    installTimeoutMs: FAKE_TOOLCHAIN_TIMEOUT_MS,
+    setupTimeoutMs: FAKE_TOOLCHAIN_TIMEOUT_MS,
+  });
+
+  withPathPrefix(binDir, () => {
+    prepareTargetToolchain(cwd, options);
+    assert.equal(fs.existsSync(path.join(cwd, "node_modules")), true);
+    const baseError = reproduceValidationFailureAtPinnedBase({
+      commands: ["bun run check"],
+      targetDir: cwd,
+      options,
+    });
+    assert.match(String(baseError), /src\/base\.ts:1: lint failed/);
+  });
+});
+
+test("pinned-base reproduction fails closed when the pinned ref is unavailable", () => {
+  const cwd = gitPackageFixture({ "check:changed": "node check.js" });
+  fs.writeFileSync(path.join(cwd, "check.js"), "process.exit(1);\n");
+  git(cwd, "add", ".");
+  git(cwd, "commit", "-m", "base");
+
+  assert.equal(
+    reproduceValidationFailureAtPinnedBase({
+      commands: ["pnpm check:changed"],
+      targetDir: cwd,
+      options: validationOptions("openclaw/openclaw", { pinnedBaseRef: "f".repeat(40) }),
+    }),
+    null,
+  );
+});
+
 test("bun-based target repos do not get pnpm check:changed injected", () => {
   const cwd = bunPackageFixture({ check: "bun x tsc --noEmit" });
 
@@ -1040,7 +1301,7 @@ function gitBunPackageFixture(scripts) {
   return cwd;
 }
 
-function fakeBunFixture(cwd) {
+function fakeBunFixture(cwd, { failRun = false } = {}) {
   const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-fake-bun-bin-"));
   const logPath = path.join(cwd, "fake-bun.log");
   writeNodeCommandShim(
@@ -1050,6 +1311,8 @@ function fakeBunFixture(cwd) {
 const fs = require("node:fs");
 fs.appendFileSync(${JSON.stringify(logPath)}, process.argv.slice(2).join(" ") + "\\n");
 if (process.argv[2] === "--version") console.log("1.3.10");
+if (process.argv[2] === "install") fs.mkdirSync("node_modules", { recursive: true });
+if (${JSON.stringify(failRun)} && process.argv[2] === "run") { console.error("src/base.ts:1: lint failed"); process.exit(1); }
 `,
   );
   return { binDir, logPath };
