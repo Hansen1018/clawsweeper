@@ -1571,7 +1571,7 @@ test("forced exact-item replay scopes forwarded comment ids before item-wide rec
   );
   assert.match(
     source,
-    /stageSelectedRouterCommands\(\{[\s\S]*selectedItemNumbers: selectedItems,[\s\S]*forcedReplay: forceReprocess,[\s\S]*attemptId,[\s\S]*appendLedger\(ledger, staged\)[\s\S]*writeLedger/,
+    /stageSelectedRouterCommands\(\{[\s\S]*selectedItemNumbers: selectedItems,[\s\S]*forcedReplay: forceReprocess,[\s\S]*attemptId,[\s\S]*claimedCommands: ledger\.commands \?\? \[\],[\s\S]*appendLedger\(ledger, staged\)[\s\S]*writeLedger/,
   );
 });
 
@@ -1612,9 +1612,12 @@ test("broad router selects distinct item cursors before bounded comment hydratio
   assert.doesNotMatch(durable, /ghPaged/);
   assert.match(
     source,
-    /ghPagedLimit<JsonValue>\([\s\S]*issues\/\$\{number\}\/comments\?since=[\s\S]*maxComments/,
+    /ghPagedTailLimit<JsonValue>\([\s\S]*issues\/\$\{number\}\/comments\?since=[\s\S]*maxComments/,
   );
-  assert.match(source, /priorityComments: durable\.pendingComments[\s\S]*maxComments/);
+  assert.match(
+    source,
+    /priorityComments: durable\.pendingComments[\s\S]*reservedItemNumbers: broadPage\.itemNumbers[\s\S]*maxComments/,
+  );
   assert.match(
     source,
     /candidateIssueCommentCache\.has\(key\)[\s\S]*candidateIssueCommentCache\.set\(key, comment\)/,
@@ -2246,7 +2249,7 @@ test("autoclose safety hydrates complete comments outside bounded routing discov
 
   assert.match(
     cacheSetup,
-    /cachedIssueComments[\s\S]*ghPagedLimit<JsonValue>\([\s\S]*comments\?since=[\s\S]*maxComments/,
+    /cachedIssueComments[\s\S]*ghPagedTailLimit<JsonValue>\([\s\S]*comments\?since=[\s\S]*maxComments/,
   );
   assert.match(
     cacheSetup,

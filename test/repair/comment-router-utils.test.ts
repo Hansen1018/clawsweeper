@@ -555,6 +555,36 @@ test("selected fanout commands are staged durably and idempotently before dispat
   assert.deepEqual(routerPendingItemNumbers(ledger.commands, "openclaw/openclaw"), [42, 43]);
 });
 
+test("restaging preserves an existing dispatch claim and its recovery timestamp", () => {
+  const command = {
+    idempotency_key: "command-42",
+    comment_id: "1042",
+    comment_version_key: "1042:2026-07-12T20:00:00Z",
+    comment_updated_at: "2026-07-12T20:00:00Z",
+    repo: "openclaw/openclaw",
+    issue_number: 42,
+    status: "ready",
+    intent: "re_review",
+    actions: [{ action: "dispatch_clawsweeper", status: "planned" }],
+  };
+  const claim = {
+    ...command,
+    status: "claimed",
+    processed_at: "2026-07-12T20:01:00Z",
+    dispatch_receipt: "router-receipt",
+    actions: [{ action: "dispatch_clawsweeper", status: "claimed" }],
+  };
+
+  const [staged] = stageSelectedRouterCommands({
+    commands: [command],
+    selectedItemNumbers: new Set([42]),
+    claimedCommands: [claim],
+    processedAt: "2026-07-12T20:05:00Z",
+  });
+
+  assert.deepEqual(staged, claim);
+});
+
 test("continuation staging cannot downgrade an exact-lane terminal result", () => {
   const command = {
     idempotency_key: "command-42",
@@ -1697,6 +1727,41 @@ test("selectCommentsForRouting reserves the cap for exact pending comments", () 
   assert.deepEqual(
     selected.map((comment) => comment.id),
     [1],
+  );
+});
+
+test("selectCommentsForRouting reserves one candidate for every cursor-selected item", () => {
+  const issueUrl = (number: number) =>
+    `https://api.github.com/repos/openclaw/openclaw/issues/${number}`;
+  const selected = selectCommentsForRouting({
+    maxComments: 2,
+    reservedItemNumbers: [42, 43],
+    recentComments: [
+      {
+        id: 4202,
+        issue_url: issueUrl(42),
+        body: "@clawsweeper status",
+        updated_at: "2026-07-12T03:42:00Z",
+      },
+      {
+        id: 4201,
+        issue_url: issueUrl(42),
+        body: "@clawsweeper rebase",
+        updated_at: "2026-07-12T03:41:00Z",
+      },
+      {
+        id: 4301,
+        issue_url: issueUrl(43),
+        body: "@clawsweeper re-review",
+        updated_at: "2026-07-12T03:40:00Z",
+      },
+    ],
+    durableComments: [],
+  });
+
+  assert.deepEqual(
+    selected.map((comment) => comment.id),
+    [4202, 4301],
   );
 });
 

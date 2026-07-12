@@ -4,8 +4,11 @@ import test from "node:test";
 import {
   collectLimitedPages,
   collectLimitedPagesAsync,
+  collectTailLimitedPages,
+  collectTailLimitedPagesAsync,
   githubLimitedPagePath,
   githubPaginatedPath,
+  parseIncludedJsonPage,
 } from "../../dist/repair/github-cli.js";
 
 test("githubPaginatedPath requests maximum REST page size by default", () => {
@@ -69,4 +72,69 @@ test("async bounded pagination does not hydrate a huge comment history", async (
 
   assert.equal(comments.length, 1);
   assert.deepEqual(calls, [{ perPage: 1, page: 1 }]);
+});
+
+test("tail pagination walks backward from the newest REST page", () => {
+  const calls: Array<{ perPage: number; page: number }> = [];
+  const comments = collectTailLimitedPages(
+    150,
+    {
+      entries: Array.from({ length: 100 }, (_, index) => ({ id: index + 1 })),
+      lastPage: 4,
+    },
+    (perPage, page) => {
+      calls.push({ perPage, page });
+      const count = page === 4 ? 25 : 100;
+      return Array.from({ length: count }, (_, index) => ({
+        id: (page - 1) * 100 + index + 1,
+      }));
+    },
+  );
+
+  assert.equal(comments.length, 150);
+  assert.equal(comments[0]?.id, 176);
+  assert.equal(comments.at(-1)?.id, 325);
+  assert.deepEqual(calls, [
+    { perPage: 100, page: 4 },
+    { perPage: 100, page: 3 },
+    { perPage: 100, page: 2 },
+  ]);
+});
+
+test("async tail pagination keeps a one-comment budget on the newest item", async () => {
+  const calls: Array<{ perPage: number; page: number }> = [];
+  const comments = await collectTailLimitedPagesAsync(
+    1,
+    {
+      entries: Array.from({ length: 100 }, (_, index) => ({ id: index + 1 })),
+      lastPage: 100,
+    },
+    async (perPage, page) => {
+      calls.push({ perPage, page });
+      return Array.from({ length: 100 }, (_, index) => ({
+        id: (page - 1) * 100 + index + 1,
+      }));
+    },
+  );
+
+  assert.deepEqual(comments, [{ id: 10_000 }]);
+  assert.deepEqual(calls, [{ perPage: 100, page: 100 }]);
+});
+
+test("included REST responses expose their last page and JSON entries", () => {
+  assert.deepEqual(
+    parseIncludedJsonPage(
+      [
+        "HTTP/2.0 200 OK",
+        'link: <https://api.github.com/example?per_page=100&page=2>; rel="next", <https://api.github.com/example?per_page=100&page=42>; rel="last"',
+        "x-github-request-id: fixture",
+        "",
+        '[{"id":1}]',
+      ].join("\n"),
+    ),
+    {
+      entries: [{ id: 1 }],
+      lastPage: 42,
+    },
+  );
 });

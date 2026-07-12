@@ -364,22 +364,45 @@ export function selectCommentsForRouting({
   recentComments,
   durableComments,
   priorityComments = [],
+  reservedItemNumbers = [],
   maxComments,
 }: {
   recentComments: LooseRecord[];
   durableComments: LooseRecord[];
   priorityComments?: LooseRecord[];
+  reservedItemNumbers?: Iterable<number>;
   maxComments: number;
 }) {
   const limit = Math.max(0, maxComments);
-  const priority = uniqueCommentsById(priorityComments).slice(0, limit);
-  const priorityIds = new Set(priority.map((comment) => String(comment.id ?? "")));
+  const priority = uniqueCommentsById(priorityComments);
+  const priorityIds = new Set(priority.map(commentIdentity));
   const remaining = sortCommentsForRouting(
     uniqueCommentsById([...recentComments, ...durableComments]).filter(
-      (comment) => !priorityIds.has(String(comment.id ?? "")),
+      (comment) => !priorityIds.has(commentIdentity(comment)),
     ),
-  ).slice(0, Math.max(0, limit - priority.length));
-  return [...priority, ...remaining];
+  );
+  const reserved: LooseRecord[] = [];
+  const reservedIds = new Set<string>();
+  for (const number of [...new Set(reservedItemNumbers)].sort((left, right) => left - right)) {
+    if (reserved.length >= limit) break;
+    const comment = [...priority, ...remaining].find(
+      (candidate) =>
+        issueNumberFromUrl(candidate.issue_url) === number &&
+        !reservedIds.has(commentIdentity(candidate)),
+    );
+    if (!comment) continue;
+    reserved.push(comment);
+    reservedIds.add(commentIdentity(comment));
+  }
+  return [
+    ...reserved,
+    ...priority.filter((comment) => !reservedIds.has(commentIdentity(comment))),
+    ...remaining.filter((comment) => !reservedIds.has(commentIdentity(comment))),
+  ].slice(0, limit);
+}
+
+function commentIdentity(comment: LooseRecord): string {
+  return String(comment.id ?? "");
 }
 
 export function routerPendingItemNumbers(commands: LooseRecord[], repo?: string) {
@@ -406,12 +429,14 @@ export function stageSelectedRouterCommands({
   selectedItemNumbers,
   forcedReplay = false,
   attemptId = null,
+  claimedCommands = [],
   processedAt = new Date().toISOString(),
 }: {
   commands: LooseRecord[];
   selectedItemNumbers: ReadonlySet<number>;
   forcedReplay?: boolean;
   attemptId?: string | null;
+  claimedCommands?: LooseRecord[];
   processedAt?: string;
 }) {
   if (forcedReplay && !attemptId) {
@@ -420,24 +445,37 @@ export function stageSelectedRouterCommands({
   const stagedAttemptId = forcedReplay
     ? forcedReplayAttemptId({ forced_replay: true, attempt_id: attemptId })
     : null;
+  const claimsByKey = new Map<string, LooseRecord>();
+  for (const claim of claimedCommands) {
+    if (claim.status !== "claimed") continue;
+    for (const key of dispatchClaimLookupKeys(claim)) claimsByKey.set(key, claim);
+  }
   return commands
     .filter((command) => selectedItemNumbers.has(Number(command.issue_number)))
     .filter(routerCommandNeedsExactLane)
     .filter((command) => validRouterCommentId(command.comment_id, command.issue_number))
-    .map((command) => ({
-      ...command,
-      ...(forcedReplay
-        ? {
-            forced_replay: true,
-            attempt_id: forcedReplayAttemptId(command) ?? stagedAttemptId,
-          }
-        : {}),
-      processed_at: processedAt,
-      status: "waiting",
-      actions: (Array.isArray(command.actions) ? command.actions : []).map((action: JsonValue) =>
-        action?.status === "executed" ? action : { ...action, status: "waiting" },
-      ),
-    }));
+    .map((command) => {
+      const existingClaim = forcedReplay
+        ? null
+        : dispatchClaimLookupKeys(command)
+            .map((key) => claimsByKey.get(key))
+            .find((claim) => claim !== undefined);
+      if (existingClaim) return existingClaim;
+      return {
+        ...command,
+        ...(forcedReplay
+          ? {
+              forced_replay: true,
+              attempt_id: forcedReplayAttemptId(command) ?? stagedAttemptId,
+            }
+          : {}),
+        processed_at: processedAt,
+        status: "waiting",
+        actions: (Array.isArray(command.actions) ? command.actions : []).map((action: JsonValue) =>
+          action?.status === "executed" ? action : { ...action, status: "waiting" },
+        ),
+      };
+    });
 }
 
 export function stageForcedReplayCommands(commands: LooseRecord[], attemptId: string) {

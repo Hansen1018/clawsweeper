@@ -129,8 +129,8 @@ import {
   ghErrorText,
   ghJsonWithRetry as ghJson,
   ghJsonWithRetryAsync as ghJsonAsync,
-  ghPagedLimitWithRetry as ghPagedLimit,
-  ghPagedLimitWithRetryAsync as ghPagedLimitAsync,
+  ghPagedTailLimitWithRetry as ghPagedTailLimit,
+  ghPagedTailLimitWithRetryAsync as ghPagedTailLimitAsync,
   ghPagedWithRetry as ghPaged,
   ghPagedWithRetryAsync as ghPagedAsync,
   ghSpawn,
@@ -267,7 +267,7 @@ const MAX_MEDIA_PREPROCESSING_TIMEOUT_MS = 480_000;
 const PROOF_OVERRIDE_DESCRIPTION_MARKER = "<!-- clawsweeper-proof-override-note -->";
 const cachedIssueComments = createCachedIssueCommentsLookup(
   (number) =>
-    ghPagedLimit<JsonValue>(
+    ghPagedTailLimit<JsonValue>(
       `repos/${targetRepo}/issues/${number}/comments?since=${encodeURIComponent(since)}`,
       maxComments,
     ),
@@ -275,7 +275,7 @@ const cachedIssueComments = createCachedIssueCommentsLookup(
 );
 const cachedIssueCommentsAsync = createCachedIssueCommentsLookupAsync(
   (number) =>
-    ghPagedLimitAsync<JsonValue>(
+    ghPagedTailLimitAsync<JsonValue>(
       `repos/${targetRepo}/issues/${number}/comments?since=${encodeURIComponent(since)}`,
       maxComments,
     ),
@@ -437,6 +437,7 @@ if (!execute && stageSelectedCommands && writeReport) {
     selectedItemNumbers: selectedItems,
     forcedReplay: forceReprocess,
     attemptId,
+    claimedCommands: ledger.commands ?? [],
   });
   for (const stagedCommand of staged) {
     const command = commands.find(
@@ -4367,6 +4368,7 @@ function listCandidateComments() {
       ),
       durableComments: durable.markerComments,
       priorityComments: durable.pendingComments,
+      reservedItemNumbers: broadPage.itemNumbers,
       maxComments,
     }),
     broadPage,

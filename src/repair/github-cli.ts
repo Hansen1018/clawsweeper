@@ -156,6 +156,27 @@ export function ghPagedLimitWithRetry<T = JsonValue>(
   throw lastError instanceof Error ? lastError : new Error(String(lastError));
 }
 
+export function ghPagedTailLimitWithRetry<T = JsonValue>(
+  apiPath: string,
+  limit: number,
+  options: GhRetryOptions | number = {},
+): T[] {
+  const resolved = resolveRetryOptions(options);
+  const firstPage = ghIncludedJsonPageWithRetry<T>(
+    githubLimitedPagePath(apiPath, 100, 1),
+    resolved,
+  );
+  return collectTailLimitedPages(
+    limit,
+    firstPage,
+    (_perPage, page) =>
+      ghJsonWithRetry<JsonValue[]>(
+        ["api", githubLimitedPagePath(apiPath, 100, page)],
+        resolved,
+      ) as T[],
+  );
+}
+
 export async function ghPagedLimitWithRetryAsync<T = JsonValue>(
   apiPath: string,
   limit: number,
@@ -167,6 +188,27 @@ export async function ghPagedLimitWithRetryAsync<T = JsonValue>(
       ["api", githubLimitedPagePath(apiPath, perPage, page)],
       resolved,
     ),
+  );
+}
+
+export async function ghPagedTailLimitWithRetryAsync<T = JsonValue>(
+  apiPath: string,
+  limit: number,
+  options: GhRetryOptions | number = {},
+): Promise<T[]> {
+  const resolved = resolveRetryOptions(options);
+  const firstPage = await ghIncludedJsonPageWithRetryAsync<T>(
+    githubLimitedPagePath(apiPath, 100, 1),
+    resolved,
+  );
+  return collectTailLimitedPagesAsync(
+    limit,
+    firstPage,
+    async (_perPage, page) =>
+      (await ghJsonWithRetryAsync<JsonValue[]>(
+        ["api", githubLimitedPagePath(apiPath, 100, page)],
+        resolved,
+      )) as T[],
   );
 }
 
@@ -186,6 +228,68 @@ export async function collectLimitedPagesAsync<T>(
     if (entries.length < perPage) break;
   }
   return out.slice(0, max);
+}
+
+export type IncludedJsonPage<T> = {
+  entries: T[];
+  lastPage: number;
+};
+
+export function collectTailLimitedPages<T>(
+  limit: number,
+  firstPage: IncludedJsonPage<T>,
+  fetchPage: (perPage: number, page: number) => T[],
+): T[] {
+  const max = Number.isFinite(limit) ? Math.max(0, Math.floor(limit)) : 0;
+  if (max <= 0) return [];
+  const lastPage = Math.max(1, Math.floor(firstPage.lastPage));
+  if (lastPage === 1) return firstPage.entries.slice(-max);
+
+  const out: T[] = [];
+  for (let page = lastPage; page >= 1 && out.length < max; page -= 1) {
+    const entries = page === 1 ? firstPage.entries : fetchPage(100, page);
+    if (!Array.isArray(entries)) continue;
+    out.unshift(...entries);
+  }
+  return out.slice(-max);
+}
+
+export async function collectTailLimitedPagesAsync<T>(
+  limit: number,
+  firstPage: IncludedJsonPage<T>,
+  fetchPage: (perPage: number, page: number) => Promise<T[]>,
+): Promise<T[]> {
+  const max = Number.isFinite(limit) ? Math.max(0, Math.floor(limit)) : 0;
+  if (max <= 0) return [];
+  const lastPage = Math.max(1, Math.floor(firstPage.lastPage));
+  if (lastPage === 1) return firstPage.entries.slice(-max);
+
+  const out: T[] = [];
+  for (let page = lastPage; page >= 1 && out.length < max; page -= 1) {
+    const entries = page === 1 ? firstPage.entries : await fetchPage(100, page);
+    if (!Array.isArray(entries)) continue;
+    out.unshift(...entries);
+  }
+  return out.slice(-max);
+}
+
+export function parseIncludedJsonPage<T = JsonValue>(text: string): IncludedJsonPage<T> {
+  const match = /\r?\n\r?\n(?=\s*\[)/.exec(text);
+  if (!match || match.index === undefined) {
+    throw new Error("invalid GitHub included response: missing JSON array body");
+  }
+  const headers = text.slice(0, match.index);
+  const body = text.slice(match.index + match[0].length);
+  const entries = JSON.parse(body) as JsonValue;
+  if (!Array.isArray(entries)) {
+    throw new Error("invalid GitHub included response: expected JSON array body");
+  }
+  const lastPageMatch = headers.match(/[?&]page=(\d+)[^>]*>;\s*rel="last"/i);
+  const lastPage = lastPageMatch ? Number(lastPageMatch[1]) : 1;
+  return {
+    entries: entries as T[],
+    lastPage: Number.isSafeInteger(lastPage) && lastPage > 0 ? lastPage : 1,
+  };
 }
 
 export function ghText(ghArgs: string[], options: GhRunOptions = {}): string {
@@ -219,6 +323,16 @@ export function ghTextWithRetry(ghArgs: string[], options: GhRetryOptions | numb
   throw lastError instanceof Error ? lastError : new Error(String(lastError));
 }
 
+function includedJsonRetryKind(error: unknown) {
+  if (
+    error instanceof SyntaxError ||
+    /invalid GitHub included response/i.test(error instanceof Error ? error.message : String(error))
+  ) {
+    return "transient" as const;
+  }
+  return ghRetryKind(error);
+}
+
 export async function ghTextWithRetryAsync(
   ghArgs: string[],
   options: GhRetryOptions | number = {},
@@ -250,6 +364,51 @@ export async function ghTextAsync(ghArgs: string[], options: GhRunOptions = {}):
     maxBuffer: 64 * 1024 * 1024,
   });
   return stripAnsi(String(stdout)).trim();
+}
+
+function ghIncludedJsonPageWithRetry<T>(
+  apiPath: string,
+  options: GhRetryOptions,
+): IncludedJsonPage<T> {
+  const attempts = Math.max(1, options.attempts ?? 6);
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return parseIncludedJsonPage<T>(
+        ghTextWithRetry(["api", "--include", apiPath], { ...options, attempts: 1 }),
+      );
+    } catch (error) {
+      lastError = error;
+      const retryKind = includedJsonRetryKind(error);
+      if (attempt >= attempts || retryKind === "none") throw error;
+      sleepMs(ghRetryWaitMs(retryKind, attempt - 1));
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
+}
+
+async function ghIncludedJsonPageWithRetryAsync<T>(
+  apiPath: string,
+  options: GhRetryOptions,
+): Promise<IncludedJsonPage<T>> {
+  const attempts = Math.max(1, options.attempts ?? 6);
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return parseIncludedJsonPage<T>(
+        await ghTextWithRetryAsync(["api", "--include", apiPath], {
+          ...options,
+          attempts: 1,
+        }),
+      );
+    } catch (error) {
+      lastError = error;
+      const retryKind = includedJsonRetryKind(error);
+      if (attempt >= attempts || retryKind === "none") throw error;
+      await sleepAsync(ghRetryWaitMs(retryKind, attempt - 1));
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
 }
 
 export function ghBestEffort(ghArgs: string[], options: GhRunOptions = {}): void {
