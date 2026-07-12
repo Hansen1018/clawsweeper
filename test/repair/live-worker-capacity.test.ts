@@ -11,6 +11,7 @@ import {
   readMaxLiveWorkers,
   repairRunNameForJob,
   repairRunNamePrefixForJob,
+  workflowRunsForExactDispatch,
 } from "../../dist/repair/live-worker-capacity.js";
 
 test("live worker capacity refuses limits above the global Codex cap", () => {
@@ -78,6 +79,39 @@ test("repair run names include command receipt keys without hiding active jobs",
       ]),
     })?.status,
     "in_progress",
+  );
+});
+
+test("exact dispatch visibility ignores concurrent runs with the same workflow revision", () => {
+  const expectedTitle = "repair cluster jobs/openclaw/inbox/cluster-001.md [requeue-expected]";
+  const selected = workflowRunsForExactDispatch({
+    expectedTitle,
+    since: "2026-07-12T12:00:00.000Z",
+    runs: [
+      {
+        databaseId: 1,
+        headSha: "same-workflow-sha",
+        displayTitle: "repair cluster jobs/openclaw/inbox/cluster-001.md [requeue-other]",
+        createdAt: "2026-07-12T12:00:01.000Z",
+      },
+      {
+        databaseId: 2,
+        headSha: "same-workflow-sha",
+        displayTitle: expectedTitle,
+        createdAt: "2026-07-12T11:59:59.000Z",
+      },
+      {
+        databaseId: 3,
+        headSha: "same-workflow-sha",
+        displayTitle: expectedTitle,
+        createdAt: "2026-07-12T12:00:02.000Z",
+      },
+    ],
+  });
+
+  assert.deepEqual(
+    selected.map((run) => run.databaseId),
+    [3],
   );
 });
 

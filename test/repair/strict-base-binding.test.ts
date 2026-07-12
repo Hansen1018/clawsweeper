@@ -591,13 +591,34 @@ test("repair execution and validation cannot mutate GitHub before trusted public
     String(reportOnlyRequeue.run ?? ""),
     /--requeue-depth[\s\S]*--max-requeue-depth 1[\s\S]*--requeue-authority clawsweeper-app/,
   );
-  assert.equal(missingHandoffRequeue.env?.CLAWSWEEPER_LIVE_WORKER_CAPACITY_TIMEOUT_MS, "120000");
-  assert.ok(
-    Number(missingHandoffRequeue.env?.CLAWSWEEPER_LIVE_WORKER_CAPACITY_TIMEOUT_MS) < 10 * 60 * 1000,
+  for (const step of [reportOnlyRequeue, missingHandoffRequeue]) {
+    assert.match(
+      String(step.run ?? ""),
+      /repair:requeue -- \.clawsweeper-repair\/authorized\/job\.md[\s\S]*--source-job-path "\$\{\{ needs\.authorize\.outputs\.source_job_path \}\}"/,
+    );
+    assert.match(
+      String(step.run ?? ""),
+      /--deadline-at-ms "\$\{\{ steps\.report_deadline\.outputs\.deadline_at_ms \}\}"[\s\S]*--wait-for-capacity/,
+    );
+  }
+  const reportDeadline = report.steps?.find(
+    (step: { id?: string }) => step.id === "report_deadline",
   );
+  assert.match(String(reportDeadline?.run ?? ""), /\+ 480000/);
+  assert.ok(480_000 < 10 * 60 * 1000);
   assert.match(reportText, /REQUEUE_OUTCOME/);
   assert.match(reportText, /bounded authorized retry could not be queued/);
+  assert.match(reportText, /bounded retry, but the retry could not be queued/);
   assert.match(reportText, /failed deterministic verification\. It was not requeued/);
+  assert.match(
+    String(
+      report.steps?.find(
+        (step: { name?: string }) => step.name === "Publish terminal report-only status",
+      )?.if ?? "",
+    ),
+    /always\(\)/,
+  );
+  assert.match(source, /context\.dispatch_key !== dispatchKey/);
   assert.doesNotMatch(
     String(
       report.steps?.find((step: { id?: string }) => step.id === "requeue_missing_execution")?.if ??

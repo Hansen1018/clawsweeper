@@ -2097,8 +2097,10 @@ test("repair workers hydrate only durable jobs from generated state", () => {
   assert.match(workflow, /requeue_authority:\n\s+description:/);
   assert.match(requeue, /"requeue=true"/);
   assert.match(requeue, /requeue_authority=\$\{requeueContext\.authority\}/);
+  assert.match(requeue, /dispatch_key=\$\{requeueContext\.dispatch_key\}/);
   assert.match(requeue, /--allow-execute 0\|1 --allow-fix-pr 0\|1/);
   assert.match(requeue, /--requeue-depth N.*--max-requeue-depth N/);
+  assert.match(requeue, /--deadline-at-ms N/);
   assert.match(requeue, /--requeue-authority clawsweeper-app\|maintainer/);
   assert.match(requeue, /requeue_context=\$\{Buffer\.from\(JSON\.stringify\(requeueContext\)\)/);
   assert.match(requeue, /requeueDepth >= maxRequeueDepth/);
@@ -2112,15 +2114,20 @@ test("repair workers hydrate only durable jobs from generated state", () => {
     requeue.indexOf("summary.live_worker_capacity_before_dispatch") <
       requeue.indexOf("const forwardedGates"),
   );
-  assert.match(requeue, /timed out waiting for .* requeued run\(s\) to become visible/);
+  assert.match(requeue, /workflowRunsForExactDispatch/);
+  assert.match(requeue, /timed out waiting for requeued run .* to become visible/);
+  assert.match(requeue, /timeoutMs: remainingDeadlineMs\(deadlineAtMs, "live worker capacity"\)/);
+  assert.match(requeue, /waitForStartedRuns\(\{[\s\S]*deadlineAtMs/);
+  assert.doesNotMatch(requeue, /headSha === headSha|currentHeadSha/);
   assert.match(workflow, /authority === "clawsweeper-app"/);
   assert.match(workflow, /actor !== "openclaw-clawsweeper\[bot\]"/);
   assert.match(workflow, /authority === "maintainer"/);
   assert.match(workflow, /authenticated human workflow-dispatch actor/);
+  assert.match(workflow, /context\.dispatch_key !== dispatchKey/);
   assert.match(workflow, /Buffer\.from\(encoded, "base64url"\)/);
   assert.match(
     repairDocs,
-    /repair:requeue[\s\S]*--open-execute-window[\s\S]*--requeue-authority maintainer[\s\S]*--allow-execute 1[\s\S]*--allow-fix-pr 1/,
+    /repair:requeue[\s\S]*--open-execute-window[\s\S]*--requeue-authority maintainer[\s\S]*--allow-execute 1[\s\S]*--allow-fix-pr 1[\s\S]*--wait-for-capacity/,
   );
   assert.equal(
     workflow.match(/uses: \.\/\.github\/actions\/setup-state[\s\S]*?sparse-checkout: jobs/g)
@@ -2147,9 +2154,20 @@ test("repair workers hydrate only durable jobs from generated state", () => {
     /id: repair_requeue[\s\S]*count-requeue-required[\s\S]*id: requeue_token[\s\S]*repair:requeue/,
   );
   assert.match(reportJob, /--max-requeue-depth 1/);
+  assert.match(
+    reportJob,
+    /repair:requeue -- \.clawsweeper-repair\/authorized\/job\.md[\s\S]*--source-job-path "\$\{\{ needs\.authorize\.outputs\.source_job_path \}\}"/,
+  );
+  assert.equal(
+    reportJob.match(
+      /--deadline-at-ms "\$\{\{ steps\.report_deadline\.outputs\.deadline_at_ms \}\}"/g,
+    )?.length,
+    2,
+  );
   assert.match(reportJob, /fromJSON\(needs\.cluster\.outputs\.requeue_depth \|\| '0'\) < 1/);
   assert.match(reportJob, /failed deterministic verification\. It was not requeued/);
   assert.match(reportJob, /if: \$\{\{ always\(\)/);
+  assert.match(reportJob, /Publish terminal report-only status[\s\S]*if: \$\{\{ always\(\)/);
   assert.match(reportJob, /Publish terminal report-only status[\s\S]*--dashboard-only/);
   assert.doesNotMatch(reportJob, /target_post_flight_token|permission-pull-requests/);
   assert.match(

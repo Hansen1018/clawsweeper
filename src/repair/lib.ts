@@ -36,6 +36,7 @@ export {
   repairRunNameForJob,
   repairRunNamePrefixForJob,
   waitForLiveWorkerCapacity,
+  workflowRunsForExactDispatch,
 } from "./live-worker-capacity.js";
 export { hasDeterministicSecuritySignal, hasSecuritySignalText } from "./security-signals.js";
 

@@ -4,16 +4,18 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { execFileSync, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import {
   assertLiveWorkerCapacity,
   currentProjectRepo,
   parseArgs,
   parseJob,
   readMaxLiveWorkers,
+  repairRunNameForJob,
   repoRoot,
   validateJob,
   waitForLiveWorkerCapacity,
+  workflowRunsForExactDispatch,
 } from "./lib.js";
 import { ghJson } from "./github-cli.js";
 import { sleepMs } from "./timing.js";
@@ -63,6 +65,10 @@ const sourceRunId = String(
 const requeueDepth = nonNegativeIntegerArg(args["requeue-depth"], "requeue-depth", 0);
 const maxRequeueDepth = nonNegativeIntegerArg(args["max-requeue-depth"], "max-requeue-depth", 1);
 const requeueAuthority = optionalRequeueAuthorityArg(args["requeue-authority"]);
+const deadlineAtMs = deadlineTimestampArg(
+  args["deadline-at-ms"],
+  Date.now() + (waitForCapacity ? 35 * 60 * 1000 : 5 * 60 * 1000),
+);
 
 const resolved = requestedRunId
   ? resolveFromRunId(String(requestedRunId))
@@ -70,7 +76,7 @@ const resolved = requestedRunId
 
 if (!resolved.source_job) {
   console.error(
-    `usage: node scripts/requeue-job.ts <job.md|run-id> [--mode plan|execute|autonomous] [--execute --requeue-authority clawsweeper-app|maintainer] [--open-execute-window --allow-execute 0|1 --allow-fix-pr 0|1] [--source-run-id id] [--source-job-path path] [--requeue-depth n] [--max-requeue-depth n] [--runner label] [--execution-runner label] [--model model] [--max-live-workers ${AUTOMATION_LIMITS.repair_live_runs.default}] [--wait-for-capacity]`,
+    `usage: node scripts/requeue-job.ts <job.md|run-id> [--source-run-id id] [--source-job-path jobs/.../job.md] [--mode plan|execute|autonomous] [--execute --requeue-authority clawsweeper-app|maintainer] [--open-execute-window --allow-execute 0|1 --allow-fix-pr 0|1] [--requeue-depth N] [--max-requeue-depth N] [--deadline-at-ms N] [--runner label] [--execution-runner label] [--model model] [--max-live-workers ${AUTOMATION_LIMITS.repair_live_runs.default}] [--wait-for-capacity]`,
   );
   process.exit(2);
 }
@@ -96,6 +102,7 @@ const summary: LooseRecord = {
   workflow,
   source_run_id: sourceRunId || null,
   source_job: sourceJobPath,
+  local_job: job.relativePath,
   source_authorization_sha256: authorizationSha256,
   requeue_depth: requeueDepth,
   max_requeue_depth: maxRequeueDepth,
@@ -107,6 +114,7 @@ const summary: LooseRecord = {
   captured_allow_execute: capturedAllowExecute,
   captured_allow_fix_pr: capturedAllowFixPr,
   requeue_authority: requeueAuthority,
+  deadline_at_ms: deadlineAtMs,
 };
 
 if (!execute) {
@@ -124,7 +132,13 @@ if (!requeueAuthority) {
 }
 
 summary.live_worker_capacity_before_dispatch = waitForCapacity
-  ? waitForLiveWorkerCapacity({ repo, workflow, requested: 1, maxLiveWorkers })
+  ? waitForLiveWorkerCapacity({
+      repo,
+      workflow,
+      requested: 1,
+      maxLiveWorkers,
+      timeoutMs: remainingDeadlineMs(deadlineAtMs, "live worker capacity"),
+    })
   : assertLiveWorkerCapacity({ repo, workflow, requested: 1, maxLiveWorkers });
 
 const forwardedGates = openExecuteWindow
@@ -140,8 +154,7 @@ assertGateOpenIfNeeded(mode, forwardedGates.allowExecute);
 summary.forwarded_allow_execute = forwardedGates.allowExecute;
 summary.forwarded_allow_fix_pr = forwardedGates.allowFixPr;
 
-const headSha = currentHeadSha();
-const dispatchStartedAt = new Date(Date.now() - 5000).toISOString();
+remainingDeadlineMs(deadlineAtMs, "requeue dispatch");
 const nextRequeueDepth = boundedNextRequeueDepth(requeueDepth, maxRequeueDepth);
 const dispatchKey = deterministicRequeueDispatchKey({
   repo,
@@ -151,6 +164,8 @@ const dispatchKey = deterministicRequeueDispatchKey({
   authorizationSha256,
   depth: nextRequeueDepth,
 });
+const expectedTitle = repairRunNameForJob(sourceJobPath, "automerge repair ", dispatchKey);
+const dispatchStartedAt = new Date(Date.now() - 5000).toISOString();
 const requeueLifecycle: CommandLifecycleInput = {
   repository: repo,
   operationKey: `repair-requeue:${repo}:${sourceJobPath}:${authorizationSha256}:depth:${nextRequeueDepth}`,
@@ -166,6 +181,7 @@ try {
     depth: nextRequeueDepth,
     allow_execute: forwardedGates.allowExecute,
     allow_fix_pr: forwardedGates.allowFixPr,
+    dispatch_key: dispatchKey,
   });
   recordCommandRequeue(requeueLifecycle, {
     dispatchKey,
@@ -173,12 +189,18 @@ try {
     sourceJobSha256: authorizationSha256,
     depth: nextRequeueDepth,
   });
-  const observedRuns = waitForStartedRuns({ headSha, since: dispatchStartedAt, expectedCount: 1 });
+  const observedRuns = waitForStartedRuns({
+    expectedTitle,
+    since: dispatchStartedAt,
+    deadlineAtMs,
+  });
 
   summary.status = "dispatched";
   summary.dispatch_key = dispatchKey;
+  summary.expected_run_title = expectedTitle;
   summary.observed_runs = observedRuns.map((run: JsonValue) => ({
     run_id: String(run.databaseId),
+    display_title: run.displayTitle,
     status: run.status,
     conclusion: run.conclusion ?? null,
     created_at: run.createdAt,
@@ -259,6 +281,7 @@ function dispatchJob(
     depth: number;
     allow_execute: "0" | "1";
     allow_fix_pr: "0" | "1";
+    dispatch_key: string;
   },
 ) {
   const result = runCommandLifecycleMutation(lifecycle, {
@@ -285,7 +308,7 @@ function dispatchJob(
           "-f",
           `job=${jobPath}`,
           "-f",
-          `dispatch_key=${dispatchKey}`,
+          `dispatch_key=${requeueContext.dispatch_key}`,
           "-f",
           `mode=${mode}`,
           "-f",
@@ -312,27 +335,31 @@ function dispatchJob(
   }
 }
 
-function waitForStartedRuns({ expectedCount, headSha, since }: LooseRecord) {
-  const deadline = Date.now() + 5 * 60 * 1000;
+function waitForStartedRuns({
+  expectedTitle,
+  since,
+  deadlineAtMs,
+}: {
+  expectedTitle: string;
+  since: string;
+  deadlineAtMs: number;
+}) {
   let latest: JsonValue[] = [];
-  while (Date.now() < deadline) {
-    latest = listClusterRuns()
-      .filter((run: JsonValue) => run.headSha === headSha)
-      .filter((run: JsonValue) => Date.parse(run.createdAt) >= Date.parse(since))
-      .sort(
-        (left: JsonValue, right: JsonValue) =>
-          Date.parse(left.createdAt) - Date.parse(right.createdAt),
-      );
-    const selected = latest.slice(-expectedCount);
-    if (selected.length >= expectedCount) return selected;
-    sleepMs(5_000);
+  while (Date.now() < deadlineAtMs) {
+    latest = workflowRunsForExactDispatch({
+      runs: listClusterRuns(),
+      expectedTitle,
+      since,
+    });
+    if (latest.length > 0) return latest.slice(-1);
+    sleepMs(Math.min(5_000, remainingDeadlineMs(deadlineAtMs, "requeue visibility")));
   }
   const observedRunIds = latest
-    .slice(-expectedCount)
+    .slice(-1)
     .map((run: JsonValue) => String(run.databaseId ?? ""))
     .filter(Boolean);
   throw new Error(
-    `timed out waiting for ${expectedCount} requeued run(s) to become visible${
+    `timed out waiting for requeued run ${expectedTitle} to become visible${
       observedRunIds.length > 0 ? `: ${observedRunIds.join(", ")}` : ""
     }`,
   );
@@ -355,7 +382,7 @@ function listClusterRuns() {
     "--limit",
     "200",
     "--json",
-    "databaseId,workflowName,headSha,status,conclusion,createdAt,url",
+    "databaseId,workflowName,displayTitle,status,conclusion,createdAt,url",
   ]).filter((run: LooseRecord) => run.workflowName === workflowName);
 }
 
@@ -404,12 +431,18 @@ function nonNegativeIntegerArg(value: JsonValue, name: string, fallback: number)
   return parsed;
 }
 
-function currentHeadSha() {
-  return execFileSync("git", ["rev-parse", "origin/main"], {
-    cwd: repoRoot(),
-    encoding: "utf8",
-    stdio: ["ignore", "pipe", "pipe"],
-  }).trim();
+function deadlineTimestampArg(value: JsonValue, fallback: number) {
+  const deadline = nonNegativeIntegerArg(value, "deadline-at-ms", fallback);
+  if (deadline <= Date.now()) {
+    throw new Error("--deadline-at-ms must be in the future");
+  }
+  return deadline;
+}
+
+function remainingDeadlineMs(deadline: number, label: string) {
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) throw new Error(`${label} deadline expired`);
+  return remaining;
 }
 
 function looksLikeRunId(value: JsonValue) {

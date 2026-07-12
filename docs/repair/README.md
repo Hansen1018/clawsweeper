@@ -320,6 +320,7 @@ pnpm run repair:requeue -- 24947178021 --execute --open-execute-window \
   --requeue-authority maintainer \
   --allow-execute 1 \
   --allow-fix-pr 1 \
+  --wait-for-capacity \
   --runner blacksmith-4vcpu-ubuntu-2404 \
   --execution-runner blacksmith-16vcpu-ubuntu-2404
 

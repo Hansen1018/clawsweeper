@@ -190,6 +190,28 @@ export function repairRunNameForJob(
   return key ? `${title} [${key}]` : title;
 }
 
+export function workflowRunsForExactDispatch({
+  runs,
+  expectedTitle,
+  since,
+}: {
+  runs: LooseRecord[];
+  expectedTitle: string;
+  since: string;
+}) {
+  const sinceMs = Date.parse(since);
+  return runs
+    .filter((run) => String(run.displayTitle ?? "") === expectedTitle)
+    .filter((run) => {
+      const createdAtMs = Date.parse(String(run.createdAt ?? ""));
+      return Number.isFinite(sinceMs) && Number.isFinite(createdAtMs) && createdAtMs >= sinceMs;
+    })
+    .sort(
+      (left, right) =>
+        Date.parse(String(left.createdAt ?? "")) - Date.parse(String(right.createdAt ?? "")),
+    );
+}
+
 export function activeRepairWorkflowRunForJob({
   repo = currentProjectRepo(),
   workflow = REPAIR_CLUSTER_WORKFLOW,

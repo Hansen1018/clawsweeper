@@ -10,7 +10,7 @@ on:
         required: true
         type: string
       dispatch_key:
-        description: "Optional command-router idempotency key"
+        description: "Optional unique dispatch correlation key"
         required: false
         default: ""
         type: string
@@ -226,6 +226,7 @@ jobs:
           REQUEUE_CONTEXT: ${{ inputs.requeue_context }}
           REQUEUE_REQUESTED: ${{ inputs.requeue }}
           REQUEUE_AUTHORITY: ${{ inputs.requeue_authority }}
+          REQUEUE_DISPATCH_KEY: ${{ inputs.dispatch_key }}
           REQUEUE_ACTOR: ${{ github.actor }}
           REQUEUE_EVENT_NAME: ${{ github.event_name }}
         run: |
@@ -234,6 +235,7 @@ jobs:
           const encoded = String(process.env.REQUEUE_CONTEXT || "");
           const requested = process.env.REQUEUE_REQUESTED === "true";
           const authority = String(process.env.REQUEUE_AUTHORITY || "");
+          const dispatchKey = String(process.env.REQUEUE_DISPATCH_KEY || "");
           const actor = String(process.env.REQUEUE_ACTOR || "");
           let depth = 0;
           if (encoded) {
@@ -242,6 +244,8 @@ jobs:
               !requested ||
               context.schema_version !== 1 ||
               context.authority !== authority ||
+              !dispatchKey ||
+              context.dispatch_key !== dispatchKey ||
               !Number.isSafeInteger(context.depth) ||
               context.depth < 1 ||
               !["0", "1"].includes(context.allow_execute) ||
@@ -1133,6 +1137,10 @@ jobs:
       CLAWSWEEPER_ALLOW_FIX_PR: ${{ needs.authorize.outputs.allow_fix_pr == '1' && '1' || '0' }}
       OPENCLAW_LOCAL_CHECK: "0"
     steps:
+      - name: Capture report deadline
+        id: report_deadline
+        run: echo "deadline_at_ms=$(( $(date +%s) * 1000 + 480000 ))" >> "$GITHUB_OUTPUT"
+
       - uses: actions/checkout@v7
         with:
           ref: ${{ github.sha }}
@@ -1251,7 +1259,7 @@ jobs:
           GH_TOKEN: ${{ steps.requeue_token.outputs.token }}
           CLAWSWEEPER_MUTATION_TOKEN_SOURCE: clawsweeper-app
         run: |
-          pnpm run repair:requeue -- "${{ needs.authorize.outputs.source_job_path }}" \
+          pnpm run repair:requeue -- .clawsweeper-repair/authorized/job.md \
             --source-job-path "${{ needs.authorize.outputs.source_job_path }}" \
             --source-run-id "${{ github.run_id }}" \
             --mode "${{ inputs.mode }}" \
@@ -1261,6 +1269,7 @@ jobs:
             --allow-fix-pr "${{ needs.authorize.outputs.allow_fix_pr }}" \
             --requeue-depth "${{ needs.cluster.outputs.requeue_depth || '0' }}" \
             --max-requeue-depth 1 \
+            --deadline-at-ms "${{ steps.report_deadline.outputs.deadline_at_ms }}" \
             --requeue-authority clawsweeper-app \
             --wait-for-capacity \
             --runner "${{ inputs.runner }}" \
@@ -1273,9 +1282,9 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.requeue_token.outputs.token }}
           CLAWSWEEPER_MUTATION_TOKEN_SOURCE: clawsweeper-app
-          CLAWSWEEPER_LIVE_WORKER_CAPACITY_TIMEOUT_MS: "120000"
         run: |
-          pnpm run repair:requeue -- "${{ needs.authorize.outputs.source_job_path }}" \
+          pnpm run repair:requeue -- .clawsweeper-repair/authorized/job.md \
+            --source-job-path "${{ needs.authorize.outputs.source_job_path }}" \
             --mode "${{ inputs.mode }}" \
             --execute \
             --open-execute-window \
@@ -1283,6 +1292,7 @@ jobs:
             --allow-fix-pr "${{ needs.authorize.outputs.allow_fix_pr }}" \
             --requeue-depth "${{ needs.cluster.outputs.requeue_depth || '0' }}" \
             --max-requeue-depth 1 \
+            --deadline-at-ms "${{ steps.report_deadline.outputs.deadline_at_ms }}" \
             --requeue-authority clawsweeper-app \
             --wait-for-capacity \
             --runner "${{ inputs.runner }}" \
@@ -1318,18 +1328,24 @@ jobs:
             --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
       - name: Publish terminal report-only status
-        if: ${{ steps.verify_execution.outcome == 'success' && (needs.execute.result != 'success' || needs.execute.outputs.execute_fix_outcome != 'success' || needs.execute.outputs.mutation_ready != 'true' || needs.validate.result != 'success') }}
+        if: ${{ always() && steps.verify_execution.outcome == 'success' && (needs.execute.result != 'success' || needs.execute.outputs.execute_fix_outcome != 'success' || needs.execute.outputs.mutation_ready != 'true' || needs.validate.result != 'success' || steps.requeue_report_only.outcome == 'failure') }}
         continue-on-error: true
         env:
           GH_TOKEN: ""
           GITHUB_TOKEN: ""
           CLAWSWEEPER_STATUS_INGEST_TOKEN: ${{ secrets.CLAWSWEEPER_STATUS_INGEST_TOKEN }}
+          REQUEUE_COUNT: ${{ steps.repair_requeue.outputs.count }}
+          REQUEUE_OUTCOME: ${{ steps.requeue_report_only.outcome }}
         run: |
+          detail="The automatic implementation worker stopped before all deterministic gates completed. Open the workflow run for the exact blocker."
+          if [ "${REQUEUE_COUNT:-0}" != "0" ] && [ "$REQUEUE_OUTCOME" != "success" ]; then
+            detail="The automatic implementation worker requested a bounded retry, but the retry could not be queued. Open the workflow run for the dispatch failure."
+          fi
           pnpm run repair:issue-implementation-status -- \
             --job .clawsweeper-repair/execution/job.md \
             --dashboard-only \
             --state "Blocked" \
-            --detail "The automatic implementation worker stopped before all deterministic gates completed. Open the workflow run for the exact blocker." \
+            --detail "$detail" \
             --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
       - name: Finalize report command action ledger

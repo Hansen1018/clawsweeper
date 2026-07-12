@@ -23,7 +23,7 @@ test("report-only repair requeues forward a stable dispatch receipt and publish 
   const source = readText("src/repair/requeue-job.ts");
   const workflow = readText(".github/workflows/repair-cluster-worker.yml");
   const dispatchIndex = source.indexOf(
-    "dispatchJob(sourceJobPath, mode, dispatchKey, requeueLifecycle)",
+    "dispatchJob(sourceJobPath, mode, dispatchKey, requeueLifecycle, {",
   );
   const receiptIndex = source.indexOf("recordCommandRequeue(requeueLifecycle", dispatchIndex);
   const finalizeStart = workflow.indexOf("- name: Finalize report command action ledger");
@@ -38,7 +38,7 @@ test("report-only repair requeues forward a stable dispatch receipt and publish 
   assert.match(source, /authorizationSha256/);
   assert.match(source, /depth: nextRequeueDepth/);
   assert.match(source, /boundedNextRequeueDepth\(requeueDepth, maxRequeueDepth\)/);
-  assert.match(source, /`dispatch_key=\$\{dispatchKey\}`/);
+  assert.match(source, /`dispatch_key=\$\{requeueContext\.dispatch_key\}`/);
   assert.match(source, /`job=\$\{jobPath\}`/);
   assert.match(source, /`requeue_depth=\$\{nextRequeueDepth\}`/);
   assert.match(source, /operationKey: `repair-requeue:/);
@@ -68,7 +68,10 @@ test("report-only repair requeues forward a stable dispatch receipt and publish 
     workflow,
     /--source-job-path "\$\{\{ needs\.authorize\.outputs\.source_job_path \}\}"/,
   );
-  assert.match(workflow, /--requeue-depth "\$\{\{ inputs\.requeue_depth \}\}"/);
+  assert.match(
+    workflow,
+    /--requeue-depth "\$\{\{ needs\.cluster\.outputs\.requeue_depth \|\| '0' \}\}"/,
+  );
   assert.match(workflow, /--max-requeue-depth 1/);
 });
 
