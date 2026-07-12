@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -18,7 +18,10 @@ import {
   reproduceValidationFailureAtPinnedBase,
   requiredValidationCommands,
   runAllowedValidationCommands,
+  runTargetControlledCommand,
   runStagedValidationProof,
+  targetValidationEnv,
+  targetValidationIsolationFromEnv,
   workspacePackagePaths,
   workspacePatternMatches,
 } from "../../dist/repair/target-validation.js";
@@ -1605,15 +1608,33 @@ test("non-gated target repos replace stale changed gates with git validation", (
 test("repair execution provisions pinned Bun before target validation can invoke it", () => {
   const workflow = fs.readFileSync(".github/workflows/repair-cluster-worker.yml", "utf8");
   const setupBunIndex = workflow.indexOf("- name: Setup pinned Bun for target validation");
+  const isolationIndex = workflow.indexOf("- name: Provision isolated target validation account");
+  const setupCodexIndex = workflow.indexOf("- uses: ./.github/actions/setup-codex", isolationIndex);
   const executeFixIndex = workflow.indexOf("- name: Execute credited fix artifact");
 
   assert.ok(setupBunIndex >= 0, "expected repair execution workflow to set up Bun");
+  assert.ok(isolationIndex >= 0, "expected repair execution workflow to isolate target validation");
+  assert.ok(setupCodexIndex >= 0, "expected repair execution workflow to set up Codex");
   assert.ok(executeFixIndex >= 0, "expected repair execution workflow to execute fix artifacts");
   assert.ok(setupBunIndex < executeFixIndex, "expected Bun setup before repair:execute-fix");
+  assert.ok(isolationIndex < setupCodexIndex, "expected isolation account before Codex setup");
+  assert.ok(setupCodexIndex < executeFixIndex, "expected Codex setup before repair:execute-fix");
 
   const setupBunStep = workflow.slice(setupBunIndex, executeFixIndex);
   assert.match(setupBunStep, /uses: oven-sh\/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6/);
   assert.match(setupBunStep, /bun-version: 1\.3\.14/);
+  assert.match(setupBunStep, /CLAWSWEEPER_TARGET_VALIDATION_ISOLATION_REQUIRED=1/);
+  assert.match(setupBunStep, /--no-user-group/);
+  assert.match(setupBunStep, /auth-mode: login/);
+  assert.doesNotMatch(setupBunStep, /auth-mode: proxy/);
+
+  const action = fs.readFileSync(".github/actions/setup-codex/action.yml", "utf8");
+  const stopProxyIndex = action.indexOf("stop-codex-responses-proxy.mjs");
+  const proxyAuthIndex = action.indexOf("- name: Authenticate Codex through Responses proxy");
+  const loginAuthIndex = action.indexOf("- name: Authenticate Codex with login");
+  assert.ok(stopProxyIndex >= 0);
+  assert.ok(stopProxyIndex < proxyAuthIndex);
+  assert.ok(stopProxyIndex < loginAuthIndex);
 });
 
 test("bun-based target toolchain installs deps and runs configured validation", () => {
@@ -3922,7 +3943,9 @@ test("changed validation does not retry after its command budget is exhausted", 
 test("target validation strips credentials and trusted workflow ledger identity", () => {
   const secretNames = [
     "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
     "CODEX_API_KEY",
+    "CODEX_CONFIG_PATH",
     "CLAWSWEEPER_INTERNAL_MODEL",
     "CODEX_HOME",
     "GH_TOKEN",
@@ -3979,6 +4002,169 @@ test("target validation strips credentials and trusted workflow ledger identity"
     for (const [key, value] of Object.entries(previous)) restoreEnv(key, value);
   }
 });
+
+test("required target validation isolation fails closed without its account contract", () => {
+  const previous = {
+    required: process.env.CLAWSWEEPER_TARGET_VALIDATION_ISOLATION_REQUIRED,
+    user: process.env.CLAWSWEEPER_TARGET_VALIDATION_USER,
+    home: process.env.CLAWSWEEPER_TARGET_VALIDATION_HOME,
+  };
+  process.env.CLAWSWEEPER_TARGET_VALIDATION_ISOLATION_REQUIRED = "1";
+  delete process.env.CLAWSWEEPER_TARGET_VALIDATION_USER;
+  delete process.env.CLAWSWEEPER_TARGET_VALIDATION_HOME;
+  try {
+    assert.throws(
+      () => targetValidationIsolationFromEnv(),
+      /requires both a user and isolated home/,
+    );
+    assert.equal(targetValidationEnv().CLAWSWEEPER_TARGET_VALIDATION_ISOLATION_REQUIRED, undefined);
+  } finally {
+    restoreEnv("CLAWSWEEPER_TARGET_VALIDATION_ISOLATION_REQUIRED", previous.required);
+    restoreEnv("CLAWSWEEPER_TARGET_VALIDATION_USER", previous.user);
+    restoreEnv("CLAWSWEEPER_TARGET_VALIDATION_HOME", previous.home);
+  }
+});
+
+test(
+  "isolated target validation cannot read Codex config or reach a host Responses proxy",
+  { skip: !canRunPrivilegedTargetIsolationProbe() },
+  () => {
+    const runnerGid = String(process.getgid());
+    const user = `cwval${process.pid}${Date.now().toString(36).slice(-4)}`;
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-validation-home-"));
+    const home = path.join(homeRoot, "home");
+    const secretHome = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-codex-home-"));
+    const targetRoot = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-repair-target-"));
+    const cwd = path.join(targetRoot, "repo");
+    const proxyRoot = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-proxy-probe-"));
+    const portFile = path.join(proxyRoot, "port");
+    const forwardedFile = path.join(proxyRoot, "forwarded-authorization");
+    const proxyScript = path.join(proxyRoot, "proxy.mjs");
+    const targetScript = path.join(cwd, "attack.mjs");
+    let proxy;
+    const previousIsolation = {
+      required: process.env.CLAWSWEEPER_TARGET_VALIDATION_ISOLATION_REQUIRED,
+      user: process.env.CLAWSWEEPER_TARGET_VALIDATION_USER,
+      home: process.env.CLAWSWEEPER_TARGET_VALIDATION_HOME,
+    };
+
+    fs.mkdirSync(cwd);
+    fs.writeFileSync(
+      path.join(secretHome, "config.toml"),
+      'model_provider = "clawsweeper-responses-proxy"\nbase_url = "http://127.0.0.1:1/v1"\n',
+    );
+    fs.writeFileSync(path.join(secretHome, "auth.json"), '{"OPENAI_API_KEY":"secret"}\n');
+    fs.writeFileSync(path.join(secretHome, "responses-proxy.json"), '{"port":1}\n');
+    fs.chmodSync(secretHome, 0o700);
+    fs.chmodSync(path.join(secretHome, "config.toml"), 0o600);
+    fs.chmodSync(path.join(secretHome, "auth.json"), 0o600);
+    fs.chmodSync(path.join(secretHome, "responses-proxy.json"), 0o600);
+    fs.writeFileSync(
+      proxyScript,
+      `import fs from "node:fs";
+import http from "node:http";
+const server = http.createServer((request, response) => {
+  if (request.url === "/v1/responses") {
+    fs.writeFileSync(${JSON.stringify(forwardedFile)}, "Authorization: Bearer secret-backed-key\\n");
+  }
+  response.writeHead(200, { "content-type": "application/json" });
+  response.end("{}");
+});
+server.listen(0, "127.0.0.1", () => {
+  fs.writeFileSync(${JSON.stringify(portFile)}, String(server.address().port));
+});
+`,
+    );
+
+    try {
+      execFileSync("sudo", [
+        "-n",
+        "useradd",
+        "--system",
+        "--no-user-group",
+        "--gid",
+        runnerGid,
+        "--home-dir",
+        home,
+        "--shell",
+        "/usr/sbin/nologin",
+        user,
+      ]);
+      execFileSync("sudo", [
+        "-n",
+        "install",
+        "-d",
+        "-o",
+        user,
+        "-g",
+        runnerGid,
+        "-m",
+        "700",
+        home,
+        path.join(home, ".cache"),
+        path.join(home, ".config"),
+        path.join(home, ".local"),
+        path.join(home, ".local", "bin"),
+        path.join(home, ".local", "share"),
+        path.join(home, "tmp"),
+      ]);
+      proxy = spawn(process.execPath, [proxyScript], { stdio: "ignore" });
+      waitForFile(portFile, 5000);
+      const port = fs.readFileSync(portFile, "utf8").trim();
+      fs.writeFileSync(
+        targetScript,
+        `import fs from "node:fs";
+for (const file of ${JSON.stringify([
+          path.join(secretHome, "config.toml"),
+          path.join(secretHome, "auth.json"),
+          path.join(secretHome, "responses-proxy.json"),
+        ])}) {
+  try {
+    fs.readFileSync(file);
+    process.exit(41);
+  } catch (error) {
+    if (!["EACCES", "EPERM"].includes(error?.code)) process.exit(42);
+  }
+}
+try {
+  await fetch("http://127.0.0.1:${port}/v1/responses", {
+    method: "POST",
+    body: "{}",
+    signal: AbortSignal.timeout(1000),
+  });
+  process.exit(43);
+} catch {}
+`,
+      );
+      process.env.CLAWSWEEPER_TARGET_VALIDATION_ISOLATION_REQUIRED = "1";
+      process.env.CLAWSWEEPER_TARGET_VALIDATION_USER = user;
+      process.env.CLAWSWEEPER_TARGET_VALIDATION_HOME = home;
+
+      runTargetControlledCommand(process.execPath, [targetScript], {
+        cwd,
+        env: targetValidationEnv(),
+        isolateNetwork: true,
+        timeoutMs: 15_000,
+      });
+
+      assert.equal(fs.existsSync(forwardedFile), false);
+    } finally {
+      proxy?.kill("SIGTERM");
+      restoreEnv("CLAWSWEEPER_TARGET_VALIDATION_ISOLATION_REQUIRED", previousIsolation.required);
+      restoreEnv("CLAWSWEEPER_TARGET_VALIDATION_USER", previousIsolation.user);
+      restoreEnv("CLAWSWEEPER_TARGET_VALIDATION_HOME", previousIsolation.home);
+      try {
+        execFileSync("sudo", ["-n", "userdel", user]);
+      } catch {}
+      try {
+        execFileSync("sudo", ["-n", "rm", "-rf", homeRoot]);
+      } catch {}
+      fs.rmSync(secretHome, { recursive: true, force: true });
+      fs.rmSync(targetRoot, { recursive: true, force: true });
+      fs.rmSync(proxyRoot, { recursive: true, force: true });
+    }
+  },
+);
 
 test("compactText keeps both head and tail for long validation output", () => {
   assert.equal(
@@ -4177,6 +4363,27 @@ if (process.argv[2] === "--version") console.log("1.3.10");
 function restoreEnv(key, previous) {
   if (previous === undefined) delete process.env[key];
   else process.env[key] = previous;
+}
+
+function canRunPrivilegedTargetIsolationProbe() {
+  if (process.platform !== "linux" || process.getuid?.() === 0) return false;
+  try {
+    execFileSync("sudo", ["-n", "true"], { stdio: "ignore" });
+    for (const command of ["ip", "setpriv", "unshare", "useradd", "userdel"]) {
+      execFileSync("sh", ["-c", `command -v ${command}`], { stdio: "ignore" });
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function waitForFile(filePath, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (!fs.existsSync(filePath)) {
+    if (Date.now() >= deadline) throw new Error(`timed out waiting for ${filePath}`);
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+  }
 }
 
 function withPathPrefix(binDir, callback) {

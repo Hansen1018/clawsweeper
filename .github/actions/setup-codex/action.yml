@@ -72,6 +72,8 @@ runs:
       run: |
         set -euo pipefail
         export CODEX_HOME="${CODEX_HOME:?}"
+        node "$GITHUB_ACTION_PATH/../../../scripts/stop-codex-responses-proxy.mjs" \
+          "$CODEX_HOME/responses-proxy.json"
         test -n "${CLAWSWEEPER_INTERNAL_MODEL:-}"
         model_json="$(node -e 'process.stdout.write(JSON.stringify(process.argv[1]))' "$CLAWSWEEPER_INTERNAL_MODEL")"
         printf 'model = %s\n' "$model_json" > "$CODEX_HOME/config.toml"

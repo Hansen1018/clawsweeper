@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { parse as parseYaml } from "yaml";
 
-import { runCommand as run } from "./command-runner.js";
+import { runCommand as run, type CommandRunOptions } from "./command-runner.js";
 import {
   ensureMergeBaseAvailable,
   gitChangedFiles,
@@ -55,6 +55,10 @@ const MIN_TRACKED_INDEX_OUTPUT_BYTES = 4 * 1024;
 const MAX_TRACKED_INDEX_OUTPUT_BYTES = 64 * 1024 * 1024;
 const MIN_VALIDATION_RETRY_BUDGET_MS = 1_000;
 const ABSENT_PROOF_INPUT = "<absent>";
+const TARGET_VALIDATION_ROOT_PREFIXES = [
+  "clawsweeper-base-validation-",
+  "clawsweeper-repair-target-",
+];
 const PROTECTED_PROOF_INPUT_DIRECTORIES = new Set([
   ".venv",
   ".yarn",
@@ -122,6 +126,18 @@ export type ExternalBaseValidationBlocker = {
 
 export type TargetValidationProofResult = StagedProofExecutionResult & {
   plan: StagedProofPlan;
+};
+
+type TargetValidationIsolation = {
+  gid: number;
+  home: string;
+  uid: number;
+  user: string;
+};
+
+type TargetControlledCommandOptions = CommandRunOptions & {
+  cwd: string;
+  isolateNetwork?: boolean;
 };
 
 type RequiredValidationCommand = {
@@ -278,7 +294,7 @@ export function prepareTargetToolchain(cwd: string, options: TargetValidationOpt
   const packageJson = JSON.parse(fs.readFileSync(packagePath, "utf8"));
   const toolchain = getToolchain(options);
   const validationEnv = targetValidationEnv();
-  run(
+  runTargetControlledCommand(
     "node",
     [
       "-e",
@@ -337,12 +353,16 @@ function preparePnpmToolchain({
   if (!packageManager.startsWith("pnpm@")) {
     throw new Error(`unsupported target package manager: ${packageManager}`);
   }
-  run("corepack", ["enable"], {
+  const isolation = targetValidationIsolationFromEnv();
+  const enableArgs = isolation
+    ? ["enable", "--install-directory", path.join(isolation.home, ".local", "bin")]
+    : ["enable"];
+  runTargetControlledCommand("corepack", enableArgs, {
     cwd,
     env: validationEnv,
     timeoutMs: targetToolchainCommandTimeout(identityLimits, setupTimeoutMs, "corepack enable"),
   });
-  run("corepack", ["prepare", packageManager, "--activate"], {
+  runTargetControlledCommand("corepack", ["prepare", packageManager, "--activate"], {
     cwd,
     env: validationEnv,
     timeoutMs: targetToolchainCommandTimeout(identityLimits, setupTimeoutMs, "corepack prepare"),
@@ -356,14 +376,14 @@ function preparePnpmToolchain({
     "--config.enable-pre-post-scripts=false",
   ];
   try {
-    run("pnpm", installArgs, {
+    runTargetControlledCommand("pnpm", installArgs, {
       cwd,
       env: validationEnv,
       timeoutMs: targetToolchainCommandTimeout(identityLimits, installTimeoutMs, "pnpm install"),
     });
   } catch (error) {
     if (!/ERR_PNPM_OUTDATED_LOCKFILE/i.test(String(error.message))) throw error;
-    run(
+    runTargetControlledCommand(
       "pnpm",
       installArgs.map((arg) => (arg === "--frozen-lockfile" ? "--no-frozen-lockfile" : arg)),
       {
@@ -381,7 +401,7 @@ function preparePnpmToolchain({
       "pnpm-lock.yaml",
       targetToolchainCommandTimeout(identityLimits, installTimeoutMs, "pnpm lockfile restoration"),
     );
-    run("pnpm", installArgs, {
+    runTargetControlledCommand("pnpm", installArgs, {
       cwd,
       env: validationEnv,
       timeoutMs: targetToolchainCommandTimeout(
@@ -411,14 +431,14 @@ function prepareBunToolchain({
   // ClawSweeper runs under pnpm, so strip caller lifecycle identity before Bun
   // while preserving target registry, auth, proxy, userconfig, and cache settings.
   const bunEnv = sanitizeEnvForBun(validationEnv);
-  run("bun", ["--version"], {
+  runTargetControlledCommand("bun", ["--version"], {
     cwd,
     env: bunEnv,
     timeoutMs: targetToolchainCommandTimeout(identityLimits, setupTimeoutMs, "bun setup probe"),
   });
   const installArgs = ["install", "--frozen-lockfile", "--ignore-scripts"];
   try {
-    run("bun", installArgs, {
+    runTargetControlledCommand("bun", installArgs, {
       cwd,
       env: bunEnv,
       timeoutMs: targetToolchainCommandTimeout(identityLimits, installTimeoutMs, "bun install"),
@@ -426,7 +446,7 @@ function prepareBunToolchain({
   } catch (error) {
     const message = String(error?.message ?? "");
     if (!/lockfile|frozen|out of date|out-of-date/i.test(message)) throw error;
-    run("bun", ["install", "--no-frozen-lockfile", "--ignore-scripts"], {
+    runTargetControlledCommand("bun", ["install", "--no-frozen-lockfile", "--ignore-scripts"], {
       cwd,
       env: bunEnv,
       timeoutMs: targetToolchainCommandTimeout(
@@ -442,7 +462,7 @@ function prepareBunToolchain({
         targetToolchainCommandTimeout(identityLimits, installTimeoutMs, `${lockfile} restoration`),
       );
     }
-    run("bun", installArgs, {
+    runTargetControlledCommand("bun", installArgs, {
       cwd,
       env: bunEnv,
       timeoutMs: targetToolchainCommandTimeout(
@@ -492,7 +512,7 @@ function prepareNpmToolchain({
   const installArgs = fs.existsSync(path.join(cwd, "package-lock.json"))
     ? ["ci", "--ignore-scripts"]
     : ["install", "--no-package-lock", "--ignore-scripts"];
-  run("npm", installArgs, {
+  runTargetControlledCommand("npm", installArgs, {
     cwd,
     env: validationEnv,
     timeoutMs: targetToolchainCommandTimeout(identityLimits, installTimeoutMs, "npm install"),
@@ -747,9 +767,10 @@ function runValidationPlanCommand({
     let executionError: Error | null = null;
     try {
       const executionParts = validationCommandForExecution(parts);
-      run(executionParts[0]!, executionParts.slice(1), {
+      runTargetControlledCommand(executionParts[0]!, executionParts.slice(1), {
         cwd,
         env: validationEnv,
+        isolateNetwork: true,
         timeoutMs: remainingBudgetMs,
       });
     } catch (error) {
@@ -2114,9 +2135,12 @@ export function targetValidationEnv() {
   delete env.ACTIONS_RUNTIME_URL;
   for (const key of Object.keys(env)) {
     if (
+      key.startsWith("OPENAI_") ||
+      key.startsWith("CODEX_") ||
       key.startsWith("GITHUB_") ||
       key.startsWith("RUNNER_") ||
       key.startsWith("ACTIONS_") ||
+      key.startsWith("CLAWSWEEPER_TARGET_VALIDATION_") ||
       key.startsWith("CLAWSWEEPER_ACTION_LEDGER_") ||
       key.startsWith("CLAWSWEEPER_CRABFLEET_") ||
       /(?:^|_)(?:TOKEN|SECRET|PASSWORD|PRIVATE_KEY|API_KEY|CREDENTIALS?)$/i.test(key)
@@ -2125,6 +2149,194 @@ export function targetValidationEnv() {
     }
   }
   return env;
+}
+
+export function targetValidationIsolationFromEnv(): TargetValidationIsolation | null {
+  const requiredValue = process.env.CLAWSWEEPER_TARGET_VALIDATION_ISOLATION_REQUIRED ?? "";
+  if (requiredValue && !["0", "1"].includes(requiredValue)) {
+    throw new Error("invalid CLAWSWEEPER_TARGET_VALIDATION_ISOLATION_REQUIRED value");
+  }
+  const required = requiredValue === "1";
+  const user = String(process.env.CLAWSWEEPER_TARGET_VALIDATION_USER ?? "").trim();
+  const configuredHome = String(process.env.CLAWSWEEPER_TARGET_VALIDATION_HOME ?? "").trim();
+  if (!required && !user && !configuredHome) return null;
+  if (!user || !configuredHome) {
+    throw new Error("target validation isolation requires both a user and isolated home");
+  }
+  if (process.platform !== "linux") {
+    throw new Error("target validation isolation is supported only on Linux");
+  }
+  if (!/^[a-z_][a-z0-9_-]{0,31}$/i.test(user)) {
+    throw new Error("invalid target validation isolation user");
+  }
+  if (!path.isAbsolute(configuredHome)) {
+    throw new Error("target validation isolation home must be absolute");
+  }
+
+  const homeStat = fs.lstatSync(configuredHome);
+  if (!homeStat.isDirectory() || homeStat.isSymbolicLink() || (homeStat.mode & 0o077) !== 0) {
+    throw new Error("target validation isolation home must be a private directory");
+  }
+  const home = fs.realpathSync(configuredHome);
+  const uid = parseIsolationIdentity("uid", run("id", ["-u", user]));
+  const gid = parseIsolationIdentity("gid", run("id", ["-g", user]));
+  if (homeStat.uid !== uid) {
+    throw new Error("target validation isolation home is not owned by the validation user");
+  }
+  const runnerGid = process.getgid?.();
+  if (runnerGid === undefined || gid !== runnerGid) {
+    throw new Error("target validation isolation user must share only the checkout group");
+  }
+  return { gid, home, uid, user };
+}
+
+export function runTargetControlledCommand(
+  command: string,
+  commandArgs: string[],
+  options: TargetControlledCommandOptions,
+): string {
+  const isolation = targetValidationIsolationFromEnv();
+  if (!isolation) return run(command, commandArgs, options);
+
+  const startedAt = Date.now();
+  const timeoutMs = options.timeoutMs ?? DEFAULT_TARGET_VALIDATION_TIMEOUT_MS;
+  const cwd = fs.realpathSync(options.cwd);
+  const root = targetValidationIsolationRoot(cwd);
+  if (pathIsWithin(root, isolation.home) || pathIsWithin(isolation.home, root)) {
+    throw new Error("target validation checkout and isolated home must be disjoint");
+  }
+  prepareTargetValidationAccess(root, isolation.gid, timeoutMs, startedAt);
+  const envArgs = isolatedTargetValidationEnv(options.env ?? process.env, isolation).map(
+    ([key, value]) => `${key}=${value}`,
+  );
+  const isolatedCommand = ["/usr/bin/env", "-i", ...envArgs, command, ...commandArgs];
+  const sudoArgs = options.isolateNetwork
+    ? [
+        "-n",
+        "unshare",
+        "--net",
+        "--",
+        "/bin/bash",
+        "-c",
+        'set -euo pipefail; ip link set lo up; uid="$1"; gid="$2"; shift 2; exec setpriv --reuid="$uid" --regid="$gid" --clear-groups --no-new-privs -- "$@"',
+        "clawsweeper-target-validation",
+        String(isolation.uid),
+        String(isolation.gid),
+        ...isolatedCommand,
+      ]
+    : [
+        "-n",
+        "-u",
+        isolation.user,
+        "-H",
+        "--",
+        "setpriv",
+        "--no-new-privs",
+        "--",
+        ...isolatedCommand,
+      ];
+  return run("sudo", sudoArgs, {
+    cwd,
+    timeoutMs: remainingIsolationBudget(timeoutMs, startedAt),
+  });
+}
+
+function parseIsolationIdentity(label: string, value: string) {
+  const parsed = Number.parseInt(value.trim(), 10);
+  if (!Number.isSafeInteger(parsed) || parsed < 1) {
+    throw new Error(`invalid target validation isolation ${label}`);
+  }
+  return parsed;
+}
+
+function targetValidationIsolationRoot(cwd: string) {
+  let candidate = cwd;
+  while (true) {
+    if (
+      TARGET_VALIDATION_ROOT_PREFIXES.some((prefix) => path.basename(candidate).startsWith(prefix))
+    ) {
+      const stat = fs.lstatSync(candidate);
+      if (!stat.isDirectory() || stat.isSymbolicLink()) {
+        throw new Error("target validation isolation root must be a real directory");
+      }
+      const runnerUid = process.getuid?.();
+      if (
+        runnerUid === undefined ||
+        stat.uid !== runnerUid ||
+        !pathIsWithin(fs.realpathSync(os.tmpdir()), candidate)
+      ) {
+        throw new Error("target validation isolation root must be runner-owned temporary storage");
+      }
+      return candidate;
+    }
+    const parent = path.dirname(candidate);
+    if (parent === candidate) break;
+    candidate = parent;
+  }
+  throw new Error("target validation isolation requires a trusted disposable checkout root");
+}
+
+function prepareTargetValidationAccess(
+  root: string,
+  gid: number,
+  timeoutMs: number,
+  startedAt: number,
+) {
+  run("sudo", ["-n", "chgrp", "-R", "--no-dereference", "--", String(gid), root], {
+    timeoutMs: remainingIsolationBudget(timeoutMs, startedAt),
+  });
+  run("sudo", ["-n", "chmod", "-R", "g+rwX", "--", root], {
+    timeoutMs: remainingIsolationBudget(timeoutMs, startedAt),
+  });
+}
+
+function isolatedTargetValidationEnv(
+  source: NodeJS.ProcessEnv,
+  isolation: TargetValidationIsolation,
+): [string, string][] {
+  const env: NodeJS.ProcessEnv = { ...source };
+  for (const key of Object.keys(env)) {
+    if (
+      key === "HOME" ||
+      key === "LOGNAME" ||
+      key === "SUDO_COMMAND" ||
+      key === "SUDO_GID" ||
+      key === "SUDO_UID" ||
+      key === "SUDO_USER" ||
+      key === "TMPDIR" ||
+      key === "USER" ||
+      key.startsWith("XDG_")
+    ) {
+      delete env[key];
+    }
+  }
+  env.HOME = isolation.home;
+  env.USER = isolation.user;
+  env.LOGNAME = isolation.user;
+  env.TMPDIR = path.join(isolation.home, "tmp");
+  env.XDG_CACHE_HOME = path.join(isolation.home, ".cache");
+  env.XDG_CONFIG_HOME = path.join(isolation.home, ".config");
+  env.XDG_DATA_HOME = path.join(isolation.home, ".local", "share");
+  env.COREPACK_HOME = path.join(isolation.home, ".cache", "node", "corepack");
+  env.PNPM_HOME = path.join(isolation.home, ".local", "share", "pnpm");
+  env.npm_config_cache = path.join(isolation.home, ".cache", "npm");
+  env.PATH = `${path.join(isolation.home, ".local", "bin")}${path.delimiter}${source.PATH ?? ""}`;
+  return Object.entries(env)
+    .filter((entry): entry is [string, string] => entry[1] !== undefined)
+    .sort(([left], [right]) => left.localeCompare(right));
+}
+
+function remainingIsolationBudget(timeoutMs: number, startedAt: number) {
+  const remaining = timeoutMs - (Date.now() - startedAt);
+  if (remaining <= 0) {
+    throw new Error("target validation isolation setup exhausted the command runtime budget");
+  }
+  return remaining;
+}
+
+function pathIsWithin(parent: string, candidate: string) {
+  const relative = path.relative(parent, candidate);
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
 }
 
 function targetValidationTimeoutMs(name: string, fallback: number, cap?: number) {

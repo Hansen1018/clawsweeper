@@ -805,9 +805,10 @@ full compiled-repo coverage ratchet.
 
 Required secrets:
 
-- `OPENAI_API_KEY`: OpenAI API key used by the per-job local Codex Responses
-  proxy. Codex subprocesses inherit only the proxy-backed `CODEX_HOME`, not the
-  raw API key.
+- `OPENAI_API_KEY`: OpenAI API key used to authenticate Codex. Review jobs use
+  a per-job local Responses proxy, while repair execution uses an isolated
+  login-authenticated `CODEX_HOME`; Codex subprocesses never inherit the raw
+  API key.
 - `CLAWSWEEPER_APP_CLIENT_ID`: public GitHub App client ID for `clawsweeper`.
   Currently `Iv23liOECG0slfuhz093`.
 - `CLAWSWEEPER_APP_PRIVATE_KEY`: private key for `clawsweeper`; plan/review
@@ -821,10 +822,11 @@ Required secrets:
 
 Token flow:
 
-- Review jobs create an isolated per-run `CODEX_HOME`; steerable repair jobs
-  use a stable per-work cache path. Both start a local Responses proxy from
-  `OPENAI_API_KEY`, write proxy-only Codex config there, and run Codex without
-  OpenAI or Codex token environment variables.
+- Review jobs create an isolated per-run `CODEX_HOME` and start a local
+  Responses proxy from `OPENAI_API_KEY`. Steerable repair jobs use a stable
+  per-work login-authenticated Codex home and explicitly stop any stale proxy
+  before trusted Codex work. Both run Codex without OpenAI or Codex token
+  environment variables.
 - Steerable repair jobs cache only the app-server `sessions/` directory and
   ClawSweeper thread-id file. Planning and execution resume the same logical
   Codex thread; CrabFleet credentials stay in the wrapper and are stripped
@@ -847,7 +849,11 @@ Token flow:
   revision, `origin/main`, output branch and operation, and action identity
   before Codex execution. The execution runner receives no GitHub or state
   write credential and can only prepare a local commit, tree, and Git bundle.
-  Target dependency setup disables package lifecycle scripts.
+  Target dependency setup disables package lifecycle scripts and runs as a
+  dedicated unprivileged account with a private home that cannot read the
+  trusted Codex config. Validation commands additionally run in a separate
+  network namespace, so target code cannot reach host-local credential
+  proxies.
 - A separate no-credential runner reconstructs the prepared commit in a
   disposable checkout and replays the original normalized staged-proof plan,
   including provenance, prerequisites, subsumption, and changed-gate
