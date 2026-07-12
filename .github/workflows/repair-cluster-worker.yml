@@ -198,6 +198,8 @@ jobs:
           sparse-checkout: jobs
           persist-credentials: "false"
 
+      - uses: ./.github/actions/setup-action-ledger
+
       - name: Check job file
         id: check_job
         env:
@@ -227,6 +229,7 @@ jobs:
           echo "CLAWSWEEPER_CODEX_THREAD_STATE=$codex_home/clawsweeper-thread-state.json" >> "$GITHUB_ENV"
 
       - uses: ./.github/actions/setup-pnpm
+        id: cluster-setup-pnpm
         if: ${{ steps.check_job.outputs.job_exists == '1' }}
         with:
           build-script: build:repair
@@ -394,6 +397,20 @@ jobs:
         if: ${{ failure() && steps.crabfleet_session.outcome == 'success' }}
         continue-on-error: true
         run: pnpm run repair:action-session -- update --state blocked --phase planning_failed --summary "Planning Action failed" --completion-reason action_failed
+
+      - name: Finalize cluster repair action ledger
+        if: ${{ always() && steps.cluster-setup-pnpm.outcome == 'success' }}
+        run: pnpm run --silent repair:action-ledger -- finalize
+
+      - name: Upload cluster repair action ledger
+        if: ${{ always() && steps.cluster-setup-pnpm.outcome == 'success' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: clawsweeper-repair-action-ledger-cluster-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .clawsweeper-repair/action-ledger-state/**
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 90
 
   authorize:
     name: Bind immutable execution handoff
@@ -1229,7 +1246,10 @@ jobs:
           filter: blob:none
           persist-credentials: false
 
+      - uses: ./.github/actions/setup-action-ledger
+
       - uses: ./.github/actions/setup-pnpm
+        id: mutate-setup-pnpm
         env:
           npm_config_ignore_scripts: "true"
         with:
@@ -1714,6 +1734,20 @@ jobs:
         continue-on-error: true
         run: pnpm run repair:action-session -- update --state blocked --phase action_failed --summary "Repair Action failed before all completion gates passed" --completion-reason action_failed
 
+      - name: Finalize mutation repair action ledger
+        if: ${{ always() && steps.mutate-setup-pnpm.outcome == 'success' }}
+        run: pnpm run --silent repair:action-ledger -- finalize
+
+      - name: Upload mutation repair action ledger
+        if: ${{ always() && steps.mutate-setup-pnpm.outcome == 'success' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: clawsweeper-repair-action-ledger-mutate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .clawsweeper-repair/action-ledger-state/**
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 90
+
       - name: Fail incomplete post-flight result
         if: ${{ always() && (steps.post_flight.outcome == 'failure' || steps.post_flight.outputs.report_outcome != 'success') }}
         env:
@@ -1722,3 +1756,76 @@ jobs:
         run: |
           echo "post-flight did not complete: ${POST_FLIGHT_OUTCOME:-missing}: ${POST_FLIGHT_DETAIL:-no report detail}" >&2
           exit 1
+
+  publish-repair-action-ledger:
+    name: Publish immutable repair action ledger
+    needs:
+      - cluster
+      - mutate
+    if: ${{ always() && needs.cluster.result != 'skipped' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          filter: blob:none
+          persist-credentials: false
+
+      - name: Create repair action ledger state token
+        id: repair-ledger-state-token
+        uses: ./.github/actions/create-state-token
+        with:
+          client-id: ${{ env.CLAWSWEEPER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
+
+      - uses: ./.github/actions/setup-state
+        with:
+          token: ${{ steps.repair-ledger-state-token.outputs.token }}
+          fetch-depth: 1
+
+      - uses: ./.github/actions/setup-pnpm
+        with:
+          build-script: build:repair
+
+      - name: Download repair action ledger shards
+        id: download-repair-action-ledger
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          pattern: clawsweeper-repair-action-ledger-*
+          path: .clawsweeper-repair/action-ledger-download
+          merge-multiple: true
+
+      - name: Publish immutable repair action ledger
+        if: ${{ steps.download-repair-action-ledger.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          test -n "${CLAWSWEEPER_STATE_DIR:-}"
+          source_root=".clawsweeper-repair/action-ledger-download"
+          event_paths_file=".artifacts/repair-action-ledger-paths.txt"
+          mkdir -p .artifacts
+          pnpm run --silent repair:action-ledger -- publish \
+            --source-root "$source_root" \
+            --state-root "$CLAWSWEEPER_STATE_DIR" |
+            jq -r '.paths[]?' |
+            sort -u > "$event_paths_file"
+          if [ ! -s "$event_paths_file" ]; then
+            echo "No repair action event shards were imported."
+            exit 0
+          fi
+          action_ledger_args=()
+          while IFS= read -r event_path; do
+            durable_event_path="$CLAWSWEEPER_STATE_DIR/$event_path"
+            test -f "$durable_event_path"
+            mkdir -p "$(dirname "$event_path")"
+            cp "$durable_event_path" "$event_path"
+            action_ledger_args+=(--path "$event_path")
+          done < "$event_paths_file"
+          pnpm run repair:publish-main -- \
+            --message "chore: append repair action ledger" \
+            "${action_ledger_args[@]}" \
+            --rebase-strategy normal

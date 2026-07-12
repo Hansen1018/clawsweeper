@@ -1,14 +1,13 @@
 #!/usr/bin/env node
 import path from "node:path";
 
-import { importActionEventShards } from "../action-ledger-runtime.js";
-import { flushCommandActionEvents } from "./command-action-ledger.js";
+import { flushWorkflowActionEvents, importActionEventShards } from "../action-ledger-runtime.js";
 import { repoRoot } from "./paths.js";
 
 const [command, ...argv] = process.argv.slice(2);
 
 if (command === "finalize") {
-  const paths = await flushCommandActionEvents();
+  const paths = await flushWorkflowActionEvents(repoRoot());
   console.log(JSON.stringify({ paths }, null, 2));
 } else if (command === "publish") {
   const args = parseArgs(argv);
