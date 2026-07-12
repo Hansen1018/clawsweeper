@@ -6,7 +6,6 @@ import { parse as parseYaml } from "yaml";
 
 import { runCommand as run } from "./command-runner.js";
 import {
-  currentHead,
   ensureMergeBaseAvailable,
   gitChangedFiles,
   gitLsFiles,
@@ -757,9 +756,18 @@ function proofInputLimits(options: TargetValidationOptions, deadlineAt: number):
 
 function validationSourceIdentity(cwd: string, limits: ProofInputLimits): ValidationSourceIdentity {
   return {
-    headSha: currentHead(cwd),
-    treeSha: run("git", ["rev-parse", "HEAD^{tree}"], { cwd }).trim(),
-    status: run("git", ["status", "--porcelain=v1", "-z", "--untracked-files=all"], { cwd }),
+    headSha: run("git", ["rev-parse", "HEAD"], {
+      cwd,
+      timeoutMs: proofHashingTimeoutMs(limits, "source head"),
+    }).trim(),
+    treeSha: run("git", ["rev-parse", "HEAD^{tree}"], {
+      cwd,
+      timeoutMs: proofHashingTimeoutMs(limits, "source tree"),
+    }).trim(),
+    status: run("git", ["status", "--porcelain=v1", "-z", "--untracked-files=all"], {
+      cwd,
+      timeoutMs: proofHashingTimeoutMs(limits, "source status"),
+    }),
     trackedWorktreeSha256: trackedWorktreeSha256(cwd, limits),
   };
 }
@@ -786,9 +794,18 @@ function validationCheckoutIdentity(
   limits: ProofInputLimits,
 ): ValidationCheckoutIdentity {
   return {
-    headSha: currentHead(cwd),
-    baseSha: run("git", ["rev-parse", baseRef], { cwd }).trim(),
-    status: run("git", ["status", "--porcelain=v1", "-z", "--untracked-files=all"], { cwd }),
+    headSha: run("git", ["rev-parse", "HEAD"], {
+      cwd,
+      timeoutMs: proofHashingTimeoutMs(limits, "checkout head"),
+    }).trim(),
+    baseSha: run("git", ["rev-parse", baseRef], {
+      cwd,
+      timeoutMs: proofHashingTimeoutMs(limits, "checkout base"),
+    }).trim(),
+    status: run("git", ["status", "--porcelain=v1", "-z", "--untracked-files=all"], {
+      cwd,
+      timeoutMs: proofHashingTimeoutMs(limits, "checkout status"),
+    }),
     trackedWorktreeSha256: trackedWorktreeSha256(cwd, limits),
   };
 }
@@ -1252,7 +1269,10 @@ function trackedWorktreeSha256(cwd: string, limits: ProofInputLimits): string {
         updateProofDigest(digest, "gitlink-worktree", "uninitialized");
         continue;
       }
-      const head = run("git", ["-C", absolutePath, "rev-parse", "HEAD"], { cwd }).trim();
+      const head = run("git", ["-C", absolutePath, "rev-parse", "HEAD"], {
+        cwd,
+        timeoutMs: proofHashingTimeoutMs(limits, `gitlink head ${relativePath}`),
+      }).trim();
       if (head !== indexObject) {
         throw new Error(`tracked gitlink worktree head differs from index: ${relativePath}`);
       }

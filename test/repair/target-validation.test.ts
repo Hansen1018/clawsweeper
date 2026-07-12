@@ -2538,6 +2538,62 @@ test("staged proof accepts an uninitialized gitlink bound by the parent index", 
   }
 });
 
+test("staged proof bounds a slow checkout status probe by its remaining budget", () => {
+  const cwd = gitPackageFixture({});
+  git(cwd, "add", ".");
+  git(cwd, "commit", "-m", "initial");
+  attachOrigin(cwd);
+
+  withStallingGit(`args[0] === "status" && args.includes("--untracked-files=all")`, () => {
+    assert.throws(
+      () =>
+        runStagedValidationProof(
+          ["git diff --check"],
+          cwd,
+          validationOptions("steipete/example", {
+            proofBudgetMs: 500,
+            validationTimeoutMs: 1_000,
+            toolchain: {
+              packageManager: "pnpm",
+              baseValidationCommands: [],
+              changedGate: null,
+            },
+          }),
+        ),
+      /command timed out after \d+ms: git status --porcelain=v1 -z --untracked-files=all/,
+    );
+  });
+});
+
+test("staged proof bounds a slow initialized gitlink head probe by its remaining budget", () => {
+  const { cwd, gitlinkPath } = initializedGitlinkFixture();
+
+  withStallingGit(
+    `args[0] === "-C" && path.resolve(args[1]) === ${JSON.stringify(
+      path.resolve(gitlinkPath),
+    )} && args[2] === "rev-parse" && args[3] === "HEAD"`,
+    () => {
+      assert.throws(
+        () =>
+          runStagedValidationProof(
+            ["git diff --check"],
+            cwd,
+            validationOptions("steipete/example", {
+              proofBudgetMs: 500,
+              validationTimeoutMs: 1_000,
+              toolchain: {
+                packageManager: "pnpm",
+                baseValidationCommands: [],
+                changedGate: null,
+              },
+            }),
+          ),
+        /command timed out after \d+ms: git -C .* rev-parse HEAD/,
+      );
+    },
+  );
+});
+
 test("staged proof charges a bounded gitlink child probe to the entry budget", () => {
   const { cwd, gitlinkPath } = uninitializedGitlinkFixture();
   fs.writeFileSync(path.join(gitlinkPath, "unexpected"), "not initialized\n");
@@ -3461,7 +3517,53 @@ function uninitializedGitlinkFixture() {
   const checkoutRoot = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-gitlink-checkout-"));
   const cwd = path.join(checkoutRoot, "repo");
   execFileSync("git", ["clone", "--branch", "main", origin, cwd], { encoding: "utf8" });
-  return { cwd, gitlinkPath: path.join(cwd, "vendor", "submodule") };
+  return {
+    cwd,
+    gitlinkPath: path.join(cwd, "vendor", "submodule"),
+    source,
+    gitlinkCommit,
+  };
+}
+
+function initializedGitlinkFixture() {
+  const fixture = uninitializedGitlinkFixture();
+  execFileSync("git", ["clone", fixture.source, fixture.gitlinkPath], { encoding: "utf8" });
+  git(fixture.gitlinkPath, "checkout", "--detach", fixture.gitlinkCommit);
+  return fixture;
+}
+
+function withStallingGit(condition, callback) {
+  const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-stalling-git-"));
+  const realGit = execFileSync(process.platform === "win32" ? "where" : "which", ["git"], {
+    encoding: "utf8",
+  })
+    .split(/\r?\n/)[0]
+    .trim();
+  writeNodeCommandShim(
+    binDir,
+    "git",
+    `#!/usr/bin/env node
+const path = require("node:path");
+const { spawnSync } = require("node:child_process");
+const args = process.argv.slice(2);
+if (${condition}) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2_000);
+}
+const child = spawnSync(${JSON.stringify(realGit)}, args, { stdio: "inherit" });
+if (child.error) throw child.error;
+process.exit(child.status ?? 1);
+`,
+  );
+  const previousGitBin = process.env.GIT_BIN;
+  const previousGitBinArgs = process.env.GIT_BIN_ARGS;
+  process.env.GIT_BIN = path.join(binDir, "git.js");
+  delete process.env.GIT_BIN_ARGS;
+  try {
+    callback();
+  } finally {
+    restoreEnv("GIT_BIN", previousGitBin);
+    restoreEnv("GIT_BIN_ARGS", previousGitBinArgs);
+  }
 }
 
 function instrumentProofDirectory(directoryPath, onRead = () => {}) {
