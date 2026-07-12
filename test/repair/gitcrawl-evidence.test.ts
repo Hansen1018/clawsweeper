@@ -44,6 +44,7 @@ import {
 import {
   assertGitcrawlThreadSafetyProjectionMatches,
   deriveGitcrawlThreadPolicySignals,
+  stripGitcrawlHtmlComments,
 } from "../../dist/repair/gitcrawl-evidence-policy.js";
 import { fsyncGitcrawlDirectory } from "../../dist/repair/gitcrawl-filesystem.js";
 import {
@@ -1383,6 +1384,20 @@ test("Gitcrawl blank-template scoring requires empty template answers", () => {
     ).blankTemplate,
     false,
   );
+});
+
+test("Gitcrawl HTML comment stripping cannot reconstruct an injection marker", () => {
+  const boundaryMarker = stripGitcrawlHtmlComments("<!<!-- hidden instructions -->--");
+  assert.equal(boundaryMarker, "<!\n--");
+  assert.doesNotMatch(boundaryMarker, /<!--/);
+
+  const adjacentComments = stripGitcrawlHtmlComments("<!-- first --><!-- second -->");
+  assert.equal(adjacentComments, "\n\n");
+  assert.doesNotMatch(adjacentComments, /<!--/);
+
+  const unterminatedComment = stripGitcrawlHtmlComments("visible<!-- hidden");
+  assert.equal(unterminatedComment, "visible\n");
+  assert.doesNotMatch(unterminatedComment, /<!--/);
 });
 
 test("Gitcrawl review evidence rejects malformed detail and file timestamps", async () => {

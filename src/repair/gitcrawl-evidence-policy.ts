@@ -72,7 +72,7 @@ function blankTemplateSignal(body: string): boolean {
   const answers: string[] = [];
   let active = false;
   let substantiveOutsideTemplate = false;
-  const withoutComments = body.replace(/<!--[\s\S]*?-->/g, "");
+  const withoutComments = stripGitcrawlHtmlComments(body);
   for (const line of withoutComments.split(/\r?\n/)) {
     const match = /^\s*(?:[-*]\s*)?([^:]+):\s*(.*)$/.exec(line);
     const label = match?.[1]?.trim().replace(/[–—]/g, "-");
@@ -117,8 +117,7 @@ function templatePreambleLineIsBlank(line: string): boolean {
 }
 
 function templateAnswerIsBlank(answer: string): boolean {
-  const normalized = answer
-    .replace(/<!--[\s\S]*?-->/g, "")
+  const normalized = stripGitcrawlHtmlComments(answer)
     .replace(/^[-*_`\s]+|[-*_`\s]+$/g, "")
     .trim()
     .toLowerCase();
@@ -128,4 +127,21 @@ function templateAnswerIsBlank(answer: string): boolean {
     normalized === "none" ||
     normalized === "no response"
   );
+}
+
+export function stripGitcrawlHtmlComments(value: string): string {
+  const chunks: string[] = [];
+  let cursor = 0;
+  while (cursor < value.length) {
+    const commentStart = value.indexOf("<!--", cursor);
+    if (commentStart === -1) {
+      chunks.push(value.slice(cursor));
+      break;
+    }
+    chunks.push(value.slice(cursor, commentStart), "\n");
+    const commentEnd = value.indexOf("-->", commentStart + 4);
+    if (commentEnd === -1) break;
+    cursor = commentEnd + 3;
+  }
+  return chunks.join("");
 }
