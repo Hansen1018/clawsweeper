@@ -274,9 +274,12 @@ function numberSet(value: JsonValue, name: string): Set<number> {
   for (const item of String(value ?? "").split(",")) {
     const trimmed = item.trim();
     if (!trimmed) continue;
+    if (!/^[1-9]\d*$/.test(trimmed)) {
+      throw new Error(`invalid ${name}: expected canonical positive integer, got ${trimmed}`);
+    }
     const number = Number(trimmed);
-    if (!Number.isInteger(number) || number <= 0) {
-      throw new Error(`invalid ${name}: expected positive integer, got ${trimmed}`);
+    if (!Number.isSafeInteger(number)) {
+      throw new Error(`invalid ${name}: expected safe positive integer, got ${trimmed}`);
     }
     numbers.add(number);
   }

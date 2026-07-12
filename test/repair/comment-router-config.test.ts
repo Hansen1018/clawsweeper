@@ -138,3 +138,20 @@ test("comment router config validates synthetic sweep continuation cursors", () 
     /invalid repair-loop-sweep-after/,
   );
 });
+
+test("comment router config rejects noncanonical item number representations", () => {
+  const base = {
+    repo: "openclaw/example",
+    "repair-repo": "openclaw/clawsweeper",
+    "review-repo": "openclaw/clawsweeper",
+  };
+  const config = readCommentRouterConfig({ ...base, "item-numbers": "42, 43" });
+  assert.deepEqual(config.itemNumbers, new Set([42, 43]));
+
+  for (const itemNumbers of ["042", "42.0", "4.2e1", "9007199254740992"]) {
+    assert.throws(
+      () => readCommentRouterConfig({ ...base, "item-numbers": itemNumbers }),
+      /invalid item-numbers/,
+    );
+  }
+});

@@ -85,14 +85,53 @@ env:
   CLAWSWEEPER_APP_CLIENT_ID: Iv23liOECG0slfuhz093
   CLAWSWEEPER_UNSPONSORED_FEATURE_CLOSE_ENABLED: ${{ vars.CLAWSWEEPER_UNSPONSORED_FEATURE_CLOSE_ENABLED || 'false' }}
 
-concurrency:
-  group: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.item_number && format('repair-comment-router-{0}-item-{1}', github.event.client_payload.target_repo || 'openclaw/openclaw', github.event.client_payload.item_number) || github.event_name == 'workflow_dispatch' && inputs.item_numbers != '' && !contains(inputs.item_numbers, ',') && format('repair-comment-router-{0}-item-{1}', inputs.target_repo || 'openclaw/openclaw', inputs.item_numbers) || format('repair-comment-router-{0}-scan', github.event.inputs.target_repo || github.event.client_payload.target_repo || 'openclaw/openclaw') }}
-  cancel-in-progress: false
-
 jobs:
+  normalize-lane:
+    runs-on: ubuntu-latest
+    outputs:
+      concurrency_group: ${{ steps.lane.outputs.concurrency_group }}
+    steps:
+      - name: Normalize exact item lane
+        id: lane
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REPOSITORY_DISPATCH_ITEM_NUMBER: ${{ github.event.client_payload.item_number }}
+          WORKFLOW_DISPATCH_ITEM_NUMBERS: ${{ inputs.item_numbers }}
+          TARGET_REPO: ${{ github.event_name == 'workflow_dispatch' && inputs.target_repo || github.event_name == 'repository_dispatch' && github.event.client_payload.target_repo || vars.CLAWSWEEPER_TARGET_REPO || 'openclaw/openclaw' }}
+        run: |
+          set -euo pipefail
+          target_repo="${TARGET_REPO:-openclaw/openclaw}"
+          if ! printf '%s' "$target_repo" | grep -Eq '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'; then
+            echo "Invalid target_repo: $target_repo" >&2
+            exit 1
+          fi
+          target_repo="$(printf '%s' "$target_repo" | tr '[:upper:]' '[:lower:]')"
+          item_number=""
+          if [ "$EVENT_NAME" = "repository_dispatch" ]; then
+            item_number="${REPOSITORY_DISPATCH_ITEM_NUMBER:-}"
+          elif [ "$EVENT_NAME" = "workflow_dispatch" ] &&
+               [[ "${WORKFLOW_DISPATCH_ITEM_NUMBERS:-}" != *,* ]]; then
+            item_number="${WORKFLOW_DISPATCH_ITEM_NUMBERS:-}"
+          fi
+          if [ -n "$item_number" ]; then
+            if ! printf '%s' "$item_number" | grep -Eq '^[1-9][0-9]*$' ||
+               ! node -e 'const n = Number(process.argv[1]); process.exit(Number.isSafeInteger(n) && String(n) === process.argv[1] ? 0 : 1)' "$item_number"; then
+              echo "Invalid exact item number: expected canonical positive decimal, got $item_number" >&2
+              exit 1
+            fi
+            concurrency_group="repair-comment-router-$target_repo-item-$item_number"
+          else
+            concurrency_group="repair-comment-router-$target_repo-scan"
+          fi
+          echo "concurrency_group=$concurrency_group" >> "$GITHUB_OUTPUT"
+
   route-comments:
+    needs: normalize-lane
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    concurrency:
+      group: ${{ needs.normalize-lane.outputs.concurrency_group }}
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v7
         with:

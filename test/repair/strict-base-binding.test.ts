@@ -604,18 +604,34 @@ test("repair execution and validation cannot mutate GitHub before trusted public
 test("exact router dispatch concurrency is item-specific and cannot replace another item", () => {
   const source = fs.readFileSync(".github/workflows/repair-comment-router.yml", "utf8");
   const workflow = readWorkflow(".github/workflows/repair-comment-router.yml");
-  const group = String(workflow.concurrency?.group ?? "");
+  const normalize = workflow.jobs?.["normalize-lane"];
+  const route = workflow.jobs?.["route-comments"];
+  const group = String(route?.concurrency?.group ?? "");
 
-  assert.match(group, /github\.event\.client_payload\.item_number/);
-  assert.match(group, /inputs\.item_numbers/);
+  assert.ok(normalize);
+  assert.equal(workflow.concurrency, undefined);
+  assert.equal(route?.needs, "normalize-lane");
+  assert.match(group, /needs\.normalize-lane\.outputs\.concurrency_group/);
   assert.doesNotMatch(group, /comment_id|items-\{1\}/);
-  assert.equal(workflow.concurrency?.["cancel-in-progress"], false);
+  assert.equal(route?.concurrency?.["cancel-in-progress"], false);
   assert.match(
     source,
-    /format\('repair-comment-router-\{0\}-item-\{1\}'.*github\.event\.client_payload\.item_number/,
+    /REPOSITORY_DISPATCH_ITEM_NUMBER:.*github\.event\.client_payload\.item_number/,
   );
-  assert.match(source, /format\('repair-comment-router-\{0\}-item-\{1\}'.*inputs\.item_numbers/);
-  assert.match(source, /format\('repair-comment-router-\{0\}-scan'/);
+  assert.match(
+    source,
+    /WORKFLOW_DISPATCH_ITEM_NUMBERS:.*inputs\.item_numbers[\s\S]*EVENT_NAME" = "repository_dispatch"[\s\S]*EVENT_NAME" = "workflow_dispatch"/,
+  );
+  assert.match(
+    source,
+    /grep -Eq '\^\[1-9\]\[0-9\]\*\$'[\s\S]*Number\.isSafeInteger\(n\)[\s\S]*String\(n\) === process\.argv\[1\]/,
+  );
+  assert.match(
+    source,
+    /concurrency_group="repair-comment-router-\$target_repo-item-\$item_number"/,
+  );
+  assert.match(source, /concurrency_group="repair-comment-router-\$target_repo-scan"/);
+  assert.match(source, /group: \$\{\{ needs\.normalize-lane\.outputs\.concurrency_group \}\}/);
   assert.match(
     source,
     /Dispatch discovered items through exact router lanes[\s\S]*-f item_numbers="\$item_number"/,
@@ -840,7 +856,18 @@ type Workflow = {
     group?: string;
     "cancel-in-progress"?: boolean;
   };
-  jobs?: Record<string, { if?: string; steps?: WorkflowStep[] }>;
+  jobs?: Record<
+    string,
+    {
+      if?: string;
+      needs?: string;
+      concurrency?: {
+        group?: string;
+        "cancel-in-progress"?: boolean;
+      };
+      steps?: WorkflowStep[];
+    }
+  >;
 };
 
 function readWorkflow(file: string): Workflow {

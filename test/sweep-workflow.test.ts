@@ -467,18 +467,22 @@ test("exact event publish and routing require a successful fresh review artifact
   assert.match(routeStep, /-f target_repo="\$TARGET_REPO"/);
   assert.match(routeStep, /-f target_branch="\$TARGET_BRANCH"/);
   assert.match(routeStep, /-f item_numbers="\$ITEM_NUMBER"/);
-  assert.match(routerWorkflow, /repair-comment-router-\{0\}-item-\{1\}/);
-  assert.doesNotMatch(routerWorkflow, /repair-comment-router-\{0\}-item-\{1\}-comment-\{2\}/);
-  assert.doesNotMatch(routerWorkflow, /repair-comment-router-\{0\}-items-\{1\}/);
-  assert.match(routerWorkflow, /repair-comment-router-\{0\}-scan/);
+  assert.match(
+    routerWorkflow,
+    /concurrency_group="repair-comment-router-\$target_repo-item-\$item_number"/,
+  );
+  assert.doesNotMatch(routerWorkflow, /item-\$item_number-comment-/);
+  assert.doesNotMatch(routerWorkflow, /concurrency_group=.*-items-/);
+  assert.match(routerWorkflow, /concurrency_group="repair-comment-router-\$target_repo-scan"/);
   assert.match(
     routerWorkflow,
     /Dispatch discovered items through exact router lanes[\s\S]*-f item_numbers="\$item_number"/,
   );
   assert.match(routerWorkflow, /cancel-in-progress: false/);
   assert.ok(
-    routerWorkflow.indexOf("repair-comment-router-{0}-item-{1}") <
-      routerWorkflow.indexOf("repair-comment-router-{0}-scan"),
+    routerWorkflow.indexOf(
+      'concurrency_group="repair-comment-router-$target_repo-item-$item_number"',
+    ) < routerWorkflow.indexOf('concurrency_group="repair-comment-router-$target_repo-scan"'),
   );
   assert.match(
     eventReviewJob,
