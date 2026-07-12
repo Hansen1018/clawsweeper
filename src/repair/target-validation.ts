@@ -835,6 +835,7 @@ function validationProofInputSnapshot(
   const root = fs.realpathSync(cwd);
   const entries = new Map<string, string>();
   const visitedPaths = new Set<string>();
+  const state: ProofTraversalState = { bytes: 0, entries: 0 };
   for (const [name, value] of Object.entries(limits)) {
     if (!Number.isSafeInteger(value) || value <= 0) {
       throw new Error(`proof input ${name} must be a positive integer`);
@@ -843,7 +844,7 @@ function validationProofInputSnapshot(
 
   const visit = (relativePath: string) => {
     if (visitedPaths.has(relativePath)) return;
-    assertProofInputTraversalBudget(relativePath, visitedPaths.size, limits);
+    consumeProofInputTraversalEntry(relativePath, state, limits);
     visitedPaths.add(relativePath);
     const entryPath = proofInputPath(root, relativePath);
     const stat = fs.lstatSync(entryPath, { bigint: true });
@@ -871,7 +872,7 @@ function validationProofInputSnapshot(
     const children = readProofInputSnapshotDirectory(
       entryPath,
       relativePath,
-      visitedPaths.size,
+      state.entries,
       limits,
     );
     entries.set(`${relativePath}\0children`, children.join("\0"));
@@ -882,7 +883,11 @@ function validationProofInputSnapshot(
 
   for (const relativePath of validationProofInputCandidates(cwd, commands)) {
     if (proofInputLstat(root, relativePath)) visit(relativePath);
-    else entries.set(relativePath, ABSENT_PROOF_INPUT);
+    else {
+      consumeProofInputTraversalEntry(relativePath, state, limits);
+      visitedPaths.add(relativePath);
+      entries.set(relativePath, ABSENT_PROOF_INPUT);
+    }
   }
   return { entries };
 }
@@ -925,6 +930,20 @@ function assertProofInputTraversalBudget(
   if (depth > limits.maxDepth) {
     throw new Error(`proof input traversal exceeded the supported depth budget at ${relativePath}`);
   }
+}
+
+function consumeProofInputTraversalEntry(
+  relativePath: string,
+  state: ProofTraversalState,
+  limits: ProofInputLimits,
+) {
+  assertProofInputTraversalBudget(relativePath, state.entries, limits);
+  const bytes = Buffer.byteLength(relativePath);
+  if (state.bytes + bytes > limits.maxBytes) {
+    throw new Error(`proof input traversal exceeded the supported byte budget at ${relativePath}`);
+  }
+  state.bytes += bytes;
+  state.entries += 1;
 }
 
 function assertProofInputTraversalDeadline(relativePath: string, limits: ProofInputLimits) {

@@ -2786,6 +2786,77 @@ for (const mode of ["initial", "replay"]) {
   });
 }
 
+test("staged proof charges absent snapshot candidates to every traversal budget", () => {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-absent-proof-inputs-"));
+  fs.writeFileSync(path.join(cwd, "tracked.txt"), "");
+  git(cwd, "init", "-b", "main");
+  git(cwd, "config", "user.email", "clawsweeper@example.invalid");
+  git(cwd, "config", "user.name", "ClawSweeper Test");
+  git(cwd, "add", ".");
+  git(cwd, "commit", "-m", "initial");
+  attachOrigin(cwd);
+  const baseOptions = {
+    toolchain: {
+      packageManager: "pnpm",
+      baseValidationCommands: [],
+      changedGate: null,
+    },
+  };
+
+  assert.throws(
+    () =>
+      runStagedValidationProof(
+        ["git diff --check"],
+        cwd,
+        validationOptions("steipete/example", {
+          ...baseOptions,
+          proofInputMaxEntries: 1,
+        }),
+      ),
+    /proof input traversal exceeded the supported entry budget/,
+  );
+  assert.throws(
+    () =>
+      runStagedValidationProof(
+        ["git diff --check"],
+        cwd,
+        validationOptions("steipete/example", {
+          ...baseOptions,
+          proofInputMaxBytes: 1,
+        }),
+      ),
+    /proof input traversal exceeded the supported byte budget/,
+  );
+
+  const originalLstatSync = fs.lstatSync;
+  const originalNow = Date.now;
+  const watchedEnvPath = path.join(fs.realpathSync(cwd), ".env");
+  let expired = false;
+  fs.lstatSync = function (...args) {
+    if (path.resolve(String(args[0])) === watchedEnvPath) expired = true;
+    return Reflect.apply(originalLstatSync, fs, args);
+  };
+  Date.now = () => (expired ? 1_101 : 1_000);
+  try {
+    assert.throws(
+      () =>
+        runStagedValidationProof(
+          ["git diff --check"],
+          cwd,
+          validationOptions("steipete/example", {
+            ...baseOptions,
+            proofBudgetMs: 100,
+            validationTimeoutMs: 1_000,
+          }),
+        ),
+      /staged proof runtime budget exhausted before proof input snapshot completed: .env/,
+    );
+  } finally {
+    fs.lstatSync = originalLstatSync;
+    Date.now = originalNow;
+  }
+});
+
 test("staged proof budget includes checkout and recursive proof-input sealing", () => {
   const cwd = gitPackageFixture({ verify: "node --test" });
   fs.mkdirSync(path.join(cwd, "node_modules", "fixture"), { recursive: true });
