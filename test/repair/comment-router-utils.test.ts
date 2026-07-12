@@ -27,6 +27,7 @@ import {
   routerFanoutItemNumbers,
   routerPendingItemNumbers,
   selectCommentsForRouting,
+  selectRouterCommentItemPage,
   selectRouterItemFanoutPage,
   shouldSuppressProcessedCommentVersion,
   sortCommentsForRouting,
@@ -313,6 +314,42 @@ test("combined router item fanout stays bounded across continuations without sta
     pages.flatMap((page) => page.itemNumbers),
     [42, 43, 44, 45, 46],
   );
+});
+
+test("broad comment discovery pages distinct items before applying comment budgets", () => {
+  const hotItemComments = Array.from({ length: 250 }, (_, index) => ({
+    id: 10_000 - index,
+    issue_url: "https://api.github.com/repos/openclaw/openclaw/issues/42",
+    updated_at: new Date(Date.UTC(2026, 6, 12, 20, 0, 0) - index * 1_000).toISOString(),
+  }));
+  const olderQuietItem = {
+    id: 1,
+    issue_url: "https://api.github.com/repos/openclaw/openclaw/issues/43",
+    updated_at: "2026-07-11T20:00:00Z",
+  };
+  const comments = [...hotItemComments, olderQuietItem];
+
+  const first = selectRouterCommentItemPage({
+    comments,
+    after: null,
+    limit: 1,
+  });
+  const second = selectRouterCommentItemPage({
+    comments,
+    after: first.nextAfterItemNumber,
+    limit: 1,
+  });
+
+  assert.deepEqual(first, {
+    itemNumbers: [42],
+    candidateCount: 2,
+    nextAfterItemNumber: 42,
+  });
+  assert.deepEqual(second, {
+    itemNumbers: [43],
+    candidateCount: 1,
+    nextAfterItemNumber: null,
+  });
 });
 
 test("router item fanout reports only final actionable selections", () => {

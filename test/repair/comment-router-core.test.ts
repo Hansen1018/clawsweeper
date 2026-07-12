@@ -1575,22 +1575,29 @@ test("forced exact-item replay scopes forwarded comment ids before item-wide rec
   );
 });
 
-test("broad router selects its cursor page before bounded durable comment hydration", () => {
+test("broad router selects distinct item cursors before bounded comment hydration", () => {
   const source = readFileSync("src/repair/comment-router.ts", "utf8");
   const candidates = source.slice(
     source.indexOf("function listCandidateComments()"),
     source.indexOf("function forwardedExactComments()"),
   );
-  const page = candidates.indexOf("const broadPage = selectRouterItemFanoutPage({");
+  const recentDiscovery = candidates.indexOf("const recentComments = listRecentComments();");
+  const page = candidates.indexOf("const broadPage = selectRouterCommentItemPage({");
   const durableHydration = candidates.indexOf(
     "const durable = listDurableRouterComments(broadPage.itemNumbers)",
   );
 
+  assert.ok(recentDiscovery >= 0);
   assert.ok(page >= 0);
+  assert.ok(page > recentDiscovery);
   assert.ok(durableHydration > page);
+  assert.doesNotMatch(
+    candidates.slice(recentDiscovery, page),
+    /selectCommentsForRouting\(\{[\s\S]*recentComments/,
+  );
   assert.match(
     candidates,
-    /routerPendingItemNumbers\(ledger\.commands \?\? \[\], targetRepo\)[\s\S]*after: routerFanoutAfter[\s\S]*limit: maxComments/,
+    /comments: recentComments,[\s\S]*routerPendingItemNumbers\(ledger\.commands \?\? \[\], targetRepo\)[\s\S]*after: routerFanoutAfter[\s\S]*limit: maxComments/,
   );
   const durable = source.slice(
     source.indexOf("function listDurableRouterComments"),

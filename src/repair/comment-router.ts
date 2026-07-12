@@ -109,6 +109,7 @@ import {
   routerFanoutItemNumbers,
   routerPendingItemNumbers,
   selectCommentsForRouting,
+  selectRouterCommentItemPage,
   selectRouterItemFanoutPage,
   shouldSuppressProcessedCommentVersion,
   stageSelectedRouterCommands,
@@ -4346,15 +4347,11 @@ function listCandidateComments() {
     };
   }
 
-  const recentComments = selectCommentsForRouting({
-    recentComments: listRecentComments(),
-    durableComments: [],
-    maxComments,
-  });
+  const recentComments = listRecentComments();
   const repairLoopTargets = listRepairLoopTargets();
-  const broadPage = selectRouterItemFanoutPage({
-    itemNumbers: [
-      ...recentComments.map((comment) => issueNumberFromUrl(comment.issue_url)),
+  const broadPage = selectRouterCommentItemPage({
+    comments: recentComments,
+    additionalItemNumbers: [
       ...repairLoopTargets.map((target) => target.number),
       ...routerPendingItemNumbers(ledger.commands ?? [], targetRepo),
     ],

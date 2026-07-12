@@ -1033,6 +1033,27 @@ export function selectRouterItemFanoutPage({
   };
 }
 
+export function selectRouterCommentItemPage({
+  comments,
+  additionalItemNumbers = [],
+  after,
+  limit,
+}: {
+  comments: LooseRecord[];
+  additionalItemNumbers?: Iterable<number>;
+  after: number | null;
+  limit: number;
+}) {
+  return selectRouterItemFanoutPage({
+    itemNumbers: [
+      ...comments.map((comment) => issueNumberFromUrl(comment.issue_url)),
+      ...additionalItemNumbers,
+    ],
+    after,
+    limit,
+  });
+}
+
 export function finalizeRouterItemFanout(
   page: ReturnType<typeof selectRouterItemFanoutPage>,
   commands: LooseRecord[],
