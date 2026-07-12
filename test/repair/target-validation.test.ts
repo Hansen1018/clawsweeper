@@ -6,6 +6,7 @@ import path from "node:path";
 import test from "node:test";
 
 import {
+  DEFAULT_PROOF_INPUT_MAX_ENTRIES,
   buildTargetValidationProofPlan,
   canSkipInternalCodexReviewForRepairDelta,
   classifyExternalBaseValidationFailure,
@@ -38,6 +39,10 @@ import {
 import { mockCommandBinEnv } from "../helpers.ts";
 
 const FAKE_TOOLCHAIN_TIMEOUT_MS = 15_000;
+
+test("default staged proof entry budget covers a supported OpenClaw install", () => {
+  assert.ok(DEFAULT_PROOF_INPUT_MAX_ENTRIES > 110_301);
+});
 
 test("OpenClaw repairs require changed-surface validation even when omitted", () => {
   const cwd = packageFixture({ "check:changed": "node check.js" });

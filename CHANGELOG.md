@@ -145,8 +145,11 @@ checkpoint, and status-only commits are intentionally omitted.
   capacity gate; separated complete autoclose safety hydration from bounded
   routing discovery; preserved forced replays as durable distinct attempts;
   paged broad discovery by complete distinct-item candidate sets before bounded
-  per-item hydration; and made requeue dispatch identities deterministic across
-  ambiguous retries.
+  newest-first per-item hydration with one reserved candidate per selected
+  item; retained claimed dispatch recovery state during continuation staging;
+  and made requeue dispatch identities deterministic across ambiguous retries.
+- Raised staged-proof entry capacity above supported OpenClaw installs while
+  retaining byte, depth, and deadline traversal bounds.
 - Bounded missing repair handoff retries, terminated deterministic handoff verification failures, removed repository-wide gate mutation from requeue, scoped router comment IDs per item, and bounded post-command proof snapshot verification.
 - Bounded every repair git helper subprocess while retaining the shorter configurable network timeout, ordinary nonzero and signal status semantics, platform-aware command launching, and explicit spawn-error reporting. Thanks @hex-AI12.
 - Waited for the exact dashboard Worker commit to reach the live health endpoint before running post-deploy smoke checks, preventing Cloudflare rollout propagation from producing false CI failures.
