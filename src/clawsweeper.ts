@@ -196,6 +196,7 @@ import {
 import {
   flushWorkflowActionEvents,
   importActionEventShards,
+  interruptOpenWorkflowActionEvents,
   recordWorkflowPhaseEvent,
 } from "./action-ledger-runtime.js";
 
@@ -20215,7 +20216,12 @@ type ReviewActionLedger = {
     reviewPolicy: string;
     shardIndex: number;
     shardCount: number;
-    candidateNumbers: number[];
+    candidateSnapshots: Array<{
+      repository: string;
+      number: number;
+      kind: ItemKind;
+      updatedAt: string;
+    }>;
   };
   batchStartEventId: string | null;
   items: Map<string, ReviewLedgerItem>;
@@ -20286,7 +20292,12 @@ function startReviewActionLedger(options: {
     reviewPolicy: options.reviewPolicy,
     shardIndex: options.shardIndex,
     shardCount: options.shardCount,
-    candidateNumbers: options.candidates.map((item) => item.number),
+    candidateSnapshots: options.candidates.map((item) => ({
+      repository: item.repo,
+      number: item.number,
+      kind: item.kind,
+      updatedAt: item.updatedAt,
+    })),
   };
   const batchStart = recordWorkflowPhaseEvent(ROOT, {
     phase: ACTION_EVENT_TYPES.reviewBatch,
@@ -20385,19 +20396,19 @@ function recordReviewLogPublication(options: {
           .map((name) => actionLedgerFileEvidence("review_log", join(options.codexWorkDir!, name)))
           .filter((entry): entry is ActionEventEvidence => entry !== null)
       : [];
-  const published = logs.length > 0;
+  const captured = logs.length > 0;
   const event = recordWorkflowPhaseEvent(ROOT, {
     phase: ACTION_EVENT_TYPES.reviewLogPublication,
-    status: published
-      ? ACTION_EVENT_STATUSES.published
+    status: captured
+      ? ACTION_EVENT_STATUSES.completed
       : (options.missingStatus ?? ACTION_EVENT_STATUSES.skipped),
-    reasonCode: published
-      ? ACTION_EVENT_REASON_CODES.published
+    reasonCode: captured
+      ? ACTION_EVENT_REASON_CODES.completed
       : (options.missingReasonCode ??
         (options.cached
           ? ACTION_EVENT_REASON_CODES.notApplicable
           : ACTION_EVENT_REASON_CODES.notFound)),
-    retryable: published ? false : (options.retryable ?? false),
+    retryable: captured ? false : (options.retryable ?? false),
     mutation: false,
     identity: {
       slot: "review_logs",
@@ -20423,7 +20434,7 @@ function recordReviewLogPublication(options: {
       cached: options.cached,
       log_count: logs.length,
       log_kind: "codex",
-      publication_kind: "artifact",
+      publication_kind: "local_artifact",
     },
     privacy: actionLedgerPrivacy(),
   });
@@ -22880,6 +22891,13 @@ type ApplyActionLedger = {
     requestedItemNumbers: number[];
     reportPath: string;
     checkpoint: string;
+    candidateRevisions: Array<{
+      repository: string;
+      number: number;
+      sourceRevision: string;
+      reviewContentDigest: string;
+      decisionPacketSha256: string;
+    }>;
   };
   batchStartEventId: string | null;
   startedAtMs: number;
@@ -22893,7 +22911,7 @@ function startApplyActionLedger(options: {
   syncCommentsOnly: boolean;
   requestedItemNumbers: readonly number[];
   reportPath: string;
-  candidateCount: number;
+  candidates: readonly ReportEntry[];
 }): ApplyActionLedger {
   const operationIdentity = {
     repository: targetRepo(),
@@ -22904,6 +22922,13 @@ function startApplyActionLedger(options: {
     requestedItemNumbers: [...options.requestedItemNumbers],
     reportPath: repoRelativePath(options.reportPath),
     checkpoint: String(process.env.CLAWSWEEPER_APPLY_CHECKPOINT ?? "0"),
+    candidateRevisions: options.candidates.map((entry) => ({
+      repository: entry.repo,
+      number: entry.number,
+      sourceRevision: reviewLeaseRevisionFromReport(entry.markdown) ?? "unknown",
+      reviewContentDigest: frontMatterValue(entry.markdown, "review_content_digest") ?? "unknown",
+      decisionPacketSha256: frontMatterValue(entry.markdown, "decision_packet_sha256") ?? "none",
+    })),
   };
   const batchStart = recordWorkflowPhaseEvent(ROOT, {
     phase: ACTION_EVENT_TYPES.applyBatch,
@@ -22923,7 +22948,7 @@ function startApplyActionLedger(options: {
     },
     evidence: workflowRunEvidence(),
     attributes: {
-      candidate_count: options.candidateCount,
+      candidate_count: options.candidates.length,
       review_mode: options.syncCommentsOnly ? "comment_sync" : "apply",
       work_kind: options.dryRun ? "proof" : "mutation",
     },
@@ -22934,6 +22959,30 @@ function startApplyActionLedger(options: {
     batchStartEventId: batchStart?.event_id ?? null,
     startedAtMs: Date.now(),
     terminal: false,
+  };
+}
+
+function applyItemIdempotencyIdentity(options: {
+  ledger: ApplyActionLedger;
+  repository: string;
+  number: number;
+  entry: ReportEntry | undefined;
+  slot: "apply_item" | "review_comment";
+}) {
+  return {
+    operationIdentity: options.ledger.operationIdentity,
+    slot: options.slot,
+    repository: options.repository,
+    number: options.number,
+    sourceRevision: options.entry
+      ? (reviewLeaseRevisionFromReport(options.entry.markdown) ?? "unknown")
+      : "unknown",
+    reviewContentDigest: options.entry
+      ? (frontMatterValue(options.entry.markdown, "review_content_digest") ?? "unknown")
+      : "unknown",
+    decisionPacketSha256: options.entry
+      ? (frontMatterValue(options.entry.markdown, "decision_packet_sha256") ?? "none")
+      : "none",
   };
 }
 
@@ -23173,11 +23222,13 @@ function recordApplyActionEvents(options: {
       parentEventId: options.ledger.batchStartEventId,
       phaseSeq: 10 + index * 10,
       idempotencyIdentity: {
-        operationIdentity: options.ledger.operationIdentity,
-        slot: "apply_result",
-        index,
-        repository,
-        number: result.number,
+        ...applyItemIdempotencyIdentity({
+          ledger: options.ledger,
+          repository,
+          number: result.number,
+          entry,
+          slot: "apply_item",
+        }),
       },
       component: "apply_decisions",
       subject,
@@ -23226,11 +23277,13 @@ function recordApplyActionEvents(options: {
         parentEventId: actionEvent?.event_id ?? options.ledger.batchStartEventId,
         phaseSeq: 11 + index * 10,
         idempotencyIdentity: {
-          operationIdentity: options.ledger.operationIdentity,
-          slot: "review_comment_publication",
-          index,
-          repository,
-          number: result.number,
+          ...applyItemIdempotencyIdentity({
+            ledger: options.ledger,
+            repository,
+            number: result.number,
+            entry,
+            slot: "review_comment",
+          }),
         },
         component: "apply_decisions",
         subject,
@@ -23272,10 +23325,13 @@ function recordApplyActionEvents(options: {
       parentEventId: options.ledger.batchStartEventId,
       phaseSeq: 900_000,
       idempotencyIdentity: {
-        operationIdentity: options.ledger.operationIdentity,
-        slot: "apply_in_flight_failure",
-        repository: options.inFlightItem.repo,
-        number: options.inFlightItem.number,
+        ...applyItemIdempotencyIdentity({
+          ledger: options.ledger,
+          repository: options.inFlightItem.repo,
+          number: options.inFlightItem.number,
+          entry,
+          slot: "apply_item",
+        }),
       },
       component: "apply_decisions",
       subject:
@@ -23369,9 +23425,9 @@ function recordApplyActionEvents(options: {
   const reportEvidence = actionLedgerFileEvidence("apply_report", options.reportPath);
   recordWorkflowPhaseEvent(ROOT, {
     phase: ACTION_EVENT_TYPES.applyPublish,
-    status: reportEvidence ? ACTION_EVENT_STATUSES.published : ACTION_EVENT_STATUSES.skipped,
+    status: reportEvidence ? ACTION_EVENT_STATUSES.completed : ACTION_EVENT_STATUSES.skipped,
     reasonCode: reportEvidence
-      ? ACTION_EVENT_REASON_CODES.published
+      ? ACTION_EVENT_REASON_CODES.completed
       : ACTION_EVENT_REASON_CODES.notFound,
     retryable: !reportEvidence,
     mutation: false,
@@ -23394,7 +23450,7 @@ function recordApplyActionEvents(options: {
     },
     evidence: [...workflowRunEvidence(), ...(reportEvidence ? [reportEvidence] : [])],
     attributes: {
-      publication_kind: "apply_report",
+      publication_kind: "local_report",
       result_count: options.results.length,
       partial,
     },
@@ -23565,7 +23621,7 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
     syncCommentsOnly,
     requestedItemNumbers,
     reportPath,
-    candidateCount: fileEntries.length,
+    candidates: fileEntries,
   });
   const mutationByItem = new Map<string, boolean>();
   let activeApplyItem: { repo: string; number: number; mutationOccurred: boolean } | null = null;
@@ -26779,10 +26835,10 @@ function applyArtifactsCommand(args: Args): void {
       },
       evidence: workflowRunEvidence(),
       attributes: {
-        published_count: appliedArtifacts,
+        action_count: appliedArtifacts,
         skipped_count: skippedClosedArtifacts,
         failed_count: failure ? 1 : 0,
-        publication_kind: "review_record",
+        publication_kind: "state_worktree",
         partial:
           failure !== null
             ? appliedArtifacts > 0 || interruptedMutation
@@ -26869,8 +26925,8 @@ function applyArtifactsCommand(args: Args): void {
           markdown: syncedMarkdown,
           reportPath,
           number,
-          status: ACTION_EVENT_STATUSES.published,
-          reasonCode: ACTION_EVENT_REASON_CODES.published,
+          status: ACTION_EVENT_STATUSES.completed,
+          reasonCode: ACTION_EVENT_REASON_CODES.completed,
           mutation: true,
           destination,
         });
@@ -28702,11 +28758,30 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     else if (command === "assist-validate") assistValidateArtifactCommand(args);
     else if (command === "assist-publish") assistPublishCommand(args);
     else if (command === "check") checkCommand();
-    else if (command !== "finalize-action-events")
-      throw new UserFacingCommandError(`Unknown command: ${command}`);
+    else if (command === "finalize-action-events") {
+      if (boolArg(args.interrupt_open_attempts)) {
+        const reason = stringArg(args.reason, ACTION_EVENT_REASON_CODES.timeout);
+        if (reason !== ACTION_EVENT_REASON_CODES.timeout) {
+          throw new UserFacingCommandError(
+            `Unsupported --reason for interrupted action events: ${reason}`,
+          );
+        }
+        const interrupted = interruptOpenWorkflowActionEvents(ROOT, {
+          reasonCode: ACTION_EVENT_REASON_CODES.timeout,
+        });
+        if (interrupted > 0) {
+          console.error(
+            `[action-ledger] recorded ${interrupted} timeout terminal event${
+              interrupted === 1 ? "" : "s"
+            }`,
+          );
+        }
+      }
+    } else throw new UserFacingCommandError(`Unknown command: ${command}`);
   } catch (error) {
     commandError = error;
   }
+  if (command === "finalize-action-events" && commandError) throw commandError;
   try {
     const shardPaths = await flushWorkflowActionEvents(ROOT);
     if (shardPaths.length > 0) {
