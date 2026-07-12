@@ -561,13 +561,27 @@ test("exact router dispatch concurrency is item-specific and cannot replace anot
   const workflow = readWorkflow(".github/workflows/repair-comment-router.yml");
   const group = String(workflow.concurrency?.group ?? "");
 
-  assert.match(group, /github\.event\.client_payload\.comment_id/);
   assert.match(group, /github\.event\.client_payload\.item_number/);
   assert.match(group, /inputs\.item_numbers/);
+  assert.doesNotMatch(group, /comment_id|items-\{1\}/);
   assert.equal(workflow.concurrency?.["cancel-in-progress"], false);
   assert.match(
     source,
     /format\('repair-comment-router-\{0\}-item-\{1\}'.*github\.event\.client_payload\.item_number/,
+  );
+  assert.match(source, /format\('repair-comment-router-\{0\}-item-\{1\}'.*inputs\.item_numbers/);
+  assert.match(source, /format\('repair-comment-router-\{0\}-scan'/);
+  assert.match(
+    source,
+    /Dispatch discovered items through exact router lanes[\s\S]*-f item_numbers="\$item_number"/,
+  );
+  assert.match(
+    source,
+    /Route ClawSweeper comments[\s\S]*repository_dispatch[\s\S]*-n "\$item_numbers"[\s\S]*workflow_dispatch[\s\S]*\[\[ "\$item_numbers" != \*,\* \]\][\s\S]*args\+=\(--execute\)/,
+  );
+  assert.match(
+    source,
+    /Retry waiting repair dispatches[\s\S]*github\.event\.client_payload\.item_number[\s\S]*!contains\(inputs\.item_numbers, ','\)/,
   );
 });
 

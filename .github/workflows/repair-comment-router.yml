@@ -81,7 +81,7 @@ env:
   CLAWSWEEPER_UNSPONSORED_FEATURE_CLOSE_ENABLED: ${{ vars.CLAWSWEEPER_UNSPONSORED_FEATURE_CLOSE_ENABLED || 'false' }}
 
 concurrency:
-  group: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.item_number && github.event.client_payload.comment_id && format('repair-comment-router-{0}-item-{1}-comment-{2}', github.event.client_payload.target_repo || 'openclaw/openclaw', github.event.client_payload.item_number, github.event.client_payload.comment_id) || github.event_name == 'repository_dispatch' && github.event.client_payload.item_number && format('repair-comment-router-{0}-item-{1}', github.event.client_payload.target_repo || 'openclaw/openclaw', github.event.client_payload.item_number) || github.event_name == 'repository_dispatch' && github.event.client_payload.comment_id && format('repair-comment-router-{0}-comment-{1}', github.event.client_payload.target_repo || 'openclaw/openclaw', github.event.client_payload.comment_id) || github.event_name == 'workflow_dispatch' && inputs.item_numbers != '' && format('repair-comment-router-{0}-items-{1}', inputs.target_repo || 'openclaw/openclaw', inputs.item_numbers) || format('repair-comment-router-{0}', github.event.inputs.target_repo || github.event.client_payload.target_repo || 'openclaw/openclaw') }}
+  group: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.item_number && format('repair-comment-router-{0}-item-{1}', github.event.client_payload.target_repo || 'openclaw/openclaw', github.event.client_payload.item_number) || github.event_name == 'workflow_dispatch' && inputs.item_numbers != '' && !contains(inputs.item_numbers, ',') && format('repair-comment-router-{0}-item-{1}', inputs.target_repo || 'openclaw/openclaw', inputs.item_numbers) || format('repair-comment-router-{0}-scan', github.event.inputs.target_repo || github.event.client_payload.target_repo || 'openclaw/openclaw') }}
   cancel-in-progress: false
 
 jobs:
@@ -327,9 +327,11 @@ jobs:
             args+=(--force-reprocess)
             args+=(--attempt-id "$attempt_id")
           fi
-          if { [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.execute }}" = "true" ]; } ||
-             { [ "${{ github.event_name }}" = "repository_dispatch" ]; } ||
-             { [ "${{ github.event_name }}" = "schedule" ] && [ "${{ vars.CLAWSWEEPER_COMMENT_ROUTER_EXECUTE || '0' }}" = "1" ]; }; then
+          if { [ "${{ github.event_name }}" = "repository_dispatch" ] && [ -n "$item_numbers" ]; } ||
+             { [ "${{ github.event_name }}" = "workflow_dispatch" ] &&
+               [ "${{ inputs.execute }}" = "true" ] &&
+               [ -n "$item_numbers" ] &&
+               [[ "$item_numbers" != *,* ]]; }; then
             args+=(--execute)
           fi
           pnpm run repair:comment-router -- "${args[@]}"
@@ -348,6 +350,38 @@ jobs:
             --path jobs \
             --rebase-strategy theirs
 
+      - name: Dispatch discovered items through exact router lanes
+        if: ${{ success() && (github.event_name == 'schedule' && (vars.CLAWSWEEPER_COMMENT_ROUTER_EXECUTE || '0') == '1' || github.event_name == 'workflow_dispatch' && inputs.execute && (inputs.item_numbers == '' || contains(inputs.item_numbers, ','))) }}
+        env:
+          GH_TOKEN: ${{ steps.dispatch-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          target_repo="${{ github.event_name == 'workflow_dispatch' && inputs.target_repo || vars.CLAWSWEEPER_TARGET_REPO || 'openclaw/openclaw' }}"
+          target_branch="${{ github.event_name == 'workflow_dispatch' && inputs.target_branch || '' }}"
+          runner="${{ github.event_name == 'workflow_dispatch' && inputs.runner || vars.CLAWSWEEPER_WORKER_RUNNER || 'blacksmith-4vcpu-ubuntu-2404' }}"
+          execution_runner="${{ github.event_name == 'workflow_dispatch' && inputs.execution_runner || vars.CLAWSWEEPER_EXECUTION_RUNNER || 'blacksmith-16vcpu-ubuntu-2404' }}"
+          jq -r '
+            .commands[]
+            | select(
+                .status == "ready" or
+                any(.actions[]?; .status == "waiting" or .status == "active")
+              )
+            | .issue_number
+            | select(type == "number" and . > 0)
+          ' results/comment-router-latest.json | sort -nu | while read -r item_number; do
+            gh workflow run repair-comment-router.yml \
+              --repo "$GITHUB_REPOSITORY" \
+              -f execute=true \
+              -f force_reprocess=false \
+              -f target_repo="$target_repo" \
+              -f target_branch="$target_branch" \
+              -f lookback_minutes=180 \
+              -f max_comments=100 \
+              -f item_numbers="$item_number" \
+              -f runner="$runner" \
+              -f execution_runner="$execution_runner"
+          done
+
       - name: Detect waiting repair dispatches
         id: waiting-repair-dispatches
         if: ${{ success() }}
@@ -360,7 +394,7 @@ jobs:
           echo "count=$count" >> "$GITHUB_OUTPUT"
 
       - name: Retry waiting repair dispatches
-        if: ${{ steps.waiting-repair-dispatches.outputs.count != '' && steps.waiting-repair-dispatches.outputs.count != '0' }}
+        if: ${{ steps.waiting-repair-dispatches.outputs.count != '' && steps.waiting-repair-dispatches.outputs.count != '0' && (github.event_name == 'repository_dispatch' && github.event.client_payload.item_number || github.event_name == 'workflow_dispatch' && inputs.execute && inputs.item_numbers != '' && !contains(inputs.item_numbers, ',')) }}
         env:
           GH_TOKEN: ${{ steps.app_token.outputs.token }}
           CLAWSWEEPER_AUTHENTICATED_APP_ID: ${{ steps.mutation-app.outputs.app_id }}
