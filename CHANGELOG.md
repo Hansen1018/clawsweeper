@@ -140,7 +140,7 @@ checkpoint, and status-only commits are intentionally omitted.
   bounded optional CrabFleet delivery, eager apply mutation receipts, exact
   active-item timeout recovery, and item/revision-stable apply and retry
   idempotency across checkpoint and batch reordering.
-- Revalidated live per-PR automerge authorization immediately before replacement merges, selected bounded broad-router item pages before per-item comment history hydration, and durably recovered coalesced forced replay comments without weakening serialized item lanes.
+- Revalidated live per-PR automerge authorization immediately before replacement merges; centralized comment-router worker dispatch behind one capacity gate; durably staged page-scoped ordinary and forced commands without allowing continuation races to downgrade terminal results; bounded per-item comment hydration; and made requeue dispatch identities deterministic across ambiguous retries.
 - Bounded missing repair handoff retries, terminated deterministic handoff verification failures, removed repository-wide gate mutation from requeue, scoped router comment IDs per item, and bounded post-command proof snapshot verification.
 - Bounded every repair git helper subprocess while retaining the shorter configurable network timeout, ordinary nonzero and signal status semantics, platform-aware command launching, and explicit spawn-error reporting. Thanks @hex-AI12.
 - Waited for the exact dashboard Worker commit to reach the live health endpoint before running post-deploy smoke checks, preventing Cloudflare rollout propagation from producing false CI failures.

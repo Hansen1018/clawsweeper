@@ -600,6 +600,7 @@ test("repair execution and validation cannot mutate GitHub before trusted public
       String(step.run ?? ""),
       /--deadline-at-ms "\$\{\{ steps\.report_deadline\.outputs\.deadline_at_ms \}\}"[\s\S]*--wait-for-capacity/,
     );
+    assert.match(String(step.run ?? ""), /--source-run-id "\$\{\{ github\.run_id \}\}"/);
   }
   const reportDeadline = report.steps?.find(
     (step: { id?: string }) => step.id === "report_deadline",
@@ -640,13 +641,17 @@ test("exact router dispatch concurrency is item-specific and cannot replace anot
   const route = workflow.jobs?.["route-comments"];
   const dispatch = workflow.jobs?.["dispatch-waiting-commands"];
   const group = String(route?.concurrency?.group ?? "");
+  const dispatchGroup = String(dispatch?.concurrency?.group ?? "");
 
   assert.ok(normalize);
+  assert.ok(dispatch);
   assert.equal(workflow.concurrency, undefined);
   assert.equal(route?.needs, "normalize-lane");
   assert.match(group, /needs\.normalize-lane\.outputs\.concurrency_group/);
   assert.doesNotMatch(group, /comment_id|items-\{1\}/);
   assert.equal(route?.concurrency?.["cancel-in-progress"], false);
+  assert.match(dispatchGroup, /needs\.normalize-lane\.outputs\.dispatch_concurrency_group/);
+  assert.equal(dispatch?.concurrency?.["cancel-in-progress"], false);
   assert.match(
     source,
     /REPOSITORY_DISPATCH_ITEM_NUMBER:.*github\.event\.client_payload\.item_number/,
@@ -671,7 +676,7 @@ test("exact router dispatch concurrency is item-specific and cannot replace anot
   assert.match(source, /group: \$\{\{ needs\.normalize-lane\.outputs\.concurrency_group \}\}/);
   const laneStep = normalize.steps?.find((step: { id?: string }) => step.id === "lane");
   const laneScript = String(laneStep?.run ?? "");
-  const scanGroup = runRouterLaneScript(laneScript, {
+  const scanLane = runRouterLaneScript(laneScript, {
     EVENT_NAME: "schedule",
     TARGET_REPO: "openclaw/openclaw",
   });
@@ -685,10 +690,31 @@ test("exact router dispatch concurrency is item-specific and cannot replace anot
     TARGET_REPO: "openclaw/openclaw",
     ROUTER_FANOUT_AFTER: "43",
   });
-  assert.equal(scanGroup, "repair-comment-router-openclaw/openclaw-scan");
-  assert.equal(continuation42, "repair-comment-router-openclaw/openclaw-scan-continuation-42");
-  assert.notEqual(continuation42, scanGroup);
-  assert.notEqual(continuation42, continuation43);
+  const item42 = runRouterLaneScript(laneScript, {
+    EVENT_NAME: "repository_dispatch",
+    TARGET_REPO: "openclaw/openclaw",
+    REPOSITORY_DISPATCH_ITEM_NUMBER: "42",
+  });
+  const item43 = runRouterLaneScript(laneScript, {
+    EVENT_NAME: "repository_dispatch",
+    TARGET_REPO: "openclaw/openclaw",
+    REPOSITORY_DISPATCH_ITEM_NUMBER: "43",
+  });
+  assert.equal(scanLane.concurrency_group, "repair-comment-router-openclaw/openclaw-scan");
+  assert.equal(
+    continuation42.concurrency_group,
+    "repair-comment-router-openclaw/openclaw-scan-continuation-42",
+  );
+  assert.notEqual(continuation42.concurrency_group, scanLane.concurrency_group);
+  assert.notEqual(continuation42.concurrency_group, continuation43.concurrency_group);
+  assert.notEqual(item42.concurrency_group, item43.concurrency_group);
+  assert.equal(item42.exact_item, "true");
+  assert.equal(item43.exact_item, "true");
+  assert.equal(
+    item42.dispatch_concurrency_group,
+    "repair-comment-router-openclaw/openclaw-worker-dispatch",
+  );
+  assert.equal(item43.dispatch_concurrency_group, item42.dispatch_concurrency_group);
   const routerSource = fs.readFileSync("src/repair/comment-router.ts", "utf8");
   const candidateSelection = routerSource.slice(
     routerSource.indexOf("function listCandidateComments()"),
@@ -714,7 +740,7 @@ test("exact router dispatch concurrency is item-specific and cannot replace anot
   const fanoutStart = source.indexOf(
     "- name: Dispatch discovered items through exact router lanes",
   );
-  const fanoutEnd = source.indexOf("- name: Detect waiting repair dispatches", fanoutStart);
+  const fanoutEnd = source.indexOf("\n  dispatch-waiting-commands:", fanoutStart);
   const fanout = source.slice(fanoutStart, fanoutEnd);
   assert.match(
     fanout,
@@ -746,6 +772,17 @@ test("exact router dispatch concurrency is item-specific and cannot replace anot
     fanout,
     /-f force_reprocess=false|-f lookback_minutes=180|-f max_comments=100/,
   );
+  assert.match(source, /Route ClawSweeper comments[\s\S]*args\+=\(--stage-selected-commands\)/);
+  const routeStep = route?.steps?.find(
+    (step: { name?: string }) => step.name === "Route ClawSweeper comments",
+  );
+  const dispatchStep = dispatch.steps?.find(
+    (step: { name?: string }) =>
+      step.name === "Dispatch waiting commands under the central capacity gate",
+  );
+  assert.doesNotMatch(String(routeStep?.run ?? ""), /--execute/);
+  assert.match(String(dispatchStep?.run ?? ""), /--wait-for-capacity/);
+  assert.match(String(dispatchStep?.run ?? ""), /--execute/);
   assert.match(
     source,
     /Route ClawSweeper comments[\s\S]*repository_dispatch[\s\S]*workflow_dispatch[\s\S]*schedule[\s\S]*args\+=\(--stage-selected-commands\)/,
@@ -794,11 +831,16 @@ function runRouterLaneScript(script: string, overrides: NodeJS.ProcessEnv) {
       GITHUB_OUTPUT: output,
     },
   });
-  const line = fs
-    .readFileSync(output, "utf8")
-    .split(/\r?\n/)
-    .find((entry) => entry.startsWith("concurrency_group="));
-  return line?.slice("concurrency_group=".length) ?? "";
+  return Object.fromEntries(
+    fs
+      .readFileSync(output, "utf8")
+      .split(/\r?\n/)
+      .filter(Boolean)
+      .map((entry) => {
+        const separator = entry.indexOf("=");
+        return [entry.slice(0, separator), entry.slice(separator + 1)];
+      }),
+  );
 }
 
 test("workflow App identity is derived from authenticated tokens, never a configured numeric id", () => {

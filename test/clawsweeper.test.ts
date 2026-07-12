@@ -2090,7 +2090,10 @@ test("repair workers hydrate only durable jobs from generated state", () => {
   const requeue = readText("src/repair/requeue-job.ts");
   const repairDocs = readText("docs/repair/README.md");
 
-  assert.match(workflow, /clawsweeper-repair-requeue-\{0\}-\{1\}.*clawsweeper-repair-\{0\}/);
+  assert.match(
+    workflow,
+    /clawsweeper-repair-requeue-\{0\}-\{1\}', inputs\.job, inputs\.dispatch_key/,
+  );
   assert.match(workflow, /cancel-in-progress: false/);
   assert.match(workflow, /requeue:\n\s+description:/);
   assert.match(workflow, /requeue_context:\n\s+description:/);
@@ -2098,6 +2101,8 @@ test("repair workers hydrate only durable jobs from generated state", () => {
   assert.match(requeue, /"requeue=true"/);
   assert.match(requeue, /requeue_authority=\$\{requeueContext\.authority\}/);
   assert.match(requeue, /dispatch_key=\$\{requeueContext\.dispatch_key\}/);
+  assert.match(requeue, /deterministicRequeueDispatchKey/);
+  assert.doesNotMatch(requeue, /randomUUID/);
   assert.match(requeue, /--allow-execute 0\|1 --allow-fix-pr 0\|1/);
   assert.match(requeue, /--requeue-depth N.*--max-requeue-depth N/);
   assert.match(requeue, /--deadline-at-ms N/);
@@ -2154,6 +2159,7 @@ test("repair workers hydrate only durable jobs from generated state", () => {
     /id: repair_requeue[\s\S]*count-requeue-required[\s\S]*id: requeue_token[\s\S]*repair:requeue/,
   );
   assert.match(reportJob, /--max-requeue-depth 1/);
+  assert.equal(reportJob.match(/--source-run-id "\$\{\{ github\.run_id \}\}"/g)?.length, 2);
   assert.match(
     reportJob,
     /repair:requeue -- \.clawsweeper-repair\/authorized\/job\.md[\s\S]*--source-job-path "\$\{\{ needs\.authorize\.outputs\.source_job_path \}\}"/,
