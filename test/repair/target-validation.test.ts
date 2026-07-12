@@ -2588,6 +2588,88 @@ test("staged proof bounds ignored dependency traversal by entries and depth", ()
   );
 });
 
+for (const mode of ["initial", "replay"]) {
+  test(`staged proof ${mode} snapshot enforces entry budgets before directory materialization`, () => {
+    const cwd = gitPackageFixture({ verify: "node --test" });
+    const dependencyPath = path.join(cwd, "node_modules");
+    fs.mkdirSync(dependencyPath, { recursive: true });
+    for (let index = 0; index < 32; index += 1) {
+      fs.writeFileSync(path.join(dependencyPath, `entry-${index}.js`), "fixture\n");
+    }
+    git(cwd, "add", ".");
+    git(cwd, "commit", "-m", "initial");
+    attachOrigin(cwd);
+    const options = validationOptions("steipete/example", {
+      proofInputMaxEntries: git(cwd, "ls-files").split("\n").filter(Boolean).length,
+      toolchain: {
+        packageManager: "pnpm",
+        baseValidationCommands: [],
+        changedGate: null,
+      },
+    });
+    const plan =
+      mode === "replay" ? buildTargetValidationProofPlan(["pnpm verify"], cwd, options) : null;
+    const traversal = instrumentProofDirectory(dependencyPath);
+    try {
+      assert.throws(() => {
+        if (mode === "replay") {
+          assert.ok(plan);
+          replayStagedValidationProof(plan, cwd, options);
+          return;
+        }
+        runStagedValidationProof(["pnpm verify"], cwd, options);
+      }, /proof input traversal exceeded the supported entry budget/);
+      assert.equal(traversal.materializedSynchronously, false);
+      assert.ok(traversal.streamedEntries > 0);
+      assert.ok(traversal.streamedEntries < 32);
+    } finally {
+      traversal.restore();
+    }
+  });
+
+  test(`staged proof ${mode} snapshot enforces deadlines before directory materialization`, () => {
+    const cwd = gitPackageFixture({ verify: "node --test" });
+    const dependencyPath = path.join(cwd, "node_modules");
+    fs.mkdirSync(dependencyPath, { recursive: true });
+    for (let index = 0; index < 32; index += 1) {
+      fs.writeFileSync(path.join(dependencyPath, `entry-${index}.js`), "fixture\n");
+    }
+    git(cwd, "add", ".");
+    git(cwd, "commit", "-m", "initial");
+    attachOrigin(cwd);
+    const options = validationOptions("steipete/example", {
+      proofBudgetMs: 100,
+      validationTimeoutMs: 1_000,
+      toolchain: {
+        packageManager: "pnpm",
+        baseValidationCommands: [],
+        changedGate: null,
+      },
+    });
+    const plan =
+      mode === "replay" ? buildTargetValidationProofPlan(["pnpm verify"], cwd, options) : null;
+    const traversal = instrumentProofDirectory(dependencyPath);
+    const originalNow = Date.now;
+    Date.now = () =>
+      traversal.materializedSynchronously || traversal.streamedEntries > 0 ? 1_101 : 1_000;
+    try {
+      assert.throws(() => {
+        if (mode === "replay") {
+          assert.ok(plan);
+          replayStagedValidationProof(plan, cwd, options);
+          return;
+        }
+        runStagedValidationProof(["pnpm verify"], cwd, options);
+      }, /staged proof runtime budget exhausted before proof input snapshot completed/);
+      assert.equal(traversal.materializedSynchronously, false);
+      assert.equal(traversal.streamedEntries, 1);
+    } finally {
+      Date.now = originalNow;
+      traversal.restore();
+    }
+  });
+}
+
 test("staged proof budget includes checkout and recursive proof-input sealing", () => {
   const cwd = gitPackageFixture({ verify: "node --test" });
   fs.mkdirSync(path.join(cwd, "node_modules", "fixture"), { recursive: true });
@@ -3304,6 +3386,49 @@ test("compactText keeps both head and tail for long validation output", () => {
     true,
   );
 });
+
+function instrumentProofDirectory(directoryPath) {
+  const watchedPath = fs.realpathSync(directoryPath);
+  const originalReaddirSync = fs.readdirSync;
+  const originalOpendirSync = fs.opendirSync;
+  let materializedSynchronously = false;
+  let streamedEntries = 0;
+
+  fs.readdirSync = function (...args) {
+    if (path.resolve(String(args[0])) === watchedPath) materializedSynchronously = true;
+    return Reflect.apply(originalReaddirSync, fs, args);
+  };
+  fs.opendirSync = function (...args) {
+    const directory = Reflect.apply(originalOpendirSync, fs, args);
+    if (path.resolve(String(args[0])) !== watchedPath) return directory;
+    return new Proxy(directory, {
+      get(target, property) {
+        if (property === "readSync") {
+          return () => {
+            const entry = target.readSync();
+            if (entry) streamedEntries += 1;
+            return entry;
+          };
+        }
+        const value = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+  };
+
+  return {
+    get materializedSynchronously() {
+      return materializedSynchronously;
+    },
+    get streamedEntries() {
+      return streamedEntries;
+    },
+    restore() {
+      fs.readdirSync = originalReaddirSync;
+      fs.opendirSync = originalOpendirSync;
+    },
+  };
+}
 
 function packageFixture(scripts) {
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-validation-"));

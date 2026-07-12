@@ -851,7 +851,12 @@ function validationProofInputSnapshot(
       return;
     }
     assertProofInputTraversalBudget(relativePath, visitedPaths.size - 1, limits);
-    const children = fs.readdirSync(entryPath).sort();
+    const children = readProofInputSnapshotDirectory(
+      entryPath,
+      relativePath,
+      visitedPaths.size,
+      limits,
+    );
     entries.set(`${relativePath}\0children`, children.join("\0"));
     for (const name of children) {
       visit(path.posix.join(relativePath, name));
@@ -865,22 +870,51 @@ function validationProofInputSnapshot(
   return { entries };
 }
 
+function readProofInputSnapshotDirectory(
+  directoryPath: string,
+  relativePath: string,
+  visitedEntries: number,
+  limits: ProofInputLimits,
+) {
+  assertProofInputTraversalDeadline(relativePath, limits);
+  const directory = fs.opendirSync(directoryPath);
+  const children: string[] = [];
+  try {
+    for (;;) {
+      assertProofInputTraversalDeadline(relativePath, limits);
+      const entry = directory.readSync();
+      assertProofInputTraversalDeadline(relativePath, limits);
+      if (!entry) break;
+      const childPath = path.posix.join(relativePath, entry.name);
+      assertProofInputTraversalBudget(childPath, visitedEntries + children.length, limits);
+      children.push(entry.name);
+    }
+  } finally {
+    directory.closeSync();
+  }
+  return children.sort();
+}
+
 function assertProofInputTraversalBudget(
   relativePath: string,
   visitedEntries: number,
   limits: ProofInputLimits,
 ) {
-  if (Date.now() >= limits.deadlineAt) {
-    throw new Error(
-      `staged proof runtime budget exhausted before proof input snapshot completed: ${relativePath}`,
-    );
-  }
+  assertProofInputTraversalDeadline(relativePath, limits);
   if (visitedEntries >= limits.maxEntries) {
     throw new Error(`proof input traversal exceeded the supported entry budget at ${relativePath}`);
   }
   const depth = relativePath.split("/").filter(Boolean).length;
   if (depth > limits.maxDepth) {
     throw new Error(`proof input traversal exceeded the supported depth budget at ${relativePath}`);
+  }
+}
+
+function assertProofInputTraversalDeadline(relativePath: string, limits: ProofInputLimits) {
+  if (Date.now() >= limits.deadlineAt) {
+    throw new Error(
+      `staged proof runtime budget exhausted before proof input snapshot completed: ${relativePath}`,
+    );
   }
 }
 
