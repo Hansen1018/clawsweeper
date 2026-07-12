@@ -27,6 +27,7 @@ test("repair sessions, statuses, and result publication flush immutable receipts
   assert.match(publisher, /ACTION_EVENT_TYPES\.publicationLifecycle/);
   assert.match(publisher, /ACTION_EVENT_TYPES\.dashboardLifecycle/);
   assert.match(publisher, /await flushRepairActionEvents\(\)/);
+  assert.doesNotMatch(publisher, /recordAggregatePublication\([^)]*,/);
 });
 
 test("repair worker jobs upload shards and one credentialed job publishes them", () => {
