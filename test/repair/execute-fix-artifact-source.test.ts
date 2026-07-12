@@ -295,6 +295,35 @@ test("automerge fast rebase binds staged proof before returning a publishable re
   assert.match(source, /tryAutomergeFastRebaseRepair\(\{[\s\S]*baseBranch,[\s\S]*fixArtifact/);
 });
 
+test("post-rebase validation refreshes target dependencies before binding proof", () => {
+  const source = readText(path.join(process.cwd(), "src/repair/execute-fix-artifact.ts"));
+  const fastStart = source.indexOf("function tryAutomergeFastRebaseRepair(");
+  const fastEnd = source.indexOf("function completeMechanicallyResolvedRebase(", fastStart);
+  const fastPath = source.slice(fastStart, fastEnd);
+  const editStart = source.indexOf("function editValidatePrepareMerge(");
+  const editEnd = source.indexOf("function compactReplacementHistory(", editStart);
+  const editPath = source.slice(editStart, editEnd);
+  const syncStart = source.indexOf("function validateAndReviewSynchronizedTree(");
+  const syncEnd = source.indexOf("\nfunction ", syncStart + 1);
+  const syncPath = source.slice(syncStart, syncEnd);
+
+  const fastClean = fastPath.indexOf('"status", "--porcelain"');
+  const fastPrepare = fastPath.indexOf("prepareTargetToolchain(");
+  const fastProof = fastPath.indexOf("runTargetValidationProof(");
+  assert.ok(fastClean >= 0 && fastPrepare > fastClean && fastProof > fastPrepare);
+
+  const editRebaseCompletion = editPath.indexOf("completeRebaseIfResolved(");
+  const editPrepare = editPath.indexOf("prepareTargetToolchain(", editRebaseCompletion);
+  const editValidation = editPath.indexOf("validateAndReviewLoop(", editPrepare);
+  assert.ok(
+    editRebaseCompletion >= 0 && editPrepare > editRebaseCompletion && editValidation > editPrepare,
+  );
+
+  const syncPrepare = syncPath.indexOf("prepareTargetToolchain(");
+  const syncProof = syncPath.indexOf("runTargetValidationProof(");
+  assert.ok(syncPrepare >= 0 && syncProof > syncPrepare);
+});
+
 test("final synchronized tree is reviewed and reports persist before publication", () => {
   const source = readText(path.join(process.cwd(), "src/repair/execute-fix-artifact.ts"));
 

@@ -1549,6 +1549,7 @@ function tryAutomergeFastRebaseRepair({
     return { status: "fallback", reason: "deterministic rebase left working tree changes" };
   }
 
+  prepareTargetToolchain(targetDir, currentTargetValidationOptions(fixArtifact.likely_files ?? []));
   const targetBaseSha = pinRepairBase(() =>
     run("git", ["rev-parse", `origin/${baseBranch}`], { cwd: targetDir }),
   ).sha;
@@ -2479,6 +2480,7 @@ function editValidatePrepareMerge({
     details: mode,
     headSha: currentHead(targetDir),
   });
+  prepareTargetToolchain(targetDir, currentTargetValidationOptions(fixArtifact.likely_files ?? []));
   let codexReview = validateAndReviewLoop({
     fixArtifact,
     targetDir,
@@ -3165,6 +3167,7 @@ function validateAndReviewSynchronizedTree({
   sourceHead,
   repairDeltaPaths,
 }: LooseRecord) {
+  prepareTargetToolchain(targetDir, currentTargetValidationOptions(fixArtifact.likely_files ?? []));
   const validationOptions = {
     ...currentTargetValidationOptions(fixArtifact.likely_files ?? []),
     pinnedBaseRef: targetBaseSha,
