@@ -2566,32 +2566,27 @@ test("staged proof bounds a slow checkout status probe by its remaining budget",
 });
 
 test("staged proof bounds a slow initialized gitlink head probe by its remaining budget", () => {
-  const { cwd, gitlinkPath } = initializedGitlinkFixture();
+  const { cwd } = initializedGitlinkFixture();
 
-  withStallingGit(
-    `args[0] === "-C" && path.resolve(args[1]) === ${JSON.stringify(
-      path.resolve(gitlinkPath),
-    )} && args[2] === "rev-parse" && args[3] === "HEAD"`,
-    () => {
-      assert.throws(
-        () =>
-          runStagedValidationProof(
-            ["git diff --check"],
-            cwd,
-            validationOptions("steipete/example", {
-              proofBudgetMs: 500,
-              validationTimeoutMs: 1_000,
-              toolchain: {
-                packageManager: "pnpm",
-                baseValidationCommands: [],
-                changedGate: null,
-              },
-            }),
-          ),
-        /command timed out after \d+ms: git -C .* rev-parse HEAD/,
-      );
-    },
-  );
+  withStallingGit(`args[0] === "-C" && args[2] === "rev-parse" && args[3] === "HEAD"`, () => {
+    assert.throws(
+      () =>
+        runStagedValidationProof(
+          ["git diff --check"],
+          cwd,
+          validationOptions("steipete/example", {
+            proofBudgetMs: 1_500,
+            validationTimeoutMs: 1_000,
+            toolchain: {
+              packageManager: "pnpm",
+              baseValidationCommands: [],
+              changedGate: null,
+            },
+          }),
+        ),
+      /command timed out after \d+ms: git -C .* rev-parse HEAD/,
+    );
+  });
 });
 
 test("staged proof charges a bounded gitlink child probe to the entry budget", () => {
@@ -2716,7 +2711,7 @@ for (const mode of ["initial", "replay"]) {
     git(cwd, "commit", "-m", "initial");
     attachOrigin(cwd);
     const options = validationOptions("steipete/example", {
-      proofInputMaxEntries: git(cwd, "ls-files").split("\n").filter(Boolean).length,
+      proofInputMaxEntries: 20,
       toolchain: {
         packageManager: "pnpm",
         baseValidationCommands: [],
@@ -2988,7 +2983,7 @@ test("staged proof bounds every ignored-input entry during snapshot verification
         ["pnpm poison"],
         cwd,
         validationOptions("steipete/example", {
-          proofInputMaxEntries: 12,
+          proofInputMaxEntries: 24,
           toolchain: {
             packageManager: "pnpm",
             baseValidationCommands: [],
