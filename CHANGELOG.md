@@ -85,6 +85,12 @@ checkpoint, and status-only commits are intentionally omitted.
   the setup-provided action-ledger output root to the state repository. Each
   command lane binds publication to a canonical, run-scoped finalized-shard
   manifest and rejects any missing producer path before state import.
+- Dual-write repair queue, plan, post-flight, publication, failure, CrabFleet
+  session, GitHub status-comment, dashboard-delivery, cluster-result,
+  aggregate-report, and finalizer transitions into immutable per-attempt action
+  chains. Credential-isolated worker jobs upload finalized shards for one
+  state-authorized collector, while existing state-authorized publishers import
+  their own shards directly.
 - Short-circuited authenticated duplicate comment deliveries when their exact
   body version is already terminal in the durable router ledger, while edited,
   retryable, and state-drifted commands retain the full routing path.

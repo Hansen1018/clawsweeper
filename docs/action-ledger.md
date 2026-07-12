@@ -301,9 +301,23 @@ The shared taxonomy defines six families:
 6. **Evidence**: Gitcrawl snapshot, query, and binding phases plus proof stage
    and binding phases.
 
-This taxonomy is a schema foundation, not a claim that every lane already emits
-every phase. Lanes can migrate independently without changing the v1 shard
-format.
+Review, apply, command-router, repair-session, issue-status, result-publication,
+and dashboard-publication lanes now emit this taxonomy. Repair receipts keep the
+logical work key and source revision stable across retries while workflow run,
+attempt, job, step, and invocation define the execution attempt. Session writes
+record both the operator-facing CrabFleet transition and the corresponding
+repair phase. GitHub status comments are receipted only after the mutation
+returns, while dashboard delivery records sent, skipped, and failed outcomes.
+Local result, aggregate apply-report, and dashboard writes use `completed`;
+their later immutable shard import is the durable publication boundary.
+
+Credential-isolated repair jobs never receive state-repository credentials just
+to publish receipts. Cluster and mutation jobs finalize local immutable shards
+and upload them as workflow artifacts. A dedicated state-authorized collector
+imports the bounded shard set and commits only the canonical ledger paths.
+Result and open-PR finalizer workflows already own state credentials, so they
+import and publish their own finalized shards directly. Additional lanes can
+migrate independently without changing the v1 shard format.
 
 New writers should prefer phase-oriented types from
 `ACTION_EVENT_PHASE_TYPES`, statuses from `ACTION_EVENT_STATUSES`, and optional
