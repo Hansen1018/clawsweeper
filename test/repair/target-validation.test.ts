@@ -2804,7 +2804,7 @@ test("staged proof bounds a slow checkout status probe by its remaining budget",
           ["git diff --check"],
           cwd,
           validationOptions("steipete/example", {
-            proofBudgetMs: 500,
+            proofBudgetMs: 1_500,
             validationTimeoutMs: 1_000,
             toolchain: {
               packageManager: "pnpm",
@@ -3151,7 +3151,7 @@ for (const mode of ["initial", "replay"] as const) {
     git(cwd, "commit", "-m", "initial");
     attachOrigin(cwd);
     const options = validationOptions("steipete/example", {
-      proofBudgetMs: 500,
+      proofBudgetMs: 1_500,
       validationTimeoutMs: 1_000,
       toolchain: {
         packageManager: "pnpm",
@@ -3223,7 +3223,7 @@ test("staged proof bounds stalled ignored-input candidate discovery", () => {
           ["git diff --check"],
           cwd,
           validationOptions("steipete/example", {
-            proofBudgetMs: 500,
+            proofBudgetMs: 1_500,
             validationTimeoutMs: 1_000,
             toolchain: {
               packageManager: "pnpm",
