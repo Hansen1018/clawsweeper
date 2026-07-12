@@ -16,6 +16,7 @@ The sequence proves:
 - the read-only drawer's safe GitHub item, job, and workflow-run links;
 - the local-only tide preview advancing through incoming, crest, backwash, and restored states while preserving terminal keys and count;
 - the short static reduced-motion tide cue preserving the same preview state;
+- nine completed outcomes fitting individually in the expanded terminal pool without a hidden overflow, including a two-column constrained-width layout with no reference-label intersections; and
 - a generated real tide visibly washing terminal crustaceans before clearing the shared buffer; and
 - zero browser-to-GitHub API requests, mutation requests, console errors, or
   uncaught page errors.
@@ -23,11 +24,11 @@ The sequence proves:
 ## Artifacts
 
 - [`playwright-proof-storyboard.jpg`](playwright-proof-storyboard.jpg) is a
-  labelled 16-state contact sheet that can be inspected without video codecs.
+  labelled 17-state contact sheet that can be inspected without video codecs.
 - [`trace.zip`](trace.zip) is the Playwright action, DOM snapshot, and network
   trace. Open it with
   `npx --yes playwright@1.60.0 show-trace docs/proof/openclaw-bay/trace.zip`.
-- [`proof-summary.json`](proof-summary.json) records all 23 passing assertions,
+- [`proof-summary.json`](proof-summary.json) records all 25 passing assertions,
   sanitized request/response metadata, safe drawer links, the unchanged
   terminal keys before and after both preview modes, and the proved real-tide
   clear.
@@ -36,8 +37,9 @@ The sequence proves:
   Playwright package in `/tmp`, starts the real local Wrangler Worker, and runs
   that script without changing repository dependencies.
 - [`fixtures/`](fixtures/) contains the exact three checked-in synthetic
-  `/api/status` transition responses. The runner derives a fourth real-tide
-  response from the final fixture and records its SHA-256 in the summary. It
+  `/api/status` transition responses. The runner derives dense-terminal and
+  real-tide responses from the final fixture and records the real-tide SHA-256
+  in the summary. It
   fails before launching Chromium if the checked-in sequence drifts.
 
 The compact trace intentionally omits Playwright's continuous screenshot film
@@ -61,9 +63,9 @@ crabbox run \
 
 ## Provenance and privacy
 
-- implementation source: `09941a121d0911278a64f71f3bbd7d57fa090dc8`
+- implementation source: `2d5793c1a0e1b39fd174c3d743118845152eaab6`
 - provider: Crabbox `local-container`
-- lease: `cbx_58b0a8f78e74` (`harbor-lobster`)
+- lease: `cbx_320bf6be31c9` (`blue-lobster`)
 - image: `mcr.microsoft.com/playwright:v1.60.0-noble`
 - fixture SHA-256:
   `FC584F8F0521221B77897384BDEB3A167E85AA6C17708A7783740FCDF363CD21`
@@ -75,7 +77,7 @@ crabbox run \
   - `03-retrigger.json`:
     `39DA760BF2E1A9E982404B2F27ABAE8649EF18B21A20E558787921D314BFC4C0`
 - derived real-tide response:
-  `CB7BD99B2ABEA3B24F7416193C97BC7DE5F950CD1A29963B003111C03920576E`
+  `1B1B049ECB65CA4548053E92C99373B6A900B76E409A75029E596E7754746049`
 
 The browser allowed only `bay-proof.test:8787`, mapped to the local Wrangler
 Worker. The trace contains no cookies or authorization headers. A binary text

@@ -102,6 +102,10 @@ test("OpenClaw Bay is an unlisted, hardened demo route", async () => {
   assert.match(body, /function laneWeightFor/);
   assert.match(body, /gridTemplateColumns=laneWeights/);
   assert.match(body, /function fitStageDensity/);
+  assert.match(body, /function terminalColumns\(count\)/);
+  assert.match(body, /terminalStack\.clientWidth>=320\?3:2/);
+  assert.match(body, /function terminalSlots\(columns\)/);
+  assert.match(body, /more in the tide buffer/);
   assert.match(body, /lane-nudge/);
   assert.match(body, /id="overall-average"/);
   assert.doesNotMatch(body, /function laneTimingHtml/);
@@ -135,9 +139,30 @@ test("OpenClaw Bay is an unlisted, hardened demo route", async () => {
   assert.match(body, /confirming outcome/);
   assert.match(body, /data-key=/);
   assert.match(body, /aria-pressed=/);
-  assert.match(body, /How long has your ClawSweeper run been going\?/);
-  assert.match(body, /I'm keeping my claws crossed\./);
+  assert.match(body, /function laneChatCopy/);
+  assert.match(body, /Have you been in this lane long\?/);
+  assert.match(body, /I'm listening for the master sweeper\./);
+  assert.match(body, /The sand is cosy enough\./);
+  assert.match(body, /chatSequence:0/);
   assert.doesNotMatch(body, /Things are moving|30m end to end/);
+  const chatScript = [...body.matchAll(/<script>\n([\s\S]*?)\n<\/script>/g)].at(-1)?.[1];
+  assert.ok(chatScript);
+  const chatCopyStart = chatScript.indexOf("function hash(value)");
+  const chatCopyEnd = chatScript.indexOf("function runLaneChat()", chatCopyStart);
+  assert.ok(chatCopyStart > 0 && chatCopyEnd > chatCopyStart);
+  const chatCopySource = chatScript.slice(chatCopyStart, chatCopyEnd);
+  const chatContext = createContext({
+    state: { chatSequence: 0 },
+    asking: { getAttribute: () => "openclaw/openclaw#1" },
+    replying: { getAttribute: () => "openclaw/openclaw#2" },
+    copies: [],
+  });
+  new Script(
+    `${chatCopySource};for(var chatIndex=0;chatIndex<10;chatIndex+=1)copies.push(laneChatCopy(asking,replying,7));`,
+  ).runInContext(chatContext);
+  assert.ok(new Set(chatContext.copies.map((copy) => copy.question)).size > 1);
+  assert.ok(new Set(chatContext.copies.map((copy) => copy.answer)).size > 1);
+  assert.ok(chatContext.copies.every((copy) => copy.answer.includes("7m")));
   const runChangedSource = body.match(/function runChanged\([^}]+\}/)?.[0];
   const transitionKindSource = body.match(
     /function transitionKind\([^]*?return oldIndex>=0&&nextIndex>oldIndex\?"forward":null;\}/,

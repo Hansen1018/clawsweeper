@@ -120,6 +120,14 @@ const terminalBuffer = [
     runId: 5003,
   }),
 ];
+const denseTerminalBuffer = Array.from({ length: 9 }, (_, index) =>
+  terminal({
+    repository: "openclaw/openclaw",
+    number: 97101 + index,
+    outcome: "success",
+    runId: 5101 + index,
+  }),
+);
 
 function snapshot(workers) {
   return {
@@ -175,18 +183,25 @@ const snapshots = fixtureBodies.map((body) => JSON.parse(body));
 if (JSON.stringify(snapshots) !== JSON.stringify(expectedSnapshots)) {
   throw new Error("Checked-in Bay proof fixtures no longer match the expected synthetic sequence");
 }
-const realTideSnapshot = structuredClone(snapshots[2]);
+const denseTerminalSnapshot = structuredClone(snapshots[2]);
+denseTerminalSnapshot.generated_at = "2026-07-11T18:02:00.000Z";
+denseTerminalSnapshot.bay = {
+  ...denseTerminalSnapshot.bay,
+  terminal_buffer: denseTerminalBuffer,
+  terminal_count: denseTerminalBuffer.length,
+};
+const realTideSnapshot = structuredClone(denseTerminalSnapshot);
 realTideSnapshot.generated_at = "2026-07-11T18:02:00.000Z";
 realTideSnapshot.bay = {
   ...realTideSnapshot.bay,
   terminal_buffer: [],
-  recently_washed: terminalBuffer,
+  recently_washed: denseTerminalBuffer,
   terminal_count: 0,
   tide_generation: 1,
   last_tide_at: "2026-07-11T18:02:00.000Z",
   washed_at: "2026-07-11T18:02:00.000Z",
 };
-const proofSnapshots = [...snapshots, realTideSnapshot];
+const proofSnapshots = [...snapshots, denseTerminalSnapshot, realTideSnapshot];
 const realTideSnapshotSha256 = createHash("sha256")
   .update(JSON.stringify(realTideSnapshot))
   .digest("hex")
@@ -708,10 +723,74 @@ try {
   await page.evaluate(() => {
     window.__bayProofReduceMotion = false;
   });
+  fixtureIndex = 3;
+  await page.evaluate(async () => {
+    await window.__bayProofPoll();
+  });
+  await page.waitForFunction(
+    () => document.querySelectorAll('[data-stage="completed"] .critter[data-key]').length === 9,
+    null,
+    { timeout: 3_000 },
+  );
+  const denseCompletedCount = await page
+    .locator('[data-stage="completed"] .critter[data-key]')
+    .count();
+  const denseOverflowCount = await page.locator('[data-stage="completed"] .overflow-note').count();
+  assertProof(
+    "dense completed pool renders every buffered outcome",
+    denseCompletedCount === denseTerminalBuffer.length && denseOverflowCount === 0,
+    { completed: denseCompletedCount, overflow_notes: denseOverflowCount },
+  );
+  await page.setViewportSize({ width: 1400, height: 1000 });
+  await page.waitForFunction(
+    () => document.querySelector('[data-stage="completed"]')?.getAttribute("data-cols") === "2",
+    null,
+    { timeout: 3_000 },
+  );
+  await page.waitForTimeout(1_000);
+  const narrowTerminalPool = await page
+    .locator('[data-stage="completed"] .ref')
+    .evaluateAll((nodes) => {
+      const references = nodes.map((node) => node.getBoundingClientRect());
+      const overlaps = references.some((reference, index) =>
+        references
+          .slice(index + 1)
+          .some(
+            (other) =>
+              reference.left < other.right &&
+              reference.right > other.left &&
+              reference.top < other.bottom &&
+              reference.bottom > other.top,
+          ),
+      );
+      return {
+        references: references.length,
+        overlaps,
+        columns: document.querySelector('[data-stage="completed"]')?.getAttribute("data-cols"),
+      };
+    });
+  assertProof(
+    "dense terminal pool keeps references readable at constrained width",
+    narrowTerminalPool.references === denseTerminalBuffer.length &&
+      narrowTerminalPool.columns === "2" &&
+      !narrowTerminalPool.overlaps,
+    narrowTerminalPool,
+  );
+  await page.setViewportSize({ width: 1900, height: 1000 });
+  await page.waitForFunction(
+    () => document.querySelector('[data-stage="completed"]')?.getAttribute("data-cols") === "3",
+    null,
+    { timeout: 3_000 },
+  );
+  await capture(
+    "15-dense-terminal-pool",
+    "Dense completed pool uses the available shoreline",
+    "Nine completed outcomes stay individually visible, with staggered three-column placement and no hidden overflow.",
+  );
   const activeBeforeRealTide = await page
     .locator(".stage .critter[data-key]")
     .evaluateAll((nodes) => nodes.map((node) => node.getAttribute("data-key")).sort());
-  fixtureIndex = 3;
+  fixtureIndex = 4;
   await page.evaluate(async () => {
     await window.__bayProofPoll();
   });
@@ -739,7 +818,7 @@ try {
     { timeout: 2_000 },
   );
   await capture(
-    "15-real-tide-cleared",
+    "16-real-tide-cleared",
     "Real tide clears only after the wash",
     "A generated tide first moves the proved terminal crustaceans seaward, then commits the empty shared buffer.",
   );
@@ -754,7 +833,7 @@ try {
   const realCountdown = await page.locator("#tide-countdown").innerText();
   assertProof(
     "real tide washes terminal outcomes before clearing",
-    realWashCount === tideBefore.length &&
+    realWashCount === denseTerminalBuffer.length &&
       !realUsesPreviewClass &&
       (await page.locator(".pool .critter[data-key]").count()) === 0 &&
       realCountdown === "0 / 20" &&
@@ -802,6 +881,7 @@ try {
     mutating_requests: mutatingRequests.length,
     preview_terminal_before: tideBefore.length,
     preview_terminal_after: reducedTideAfter.length,
+    dense_terminal_completed: denseCompletedCount,
     real_tide_terminal_after: 0,
     assertions_passed: assertions.length,
   };
@@ -837,7 +917,7 @@ try {
     document.body.append(node);
   }, diagnostics);
   await capture(
-    "16-visible-proof-diagnostics",
+    "17-visible-proof-diagnostics",
     "Network and state boundary",
     "Visible diagnostics confirm no GitHub API or mutation request, unchanged preview data, and a proved real clear.",
   );

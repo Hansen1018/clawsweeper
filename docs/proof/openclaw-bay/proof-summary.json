@@ -1,6 +1,6 @@
 {
   "proof": "OpenClaw Bay deterministic Playwright browser proof",
-  "source_sha": "09941a121d0911278a64f71f3bbd7d57fa090dc8",
+  "source_sha": "2d5793c1a0e1b39fd174c3d743118845152eaab6",
   "route": "/bay-demo",
   "data_classification": "fully synthetic and redacted; no live/private dashboard payloads",
   "fixture_sha256": "FC584F8F0521221B77897384BDEB3A167E85AA6C17708A7783740FCDF363CD21",
@@ -18,8 +18,8 @@
       "sha256": "39DA760BF2E1A9E982404B2F27ABAE8649EF18B21A20E558787921D314BFC4C0"
     }
   ],
-  "derived_real_tide_snapshot_sha256": "CB7BD99B2ABEA3B24F7416193C97BC7DE5F950CD1A29963B003111C03920576E",
-  "generated_at": "2026-07-12T11:29:47.345Z",
+  "derived_real_tide_snapshot_sha256": "1B1B049ECB65CA4548053E92C99373B6A900B76E409A75029E596E7754746049",
+  "generated_at": "2026-07-12T14:00:47.968Z",
   "assertions": [
     {
       "name": "real Bay route loaded",
@@ -46,7 +46,7 @@
     {
       "name": "crustacean claw animation advances",
       "status": "PASS",
-      "elapsed_animation_ms": 283
+      "elapsed_animation_ms": 300
     },
     {
       "name": "forward transition raises READY flag",
@@ -68,7 +68,7 @@
       "status": "PASS",
       "source_hole": 1,
       "target_hole": 1,
-      "target_hole_opacity": 0.392261,
+      "target_hole_opacity": 0.392151,
       "label": "openclaw/openclaw#97722 burrowing"
     },
     {
@@ -117,7 +117,7 @@
     {
       "name": "layered preview tide visibly animates",
       "status": "PASS",
-      "elapsed_animation_ms": 233,
+      "elapsed_animation_ms": 250,
       "tide_layers": 3
     },
     {
@@ -135,7 +135,7 @@
       "status": "PASS",
       "duration": "520ms",
       "animation_name": "none",
-      "elapsed_ms": 573
+      "elapsed_ms": 629
     },
     {
       "name": "tide previews do not poll status",
@@ -144,9 +144,22 @@
       "after_status_gets": 3
     },
     {
+      "name": "dense completed pool renders every buffered outcome",
+      "status": "PASS",
+      "completed": 9,
+      "overflow_notes": 0
+    },
+    {
+      "name": "dense terminal pool keeps references readable at constrained width",
+      "status": "PASS",
+      "references": 9,
+      "overlaps": false,
+      "columns": "2"
+    },
+    {
       "name": "real tide washes terminal outcomes before clearing",
       "status": "PASS",
-      "washed_terminal_count": 3,
+      "washed_terminal_count": 9,
       "preview_class_used": false,
       "terminal_after": 0,
       "countdown": "0 / 20",
@@ -279,16 +292,22 @@
       "storyboard_panel": 14
     },
     {
-      "id": "15-real-tide-cleared",
-      "title": "Real tide clears only after the wash",
-      "detail": "A generated tide first moves the proved terminal crustaceans seaward, then commits the empty shared buffer.",
+      "id": "15-dense-terminal-pool",
+      "title": "Dense completed pool uses the available shoreline",
+      "detail": "Nine completed outcomes stay individually visible, with staggered three-column placement and no hidden overflow.",
       "storyboard_panel": 15
     },
     {
-      "id": "16-visible-proof-diagnostics",
+      "id": "16-real-tide-cleared",
+      "title": "Real tide clears only after the wash",
+      "detail": "A generated tide first moves the proved terminal crustaceans seaward, then commits the empty shared buffer.",
+      "storyboard_panel": 16
+    },
+    {
+      "id": "17-visible-proof-diagnostics",
       "title": "Network and state boundary",
       "detail": "Visible diagnostics confirm no GitHub API or mutation request, unchanged preview data, and a proved real clear.",
-      "storyboard_panel": 16
+      "storyboard_panel": 17
     }
   ],
   "tide_isolation": {
@@ -384,6 +403,12 @@
         "host": "bay-proof.test:8787",
         "path": "/api/status",
         "resource_type": "fetch"
+      },
+      {
+        "method": "GET",
+        "host": "bay-proof.test:8787",
+        "path": "/api/status",
+        "resource_type": "fetch"
       }
     ],
     "responses": [
@@ -411,6 +436,11 @@
         "status": 200,
         "host": "bay-proof.test:8787",
         "path": "/bay-assets/crustaceans-atlas.webp"
+      },
+      {
+        "status": 200,
+        "host": "bay-proof.test:8787",
+        "path": "/api/status"
       },
       {
         "status": 200,
