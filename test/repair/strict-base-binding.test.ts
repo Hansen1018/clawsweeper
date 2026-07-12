@@ -632,6 +632,19 @@ test("exact router dispatch concurrency is item-specific and cannot replace anot
   );
   assert.match(source, /concurrency_group="repair-comment-router-\$target_repo-scan"/);
   assert.match(source, /group: \$\{\{ needs\.normalize-lane\.outputs\.concurrency_group \}\}/);
+  const routerSource = fs.readFileSync("src/repair/comment-router.ts", "utf8");
+  const candidateSelection = routerSource.slice(
+    routerSource.indexOf("function listCandidateComments()"),
+    routerSource.indexOf("function extractMarkdownSection"),
+  );
+  assert.ok(
+    candidateSelection.indexOf("if (itemNumbers.size > 0)") <
+      candidateSelection.indexOf("if (commentIds.size > 0)"),
+  );
+  assert.match(
+    candidateSelection,
+    /itemNumbers[\s\S]*recentComments: \[\],[\s\S]*durableComments: \[\.\.\.itemNumbers\]\.flatMap/,
+  );
   assert.match(
     source,
     /Dispatch discovered items through exact router lanes[\s\S]*-f item_numbers="\$item_number"/,

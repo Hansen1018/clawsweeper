@@ -4161,19 +4161,19 @@ function listRecentComments() {
 }
 
 function listCandidateComments() {
+  if (itemNumbers.size > 0) {
+    return selectCommentsForRouting({
+      recentComments: [],
+      durableComments: [...itemNumbers].flatMap((number) => issueCommentsFor(number)),
+      maxComments,
+    });
+  }
   if (commentIds.size > 0) {
     return selectCommentsForRouting({
       recentComments: [...commentIds]
         .filter((commentId) => /^[1-9]\d*$/.test(commentId))
         .map((commentId) => fetchIssueComment(commentId))
         .filter((comment) => comment !== null),
-      durableComments: [],
-      maxComments,
-    });
-  }
-  if (itemNumbers.size > 0) {
-    return selectCommentsForRouting({
-      recentComments: [...itemNumbers].flatMap((number) => issueCommentsFor(number)),
       durableComments: [],
       maxComments,
     });
