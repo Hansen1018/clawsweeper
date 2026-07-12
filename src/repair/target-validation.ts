@@ -276,16 +276,26 @@ export function prepareTargetToolchain(cwd: string, options: TargetValidationOpt
       "-e",
       "const major = Number(process.versions.node.split('.')[0]); if (major < 22) { console.error(`Node ${process.version} is too old for target validation`); process.exit(1); }",
     ],
-    { cwd, env: validationEnv, timeoutMs: setupTimeoutMs },
+    {
+      cwd,
+      env: validationEnv,
+      timeoutMs: targetToolchainCommandTimeout(identityLimits, setupTimeoutMs, "node setup probe"),
+    },
   );
 
   if (toolchain.packageManager === "bun") {
-    prepareBunToolchain({ cwd, validationEnv, setupTimeoutMs, installTimeoutMs });
+    prepareBunToolchain({
+      cwd,
+      validationEnv,
+      setupTimeoutMs,
+      installTimeoutMs,
+      identityLimits,
+    });
     assertValidationSourceIdentity(cwd, sourceIdentity, identityLimits);
     return;
   }
   if (toolchain.packageManager === "npm") {
-    prepareNpmToolchain({ cwd, validationEnv, installTimeoutMs });
+    prepareNpmToolchain({ cwd, validationEnv, installTimeoutMs, identityLimits });
     assertValidationSourceIdentity(cwd, sourceIdentity, identityLimits);
     return;
   }
@@ -295,6 +305,7 @@ export function prepareTargetToolchain(cwd: string, options: TargetValidationOpt
     validationEnv,
     setupTimeoutMs,
     installTimeoutMs,
+    identityLimits,
   });
   assertValidationSourceIdentity(cwd, sourceIdentity, identityLimits);
 }
@@ -305,22 +316,28 @@ function preparePnpmToolchain({
   validationEnv,
   setupTimeoutMs,
   installTimeoutMs,
+  identityLimits,
 }: {
   cwd: string;
   packageJson: LooseRecord;
   validationEnv: NodeJS.ProcessEnv;
   setupTimeoutMs: number;
   installTimeoutMs: number;
+  identityLimits: ProofInputLimits;
 }) {
   const packageManager = String(packageJson.packageManager ?? "pnpm@10.33.0");
   if (!packageManager.startsWith("pnpm@")) {
     throw new Error(`unsupported target package manager: ${packageManager}`);
   }
-  run("corepack", ["enable"], { cwd, env: validationEnv, timeoutMs: setupTimeoutMs });
+  run("corepack", ["enable"], {
+    cwd,
+    env: validationEnv,
+    timeoutMs: targetToolchainCommandTimeout(identityLimits, setupTimeoutMs, "corepack enable"),
+  });
   run("corepack", ["prepare", packageManager, "--activate"], {
     cwd,
     env: validationEnv,
-    timeoutMs: setupTimeoutMs,
+    timeoutMs: targetToolchainCommandTimeout(identityLimits, setupTimeoutMs, "corepack prepare"),
   });
   const installArgs = [
     "install",
@@ -331,7 +348,11 @@ function preparePnpmToolchain({
     "--config.enable-pre-post-scripts=false",
   ];
   try {
-    run("pnpm", installArgs, { cwd, env: validationEnv, timeoutMs: installTimeoutMs });
+    run("pnpm", installArgs, {
+      cwd,
+      env: validationEnv,
+      timeoutMs: targetToolchainCommandTimeout(identityLimits, installTimeoutMs, "pnpm install"),
+    });
   } catch (error) {
     if (!/ERR_PNPM_OUTDATED_LOCKFILE/i.test(String(error.message))) throw error;
     run(
@@ -340,7 +361,11 @@ function preparePnpmToolchain({
       {
         cwd,
         env: validationEnv,
-        timeoutMs: installTimeoutMs,
+        timeoutMs: targetToolchainCommandTimeout(
+          identityLimits,
+          installTimeoutMs,
+          "pnpm install fallback",
+        ),
       },
     );
     restoreTargetLockfile(cwd, "pnpm-lock.yaml");
@@ -352,28 +377,42 @@ function prepareBunToolchain({
   validationEnv,
   setupTimeoutMs,
   installTimeoutMs,
+  identityLimits,
 }: {
   cwd: string;
   validationEnv: NodeJS.ProcessEnv;
   setupTimeoutMs: number;
   installTimeoutMs: number;
+  identityLimits: ProofInputLimits;
 }) {
   // The repair execution workflow provisions pinned Bun before this path runs.
   // Keep a clear fail-fast probe so local/manual runners surface setup gaps early.
   // ClawSweeper runs under pnpm, so strip caller lifecycle identity before Bun
   // while preserving target registry, auth, proxy, userconfig, and cache settings.
   const bunEnv = sanitizeEnvForBun(validationEnv);
-  run("bun", ["--version"], { cwd, env: bunEnv, timeoutMs: setupTimeoutMs });
+  run("bun", ["--version"], {
+    cwd,
+    env: bunEnv,
+    timeoutMs: targetToolchainCommandTimeout(identityLimits, setupTimeoutMs, "bun setup probe"),
+  });
   const installArgs = ["install", "--frozen-lockfile", "--ignore-scripts"];
   try {
-    run("bun", installArgs, { cwd, env: bunEnv, timeoutMs: installTimeoutMs });
+    run("bun", installArgs, {
+      cwd,
+      env: bunEnv,
+      timeoutMs: targetToolchainCommandTimeout(identityLimits, installTimeoutMs, "bun install"),
+    });
   } catch (error) {
     const message = String(error?.message ?? "");
     if (!/lockfile|frozen|out of date|out-of-date/i.test(message)) throw error;
     run("bun", ["install", "--no-frozen-lockfile", "--ignore-scripts"], {
       cwd,
       env: bunEnv,
-      timeoutMs: installTimeoutMs,
+      timeoutMs: targetToolchainCommandTimeout(
+        identityLimits,
+        installTimeoutMs,
+        "bun install fallback",
+      ),
     });
     for (const lockfile of ["bun.lock", "bun.lockb"]) {
       restoreTargetLockfile(cwd, lockfile);
@@ -409,15 +448,21 @@ function prepareNpmToolchain({
   cwd,
   validationEnv,
   installTimeoutMs,
+  identityLimits,
 }: {
   cwd: string;
   validationEnv: NodeJS.ProcessEnv;
   installTimeoutMs: number;
+  identityLimits: ProofInputLimits;
 }) {
   const installArgs = fs.existsSync(path.join(cwd, "package-lock.json"))
     ? ["ci", "--ignore-scripts"]
     : ["install", "--no-package-lock", "--ignore-scripts"];
-  run("npm", installArgs, { cwd, env: validationEnv, timeoutMs: installTimeoutMs });
+  run("npm", installArgs, {
+    cwd,
+    env: validationEnv,
+    timeoutMs: targetToolchainCommandTimeout(identityLimits, installTimeoutMs, "npm install"),
+  });
 }
 
 export function runAllowedValidationCommands(
@@ -665,6 +710,7 @@ function runValidationPlanCommand({
     if (remainingBudgetMs <= 0) {
       throw validationCommandBudgetError(rendered);
     }
+    let executionError: Error | null = null;
     try {
       const executionParts = validationCommandForExecution(parts);
       run(executionParts[0]!, executionParts.slice(1), {
@@ -672,8 +718,16 @@ function runValidationPlanCommand({
         env: validationEnv,
         timeoutMs: remainingBudgetMs,
       });
-      assertValidationCheckoutIdentity(cwd, baseRef, checkoutIdentity, proofLimits);
-      assertValidationProofInputSnapshot(cwd, proofInputSnapshot, proofLimits);
+    } catch (error) {
+      executionError = error as Error;
+    }
+    assertValidationCheckoutIdentity(cwd, baseRef, checkoutIdentity, proofLimits);
+    assertValidationProofInputSnapshot(cwd, proofInputSnapshot, proofLimits);
+    const postVerificationBudgetMs = remainingCommandBudget(timeoutMs, startedAt);
+    if (postVerificationBudgetMs <= 0) {
+      throw validationCommandBudgetError(rendered, executionError ?? undefined);
+    }
+    if (!executionError) {
       executed.add(commandIdentity);
       return {
         executedCommands: [rendered],
@@ -682,30 +736,23 @@ function runValidationPlanCommand({
             ? `passed after ${(attempts.get(commandIdentity) ?? 0) + 1} attempts`
             : "passed",
       };
-    } catch (error) {
-      assertValidationCheckoutIdentity(cwd, baseRef, checkoutIdentity, proofLimits);
-      assertValidationProofInputSnapshot(cwd, proofInputSnapshot, proofLimits);
-      const remainingBudgetMs = remainingCommandBudget(timeoutMs, startedAt);
-      if (
-        remainingBudgetMs >= MIN_VALIDATION_RETRY_BUDGET_MS &&
-        shouldRetryValidationCommand({
-          parts,
-          error,
-          attempts,
-          options,
-          attemptKey: commandIdentity,
-        })
-      ) {
-        continue;
-      }
-      if (remainingBudgetMs <= 0) {
-        throw validationCommandBudgetError(rendered, error);
-      }
-      throw new Error(
-        `validation command failed (${rendered}): ${compactText(error.message, 12000)}`,
-        { cause: error },
-      );
     }
+    if (
+      postVerificationBudgetMs >= MIN_VALIDATION_RETRY_BUDGET_MS &&
+      shouldRetryValidationCommand({
+        parts,
+        error: executionError,
+        attempts,
+        options,
+        attemptKey: commandIdentity,
+      })
+    ) {
+      continue;
+    }
+    throw new Error(
+      `validation command failed (${rendered}): ${compactText(executionError.message, 12000)}`,
+      { cause: executionError },
+    );
   }
 }
 
@@ -881,7 +928,7 @@ function validationProofInputSnapshot(
     }
   };
 
-  for (const relativePath of validationProofInputCandidates(cwd, commands)) {
+  for (const relativePath of validationProofInputCandidates(cwd, commands, limits)) {
     if (proofInputLstat(root, relativePath)) visit(relativePath);
     else {
       consumeProofInputTraversalEntry(relativePath, state, limits);
@@ -990,25 +1037,33 @@ function assertValidationProofInputSnapshot(
 function validationProofInputCandidates(
   cwd: string,
   commands: readonly { parts: readonly string[] }[],
+  limits: ProofInputLimits,
 ): string[] {
   const candidates = new Set(ROOT_PROOF_INPUT_CANDIDATES);
-  for (const candidate of trackedManifestProofInputCandidates(cwd)) candidates.add(candidate);
-  const ignoredEntries = run(
-    "git",
+  const discoveryState: ProofTraversalState = { bytes: 0, entries: 0 };
+  for (const candidate of trackedManifestProofInputCandidates(cwd, limits, discoveryState)) {
+    candidates.add(candidate);
+  }
+  const ignoredPaths = boundedGitProofInputPaths(
+    cwd,
     ["ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z"],
-    { cwd },
+    limits,
+    discoveryState,
+    "ignored proof inputs",
   );
-  const ignoredPaths = ignoredEntries
-    .split("\0")
-    .map((entry) => entry.replace(/\/+$/, ""))
-    .filter(Boolean);
+  const ignoredPathSet = new Set(ignoredPaths);
   for (const ignoredPath of ignoredPaths) {
     const parts = ignoredPath.split("/");
     const protectedIndex = parts.findIndex((part) => PROTECTED_PROOF_INPUT_DIRECTORIES.has(part));
     if (protectedIndex >= 0) {
-      candidates.add(parts.slice(0, protectedIndex + 1).join("/"));
+      addDiscoveredProofInputCandidate(
+        candidates,
+        parts.slice(0, protectedIndex + 1).join("/"),
+        discoveryState,
+        limits,
+      );
     } else if (isProtectedProofInputFile(ignoredPath)) {
-      candidates.add(ignoredPath);
+      addDiscoveredProofInputCandidate(candidates, ignoredPath, discoveryState, limits);
     }
   }
 
@@ -1018,32 +1073,22 @@ function validationProofInputCandidates(
       const absolute = path.resolve(cwd, argument);
       if (!isPathWithin(path.resolve(cwd), absolute) || !fs.existsSync(absolute)) continue;
       const relative = proofInputRelativePath(path.resolve(cwd), absolute);
-      if (
-        ignoredPaths.some((ignored) => relative === ignored || relative.startsWith(`${ignored}/`))
-      ) {
-        candidates.add(relative);
+      if (pathIsWithinCandidateSet(relative, ignoredPathSet)) {
+        addDiscoveredProofInputCandidate(candidates, relative, discoveryState, limits);
       }
     }
   }
 
-  return [...candidates]
-    .map((candidate) => candidate.replaceAll("\\", "/").replace(/^\.\/+/, ""))
-    .filter((candidate) => candidate && candidate !== ".git" && !candidate.startsWith(".git/"))
-    .sort((left, right) => left.localeCompare(right))
-    .filter(
-      (candidate, index, values) =>
-        !values.some(
-          (parent, parentIndex) =>
-            parentIndex !== index &&
-            candidate.startsWith(`${parent}/`) &&
-            parent.split("/").length < candidate.split("/").length,
-        ),
-    );
+  return reduceProofInputCandidatePrefixes(candidates);
 }
 
-function trackedManifestProofInputCandidates(cwd: string): string[] {
-  const manifests = run(
-    "git",
+function trackedManifestProofInputCandidates(
+  cwd: string,
+  limits: ProofInputLimits,
+  state: ProofTraversalState,
+): string[] {
+  const manifests = boundedGitProofInputPaths(
+    cwd,
     [
       "ls-files",
       "-z",
@@ -1058,24 +1103,172 @@ function trackedManifestProofInputCandidates(cwd: string): string[] {
       ":(glob)**/pyproject.toml",
       ":(glob)**/requirements*.txt",
     ],
-    { cwd },
-  )
-    .split("\0")
-    .filter(Boolean);
+    limits,
+    state,
+    "tracked manifest proof inputs",
+  );
   const candidates = new Set<string>();
   for (const manifest of manifests) {
     const directory = path.posix.dirname(manifest);
     for (const name of ROOT_PROOF_INPUT_CANDIDATES) {
-      candidates.add(directory === "." ? name : path.posix.join(directory, name));
+      addDiscoveredProofInputCandidate(
+        candidates,
+        directory === "." ? name : path.posix.join(directory, name),
+        state,
+        limits,
+      );
     }
     if (
       path.posix.basename(manifest) === "Cargo.toml" ||
       path.posix.basename(manifest) === "go.mod"
     ) {
-      candidates.add(directory === "." ? "vendor" : path.posix.join(directory, "vendor"));
+      addDiscoveredProofInputCandidate(
+        candidates,
+        directory === "." ? "vendor" : path.posix.join(directory, "vendor"),
+        state,
+        limits,
+      );
     }
   }
   return [...candidates];
+}
+
+export function reduceProofInputCandidatePrefixes(values: Iterable<string>): string[] {
+  type TrieNode = { terminal: boolean; children: Map<string, TrieNode> };
+  const root: TrieNode = { terminal: false, children: new Map() };
+  const selected: string[] = [];
+  const candidates = [
+    ...new Set([...values].map(normalizeProofInputCandidate).filter(Boolean)),
+  ].sort((left, right) => left.localeCompare(right));
+  for (const candidate of candidates) {
+    const parts = candidate.split("/");
+    let node = root;
+    let covered = false;
+    for (const part of parts) {
+      if (node.terminal) {
+        covered = true;
+        break;
+      }
+      let child = node.children.get(part);
+      if (!child) {
+        child = { terminal: false, children: new Map() };
+        node.children.set(part, child);
+      }
+      node = child;
+    }
+    if (covered || node.terminal) continue;
+    node.terminal = true;
+    node.children.clear();
+    selected.push(candidate);
+  }
+  return selected;
+}
+
+function boundedGitProofInputPaths(
+  cwd: string,
+  args: string[],
+  limits: ProofInputLimits,
+  state: ProofTraversalState,
+  label: string,
+) {
+  let output: string;
+  try {
+    output = run("git", args, {
+      cwd,
+      timeoutMs: proofInputDiscoveryTimeoutMs(limits, label),
+      maxBuffer: Math.max(1, limits.maxBytes),
+    });
+  } catch (error) {
+    if (/ENOBUFS|maxBuffer/i.test(String((error as Error).message))) {
+      throw new Error(
+        `proof input candidate discovery exceeded the supported byte budget at ${label}`,
+        { cause: error },
+      );
+    }
+    throw error;
+  }
+  const entries: string[] = [];
+  let start = 0;
+  for (let index = 0; index <= output.length; index += 1) {
+    if (index < output.length && output[index] !== "\0") continue;
+    const entry = normalizeProofInputCandidate(output.slice(start, index).replace(/\/+$/, ""));
+    start = index + 1;
+    if (!entry) continue;
+    consumeProofInputCandidateDiscoveryEntry(entry, state, limits);
+    entries.push(entry);
+  }
+  return entries;
+}
+
+function addDiscoveredProofInputCandidate(
+  candidates: Set<string>,
+  candidate: string,
+  state: ProofTraversalState,
+  limits: ProofInputLimits,
+) {
+  const normalized = normalizeProofInputCandidate(candidate);
+  if (!normalized || candidates.has(normalized)) return;
+  consumeProofInputCandidateDiscoveryEntry(normalized, state, limits);
+  candidates.add(normalized);
+}
+
+function normalizeProofInputCandidate(candidate: string) {
+  const normalized = candidate
+    .replaceAll("\\", "/")
+    .replace(/^\.\/+/, "")
+    .replace(/\/+$/, "");
+  if (!normalized || normalized === ".git" || normalized.startsWith(".git/")) return "";
+  return normalized;
+}
+
+function consumeProofInputCandidateDiscoveryEntry(
+  relativePath: string,
+  state: ProofTraversalState,
+  limits: ProofInputLimits,
+) {
+  assertProofInputCandidateDiscoveryDeadline(limits, relativePath);
+  if (state.entries >= limits.maxEntries) {
+    throw new Error(
+      `proof input candidate discovery exceeded the supported entry budget at ${relativePath}`,
+    );
+  }
+  const depth = relativePath.split("/").filter(Boolean).length;
+  if (depth > limits.maxDepth) {
+    throw new Error(
+      `proof input candidate discovery exceeded the supported depth budget at ${relativePath}`,
+    );
+  }
+  const bytes = Buffer.byteLength(relativePath) + 1;
+  if (state.bytes + bytes > limits.maxBytes) {
+    throw new Error(
+      `proof input candidate discovery exceeded the supported byte budget at ${relativePath}`,
+    );
+  }
+  state.entries += 1;
+  state.bytes += bytes;
+}
+
+function proofInputDiscoveryTimeoutMs(limits: ProofInputLimits, label: string) {
+  assertProofInputCandidateDiscoveryDeadline(limits, label);
+  return Math.max(1, limits.deadlineAt - Date.now());
+}
+
+function assertProofInputCandidateDiscoveryDeadline(limits: ProofInputLimits, label: string) {
+  if (Date.now() >= limits.deadlineAt) {
+    throw new Error(
+      `staged proof runtime budget exhausted during proof input candidate discovery: ${label}`,
+    );
+  }
+}
+
+function pathIsWithinCandidateSet(relativePath: string, candidates: Set<string>) {
+  let candidate = relativePath;
+  for (;;) {
+    if (candidates.has(candidate)) return true;
+    const parent = path.posix.dirname(candidate);
+    if (parent === "." || parent === candidate) return false;
+    candidate = parent;
+  }
 }
 
 function isProtectedProofInputFile(filePath: string) {
@@ -1545,6 +1738,14 @@ function consumeProofHashingBytes(
 function proofHashingTimeoutMs(limits: ProofInputLimits, logicalPath: string) {
   assertProofHashingDeadline(limits, logicalPath);
   return Math.max(1, limits.deadlineAt - Date.now());
+}
+
+function targetToolchainCommandTimeout(
+  limits: ProofInputLimits,
+  configuredTimeoutMs: number,
+  logicalPath: string,
+) {
+  return Math.min(configuredTimeoutMs, proofHashingTimeoutMs(limits, logicalPath));
 }
 
 function assertProofHashingDeadline(limits: ProofInputLimits, logicalPath: string) {

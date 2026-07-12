@@ -11,6 +11,7 @@ import {
   classifyExternalBaseValidationFailure,
   preflightTargetValidationPlan,
   prepareTargetToolchain,
+  reduceProofInputCandidatePrefixes,
   repairDeltaValidationPlan,
   replayStagedValidationProof,
   reproduceValidationFailureAtPinnedBase,
@@ -1664,6 +1665,66 @@ test("bun lockfile fallback keeps lifecycle hooks disabled", () => {
   ]);
 });
 
+test("pnpm fallback shares one setup and install identity deadline", () => {
+  const cwd = gitPackageFixture({ check: "node check.js" });
+  fs.writeFileSync(path.join(cwd, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\n");
+  git(cwd, "add", ".");
+  git(cwd, "commit", "-m", "initial");
+  const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-pnpm-deadline-"));
+  const corepackPath = path.join(binDir, "corepack.js");
+  const pnpmPath = path.join(binDir, "pnpm.js");
+  const invocationPath = path.join(binDir, "pnpm-count");
+  fs.writeFileSync(
+    corepackPath,
+    "Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 180);\n",
+  );
+  fs.writeFileSync(
+    pnpmPath,
+    `const fs = require("node:fs");
+const count = fs.existsSync(${JSON.stringify(invocationPath)})
+  ? Number(fs.readFileSync(${JSON.stringify(invocationPath)}, "utf8"))
+  : 0;
+fs.writeFileSync(${JSON.stringify(invocationPath)}, String(count + 1));
+if (count === 0) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 250);
+  console.error("ERR_PNPM_OUTDATED_LOCKFILE");
+  process.exit(1);
+}
+Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 450);
+`,
+  );
+  const previousCorepackBin = process.env.COREPACK_BIN;
+  const previousCorepackBinArgs = process.env.COREPACK_BIN_ARGS;
+  const previousPnpmBin = process.env.PNPM_BIN;
+  const previousPnpmBinArgs = process.env.PNPM_BIN_ARGS;
+  Object.assign(process.env, mockCommandBinEnv("corepack", corepackPath));
+  Object.assign(process.env, mockCommandBinEnv("pnpm", pnpmPath));
+  try {
+    assert.throws(
+      () =>
+        prepareTargetToolchain(cwd, {
+          ...validationOptions("steipete/example", {
+            toolchain: {
+              packageManager: "pnpm",
+              baseValidationCommands: ["pnpm check"],
+              changedGate: null,
+            },
+          }),
+          installTargetDeps: true,
+          installTimeoutMs: 500,
+          setupTimeoutMs: 500,
+        }),
+      /command timed out after \d+ms: pnpm install --no-frozen-lockfile/,
+    );
+  } finally {
+    restoreEnv("COREPACK_BIN", previousCorepackBin);
+    restoreEnv("COREPACK_BIN_ARGS", previousCorepackBinArgs);
+    restoreEnv("PNPM_BIN", previousPnpmBin);
+    restoreEnv("PNPM_BIN_ARGS", previousPnpmBinArgs);
+  }
+  assert.equal(fs.readFileSync(invocationPath, "utf8"), "2");
+});
+
 test("npm target setup without a lockfile preserves a clean proof checkout", () => {
   const cwd = gitPackageFixture({ check: "node check.js" });
   git(cwd, "add", ".");
@@ -2664,7 +2725,7 @@ test("staged proof bounds ignored dependency traversal by entries and depth", ()
   git(cwd, "add", ".");
   git(cwd, "commit", "-m", "initial");
   attachOrigin(cwd);
-  const proofEntryLimit = Math.max(git(cwd, "ls-files").split("\n").filter(Boolean).length, 3);
+  const proofEntryLimit = Math.max(git(cwd, "ls-files").split("\n").filter(Boolean).length, 20);
   const baseOptions = {
     toolchain: {
       packageManager: "pnpm",
@@ -2852,7 +2913,7 @@ test("staged proof charges absent snapshot candidates to every traversal budget"
   }
 });
 
-test("staged proof recomputes command timeout after snapshot verification", () => {
+test("staged proof rechecks command timeout after post-command identity and snapshot verification", () => {
   const cwd = gitPackageFixture({});
   git(cwd, "add", ".");
   git(cwd, "commit", "-m", "initial");
@@ -2862,7 +2923,7 @@ test("staged proof recomputes command timeout after snapshot verification", () =
   const watchedEnvPath = path.join(fs.realpathSync(cwd), ".env");
   let envReads = 0;
   fs.lstatSync = function (...args) {
-    if (path.resolve(String(args[0])) === watchedEnvPath && ++envReads === 2) {
+    if (path.resolve(String(args[0])) === watchedEnvPath && ++envReads === 3) {
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 750);
     }
     return Reflect.apply(originalLstatSync, fs, args);
@@ -2885,10 +2946,121 @@ test("staged proof recomputes command timeout after snapshot verification", () =
         ),
       /validation command runtime budget exhausted/,
     );
-    assert.equal(envReads >= 2, true);
+    assert.equal(envReads >= 3, true);
   } finally {
     fs.lstatSync = originalLstatSync;
   }
+});
+
+for (const mode of ["initial", "replay"] as const) {
+  test(`staged proof ${mode} bounds stalled manifest candidate discovery`, () => {
+    const cwd = gitPackageFixture({});
+    git(cwd, "add", ".");
+    git(cwd, "commit", "-m", "initial");
+    attachOrigin(cwd);
+    const options = validationOptions("steipete/example", {
+      proofBudgetMs: 500,
+      validationTimeoutMs: 1_000,
+      toolchain: {
+        packageManager: "pnpm",
+        baseValidationCommands: [],
+        changedGate: null,
+      },
+    });
+    const plan =
+      mode === "replay" ? buildTargetValidationProofPlan(["git diff --check"], cwd, options) : null;
+
+    withStallingGit(
+      `args[0] === "ls-files" && args.some((arg) => arg.includes("**/package.json"))`,
+      () => {
+        assert.throws(() => {
+          if (mode === "replay") {
+            assert.ok(plan);
+            replayStagedValidationProof(plan, cwd, options);
+            return;
+          }
+          runStagedValidationProof(["git diff --check"], cwd, options);
+        }, /command timed out after \d+ms: git ls-files/);
+      },
+    );
+  });
+
+  test(`staged proof ${mode} bounds manifest candidate accumulation`, () => {
+    const cwd = gitPackageFixture({});
+    for (let index = 0; index < 20; index += 1) {
+      const packageDir = path.join(cwd, "packages", `package-${index}`);
+      fs.mkdirSync(packageDir, { recursive: true });
+      fs.writeFileSync(path.join(packageDir, "package.json"), "{}\n");
+    }
+    git(cwd, "add", ".");
+    git(cwd, "commit", "-m", "initial");
+    attachOrigin(cwd);
+    const trackedEntries = git(cwd, "ls-files").split("\n").filter(Boolean).length;
+    const options = validationOptions("steipete/example", {
+      proofInputMaxEntries: trackedEntries + 20,
+      toolchain: {
+        packageManager: "pnpm",
+        baseValidationCommands: [],
+        changedGate: null,
+      },
+    });
+    const plan =
+      mode === "replay" ? buildTargetValidationProofPlan(["git diff --check"], cwd, options) : null;
+
+    assert.throws(() => {
+      if (mode === "replay") {
+        assert.ok(plan);
+        replayStagedValidationProof(plan, cwd, options);
+        return;
+      }
+      runStagedValidationProof(["git diff --check"], cwd, options);
+    }, /proof input candidate discovery exceeded the supported entry budget/);
+  });
+}
+
+test("staged proof bounds stalled ignored-input candidate discovery", () => {
+  const cwd = gitPackageFixture({});
+  git(cwd, "add", ".");
+  git(cwd, "commit", "-m", "initial");
+  attachOrigin(cwd);
+
+  withStallingGit(`args[0] === "ls-files" && args.includes("--others")`, () => {
+    assert.throws(
+      () =>
+        runStagedValidationProof(
+          ["git diff --check"],
+          cwd,
+          validationOptions("steipete/example", {
+            proofBudgetMs: 500,
+            validationTimeoutMs: 1_000,
+            toolchain: {
+              packageManager: "pnpm",
+              baseValidationCommands: [],
+              changedGate: null,
+            },
+          }),
+        ),
+      /command timed out after \d+ms: git ls-files --others --ignored/,
+    );
+  });
+});
+
+test("proof input candidate prefix reduction scales across large unrelated sets", () => {
+  const unrelated = Array.from(
+    { length: 10_000 },
+    (_, index) => `packages/package-${String(index).padStart(5, "0")}/node_modules`,
+  );
+  const reduced = reduceProofInputCandidatePrefixes([
+    ...unrelated,
+    "shared",
+    "shared/cache",
+    "./shared/cache/deeper/",
+    ".git",
+  ]);
+
+  assert.equal(reduced.length, unrelated.length + 1);
+  assert.equal(reduced[0], "packages/package-00000/node_modules");
+  assert.equal(reduced.at(-1), "shared");
 });
 
 test("staged proof budget includes checkout and recursive proof-input sealing", () => {
