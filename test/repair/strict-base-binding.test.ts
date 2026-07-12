@@ -533,7 +533,11 @@ test("repair execution and validation cannot mutate GitHub before trusted public
   const reportOnlyRequeue = report.steps?.find(
     (step: { id?: string }) => step.id === "requeue_report_only",
   );
+  const missingHandoffRequeue = report.steps?.find(
+    (step: { id?: string }) => step.id === "requeue_missing_execution",
+  );
   assert.ok(reportOnlyRequeue);
+  assert.ok(missingHandoffRequeue);
   assert.doesNotMatch(executeText, /create-github-app-token|create-state-token|setup-state/);
   assert.doesNotMatch(validateText, /create-github-app-token|create-state-token|setup-state/);
   assert.doesNotMatch(
@@ -583,6 +587,10 @@ test("repair execution and validation cannot mutate GitHub before trusted public
   assert.match(
     String(reportOnlyRequeue.run ?? ""),
     /--requeue-depth[\s\S]*--max-requeue-depth 1[\s\S]*--requeue-authority clawsweeper-app/,
+  );
+  assert.equal(missingHandoffRequeue.env?.CLAWSWEEPER_LIVE_WORKER_CAPACITY_TIMEOUT_MS, "120000");
+  assert.ok(
+    Number(missingHandoffRequeue.env?.CLAWSWEEPER_LIVE_WORKER_CAPACITY_TIMEOUT_MS) < 10 * 60 * 1000,
   );
   assert.match(reportText, /REQUEUE_OUTCOME/);
   assert.match(reportText, /bounded authorized retry could not be queued/);

@@ -1273,6 +1273,7 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.requeue_token.outputs.token }}
           CLAWSWEEPER_MUTATION_TOKEN_SOURCE: clawsweeper-app
+          CLAWSWEEPER_LIVE_WORKER_CAPACITY_TIMEOUT_MS: "120000"
         run: |
           pnpm run repair:requeue -- "${{ needs.authorize.outputs.source_job_path }}" \
             --mode "${{ inputs.mode }}" \
