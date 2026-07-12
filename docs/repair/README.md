@@ -314,9 +314,10 @@ pnpm run repair:self-heal
 pnpm run repair:requeue -- 24947178021
 
 # Requeue one reviewed job/run into the live queue. This waits for capacity,
-# then forwards the explicit captured gate values to the App-authenticated run
-# without changing repository-wide variables.
+# then forwards the explicit captured gate values through an authenticated
+# maintainer workflow dispatch without changing repository-wide variables.
 pnpm run repair:requeue -- 24947178021 --execute --open-execute-window \
+  --requeue-authority maintainer \
   --allow-execute 1 \
   --allow-fix-pr 1 \
   --runner blacksmith-4vcpu-ubuntu-2404 \

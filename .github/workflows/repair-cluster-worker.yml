@@ -62,7 +62,12 @@ on:
         default: "0"
         type: string
       requeue_context:
-        description: "Internal App-authenticated captured gate and retry context"
+        description: "Captured gate and retry context bound to an explicit authenticated authority"
+        required: false
+        default: ""
+        type: string
+      requeue_authority:
+        description: "Authenticated requeue authority: clawsweeper-app or maintainer"
         required: false
         default: ""
         type: string
@@ -215,31 +220,51 @@ jobs:
           JOB_PATH: ${{ inputs.job }}
         run: scripts/restore-repair-job.sh "$JOB_PATH" "this worker"
 
-      - name: Restore App-authenticated requeue context
+      - name: Restore authenticated requeue context
         id: requeue_context
         env:
           REQUEUE_CONTEXT: ${{ inputs.requeue_context }}
           REQUEUE_REQUESTED: ${{ inputs.requeue }}
+          REQUEUE_AUTHORITY: ${{ inputs.requeue_authority }}
           REQUEUE_ACTOR: ${{ github.actor }}
+          REQUEUE_EVENT_NAME: ${{ github.event_name }}
         run: |
           node <<'NODE'
           const fs = require("node:fs");
           const encoded = String(process.env.REQUEUE_CONTEXT || "");
           const requested = process.env.REQUEUE_REQUESTED === "true";
+          const authority = String(process.env.REQUEUE_AUTHORITY || "");
+          const actor = String(process.env.REQUEUE_ACTOR || "");
           let depth = 0;
           if (encoded) {
-            if (!requested || process.env.REQUEUE_ACTOR !== "openclaw-clawsweeper[bot]") {
-              throw new Error("captured requeue context requires the trusted ClawSweeper App actor");
-            }
             const context = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8"));
             if (
+              !requested ||
               context.schema_version !== 1 ||
+              context.authority !== authority ||
               !Number.isSafeInteger(context.depth) ||
               context.depth < 1 ||
               !["0", "1"].includes(context.allow_execute) ||
               !["0", "1"].includes(context.allow_fix_pr)
             ) {
               throw new Error("captured requeue context is invalid");
+            }
+            if (authority === "clawsweeper-app") {
+              if (actor !== "openclaw-clawsweeper[bot]") {
+                throw new Error("captured App requeue context requires the trusted ClawSweeper App actor");
+              }
+            } else if (authority === "maintainer") {
+              if (
+                process.env.REQUEUE_EVENT_NAME !== "workflow_dispatch" ||
+                !actor ||
+                actor.endsWith("[bot]")
+              ) {
+                throw new Error(
+                  "captured maintainer requeue context requires an authenticated human workflow-dispatch actor",
+                );
+              }
+            } else {
+              throw new Error("captured requeue context authority is invalid");
             }
             depth = context.depth;
             fs.appendFileSync(
@@ -1236,6 +1261,7 @@ jobs:
             --allow-fix-pr "${{ needs.authorize.outputs.allow_fix_pr }}" \
             --requeue-depth "${{ needs.cluster.outputs.requeue_depth || '0' }}" \
             --max-requeue-depth 1 \
+            --requeue-authority clawsweeper-app \
             --wait-for-capacity \
             --runner "${{ inputs.runner }}" \
             --execution-runner "${{ inputs.execution_runner }}" \
@@ -1256,6 +1282,7 @@ jobs:
             --allow-fix-pr "${{ needs.authorize.outputs.allow_fix_pr }}" \
             --requeue-depth "${{ needs.cluster.outputs.requeue_depth || '0' }}" \
             --max-requeue-depth 1 \
+            --requeue-authority clawsweeper-app \
             --wait-for-capacity \
             --runner "${{ inputs.runner }}" \
             --execution-runner "${{ inputs.execution_runner }}" \

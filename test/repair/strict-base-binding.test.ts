@@ -580,7 +580,10 @@ test("repair execution and validation cannot mutate GitHub before trusted public
     String(reportOnlyRequeue.if ?? ""),
     /fromJSON\(needs\.cluster\.outputs\.requeue_depth \|\| '0'\) < 1/,
   );
-  assert.match(String(reportOnlyRequeue.run ?? ""), /--requeue-depth[\s\S]*--max-requeue-depth 1/);
+  assert.match(
+    String(reportOnlyRequeue.run ?? ""),
+    /--requeue-depth[\s\S]*--max-requeue-depth 1[\s\S]*--requeue-authority clawsweeper-app/,
+  );
   assert.match(reportText, /REQUEUE_OUTCOME/);
   assert.match(reportText, /bounded authorized retry could not be queued/);
   assert.match(reportText, /failed deterministic verification\. It was not requeued/);

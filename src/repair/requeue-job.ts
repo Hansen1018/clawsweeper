@@ -62,6 +62,7 @@ const sourceRunId = String(
 ).trim();
 const requeueDepth = nonNegativeIntegerArg(args["requeue-depth"], "requeue-depth", 0);
 const maxRequeueDepth = nonNegativeIntegerArg(args["max-requeue-depth"], "max-requeue-depth", 1);
+const requeueAuthority = optionalRequeueAuthorityArg(args["requeue-authority"]);
 
 const resolved = requestedRunId
   ? resolveFromRunId(String(requestedRunId))
@@ -69,7 +70,7 @@ const resolved = requestedRunId
 
 if (!resolved.source_job) {
   console.error(
-    `usage: node scripts/requeue-job.ts <job.md|run-id> [--mode plan|execute|autonomous] [--execute] [--open-execute-window --allow-execute 0|1 --allow-fix-pr 0|1] [--source-run-id id] [--source-job-path path] [--requeue-depth n] [--max-requeue-depth n] [--runner label] [--execution-runner label] [--model model] [--max-live-workers ${AUTOMATION_LIMITS.repair_live_runs.default}] [--wait-for-capacity]`,
+    `usage: node scripts/requeue-job.ts <job.md|run-id> [--mode plan|execute|autonomous] [--execute --requeue-authority clawsweeper-app|maintainer] [--open-execute-window --allow-execute 0|1 --allow-fix-pr 0|1] [--source-run-id id] [--source-job-path path] [--requeue-depth n] [--max-requeue-depth n] [--runner label] [--execution-runner label] [--model model] [--max-live-workers ${AUTOMATION_LIMITS.repair_live_runs.default}] [--wait-for-capacity]`,
   );
   process.exit(2);
 }
@@ -105,6 +106,7 @@ const summary: LooseRecord = {
   max_live_workers: maxLiveWorkers,
   captured_allow_execute: capturedAllowExecute,
   captured_allow_fix_pr: capturedAllowFixPr,
+  requeue_authority: requeueAuthority,
 };
 
 if (!execute) {
@@ -116,6 +118,9 @@ if (maxRequeueDepth !== null && requeueDepth >= maxRequeueDepth) {
   throw new Error(
     `requeue depth ${requeueDepth} reached the maximum ${maxRequeueDepth}; refusing another dispatch`,
   );
+}
+if (!requeueAuthority) {
+  throw new Error("live requeue dispatch requires --requeue-authority clawsweeper-app|maintainer");
 }
 
 summary.live_worker_capacity_before_dispatch = waitForCapacity
@@ -157,6 +162,7 @@ let commandError: unknown = null;
 try {
   dispatchJob(sourceJobPath, mode, dispatchKey, requeueLifecycle, {
     schema_version: 1,
+    authority: requeueAuthority,
     depth: nextRequeueDepth,
     allow_execute: forwardedGates.allowExecute,
     allow_fix_pr: forwardedGates.allowFixPr,
@@ -249,6 +255,7 @@ function dispatchJob(
   lifecycle: CommandLifecycleInput,
   requeueContext: {
     schema_version: 1;
+    authority: "clawsweeper-app" | "maintainer";
     depth: number;
     allow_execute: "0" | "1";
     allow_fix_pr: "0" | "1";
@@ -291,6 +298,8 @@ function dispatchJob(
           "requeue=true",
           "-f",
           `requeue_depth=${nextRequeueDepth}`,
+          "-f",
+          `requeue_authority=${requeueContext.authority}`,
           "-f",
           `requeue_context=${Buffer.from(JSON.stringify(requeueContext)).toString("base64url")}`,
         ],
@@ -366,6 +375,12 @@ function normalizedGateValue(name: string): "0" | "1" {
   ]);
   const variable = variables.find((entry) => entry.name === name);
   return String(variable?.value ?? "") === "1" ? "1" : "0";
+}
+
+function optionalRequeueAuthorityArg(value: JsonValue): "clawsweeper-app" | "maintainer" | null {
+  if (value === undefined || value === null || value === false || value === "") return null;
+  if (value === "clawsweeper-app" || value === "maintainer") return value;
+  throw new Error("requeue-authority must be clawsweeper-app or maintainer");
 }
 
 function capturedGateArg(value: JsonValue, name: string, required: boolean): "0" | "1" | null {

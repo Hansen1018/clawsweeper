@@ -2094,11 +2094,18 @@ test("repair workers hydrate only durable jobs from generated state", () => {
   assert.match(workflow, /cancel-in-progress: false/);
   assert.match(workflow, /requeue:\n\s+description:/);
   assert.match(workflow, /requeue_context:\n\s+description:/);
+  assert.match(workflow, /requeue_authority:\n\s+description:/);
   assert.match(requeue, /"requeue=true"/);
+  assert.match(requeue, /requeue_authority=\$\{requeueContext\.authority\}/);
   assert.match(requeue, /--allow-execute 0\|1 --allow-fix-pr 0\|1/);
   assert.match(requeue, /--requeue-depth N.*--max-requeue-depth N/);
+  assert.match(requeue, /--requeue-authority clawsweeper-app\|maintainer/);
   assert.match(requeue, /requeue_context=\$\{Buffer\.from\(JSON\.stringify\(requeueContext\)\)/);
   assert.match(requeue, /requeueDepth >= maxRequeueDepth/);
+  assert.match(
+    requeue,
+    /live requeue dispatch requires --requeue-authority clawsweeper-app\|maintainer/,
+  );
   assert.doesNotMatch(requeue, /variable",\s*"(?:set|delete)"/);
   assert.doesNotMatch(requeue, /setGateTemporarily|restoreGate|gateRestores/);
   assert.ok(
@@ -2106,11 +2113,14 @@ test("repair workers hydrate only durable jobs from generated state", () => {
       requeue.indexOf("const forwardedGates"),
   );
   assert.match(requeue, /timed out waiting for .* requeued run\(s\) to become visible/);
-  assert.match(workflow, /REQUEUE_ACTOR !== "openclaw-clawsweeper\[bot\]"/);
+  assert.match(workflow, /authority === "clawsweeper-app"/);
+  assert.match(workflow, /actor !== "openclaw-clawsweeper\[bot\]"/);
+  assert.match(workflow, /authority === "maintainer"/);
+  assert.match(workflow, /authenticated human workflow-dispatch actor/);
   assert.match(workflow, /Buffer\.from\(encoded, "base64url"\)/);
   assert.match(
     repairDocs,
-    /repair:requeue[\s\S]*--open-execute-window[\s\S]*--allow-execute 1[\s\S]*--allow-fix-pr 1/,
+    /repair:requeue[\s\S]*--open-execute-window[\s\S]*--requeue-authority maintainer[\s\S]*--allow-execute 1[\s\S]*--allow-fix-pr 1/,
   );
   assert.equal(
     workflow.match(/uses: \.\/\.github\/actions\/setup-state[\s\S]*?sparse-checkout: jobs/g)
