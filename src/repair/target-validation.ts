@@ -659,7 +659,7 @@ function runValidationPlanCommand({
   if (executed.has(commandIdentity)) {
     return { executedCommands: [], reason: "exact command already passed" };
   }
-  assertValidationProofInputSnapshot(cwd, proofInputSnapshot);
+  assertValidationProofInputSnapshot(cwd, proofInputSnapshot, proofLimits);
   const startedAt = Date.now();
   while (true) {
     const remainingBudgetMs = remainingCommandBudget(timeoutMs, startedAt);
@@ -674,7 +674,7 @@ function runValidationPlanCommand({
         timeoutMs: remainingBudgetMs,
       });
       assertValidationCheckoutIdentity(cwd, baseRef, checkoutIdentity, proofLimits);
-      assertValidationProofInputSnapshot(cwd, proofInputSnapshot);
+      assertValidationProofInputSnapshot(cwd, proofInputSnapshot, proofLimits);
       executed.add(commandIdentity);
       return {
         executedCommands: [rendered],
@@ -685,7 +685,7 @@ function runValidationPlanCommand({
       };
     } catch (error) {
       assertValidationCheckoutIdentity(cwd, baseRef, checkoutIdentity, proofLimits);
-      assertValidationProofInputSnapshot(cwd, proofInputSnapshot);
+      assertValidationProofInputSnapshot(cwd, proofInputSnapshot, proofLimits);
       const remainingBudgetMs = remainingCommandBudget(timeoutMs, startedAt);
       if (
         remainingBudgetMs >= MIN_VALIDATION_RETRY_BUDGET_MS &&
@@ -896,12 +896,23 @@ function validationProofInputSignature(stat: fs.BigIntStats) {
   ].join(":");
 }
 
-function assertValidationProofInputSnapshot(cwd: string, expected: ValidationProofInputSnapshot) {
+function assertValidationProofInputSnapshot(
+  cwd: string,
+  expected: ValidationProofInputSnapshot,
+  limits: ProofInputLimits,
+) {
   const root = fs.realpathSync(cwd);
+  const state: ProofTraversalState = { bytes: 0, entries: 0 };
   for (const [entryPath, signature] of expected.entries) {
-    if (currentProofInputSignature(root, entryPath) === signature) continue;
+    const relativePath = entryPath.split("\0", 1)[0]!;
+    assertProofInputVerificationDeadline(limits, relativePath);
+    assertProofInputVerificationDepth(limits, relativePath);
+    if (currentProofInputSignature(root, entryPath, limits, state) === signature) continue;
+    if (!entryPath.includes("\0") && expected.entries.has(`${relativePath}\0children`)) {
+      currentProofInputSignature(root, `${relativePath}\0children`, limits, state);
+    }
     throw new Error(
-      `unsafe validation command mutated ignored proof input surface: ${entryPath.split("\0", 1)[0] ?? "unknown"}`,
+      `unsafe validation command mutated ignored proof input surface: ${relativePath || "unknown"}`,
     );
   }
 }
@@ -1005,26 +1016,111 @@ function isProtectedProofInputFile(filePath: string) {
   );
 }
 
-function currentProofInputSignature(root: string, entryPath: string): string {
+function currentProofInputSignature(
+  root: string,
+  entryPath: string,
+  limits: ProofInputLimits,
+  state: ProofTraversalState,
+): string {
   const [relativePath, kind = "stat"] = entryPath.split("\0");
+  assertProofInputVerificationDeadline(limits, relativePath!);
   const absolute = proofInputPath(root, relativePath!);
   const stat = proofInputLstat(root, relativePath!);
   if (!stat) return ABSENT_PROOF_INPUT;
   if (kind === "stat") return validationProofInputSignature(stat);
   if (kind === "children") {
-    return stat.isDirectory() ? fs.readdirSync(absolute).sort().join("\0") : "<not-directory>";
+    return stat.isDirectory()
+      ? readProofInputVerificationDirectory(absolute, relativePath!, state, limits).join("\0")
+      : "<not-directory>";
   }
   if (kind === "link") {
-    return stat.isSymbolicLink() ? fs.readlinkSync(absolute) : "<not-symlink>";
+    if (!stat.isSymbolicLink()) return "<not-symlink>";
+    const target = fs.readlinkSync(absolute);
+    consumeProofInputVerificationBytes(relativePath!, Buffer.byteLength(target), state, limits);
+    return target;
   }
   if (kind === "target") {
     if (!stat.isSymbolicLink()) return "<not-symlink>";
     const targetPath = proofInputSymlinkTarget(root, absolute, relativePath!);
-    return `${proofInputRelativePath(root, targetPath)}\0${validationProofInputSignature(
+    const targetRelativePath = proofInputRelativePath(root, targetPath);
+    consumeProofInputVerificationBytes(
+      relativePath!,
+      Buffer.byteLength(targetRelativePath),
+      state,
+      limits,
+    );
+    return `${targetRelativePath}\0${validationProofInputSignature(
       fs.statSync(targetPath, { bigint: true }),
     )}`;
   }
   return "<unknown-proof-input>";
+}
+
+function readProofInputVerificationDirectory(
+  directoryPath: string,
+  relativePath: string,
+  state: ProofTraversalState,
+  limits: ProofInputLimits,
+) {
+  const directory = fs.opendirSync(directoryPath);
+  const children: string[] = [];
+  try {
+    for (;;) {
+      assertProofInputVerificationDeadline(limits, relativePath);
+      const entry = directory.readSync();
+      if (!entry) break;
+      const childPath = path.posix.join(relativePath, entry.name);
+      if (state.entries >= limits.maxEntries) {
+        throw new Error(
+          `proof input snapshot verification exceeded the supported entry budget at ${childPath}`,
+        );
+      }
+      const depth = childPath.split("/").filter(Boolean).length;
+      if (depth > limits.maxDepth) {
+        throw new Error(
+          `proof input snapshot verification exceeded the supported depth budget at ${childPath}`,
+        );
+      }
+      consumeProofInputVerificationBytes(childPath, Buffer.byteLength(entry.name), state, limits);
+      state.entries += 1;
+      children.push(entry.name);
+    }
+  } finally {
+    directory.closeSync();
+  }
+  return children.sort();
+}
+
+function consumeProofInputVerificationBytes(
+  relativePath: string,
+  bytes: number,
+  state: ProofTraversalState,
+  limits: ProofInputLimits,
+) {
+  assertProofInputVerificationDeadline(limits, relativePath);
+  if (!Number.isSafeInteger(bytes) || bytes < 0 || state.bytes + bytes > limits.maxBytes) {
+    throw new Error(
+      `proof input snapshot verification exceeded the supported byte budget at ${relativePath}`,
+    );
+  }
+  state.bytes += bytes;
+}
+
+function assertProofInputVerificationDeadline(limits: ProofInputLimits, relativePath: string) {
+  if (Date.now() >= limits.deadlineAt) {
+    throw new Error(
+      `staged proof runtime budget exhausted during proof input snapshot verification: ${relativePath}`,
+    );
+  }
+}
+
+function assertProofInputVerificationDepth(limits: ProofInputLimits, relativePath: string) {
+  const depth = relativePath.split("/").filter(Boolean).length;
+  if (depth > limits.maxDepth) {
+    throw new Error(
+      `proof input snapshot verification exceeded the supported depth budget at ${relativePath}`,
+    );
+  }
 }
 
 function proofInputLstat(root: string, relativePath: string): fs.BigIntStats | null {

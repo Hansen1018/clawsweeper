@@ -552,6 +552,8 @@ test("repair execution and validation cannot mutate GitHub before trusted public
   assert.match(reportText, /Requeue execution missing a sealed handoff/);
   assert.match(reportText, /\.clawsweeper-repair\/authorized\/job\.md/);
   assert.match(reportText, /steps\.verify_execution\.outcome != 'success'/);
+  assert.match(reportText, /steps\.download_execution\.outcome != 'success'/);
+  assert.match(reportText, /fromJSON\(needs\.cluster\.outputs\.requeue_depth \|\| '0'\) < 1/);
   assert.match(reportText, /count-requeue-required/);
   assert.match(reportText, /repair:requeue/);
   assert.match(
@@ -570,8 +572,17 @@ test("repair execution and validation cannot mutate GitHub before trusted public
   }
   assert.match(source, /Authorize exact job and run[\s\S]*--allow-execute[\s\S]*--allow-fix-pr/);
   assert.match(reportText, /repair:requeue[\s\S]*--allow-execute[\s\S]*--allow-fix-pr/);
+  assert.match(reportText, /--requeue-depth[\s\S]*--max-requeue-depth 1/);
   assert.match(reportText, /REQUEUE_OUTCOME/);
-  assert.match(reportText, /retry could not be queued/);
+  assert.match(reportText, /bounded authorized retry could not be queued/);
+  assert.match(reportText, /failed deterministic verification\. It was not requeued/);
+  assert.doesNotMatch(
+    String(
+      report.steps?.find((step: { id?: string }) => step.id === "requeue_missing_execution")?.if ??
+        "",
+    ),
+    /verify_execution/,
+  );
   assert.doesNotMatch(reportText, /target_post_flight_token|permission-pull-requests/);
   assert.doesNotMatch(JSON.stringify(mutate), /repair:apply-result|repair:tag-clawsweeper/);
   assert.match(JSON.stringify(mutate), /npm_config_ignore_scripts/);
@@ -607,20 +618,15 @@ test("exact router dispatch concurrency is item-specific and cannot replace anot
     fanout,
     /repository_dispatch.*!github\.event\.client_payload\.item_number.*github\.event\.client_payload\.comment_id/,
   );
-  for (const input of [
-    "force_reprocess",
-    "lookback_minutes",
-    "since",
-    "max_comments",
-    "comment_ids",
-  ]) {
+  for (const input of ["force_reprocess", "lookback_minutes", "since", "max_comments"]) {
     assert.match(fanout, new RegExp(`-f ${input}="\\$${input}"`));
   }
   assert.match(fanout, /since="\$\{\{ github\.event\.client_payload\.since \|\| '' \}\}"/);
-  assert.match(
-    fanout,
-    /comment_ids="\$\{\{ github\.event\.client_payload\.comment_id \|\| '' \}\}"/,
-  );
+  assert.match(fanout, /group_by\(\.issue_number\)/);
+  assert.match(fanout, /\.\[\]\.comment_id.*test\("\^\[0-9\]\+\$"\)/s);
+  assert.match(fanout, /read -r item_number item_comment_ids/);
+  assert.match(fanout, /if \[ -n "\$item_comment_ids" \][\s\S]*comment_ids=\$item_comment_ids/);
+  assert.doesNotMatch(fanout, /comment_ids="\$comment_ids"/);
   assert.doesNotMatch(
     fanout,
     /-f force_reprocess=false|-f lookback_minutes=180|-f max_comments=100/,

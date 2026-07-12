@@ -2653,6 +2653,45 @@ test("staged proof replay budget includes checkout and recursive proof-input sea
   }
 });
 
+test("staged proof bounds every ignored-input entry during snapshot verification", () => {
+  const cwd = gitPackageFixture({ poison: "node poison.js" });
+  const dependencyPath = path.join(cwd, "node_modules", "fixture");
+  fs.mkdirSync(dependencyPath, { recursive: true });
+  fs.writeFileSync(path.join(dependencyPath, "state.js"), "clean\n");
+  fs.writeFileSync(
+    path.join(cwd, "poison.js"),
+    [
+      "const fs = require('node:fs');",
+      "const path = require('node:path');",
+      "const directory = 'node_modules/fixture';",
+      "for (let index = 0; index < 32; index += 1) {",
+      "  fs.writeFileSync(path.join(directory, `extra-${index}.js`), 'generated\\n');",
+      "}",
+      "",
+    ].join("\n"),
+  );
+  git(cwd, "add", ".");
+  git(cwd, "commit", "-m", "initial");
+  attachOrigin(cwd);
+
+  assert.throws(
+    () =>
+      runStagedValidationProof(
+        ["pnpm poison"],
+        cwd,
+        validationOptions("steipete/example", {
+          proofInputMaxEntries: 12,
+          toolchain: {
+            packageManager: "pnpm",
+            baseValidationCommands: [],
+            changedGate: null,
+          },
+        }),
+      ),
+    /proof input snapshot verification exceeded the supported entry budget/,
+  );
+});
+
 test("staged proof rejects ignored dependency poisoning before later commands", () => {
   const cwd = gitPackageFixture({
     poison: "node poison.js",

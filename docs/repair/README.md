@@ -313,10 +313,12 @@ pnpm run repair:self-heal
 # Resolve a job from a run id or job path and show the requeue plan.
 pnpm run repair:requeue -- 24947178021
 
-# Requeue one reviewed job/run into the live queue. This briefly opens both
-# write gates when the job is execute/autonomous, waits for the run to start,
-# then closes the gates.
+# Requeue one reviewed job/run into the live queue. This waits for capacity,
+# then forwards the explicit captured gate values to the App-authenticated run
+# without changing repository-wide variables.
 pnpm run repair:requeue -- 24947178021 --execute --open-execute-window \
+  --allow-execute 1 \
+  --allow-fix-pr 1 \
   --runner blacksmith-4vcpu-ubuntu-2404 \
   --execution-runner blacksmith-16vcpu-ubuntu-2404
 

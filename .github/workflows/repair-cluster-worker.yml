@@ -61,6 +61,11 @@ on:
         required: false
         default: "0"
         type: string
+      requeue_context:
+        description: "Internal App-authenticated captured gate and retry context"
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
@@ -73,8 +78,8 @@ env:
 
 concurrency:
   group: ${{ inputs.requeue && format('clawsweeper-repair-requeue-{0}-{1}', inputs.job, github.run_id) || format('clawsweeper-repair-{0}', inputs.job) }}
-  # Keep an active execute run alive so its temporary gate cleanup can finish;
-  # GitHub still coalesces pending runs in this group to the newest dispatch.
+  # Keep active execution alive through its durable report and publication
+  # checkpoints; GitHub still coalesces pending runs in this group.
   cancel-in-progress: false
 
 jobs:
@@ -128,6 +133,7 @@ jobs:
       allow_execute: ${{ steps.capture_gates.outputs.allow_execute }}
       allow_fix_pr: ${{ steps.capture_gates.outputs.allow_fix_pr }}
       allow_merge: ${{ steps.capture_gates.outputs.allow_merge }}
+      requeue_depth: ${{ steps.requeue_context.outputs.depth }}
       job_exists: ${{ steps.check_job.outputs.job_exists }}
       worker_artifact_id: ${{ steps.upload_worker.outputs.artifact-id }}
       worker_artifact_digest: ${{ steps.upload_worker.outputs.artifact-digest }}
@@ -208,6 +214,42 @@ jobs:
         env:
           JOB_PATH: ${{ inputs.job }}
         run: scripts/restore-repair-job.sh "$JOB_PATH" "this worker"
+
+      - name: Restore App-authenticated requeue context
+        id: requeue_context
+        env:
+          REQUEUE_CONTEXT: ${{ inputs.requeue_context }}
+          REQUEUE_REQUESTED: ${{ inputs.requeue }}
+          REQUEUE_ACTOR: ${{ github.actor }}
+        run: |
+          node <<'NODE'
+          const fs = require("node:fs");
+          const encoded = String(process.env.REQUEUE_CONTEXT || "");
+          const requested = process.env.REQUEUE_REQUESTED === "true";
+          let depth = 0;
+          if (encoded) {
+            if (!requested || process.env.REQUEUE_ACTOR !== "openclaw-clawsweeper[bot]") {
+              throw new Error("captured requeue context requires the trusted ClawSweeper App actor");
+            }
+            const context = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8"));
+            if (
+              context.schema_version !== 1 ||
+              !Number.isSafeInteger(context.depth) ||
+              context.depth < 1 ||
+              !["0", "1"].includes(context.allow_execute) ||
+              !["0", "1"].includes(context.allow_fix_pr)
+            ) {
+              throw new Error("captured requeue context is invalid");
+            }
+            depth = context.depth;
+            fs.appendFileSync(
+              process.env.GITHUB_ENV,
+              `CLAWSWEEPER_ALLOW_EXECUTE=${context.allow_execute}\n` +
+                `CLAWSWEEPER_ALLOW_FIX_PR=${context.allow_fix_pr}\n`,
+            );
+          }
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `depth=${depth}\n`);
+          NODE
 
       - name: Capture execution gates
         id: capture_gates
@@ -1137,6 +1179,7 @@ jobs:
             --expected-artifact-digest "${{ needs.execute.outputs.artifact_digest }}"
 
       - name: Download sealed execution handoff
+        id: download_execution
         if: ${{ steps.execution_artifact.outcome == 'success' }}
         continue-on-error: true
         uses: actions/download-artifact@v8
@@ -1149,7 +1192,7 @@ jobs:
 
       - name: Verify report-only handoff
         id: verify_execution
-        if: ${{ steps.execution_artifact.outcome == 'success' }}
+        if: ${{ steps.execution_artifact.outcome == 'success' && steps.download_execution.outcome == 'success' }}
         continue-on-error: true
         run: |
           pnpm run repair:execution-handoff -- verify-execution \
@@ -1166,7 +1209,7 @@ jobs:
 
       - name: Create central requeue token
         id: requeue_token
-        if: ${{ steps.verify_execution.outcome != 'success' || steps.repair_requeue.outputs.count != '' && steps.repair_requeue.outputs.count != '0' }}
+        if: ${{ steps.repair_requeue.outputs.count != '' && steps.repair_requeue.outputs.count != '0' || (steps.execution_artifact.outcome != 'success' || steps.download_execution.outcome != 'success') && fromJSON(needs.cluster.outputs.requeue_depth || '0') < 1 }}
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           client-id: ${{ env.CLAWSWEEPER_APP_CLIENT_ID }}
@@ -1189,10 +1232,10 @@ jobs:
             --mode "${{ inputs.mode }}" \
             --execute \
             --open-execute-window \
-            --requeue-depth "${{ inputs.requeue_depth }}" \
-            --max-requeue-depth 1 \
             --allow-execute "${{ needs.authorize.outputs.allow_execute }}" \
             --allow-fix-pr "${{ needs.authorize.outputs.allow_fix_pr }}" \
+            --requeue-depth "${{ needs.cluster.outputs.requeue_depth || '0' }}" \
+            --max-requeue-depth 1 \
             --wait-for-capacity \
             --runner "${{ inputs.runner }}" \
             --execution-runner "${{ inputs.execution_runner }}" \
@@ -1200,7 +1243,7 @@ jobs:
 
       - name: Requeue execution missing a sealed handoff
         id: requeue_missing_execution
-        if: ${{ steps.verify_execution.outcome != 'success' }}
+        if: ${{ (steps.execution_artifact.outcome != 'success' || steps.download_execution.outcome != 'success') && fromJSON(needs.cluster.outputs.requeue_depth || '0') < 1 }}
         env:
           GH_TOKEN: ${{ steps.requeue_token.outputs.token }}
           CLAWSWEEPER_MUTATION_TOKEN_SOURCE: clawsweeper-app
@@ -1211,6 +1254,8 @@ jobs:
             --open-execute-window \
             --allow-execute "${{ needs.authorize.outputs.allow_execute }}" \
             --allow-fix-pr "${{ needs.authorize.outputs.allow_fix_pr }}" \
+            --requeue-depth "${{ needs.cluster.outputs.requeue_depth || '0' }}" \
+            --max-requeue-depth 1 \
             --wait-for-capacity \
             --runner "${{ inputs.runner }}" \
             --execution-runner "${{ inputs.execution_runner }}" \
@@ -1223,12 +1268,19 @@ jobs:
           GH_TOKEN: ""
           GITHUB_TOKEN: ""
           CLAWSWEEPER_STATUS_INGEST_TOKEN: ${{ secrets.CLAWSWEEPER_STATUS_INGEST_TOKEN }}
+          EXECUTION_ARTIFACT_OUTCOME: ${{ steps.execution_artifact.outcome }}
+          DOWNLOAD_EXECUTION_OUTCOME: ${{ steps.download_execution.outcome }}
+          REQUEUE_DEPTH: ${{ needs.cluster.outputs.requeue_depth || '0' }}
           REQUEUE_OUTCOME: ${{ steps.requeue_missing_execution.outcome }}
         run: |
-          if [ "$REQUEUE_OUTCOME" = "success" ]; then
-            detail="The automatic implementation worker stopped before it sealed the execution handoff. A fresh authorized retry was queued."
+          if [ "$EXECUTION_ARTIFACT_OUTCOME" = "success" ] && [ "$DOWNLOAD_EXECUTION_OUTCOME" = "success" ]; then
+            detail="The automatic implementation worker produced an execution handoff that failed deterministic verification. It was not requeued."
+          elif [ "$REQUEUE_OUTCOME" = "success" ]; then
+            detail="The automatic implementation worker stopped before its sealed execution handoff was available. One bounded authorized retry was queued."
+          elif [[ "$REQUEUE_DEPTH" =~ ^[0-9]+$ ]] && [ "$REQUEUE_DEPTH" -ge 1 ]; then
+            detail="The automatic implementation worker stopped before its sealed execution handoff was available. The bounded retry was already consumed, so no further run was queued."
           else
-            detail="The automatic implementation worker stopped before it sealed the execution handoff. The authorized retry could not be queued; open the workflow run for the dispatch failure."
+            detail="The automatic implementation worker stopped before its sealed execution handoff was available. The bounded authorized retry could not be queued; open the workflow run for the dispatch failure."
           fi
           pnpm run repair:issue-implementation-status -- \
             --job .clawsweeper-repair/authorized/job.md \

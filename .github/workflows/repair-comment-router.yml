@@ -361,7 +361,6 @@ jobs:
           lookback_minutes="${{ github.event_name == 'workflow_dispatch' && inputs.lookback_minutes || vars.CLAWSWEEPER_COMMENT_LOOKBACK_MINUTES || '180' }}"
           since="${{ github.event_name == 'workflow_dispatch' && inputs.since || '' }}"
           max_comments="${{ github.event_name == 'workflow_dispatch' && inputs.max_comments || vars.CLAWSWEEPER_COMMENT_MAX_COMMENTS || '100' }}"
-          comment_ids="${{ github.event_name == 'workflow_dispatch' && inputs.comment_ids || '' }}"
           runner="${{ github.event_name == 'workflow_dispatch' && inputs.runner || vars.CLAWSWEEPER_WORKER_RUNNER || 'blacksmith-4vcpu-ubuntu-2404' }}"
           execution_runner="${{ github.event_name == 'workflow_dispatch' && inputs.execution_runner || vars.CLAWSWEEPER_EXECUTION_RUNNER || 'blacksmith-16vcpu-ubuntu-2404' }}"
           force_reprocess="${{ github.event_name == 'workflow_dispatch' && inputs.force_reprocess || 'false' }}"
@@ -371,33 +370,47 @@ jobs:
             lookback_minutes="${{ github.event.client_payload.lookback_minutes || vars.CLAWSWEEPER_COMMENT_LOOKBACK_MINUTES || '180' }}"
             since="${{ github.event.client_payload.since || '' }}"
             max_comments="${{ github.event.client_payload.max_comments || '1' }}"
-            comment_ids="${{ github.event.client_payload.comment_id || '' }}"
             runner="${{ github.event.client_payload.runner || vars.CLAWSWEEPER_WORKER_RUNNER || 'blacksmith-4vcpu-ubuntu-2404' }}"
             execution_runner="${{ github.event.client_payload.execution_runner || vars.CLAWSWEEPER_EXECUTION_RUNNER || 'blacksmith-16vcpu-ubuntu-2404' }}"
             force_reprocess="${{ github.event.client_payload.force_reprocess || 'false' }}"
           fi
           jq -r '
-            .commands[]
-            | select(
-                .status == "ready" or
-                any(.actions[]?; .status == "waiting" or .status == "active")
+            .commands
+            | map(
+                select(
+                  (.issue_number | type == "number" and . > 0) and
+                  (
+                    .status == "ready" or
+                    any(.actions[]?; .status == "waiting" or .status == "active")
+                  )
+                )
               )
-            | .issue_number
-            | select(type == "number" and . > 0)
-          ' results/comment-router-latest.json | sort -nu | while read -r item_number; do
-            gh workflow run repair-comment-router.yml \
-              --repo "$GITHUB_REPOSITORY" \
-              -f execute=true \
-              -f force_reprocess="$force_reprocess" \
-              -f target_repo="$target_repo" \
-              -f target_branch="$target_branch" \
-              -f lookback_minutes="$lookback_minutes" \
-              -f since="$since" \
-              -f max_comments="$max_comments" \
-              -f item_numbers="$item_number" \
-              -f comment_ids="$comment_ids" \
-              -f runner="$runner" \
+            | sort_by(.issue_number)
+            | group_by(.issue_number)[]
+            | [
+                .[0].issue_number,
+                ([.[].comment_id | strings | select(test("^[0-9]+$"))] | unique | join(","))
+              ]
+            | @tsv
+          ' results/comment-router-latest.json | while IFS=$'\t' read -r item_number item_comment_ids; do
+            dispatch_args=(
+              workflow run repair-comment-router.yml
+              --repo "$GITHUB_REPOSITORY"
+              -f execute=true
+              -f force_reprocess="$force_reprocess"
+              -f target_repo="$target_repo"
+              -f target_branch="$target_branch"
+              -f lookback_minutes="$lookback_minutes"
+              -f since="$since"
+              -f max_comments="$max_comments"
+              -f item_numbers="$item_number"
+              -f runner="$runner"
               -f execution_runner="$execution_runner"
+            )
+            if [ -n "$item_comment_ids" ]; then
+              dispatch_args+=(-f "comment_ids=$item_comment_ids")
+            fi
+            gh "${dispatch_args[@]}"
           done
 
       - name: Detect waiting repair dispatches

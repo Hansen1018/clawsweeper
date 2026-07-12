@@ -15,7 +15,7 @@ import {
   validateJob,
   waitForLiveWorkerCapacity,
 } from "./lib.js";
-import { ghJson, ghText } from "./github-cli.js";
+import { ghJson } from "./github-cli.js";
 import { sleepMs } from "./timing.js";
 import { REPAIR_CLUSTER_WORKFLOW } from "./constants.js";
 import { AUTOMATION_LIMITS } from "./limits.js";
@@ -112,7 +112,29 @@ if (!execute) {
   process.exit(0);
 }
 
-const gateRestores: RepositoryVariableSnapshot[] = [];
+if (maxRequeueDepth !== null && requeueDepth >= maxRequeueDepth) {
+  throw new Error(
+    `requeue depth ${requeueDepth} reached the maximum ${maxRequeueDepth}; refusing another dispatch`,
+  );
+}
+
+summary.live_worker_capacity_before_dispatch = waitForCapacity
+  ? waitForLiveWorkerCapacity({ repo, workflow, requested: 1, maxLiveWorkers })
+  : assertLiveWorkerCapacity({ repo, workflow, requested: 1, maxLiveWorkers });
+
+const forwardedGates = openExecuteWindow
+  ? {
+      allowExecute: capturedAllowExecute!,
+      allowFixPr: capturedAllowFixPr!,
+    }
+  : {
+      allowExecute: normalizedGateValue("CLAWSWEEPER_ALLOW_EXECUTE"),
+      allowFixPr: normalizedGateValue("CLAWSWEEPER_ALLOW_FIX_PR"),
+    };
+assertGateOpenIfNeeded(mode, forwardedGates.allowExecute);
+summary.forwarded_allow_execute = forwardedGates.allowExecute;
+summary.forwarded_allow_fix_pr = forwardedGates.allowFixPr;
+
 const headSha = currentHeadSha();
 const dispatchStartedAt = new Date(Date.now() - 5000).toISOString();
 const nextRequeueDepth = boundedNextRequeueDepth(requeueDepth, maxRequeueDepth);
@@ -133,16 +155,12 @@ const requeueLifecycle: CommandLifecycleInput = {
 let commandError: unknown = null;
 
 try {
-  if (openExecuteWindow && ["execute", "autonomous"].includes(mode)) {
-    setGateTemporarily("CLAWSWEEPER_ALLOW_EXECUTE", capturedAllowExecute!, requeueLifecycle);
-    setGateTemporarily("CLAWSWEEPER_ALLOW_FIX_PR", capturedAllowFixPr!, requeueLifecycle);
-  }
-
-  assertGateOpenIfNeeded(mode);
-  summary.live_worker_capacity_before_dispatch = waitForCapacity
-    ? waitForLiveWorkerCapacity({ repo, workflow, requested: 1, maxLiveWorkers })
-    : assertLiveWorkerCapacity({ repo, workflow, requested: 1, maxLiveWorkers });
-  dispatchJob(sourceJobPath, mode, dispatchKey, requeueLifecycle);
+  dispatchJob(sourceJobPath, mode, dispatchKey, requeueLifecycle, {
+    schema_version: 1,
+    depth: nextRequeueDepth,
+    allow_execute: forwardedGates.allowExecute,
+    allow_fix_pr: forwardedGates.allowFixPr,
+  });
   recordCommandRequeue(requeueLifecycle, {
     dispatchKey,
     sourceJobPath,
@@ -163,20 +181,6 @@ try {
   console.log(JSON.stringify(summary, null, 2));
 } catch (error) {
   commandError = error;
-} finally {
-  for (const gate of gateRestores.reverse()) {
-    try {
-      restoreGate(gate, requeueLifecycle);
-    } catch (error) {
-      if (!commandError) {
-        commandError = error;
-      } else {
-        console.error(
-          `failed to restore ${gate.name}: ${error instanceof Error ? error.message : String(error)}`,
-        );
-      }
-    }
-  }
 }
 if (commandError) {
   recordCommandLifecycleFailure(requeueLifecycle, {
@@ -243,6 +247,12 @@ function dispatchJob(
   mode: string,
   dispatchKey: string,
   lifecycle: CommandLifecycleInput,
+  requeueContext: {
+    schema_version: 1;
+    depth: number;
+    allow_execute: "0" | "1";
+    allow_fix_pr: "0" | "1";
+  },
 ) {
   const result = runCommandLifecycleMutation(lifecycle, {
     kind: "requeue_dispatch",
@@ -253,6 +263,7 @@ function dispatchJob(
       sourceJobSha256: authorizationSha256,
       depth: nextRequeueDepth,
       dispatchKey,
+      requeueContext,
     },
     component: "repair_requeue",
     operation: () =>
@@ -280,6 +291,8 @@ function dispatchJob(
           "requeue=true",
           "-f",
           `requeue_depth=${nextRequeueDepth}`,
+          "-f",
+          `requeue_context=${Buffer.from(JSON.stringify(requeueContext)).toString("base64url")}`,
         ],
         { cwd: repoRoot(), encoding: "utf8", stdio: "pipe" },
       ),
@@ -302,12 +315,7 @@ function waitForStartedRuns({ expectedCount, headSha, since }: LooseRecord) {
           Date.parse(left.createdAt) - Date.parse(right.createdAt),
       );
     const selected = latest.slice(-expectedCount);
-    if (
-      selected.length >= expectedCount &&
-      selected.every((run: JsonValue) => gateCaptureJobStarted(run.databaseId))
-    ) {
-      return selected;
-    }
+    if (selected.length >= expectedCount) return selected;
     sleepMs(5_000);
   }
   const observedRunIds = latest
@@ -315,29 +323,16 @@ function waitForStartedRuns({ expectedCount, headSha, since }: LooseRecord) {
     .map((run: JsonValue) => String(run.databaseId ?? ""))
     .filter(Boolean);
   throw new Error(
-    `timed out waiting for ${expectedCount} requeued run(s) to capture execution gates${
+    `timed out waiting for ${expectedCount} requeued run(s) to become visible${
       observedRunIds.length > 0 ? `: ${observedRunIds.join(", ")}` : ""
     }`,
   );
 }
 
-function gateCaptureJobStarted(runId: JsonValue) {
-  const run = ghJson<LooseRecord>(["run", "view", String(runId), "--repo", repo, "--json", "jobs"]);
-  const job = (run.jobs ?? []).find(
-    (candidate: JsonValue) => candidate.name === "Plan and review cluster",
-  );
-  if (!job) return false;
-  const status = String(job.status ?? "").toLowerCase();
-  const conclusion = String(job.conclusion ?? "").toLowerCase();
-  return status === "in_progress" || (status === "completed" && conclusion !== "skipped");
-}
-
-function assertGateOpenIfNeeded(mode: string) {
+function assertGateOpenIfNeeded(mode: string, allowExecute: "0" | "1") {
   if (!["execute", "autonomous"].includes(mode)) return;
-  if (readGateSnapshot("CLAWSWEEPER_ALLOW_EXECUTE").value !== "1") {
-    throw new Error(
-      "refusing write-mode requeue: CLAWSWEEPER_ALLOW_EXECUTE is not 1; use --open-execute-window",
-    );
+  if (allowExecute !== "1") {
+    throw new Error("refusing write-mode requeue: captured CLAWSWEEPER_ALLOW_EXECUTE is not 1");
   }
 }
 
@@ -360,13 +355,7 @@ function workflowDisplayName(workflowNameOrFile: string): string {
   return workflowNameOrFile;
 }
 
-type RepositoryVariableSnapshot = {
-  name: string;
-  exists: boolean;
-  value: string;
-};
-
-function readGateSnapshot(name: string): RepositoryVariableSnapshot {
+function normalizedGateValue(name: string): "0" | "1" {
   const variables = ghJson<LooseRecord[]>([
     "variable",
     "list",
@@ -376,46 +365,7 @@ function readGateSnapshot(name: string): RepositoryVariableSnapshot {
     "name,value",
   ]);
   const variable = variables.find((entry) => entry.name === name);
-  return {
-    name,
-    exists: Boolean(variable),
-    value: variable ? String(variable.value ?? "") : "",
-  };
-}
-
-function setGateTemporarily(
-  name: string,
-  value: "0" | "1",
-  lifecycle: CommandLifecycleInput,
-) {
-  const previous = readGateSnapshot(name);
-  if (previous.exists && previous.value === value) return;
-  gateRestores.push(previous);
-  setGate(name, value, lifecycle);
-}
-
-function restoreGate(snapshot: RepositoryVariableSnapshot, lifecycle: CommandLifecycleInput) {
-  if (snapshot.exists) {
-    setGate(snapshot.name, snapshot.value, lifecycle);
-    return;
-  }
-  runCommandLifecycleMutation(lifecycle, {
-    kind: "repository_variable_delete",
-    identity: { repository: repo, name: snapshot.name },
-    component: "repair_requeue",
-    operation: () => ghText(["variable", "delete", snapshot.name, "--repo", repo]),
-  });
-  console.log(`${snapshot.name}=<deleted>`);
-}
-
-function setGate(name: string, value: string, lifecycle: CommandLifecycleInput) {
-  runCommandLifecycleMutation(lifecycle, {
-    kind: "repository_variable_update",
-    identity: { repository: repo, name, value },
-    component: "repair_requeue",
-    operation: () => ghText(["variable", "set", name, "--repo", repo, "--body", value]),
-  });
-  console.log(`${name}=${value}`);
+  return String(variable?.value ?? "") === "1" ? "1" : "0";
 }
 
 function capturedGateArg(value: JsonValue, name: string, required: boolean): "0" | "1" | null {
@@ -430,6 +380,15 @@ function capturedGateArg(value: JsonValue, name: string, required: boolean): "0"
   return normalized;
 }
 
+function nonNegativeIntegerArg(value: JsonValue, name: string, fallback: number): number {
+  if (value === undefined || value === null || value === false || value === "") return fallback;
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 0) {
+    throw new Error(`--${name} must be a non-negative integer`);
+  }
+  return parsed;
+}
+
 function currentHeadSha() {
   return execFileSync("git", ["rev-parse", "origin/main"], {
     cwd: repoRoot(),
@@ -440,13 +399,4 @@ function currentHeadSha() {
 
 function looksLikeRunId(value: JsonValue) {
   return /^[0-9]{6,}$/.test(String(value ?? ""));
-}
-
-function nonNegativeIntegerArg(value: JsonValue, name: string, fallback: number): number {
-  if (value === undefined || value === null || value === false || value === "") return fallback;
-  const parsed = Number(value);
-  if (!Number.isSafeInteger(parsed) || parsed < 0) {
-    throw new Error(`--${name} must be a non-negative integer`);
-  }
-  return parsed;
 }

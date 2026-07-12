@@ -2088,16 +2088,30 @@ test("issue implementation workflow lets job intent choose dispatch capacity", (
 test("repair workers hydrate only durable jobs from generated state", () => {
   const workflow = readText(".github/workflows/repair-cluster-worker.yml");
   const requeue = readText("src/repair/requeue-job.ts");
+  const repairDocs = readText("docs/repair/README.md");
 
   assert.match(workflow, /clawsweeper-repair-requeue-\{0\}-\{1\}.*clawsweeper-repair-\{0\}/);
   assert.match(workflow, /cancel-in-progress: false/);
   assert.match(workflow, /requeue:\n\s+description:/);
+  assert.match(workflow, /requeue_context:\n\s+description:/);
   assert.match(requeue, /"requeue=true"/);
   assert.match(requeue, /--allow-execute 0\|1 --allow-fix-pr 0\|1/);
-  assert.match(requeue, /variable", "delete", snapshot\.name/);
-  assert.doesNotMatch(requeue, /previous \|\| "1"/);
-  assert.match(requeue, /run",\s+"view"[\s\S]*Plan and review cluster/);
-  assert.match(requeue, /timed out waiting for .* requeued run\(s\) to capture execution gates/);
+  assert.match(requeue, /--requeue-depth N.*--max-requeue-depth N/);
+  assert.match(requeue, /requeue_context=\$\{Buffer\.from\(JSON\.stringify\(requeueContext\)\)/);
+  assert.match(requeue, /requeueDepth >= maxRequeueDepth/);
+  assert.doesNotMatch(requeue, /variable",\s*"(?:set|delete)"/);
+  assert.doesNotMatch(requeue, /setGateTemporarily|restoreGate|gateRestores/);
+  assert.ok(
+    requeue.indexOf("summary.live_worker_capacity_before_dispatch") <
+      requeue.indexOf("const forwardedGates"),
+  );
+  assert.match(requeue, /timed out waiting for .* requeued run\(s\) to become visible/);
+  assert.match(workflow, /REQUEUE_ACTOR !== "openclaw-clawsweeper\[bot\]"/);
+  assert.match(workflow, /Buffer\.from\(encoded, "base64url"\)/);
+  assert.match(
+    repairDocs,
+    /repair:requeue[\s\S]*--open-execute-window[\s\S]*--allow-execute 1[\s\S]*--allow-fix-pr 1/,
+  );
   assert.equal(
     workflow.match(/uses: \.\/\.github\/actions\/setup-state[\s\S]*?sparse-checkout: jobs/g)
       ?.length,
@@ -2122,6 +2136,9 @@ test("repair workers hydrate only durable jobs from generated state", () => {
     reportJob,
     /id: repair_requeue[\s\S]*count-requeue-required[\s\S]*id: requeue_token[\s\S]*repair:requeue/,
   );
+  assert.match(reportJob, /--max-requeue-depth 1/);
+  assert.match(reportJob, /fromJSON\(needs\.cluster\.outputs\.requeue_depth \|\| '0'\) < 1/);
+  assert.match(reportJob, /failed deterministic verification\. It was not requeued/);
   assert.match(reportJob, /if: \$\{\{ always\(\)/);
   assert.match(reportJob, /Publish terminal report-only status[\s\S]*--dashboard-only/);
   assert.doesNotMatch(reportJob, /target_post_flight_token|permission-pull-requests/);
