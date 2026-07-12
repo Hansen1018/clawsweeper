@@ -276,6 +276,25 @@ test("contributor repair review loop stays on one pinned target base", () => {
   assert.match(promptBuilder, /Pinned target base SHA: \$\{targetBaseSha\}/);
 });
 
+test("automerge fast rebase binds staged proof before returning a publishable repair", () => {
+  const source = readText(path.join(process.cwd(), "src/repair/execute-fix-artifact.ts"));
+  const start = source.indexOf("function tryAutomergeFastRebaseRepair(");
+  const end = source.indexOf("function completeMechanicallyResolvedRebase(", start);
+  const fastPath = source.slice(start, end);
+
+  assert.notEqual(start, -1);
+  assert.notEqual(end, -1);
+  assert.match(fastPath, /pinnedBaseRef: targetBaseSha/);
+  const proof = fastPath.indexOf("runTargetValidationProof(");
+  const bind = fastPath.indexOf("bindMergePreflightToStagedProof(", proof);
+  const ready = fastPath.indexOf('status: "ready"', bind);
+  assert.ok(proof >= 0 && bind > proof && ready > bind);
+  assert.match(fastPath, /validation_commands: validationCommands/);
+  assert.match(fastPath, /validatedHeadSha: commit/);
+  assert.match(fastPath, /validatedBaseSha: targetBaseSha/);
+  assert.match(source, /tryAutomergeFastRebaseRepair\(\{[\s\S]*baseBranch,[\s\S]*fixArtifact/);
+});
+
 test("final synchronized tree is reviewed and reports persist before publication", () => {
   const source = readText(path.join(process.cwd(), "src/repair/execute-fix-artifact.ts"));
 

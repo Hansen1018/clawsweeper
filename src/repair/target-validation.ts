@@ -49,6 +49,8 @@ const DEFAULT_BASE_BRANCH = "main";
 const DEFAULT_TARGET_SETUP_TIMEOUT_MS = 2 * 60 * 1000;
 const DEFAULT_TARGET_INSTALL_TIMEOUT_MS = 12 * 60 * 1000;
 const DEFAULT_TARGET_VALIDATION_TIMEOUT_MS = 12 * 60 * 1000;
+const DEFAULT_PROOF_INPUT_MAX_ENTRIES = 100_000;
+const DEFAULT_PROOF_INPUT_MAX_DEPTH = 64;
 const MIN_VALIDATION_RETRY_BUDGET_MS = 1_000;
 const ABSENT_PROOF_INPUT = "<absent>";
 const PROTECTED_PROOF_INPUT_DIRECTORIES = new Set([
@@ -89,6 +91,8 @@ export type TargetValidationOptions = {
   setupTimeoutMs?: number;
   validationTimeoutMs?: number;
   proofBudgetMs?: number;
+  proofInputMaxEntries?: number;
+  proofInputMaxDepth?: number;
   proofSurfacePaths?: string[];
   pinnedBaseRef?: string;
   /**
@@ -468,7 +472,11 @@ export function runStagedValidationProof(
   if (checkoutIdentity.status) {
     throw new Error("staged proof requires a clean validation checkout");
   }
-  const proofInputSnapshot = validationProofInputSnapshot(cwd, plan.commands);
+  const proofInputSnapshot = validationProofInputSnapshot(cwd, plan.commands, {
+    deadlineAt: proofStartedAt + proofBudgetMs,
+    maxDepth: options.proofInputMaxDepth ?? DEFAULT_PROOF_INPUT_MAX_DEPTH,
+    maxEntries: options.proofInputMaxEntries ?? DEFAULT_PROOF_INPUT_MAX_ENTRIES,
+  });
   const executed = new Set<string>();
   const attempts = new Map<string, number>();
   const result = executeStagedProofPlan(plan, {
@@ -522,7 +530,11 @@ export function replayStagedValidationProof(
   if (checkoutIdentity.status) {
     throw new Error("staged proof replay requires a clean validation checkout");
   }
-  const proofInputSnapshot = validationProofInputSnapshot(cwd, plan.commands);
+  const proofInputSnapshot = validationProofInputSnapshot(cwd, plan.commands, {
+    deadlineAt: proofStartedAt + proofBudgetMs,
+    maxDepth: options.proofInputMaxDepth ?? DEFAULT_PROOF_INPUT_MAX_DEPTH,
+    maxEntries: options.proofInputMaxEntries ?? DEFAULT_PROOF_INPUT_MAX_ENTRIES,
+  });
   const executed = new Set<string>();
   const attempts = new Map<string, number>();
   const result = executeStagedProofPlan(plan, {
@@ -764,13 +776,24 @@ function assertValidationCheckoutIdentity(
 function validationProofInputSnapshot(
   cwd: string,
   commands: readonly { parts: readonly string[] }[],
+  limits: {
+    deadlineAt: number;
+    maxDepth: number;
+    maxEntries: number;
+  },
 ): ValidationProofInputSnapshot {
   const root = fs.realpathSync(cwd);
   const entries = new Map<string, string>();
   const visitedPaths = new Set<string>();
+  for (const [name, value] of Object.entries(limits)) {
+    if (!Number.isSafeInteger(value) || value <= 0) {
+      throw new Error(`proof input ${name} must be a positive integer`);
+    }
+  }
 
   const visit = (relativePath: string) => {
     if (visitedPaths.has(relativePath)) return;
+    assertProofInputTraversalBudget(relativePath, visitedPaths.size, limits);
     visitedPaths.add(relativePath);
     const entryPath = proofInputPath(root, relativePath);
     const stat = fs.lstatSync(entryPath, { bigint: true });
@@ -794,6 +817,7 @@ function validationProofInputSnapshot(
       }
       return;
     }
+    assertProofInputTraversalBudget(relativePath, visitedPaths.size - 1, limits);
     const children = fs.readdirSync(entryPath).sort();
     entries.set(`${relativePath}\0children`, children.join("\0"));
     for (const name of children) {
@@ -806,6 +830,29 @@ function validationProofInputSnapshot(
     else entries.set(relativePath, ABSENT_PROOF_INPUT);
   }
   return { entries };
+}
+
+function assertProofInputTraversalBudget(
+  relativePath: string,
+  visitedEntries: number,
+  limits: {
+    deadlineAt: number;
+    maxDepth: number;
+    maxEntries: number;
+  },
+) {
+  if (Date.now() >= limits.deadlineAt) {
+    throw new Error(
+      `staged proof runtime budget exhausted before proof input snapshot completed: ${relativePath}`,
+    );
+  }
+  if (visitedEntries >= limits.maxEntries) {
+    throw new Error(`proof input traversal exceeded the supported entry budget at ${relativePath}`);
+  }
+  const depth = relativePath.split("/").filter(Boolean).length;
+  if (depth > limits.maxDepth) {
+    throw new Error(`proof input traversal exceeded the supported depth budget at ${relativePath}`);
+  }
 }
 
 function validationProofInputSignature(stat: fs.BigIntStats) {
@@ -1017,8 +1064,30 @@ function trackedWorktreeSha256(cwd: string): string {
     updateProofDigest(digest, "mode", mode!);
     updateProofDigest(digest, "index", indexObject!);
     if (mode === "160000") {
+      let stat: fs.Stats;
+      try {
+        stat = fs.lstatSync(absolutePath);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        updateProofDigest(digest, "gitlink-worktree", "uninitialized");
+        continue;
+      }
+      if (!stat.isDirectory()) {
+        throw new Error(`tracked gitlink worktree is not a directory: ${relativePath}`);
+      }
+      const children = fs.readdirSync(absolutePath);
+      if (children.length === 0 || !children.includes(".git")) {
+        if (children.length > 0) {
+          throw new Error(`tracked gitlink worktree is not initialized: ${relativePath}`);
+        }
+        updateProofDigest(digest, "gitlink-worktree", "uninitialized");
+        continue;
+      }
       const head = run("git", ["-C", absolutePath, "rev-parse", "HEAD"], { cwd }).trim();
-      updateProofDigest(digest, "gitlink", head);
+      if (head !== indexObject) {
+        throw new Error(`tracked gitlink worktree head differs from index: ${relativePath}`);
+      }
+      updateProofDigest(digest, "gitlink-worktree", head);
       continue;
     }
     let stat: fs.Stats;
@@ -1608,6 +1677,11 @@ function splitGitLines(value: string) {
 
 type PackageScriptInventory = {
   rootScripts: Set<string>;
+  rootPackage: {
+    name: string;
+    relativePath: ".";
+    scripts: Set<string>;
+  };
   workspaces: Array<{
     name: string;
     relativePath: string;
@@ -1617,9 +1691,15 @@ type PackageScriptInventory = {
 
 function readPackageScriptInventory(cwd: string): PackageScriptInventory {
   const packagePath = path.join(cwd, "package.json");
-  if (!fs.existsSync(packagePath)) return { rootScripts: new Set(), workspaces: [] };
+  const empty = {
+    rootScripts: new Set<string>(),
+    rootPackage: { name: "", relativePath: "." as const, scripts: new Set<string>() },
+    workspaces: [],
+  };
+  if (!fs.existsSync(packagePath)) return empty;
   try {
     const pkg = JSON.parse(fs.readFileSync(packagePath, "utf8"));
+    const rootScripts = new Set<string>(Object.keys(pkg.scripts ?? {}));
     const patterns = workspacePackagePatterns(cwd, pkg);
     const workspaces = workspacePackagePaths(cwd, patterns).flatMap((relativePath) => {
       try {
@@ -1638,11 +1718,16 @@ function readPackageScriptInventory(cwd: string): PackageScriptInventory {
       }
     });
     return {
-      rootScripts: new Set<string>(Object.keys(pkg.scripts ?? {})),
+      rootScripts,
+      rootPackage: {
+        name: String(pkg.name ?? ""),
+        relativePath: ".",
+        scripts: rootScripts,
+      },
       workspaces,
     };
   } catch {
-    return { rootScripts: new Set(), workspaces: [] };
+    return empty;
   }
 }
 
@@ -1661,7 +1746,7 @@ function missingRequiredPackageScript(
       if (!inventory.rootScripts.has(script.name)) return script;
       continue;
     }
-    const selected = selectWorkspacePackages(script, inventory.workspaces);
+    const selected = selectWorkspacePackages(script, inventory);
     if (selected === null) continue;
     if (
       selected.length === 0 ||
@@ -1837,7 +1922,7 @@ function workspaceScanLimits(overrides: Partial<WorkspaceScanLimits>): Workspace
 
 function selectWorkspacePackages(
   script: NonNullable<ReturnType<typeof packageScriptRequirement>>,
-  workspaces: PackageScriptInventory["workspaces"],
+  inventory: PackageScriptInventory,
 ): PackageScriptInventory["workspaces"] | null {
   if (
     script.executable === "pnpm" &&
@@ -1846,9 +1931,9 @@ function selectWorkspacePackages(
     return null;
   }
   if (script.workspaceSelectors.length === 0) {
-    return script.allWorkspaces ? workspaces : [];
+    return script.allWorkspaces ? inventory.workspaces : [];
   }
-  return workspaces.filter((workspace) =>
+  return [inventory.rootPackage, ...inventory.workspaces].filter((workspace) =>
     script.workspaceSelectors.some((selector) => workspaceSelectorMatches(selector, workspace)),
   );
 }

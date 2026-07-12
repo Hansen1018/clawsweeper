@@ -731,6 +731,50 @@ test("recursive pnpm preflight preserves filters and ignores unrelated workspace
   ]);
 });
 
+test("pnpm workspace filters include the root package identity", () => {
+  const cwd = packageFixture({ verify: "node --test" });
+  const rootPackage = JSON.parse(fs.readFileSync(path.join(cwd, "package.json"), "utf8"));
+  fs.writeFileSync(
+    path.join(cwd, "package.json"),
+    `${JSON.stringify({ ...rootPackage, name: "@openclaw/root" }, null, 2)}\n`,
+  );
+  const options = validationOptions("openclaw/example", {
+    toolchain: {
+      packageManager: "pnpm",
+      baseValidationCommands: [],
+      changedGate: null,
+    },
+  });
+
+  for (const selector of ["@openclaw/root", "."]) {
+    const result = preflightTargetValidationPlan(
+      {
+        fixArtifact: {
+          validation_commands: [`pnpm --filter ${selector} run verify`],
+        },
+        targetDir: cwd,
+      },
+      options,
+    );
+    assert.equal(result.status, "passed", selector);
+    assert.deepEqual(result.resolved_commands, [
+      `pnpm --fail-if-no-match --filter ${selector} run verify`,
+    ]);
+  }
+
+  const missing = preflightTargetValidationPlan(
+    {
+      fixArtifact: {
+        validation_commands: ["pnpm --filter @openclaw/root run missing"],
+      },
+      targetDir: cwd,
+    },
+    options,
+  );
+  assert.equal(missing.status, "blocked");
+  assert.equal(missing.missing_script, "missing");
+});
+
 test("workspace glob matching is bounded for adversarial target patterns", () => {
   const adversarial = `${"*a".repeat(500)}b`;
   const startedAt = performance.now();
@@ -2381,6 +2425,80 @@ test(
     );
   },
 );
+
+test("staged proof accepts an uninitialized gitlink bound by the parent index", () => {
+  const source = gitPackageFixture({});
+  git(source, "add", ".");
+  git(source, "commit", "-m", "initial");
+  const gitlinkCommit = git(source, "rev-parse", "HEAD");
+  git(source, "update-index", "--add", "--cacheinfo", `160000,${gitlinkCommit},vendor/submodule`);
+  git(source, "commit", "-m", "add uninitialized gitlink");
+  const origin = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-gitlink-origin-"));
+  git(origin, "init", "--bare");
+  git(source, "remote", "add", "origin", origin);
+  git(source, "push", "-u", "origin", "main:main");
+  const checkoutRoot = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-gitlink-checkout-"));
+  const cwd = path.join(checkoutRoot, "repo");
+  execFileSync("git", ["clone", origin, cwd], { encoding: "utf8" });
+
+  const result = runStagedValidationProof(
+    ["git diff --check"],
+    cwd,
+    validationOptions("steipete/example", {
+      toolchain: {
+        packageManager: "pnpm",
+        baseValidationCommands: [],
+        changedGate: null,
+      },
+    }),
+  );
+
+  assert.equal(result.trace.status, "passed");
+  assert.deepEqual(fs.readdirSync(path.join(cwd, "vendor", "submodule")), []);
+});
+
+test("staged proof bounds ignored dependency traversal by entries and depth", () => {
+  const cwd = gitPackageFixture({ verify: "node --test" });
+  fs.mkdirSync(path.join(cwd, "node_modules", "a", "b"), { recursive: true });
+  fs.writeFileSync(path.join(cwd, "node_modules", "first.js"), "first\n");
+  fs.writeFileSync(path.join(cwd, "node_modules", "second.js"), "second\n");
+  fs.writeFileSync(path.join(cwd, "node_modules", "a", "b", "deep.js"), "deep\n");
+  git(cwd, "add", ".");
+  git(cwd, "commit", "-m", "initial");
+  attachOrigin(cwd);
+  const baseOptions = {
+    toolchain: {
+      packageManager: "pnpm",
+      baseValidationCommands: [],
+      changedGate: null,
+    },
+  };
+
+  assert.throws(
+    () =>
+      runStagedValidationProof(
+        ["pnpm verify"],
+        cwd,
+        validationOptions("steipete/example", {
+          ...baseOptions,
+          proofInputMaxEntries: 2,
+        }),
+      ),
+    /proof input traversal exceeded the supported entry budget/,
+  );
+  assert.throws(
+    () =>
+      runStagedValidationProof(
+        ["pnpm verify"],
+        cwd,
+        validationOptions("steipete/example", {
+          ...baseOptions,
+          proofInputMaxDepth: 2,
+        }),
+      ),
+    /proof input traversal exceeded the supported depth budget/,
+  );
+});
 
 test("staged proof budget includes checkout and recursive proof-input sealing", () => {
   const cwd = gitPackageFixture({ verify: "node --test" });

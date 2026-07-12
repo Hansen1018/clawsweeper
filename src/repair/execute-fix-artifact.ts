@@ -997,6 +997,7 @@ function executeRepairBranch({ fixArtifact, targetDir }: LooseRecord) {
     }
 
     fastRepair = tryAutomergeFastRebaseRepair({
+      baseBranch,
       fixArtifact,
       targetDir,
       sourceHead,
@@ -1503,6 +1504,7 @@ function liveRepairPauseBlock({
 }
 
 function tryAutomergeFastRebaseRepair({
+  baseBranch,
   fixArtifact,
   targetDir,
   sourceHead,
@@ -1547,6 +1549,53 @@ function tryAutomergeFastRebaseRepair({
     return { status: "fallback", reason: "deterministic rebase left working tree changes" };
   }
 
+  const targetBaseSha = pinRepairBase(() =>
+    run("git", ["rev-parse", `origin/${baseBranch}`], { cwd: targetDir }),
+  ).sha;
+  const validationOptions = {
+    ...currentTargetValidationOptions(fixArtifact.likely_files ?? []),
+    pinnedBaseRef: targetBaseSha,
+  };
+  const validationPlan = repairDeltaValidationPlan(
+    { fixArtifact, targetDir, sourceHead },
+    validationOptions,
+  );
+  const validationCommands = runTargetValidationProof(
+    validationPlan.commands,
+    targetDir,
+    validationPlan.options,
+    baseBranch,
+  );
+  const mergePreflight = bindMergePreflightToStagedProof({
+    preflight: {
+      target: null,
+      security_status: "deferred",
+      security_evidence: [
+        "Deterministic automerge rebase changed only base ancestry; exact-head ClawSweeper review is dispatched after push.",
+      ],
+      comments_status: "deferred",
+      comments_evidence: ["Fresh exact-head review gates merge after the rebase push."],
+      bot_comments_status: "deferred",
+      bot_comments_evidence: ["Fresh exact-head review gates merge after the rebase push."],
+      codex_review: {
+        command: "/review",
+        status: "pending",
+        findings_addressed: false,
+        evidence: [
+          "Skipped Codex fix worker for deterministic rebase; review worker runs after push.",
+        ],
+      },
+      validation_commands: validationCommands,
+      final_base_sync: {
+        status: "deterministic_rebase",
+        previous_head: rebaseResult.previous_head,
+        current_head: commit,
+        base_sha: rebaseResult.base_sha,
+      },
+    },
+    validatedHeadSha: commit,
+    validatedBaseSha: targetBaseSha,
+  });
   logProgress("automerge deterministic rebase ready; skipping Codex fix and local review pass", {
     source_head: sourceHead,
     commit,
@@ -1561,32 +1610,7 @@ function tryAutomergeFastRebaseRepair({
       commit,
       repair_delta_base_sha: sourceHead,
       checkpoint_commits: [],
-      merge_preflight: {
-        target: null,
-        security_status: "deferred",
-        security_evidence: [
-          "Deterministic automerge rebase changed only base ancestry; exact-head ClawSweeper review is dispatched after push.",
-        ],
-        comments_status: "deferred",
-        comments_evidence: ["Fresh exact-head review gates merge after the rebase push."],
-        bot_comments_status: "deferred",
-        bot_comments_evidence: ["Fresh exact-head review gates merge after the rebase push."],
-        codex_review: {
-          command: "/review",
-          status: "pending",
-          findings_addressed: false,
-          evidence: [
-            "Skipped Codex fix worker for deterministic rebase; review worker runs after push.",
-          ],
-        },
-        validation_commands: ["GitHub checks and exact-head ClawSweeper review gate this rebase"],
-        final_base_sync: {
-          status: "deterministic_rebase",
-          previous_head: rebaseResult.previous_head,
-          current_head: commit,
-          base_sha: rebaseResult.base_sha,
-        },
-      },
+      merge_preflight: mergePreflight,
     },
   };
 }
