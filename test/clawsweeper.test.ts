@@ -2447,7 +2447,11 @@ test("repair workflows preserve existing dispatch while scheduled cluster intake
   assert.match(router, /pnpm run repair:comment-router -- "\$\{args\[@\]\}"/);
   assert.match(
     router,
-    /\{ \[ "\$\{\{ github\.event_name \}\}" = "repository_dispatch" \] && \[ -n "\$item_numbers" \]; \}/,
+    /repository_dispatch[\s\S]*workflow_dispatch[\s\S]*schedule[\s\S]*args\+=\(--stage-selected-commands\)/,
+  );
+  assert.match(
+    router,
+    /dispatch-waiting-commands:[\s\S]*dispatch_concurrency_group[\s\S]*Dispatch waiting commands under the central capacity gate[\s\S]*--execute/,
   );
   assert.match(issueImplementation, /ENABLED: \$\{\{ github\.event\.inputs\.enabled/);
   assert.match(commitFinding, /ENABLED: \$\{\{ github\.event\.inputs\.enabled/);

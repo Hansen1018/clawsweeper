@@ -31,7 +31,6 @@ export function deterministicRequeueDispatchKey({
     .slice(0, 24);
   return `requeue-${depth}-${digest}`;
 }
-
 export function boundedNextRequeueDepth(depth: number, maxDepth: number): number {
   if (!Number.isSafeInteger(depth) || depth < 0) {
     throw new Error("requeue depth must be a non-negative integer");

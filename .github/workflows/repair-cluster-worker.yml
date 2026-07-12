@@ -82,7 +82,7 @@ env:
   CLAWSWEEPER_MODEL: internal
 
 concurrency:
-  group: ${{ inputs.requeue && format('clawsweeper-repair-requeue-{0}-{1}', inputs.job, github.run_id) || format('clawsweeper-repair-{0}', inputs.job) }}
+  group: ${{ inputs.requeue && format('clawsweeper-repair-requeue-{0}-{1}', inputs.job, inputs.dispatch_key) || format('clawsweeper-repair-{0}', inputs.job) }}
   # Keep active execution alive through its durable report and publication
   # checkpoints; GitHub still coalesces pending runs in this group.
   cancel-in-progress: false
@@ -1285,6 +1285,7 @@ jobs:
         run: |
           pnpm run repair:requeue -- .clawsweeper-repair/authorized/job.md \
             --source-job-path "${{ needs.authorize.outputs.source_job_path }}" \
+            --source-run-id "${{ github.run_id }}" \
             --mode "${{ inputs.mode }}" \
             --execute \
             --open-execute-window \

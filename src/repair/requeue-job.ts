@@ -59,9 +59,9 @@ const capturedAllowExecute = capturedGateArg(
 const capturedAllowFixPr = capturedGateArg(args["allow-fix-pr"], "allow-fix-pr", openExecuteWindow);
 const requestedMode = typeof args.mode === "string" ? args.mode : null;
 const requestedRunId = args["run-id"] ?? (looksLikeRunId(args._[0]) ? args._[0] : null);
-const sourceRunId = String(
-  args["source-run-id"] ?? requestedRunId ?? process.env.GITHUB_RUN_ID ?? "",
-).trim();
+const sourceRunId = optionalSourceRunIdArg(
+  args["source-run-id"] ?? requestedRunId ?? process.env.GITHUB_RUN_ID,
+);
 const requeueDepth = nonNegativeIntegerArg(args["requeue-depth"], "requeue-depth", 0);
 const maxRequeueDepth = nonNegativeIntegerArg(args["max-requeue-depth"], "max-requeue-depth", 1);
 const requeueAuthority = optionalRequeueAuthorityArg(args["requeue-authority"]);
@@ -76,7 +76,7 @@ const resolved = requestedRunId
 
 if (!resolved.source_job) {
   console.error(
-    `usage: node scripts/requeue-job.ts <job.md|run-id> [--source-run-id id] [--source-job-path jobs/.../job.md] [--mode plan|execute|autonomous] [--execute --requeue-authority clawsweeper-app|maintainer] [--open-execute-window --allow-execute 0|1 --allow-fix-pr 0|1] [--requeue-depth N] [--max-requeue-depth N] [--deadline-at-ms N] [--runner label] [--execution-runner label] [--model model] [--max-live-workers ${AUTOMATION_LIMITS.repair_live_runs.default}] [--wait-for-capacity]`,
+    `usage: node scripts/requeue-job.ts <job.md|run-id> [--source-job-path jobs/.../job.md] [--source-run-id run-id] [--mode plan|execute|autonomous] [--execute --requeue-authority clawsweeper-app|maintainer] [--open-execute-window --allow-execute 0|1 --allow-fix-pr 0|1] [--requeue-depth N] [--max-requeue-depth N] [--deadline-at-ms N] [--runner label] [--execution-runner label] [--model model] [--max-live-workers ${AUTOMATION_LIMITS.repair_live_runs.default}] [--wait-for-capacity]`,
   );
   process.exit(2);
 }
@@ -100,10 +100,10 @@ const summary: LooseRecord = {
   status: execute ? "dispatching" : "dry_run",
   repo,
   workflow,
-  source_run_id: sourceRunId || null,
+  source_run_id: sourceRunId,
   source_job: sourceJobPath,
-  local_job: job.relativePath,
   source_authorization_sha256: authorizationSha256,
+  local_job: job.relativePath,
   requeue_depth: requeueDepth,
   max_requeue_depth: maxRequeueDepth,
   mode,
@@ -159,7 +159,7 @@ const nextRequeueDepth = boundedNextRequeueDepth(requeueDepth, maxRequeueDepth);
 const dispatchKey = deterministicRequeueDispatchKey({
   repo,
   workflow,
-  sourceRunId: sourceRunId || null,
+  sourceRunId,
   sourceJobPath,
   authorizationSha256,
   depth: nextRequeueDepth,
@@ -408,6 +408,13 @@ function optionalRequeueAuthorityArg(value: JsonValue): "clawsweeper-app" | "mai
   if (value === undefined || value === null || value === false || value === "") return null;
   if (value === "clawsweeper-app" || value === "maintainer") return value;
   throw new Error("requeue-authority must be clawsweeper-app or maintainer");
+}
+
+function optionalSourceRunIdArg(value: JsonValue): string | null {
+  if (value === undefined || value === null || value === false || value === "") return null;
+  const runId = String(value);
+  if (!looksLikeRunId(runId)) throw new Error("source-run-id must be a positive integer");
+  return runId;
 }
 
 function capturedGateArg(value: JsonValue, name: string, required: boolean): "0" | "1" | null {
