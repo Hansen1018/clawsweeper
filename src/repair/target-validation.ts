@@ -1245,11 +1245,10 @@ function trackedWorktreeSha256(cwd: string, limits: ProofInputLimits): string {
       if (!stat.isDirectory()) {
         throw new Error(`tracked gitlink worktree is not a directory: ${relativePath}`);
       }
-      const children = fs.readdirSync(absolutePath);
-      if (children.length === 0 || !children.includes(".git")) {
-        if (children.length > 0) {
-          throw new Error(`tracked gitlink worktree is not initialized: ${relativePath}`);
-        }
+      if (
+        trackedGitlinkWorktreeState(absolutePath, relativePath!, depth, state, limits) ===
+        "uninitialized"
+      ) {
         updateProofDigest(digest, "gitlink-worktree", "uninitialized");
         continue;
       }
@@ -1291,6 +1290,36 @@ function trackedWorktreeSha256(cwd: string, limits: ProofInputLimits): string {
     hashTrackedFile(digest, absolutePath, relativePath!, "working-tree", stat, state, limits);
   }
   return digest.digest("hex");
+}
+
+function trackedGitlinkWorktreeState(
+  absolutePath: string,
+  relativePath: string,
+  depth: number,
+  state: ProofTraversalState,
+  limits: ProofInputLimits,
+): "initialized" | "uninitialized" {
+  const gitMarkerPath = path.join(absolutePath, ".git");
+  assertProofHashingDeadline(limits, `${relativePath}/.git`);
+  try {
+    fs.lstatSync(gitMarkerPath);
+    consumeProofHashingEntry(`${relativePath}/.git`, depth + 1, state, limits);
+    return "initialized";
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+
+  const directory = fs.opendirSync(absolutePath);
+  try {
+    assertProofHashingDeadline(limits, relativePath);
+    const child = directory.readSync();
+    assertProofHashingDeadline(limits, relativePath);
+    if (!child) return "uninitialized";
+    consumeProofHashingEntry(`${relativePath}/${child.name}`, depth + 1, state, limits);
+    throw new Error(`tracked gitlink worktree is not initialized: ${relativePath}`);
+  } finally {
+    directory.closeSync();
+  }
 }
 
 function trackedProofInputSymlinkTarget(root: string, entryPath: string, relativePath: string) {

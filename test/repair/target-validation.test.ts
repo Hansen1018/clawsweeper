@@ -2514,34 +2514,94 @@ test(
 );
 
 test("staged proof accepts an uninitialized gitlink bound by the parent index", () => {
-  const source = gitPackageFixture({});
-  git(source, "add", ".");
-  git(source, "commit", "-m", "initial");
-  const gitlinkCommit = git(source, "rev-parse", "HEAD");
-  git(source, "update-index", "--add", "--cacheinfo", `160000,${gitlinkCommit},vendor/submodule`);
-  git(source, "commit", "-m", "add uninitialized gitlink");
-  const origin = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-gitlink-origin-"));
-  git(origin, "init", "--bare");
-  git(source, "remote", "add", "origin", origin);
-  git(source, "push", "-u", "origin", "main:main");
-  const checkoutRoot = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-gitlink-checkout-"));
-  const cwd = path.join(checkoutRoot, "repo");
-  execFileSync("git", ["clone", "--branch", "main", origin, cwd], { encoding: "utf8" });
+  const { cwd, gitlinkPath } = uninitializedGitlinkFixture();
+  const instrumentation = instrumentProofDirectory(gitlinkPath);
 
-  const result = runStagedValidationProof(
-    ["git diff --check"],
-    cwd,
-    validationOptions("steipete/example", {
-      toolchain: {
-        packageManager: "pnpm",
-        baseValidationCommands: [],
-        changedGate: null,
-      },
-    }),
-  );
+  try {
+    const result = runStagedValidationProof(
+      ["git diff --check"],
+      cwd,
+      validationOptions("steipete/example", {
+        toolchain: {
+          packageManager: "pnpm",
+          baseValidationCommands: [],
+          changedGate: null,
+        },
+      }),
+    );
 
-  assert.equal(result.trace.status, "passed");
-  assert.deepEqual(fs.readdirSync(path.join(cwd, "vendor", "submodule")), []);
+    assert.equal(result.trace.status, "passed");
+    assert.equal(instrumentation.materializedSynchronously, false);
+    assert.equal(instrumentation.streamedEntries, 0);
+  } finally {
+    instrumentation.restore();
+  }
+});
+
+test("staged proof charges a bounded gitlink child probe to the entry budget", () => {
+  const { cwd, gitlinkPath } = uninitializedGitlinkFixture();
+  fs.writeFileSync(path.join(gitlinkPath, "unexpected"), "not initialized\n");
+  const trackedEntries = git(cwd, "ls-files").split("\n").filter(Boolean).length;
+  const instrumentation = instrumentProofDirectory(gitlinkPath);
+
+  try {
+    assert.throws(
+      () =>
+        runStagedValidationProof(
+          ["git diff --check"],
+          cwd,
+          validationOptions("steipete/example", {
+            proofInputMaxEntries: trackedEntries,
+            toolchain: {
+              packageManager: "pnpm",
+              baseValidationCommands: [],
+              changedGate: null,
+            },
+          }),
+        ),
+      /tracked checkout hashing exceeded the supported entry budget/,
+    );
+    assert.equal(instrumentation.materializedSynchronously, false);
+    assert.equal(instrumentation.streamedEntries, 1);
+  } finally {
+    instrumentation.restore();
+  }
+});
+
+test("staged proof enforces its deadline during a bounded gitlink child probe", () => {
+  const { cwd, gitlinkPath } = uninitializedGitlinkFixture();
+  fs.writeFileSync(path.join(gitlinkPath, "unexpected"), "not initialized\n");
+  const originalNow = Date.now;
+  let expired = false;
+  Date.now = () => (expired ? 1_101 : 1_000);
+  const instrumentation = instrumentProofDirectory(gitlinkPath, () => {
+    expired = true;
+  });
+
+  try {
+    assert.throws(
+      () =>
+        runStagedValidationProof(
+          ["git diff --check"],
+          cwd,
+          validationOptions("steipete/example", {
+            proofBudgetMs: 100,
+            validationTimeoutMs: 1_000,
+            toolchain: {
+              packageManager: "pnpm",
+              baseValidationCommands: [],
+              changedGate: null,
+            },
+          }),
+        ),
+      /staged proof runtime budget exhausted during tracked checkout hashing/,
+    );
+    assert.equal(instrumentation.materializedSynchronously, false);
+    assert.equal(instrumentation.streamedEntries, 1);
+  } finally {
+    instrumentation.restore();
+    Date.now = originalNow;
+  }
 });
 
 test("staged proof bounds ignored dependency traversal by entries and depth", () => {
@@ -3387,7 +3447,24 @@ test("compactText keeps both head and tail for long validation output", () => {
   );
 });
 
-function instrumentProofDirectory(directoryPath) {
+function uninitializedGitlinkFixture() {
+  const source = gitPackageFixture({});
+  git(source, "add", ".");
+  git(source, "commit", "-m", "initial");
+  const gitlinkCommit = git(source, "rev-parse", "HEAD");
+  git(source, "update-index", "--add", "--cacheinfo", `160000,${gitlinkCommit},vendor/submodule`);
+  git(source, "commit", "-m", "add uninitialized gitlink");
+  const origin = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-gitlink-origin-"));
+  git(origin, "init", "--bare");
+  git(source, "remote", "add", "origin", origin);
+  git(source, "push", "-u", "origin", "main:main");
+  const checkoutRoot = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-gitlink-checkout-"));
+  const cwd = path.join(checkoutRoot, "repo");
+  execFileSync("git", ["clone", "--branch", "main", origin, cwd], { encoding: "utf8" });
+  return { cwd, gitlinkPath: path.join(cwd, "vendor", "submodule") };
+}
+
+function instrumentProofDirectory(directoryPath, onRead = () => {}) {
   const watchedPath = fs.realpathSync(directoryPath);
   const originalReaddirSync = fs.readdirSync;
   const originalOpendirSync = fs.opendirSync;
@@ -3406,7 +3483,10 @@ function instrumentProofDirectory(directoryPath) {
         if (property === "readSync") {
           return () => {
             const entry = target.readSync();
-            if (entry) streamedEntries += 1;
+            if (entry) {
+              streamedEntries += 1;
+              onRead(entry);
+            }
             return entry;
           };
         }
