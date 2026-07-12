@@ -514,8 +514,28 @@ test("post-flight rechecks live security immediately before privileged mutations
   );
   assert.match(
     finalizeFixPr,
-    /liveSecurityBlockReason\([\s\S]*fetchPullRequest[\s\S]*runVerifiedPostFlightPullMutation\(parsed\.number, \(\) => \{[\s\S]*runtimeStrictBaseBindingBlock\(\{[\s\S]*ghWithRetry\(mergeArgs\)/,
+    /liveSecurityBlockReason\([\s\S]*fetchPullRequest[\s\S]*runVerifiedPostFlightPullMutation\(parsed\.number, \(\) => \{[\s\S]*runtimeStrictBaseBindingBlock\(\{[\s\S]*freshPostFlightMergeMutationBlock\(parsed\.number\)[\s\S]*ghWithRetry\(mergeArgs\)/,
   );
+  const mergeMutation = finalizeFixPr.slice(
+    finalizeFixPr.indexOf("runVerifiedPostFlightPullMutation(parsed.number, () => {"),
+  );
+  const finalView = mergeMutation.indexOf("fetchPullRequestView(result.repo, parsed.number)");
+  const strictBase = mergeMutation.indexOf("runtimeStrictBaseBindingBlock(", finalView);
+  const finalSafety = mergeMutation.indexOf(
+    "freshPostFlightMergeMutationBlock(parsed.number)",
+    strictBase,
+  );
+  const merge = mergeMutation.indexOf("ghWithRetry(mergeArgs)", finalSafety);
+  assert.ok(
+    finalView >= 0 && strictBase > finalView && finalSafety > strictBase && merge > finalSafety,
+  );
+  const finalSafetyHelper = source.slice(
+    source.indexOf("function freshPostFlightMergeMutationBlock"),
+    source.indexOf("function validateMergeableFixPr"),
+  );
+  assert.match(finalSafetyHelper, /fetchPullRequest\(result\.repo, number\)/);
+  assert.match(finalSafetyHelper, /repairPauseLabel\(pull\.labels\)/);
+  assert.match(finalSafetyHelper, /liveSecurityBlockReason\(number, pull\.labels \?\? \[\]\)/);
   assert.match(
     finalizeFixPr,
     /runVerifiedPostFlightPullMutation\(parsed\.number, \(\) =>[\s\S]*labelForClawSweeperReview/,

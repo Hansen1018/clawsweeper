@@ -26,6 +26,7 @@ import {
   CLAWSWEEPER_LABEL_DESCRIPTION,
 } from "./constants.js";
 import { AUTOMERGE_LABEL } from "./comment-router-core.js";
+import { repairPauseLabel } from "./execute-fix-validation.js";
 import { numberEnv } from "./env-utils.js";
 import {
   buildRepairSquashMergeMessage,
@@ -348,6 +349,8 @@ function finalizeFixPr(action: LooseRecord) {
         policyReadJson: rulesetPolicyReader(),
       });
       if (finalStrictBaseBindingBlock) return { policyBlock: finalStrictBaseBindingBlock };
+      const finalMutationBlock = freshPostFlightMergeMutationBlock(parsed.number);
+      if (finalMutationBlock) return { policyBlock: finalMutationBlock };
       ghWithRetry(mergeArgs);
       return { policyBlock: "" };
     });
@@ -724,6 +727,15 @@ function liveSecurityBlockReason(number: JsonValue, labels: LooseRecord[]) {
 function freshLiveSecurityBlockReason(number: JsonValue) {
   const issue = fetchIssue(result.repo, number);
   return liveSecurityBlockReason(number, issue.labels ?? []);
+}
+
+function freshPostFlightMergeMutationBlock(number: number) {
+  const pull = fetchPullRequest(result.repo, number);
+  const pauseLabel = repairPauseLabel(pull.labels);
+  if (pauseLabel) {
+    return `pull request is paused by ${pauseLabel}; refusing final merge mutation`;
+  }
+  return liveSecurityBlockReason(number, pull.labels ?? []);
 }
 
 function validateMergeableFixPr({

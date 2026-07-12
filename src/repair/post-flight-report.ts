@@ -107,8 +107,10 @@ export function issueImplementationPublishedHeadBlock({
 
 export function summarizePostFlightReport(report: LooseRecord): PostFlightReportSummary {
   const actions = Array.isArray(report.actions) ? report.actions : [];
+  const successStatuses =
+    report.dry_run === true ? new Set([...SUCCESS_STATUSES, "planned"]) : SUCCESS_STATUSES;
   const incomplete = actions.filter(
-    (action: JsonValue) => !SUCCESS_STATUSES.has(String(action?.status ?? "")),
+    (action: JsonValue) => !successStatuses.has(String(action?.status ?? "")),
   );
   if (actions.length > 0 && incomplete.length === 0) {
     return {

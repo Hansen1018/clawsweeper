@@ -26,6 +26,29 @@ test("post-flight report succeeds only when every generated action completed", (
   );
 });
 
+test("post-flight dry runs treat planned actions as successful summaries", () => {
+  assert.deepEqual(
+    summarizePostFlightReport({
+      dry_run: true,
+      actions: [
+        { action: "finalize_fix_pr", status: "planned" },
+        { action: "post_merge_closeout", status: "planned" },
+      ],
+    }),
+    {
+      outcome: "success",
+      detail: "all generated post-flight actions completed",
+    },
+  );
+  assert.equal(
+    summarizePostFlightReport({
+      dry_run: false,
+      actions: [{ action: "finalize_fix_pr", status: "planned" }],
+    }).outcome,
+    "blocked",
+  );
+});
+
 test("post-flight treats non-merge repair lanes as publication-only", () => {
   assert.equal(
     isPublicationOnlyPostFlightJob({
