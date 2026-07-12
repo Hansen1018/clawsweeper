@@ -2210,6 +2210,57 @@ test("trusted autoclose markers are live close gated before close execution", ()
   assert.ok((source.match(/unsponsoredFeatureLinkedPrBlockReason\(/g) ?? []).length >= 3);
 });
 
+test("autoclose safety hydrates complete comments outside bounded routing discovery", () => {
+  const source = readFileSync("src/repair/comment-router.ts", "utf8");
+  const cacheSetup = source.slice(
+    source.indexOf("const issueCommentsCache"),
+    source.indexOf("const openIssueNumbersByLabel"),
+  );
+  const prehydrate = source.slice(
+    source.indexOf("async function prehydrateCommandLookups"),
+    source.indexOf("function classifyCommand"),
+  );
+  const autocloseClassifier = source.slice(
+    source.indexOf("function classifyAutoclose"),
+    source.indexOf("function classifyMaintainerApprovedAutomerge"),
+  );
+  const liveCloseGate = source.slice(
+    source.indexOf("function liveTrustedCloseBlockReason"),
+    source.indexOf("function unsponsoredFeatureLinkedPrBlockReason"),
+  );
+
+  assert.match(
+    cacheSetup,
+    /cachedIssueComments[\s\S]*ghPagedLimit<JsonValue>\([\s\S]*comments\?since=[\s\S]*maxComments/,
+  );
+  assert.match(
+    cacheSetup,
+    /cachedAutocloseSafetyComments[\s\S]*ghPaged<JsonValue>\(`repos\/\$\{targetRepo\}\/issues\/\$\{number\}\/comments\?per_page=100`\)/,
+  );
+  assert.match(
+    cacheSetup,
+    /cachedAutocloseSafetyCommentsAsync[\s\S]*ghPagedAsync<JsonValue>\(`repos\/\$\{targetRepo\}\/issues\/\$\{number\}\/comments\?per_page=100`\)/,
+  );
+  assert.doesNotMatch(
+    cacheSetup.slice(cacheSetup.indexOf("const cachedAutocloseSafetyComments")),
+    /comments\?since=/,
+  );
+  assert.match(
+    prehydrate,
+    /autocloseSafetyIssueNumbers[\s\S]*command\.trusted_bot === true[\s\S]*AUTOCLOSE_INTENTS\.has/,
+  );
+  assert.match(prehydrate, /cachedAutocloseSafetyCommentsAsync\(number\)/);
+  assert.match(autocloseClassifier, /autocloseSafetyCommentsFor\(command\.issue_number\)/);
+  assert.doesNotMatch(autocloseClassifier, /cachedIssueComments\(command\.issue_number\)/);
+  assert.ok(
+    (
+      liveCloseGate.match(
+        /autocloseSafetyCommentsFor\(liveTarget\.number,\s*\{\s*refresh:\s*true\s*\}\)/g,
+      ) ?? []
+    ).length >= 2,
+  );
+});
+
 test("trusted close gates block protected labels, source drift, and unsupported reasons", () => {
   const base = {
     repo: "openclaw/openclaw",

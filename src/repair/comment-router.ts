@@ -130,6 +130,7 @@ import {
   ghPagedLimitWithRetry as ghPagedLimit,
   ghPagedLimitWithRetryAsync as ghPagedLimitAsync,
   ghPagedWithRetry as ghPaged,
+  ghPagedWithRetryAsync as ghPagedAsync,
   ghSpawn,
   ghText,
   type GhRetryOptions,
@@ -253,6 +254,7 @@ const collaboratorPermissionCache = new Map();
 const activeRepairRunsByPrefix = new Map<string, LooseRecord[]>();
 const liveTargetCache = new Map<number, LooseRecord>();
 const issueCommentsCache = new Map<number, JsonValue[]>();
+const autocloseSafetyCommentsCache = new Map<number, JsonValue[]>();
 const candidateIssueCommentCache = new Map<string, LooseRecord | null>();
 const MAX_MEDIA_PREPROCESSING_TIMEOUT_MS = 480_000;
 const PROOF_OVERRIDE_DESCRIPTION_MARKER = "<!-- clawsweeper-proof-override-note -->";
@@ -271,6 +273,14 @@ const cachedIssueCommentsAsync = createCachedIssueCommentsLookupAsync(
       maxComments,
     ),
   issueCommentsCache,
+);
+const cachedAutocloseSafetyComments = createCachedIssueCommentsLookup(
+  (number) => ghPaged<JsonValue>(`repos/${targetRepo}/issues/${number}/comments?per_page=100`),
+  autocloseSafetyCommentsCache,
+);
+const cachedAutocloseSafetyCommentsAsync = createCachedIssueCommentsLookupAsync(
+  (number) => ghPagedAsync<JsonValue>(`repos/${targetRepo}/issues/${number}/comments?per_page=100`),
+  autocloseSafetyCommentsCache,
 );
 const openIssueNumbersByLabel = createCachedLabelNumberLookup((label) =>
   ghPaged<JsonValue>(
@@ -808,6 +818,15 @@ async function prehydrateCommandLookups(
       .map((command) => Number(command.issue_number))
       .filter((number) => Number.isInteger(number) && number > 0),
   );
+  const autocloseSafetyIssueNumbers = unique(
+    pending
+      .filter(
+        (command) =>
+          command.trusted_bot === true && AUTOCLOSE_INTENTS.has(String(command.intent ?? "")),
+      )
+      .map((command) => Number(command.issue_number))
+      .filter((number) => Number.isInteger(number) && number > 0),
+  );
 
   await Promise.all([
     mapLimit(logins, lookupConcurrency, (login) => fetchCollaboratorPermissionAsync(login)),
@@ -817,6 +836,10 @@ async function prehydrateCommandLookups(
     mapLimit(issueNumbers, lookupConcurrency, async (number) => {
       if (options.refreshIssueComments) issueCommentsCache.delete(number);
       await cachedIssueCommentsAsync(number);
+    }),
+    mapLimit(autocloseSafetyIssueNumbers, lookupConcurrency, async (number) => {
+      if (options.refreshIssueComments) autocloseSafetyCommentsCache.delete(number);
+      await cachedAutocloseSafetyCommentsAsync(number);
     }),
   ]);
 }
@@ -1354,7 +1377,7 @@ function classifyAutoclose(command: LooseRecord, issue: LooseRecord, pull: Loose
   }
   if (command.trusted_bot && pull) {
     const closeReason = String(command.close_reason ?? "");
-    const comments = cachedIssueComments(command.issue_number);
+    const comments = autocloseSafetyCommentsFor(command.issue_number);
     const needsCloseSignalContext =
       closeReason === "unconfirmed_product_direction" ||
       closeReason === "low_signal_unmergeable_pr";
@@ -1416,7 +1439,7 @@ function classifyAutoclose(command: LooseRecord, issue: LooseRecord, pull: Loose
         reason: linkedPrBlock,
       };
     }
-    const comments = cachedIssueComments(command.issue_number);
+    const comments = autocloseSafetyCommentsFor(command.issue_number);
     const trustedCloseBlock = trustedCloseBlockReason({
       repo: command.repo,
       kind: "issue",
@@ -3534,7 +3557,7 @@ function liveTrustedCloseBlockReason(command: LooseRecord, liveTarget: LooseReco
   if (liveTarget.kind === "pull_request") {
     const issue = fetchIssue(liveTarget.number);
     const pull = fetchPullRequestView(liveTarget.number);
-    const comments = cachedIssueComments(liveTarget.number);
+    const comments = autocloseSafetyCommentsFor(liveTarget.number, { refresh: true });
     const closeReason = String(command.close_reason ?? "");
     const needsCloseSignalContext =
       closeReason === "unconfirmed_product_direction" ||
@@ -3578,7 +3601,7 @@ function liveTrustedCloseBlockReason(command: LooseRecord, liveTarget: LooseReco
     if (linkedPrBlock) return linkedPrBlock;
   }
   const issue = fetchIssue(liveTarget.number);
-  const comments = cachedIssueComments(liveTarget.number);
+  const comments = autocloseSafetyCommentsFor(liveTarget.number, { refresh: true });
   return trustedCloseBlockReason({
     repo: command.repo,
     kind: "issue",
@@ -4339,6 +4362,15 @@ function extractMarkdownSection(body: JsonValue, heading: string): string | null
 
 function issueCommentsFor(number: JsonValue): JsonValue[] {
   return cachedIssueComments(number);
+}
+
+function autocloseSafetyCommentsFor(
+  number: JsonValue,
+  { refresh = false }: { refresh?: boolean } = {},
+): JsonValue[] {
+  const key = Number(number);
+  if (refresh && Number.isInteger(key) && key > 0) autocloseSafetyCommentsCache.delete(key);
+  return cachedAutocloseSafetyComments(number);
 }
 
 function listRepairLoopTargets(): RepairLoopTarget[] {
