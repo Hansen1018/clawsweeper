@@ -200,6 +200,7 @@ jobs:
           set -euo pipefail
           mkdir -p .artifacts/cluster-repair-intake
           generated_log=".artifacts/cluster-repair-intake/generated.txt"
+          set +e
           pnpm run repair:import-gitcrawl -- \
             --from-gitcrawl \
             --repo "$TARGET_REPO" \
@@ -213,6 +214,12 @@ jobs:
             --allow-post-merge-close true \
             2> >(tee .artifacts/cluster-repair-intake/import-stderr.txt >&2) \
             | tee "$generated_log"
+          pipeline_status=("${PIPESTATUS[@]}")
+          set -e
+          import_status="${pipeline_status[0]}"
+          if [ "$import_status" -eq 0 ] && [ "${pipeline_status[1]}" -ne 0 ]; then
+            import_status="${pipeline_status[1]}"
+          fi
 
           mapfile -t generated < <(grep '^jobs/' "$generated_log" || true)
           printf '%s\n' "${generated[@]}" > .artifacts/cluster-repair-intake/generated-paths.txt
@@ -224,6 +231,7 @@ jobs:
               echo "should_dispatch=false"
             fi
           } >> "$GITHUB_OUTPUT"
+          exit "$import_status"
 
       - name: Record intake ledger
         if: ${{ steps.prepare.outputs.should_import == 'true' }}
@@ -259,21 +267,24 @@ jobs:
           NODE
 
       - name: Finalize Gitcrawl evidence action ledger
+        id: gitcrawl-action-ledger-finalize
         if: ${{ always() && steps.gitcrawl-action-ledger.outcome == 'success' }}
         run: pnpm run --silent repair:action-ledger -- finalize
 
-      - name: Publish immutable Gitcrawl evidence action ledger
-        if: ${{ always() && steps.gitcrawl-action-ledger.outcome == 'success' }}
+      - name: Stage immutable Gitcrawl evidence action ledger
+        id: gitcrawl-action-ledger-paths
+        if: ${{ always() && steps.gitcrawl-action-ledger-finalize.outcome == 'success' }}
         run: |
           set -euo pipefail
           test -n "${CLAWSWEEPER_STATE_DIR:-}"
           source_root=".clawsweeper-repair/action-ledger-state"
+          event_paths_file=".artifacts/cluster-repair-intake/action-ledger-paths.txt"
+          mkdir -p "$(dirname "$event_paths_file")"
+          : > "$event_paths_file"
           if [ ! -d "$source_root/ledger" ]; then
             echo "No Gitcrawl evidence action event shards were finalized."
             exit 0
           fi
-          event_paths_file=".artifacts/cluster-repair-intake/action-ledger-paths.txt"
-          mkdir -p "$(dirname "$event_paths_file")"
           pnpm run --silent repair:action-ledger -- publish \
             --source-root "$source_root" \
             --state-root "$CLAWSWEEPER_STATE_DIR" |
@@ -283,29 +294,53 @@ jobs:
             echo "Gitcrawl evidence action event shards existed but no paths were imported." >&2
             exit 1
           fi
-          action_ledger_args=()
           while IFS= read -r event_path; do
             durable_event_path="$CLAWSWEEPER_STATE_DIR/$event_path"
             test -f "$durable_event_path"
             mkdir -p "$(dirname "$event_path")"
             cp "$durable_event_path" "$event_path"
-            action_ledger_args+=(--path "$event_path")
           done < "$event_paths_file"
-          pnpm run repair:publish-main -- \
-            --message "chore: append Gitcrawl evidence action ledger" \
-            "${action_ledger_args[@]}" \
-            --rebase-strategy normal
 
-      - name: Publish intake jobs and ledger
-        if: ${{ steps.prepare.outputs.should_import == 'true' }}
+      - name: Prepare Gitcrawl intake publication transaction
+        id: gitcrawl-publication
+        if: ${{ always() && steps.prepare.outputs.should_import == 'true' && steps.gitcrawl-action-ledger-paths.outcome == 'success' }}
+        env:
+          TARGET_REPO: ${{ steps.prepare.outputs.target_repo }}
+          LEDGER_PATH: ${{ steps.prepare.outputs.ledger_path }}
         run: |
           set -euo pipefail
+          owner="${TARGET_REPO%%/*}"
+          event_paths_file=".artifacts/cluster-repair-intake/action-ledger-paths.txt"
+          generated_paths_file=".artifacts/cluster-repair-intake/generated-paths.txt"
+          publication_paths_file=".artifacts/cluster-repair-intake/publication-paths.txt"
+          cursor_path="jobs/${owner}/inbox/.gitcrawl-scan-cursors.json"
+          manifest_path="results/cluster-repair-intake/transactions/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json"
+          pnpm run --silent repair:gitcrawl-publication -- \
+            --event-paths-file "$event_paths_file" \
+            --generated-paths-file "$generated_paths_file" \
+            --cursor "$cursor_path" \
+            --intake "$LEDGER_PATH" \
+            --manifest "$manifest_path" \
+            --paths-file "$publication_paths_file"
+          test -s "$publication_paths_file"
+          echo "paths_file=$publication_paths_file" >> "$GITHUB_OUTPUT"
+
+      - name: Publish Gitcrawl intake transaction
+        if: ${{ always() && steps.gitcrawl-publication.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          publication_args=()
+          while IFS= read -r publication_path; do
+            test -n "$publication_path"
+            publication_args+=(--path "$publication_path")
+          done < "${{ steps.gitcrawl-publication.outputs.paths_file }}"
+          test "${#publication_args[@]}" -gt 0
           pnpm run repair:publish-main -- \
             --message "chore: record cluster repair intake" \
-            --path jobs \
-            --path results/cluster-repair-intake \
+            "${publication_args[@]}" \
             --max-attempts 12 \
-            --push-attempts 4
+            --push-attempts 4 \
+            --rebase-strategy normal
 
       - name: Dispatch imported cluster repair
         if: ${{ steps.import.outputs.should_dispatch == 'true' }}

@@ -2405,7 +2405,7 @@ test("cluster intake publishes generated repair state through state repo", () =>
   const stateTokenIndex = workflow.indexOf("uses: ./.github/actions/create-state-token");
   const setupStateIndex = workflow.indexOf("uses: ./.github/actions/setup-state");
   const importIndex = workflow.indexOf("- name: Import one cluster from gitcrawl-store");
-  const publishIndex = workflow.indexOf("- name: Publish intake jobs and ledger");
+  const publishIndex = workflow.indexOf("- name: Publish Gitcrawl intake transaction");
 
   assert.notEqual(stateTokenIndex, -1);
   assert.notEqual(setupStateIndex, -1);
@@ -2414,8 +2414,11 @@ test("cluster intake publishes generated repair state through state repo", () =>
   assert.ok(stateTokenIndex < setupStateIndex, "state token must be created before setup-state");
   assert.ok(setupStateIndex < importIndex, "state repo must be hydrated before job import");
   assert.ok(setupStateIndex < publishIndex, "state repo must be configured before publish-main");
-  assert.match(workflow, /--path jobs/);
-  assert.match(workflow, /--path results\/cluster-repair-intake/);
+  assert.match(workflow, /repair:gitcrawl-publication/);
+  assert.match(workflow, /--generated-paths-file "\$generated_paths_file"/);
+  assert.match(workflow, /--cursor "\$cursor_path"/);
+  assert.match(workflow, /--intake "\$LEDGER_PATH"/);
+  assert.match(workflow, /publication_args\+=\(--path "\$publication_path"\)/);
 });
 
 test("conflict self-heal publishes exact-head jobs before worker dispatch", () => {

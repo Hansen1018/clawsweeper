@@ -34,6 +34,7 @@
     "repair:import-gitcrawl": "node dist/repair/import-gitcrawl-clusters.js",
     "repair:import-gitcrawl-low-signal": "node dist/repair/import-gitcrawl-low-signal-prs.js",
     "repair:gitcrawl-evidence-preflight": "node dist/repair/gitcrawl-evidence-preflight.js",
+    "repair:gitcrawl-publication": "node dist/repair/gitcrawl-publication-transaction.js",
     "repair:import-ghcrawl": "node dist/repair/import-gitcrawl-clusters.js",
     "repair:import-low-signal": "node dist/repair/import-gitcrawl-low-signal-prs.js",
     "repair:worker": "node dist/repair/run-worker.js",

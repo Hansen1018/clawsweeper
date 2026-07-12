@@ -289,12 +289,17 @@ Review, apply, command-router, repair-session, issue-status, result-publication,
 dashboard-publication, and Gitcrawl intake lanes now emit this taxonomy.
 Gitcrawl cluster and low-signal importers record a snapshot event, digest-only
 query events, and a packet-binding event only after atomic job publication and
-before durable scan-cursor advancement. Repair receipts keep the logical work
-key and sealed repaired-source revision stable across retries; ClawSweeper's
-workflow checkout SHA is not target provenance. Workflow run and run attempt
-define the repair execution attempt; job, step, and invocation remain producer
-identity. Each process reconstructs the latest parent and phase sequence from
-the canonical local spool plus prior-job shard artifacts accepted by the same
+before scan-cursor advancement. Cluster intake then verifies that every
+generated path has one matching binding whose packet digest matches the
+embedded job packet. Generated jobs, the cursor, the intake record, the
+transaction manifest, and finalized action-event shards become visible in one
+state-repository commit; a failed validation or push exposes none of that
+transaction to durable consumers. Repair receipts keep the logical work key and
+sealed repaired-source revision stable across retries; ClawSweeper's workflow
+checkout SHA is not target provenance. Workflow run and run attempt define the
+repair execution attempt; job, step, and invocation remain producer identity.
+Each process reconstructs the latest parent and phase sequence from the
+canonical local spool plus prior-job shard artifacts accepted by the same
 bounded path, shard, packing, and topology validator used for state imports.
 Queue, plan, and post-flight events therefore remain one monotonic chain without
 reusing a finalized producer. Session writes record both the optional

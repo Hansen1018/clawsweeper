@@ -12,7 +12,11 @@ import {
   createGitcrawlEvidenceClaim,
   type GitcrawlCoverageRow,
 } from "../../dist/repair/gitcrawl-evidence-contract.js";
-import { buildGitcrawlEvidencePacket } from "../../dist/repair/gitcrawl-evidence-graph.js";
+import {
+  buildGitcrawlEvidencePacket,
+  renderGitcrawlEvidencePacket,
+} from "../../dist/repair/gitcrawl-evidence-graph.js";
+import { prepareGitcrawlPublicationTransaction } from "../../dist/repair/gitcrawl-publication-transaction.js";
 
 const now = new Date("2026-07-12T12:00:00.000Z");
 const env = {
@@ -190,6 +194,137 @@ test("Gitcrawl evidence records no binding when no job is published", async () =
   );
 });
 
+test("Gitcrawl durable publication transaction binds jobs, cursor, and event shards", async () => {
+  const root = fs.realpathSync(
+    fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-gitcrawl-transaction-")),
+  );
+  const stagedRoot = path.join(root, "staged");
+  fs.mkdirSync(stagedRoot);
+  const coverage = completeCoverage();
+  const claim = createGitcrawlEvidenceClaim({
+    provider: "local",
+    snapshotId: "snapshot-a",
+    queryName: "gitcrawl.clusters.members",
+    subject: "openclaw/openclaw#issue:42",
+    data: { number: 42, state: "open" },
+  });
+  const packet = buildGitcrawlEvidencePacket({
+    provider: "local",
+    repository: "openclaw/openclaw",
+    snapshotId: "snapshot-a",
+    coverage,
+    claims: [claim],
+    generatedAt: now.toISOString(),
+  });
+  const jobPath = "jobs/openclaw/inbox/gitcrawl-evidence-v1-test.md";
+  const ledger = beginGitcrawlActionLedger(
+    root,
+    {
+      repository: "openclaw/openclaw",
+      consumer: "cluster_intake",
+      provider: "local",
+      snapshotId: "snapshot-a",
+      coverage,
+    },
+    { env, now: () => now },
+  );
+  ledger.recordBinding({
+    phaseSeq: 20,
+    identity: { clusterId: 7 },
+    packet,
+    recordPath: jobPath,
+    itemCount: 1,
+    subject: {
+      repository: "openclaw/openclaw",
+      kind: "cluster",
+      clusterId: "gitcrawl-evidence-v1-test",
+    },
+  });
+  const [shardPath] = await flushWorkflowActionEvents(root, { env, outputRoot: stagedRoot });
+  assert.ok(shardPath);
+  fs.mkdirSync(path.dirname(path.join(root, shardPath)), { recursive: true });
+  fs.copyFileSync(path.join(stagedRoot, shardPath), path.join(root, shardPath));
+  fs.mkdirSync(path.dirname(path.join(root, jobPath)), { recursive: true });
+  fs.writeFileSync(
+    path.join(root, jobPath),
+    ["# Generated repair job", "", ...renderGitcrawlEvidencePacket(packet)].join("\n"),
+  );
+  const cursorPath = "jobs/openclaw/inbox/.gitcrawl-scan-cursors.json";
+  const intakePath = "results/cluster-repair-intake/openclaw-openclaw.json";
+  fs.writeFileSync(path.join(root, cursorPath), "{}\n");
+  fs.mkdirSync(path.dirname(path.join(root, intakePath)), { recursive: true });
+  fs.writeFileSync(path.join(root, intakePath), "{}\n");
+
+  const transaction = prepareGitcrawlPublicationTransaction({
+    root,
+    eventPaths: [shardPath],
+    generatedPaths: [jobPath],
+    cursorPath,
+    intakePath,
+    manifestPath: "results/cluster-repair-intake/transactions/123-1.json",
+    runId: "123",
+    runAttempt: "1",
+  });
+  assert.deepEqual(transaction.generated_jobs, [
+    {
+      path: jobPath,
+      packet_sha256: packet.sha256,
+      binding_event_id: readActionEventShard(path.join(root, shardPath)).at(-1)!.event_id,
+    },
+  ]);
+  for (const requiredPath of [jobPath, shardPath, cursorPath, intakePath]) {
+    assert.ok(transaction.publish_paths.includes(requiredPath), requiredPath);
+  }
+  assert.ok(
+    transaction.publish_paths.includes("results/cluster-repair-intake/transactions/123-1.json"),
+  );
+
+  const differentPacket = buildGitcrawlEvidencePacket({
+    provider: "local",
+    repository: "openclaw/openclaw",
+    snapshotId: "snapshot-a",
+    coverage,
+    claims: [claim],
+    generatedAt: "2026-07-12T11:59:00.000Z",
+  });
+  fs.writeFileSync(
+    path.join(root, jobPath),
+    ["# Generated repair job", "", ...renderGitcrawlEvidencePacket(differentPacket)].join("\n"),
+  );
+  assert.throws(
+    () =>
+      prepareGitcrawlPublicationTransaction({
+        root,
+        eventPaths: [shardPath],
+        generatedPaths: [jobPath],
+        manifestPath: "results/cluster-repair-intake/transactions/digest-mismatch.json",
+      }),
+    /binding packet digest does not match job/,
+  );
+
+  fs.unlinkSync(path.join(root, jobPath));
+  assert.throws(
+    () =>
+      prepareGitcrawlPublicationTransaction({
+        root,
+        eventPaths: [shardPath],
+        generatedPaths: [jobPath],
+        manifestPath: "results/cluster-repair-intake/transactions/missing-job.json",
+      }),
+    /generated job is missing or is not a regular file/,
+  );
+  assert.throws(
+    () =>
+      prepareGitcrawlPublicationTransaction({
+        root,
+        eventPaths: [shardPath],
+        generatedPaths: [],
+        manifestPath: "results/cluster-repair-intake/transactions/missing-binding.json",
+      }),
+    /generated jobs do not exactly match binding events/,
+  );
+});
+
 test("Gitcrawl importers bind only after atomic publication and before cursor advancement", () => {
   for (const file of [
     "src/repair/import-gitcrawl-clusters.ts",
@@ -209,23 +344,33 @@ test("Gitcrawl importers bind only after atomic publication and before cursor ad
   }
 });
 
-test("cluster intake publishes finalized Gitcrawl evidence shards to state", () => {
+test("cluster intake publishes jobs, cursor, and Gitcrawl bindings in one durable transaction", () => {
   const workflow = fs.readFileSync(".github/workflows/repair-cluster-intake.yml", "utf8");
   assert.match(workflow, /name: Setup Gitcrawl evidence action ledger/);
   assert.match(workflow, /uses: \.\/\.github\/actions\/setup-action-ledger/);
   assert.match(workflow, /name: Finalize Gitcrawl evidence action ledger/);
   assert.match(workflow, /repair:action-ledger -- finalize/);
-  assert.match(workflow, /name: Publish immutable Gitcrawl evidence action ledger/);
+  assert.match(workflow, /name: Stage immutable Gitcrawl evidence action ledger/);
   assert.match(
     workflow,
-    /if: \$\{\{ always\(\) && steps\.gitcrawl-action-ledger\.outcome == 'success' \}\}/,
+    /if: \$\{\{ always\(\) && steps\.gitcrawl-action-ledger-finalize\.outcome == 'success' \}\}/,
   );
   assert.match(workflow, /repair:action-ledger -- publish/);
   assert.match(workflow, /--state-root "\$CLAWSWEEPER_STATE_DIR"/);
-  assert.match(workflow, /--message "chore: append Gitcrawl evidence action ledger"/);
+  assert.match(workflow, /name: Prepare Gitcrawl intake publication transaction/);
+  assert.match(workflow, /repair:gitcrawl-publication/);
+  assert.match(workflow, /--generated-paths-file "\$generated_paths_file"/);
+  assert.match(workflow, /--cursor "\$cursor_path"/);
+  assert.match(workflow, /name: Publish Gitcrawl intake transaction/);
+  assert.equal(workflow.match(/pnpm run repair:publish-main/g)?.length, 1);
+  assert.doesNotMatch(workflow, /chore: append Gitcrawl evidence action ledger/);
   assert.ok(
-    workflow.indexOf("Publish immutable Gitcrawl evidence action ledger") <
-      workflow.indexOf("Publish intake jobs and ledger"),
+    workflow.indexOf("Stage immutable Gitcrawl evidence action ledger") <
+      workflow.indexOf("Prepare Gitcrawl intake publication transaction"),
+  );
+  assert.ok(
+    workflow.indexOf("Prepare Gitcrawl intake publication transaction") <
+      workflow.indexOf("Publish Gitcrawl intake transaction"),
   );
 });
 
