@@ -29,6 +29,8 @@ switch (command) {
       workflowRepository: requiredArg(args, "workflow-repository"),
       workflowSha: requiredArg(args, "workflow-sha"),
       allowedOwner: requiredArg(args, "allowed-owner"),
+      allowExecute: requiredGateArg(args, "allow-execute"),
+      allowFixPr: requiredGateArg(args, "allow-fix-pr"),
       closeSupersededSourcePrs: /^(1|true|yes|on)$/i.test(args.get("close-superseded") ?? ""),
     });
     writeOutputs({
@@ -41,6 +43,8 @@ switch (command) {
       target_repo: authorization.target_repo,
       target_owner: authorization.target_owner,
       target_name: authorization.target_name,
+      allow_execute: authorization.allow_execute ? "1" : "0",
+      allow_fix_pr: authorization.allow_fix_pr ? "1" : "0",
     });
     break;
   }
@@ -68,6 +72,8 @@ switch (command) {
       target_repo: authorization.target_repo,
       target_owner: authorization.target_owner,
       target_name: authorization.target_name,
+      allow_execute: authorization.allow_execute ? "1" : "0",
+      allow_fix_pr: authorization.allow_fix_pr ? "1" : "0",
       checkpoint_recovered: "1",
       checkpoint_producer_attempt: authorization.checkpoint_producer_attempt,
       checkpoint_validation_receipt_sha256: authorization.checkpoint_validation_receipt_sha256,
@@ -237,6 +243,14 @@ function requiredArg(args: Map<string, string>, name: string): string {
   const value = args.get(name)?.trim();
   if (!value) throw new Error(`--${name} is required`);
   return value;
+}
+
+function requiredGateArg(args: Map<string, string>, name: string): boolean {
+  const value = requiredArg(args, name);
+  if (value !== "0" && value !== "1") {
+    throw new Error(`--${name} must be 0 or 1`);
+  }
+  return value === "1";
 }
 
 function writeOutputs(outputs: Record<string, string>) {

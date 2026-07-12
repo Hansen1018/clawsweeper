@@ -43,7 +43,7 @@ import {
   type TargetValidationOptions,
 } from "./target-validation.js";
 
-const AUTHORIZATION_SCHEMA_VERSION = 2;
+const AUTHORIZATION_SCHEMA_VERSION = 3;
 const EXECUTION_SCHEMA_VERSION = 2;
 const VALIDATION_RECEIPT_SCHEMA_VERSION = 3;
 const DIGEST_PATTERN = /^[a-f0-9]{64}$/;
@@ -124,6 +124,8 @@ export type ExecutionAuthorization = {
   target_name: string;
   cluster_id: string;
   mode: string;
+  allow_execute: boolean;
+  allow_fix_pr: boolean;
   job_sha256: string;
   result_sha256: string;
   execution_intent_sha256: string;
@@ -178,6 +180,8 @@ export function prepareExecutionAuthorization({
   workflowRepository,
   workflowSha,
   allowedOwner,
+  allowExecute = false,
+  allowFixPr = false,
   closeSupersededSourcePrs = false,
   resolveIntent = resolveLiveExecutionIntent,
 }: {
@@ -189,6 +193,8 @@ export function prepareExecutionAuthorization({
   workflowRepository: string;
   workflowSha: string;
   allowedOwner: string;
+  allowExecute?: boolean;
+  allowFixPr?: boolean;
   closeSupersededSourcePrs?: boolean;
   resolveIntent?: IntentResolver;
 }): ExecutionAuthorization {
@@ -248,6 +254,8 @@ export function prepareExecutionAuthorization({
     target_name: targetName!,
     cluster_id: requiredText(job.frontmatter.cluster_id, "cluster id"),
     mode: requiredText(job.frontmatter.mode, "job mode"),
+    allow_execute: allowExecute === true,
+    allow_fix_pr: allowFixPr === true,
     job_sha256: sha256File(path.join(outputRoot, "job.md")),
     result_sha256: sha256File(path.join(outputRoot, "run", "result.json")),
     execution_intent_sha256: executionIntent.identity_sha256,
@@ -427,6 +435,8 @@ export function verifyExecutionAuthorization(
   const { identity_sha256: identitySha256, ...identity } = authorization;
   if (
     authorization.schema_version !== AUTHORIZATION_SCHEMA_VERSION ||
+    typeof authorization.allow_execute !== "boolean" ||
+    typeof authorization.allow_fix_pr !== "boolean" ||
     identitySha256 !== digestJson(identity) ||
     identitySha256 !== expectedAuthorizationSha256
   ) {

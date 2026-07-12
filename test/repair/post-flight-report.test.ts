@@ -37,7 +37,7 @@ test("post-flight dry runs treat planned actions as successful summaries", () =>
     }),
     {
       outcome: "success",
-      detail: "all generated post-flight actions completed",
+      detail: "all generated post-flight actions planned",
     },
   );
   assert.equal(

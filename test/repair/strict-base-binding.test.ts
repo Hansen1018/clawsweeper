@@ -521,10 +521,11 @@ test("repair execution and validation cannot mutate GitHub before trusted public
   const source = fs.readFileSync(file, "utf8");
   const workflow = readWorkflow(file);
   const execute = workflow.jobs?.execute;
+  const authorize = workflow.jobs?.authorize;
   const validate = workflow.jobs?.validate;
   const report = workflow.jobs?.report;
   const mutate = workflow.jobs?.mutate;
-  assert.ok(execute && validate && report && mutate);
+  assert.ok(authorize && execute && validate && report && mutate);
 
   const executeText = JSON.stringify(execute);
   const validateText = JSON.stringify(validate);
@@ -553,6 +554,24 @@ test("repair execution and validation cannot mutate GitHub before trusted public
   assert.match(reportText, /steps\.verify_execution\.outcome != 'success'/);
   assert.match(reportText, /count-requeue-required/);
   assert.match(reportText, /repair:requeue/);
+  assert.match(
+    String(authorize.outputs?.allow_execute ?? ""),
+    /steps\.restore_authorization\.outputs\.allow_execute.*steps\.authorize\.outputs\.allow_execute/,
+  );
+  assert.match(
+    String(authorize.outputs?.allow_fix_pr ?? ""),
+    /steps\.restore_authorization\.outputs\.allow_fix_pr.*steps\.authorize\.outputs\.allow_fix_pr/,
+  );
+  for (const job of [execute, report, mutate]) {
+    assert.match(String(job.env?.CLAWSWEEPER_ALLOW_EXECUTE ?? ""), /needs\.authorize\.outputs/);
+  }
+  for (const job of [execute, report, mutate]) {
+    assert.match(String(job.env?.CLAWSWEEPER_ALLOW_FIX_PR ?? ""), /needs\.authorize\.outputs/);
+  }
+  assert.match(source, /Authorize exact job and run[\s\S]*--allow-execute[\s\S]*--allow-fix-pr/);
+  assert.match(reportText, /repair:requeue[\s\S]*--allow-execute[\s\S]*--allow-fix-pr/);
+  assert.match(reportText, /REQUEUE_OUTCOME/);
+  assert.match(reportText, /retry could not be queued/);
   assert.doesNotMatch(reportText, /target_post_flight_token|permission-pull-requests/);
   assert.doesNotMatch(JSON.stringify(mutate), /repair:apply-result|repair:tag-clawsweeper/);
   assert.match(JSON.stringify(mutate), /npm_config_ignore_scripts/);
@@ -578,6 +597,33 @@ test("exact router dispatch concurrency is item-specific and cannot replace anot
   assert.match(
     source,
     /Dispatch discovered items through exact router lanes[\s\S]*-f item_numbers="\$item_number"/,
+  );
+  const fanoutStart = source.indexOf(
+    "- name: Dispatch discovered items through exact router lanes",
+  );
+  const fanoutEnd = source.indexOf("- name: Detect waiting repair dispatches", fanoutStart);
+  const fanout = source.slice(fanoutStart, fanoutEnd);
+  assert.match(
+    fanout,
+    /repository_dispatch.*!github\.event\.client_payload\.item_number.*github\.event\.client_payload\.comment_id/,
+  );
+  for (const input of [
+    "force_reprocess",
+    "lookback_minutes",
+    "since",
+    "max_comments",
+    "comment_ids",
+  ]) {
+    assert.match(fanout, new RegExp(`-f ${input}="\\$${input}"`));
+  }
+  assert.match(fanout, /since="\$\{\{ github\.event\.client_payload\.since \|\| '' \}\}"/);
+  assert.match(
+    fanout,
+    /comment_ids="\$\{\{ github\.event\.client_payload\.comment_id \|\| '' \}\}"/,
+  );
+  assert.doesNotMatch(
+    fanout,
+    /-f force_reprocess=false|-f lookback_minutes=180|-f max_comments=100/,
   );
   assert.match(
     source,

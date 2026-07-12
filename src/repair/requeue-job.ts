@@ -37,8 +37,6 @@ const DEFAULT_WORKFLOW = REPAIR_CLUSTER_WORKFLOW;
 const DEFAULT_RUNNER = process.env.CLAWSWEEPER_WORKER_RUNNER ?? "blacksmith-4vcpu-ubuntu-2404";
 const DEFAULT_EXECUTION_RUNNER =
   process.env.CLAWSWEEPER_EXECUTION_RUNNER ?? "blacksmith-16vcpu-ubuntu-2404";
-const QUEUED_STATUSES = new Set(["queued", "requested", "waiting", "pending"]);
-
 const args = parseArgs(process.argv.slice(2));
 const repo = String(args.repo ?? DEFAULT_REPO);
 const workflow = String(args.workflow ?? DEFAULT_WORKFLOW);
@@ -51,6 +49,12 @@ const maxLiveWorkers = readMaxLiveWorkers(args);
 const waitForCapacity = Boolean(args["wait-for-capacity"]);
 const execute = Boolean(args.execute || args.live);
 const openExecuteWindow = Boolean(args["open-execute-window"] || args.live);
+const capturedAllowExecute = capturedGateArg(
+  args["allow-execute"],
+  "allow-execute",
+  openExecuteWindow,
+);
+const capturedAllowFixPr = capturedGateArg(args["allow-fix-pr"], "allow-fix-pr", openExecuteWindow);
 const requestedMode = typeof args.mode === "string" ? args.mode : null;
 const requestedRunId = args["run-id"] ?? (looksLikeRunId(args._[0]) ? args._[0] : null);
 const sourceRunId = String(
@@ -65,7 +69,7 @@ const resolved = requestedRunId
 
 if (!resolved.source_job) {
   console.error(
-    `usage: node scripts/requeue-job.ts <job.md|run-id> [--mode plan|execute|autonomous] [--execute] [--open-execute-window] [--source-run-id id] [--source-job-path path] [--requeue-depth n] [--max-requeue-depth n] [--runner label] [--execution-runner label] [--model model] [--max-live-workers ${AUTOMATION_LIMITS.repair_live_runs.default}] [--wait-for-capacity]`,
+    `usage: node scripts/requeue-job.ts <job.md|run-id> [--mode plan|execute|autonomous] [--execute] [--open-execute-window --allow-execute 0|1 --allow-fix-pr 0|1] [--source-run-id id] [--source-job-path path] [--requeue-depth n] [--max-requeue-depth n] [--runner label] [--execution-runner label] [--model model] [--max-live-workers ${AUTOMATION_LIMITS.repair_live_runs.default}] [--wait-for-capacity]`,
   );
   process.exit(2);
 }
@@ -99,6 +103,8 @@ const summary: LooseRecord = {
   execution_runner: executionRunner,
   model,
   max_live_workers: maxLiveWorkers,
+  captured_allow_execute: capturedAllowExecute,
+  captured_allow_fix_pr: capturedAllowFixPr,
 };
 
 if (!execute) {
@@ -106,7 +112,7 @@ if (!execute) {
   process.exit(0);
 }
 
-const gateRestores: JsonValue[] = [];
+const gateRestores: RepositoryVariableSnapshot[] = [];
 const headSha = currentHeadSha();
 const dispatchStartedAt = new Date(Date.now() - 5000).toISOString();
 const nextRequeueDepth = boundedNextRequeueDepth(requeueDepth, maxRequeueDepth);
@@ -128,10 +134,8 @@ let commandError: unknown = null;
 
 try {
   if (openExecuteWindow && ["execute", "autonomous"].includes(mode)) {
-    openGate("CLAWSWEEPER_ALLOW_EXECUTE", requeueLifecycle);
-    if (job.frontmatter.allow_fix_pr === true || job.frontmatter.allowed_actions.includes("fix")) {
-      openGate("CLAWSWEEPER_ALLOW_FIX_PR", requeueLifecycle);
-    }
+    setGateTemporarily("CLAWSWEEPER_ALLOW_EXECUTE", capturedAllowExecute!, requeueLifecycle);
+    setGateTemporarily("CLAWSWEEPER_ALLOW_FIX_PR", capturedAllowFixPr!, requeueLifecycle);
   }
 
   assertGateOpenIfNeeded(mode);
@@ -162,7 +166,7 @@ try {
 } finally {
   for (const gate of gateRestores.reverse()) {
     try {
-      setGate(gate.name, gate.previous || "1", requeueLifecycle);
+      restoreGate(gate, requeueLifecycle);
     } catch (error) {
       if (!commandError) {
         commandError = error;
@@ -297,20 +301,40 @@ function waitForStartedRuns({ expectedCount, headSha, since }: LooseRecord) {
         (left: JsonValue, right: JsonValue) =>
           Date.parse(left.createdAt) - Date.parse(right.createdAt),
       );
+    const selected = latest.slice(-expectedCount);
     if (
-      latest.length >= expectedCount &&
-      latest.every((run: JsonValue) => !QUEUED_STATUSES.has(run.status))
+      selected.length >= expectedCount &&
+      selected.every((run: JsonValue) => gateCaptureJobStarted(run.databaseId))
     ) {
-      return latest.slice(-expectedCount);
+      return selected;
     }
     sleepMs(5_000);
   }
-  return latest.slice(-expectedCount);
+  const observedRunIds = latest
+    .slice(-expectedCount)
+    .map((run: JsonValue) => String(run.databaseId ?? ""))
+    .filter(Boolean);
+  throw new Error(
+    `timed out waiting for ${expectedCount} requeued run(s) to capture execution gates${
+      observedRunIds.length > 0 ? `: ${observedRunIds.join(", ")}` : ""
+    }`,
+  );
+}
+
+function gateCaptureJobStarted(runId: JsonValue) {
+  const run = ghJson<LooseRecord>(["run", "view", String(runId), "--repo", repo, "--json", "jobs"]);
+  const job = (run.jobs ?? []).find(
+    (candidate: JsonValue) => candidate.name === "Plan and review cluster",
+  );
+  if (!job) return false;
+  const status = String(job.status ?? "").toLowerCase();
+  const conclusion = String(job.conclusion ?? "").toLowerCase();
+  return status === "in_progress" || (status === "completed" && conclusion !== "skipped");
 }
 
 function assertGateOpenIfNeeded(mode: string) {
   if (!["execute", "autonomous"].includes(mode)) return;
-  if (readGate("CLAWSWEEPER_ALLOW_EXECUTE") !== "1") {
+  if (readGateSnapshot("CLAWSWEEPER_ALLOW_EXECUTE").value !== "1") {
     throw new Error(
       "refusing write-mode requeue: CLAWSWEEPER_ALLOW_EXECUTE is not 1; use --open-execute-window",
     );
@@ -336,26 +360,74 @@ function workflowDisplayName(workflowNameOrFile: string): string {
   return workflowNameOrFile;
 }
 
-function readGate(name: string) {
-  const variables = ghJson(["variable", "list", "--repo", repo, "--json", "name,value"]);
-  return variables.find((variable: JsonValue) => variable.name === name)?.value ?? "";
+type RepositoryVariableSnapshot = {
+  name: string;
+  exists: boolean;
+  value: string;
+};
+
+function readGateSnapshot(name: string): RepositoryVariableSnapshot {
+  const variables = ghJson<LooseRecord[]>([
+    "variable",
+    "list",
+    "--repo",
+    repo,
+    "--json",
+    "name,value",
+  ]);
+  const variable = variables.find((entry) => entry.name === name);
+  return {
+    name,
+    exists: Boolean(variable),
+    value: variable ? String(variable.value ?? "") : "",
+  };
 }
 
-function openGate(name: string, lifecycle: CommandLifecycleInput) {
-  const previous = readGate(name);
-  gateRestores.push({ name, previous });
-  if (previous !== "1") setGate(name, "1", lifecycle);
+function setGateTemporarily(
+  name: string,
+  value: "0" | "1",
+  lifecycle: CommandLifecycleInput,
+) {
+  const previous = readGateSnapshot(name);
+  if (previous.exists && previous.value === value) return;
+  gateRestores.push(previous);
+  setGate(name, value, lifecycle);
 }
 
-function setGate(name: string, value: JsonValue, lifecycle: CommandLifecycleInput) {
+function restoreGate(snapshot: RepositoryVariableSnapshot, lifecycle: CommandLifecycleInput) {
+  if (snapshot.exists) {
+    setGate(snapshot.name, snapshot.value, lifecycle);
+    return;
+  }
+  runCommandLifecycleMutation(lifecycle, {
+    kind: "repository_variable_delete",
+    identity: { repository: repo, name: snapshot.name },
+    component: "repair_requeue",
+    operation: () => ghText(["variable", "delete", snapshot.name, "--repo", repo]),
+  });
+  console.log(`${snapshot.name}=<deleted>`);
+}
+
+function setGate(name: string, value: string, lifecycle: CommandLifecycleInput) {
   runCommandLifecycleMutation(lifecycle, {
     kind: "repository_variable_update",
-    identity: { repository: repo, name, value: String(value ?? "") },
+    identity: { repository: repo, name, value },
     component: "repair_requeue",
-    operation: () =>
-      ghText(["variable", "set", name, "--repo", repo, "--body", String(value ?? "")]),
+    operation: () => ghText(["variable", "set", name, "--repo", repo, "--body", value]),
   });
   console.log(`${name}=${value}`);
+}
+
+function capturedGateArg(value: JsonValue, name: string, required: boolean): "0" | "1" | null {
+  if (value === undefined || value === null || value === false) {
+    if (required) throw new Error(`--${name} is required with --open-execute-window`);
+    return null;
+  }
+  const normalized = String(value);
+  if (normalized !== "0" && normalized !== "1") {
+    throw new Error(`--${name} must be 0 or 1`);
+  }
+  return normalized;
 }
 
 function currentHeadSha() {

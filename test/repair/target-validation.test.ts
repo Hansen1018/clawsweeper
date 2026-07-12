@@ -2426,6 +2426,93 @@ test(
   },
 );
 
+test(
+  "staged proof bounds tracked symlink checkout hashing",
+  { skip: process.platform === "win32" },
+  () => {
+    const cwd = gitPackageFixture({ verify: "node --test" });
+    fs.appendFileSync(path.join(cwd, ".gitignore"), "ignored-store/\n");
+    fs.mkdirSync(path.join(cwd, "ignored-store", "nested"), { recursive: true });
+    fs.writeFileSync(path.join(cwd, "ignored-store", "payload.txt"), "0123456789abcdef\n");
+    fs.writeFileSync(path.join(cwd, "ignored-store", "nested", "deep.txt"), "deep\n");
+    fs.symlinkSync("ignored-store", path.join(cwd, "tracked-config"));
+    git(cwd, "add", ".");
+    git(cwd, "commit", "-m", "initial");
+    attachOrigin(cwd);
+
+    const trackedPaths = git(cwd, "ls-files").split("\n").filter(Boolean);
+    const trackedBytes = trackedPaths.reduce((total, relativePath) => {
+      const stat = fs.lstatSync(path.join(cwd, relativePath));
+      return stat.isFile() ? total + stat.size : total;
+    }, 0);
+    const baseOptions = {
+      toolchain: {
+        packageManager: "pnpm",
+        baseValidationCommands: [],
+        changedGate: null,
+      },
+    };
+
+    assert.throws(
+      () =>
+        runStagedValidationProof(
+          ["pnpm verify"],
+          cwd,
+          validationOptions("steipete/example", {
+            ...baseOptions,
+            proofInputMaxEntries: trackedPaths.length + 1,
+          }),
+        ),
+      /tracked checkout hashing exceeded the supported entry budget/,
+    );
+    assert.throws(
+      () =>
+        runStagedValidationProof(
+          ["pnpm verify"],
+          cwd,
+          validationOptions("steipete/example", {
+            ...baseOptions,
+            proofInputMaxDepth: 2,
+          }),
+        ),
+      /tracked checkout hashing exceeded the supported depth budget/,
+    );
+    assert.throws(
+      () =>
+        runStagedValidationProof(
+          ["pnpm verify"],
+          cwd,
+          validationOptions("steipete/example", {
+            ...baseOptions,
+            proofInputMaxBytes: trackedBytes + 1,
+          }),
+        ),
+      /tracked checkout hashing exceeded the supported byte budget/,
+    );
+
+    const originalNow = Date.now;
+    let calls = 0;
+    Date.now = () => (calls++ === 0 ? 1_000 : 1_101);
+    try {
+      assert.throws(
+        () =>
+          runStagedValidationProof(
+            ["pnpm verify"],
+            cwd,
+            validationOptions("steipete/example", {
+              ...baseOptions,
+              proofBudgetMs: 100,
+              validationTimeoutMs: 1_000,
+            }),
+          ),
+        /staged proof runtime budget exhausted during tracked checkout hashing/,
+      );
+    } finally {
+      Date.now = originalNow;
+    }
+  },
+);
+
 test("staged proof accepts an uninitialized gitlink bound by the parent index", () => {
   const source = gitPackageFixture({});
   git(source, "add", ".");
@@ -2439,7 +2526,7 @@ test("staged proof accepts an uninitialized gitlink bound by the parent index", 
   git(source, "push", "-u", "origin", "main:main");
   const checkoutRoot = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-gitlink-checkout-"));
   const cwd = path.join(checkoutRoot, "repo");
-  execFileSync("git", ["clone", origin, cwd], { encoding: "utf8" });
+  execFileSync("git", ["clone", "--branch", "main", origin, cwd], { encoding: "utf8" });
 
   const result = runStagedValidationProof(
     ["git diff --check"],
@@ -2466,6 +2553,7 @@ test("staged proof bounds ignored dependency traversal by entries and depth", ()
   git(cwd, "add", ".");
   git(cwd, "commit", "-m", "initial");
   attachOrigin(cwd);
+  const proofEntryLimit = Math.max(git(cwd, "ls-files").split("\n").filter(Boolean).length, 3);
   const baseOptions = {
     toolchain: {
       packageManager: "pnpm",
@@ -2481,7 +2569,7 @@ test("staged proof bounds ignored dependency traversal by entries and depth", ()
         cwd,
         validationOptions("steipete/example", {
           ...baseOptions,
-          proofInputMaxEntries: 2,
+          proofInputMaxEntries: proofEntryLimit,
         }),
       ),
     /proof input traversal exceeded the supported entry budget/,
@@ -2527,7 +2615,7 @@ test("staged proof budget includes checkout and recursive proof-input sealing", 
             },
           }),
         ),
-      /staged proof runtime budget exhausted before/,
+      /staged proof runtime budget exhausted (?:before|during)/,
     );
   } finally {
     Date.now = originalNow;
@@ -2558,7 +2646,7 @@ test("staged proof replay budget includes checkout and recursive proof-input sea
   try {
     assert.throws(
       () => replayStagedValidationProof(plan, cwd, options),
-      /staged proof runtime budget exhausted before/,
+      /staged proof runtime budget exhausted (?:before|during)/,
     );
   } finally {
     Date.now = originalNow;

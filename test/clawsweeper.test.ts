@@ -2093,6 +2093,11 @@ test("repair workers hydrate only durable jobs from generated state", () => {
   assert.match(workflow, /cancel-in-progress: false/);
   assert.match(workflow, /requeue:\n\s+description:/);
   assert.match(requeue, /"requeue=true"/);
+  assert.match(requeue, /--allow-execute 0\|1 --allow-fix-pr 0\|1/);
+  assert.match(requeue, /variable", "delete", snapshot\.name/);
+  assert.doesNotMatch(requeue, /previous \|\| "1"/);
+  assert.match(requeue, /run",\s+"view"[\s\S]*Plan and review cluster/);
+  assert.match(requeue, /timed out waiting for .* requeued run\(s\) to capture execution gates/);
   assert.equal(
     workflow.match(/uses: \.\/\.github\/actions\/setup-state[\s\S]*?sparse-checkout: jobs/g)
       ?.length,

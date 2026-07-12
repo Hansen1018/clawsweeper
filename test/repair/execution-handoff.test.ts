@@ -67,6 +67,8 @@ test("execution authorization selects one explicit run and seals its immutable i
   try {
     const authorization = prepareAuthorization(fixture);
     assert.equal(authorization.target_repo, "openclaw/example");
+    assert.equal(authorization.allow_execute, true);
+    assert.equal(authorization.allow_fix_pr, false);
     assert.equal(fs.existsSync(path.join(fixture.outputRoot, "run", "result.json")), true);
 
     fs.writeFileSync(
@@ -91,6 +93,17 @@ test("execution authorization selects one explicit run and seals its immutable i
       verifyExecutionHandoff(fixture.outputRoot, authorization.identity_sha256).tree_sha256,
       manifest.tree_sha256,
     );
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("execution authorization defaults omitted captured gates closed", () => {
+  const fixture = handoffFixture();
+  try {
+    const authorization = prepareAuthorization(fixture, {});
+    assert.equal(authorization.allow_execute, false);
+    assert.equal(authorization.allow_fix_pr, false);
   } finally {
     fixture.cleanup();
   }
@@ -209,6 +222,8 @@ test("full reruns restore the exact checkpoint proof bundle without live source 
       allowedOwner: "openclaw",
     });
     assert.equal(restored.identity_sha256, authorization.identity_sha256);
+    assert.equal(restored.allow_execute, true);
+    assert.equal(restored.allow_fix_pr, false);
     assert.equal(restored.checkpoint_producer_attempt, "2");
     assert.equal(restored.checkpoint_validation_receipt_sha256, validationReceipt.identity_sha256);
     assert.equal(fs.existsSync(path.join(restoredRoot, "run", "publication-intent.json")), false);
@@ -2091,7 +2106,13 @@ test("publication comment no-op accepts only the exact trusted App author", () =
   }
 });
 
-function prepareAuthorization(fixture: ReturnType<typeof handoffFixture>) {
+function prepareAuthorization(
+  fixture: ReturnType<typeof handoffFixture>,
+  gates: { allowExecute?: boolean; allowFixPr?: boolean } = {
+    allowExecute: true,
+    allowFixPr: false,
+  },
+) {
   return prepareExecutionAuthorization({
     jobPath: fixture.jobPath,
     runsRoot: fixture.runsRoot,
@@ -2101,6 +2122,7 @@ function prepareAuthorization(fixture: ReturnType<typeof handoffFixture>) {
     workflowRepository: "openclaw/clawsweeper",
     workflowSha: "a".repeat(40),
     allowedOwner: "openclaw",
+    ...gates,
     resolveIntent: ({ actionIdentitySha256 }) => executionIntent(actionIdentitySha256),
   });
 }

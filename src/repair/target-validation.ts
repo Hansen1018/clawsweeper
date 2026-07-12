@@ -51,6 +51,7 @@ const DEFAULT_TARGET_INSTALL_TIMEOUT_MS = 12 * 60 * 1000;
 const DEFAULT_TARGET_VALIDATION_TIMEOUT_MS = 12 * 60 * 1000;
 const DEFAULT_PROOF_INPUT_MAX_ENTRIES = 100_000;
 const DEFAULT_PROOF_INPUT_MAX_DEPTH = 64;
+const DEFAULT_PROOF_INPUT_MAX_BYTES = 512 * 1024 * 1024;
 const MIN_VALIDATION_RETRY_BUDGET_MS = 1_000;
 const ABSENT_PROOF_INPUT = "<absent>";
 const PROTECTED_PROOF_INPUT_DIRECTORIES = new Set([
@@ -91,6 +92,7 @@ export type TargetValidationOptions = {
   setupTimeoutMs?: number;
   validationTimeoutMs?: number;
   proofBudgetMs?: number;
+  proofInputMaxBytes?: number;
   proofInputMaxEntries?: number;
   proofInputMaxDepth?: number;
   proofSurfacePaths?: string[];
@@ -250,14 +252,6 @@ export function prepareTargetToolchain(cwd: string, options: TargetValidationOpt
   if (!options.installTargetDeps) return;
   const packagePath = path.join(cwd, "package.json");
   if (!fs.existsSync(packagePath)) return;
-  const sourceIdentity = validationSourceIdentity(cwd);
-  if (sourceIdentity.status) {
-    throw new Error("target dependency setup requires a clean source checkout");
-  }
-
-  const packageJson = JSON.parse(fs.readFileSync(packagePath, "utf8"));
-  const toolchain = getToolchain(options);
-  const validationEnv = targetValidationEnv();
   const setupTimeoutMs = targetValidationTimeoutMs(
     "CLAWSWEEPER_TARGET_SETUP_TIMEOUT_MS",
     options.setupTimeoutMs ?? DEFAULT_TARGET_SETUP_TIMEOUT_MS,
@@ -268,6 +262,15 @@ export function prepareTargetToolchain(cwd: string, options: TargetValidationOpt
     options.installTimeoutMs ?? DEFAULT_TARGET_INSTALL_TIMEOUT_MS,
     options.installTimeoutMs,
   );
+  const identityLimits = proofInputLimits(options, Date.now() + setupTimeoutMs + installTimeoutMs);
+  const sourceIdentity = validationSourceIdentity(cwd, identityLimits);
+  if (sourceIdentity.status) {
+    throw new Error("target dependency setup requires a clean source checkout");
+  }
+
+  const packageJson = JSON.parse(fs.readFileSync(packagePath, "utf8"));
+  const toolchain = getToolchain(options);
+  const validationEnv = targetValidationEnv();
   run(
     "node",
     [
@@ -279,12 +282,12 @@ export function prepareTargetToolchain(cwd: string, options: TargetValidationOpt
 
   if (toolchain.packageManager === "bun") {
     prepareBunToolchain({ cwd, validationEnv, setupTimeoutMs, installTimeoutMs });
-    assertValidationSourceIdentity(cwd, sourceIdentity);
+    assertValidationSourceIdentity(cwd, sourceIdentity, identityLimits);
     return;
   }
   if (toolchain.packageManager === "npm") {
     prepareNpmToolchain({ cwd, validationEnv, installTimeoutMs });
-    assertValidationSourceIdentity(cwd, sourceIdentity);
+    assertValidationSourceIdentity(cwd, sourceIdentity, identityLimits);
     return;
   }
   preparePnpmToolchain({
@@ -294,7 +297,7 @@ export function prepareTargetToolchain(cwd: string, options: TargetValidationOpt
     setupTimeoutMs,
     installTimeoutMs,
   });
-  assertValidationSourceIdentity(cwd, sourceIdentity);
+  assertValidationSourceIdentity(cwd, sourceIdentity, identityLimits);
 }
 
 function preparePnpmToolchain({
@@ -468,15 +471,12 @@ export function runStagedValidationProof(
     options.proofBudgetMs,
   );
   const proofStartedAt = Date.now();
-  const checkoutIdentity = validationCheckoutIdentity(cwd, baseRef);
+  const proofLimits = proofInputLimits(options, proofStartedAt + proofBudgetMs);
+  const checkoutIdentity = validationCheckoutIdentity(cwd, baseRef, proofLimits);
   if (checkoutIdentity.status) {
     throw new Error("staged proof requires a clean validation checkout");
   }
-  const proofInputSnapshot = validationProofInputSnapshot(cwd, plan.commands, {
-    deadlineAt: proofStartedAt + proofBudgetMs,
-    maxDepth: options.proofInputMaxDepth ?? DEFAULT_PROOF_INPUT_MAX_DEPTH,
-    maxEntries: options.proofInputMaxEntries ?? DEFAULT_PROOF_INPUT_MAX_ENTRIES,
-  });
+  const proofInputSnapshot = validationProofInputSnapshot(cwd, plan.commands, proofLimits);
   const executed = new Set<string>();
   const attempts = new Map<string, number>();
   const result = executeStagedProofPlan(plan, {
@@ -497,6 +497,7 @@ export function runStagedValidationProof(
         baseRef,
         checkoutIdentity,
         proofInputSnapshot,
+        proofLimits,
       }),
   });
   return { ...result, plan };
@@ -526,15 +527,12 @@ export function replayStagedValidationProof(
     options.proofBudgetMs,
   );
   const proofStartedAt = Date.now();
-  const checkoutIdentity = validationCheckoutIdentity(cwd, baseRef);
+  const proofLimits = proofInputLimits(options, proofStartedAt + proofBudgetMs);
+  const checkoutIdentity = validationCheckoutIdentity(cwd, baseRef, proofLimits);
   if (checkoutIdentity.status) {
     throw new Error("staged proof replay requires a clean validation checkout");
   }
-  const proofInputSnapshot = validationProofInputSnapshot(cwd, plan.commands, {
-    deadlineAt: proofStartedAt + proofBudgetMs,
-    maxDepth: options.proofInputMaxDepth ?? DEFAULT_PROOF_INPUT_MAX_DEPTH,
-    maxEntries: options.proofInputMaxEntries ?? DEFAULT_PROOF_INPUT_MAX_ENTRIES,
-  });
+  const proofInputSnapshot = validationProofInputSnapshot(cwd, plan.commands, proofLimits);
   const executed = new Set<string>();
   const attempts = new Map<string, number>();
   const result = executeStagedProofPlan(plan, {
@@ -561,6 +559,7 @@ export function replayStagedValidationProof(
         baseRef,
         checkoutIdentity,
         proofInputSnapshot,
+        proofLimits,
       });
     },
   });
@@ -640,6 +639,7 @@ function runValidationPlanCommand({
   baseRef,
   checkoutIdentity,
   proofInputSnapshot,
+  proofLimits,
 }: {
   parts: string[];
   displayParts: string[];
@@ -652,6 +652,7 @@ function runValidationPlanCommand({
   baseRef: string;
   checkoutIdentity: ValidationCheckoutIdentity;
   proofInputSnapshot: ValidationProofInputSnapshot;
+  proofLimits: ProofInputLimits;
 }) {
   const rendered = displayParts.join(" ");
   const commandIdentity = JSON.stringify(parts);
@@ -672,7 +673,7 @@ function runValidationPlanCommand({
         env: validationEnv,
         timeoutMs: remainingBudgetMs,
       });
-      assertValidationCheckoutIdentity(cwd, baseRef, checkoutIdentity);
+      assertValidationCheckoutIdentity(cwd, baseRef, checkoutIdentity, proofLimits);
       assertValidationProofInputSnapshot(cwd, proofInputSnapshot);
       executed.add(commandIdentity);
       return {
@@ -683,7 +684,7 @@ function runValidationPlanCommand({
             : "passed",
       };
     } catch (error) {
-      assertValidationCheckoutIdentity(cwd, baseRef, checkoutIdentity);
+      assertValidationCheckoutIdentity(cwd, baseRef, checkoutIdentity, proofLimits);
       assertValidationProofInputSnapshot(cwd, proofInputSnapshot);
       const remainingBudgetMs = remainingCommandBudget(timeoutMs, startedAt);
       if (
@@ -720,6 +721,18 @@ type ValidationProofInputSnapshot = {
   entries: Map<string, string>;
 };
 
+type ProofInputLimits = {
+  deadlineAt: number;
+  maxBytes: number;
+  maxDepth: number;
+  maxEntries: number;
+};
+
+type ProofTraversalState = {
+  bytes: number;
+  entries: number;
+};
+
 type ValidationSourceIdentity = {
   headSha: string;
   treeSha: string;
@@ -727,17 +740,36 @@ type ValidationSourceIdentity = {
   trackedWorktreeSha256: string;
 };
 
-function validationSourceIdentity(cwd: string): ValidationSourceIdentity {
+function proofInputLimits(options: TargetValidationOptions, deadlineAt: number): ProofInputLimits {
+  const limits = {
+    deadlineAt,
+    maxBytes: options.proofInputMaxBytes ?? DEFAULT_PROOF_INPUT_MAX_BYTES,
+    maxDepth: options.proofInputMaxDepth ?? DEFAULT_PROOF_INPUT_MAX_DEPTH,
+    maxEntries: options.proofInputMaxEntries ?? DEFAULT_PROOF_INPUT_MAX_ENTRIES,
+  };
+  for (const [name, value] of Object.entries(limits)) {
+    if (!Number.isSafeInteger(value) || value <= 0) {
+      throw new Error(`proof input ${name} must be a positive integer`);
+    }
+  }
+  return limits;
+}
+
+function validationSourceIdentity(cwd: string, limits: ProofInputLimits): ValidationSourceIdentity {
   return {
     headSha: currentHead(cwd),
     treeSha: run("git", ["rev-parse", "HEAD^{tree}"], { cwd }).trim(),
     status: run("git", ["status", "--porcelain=v1", "-z", "--untracked-files=all"], { cwd }),
-    trackedWorktreeSha256: trackedWorktreeSha256(cwd),
+    trackedWorktreeSha256: trackedWorktreeSha256(cwd, limits),
   };
 }
 
-function assertValidationSourceIdentity(cwd: string, expected: ValidationSourceIdentity) {
-  const actual = validationSourceIdentity(cwd);
+function assertValidationSourceIdentity(
+  cwd: string,
+  expected: ValidationSourceIdentity,
+  limits: ProofInputLimits,
+) {
+  const actual = validationSourceIdentity(cwd, limits);
   if (
     actual.headSha !== expected.headSha ||
     actual.treeSha !== expected.treeSha ||
@@ -748,12 +780,16 @@ function assertValidationSourceIdentity(cwd: string, expected: ValidationSourceI
   }
 }
 
-function validationCheckoutIdentity(cwd: string, baseRef: string): ValidationCheckoutIdentity {
+function validationCheckoutIdentity(
+  cwd: string,
+  baseRef: string,
+  limits: ProofInputLimits,
+): ValidationCheckoutIdentity {
   return {
     headSha: currentHead(cwd),
     baseSha: run("git", ["rev-parse", baseRef], { cwd }).trim(),
     status: run("git", ["status", "--porcelain=v1", "-z", "--untracked-files=all"], { cwd }),
-    trackedWorktreeSha256: trackedWorktreeSha256(cwd),
+    trackedWorktreeSha256: trackedWorktreeSha256(cwd, limits),
   };
 }
 
@@ -761,8 +797,9 @@ function assertValidationCheckoutIdentity(
   cwd: string,
   baseRef: string,
   expected: ValidationCheckoutIdentity,
+  limits: ProofInputLimits,
 ) {
-  const actual = validationCheckoutIdentity(cwd, baseRef);
+  const actual = validationCheckoutIdentity(cwd, baseRef, limits);
   if (
     actual.headSha !== expected.headSha ||
     actual.baseSha !== expected.baseSha ||
@@ -776,11 +813,7 @@ function assertValidationCheckoutIdentity(
 function validationProofInputSnapshot(
   cwd: string,
   commands: readonly { parts: readonly string[] }[],
-  limits: {
-    deadlineAt: number;
-    maxDepth: number;
-    maxEntries: number;
-  },
+  limits: ProofInputLimits,
 ): ValidationProofInputSnapshot {
   const root = fs.realpathSync(cwd);
   const entries = new Map<string, string>();
@@ -835,11 +868,7 @@ function validationProofInputSnapshot(
 function assertProofInputTraversalBudget(
   relativePath: string,
   visitedEntries: number,
-  limits: {
-    deadlineAt: number;
-    maxDepth: number;
-    maxEntries: number;
-  },
+  limits: ProofInputLimits,
 ) {
   if (Date.now() >= limits.deadlineAt) {
     throw new Error(
@@ -1045,17 +1074,28 @@ function remainingProofBudgetMs(budgetMs: number, startedAt: number) {
   return Math.max(0, budgetMs - Math.max(0, Date.now() - startedAt));
 }
 
-function trackedWorktreeSha256(cwd: string): string {
-  assertNoHiddenTrackedIndexFlags(cwd);
+function trackedWorktreeSha256(cwd: string, limits: ProofInputLimits): string {
+  assertNoHiddenTrackedIndexFlags(cwd, limits);
   const root = fs.realpathSync(cwd);
   const digest = crypto.createHash("sha256");
-  const entries = run("git", ["ls-files", "--stage", "-z"], { cwd }).split("\0").filter(Boolean);
+  const state: ProofTraversalState = { bytes: 0, entries: 0 };
+  const entries = run("git", ["ls-files", "--stage", "-z"], {
+    cwd,
+    timeoutMs: proofHashingTimeoutMs(limits, "tracked index"),
+  })
+    .split("\0")
+    .filter(Boolean);
+  if (entries.length > limits.maxEntries) {
+    throw new Error("tracked checkout hashing exceeded the supported entry budget");
+  }
   for (const entry of entries) {
     const match = entry.match(/^([0-7]{6}) ([a-f0-9]{40,64}) ([0-3])\t([\s\S]+)$/);
     if (!match || match[3] !== "0") {
       throw new Error("staged proof requires an unambiguous tracked index");
     }
     const [, mode, indexObject, , relativePath] = match;
+    const depth = relativePath!.split("/").filter(Boolean).length;
+    consumeProofHashingEntry(relativePath!, depth, state, limits);
     const absolutePath = path.resolve(root, ...relativePath!.split("/"));
     if (!isPathWithin(root, absolutePath)) {
       throw new Error(`tracked proof input escapes validation checkout: ${relativePath}`);
@@ -1099,19 +1139,26 @@ function trackedWorktreeSha256(cwd: string): string {
       continue;
     }
     if (stat.isSymbolicLink()) {
+      assertProofHashingDeadline(limits, relativePath!);
       updateProofDigest(digest, "symlink", fs.readlinkSync(absolutePath));
       const targetPath = trackedProofInputSymlinkTarget(root, absolutePath, relativePath!);
       updateProofDigest(digest, "symlink-target", proofInputRelativePath(root, targetPath));
-      updateTrackedSymlinkTargetDigest(digest, root, targetPath, relativePath!, new Set());
+      updateTrackedSymlinkTargetDigest(
+        digest,
+        root,
+        targetPath,
+        `${relativePath!}\0target`,
+        depth + 1,
+        new Set(),
+        state,
+        limits,
+      );
       continue;
     }
     if (!stat.isFile()) {
       throw new Error(`tracked proof input is not a regular file: ${relativePath}`);
     }
-    const bytes = fs.readFileSync(absolutePath);
-    digest.update(`working-tree:${bytes.length}:`);
-    digest.update(bytes);
-    digest.update("\0");
+    hashTrackedFile(digest, absolutePath, relativePath!, "working-tree", stat, state, limits);
   }
   return digest.digest("hex");
 }
@@ -1134,8 +1181,12 @@ function updateTrackedSymlinkTargetDigest(
   root: string,
   entryPath: string,
   logicalPath: string,
+  depth: number,
   activeDirectories: Set<string>,
+  state: ProofTraversalState,
+  limits: ProofInputLimits,
 ) {
+  consumeProofHashingEntry(logicalPath, depth, state, limits);
   const stat = fs.lstatSync(entryPath);
   updateProofDigest(digest, "symlink-target-entry", logicalPath);
   updateProofDigest(digest, "symlink-target-mode", stat.mode.toString(8));
@@ -1151,15 +1202,15 @@ function updateTrackedSymlinkTargetDigest(
       root,
       targetPath,
       `${logicalPath}\0target`,
+      depth + 1,
       activeDirectories,
+      state,
+      limits,
     );
     return;
   }
   if (stat.isFile()) {
-    const bytes = fs.readFileSync(entryPath);
-    digest.update(`symlink-target-bytes:${bytes.length}:`);
-    digest.update(bytes);
-    digest.update("\0");
+    hashTrackedFile(digest, entryPath, logicalPath, "symlink-target-bytes", stat, state, limits);
     return;
   }
   if (!stat.isDirectory()) {
@@ -1172,7 +1223,7 @@ function updateTrackedSymlinkTargetDigest(
   }
   activeDirectories.add(realDirectory);
   try {
-    const children = fs.readdirSync(entryPath).sort();
+    const children = readProofHashingDirectory(entryPath, logicalPath, state, limits);
     updateProofDigest(digest, "symlink-target-children", children.join("\0"));
     for (const child of children) {
       updateTrackedSymlinkTargetDigest(
@@ -1180,7 +1231,10 @@ function updateTrackedSymlinkTargetDigest(
         root,
         path.join(entryPath, child),
         `${logicalPath}/${child}`,
+        depth + 1,
         activeDirectories,
+        state,
+        limits,
       );
     }
   } finally {
@@ -1188,8 +1242,132 @@ function updateTrackedSymlinkTargetDigest(
   }
 }
 
-function assertNoHiddenTrackedIndexFlags(cwd: string) {
-  const entries = run("git", ["ls-files", "-v", "-z"], { cwd }).split("\0").filter(Boolean);
+function readProofHashingDirectory(
+  directoryPath: string,
+  logicalPath: string,
+  state: ProofTraversalState,
+  limits: ProofInputLimits,
+) {
+  assertProofHashingDeadline(limits, logicalPath);
+  const directory = fs.opendirSync(directoryPath);
+  const children: string[] = [];
+  try {
+    for (;;) {
+      assertProofHashingDeadline(limits, logicalPath);
+      const entry = directory.readSync();
+      if (!entry) break;
+      if (state.entries + children.length >= limits.maxEntries) {
+        throw new Error(
+          `tracked checkout hashing exceeded the supported entry budget at ${logicalPath}/${entry.name}`,
+        );
+      }
+      consumeProofHashingBytes(
+        `${logicalPath}/${entry.name}`,
+        Buffer.byteLength(entry.name),
+        state,
+        limits,
+      );
+      children.push(entry.name);
+    }
+  } finally {
+    directory.closeSync();
+  }
+  return children.sort();
+}
+
+function hashTrackedFile(
+  digest: crypto.Hash,
+  filePath: string,
+  logicalPath: string,
+  label: string,
+  stat: fs.Stats,
+  state: ProofTraversalState,
+  limits: ProofInputLimits,
+) {
+  consumeProofHashingBytes(logicalPath, stat.size, state, limits);
+  const fileDigest = crypto.createHash("sha256");
+  const buffer = Buffer.allocUnsafe(64 * 1024);
+  const descriptor = fs.openSync(filePath, "r");
+  let remaining = stat.size;
+  try {
+    while (remaining > 0) {
+      assertProofHashingDeadline(limits, logicalPath);
+      const read = fs.readSync(descriptor, buffer, 0, Math.min(buffer.length, remaining), null);
+      if (read <= 0) {
+        throw new Error(`tracked proof input changed during hashing: ${logicalPath}`);
+      }
+      fileDigest.update(buffer.subarray(0, read));
+      remaining -= read;
+    }
+    if (fs.fstatSync(descriptor).size !== stat.size) {
+      throw new Error(`tracked proof input changed during hashing: ${logicalPath}`);
+    }
+  } finally {
+    fs.closeSync(descriptor);
+  }
+  updateProofDigest(digest, `${label}-length`, String(stat.size));
+  updateProofDigest(digest, `${label}-sha256`, fileDigest.digest("hex"));
+}
+
+function consumeProofHashingEntry(
+  logicalPath: string,
+  depth: number,
+  state: ProofTraversalState,
+  limits: ProofInputLimits,
+) {
+  assertProofHashingDeadline(limits, logicalPath);
+  if (state.entries >= limits.maxEntries) {
+    throw new Error(
+      `tracked checkout hashing exceeded the supported entry budget at ${logicalPath}`,
+    );
+  }
+  if (depth > limits.maxDepth) {
+    throw new Error(
+      `tracked checkout hashing exceeded the supported depth budget at ${logicalPath}`,
+    );
+  }
+  state.entries += 1;
+}
+
+function consumeProofHashingBytes(
+  logicalPath: string,
+  bytes: number,
+  state: ProofTraversalState,
+  limits: ProofInputLimits,
+) {
+  assertProofHashingDeadline(limits, logicalPath);
+  if (!Number.isSafeInteger(bytes) || bytes < 0 || state.bytes + bytes > limits.maxBytes) {
+    throw new Error(
+      `tracked checkout hashing exceeded the supported byte budget at ${logicalPath}`,
+    );
+  }
+  state.bytes += bytes;
+}
+
+function proofHashingTimeoutMs(limits: ProofInputLimits, logicalPath: string) {
+  assertProofHashingDeadline(limits, logicalPath);
+  return Math.max(1, limits.deadlineAt - Date.now());
+}
+
+function assertProofHashingDeadline(limits: ProofInputLimits, logicalPath: string) {
+  if (Date.now() >= limits.deadlineAt) {
+    throw new Error(
+      `staged proof runtime budget exhausted during tracked checkout hashing: ${logicalPath}`,
+    );
+  }
+}
+
+function assertNoHiddenTrackedIndexFlags(cwd: string, limits: ProofInputLimits) {
+  const entries = run("git", ["ls-files", "-v", "-z"], {
+    cwd,
+    timeoutMs: proofHashingTimeoutMs(limits, "tracked index flags"),
+  })
+    .split("\0")
+    .filter(Boolean);
+  if (entries.length > limits.maxEntries) {
+    throw new Error("tracked checkout hashing exceeded the supported entry budget");
+  }
+  assertProofHashingDeadline(limits, "tracked index flags");
   for (const entry of entries) {
     const tag = entry[0] ?? "";
     if (tag === "S" || (/[A-Za-z]/.test(tag) && tag === tag.toLowerCase())) {

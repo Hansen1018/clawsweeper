@@ -419,6 +419,8 @@ jobs:
       target_repo: ${{ steps.restore_authorization.outputs.target_repo || steps.authorize.outputs.target_repo }}
       target_owner: ${{ steps.restore_authorization.outputs.target_owner || steps.authorize.outputs.target_owner }}
       target_name: ${{ steps.restore_authorization.outputs.target_name || steps.authorize.outputs.target_name }}
+      allow_execute: ${{ steps.restore_authorization.outputs.allow_execute || steps.authorize.outputs.allow_execute }}
+      allow_fix_pr: ${{ steps.restore_authorization.outputs.allow_fix_pr || steps.authorize.outputs.allow_fix_pr }}
       checkpoint_recovered: ${{ steps.restore_authorization.outputs.checkpoint_recovered }}
       checkpoint_validation_receipt_sha256: ${{ steps.restore_authorization.outputs.checkpoint_validation_receipt_sha256 }}
       worker_artifact_id: ${{ steps.prior_worker_artifact.outputs.artifact_id || needs.cluster.outputs.worker_artifact_id }}
@@ -681,6 +683,8 @@ jobs:
             --workflow-repository "${{ github.repository }}" \
             --workflow-sha "${{ github.sha }}" \
             --allowed-owner "${CLAWSWEEPER_ALLOWED_OWNER}" \
+            --allow-execute "${{ needs.cluster.outputs.allow_execute == '1' && '1' || '0' }}" \
+            --allow-fix-pr "${{ needs.cluster.outputs.allow_fix_pr == '1' && '1' || '0' }}" \
             --close-superseded "${{ vars.CLAWSWEEPER_CLOSE_SUPERSEDED_SOURCE_PRS || '1' }}"
 
       - name: Upload immutable execution handoff
@@ -714,8 +718,8 @@ jobs:
       producer_attempt: ${{ needs.authorize.outputs.checkpoint_recovered == '1' && needs.authorize.outputs.producer_attempt || steps.producer_attempt.outputs.value }}
     env:
       CLAWSWEEPER_ALLOWED_OWNER: ${{ needs.authorize.outputs.target_owner }}
-      CLAWSWEEPER_ALLOW_EXECUTE: ${{ needs.cluster.outputs.allow_execute == '1' && '1' || '0' }}
-      CLAWSWEEPER_ALLOW_FIX_PR: ${{ needs.cluster.outputs.allow_fix_pr == '1' && '1' || '0' }}
+      CLAWSWEEPER_ALLOW_EXECUTE: ${{ needs.authorize.outputs.allow_execute == '1' && '1' || '0' }}
+      CLAWSWEEPER_ALLOW_FIX_PR: ${{ needs.authorize.outputs.allow_fix_pr == '1' && '1' || '0' }}
       CLAWSWEEPER_ALLOW_MERGE: ${{ needs.cluster.outputs.allow_merge || '0' }}
       CLAWSWEEPER_CODEX_REASONING_EFFORT: ${{ vars.CLAWSWEEPER_CODEX_REASONING_EFFORT || 'high' }}
       CLAWSWEEPER_CODEX_REVIEW_ATTEMPTS: ${{ vars.CLAWSWEEPER_CODEX_REVIEW_ATTEMPTS || '4' }}
@@ -1058,7 +1062,8 @@ jobs:
       contents: read
     env:
       CLAWSWEEPER_ALLOWED_OWNER: ${{ needs.authorize.outputs.target_owner }}
-      CLAWSWEEPER_ALLOW_EXECUTE: ${{ needs.cluster.outputs.allow_execute == '1' && '1' || '0' }}
+      CLAWSWEEPER_ALLOW_EXECUTE: ${{ needs.authorize.outputs.allow_execute == '1' && '1' || '0' }}
+      CLAWSWEEPER_ALLOW_FIX_PR: ${{ needs.authorize.outputs.allow_fix_pr == '1' && '1' || '0' }}
       OPENCLAW_LOCAL_CHECK: "0"
     steps:
       - uses: actions/checkout@v7
@@ -1172,6 +1177,7 @@ jobs:
           permission-contents: write
 
       - name: Requeue retryable report-only outcomes
+        id: requeue_report_only
         if: ${{ steps.verify_execution.outcome == 'success' && steps.repair_requeue.outputs.count != '' && steps.repair_requeue.outputs.count != '0' }}
         env:
           GH_TOKEN: ${{ steps.requeue_token.outputs.token }}
@@ -1185,12 +1191,15 @@ jobs:
             --open-execute-window \
             --requeue-depth "${{ inputs.requeue_depth }}" \
             --max-requeue-depth 1 \
+            --allow-execute "${{ needs.authorize.outputs.allow_execute }}" \
+            --allow-fix-pr "${{ needs.authorize.outputs.allow_fix_pr }}" \
             --wait-for-capacity \
             --runner "${{ inputs.runner }}" \
             --execution-runner "${{ inputs.execution_runner }}" \
             --model "${{ inputs.model }}"
 
       - name: Requeue execution missing a sealed handoff
+        id: requeue_missing_execution
         if: ${{ steps.verify_execution.outcome != 'success' }}
         env:
           GH_TOKEN: ${{ steps.requeue_token.outputs.token }}
@@ -1200,6 +1209,8 @@ jobs:
             --mode "${{ inputs.mode }}" \
             --execute \
             --open-execute-window \
+            --allow-execute "${{ needs.authorize.outputs.allow_execute }}" \
+            --allow-fix-pr "${{ needs.authorize.outputs.allow_fix_pr }}" \
             --wait-for-capacity \
             --runner "${{ inputs.runner }}" \
             --execution-runner "${{ inputs.execution_runner }}" \
@@ -1212,12 +1223,18 @@ jobs:
           GH_TOKEN: ""
           GITHUB_TOKEN: ""
           CLAWSWEEPER_STATUS_INGEST_TOKEN: ${{ secrets.CLAWSWEEPER_STATUS_INGEST_TOKEN }}
+          REQUEUE_OUTCOME: ${{ steps.requeue_missing_execution.outcome }}
         run: |
+          if [ "$REQUEUE_OUTCOME" = "success" ]; then
+            detail="The automatic implementation worker stopped before it sealed the execution handoff. A fresh authorized retry was queued."
+          else
+            detail="The automatic implementation worker stopped before it sealed the execution handoff. The authorized retry could not be queued; open the workflow run for the dispatch failure."
+          fi
           pnpm run repair:issue-implementation-status -- \
             --job .clawsweeper-repair/authorized/job.md \
             --dashboard-only \
             --state "Blocked" \
-            --detail "The automatic implementation worker stopped before it sealed the execution handoff. A fresh authorized retry was queued." \
+            --detail "$detail" \
             --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
       - name: Publish terminal report-only status
@@ -1301,8 +1318,8 @@ jobs:
       contents: read
     env:
       CLAWSWEEPER_ALLOWED_OWNER: ${{ needs.authorize.outputs.target_owner }}
-      CLAWSWEEPER_ALLOW_EXECUTE: ${{ needs.cluster.outputs.allow_execute == '1' && '1' || '0' }}
-      CLAWSWEEPER_ALLOW_FIX_PR: ${{ needs.cluster.outputs.allow_fix_pr == '1' && '1' || '0' }}
+      CLAWSWEEPER_ALLOW_EXECUTE: ${{ needs.authorize.outputs.allow_execute == '1' && '1' || '0' }}
+      CLAWSWEEPER_ALLOW_FIX_PR: ${{ needs.authorize.outputs.allow_fix_pr == '1' && '1' || '0' }}
       CLAWSWEEPER_ALLOW_MERGE: ${{ needs.cluster.outputs.allow_merge || '0' }}
       CLAWSWEEPER_POST_FLIGHT_IGNORE_CHECKS: ${{ vars.CLAWSWEEPER_POST_FLIGHT_IGNORE_CHECKS || 'auto-response,Labeler,Stale' }}
       CLAWSWEEPER_MAX_ACTIVE_PRS_PER_AREA: ${{ vars.CLAWSWEEPER_MAX_ACTIVE_PRS_PER_AREA || '50' }}

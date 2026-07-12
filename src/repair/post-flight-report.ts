@@ -115,7 +115,10 @@ export function summarizePostFlightReport(report: LooseRecord): PostFlightReport
   if (actions.length > 0 && incomplete.length === 0) {
     return {
       outcome: "success",
-      detail: "all generated post-flight actions completed",
+      detail:
+        report.dry_run === true
+          ? "all generated post-flight actions planned"
+          : "all generated post-flight actions completed",
     };
   }
 

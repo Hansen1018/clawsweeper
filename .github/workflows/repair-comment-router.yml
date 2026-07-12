@@ -251,7 +251,7 @@ jobs:
             target_repo="${{ github.event.client_payload.target_repo || 'openclaw/openclaw' }}"
             target_branch="${{ github.event.client_payload.target_branch || '' }}"
             lookback_minutes="${{ github.event.client_payload.lookback_minutes || vars.CLAWSWEEPER_COMMENT_LOOKBACK_MINUTES || '180' }}"
-            since=""
+            since="${{ github.event.client_payload.since || '' }}"
             max_comments="${{ github.event.client_payload.max_comments || '1' }}"
             item_numbers="${{ github.event.client_payload.item_number || '' }}"
             comment_ids="${{ github.event.client_payload.comment_id || '' }}"
@@ -351,15 +351,31 @@ jobs:
             --rebase-strategy theirs
 
       - name: Dispatch discovered items through exact router lanes
-        if: ${{ success() && (github.event_name == 'schedule' && (vars.CLAWSWEEPER_COMMENT_ROUTER_EXECUTE || '0') == '1' || github.event_name == 'workflow_dispatch' && inputs.execute && (inputs.item_numbers == '' || contains(inputs.item_numbers, ','))) }}
+        if: ${{ success() && (github.event_name == 'schedule' && (vars.CLAWSWEEPER_COMMENT_ROUTER_EXECUTE || '0') == '1' || github.event_name == 'workflow_dispatch' && inputs.execute && (inputs.item_numbers == '' || contains(inputs.item_numbers, ',')) || github.event_name == 'repository_dispatch' && !github.event.client_payload.item_number && github.event.client_payload.comment_id) }}
         env:
           GH_TOKEN: ${{ steps.dispatch-token.outputs.token }}
         run: |
           set -euo pipefail
           target_repo="${{ github.event_name == 'workflow_dispatch' && inputs.target_repo || vars.CLAWSWEEPER_TARGET_REPO || 'openclaw/openclaw' }}"
           target_branch="${{ github.event_name == 'workflow_dispatch' && inputs.target_branch || '' }}"
+          lookback_minutes="${{ github.event_name == 'workflow_dispatch' && inputs.lookback_minutes || vars.CLAWSWEEPER_COMMENT_LOOKBACK_MINUTES || '180' }}"
+          since="${{ github.event_name == 'workflow_dispatch' && inputs.since || '' }}"
+          max_comments="${{ github.event_name == 'workflow_dispatch' && inputs.max_comments || vars.CLAWSWEEPER_COMMENT_MAX_COMMENTS || '100' }}"
+          comment_ids="${{ github.event_name == 'workflow_dispatch' && inputs.comment_ids || '' }}"
           runner="${{ github.event_name == 'workflow_dispatch' && inputs.runner || vars.CLAWSWEEPER_WORKER_RUNNER || 'blacksmith-4vcpu-ubuntu-2404' }}"
           execution_runner="${{ github.event_name == 'workflow_dispatch' && inputs.execution_runner || vars.CLAWSWEEPER_EXECUTION_RUNNER || 'blacksmith-16vcpu-ubuntu-2404' }}"
+          force_reprocess="${{ github.event_name == 'workflow_dispatch' && inputs.force_reprocess || 'false' }}"
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            target_repo="${{ github.event.client_payload.target_repo || 'openclaw/openclaw' }}"
+            target_branch="${{ github.event.client_payload.target_branch || '' }}"
+            lookback_minutes="${{ github.event.client_payload.lookback_minutes || vars.CLAWSWEEPER_COMMENT_LOOKBACK_MINUTES || '180' }}"
+            since="${{ github.event.client_payload.since || '' }}"
+            max_comments="${{ github.event.client_payload.max_comments || '1' }}"
+            comment_ids="${{ github.event.client_payload.comment_id || '' }}"
+            runner="${{ github.event.client_payload.runner || vars.CLAWSWEEPER_WORKER_RUNNER || 'blacksmith-4vcpu-ubuntu-2404' }}"
+            execution_runner="${{ github.event.client_payload.execution_runner || vars.CLAWSWEEPER_EXECUTION_RUNNER || 'blacksmith-16vcpu-ubuntu-2404' }}"
+            force_reprocess="${{ github.event.client_payload.force_reprocess || 'false' }}"
+          fi
           jq -r '
             .commands[]
             | select(
@@ -372,12 +388,14 @@ jobs:
             gh workflow run repair-comment-router.yml \
               --repo "$GITHUB_REPOSITORY" \
               -f execute=true \
-              -f force_reprocess=false \
+              -f force_reprocess="$force_reprocess" \
               -f target_repo="$target_repo" \
               -f target_branch="$target_branch" \
-              -f lookback_minutes=180 \
-              -f max_comments=100 \
+              -f lookback_minutes="$lookback_minutes" \
+              -f since="$since" \
+              -f max_comments="$max_comments" \
               -f item_numbers="$item_number" \
+              -f comment_ids="$comment_ids" \
               -f runner="$runner" \
               -f execution_runner="$execution_runner"
           done
@@ -425,7 +443,7 @@ jobs:
             target_repo="${{ github.event.client_payload.target_repo || 'openclaw/openclaw' }}"
             target_branch="${{ github.event.client_payload.target_branch || '' }}"
             lookback_minutes="${{ github.event.client_payload.lookback_minutes || vars.CLAWSWEEPER_COMMENT_LOOKBACK_MINUTES || '180' }}"
-            since=""
+            since="${{ github.event.client_payload.since || '' }}"
             max_comments="${{ github.event.client_payload.max_comments || '1' }}"
             item_numbers="${{ github.event.client_payload.item_number || '' }}"
             comment_ids="${{ github.event.client_payload.comment_id || '' }}"
