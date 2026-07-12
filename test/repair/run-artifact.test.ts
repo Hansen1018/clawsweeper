@@ -266,25 +266,36 @@ test("repair workflow resolves producer artifacts by trusted id across rerun att
       /uses: actions\/download-artifact@v8\n\s+with:\n([\s\S]*?)(?=\n\s{6}- (?:name|uses):|\n\n)/g,
     ),
   ];
-  assert.equal(downloadBlocks.length, 15);
-  const exactArtifactDownloads = downloadBlocks.filter((block) =>
-    block[1]!.includes("artifact-ids:"),
+  assert.equal(downloadBlocks.length, 16);
+  const collectorDownload = downloadBlocks.find((block) =>
+    block[1]!.includes("steps.repair-action-ledger-artifacts.outputs.artifact_ids"),
   );
-  assert.equal(exactArtifactDownloads.length, 14);
+  assert.ok(collectorDownload);
+  assert.match(collectorDownload[1]!, /github-token: \$\{\{ github\.token \}\}/);
+  assert.match(collectorDownload[1]!, /run-id: \$\{\{ github\.run_id \}\}/);
+  assert.match(collectorDownload[1]!, /merge-multiple: true/);
+  const exactArtifactDownloads = downloadBlocks.filter(
+    (block) => block !== collectorDownload && block[1]!.includes("artifact-ids:"),
+  );
+  assert.equal(exactArtifactDownloads.length, 15);
   for (const block of exactArtifactDownloads) {
     assert.match(block[1]!, /artifact-ids: \$\{\{ steps\.[^.]+\.outputs\.artifact_id \}\}/);
     assert.match(block[1]!, /github-token: \$\{\{ github\.token \}\}/);
     assert.match(block[1]!, /run-id: \$\{\{ github\.run_id \}\}/);
     assert.doesNotMatch(block[1]!, /name:|github\.run_attempt/);
   }
-  const shardDownload = downloadBlocks.find((block) =>
-    block[1]!.includes("pattern: clawsweeper-repair-action-ledger-*"),
-  );
-  assert.ok(shardDownload);
-  assert.match(shardDownload[1]!, /merge-multiple: true/);
   assert.equal(
     [...workflow.matchAll(/pnpm run repair:resolve-run-artifact/g)].length,
     exactArtifactDownloads.length,
+  );
+  assert.doesNotMatch(workflow, /pattern: clawsweeper-repair-action-ledger-\*/);
+  assert.match(
+    workflow,
+    /action_ledger_artifact_id: \$\{\{ steps\.upload_action_ledger\.outputs\.artifact-id \}\}/,
+  );
+  assert.match(
+    workflow,
+    /Resolve planning action ledger context[\s\S]*--expected-artifact-digest "\$\{\{ needs\.cluster\.outputs\.action_ledger_artifact_digest \}\}"/,
   );
   for (const prefix of [
     "clawsweeper-repair-worker",

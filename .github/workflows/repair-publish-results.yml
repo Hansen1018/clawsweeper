@@ -155,14 +155,17 @@ jobs:
           set -euo pipefail
           git fetch origin main
           git checkout -B main origin/main
-          pnpm run repair:publish-result -- artifacts \
+          CLAWSWEEPER_ACTION_LEDGER_INVOCATION=cluster-results \
+            pnpm run repair:publish-result -- artifacts \
             --skip-dashboard \
             --run-id "$RUN_ID" \
             --run-url "$RUN_URL" \
             --head-sha "$HEAD_SHA" \
             --conclusion "$CONCLUSION"
-          pnpm run repair:finalize-open-prs -- --write-report
-          pnpm run repair:publish-result -- --skip-dashboard
+          CLAWSWEEPER_ACTION_LEDGER_INVOCATION=open-pr-finalizer \
+            pnpm run repair:finalize-open-prs -- --write-report
+          CLAWSWEEPER_ACTION_LEDGER_INVOCATION=finalizer-results \
+            pnpm run repair:publish-result -- --skip-dashboard
 
       # This workflow_run job executes trusted main-branch code only; artifacts
       # from worker runs are downloaded as data and handled by repair publishers.

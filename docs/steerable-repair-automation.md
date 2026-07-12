@@ -327,7 +327,8 @@ The planning job performs:
 3. Durable state checkout.
 4. Execution-gate capture.
 5. Stable Codex session path resolution and cache restore.
-6. CrabFleet action-session registration.
+6. Local repair lifecycle registration, with CrabFleet session registration
+   only when steerable mode is enabled.
 7. Job validation and stale-head verification.
 8. Codex planning or autonomous artifact generation.
 9. Deterministic result review.
