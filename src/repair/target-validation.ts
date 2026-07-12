@@ -658,8 +658,8 @@ function runValidationPlanCommand({
   if (executed.has(commandIdentity)) {
     return { executedCommands: [], reason: "exact command already passed" };
   }
-  assertValidationProofInputSnapshot(cwd, proofInputSnapshot, proofLimits);
   const startedAt = Date.now();
+  assertValidationProofInputSnapshot(cwd, proofInputSnapshot, proofLimits);
   while (true) {
     const remainingBudgetMs = remainingCommandBudget(timeoutMs, startedAt);
     if (remainingBudgetMs <= 0) {

@@ -2857,6 +2857,45 @@ test("staged proof charges absent snapshot candidates to every traversal budget"
   }
 });
 
+test("staged proof recomputes command timeout after snapshot verification", () => {
+  const cwd = gitPackageFixture({});
+  git(cwd, "add", ".");
+  git(cwd, "commit", "-m", "initial");
+  attachOrigin(cwd);
+
+  const originalLstatSync = fs.lstatSync;
+  const watchedEnvPath = path.join(fs.realpathSync(cwd), ".env");
+  let envReads = 0;
+  fs.lstatSync = function (...args) {
+    if (path.resolve(String(args[0])) === watchedEnvPath && ++envReads === 2) {
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 750);
+    }
+    return Reflect.apply(originalLstatSync, fs, args);
+  };
+  try {
+    assert.throws(
+      () =>
+        runStagedValidationProof(
+          ["git diff --check"],
+          cwd,
+          validationOptions("steipete/example", {
+            proofBudgetMs: 5_000,
+            validationTimeoutMs: 500,
+            toolchain: {
+              packageManager: "pnpm",
+              baseValidationCommands: [],
+              changedGate: null,
+            },
+          }),
+        ),
+      /validation command runtime budget exhausted/,
+    );
+    assert.equal(envReads >= 2, true);
+  } finally {
+    fs.lstatSync = originalLstatSync;
+  }
+});
+
 test("staged proof budget includes checkout and recursive proof-input sealing", () => {
   const cwd = gitPackageFixture({ verify: "node --test" });
   fs.mkdirSync(path.join(cwd, "node_modules", "fixture"), { recursive: true });
