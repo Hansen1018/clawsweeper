@@ -2238,7 +2238,7 @@ test("scheduled repair loops preserve live opt-in through mutation and dispatch 
     "const issueLabelBlock = finalAutomergeMutationBlock(command)",
     mergeReadyMutation,
   );
-  const issueLabelMutation = automerge.indexOf("runGitHubBestEffortMutation(", issueLabelGuard);
+  const issueLabelMutation = automerge.indexOf("runBestEffortCommandMutation(", issueLabelGuard);
   assert.ok(gateBlock >= 0);
   assert.ok(humanLabelGuard > gateBlock);
   assert.ok(humanLabelMutation > humanLabelGuard);
@@ -2261,7 +2261,7 @@ test("scheduled repair loops preserve live opt-in through mutation and dispatch 
     failureLabelMutation,
   );
   const failureIssueLabelMutation = automerge.indexOf(
-    "runGitHubBestEffortMutation(",
+    "runBestEffortCommandMutation(",
     failureIssueLabelGuard,
   );
   assert.ok(mergeFailure > merge);
@@ -2518,9 +2518,7 @@ test("exact comment fast path converges terminal acknowledgement before own reac
     source.indexOf("function commandAckMarkerForCommentId"),
   );
   const ackPlan = precreatedAckConvergence.indexOf("planCommandAckConvergence(");
-  const ackRevalidation = precreatedAckConvergence.indexOf(
-    "revalidateCommandImmediatelyBeforeMutation(command)",
-  );
+  const ackRevalidation = precreatedAckConvergence.indexOf("runBestEffortCommandMutation(");
   const ackDeletion = precreatedAckConvergence.indexOf('"DELETE"');
   assert.ok(ackPlan >= 0);
   assert.ok(ackRevalidation > ackPlan);
@@ -2534,6 +2532,73 @@ test("exact comment fast path converges terminal acknowledgement before own reac
   assert.match(reactionCleanup, /"--method",\s*"DELETE"/);
   assert.match(reactionCleanup, /isAllowedMutationActor\(login, DEFAULT_TRUSTED_BOTS\)/);
   assert.doesNotMatch(reactionCleanup, /isAllowedMutationActor\(login, trustedBots\)/);
+});
+
+test("every durable command mutation uses the final source authorization guard", () => {
+  const source = readFileSync("src/repair/comment-router.ts", "utf8");
+  const wrappers = source.slice(
+    source.indexOf("function runBestEffortCommandMutation"),
+    source.indexOf("function finalAutomergeMutationBlock"),
+  );
+  assert.match(
+    wrappers,
+    /runBestEffortCommandMutation[\s\S]*blockCommandImmediatelyBeforeSideEffect\(command\)[\s\S]*runGitHubBestEffortMutation\(command/,
+  );
+  assert.match(
+    wrappers,
+    /runTextCommandMutation[\s\S]*blockCommandImmediatelyBeforeSideEffect\(command\)[\s\S]*runGitHubTextMutation\(command/,
+  );
+  assert.match(
+    wrappers,
+    /runFileCommandMutation[\s\S]*blockCommandImmediatelyBeforeSideEffect\(command\)[\s\S]*mutation\(\)/,
+  );
+
+  const execute = source.slice(
+    source.indexOf("function executeCommand"),
+    source.indexOf("function executeCommandWithReceipt"),
+  );
+  assert.doesNotMatch(execute, /\bgh(?:BestEffort|Text)\(/);
+  assert.match(execute, /if \(!applyRepairLoopOptIn\(command\)\) return/);
+  assert.match(execute, /job\.status_detail === "guard_blocked"/);
+  assert.match(execute, /if \(!ensureHumanReviewLabel\(command\)\) return/);
+  assert.match(execute, /if \(!applyRemoveLabelActions\(command\)\) return/);
+  assert.match(execute, /if \(!commentResult\) return/);
+
+  const jobs = source.slice(
+    source.indexOf("function ensureAutomergeJob"),
+    source.indexOf("function issueImplementationJobOptions"),
+  );
+  assert.equal(jobs.match(/runFileCommandMutation\(command/g)?.length, 3);
+
+  const autoclose = source.slice(
+    source.indexOf("function executeAutoclose"),
+    source.indexOf("function discoverAutocloseTargets"),
+  );
+  assert.match(autoclose, /postIssueComment\(\s*command/);
+  assert.match(autoclose, /closeIssueOrPullRequest\(\s*command/);
+
+  const ledgerRead = source.indexOf("const ledger = readLedger(ledgerPath())");
+  const firstGitHubLookup = source.indexOf('measure("list_candidate_comments"');
+  assert.ok(ledgerRead >= 0);
+  assert.ok(firstGitHubLookup > ledgerRead);
+  const claim = source.slice(
+    source.indexOf("function claimDispatchCommands"),
+    source.indexOf("function dispatchClaimEntry"),
+  );
+  assert.match(claim, /assertCommentRouterLedgerReadyForMutation\(ledger\)/);
+
+  const finalAutomerge = source.slice(
+    source.indexOf("function finalAutomergeMutationBlock"),
+    source.indexOf("function automergeReadinessBlockResult"),
+  );
+  const finalReadiness = finalAutomerge.lastIndexOf("validateAutomergeReadiness");
+  const finalAuthorization = finalAutomerge.lastIndexOf(
+    "revalidateCommandImmediatelyBeforeMutation(command)",
+  );
+  const returnReady = finalAutomerge.lastIndexOf("return null");
+  assert.ok(finalReadiness >= 0);
+  assert.ok(finalAuthorization > finalReadiness);
+  assert.ok(returnReady > finalAuthorization);
 });
 
 test("command receipt gates let the oldest same-key run proceed when a newer duplicate is pending", () => {

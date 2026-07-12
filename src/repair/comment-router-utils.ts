@@ -25,6 +25,56 @@ const LEDGER_COMMAND_STRING_FIELDS = [
   "processed_at",
 ] as const;
 const COMMENT_ROUTER_LEDGER_ENTRY_LIMIT = 1000;
+const COMMENT_ROUTER_LEDGER_ACTION_LIMIT = 64;
+const COMMENT_ROUTER_LEDGER_ENTRY_FIELDS = new Set([
+  "idempotency_key",
+  "comment_id",
+  "comment_version_key",
+  "comment_url",
+  "comment_created_at",
+  "comment_updated_at",
+  "status_comment_id",
+  "comment_body_sha256",
+  "forced_replay",
+  "attempt_id",
+  "attempt_sequence",
+  "attempt_nonce",
+  "resolution_reason",
+  "repo",
+  "issue_number",
+  "author",
+  "author_id",
+  "author_name",
+  "author_association",
+  "trigger",
+  "command",
+  "intent",
+  "trusted_bot",
+  "trusted_bot_author",
+  "automation_source",
+  "repair_reason",
+  "expected_head_sha",
+  "finding_id",
+  "dispatch_context",
+  "status",
+  "processed_at",
+  "target",
+  "actions",
+]);
+const COMMENT_ROUTER_LEDGER_ACTION_FIELDS = new Set(["action", "status", "label", "job_path"]);
+const COMMENT_ROUTER_LEDGER_DISPATCH_FIELDS = new Set([
+  "target_branch",
+  "runner",
+  "execution_runner",
+  "since",
+]);
+const COMMENT_ROUTER_LEDGER_TARGET_FIELDS = new Set([
+  "kind",
+  "branch",
+  "head_sha",
+  "cluster_id",
+  "job_path",
+]);
 export const COMMENT_ROUTER_ATTEMPT_SEQUENCE_LIMIT = 1000;
 const ACTIVE_COMMENT_ROUTER_STATUSES = new Set(["waiting", "claimed"]);
 export const EDITED_DURABLE_COMMENT_VERSION_REASON =
@@ -835,7 +885,7 @@ export function readLedger(file: JsonValue) {
       { cause: error },
     );
   }
-  assertCommentRouterLedgerShape(data);
+  assertCommentRouterLedgerReadyForMutation(data);
   const attemptHighWater = normalizedRepairLoopAttemptHighWater(data.attempt_high_water);
   return {
     updated_at: data.updated_at ?? null,
@@ -845,12 +895,30 @@ export function readLedger(file: JsonValue) {
   };
 }
 
-function assertCommentRouterLedgerShape(data: JsonValue): asserts data is LooseRecord {
+export function assertCommentRouterLedgerReadyForMutation(
+  data: JsonValue,
+): asserts data is LooseRecord {
+  const commands = assertCommentRouterLedgerRoot(data);
+  assertCommentRouterLedgerCapacity(commands);
+  assertCommentRouterLedgerShape(data, commands);
+}
+
+function assertCommentRouterLedgerRoot(data: JsonValue): JsonValue[] {
   if (!data || typeof data !== "object" || Array.isArray(data)) {
     throw new Error("existing comment router ledger must be an object");
   }
   if (!Array.isArray(data.commands)) {
     throw new Error("existing comment router ledger commands must be an array");
+  }
+  return data.commands ?? [];
+}
+
+function assertCommentRouterLedgerShape(
+  data: LooseRecord,
+  commands: JsonValue[],
+): asserts data is LooseRecord {
+  for (const [index, command] of commands.entries()) {
+    assertCommentRouterLedgerEntry(command, index);
   }
   if (
     data.attempt_high_water !== undefined &&
@@ -870,7 +938,13 @@ function assertCommentRouterLedgerShape(data: JsonValue): asserts data is LooseR
   ) {
     throw new Error("existing comment router ledger attempt_sequences must be an object");
   }
-  for (const [key, sequence] of Object.entries(data.attempt_sequences)) {
+  const attemptSequences = Object.entries(data.attempt_sequences);
+  if (attemptSequences.length > COMMENT_ROUTER_ATTEMPT_SEQUENCE_LIMIT) {
+    throw new Error(
+      `existing comment router ledger has ${attemptSequences.length} attempt sequences; maximum is ${COMMENT_ROUTER_ATTEMPT_SEQUENCE_LIMIT}`,
+    );
+  }
+  for (const [key, sequence] of attemptSequences) {
     if (
       !key.startsWith("repair-loop-label-sweep:") ||
       key.length > 512 ||
@@ -880,6 +954,290 @@ function assertCommentRouterLedgerShape(data: JsonValue): asserts data is LooseR
     ) {
       throw new Error("existing comment router ledger contains an invalid attempt sequence");
     }
+  }
+}
+
+function assertCommentRouterLedgerEntry(
+  value: JsonValue,
+  index: number,
+): asserts value is LooseRecord {
+  const invalid = (field: string) => {
+    throw new Error(`existing comment router ledger command ${index + 1} has invalid ${field}`);
+  };
+  if (!value || typeof value !== "object" || Array.isArray(value)) invalid("entry");
+  const entry = value as LooseRecord;
+  const commentId = String(entry.comment_id ?? "").trim();
+  const sourceComment = /^[1-9]\d*$/.test(commentId);
+  const status = String(entry.status ?? "");
+  const active = ACTIVE_COMMENT_ROUTER_STATUSES.has(status);
+  if (active) {
+    for (const field of Object.keys(entry)) {
+      if (!COMMENT_ROUTER_LEDGER_ENTRY_FIELDS.has(field)) invalid(`field ${field}`);
+    }
+  }
+  const boundedText = (field: string, maxLength: number, required = false) => {
+    const fieldValue = entry[field];
+    if (fieldValue === undefined || fieldValue === null) {
+      if (required) invalid(field);
+      return;
+    }
+    if (
+      typeof fieldValue !== "string" ||
+      (required && !fieldValue.trim()) ||
+      fieldValue.length > maxLength ||
+      hasUnsafeCommentRouterLedgerText(fieldValue)
+    ) {
+      invalid(field);
+    }
+  };
+  const boundedNullableText = (field: string, maxLength: number, required = false) => {
+    const fieldValue = entry[field];
+    if (fieldValue === null || fieldValue === undefined) {
+      if (required && fieldValue === undefined) invalid(field);
+      return;
+    }
+    boundedText(field, maxLength, required);
+  };
+  const timestamp = (field: string, required = false) => {
+    boundedNullableText(field, 64, required);
+    const fieldValue = entry[field];
+    if (
+      fieldValue !== undefined &&
+      fieldValue !== null &&
+      !Number.isFinite(Date.parse(String(fieldValue)))
+    ) {
+      invalid(field);
+    }
+  };
+  boundedText("idempotency_key", 1_024, entry.idempotency_key !== undefined);
+  boundedText("comment_id", 512, entry.comment_id !== undefined);
+  if (
+    active &&
+    commentId &&
+    commentId !== "0" &&
+    !validRouterCommentId(commentId, entry.issue_number)
+  ) {
+    invalid("comment_id");
+  }
+  if (sourceComment)
+    boundedText("comment_version_key", 1_024, entry.comment_version_key !== undefined);
+  else boundedNullableText("comment_version_key", 1_024, entry.comment_version_key !== undefined);
+  boundedText("comment_url", 2_048, entry.comment_url !== undefined);
+  timestamp("comment_created_at", entry.comment_created_at !== undefined);
+  timestamp("comment_updated_at", entry.comment_updated_at !== undefined);
+  boundedText("repo", 255, entry.repo !== undefined);
+  boundedText("intent", 128, entry.intent !== undefined);
+  boundedText("processed_at", 64, true);
+  if (entry.repo !== undefined && !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(String(entry.repo))) {
+    invalid("repo");
+  }
+  if (
+    entry.issue_number !== undefined &&
+    (!Number.isSafeInteger(Number(entry.issue_number)) || Number(entry.issue_number) <= 0)
+  ) {
+    invalid("issue_number");
+  }
+  if (!["claimed", "executed", "skipped", "waiting"].includes(String(entry.status ?? ""))) {
+    invalid("status");
+  }
+  if (!Number.isFinite(Date.parse(String(entry.processed_at ?? "")))) invalid("processed_at");
+  if (
+    entry.status_comment_id !== undefined &&
+    (!Number.isSafeInteger(Number(entry.status_comment_id)) || Number(entry.status_comment_id) <= 0)
+  ) {
+    invalid("status_comment_id");
+  }
+  if (
+    entry.comment_body_sha256 !== undefined &&
+    !/^[a-f0-9]{64}$/.test(String(entry.comment_body_sha256))
+  ) {
+    invalid("comment_body_sha256");
+  }
+  if (entry.forced_replay !== undefined && typeof entry.forced_replay !== "boolean") {
+    invalid("forced_replay");
+  }
+  boundedNullableText("attempt_id", 512);
+  for (const field of ["attempt_sequence", "attempt_nonce"]) {
+    if (
+      entry[field] !== undefined &&
+      (!Number.isSafeInteger(Number(entry[field])) || Number(entry[field]) <= 0)
+    ) {
+      invalid(field);
+    }
+  }
+  boundedNullableText("resolution_reason", 255);
+  boundedText("author", 255, entry.author !== undefined);
+  boundedNullableText("author_name", 255, entry.author_name !== undefined);
+  boundedText("author_association", 64, entry.author_association !== undefined);
+  boundedText("trigger", 128, entry.trigger !== undefined);
+  boundedText("command", 128, entry.command !== undefined);
+  if (entry.trusted_bot !== undefined && typeof entry.trusted_bot !== "boolean") {
+    invalid("trusted_bot");
+  }
+  boundedNullableText("trusted_bot_author", 255, entry.trusted_bot_author !== undefined);
+  boundedNullableText("automation_source", 255, entry.automation_source !== undefined);
+  boundedNullableText("repair_reason", 16_384, entry.repair_reason !== undefined);
+  boundedNullableText("expected_head_sha", 128, entry.expected_head_sha !== undefined);
+  boundedNullableText("finding_id", 1_024, entry.finding_id !== undefined);
+  if (
+    entry.author_id !== undefined &&
+    entry.author_id !== null &&
+    (!Number.isSafeInteger(Number(entry.author_id)) || Number(entry.author_id) <= 0)
+  ) {
+    invalid("author_id");
+  }
+  assertCommentRouterDispatchContext(entry.dispatch_context, invalid);
+  assertCommentRouterTarget(entry.target, invalid, false);
+  if (entry.actions !== undefined) {
+    if (!Array.isArray(entry.actions)) invalid("actions");
+    if (entry.actions.length > COMMENT_ROUTER_LEDGER_ACTION_LIMIT) invalid("actions");
+    for (const action of entry.actions) {
+      if (!action || typeof action !== "object" || Array.isArray(action)) invalid("actions");
+      for (const field of Object.keys(action)) {
+        if (!COMMENT_ROUTER_LEDGER_ACTION_FIELDS.has(field)) invalid(`actions.${field}`);
+      }
+      for (const field of ["action", "status", "label", "job_path"]) {
+        const actionValue = action[field];
+        if (
+          actionValue !== undefined &&
+          actionValue !== null &&
+          (typeof actionValue !== "string" ||
+            actionValue.length > 1_024 ||
+            hasUnsafeCommentRouterLedgerText(actionValue))
+        ) {
+          invalid(`actions.${field}`);
+        }
+      }
+      if (!String(action.action ?? "").trim() || !String(action.status ?? "").trim()) {
+        invalid("actions");
+      }
+      if (action.job_path !== undefined && action.job_path !== null) {
+        if (!validCommentRouterLedgerJobPath(String(action.job_path))) {
+          invalid("actions.job_path");
+        }
+      }
+    }
+  }
+}
+
+function assertCommentRouterDispatchContext(value: JsonValue, invalid: (field: string) => never) {
+  if (value === undefined) return;
+  if (!value || typeof value !== "object" || Array.isArray(value)) invalid("dispatch_context");
+  for (const field of Object.keys(value)) {
+    if (!COMMENT_ROUTER_LEDGER_DISPATCH_FIELDS.has(field)) {
+      invalid(`dispatch_context.${field}`);
+    }
+  }
+  for (const [field, maxLength] of [
+    ["target_branch", 255],
+    ["runner", 128],
+    ["execution_runner", 128],
+    ["since", 64],
+  ] as const) {
+    const fieldValue = value[field];
+    if (
+      typeof fieldValue !== "string" ||
+      (field !== "target_branch" && !fieldValue.trim()) ||
+      fieldValue.length > maxLength ||
+      hasUnsafeCommentRouterLedgerText(fieldValue)
+    ) {
+      invalid(`dispatch_context.${field}`);
+    }
+  }
+  if (!Number.isFinite(Date.parse(String(value.since)))) invalid("dispatch_context.since");
+}
+
+function assertCommentRouterTarget(
+  value: JsonValue,
+  invalid: (field: string) => never,
+  required: boolean,
+) {
+  if (value === null) return;
+  if (value === undefined) {
+    if (required) invalid("target");
+    return;
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) invalid("target");
+  for (const field of Object.keys(value)) {
+    if (!COMMENT_ROUTER_LEDGER_TARGET_FIELDS.has(field)) invalid(`target.${field}`);
+  }
+  if (!["issue", "pull_request"].includes(String(value.kind ?? ""))) invalid("target.kind");
+  for (const [field, maxLength] of [
+    ["kind", 64],
+    ["branch", 255],
+    ["head_sha", 128],
+    ["cluster_id", 255],
+    ["job_path", 1_024],
+  ] as const) {
+    const fieldValue = value[field];
+    if (
+      fieldValue !== undefined &&
+      fieldValue !== null &&
+      (typeof fieldValue !== "string" ||
+        fieldValue.length > maxLength ||
+        hasUnsafeCommentRouterLedgerText(fieldValue))
+    ) {
+      invalid(`target.${field}`);
+    }
+  }
+  if (
+    value.head_sha !== undefined &&
+    value.head_sha !== null &&
+    !/^[a-f0-9]{40}$/i.test(String(value.head_sha))
+  ) {
+    invalid("target.head_sha");
+  }
+  if (
+    value.job_path !== undefined &&
+    value.job_path !== null &&
+    !validCommentRouterLedgerJobPath(String(value.job_path))
+  ) {
+    invalid("target.job_path");
+  }
+}
+
+function hasUnsafeCommentRouterLedgerText(value: string) {
+  return value.includes("\0") || value.includes("\r") || value.includes("\n");
+}
+
+function validCommentRouterLedgerJobPath(value: string) {
+  return (
+    value.startsWith("jobs/") &&
+    value.endsWith(".md") &&
+    !value.includes("\\") &&
+    path.posix.normalize(value) === value
+  );
+}
+
+function assertCommentRouterLedgerCapacity(commands: JsonValue[]) {
+  if (commands.length > COMMENT_ROUTER_LEDGER_ENTRY_LIMIT) {
+    throw new Error(
+      `comment router ledger has ${commands.length} commands; maximum is ${COMMENT_ROUTER_LEDGER_ENTRY_LIMIT}`,
+    );
+  }
+  let activeCount = 0;
+  for (const entry of commands) {
+    if (
+      entry &&
+      typeof entry === "object" &&
+      !Array.isArray(entry) &&
+      ACTIVE_COMMENT_ROUTER_STATUSES.has(String(entry.status ?? ""))
+    ) {
+      activeCount += 1;
+      if (activeCount > COMMENT_ROUTER_LEDGER_ENTRY_LIMIT) {
+        throw new Error(
+          `comment router ledger has ${activeCount} active commands; maximum is ${COMMENT_ROUTER_LEDGER_ENTRY_LIMIT}`,
+        );
+      }
+    }
+  }
+  const keys = new Set<string>();
+  for (const entry of commands) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+    const key = ledgerEntryKey(entry);
+    if (keys.has(key))
+      throw new Error(`comment router ledger contains duplicate command key: ${key}`);
+    keys.add(key);
   }
 }
 
@@ -1446,6 +1804,7 @@ function compactLedgerActions(actions: JsonValue) {
 }
 
 export function writeLedger(file: JsonValue, current: LooseRecord) {
+  assertCommentRouterLedgerReadyForMutation(current);
   const ledgerPath = String(file);
   const directory = path.dirname(ledgerPath);
   const temporaryPath = path.join(

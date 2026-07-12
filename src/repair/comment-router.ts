@@ -92,6 +92,7 @@ import {
   EDITED_DURABLE_COMMENT_VERSION_REASON,
   SUPERSEDED_RE_REVIEW_REASON,
   appendLedger,
+  assertCommentRouterLedgerReadyForMutation,
   commentBodySha256,
   dispatchClaimDecision,
   dispatchClaimLookupKeys,
@@ -499,11 +500,18 @@ if (execute && !exactCommentVersionFastPath.suppress) {
         continue;
       }
       if (actionable.includes(command)) {
+        const ledgerBeforeClaim = structuredClone(ledger);
         const claimedCommands = measure("claim_dispatch_command", () =>
           claimDispatchCommands([command]),
         );
         const commandClaimed = appendLedger(ledger, claimedCommands);
         if (commandClaimed) {
+          if (!revalidateCommandImmediatelyBeforeMutation(command)) {
+            replaceLedgerContents(ledger, ledgerBeforeClaim);
+            recordCommandOutcome(command);
+            clearTerminalMaintainerCommandReaction(command);
+            continue;
+          }
           ledgerClaimed = true;
           writeLedger(ledgerPath(), ledger);
           for (const claimedCommand of claimedCommands) recordCommandClaimed(claimedCommand);
@@ -521,6 +529,7 @@ if (execute && !exactCommentVersionFastPath.suppress) {
     }
     report.ledger_claimed = ledgerClaimed;
   });
+  for (const command of commands) revalidateCommandImmediatelyBeforeMutation(command);
   report.ledger_changed = measure("append_ledger", () => appendLedger(ledger, commands));
   if (report.ledger_changed) writeLedger(ledgerPath(), ledger);
 }
@@ -656,6 +665,7 @@ function bindRecoveredForcedReplayAttempts(command: LooseRecord): LooseRecord {
 }
 
 function claimDispatchCommands(commands: LooseRecord[]) {
+  assertCommentRouterLedgerReadyForMutation(ledger);
   const processedAt = new Date().toISOString();
   return commands
     .filter(commandNeedsDurableDispatchClaim)
@@ -678,11 +688,18 @@ function dispatchClaimEntry(command: LooseRecord, processedAt: string) {
 }
 
 function refreshDispatchClaim(command: LooseRecord) {
+  if (blockCommandImmediatelyBeforeSideEffect(command)) return false;
   const claim = dispatchClaimEntry(command, new Date().toISOString());
   appendLedger(ledger, [claim]);
   writeLedger(ledgerPath(), ledger);
   for (const key of dispatchClaimLookupKeys(claim)) priorDispatchClaims.set(key, claim);
   recordCommandClaimRefreshed(claim);
+  return true;
+}
+
+function replaceLedgerContents(target: LooseRecord, source: LooseRecord) {
+  for (const key of Object.keys(target)) delete target[key];
+  Object.assign(target, source);
 }
 
 function commandNeedsDurableDispatchClaim(command: LooseRecord) {
@@ -771,7 +788,13 @@ function claimedDispatchState({
     graceMs: dispatchClaimGraceMs(),
   });
   if (decision.action === "dispatch") {
-    refreshDispatchClaim(command);
+    if (!refreshDispatchClaim(command)) {
+      return {
+        status: "guard_blocked",
+        reason: String(command.reason ?? "command was withdrawn before dispatch claim refresh"),
+        retryable: String(command.status ?? "") === "waiting",
+      };
+    }
     return null;
   }
   if (decision.action === "wait") {
@@ -2070,7 +2093,9 @@ function isRepairLoopControlIntent(command: LooseRecord) {
 }
 
 function revalidateCommandImmediatelyBeforeMutation(command: LooseRecord) {
-  if (!["ready", "skipped", "waiting", "claimed"].includes(String(command.status ?? ""))) {
+  if (
+    !["ready", "skipped", "waiting", "claimed", "executed"].includes(String(command.status ?? ""))
+  ) {
     return false;
   }
   const commentId = String(command.comment_id ?? "");
@@ -2223,7 +2248,7 @@ function executeCommand(command: LooseRecord) {
     const shouldDispatchAssist = commandHasAction(command, "dispatch_assist");
     const shouldMerge = commandHasAction(command, "merge");
     const shouldApplyHumanReviewLabel = commandHasAction(command, "label");
-    if (!command.trusted_bot) reactToComment(command, "eyes");
+    if (!command.trusted_bot && !reactToComment(command, "eyes")) return;
     if (
       shouldDispatchRepair &&
       (canRepairPullTarget(command.target) ||
@@ -2233,12 +2258,13 @@ function executeCommand(command: LooseRecord) {
         ["autofix", "automerge"].includes(command.intent) &&
         command.automation_source !== "repair_loop_label_sweep"
       ) {
-        applyRepairLoopOptIn(command);
+        if (!applyRepairLoopOptIn(command)) return;
       }
       const job =
         command.intent === "implement_issue"
           ? ensureIssueImplementationJob(command)
           : ensureAutomergeJob(command);
+      if (job.status_detail === "guard_blocked") return;
       if (job.status_detail === "written") {
         command.actions = command.actions.map((action: JsonValue) => {
           if (
@@ -2294,21 +2320,24 @@ function executeCommand(command: LooseRecord) {
               .map((action: JsonValue) => String(action.label ?? ""))
               .filter(Boolean);
       for (const pausedLabel of labelsToRemove) {
-        runGitHubBestEffortMutation(
-          command,
-          "label_remove",
-          { repository: command.repo, number: command.issue_number, label: pausedLabel },
-          [
-            "issue",
-            "edit",
-            String(command.issue_number),
-            "--repo",
-            command.repo,
-            "--remove-label",
-            pausedLabel,
-          ],
-          githubNotFoundNoMutation,
-        );
+        if (
+          !runBestEffortCommandMutation(
+            command,
+            "label_remove",
+            { repository: command.repo, number: command.issue_number, label: pausedLabel },
+            [
+              "issue",
+              "edit",
+              String(command.issue_number),
+              "--repo",
+              command.repo,
+              "--remove-label",
+              pausedLabel,
+            ],
+            githubNotFoundNoMutation,
+          )
+        )
+          return;
       }
       command.actions = command.actions.map((action: JsonValue) => {
         if (
@@ -2351,57 +2380,67 @@ function executeCommand(command: LooseRecord) {
         return;
       }
       const job = ensureAutomergeJob(command);
+      if (job.status_detail === "guard_blocked") return;
       if (command.automation_source !== "repair_loop_label_sweep") {
-        ensureRepairLoopLabel(command, modeLabel);
+        if (!ensureRepairLoopLabel(command, modeLabel)) return;
         for (const pausedLabel of pauseLabelsOn(command.target)) {
-          runGitHubBestEffortMutation(
-            command,
-            "label_remove",
-            { repository: command.repo, number: command.issue_number, label: pausedLabel },
-            [
-              "issue",
-              "edit",
-              String(command.issue_number),
-              "--repo",
-              command.repo,
-              "--remove-label",
-              pausedLabel,
-            ],
-            githubNotFoundNoMutation,
-          );
+          if (
+            !runBestEffortCommandMutation(
+              command,
+              "label_remove",
+              { repository: command.repo, number: command.issue_number, label: pausedLabel },
+              [
+                "issue",
+                "edit",
+                String(command.issue_number),
+                "--repo",
+                command.repo,
+                "--remove-label",
+                pausedLabel,
+              ],
+              githubNotFoundNoMutation,
+            )
+          )
+            return;
         }
         if (hasLabel(command.target, oppositeModeLabel)) {
-          runGitHubBestEffortMutation(
+          if (
+            !runBestEffortCommandMutation(
+              command,
+              "label_remove",
+              { repository: command.repo, number: command.issue_number, label: oppositeModeLabel },
+              [
+                "issue",
+                "edit",
+                String(command.issue_number),
+                "--repo",
+                command.repo,
+                "--remove-label",
+                oppositeModeLabel,
+              ],
+              githubNotFoundNoMutation,
+            )
+          )
+            return;
+        }
+        if (
+          !runBestEffortCommandMutation(
             command,
-            "label_remove",
-            { repository: command.repo, number: command.issue_number, label: oppositeModeLabel },
+            "label_add",
+            { repository: command.repo, number: command.issue_number, label: modeLabel },
             [
               "issue",
               "edit",
               String(command.issue_number),
               "--repo",
               command.repo,
-              "--remove-label",
-              oppositeModeLabel,
+              "--add-label",
+              modeLabel,
             ],
-            githubNotFoundNoMutation,
-          );
-        }
-        runGitHubBestEffortMutation(
-          command,
-          "label_add",
-          { repository: command.repo, number: command.issue_number, label: modeLabel },
-          [
-            "issue",
-            "edit",
-            String(command.issue_number),
-            "--repo",
-            command.repo,
-            "--add-label",
-            modeLabel,
-          ],
-          githubAlreadyExistsNoMutation,
-        );
+            githubAlreadyExistsNoMutation,
+          )
+        )
+          return;
       }
       const dispatchBlock = repairLoopReviewDispatchBlockReason(command);
       if (dispatchBlock) {
@@ -2482,6 +2521,7 @@ function executeCommand(command: LooseRecord) {
       command.autoclose_targets?.length > 0
     ) {
       const autoclose = executeAutoclose(command);
+      if (autoclose.status === "guard_blocked") return;
       dispatched = { ...dispatched, autoclose };
       command.actions = command.actions.map((action: JsonValue) =>
         action.action === "autoclose"
@@ -2499,7 +2539,7 @@ function executeCommand(command: LooseRecord) {
         command.automation_source !== "repair_loop_label_sweep" &&
         commandHasAction(command, "label")
       ) {
-        applyLabelActions(command);
+        if (!applyLabelActions(command)) return;
       }
       if (commandHasAction(command, "update_description_note")) {
         const descriptionMutationBlock = repairLoopReviewDispatchBlockReason(command);
@@ -2507,7 +2547,7 @@ function executeCommand(command: LooseRecord) {
           applyReviewLeaseGuardBlock(command, descriptionMutationBlock);
           return;
         }
-        applyDescriptionNoteActions(command);
+        if (!applyDescriptionNoteActions(command)) return;
       }
       const pauseLabels = command.actions
         .filter((action: JsonValue) => action.action === "remove_label")
@@ -2515,21 +2555,24 @@ function executeCommand(command: LooseRecord) {
         .filter(Boolean);
       if (pauseLabels.length > 0 && command.automation_source !== "repair_loop_label_sweep") {
         for (const pausedLabel of pauseLabels) {
-          runGitHubBestEffortMutation(
-            command,
-            "label_remove",
-            { repository: command.repo, number: command.issue_number, label: pausedLabel },
-            [
-              "issue",
-              "edit",
-              String(command.issue_number),
-              "--repo",
-              command.repo,
-              "--remove-label",
-              pausedLabel,
-            ],
-            githubNotFoundNoMutation,
-          );
+          if (
+            !runBestEffortCommandMutation(
+              command,
+              "label_remove",
+              { repository: command.repo, number: command.issue_number, label: pausedLabel },
+              [
+                "issue",
+                "edit",
+                String(command.issue_number),
+                "--repo",
+                command.repo,
+                "--remove-label",
+                pausedLabel,
+              ],
+              githubNotFoundNoMutation,
+            )
+          )
+            return;
         }
         command.target = {
           ...command.target,
@@ -2573,6 +2616,7 @@ function executeCommand(command: LooseRecord) {
         } else {
           command.repair_reason = `${command.repair_reason ?? "structured ClawSweeper verdict: pass"}; ${merge.repair_reason ?? merge.reason}`;
           const job = ensureAutomergeJob(command);
+          if (job.status_detail === "guard_blocked") return;
           if (job.status_detail === "written") {
             command.actions.push({
               action: "dispatch_repair",
@@ -2607,26 +2651,29 @@ function executeCommand(command: LooseRecord) {
       command.issue_number &&
       shouldApplyHumanReviewLabel
     ) {
-      ensureHumanReviewLabel(command);
-      runGitHubBestEffortMutation(
-        command,
-        "label_add",
-        {
-          repository: command.repo,
-          number: command.issue_number,
-          label: HUMAN_REVIEW_LABEL,
-        },
-        [
-          "issue",
-          "edit",
-          String(command.issue_number),
-          "--repo",
-          command.repo,
-          "--add-label",
-          HUMAN_REVIEW_LABEL,
-        ],
-        githubAlreadyExistsNoMutation,
-      );
+      if (!ensureHumanReviewLabel(command)) return;
+      if (
+        !runBestEffortCommandMutation(
+          command,
+          "label_add",
+          {
+            repository: command.repo,
+            number: command.issue_number,
+            label: HUMAN_REVIEW_LABEL,
+          },
+          [
+            "issue",
+            "edit",
+            String(command.issue_number),
+            "--repo",
+            command.repo,
+            "--add-label",
+            HUMAN_REVIEW_LABEL,
+          ],
+          githubAlreadyExistsNoMutation,
+        )
+      )
+        return;
       command.actions = command.actions.map((action: JsonValue) =>
         action.action === "label"
           ? { ...action, status: "executed", label: HUMAN_REVIEW_LABEL }
@@ -2634,27 +2681,30 @@ function executeCommand(command: LooseRecord) {
       );
     }
     if (command.intent === "stop" && command.issue_number && shouldApplyHumanReviewLabel) {
-      applyRemoveLabelActions(command);
-      ensureHumanReviewLabel(command);
-      runGitHubBestEffortMutation(
-        command,
-        "label_add",
-        {
-          repository: command.repo,
-          number: command.issue_number,
-          label: HUMAN_REVIEW_LABEL,
-        },
-        [
-          "issue",
-          "edit",
-          String(command.issue_number),
-          "--repo",
-          command.repo,
-          "--add-label",
-          HUMAN_REVIEW_LABEL,
-        ],
-        githubAlreadyExistsNoMutation,
-      );
+      if (!applyRemoveLabelActions(command)) return;
+      if (!ensureHumanReviewLabel(command)) return;
+      if (
+        !runBestEffortCommandMutation(
+          command,
+          "label_add",
+          {
+            repository: command.repo,
+            number: command.issue_number,
+            label: HUMAN_REVIEW_LABEL,
+          },
+          [
+            "issue",
+            "edit",
+            String(command.issue_number),
+            "--repo",
+            command.repo,
+            "--add-label",
+            HUMAN_REVIEW_LABEL,
+          ],
+          githubAlreadyExistsNoMutation,
+        )
+      )
+        return;
       command.actions = command.actions.map((action: JsonValue) =>
         action.action === "label"
           ? { ...action, status: "executed", label: HUMAN_REVIEW_LABEL }
@@ -2662,10 +2712,11 @@ function executeCommand(command: LooseRecord) {
       );
     }
     if (command.autofix_complete && command.issue_number) {
-      applyRemoveLabelActions(command);
+      if (!applyRemoveLabelActions(command)) return;
     }
 
     const commentResult = postComment(command, renderResponse(command, dispatched));
+    if (!commentResult) return;
     command.actions = command.actions.map((action: JsonValue) =>
       action.action === "comment"
         ? {
@@ -2764,11 +2815,34 @@ function runGitHubBestEffortMutation(
   knownNoMutation?: (error: unknown) => boolean,
 ) {
   try {
-    runGitHubTextMutationOnce(command, kind, identity, ghArgs, {}, knownNoMutation);
-    return true;
+    return runGitHubTextMutationOnce(command, kind, identity, ghArgs, {}, knownNoMutation) !== null;
   } catch {
     return false;
   }
+}
+
+function runBestEffortCommandMutation(
+  command: LooseRecord,
+  kind: string,
+  identity: unknown,
+  ghArgs: string[],
+  knownNoMutation?: (error: unknown) => boolean,
+): boolean {
+  if (blockCommandImmediatelyBeforeSideEffect(command)) return false;
+  return runGitHubBestEffortMutation(command, kind, identity, ghArgs, knownNoMutation);
+}
+
+function runTextCommandMutation(
+  command: LooseRecord,
+  kind: string,
+  identity: unknown,
+  ghArgs: string[],
+  options: GhRetryOptions = {},
+  knownNoMutation?: (error: unknown) => boolean,
+): boolean {
+  if (blockCommandImmediatelyBeforeSideEffect(command)) return false;
+  runGitHubTextMutation(command, kind, identity, ghArgs, options, knownNoMutation);
+  return true;
 }
 
 function githubMutationRetryAttempts(options: GhRetryOptions): number {
@@ -2795,23 +2869,26 @@ function applyRemoveLabelActions(command: LooseRecord) {
     .filter((action: JsonValue) => action.action === "remove_label")
     .map((action: JsonValue) => String(action.label ?? ""))
     .filter(Boolean);
-  if (labelsToRemove.length === 0) return;
+  if (labelsToRemove.length === 0) return true;
   for (const label of labelsToRemove) {
-    runGitHubBestEffortMutation(
-      command,
-      "label_remove",
-      { repository: command.repo, number: command.issue_number, label },
-      [
-        "issue",
-        "edit",
-        String(command.issue_number),
-        "--repo",
-        command.repo,
-        "--remove-label",
-        label,
-      ],
-      githubNotFoundNoMutation,
-    );
+    if (
+      !runBestEffortCommandMutation(
+        command,
+        "label_remove",
+        { repository: command.repo, number: command.issue_number, label },
+        [
+          "issue",
+          "edit",
+          String(command.issue_number),
+          "--repo",
+          command.repo,
+          "--remove-label",
+          label,
+        ],
+        githubNotFoundNoMutation,
+      )
+    )
+      return false;
   }
   command.target = {
     ...command.target,
@@ -2824,6 +2901,7 @@ function applyRemoveLabelActions(command: LooseRecord) {
       ? { ...action, status: "executed", label: action.label }
       : action,
   );
+  return true;
 }
 
 function applyLabelActions(command: LooseRecord) {
@@ -2831,21 +2909,37 @@ function applyLabelActions(command: LooseRecord) {
     .filter((action: JsonValue) => action.action === "label")
     .map((action: JsonValue) => String(action.label ?? ""))
     .filter(Boolean);
-  if (labels.length === 0) return;
+  if (labels.length === 0) return true;
   for (const label of labels) {
-    if (label === AUTOMERGE_LABEL || label === AUTOFIX_LABEL) ensureRepairLoopLabel(command, label);
-    runGitHubBestEffortMutation(
-      command,
-      "label_add",
-      { repository: command.repo, number: command.issue_number, label },
-      ["issue", "edit", String(command.issue_number), "--repo", command.repo, "--add-label", label],
-      githubAlreadyExistsNoMutation,
-    );
+    if (
+      (label === AUTOMERGE_LABEL || label === AUTOFIX_LABEL) &&
+      !ensureRepairLoopLabel(command, label)
+    )
+      return false;
+    if (
+      !runBestEffortCommandMutation(
+        command,
+        "label_add",
+        { repository: command.repo, number: command.issue_number, label },
+        [
+          "issue",
+          "edit",
+          String(command.issue_number),
+          "--repo",
+          command.repo,
+          "--add-label",
+          label,
+        ],
+        githubAlreadyExistsNoMutation,
+      )
+    )
+      return false;
   }
   command.target = {
     ...command.target,
     labels: [...new Set([...(command.target?.labels ?? []), ...labels])],
   };
+  return true;
 }
 
 function applyDescriptionNoteActions(command: LooseRecord) {
@@ -2853,7 +2947,7 @@ function applyDescriptionNoteActions(command: LooseRecord) {
     .filter((action: JsonValue) => action.action === "update_description_note")
     .map((action: JsonValue) => String(action.note ?? "").trim())
     .filter(Boolean);
-  if (notes.length === 0) return;
+  if (notes.length === 0) return true;
   let body = String(command.target?.body ?? "").trimEnd();
   for (const note of notes) {
     body = body.includes(PROOF_OVERRIDE_DESCRIPTION_MARKER)
@@ -2864,24 +2958,28 @@ function applyDescriptionNoteActions(command: LooseRecord) {
       : `${body}${body ? "\n\n" : ""}${note}`;
   }
   const payloadPath = writePayload(repoRoot(), `pr-description-${command.issue_number}`, { body });
-  runGitHubTextMutation(
-    command,
-    "description_update",
-    {
-      repository: command.repo,
-      number: command.issue_number,
-      bodySha256: commentBodySha256(body),
-    },
-    [
-      "api",
-      `repos/${command.repo}/issues/${command.issue_number}`,
-      "--method",
-      "PATCH",
-      "--input",
-      payloadPath,
-    ],
-  );
+  if (
+    !runTextCommandMutation(
+      command,
+      "description_update",
+      {
+        repository: command.repo,
+        number: command.issue_number,
+        bodySha256: commentBodySha256(body),
+      },
+      [
+        "api",
+        `repos/${command.repo}/issues/${command.issue_number}`,
+        "--method",
+        "PATCH",
+        "--input",
+        payloadPath,
+      ],
+    )
+  )
+    return false;
   command.target = { ...command.target, body };
+  return true;
 }
 
 function workerCapacityRequests(commands: LooseRecord[]) {
@@ -2916,62 +3014,72 @@ function usesAutomergeRepairLane(command: LooseRecord) {
 function applyRepairLoopOptIn(command: LooseRecord) {
   const modeLabel = command.intent === "autofix" ? AUTOFIX_LABEL : AUTOMERGE_LABEL;
   const oppositeModeLabel = command.intent === "autofix" ? AUTOMERGE_LABEL : AUTOFIX_LABEL;
-  ensureRepairLoopLabel(command, modeLabel);
+  if (!ensureRepairLoopLabel(command, modeLabel)) return false;
 
   const labels = new Set((command.target?.labels ?? []).map((label: JsonValue) => String(label)));
   for (const pausedLabel of pauseLabelsOn(command.target)) {
-    runGitHubBestEffortMutation(
-      command,
-      "label_remove",
-      { repository: command.repo, number: command.issue_number, label: pausedLabel },
-      [
-        "issue",
-        "edit",
-        String(command.issue_number),
-        "--repo",
-        command.repo,
-        "--remove-label",
-        pausedLabel,
-      ],
-      githubNotFoundNoMutation,
-    );
+    if (
+      !runBestEffortCommandMutation(
+        command,
+        "label_remove",
+        { repository: command.repo, number: command.issue_number, label: pausedLabel },
+        [
+          "issue",
+          "edit",
+          String(command.issue_number),
+          "--repo",
+          command.repo,
+          "--remove-label",
+          pausedLabel,
+        ],
+        githubNotFoundNoMutation,
+      )
+    )
+      return false;
     labels.delete(pausedLabel);
   }
   if (labels.has(oppositeModeLabel)) {
-    runGitHubBestEffortMutation(
+    if (
+      !runBestEffortCommandMutation(
+        command,
+        "label_remove",
+        { repository: command.repo, number: command.issue_number, label: oppositeModeLabel },
+        [
+          "issue",
+          "edit",
+          String(command.issue_number),
+          "--repo",
+          command.repo,
+          "--remove-label",
+          oppositeModeLabel,
+        ],
+        githubNotFoundNoMutation,
+      )
+    )
+      return false;
+    labels.delete(oppositeModeLabel);
+  }
+  if (
+    !runBestEffortCommandMutation(
       command,
-      "label_remove",
-      { repository: command.repo, number: command.issue_number, label: oppositeModeLabel },
+      "label_add",
+      { repository: command.repo, number: command.issue_number, label: modeLabel },
       [
         "issue",
         "edit",
         String(command.issue_number),
         "--repo",
         command.repo,
-        "--remove-label",
-        oppositeModeLabel,
+        "--add-label",
+        modeLabel,
       ],
-      githubNotFoundNoMutation,
-    );
-    labels.delete(oppositeModeLabel);
-  }
-  runGitHubBestEffortMutation(
-    command,
-    "label_add",
-    { repository: command.repo, number: command.issue_number, label: modeLabel },
-    [
-      "issue",
-      "edit",
-      String(command.issue_number),
-      "--repo",
-      command.repo,
-      "--add-label",
-      modeLabel,
-    ],
-    githubAlreadyExistsNoMutation,
-  );
+      githubAlreadyExistsNoMutation,
+    )
+  )
+    return false;
   labels.add(modeLabel);
   command.target = { ...command.target, labels: [...labels] };
+  return true;
 }
 
 function acknowledgeSkippedMaintainerCommand(command: LooseRecord) {
@@ -3008,20 +3116,26 @@ function ensureAutomergeJob(command: LooseRecord) {
   const absolute = path.join(repoRoot(), relative);
   let statusDetail = "existing";
   if (!fs.existsSync(absolute)) {
-    fs.mkdirSync(path.dirname(absolute), { recursive: true });
-    fs.writeFileSync(
-      absolute,
-      renderAutomergeJob({
-        repo: command.repo,
-        issueNumber: command.issue_number,
-        title: command.target.title,
-        repairMode: repairJobModeForCommand(command),
-        author: command.author,
-        authorId: command.author_id,
-        commentUrl: command.comment_url,
-        automergeInstructions: command.automerge_instructions,
-      }),
-    );
+    if (
+      !runFileCommandMutation(command, () => {
+        fs.mkdirSync(path.dirname(absolute), { recursive: true });
+        fs.writeFileSync(
+          absolute,
+          renderAutomergeJob({
+            repo: command.repo,
+            issueNumber: command.issue_number,
+            title: command.target.title,
+            repairMode: repairJobModeForCommand(command),
+            author: command.author,
+            authorId: command.author_id,
+            commentUrl: command.comment_url,
+            automergeInstructions: command.automerge_instructions,
+          }),
+        );
+      })
+    ) {
+      return { status_detail: "guard_blocked" };
+    }
     statusDetail = "written";
   }
 
@@ -3049,10 +3163,16 @@ function ensureIssueImplementationJob(command: LooseRecord) {
     if (command.operator_override === true) {
       const absolute = path.join(repoRoot(), command.target.job_path);
       if (fs.existsSync(absolute)) {
-        fs.writeFileSync(
-          absolute,
-          renderIssueImplementationJob(issueImplementationJobOptions(command)),
-        );
+        if (
+          !runFileCommandMutation(command, () =>
+            fs.writeFileSync(
+              absolute,
+              renderIssueImplementationJob(issueImplementationJobOptions(command)),
+            ),
+          )
+        ) {
+          return { status_detail: "guard_blocked" };
+        }
         statusDetail = "written";
       }
     }
@@ -3072,11 +3192,17 @@ function ensureIssueImplementationJob(command: LooseRecord) {
   const absolute = path.join(repoRoot(), relative);
   let statusDetail = "existing";
   if (!fs.existsSync(absolute)) {
-    fs.mkdirSync(path.dirname(absolute), { recursive: true });
-    fs.writeFileSync(
-      absolute,
-      renderIssueImplementationJob(issueImplementationJobOptions(command)),
-    );
+    if (
+      !runFileCommandMutation(command, () => {
+        fs.mkdirSync(path.dirname(absolute), { recursive: true });
+        fs.writeFileSync(
+          absolute,
+          renderIssueImplementationJob(issueImplementationJobOptions(command)),
+        );
+      })
+    ) {
+      return { status_detail: "guard_blocked" };
+    }
     statusDetail = "written";
   }
 
@@ -3738,6 +3864,12 @@ function blockCommandImmediatelyBeforeSideEffect(command: LooseRecord): LooseRec
   };
 }
 
+function runFileCommandMutation(command: LooseRecord, mutation: () => void): boolean {
+  if (blockCommandImmediatelyBeforeSideEffect(command)) return false;
+  mutation();
+  return true;
+}
+
 function finalAutomergeMutationBlock(command: LooseRecord): LooseRecord | null {
   const scheduledBlock = repairLoopReviewDispatchBlockReason(command);
   if (scheduledBlock) {
@@ -3787,6 +3919,12 @@ function finalAutomergeMutationBlock(command: LooseRecord): LooseRecord | null {
   const target = latestAutomergeTarget(command, view);
   const readinessBlock = validateAutomergeReadiness({ command, view, target });
   if (readinessBlock) return automergeReadinessBlockResult(readinessBlock);
+  if (!revalidateCommandImmediatelyBeforeMutation(command)) {
+    return automergeGuardBlockResult(
+      String(command.reason ?? "command was withdrawn before automerge mutation"),
+      String(command.status ?? "") === "waiting",
+    );
+  }
   return null;
 }
 
@@ -3917,13 +4055,29 @@ function executeAutoclose(command: LooseRecord) {
         }
       }
       if (Number(liveTarget.number) !== currentNumber) {
-        postIssueComment(
-          command,
-          liveTarget.number,
-          renderAutocloseLinkedComment(command, liveTarget, reason),
-        );
+        if (
+          !postIssueComment(
+            command,
+            liveTarget.number,
+            renderAutocloseLinkedComment(command, liveTarget, reason),
+          )
+        ) {
+          return {
+            action: "autoclose",
+            status: "guard_blocked",
+            reason: String(command.reason ?? "command was withdrawn before autoclose"),
+            targets: results,
+          };
+        }
       }
-      closeIssueOrPullRequest(command, liveTarget.number, liveTarget.kind);
+      if (!closeIssueOrPullRequest(command, liveTarget.number, liveTarget.kind)) {
+        return {
+          action: "autoclose",
+          status: "guard_blocked",
+          reason: String(command.reason ?? "command was withdrawn before autoclose"),
+          targets: results,
+        };
+      }
       results.push({ ...liveTarget, status: "closed", closed_at: new Date().toISOString() });
     } catch (error) {
       results.push({
@@ -4120,7 +4274,7 @@ function renderAutocloseLinkedComment(command: LooseRecord, target: LooseRecord,
 
 function postIssueComment(command: LooseRecord, number: number, body: string) {
   const payloadPath = writePayload(repoRoot(), `autoclose-comment-${number}`, { body });
-  runGitHubTextMutation(
+  return runTextCommandMutation(
     command,
     "comment_create",
     { repository: command.repo, number, bodySha256: commentBodySha256(body) },
@@ -4137,20 +4291,18 @@ function postIssueComment(command: LooseRecord, number: number, body: string) {
 
 function closeIssueOrPullRequest(command: LooseRecord, number: number, kind: string) {
   if (kind === "pull_request") {
-    runGitHubTextMutation(command, "pull_request_close", { repository: command.repo, number }, [
-      "pr",
-      "close",
-      String(number),
-      "--repo",
-      command.repo,
-    ]);
-    return;
+    return runTextCommandMutation(
+      command,
+      "pull_request_close",
+      { repository: command.repo, number },
+      ["pr", "close", String(number), "--repo", command.repo],
+    );
   }
   const payloadPath = writePayload(repoRoot(), `autoclose-close-${number}`, {
     state: "closed",
     state_reason: "not_planned",
   });
-  runGitHubTextMutation(
+  return runTextCommandMutation(
     command,
     "issue_close",
     { repository: command.repo, number, stateReason: "not_planned" },
@@ -4214,33 +4366,48 @@ function executeAutomerge(command: LooseRecord) {
   if (gateBlock) {
     const humanReviewLabelBlock = finalAutomergeMutationBlock(command);
     if (humanReviewLabelBlock) return humanReviewLabelBlock;
-    ensureHumanReviewLabel(command);
+    if (!ensureHumanReviewLabel(command))
+      return automergeGuardBlockResult(
+        String(command.reason ?? "command was withdrawn before human-review labeling"),
+        String(command.status ?? "") === "waiting",
+      );
     const mergeReadyLabelBlock = finalAutomergeMutationBlock(command);
     if (mergeReadyLabelBlock) return mergeReadyLabelBlock;
-    ensureMergeReadyLabel(command);
+    if (!ensureMergeReadyLabel(command))
+      return automergeGuardBlockResult(
+        String(command.reason ?? "command was withdrawn before merge-ready labeling"),
+        String(command.status ?? "") === "waiting",
+      );
     const issueLabelBlock = finalAutomergeMutationBlock(command);
     if (issueLabelBlock) return issueLabelBlock;
-    runGitHubBestEffortMutation(
-      command,
-      "label_add",
-      {
-        repository: command.repo,
-        number: command.issue_number,
-        labels: [HUMAN_REVIEW_LABEL, MERGE_READY_LABEL],
-      },
-      [
-        "issue",
-        "edit",
-        String(command.issue_number),
-        "--repo",
-        command.repo,
-        "--add-label",
-        HUMAN_REVIEW_LABEL,
-        "--add-label",
-        MERGE_READY_LABEL,
-      ],
-      githubAlreadyExistsNoMutation,
-    );
+    if (
+      !runBestEffortCommandMutation(
+        command,
+        "label_add",
+        {
+          repository: command.repo,
+          number: command.issue_number,
+          labels: [HUMAN_REVIEW_LABEL, MERGE_READY_LABEL],
+        },
+        [
+          "issue",
+          "edit",
+          String(command.issue_number),
+          "--repo",
+          command.repo,
+          "--add-label",
+          HUMAN_REVIEW_LABEL,
+          "--add-label",
+          MERGE_READY_LABEL,
+        ],
+        githubAlreadyExistsNoMutation,
+      )
+    ) {
+      return automergeGuardBlockResult(
+        String(command.reason ?? "command was withdrawn before human-review labeling"),
+        String(command.status ?? "") === "waiting",
+      );
+    }
     return { action: "merge", status: "blocked", reason: gateBlock, merge_method: "squash" };
   }
   const mergeMessage = buildAutomergeSquashMessage({
@@ -4308,28 +4475,39 @@ function executeAutomerge(command: LooseRecord) {
     }
     const mergeReadyLabelBlock = finalAutomergeMutationBlock(command);
     if (mergeReadyLabelBlock) return mergeReadyLabelBlock;
-    ensureMergeReadyLabel(command);
+    if (!ensureMergeReadyLabel(command))
+      return automergeGuardBlockResult(
+        String(command.reason ?? "command was withdrawn before merge-ready labeling"),
+        String(command.status ?? "") === "waiting",
+      );
     const issueLabelBlock = finalAutomergeMutationBlock(command);
     if (issueLabelBlock) return issueLabelBlock;
-    runGitHubBestEffortMutation(
-      command,
-      "label_add",
-      {
-        repository: command.repo,
-        number: command.issue_number,
-        label: MERGE_READY_LABEL,
-      },
-      [
-        "issue",
-        "edit",
-        String(command.issue_number),
-        "--repo",
-        command.repo,
-        "--add-label",
-        MERGE_READY_LABEL,
-      ],
-      githubAlreadyExistsNoMutation,
-    );
+    if (
+      !runBestEffortCommandMutation(
+        command,
+        "label_add",
+        {
+          repository: command.repo,
+          number: command.issue_number,
+          label: MERGE_READY_LABEL,
+        },
+        [
+          "issue",
+          "edit",
+          String(command.issue_number),
+          "--repo",
+          command.repo,
+          "--add-label",
+          MERGE_READY_LABEL,
+        ],
+        githubAlreadyExistsNoMutation,
+      )
+    ) {
+      return automergeGuardBlockResult(
+        String(command.reason ?? "command was withdrawn before merge-ready labeling"),
+        String(command.status ?? "") === "waiting",
+      );
+    }
     return {
       action: "merge",
       status: "blocked",
@@ -5312,33 +5490,39 @@ function postComment(command: LooseRecord, body: string) {
     body: nextBody,
   });
   if (existing?.id) {
-    runGitHubTextMutation(
-      command,
-      "comment_update",
-      {
-        repository: command.repo,
-        commentId: existing.id,
-        bodySha256: commentBodySha256(nextBody),
-      },
-      [
-        "api",
-        `repos/${command.repo}/issues/comments/${existing.id}`,
-        "--method",
-        "PATCH",
-        "--input",
-        payloadPath,
-      ],
-    );
+    if (
+      !runTextCommandMutation(
+        command,
+        "comment_update",
+        {
+          repository: command.repo,
+          commentId: existing.id,
+          bodySha256: commentBodySha256(nextBody),
+        },
+        [
+          "api",
+          `repos/${command.repo}/issues/comments/${existing.id}`,
+          "--method",
+          "PATCH",
+          "--input",
+          payloadPath,
+        ],
+      )
+    )
+      return null;
     const precreatedId = Number(precreated?.id ?? 0) || 0;
     const existingId = Number(existing.id ?? 0) || 0;
     if (existingStatus && precreatedId > 0 && precreatedId !== existingId) {
-      runGitHubBestEffortMutation(
-        command,
-        "ack_comment_delete",
-        { repository: command.repo, commentId: precreatedId },
-        ["api", `repos/${command.repo}/issues/comments/${precreatedId}`, "--method", "DELETE"],
-        githubNotFoundNoMutation,
-      );
+      if (
+        !runBestEffortCommandMutation(
+          command,
+          "ack_comment_delete",
+          { repository: command.repo, commentId: precreatedId },
+          ["api", `repos/${command.repo}/issues/comments/${precreatedId}`, "--method", "DELETE"],
+          githubNotFoundNoMutation,
+        )
+      )
+        return null;
       issueCommentsCache.delete(Number(command.issue_number));
     }
     return {
@@ -5349,23 +5533,26 @@ function postComment(command: LooseRecord, body: string) {
         : {}),
     };
   }
-  runGitHubTextMutation(
-    command,
-    "comment_create",
-    {
-      repository: command.repo,
-      number: command.issue_number,
-      bodySha256: commentBodySha256(nextBody),
-    },
-    [
-      "api",
-      `repos/${command.repo}/issues/${command.issue_number}/comments`,
-      "--method",
-      "POST",
-      "--input",
-      payloadPath,
-    ],
-  );
+  if (
+    !runTextCommandMutation(
+      command,
+      "comment_create",
+      {
+        repository: command.repo,
+        number: command.issue_number,
+        bodySha256: commentBodySha256(nextBody),
+      },
+      [
+        "api",
+        `repos/${command.repo}/issues/${command.issue_number}/comments`,
+        "--method",
+        "POST",
+        "--input",
+        payloadPath,
+      ],
+    )
+  )
+    return null;
   return { mode: "created", comment_id: null };
 }
 
@@ -5424,21 +5611,24 @@ function convergeExactCommentVersionFastPathAck(command: LooseRecord, commentId:
       String(terminal?.body ?? "").trim() || exactCommentVersionMissingTerminalBody(command);
     const body = terminalBody.includes(ackMarker) ? terminalBody : `${ackMarker}\n${terminalBody}`;
     const payloadPath = writePayload(repoRoot(), `comment-router-fast-path-${id}`, { body });
-    runGitHubTextMutation(
-      command,
-      "ack_comment_update",
-      { repository: command.repo, commentId: id, bodySha256: commentBodySha256(body) },
-      [
-        "api",
-        `repos/${command.repo}/issues/comments/${id}`,
-        "--method",
-        "PATCH",
-        "--input",
-        payloadPath,
-      ],
-      {},
-      githubNotFoundNoMutation,
-    );
+    if (
+      !runTextCommandMutation(
+        command,
+        "ack_comment_update",
+        { repository: command.repo, commentId: id, bodySha256: commentBodySha256(body) },
+        [
+          "api",
+          `repos/${command.repo}/issues/comments/${id}`,
+          "--method",
+          "PATCH",
+          "--input",
+          payloadPath,
+        ],
+        {},
+        githubNotFoundNoMutation,
+      )
+    )
+      return "skipped_source_drift";
     issueCommentsCache.delete(Number(command.issue_number));
     return "updated";
   } catch (error) {
@@ -5495,18 +5685,20 @@ function convergePrecreatedCommandAckCommentsInner(command: LooseRecord) {
     commandStatusMarker(command),
   );
   if (!keep) return null;
-  if (prunable.length > 0 && !revalidateCommandImmediatelyBeforeMutation(command)) return null;
   let deleted = false;
   for (const comment of prunable) {
     const id = Number(comment.id ?? 0) || 0;
     if (id <= 0) continue;
-    runGitHubBestEffortMutation(
-      command,
-      "ack_comment_delete",
-      { repository: command.repo, commentId: id },
-      ["api", `repos/${command.repo}/issues/comments/${id}`, "--method", "DELETE"],
-      githubNotFoundNoMutation,
-    );
+    if (
+      !runBestEffortCommandMutation(
+        command,
+        "ack_comment_delete",
+        { repository: command.repo, commentId: id },
+        ["api", `repos/${command.repo}/issues/comments/${id}`, "--method", "DELETE"],
+        githubNotFoundNoMutation,
+      )
+    )
+      return null;
     deleted = true;
   }
   if (deleted) issueCommentsCache.delete(Number(command.issue_number));
@@ -5629,39 +5821,43 @@ function isTrustedStatusComment(comment: LooseRecord) {
 }
 
 function reactToComment(command: LooseRecord, content: string) {
-  if (!command.comment_id) return;
+  if (!command.comment_id) return true;
   const payloadPath = writePayload(
     repoRoot(),
     `comment-router-reaction-${command.comment_id}-${content}`,
     { content },
   );
   try {
-    runGitHubTextMutation(
-      command,
-      "reaction_add",
-      {
-        repository: command.repo,
-        commentId: command.comment_id,
-        content,
-      },
-      [
-        "api",
-        `repos/${command.repo}/issues/comments/${command.comment_id}/reactions`,
-        "--method",
-        "POST",
-        "--input",
-        payloadPath,
-      ],
-      {},
-      githubAlreadyExistsNoMutation,
-    );
+    if (
+      !runTextCommandMutation(
+        command,
+        "reaction_add",
+        {
+          repository: command.repo,
+          commentId: command.comment_id,
+          content,
+        },
+        [
+          "api",
+          `repos/${command.repo}/issues/comments/${command.comment_id}/reactions`,
+          "--method",
+          "POST",
+          "--input",
+          payloadPath,
+        ],
+        {},
+        githubAlreadyExistsNoMutation,
+      )
+    )
+      return false;
   } catch (error) {
     const message = stripAnsi(error?.message ?? error);
-    if (/already exists/i.test(message) || /\b422\b/.test(message)) return;
+    if (/already exists/i.test(message) || /\b422\b/.test(message)) return true;
     console.warn(
       `warning: failed to add ${content} reaction to comment ${command.comment_id}: ${message}`,
     );
   }
+  return true;
 }
 
 function clearTerminalMaintainerCommandReaction(command: LooseRecord) {
@@ -5736,7 +5932,7 @@ function isOwnCommentReaction(reaction: LooseRecord, content: string) {
 }
 
 function ensureAutomergeLabel(command: LooseRecord) {
-  runGitHubBestEffortMutation(
+  return runBestEffortCommandMutation(
     command,
     "label_create",
     { repository: command.repo, label: AUTOMERGE_LABEL },
@@ -5756,7 +5952,7 @@ function ensureAutomergeLabel(command: LooseRecord) {
 }
 
 function ensureAutofixLabel(command: LooseRecord) {
-  runGitHubBestEffortMutation(
+  return runBestEffortCommandMutation(
     command,
     "label_create",
     { repository: command.repo, label: AUTOFIX_LABEL },
@@ -5777,14 +5973,13 @@ function ensureAutofixLabel(command: LooseRecord) {
 
 function ensureRepairLoopLabel(command: LooseRecord, label: string) {
   if (label === AUTOFIX_LABEL) {
-    ensureAutofixLabel(command);
-    return;
+    return ensureAutofixLabel(command);
   }
-  ensureAutomergeLabel(command);
+  return ensureAutomergeLabel(command);
 }
 
 function ensureHumanReviewLabel(command: LooseRecord) {
-  runGitHubBestEffortMutation(
+  return runBestEffortCommandMutation(
     command,
     "label_create",
     { repository: command.repo, label: HUMAN_REVIEW_LABEL },
@@ -5804,7 +5999,7 @@ function ensureHumanReviewLabel(command: LooseRecord) {
 }
 
 function ensureMergeReadyLabel(command: LooseRecord) {
-  runGitHubBestEffortMutation(
+  return runBestEffortCommandMutation(
     command,
     "label_create",
     { repository: command.repo, label: MERGE_READY_LABEL },

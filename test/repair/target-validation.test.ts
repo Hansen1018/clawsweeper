@@ -3919,7 +3919,7 @@ test("changed validation does not retry after its command budget is exhausted", 
   }
 });
 
-test("target validation strips Codex, model, and GitHub write credentials", () => {
+test("target validation strips credentials and trusted workflow ledger identity", () => {
   const secretNames = [
     "OPENAI_API_KEY",
     "CODEX_API_KEY",
@@ -3930,10 +3930,25 @@ test("target validation strips Codex, model, and GitHub write credentials", () =
     "GITHUB_ENV",
     "GITHUB_OUTPUT",
     "GITHUB_PATH",
+    "GITHUB_WORKSPACE",
+    "GITHUB_REPOSITORY",
+    "GITHUB_RUN_ID",
+    "GITHUB_RUN_ATTEMPT",
+    "GITHUB_ACTIONS",
     "GITHUB_STEP_SUMMARY",
+    "RUNNER_WORKSPACE",
+    "RUNNER_TEMP",
     "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
     "ACTIONS_RUNTIME_TOKEN",
+    "ACTIONS_RUNTIME_URL",
+    "ACTIONS_CACHE_URL",
     "CLAWSWEEPER_RULESET_GH_TOKEN",
+    "CLAWSWEEPER_ACTION_LEDGER_FORCE",
+    "CLAWSWEEPER_ACTION_LEDGER_ROOT",
+    "CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT",
+    "CLAWSWEEPER_ACTION_LEDGER_DISPATCH_KEY",
+    "CLAWSWEEPER_CRABFLEET_AGENT_TOKEN",
+    "TARGET_VALIDATION_API_KEY",
   ];
   const secretNameArray = `[${secretNames.map((name) => `'${name}'`).join(",")}]`;
   const cwd = gitPackageFixture({

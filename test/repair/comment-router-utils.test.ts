@@ -97,15 +97,103 @@ function routerLedgerEntry(index: number, status: "waiting" | "claimed" | "execu
     idempotency_key: `command-${commentId}`,
     comment_id: commentId,
     comment_version_key: `${commentId}:2026-07-12T20:00:00Z`,
+    comment_url: `https://github.com/openclaw/openclaw/pull/${commentId}#issuecomment-${commentId}`,
+    comment_created_at: "2026-07-12T20:00:00Z",
     comment_updated_at: "2026-07-12T20:00:00Z",
+    comment_body_sha256: "a".repeat(64),
     processed_at: new Date(Date.UTC(2026, 6, 12, 20, 0, index)).toISOString(),
     repo: "openclaw/openclaw",
     issue_number: index + 1,
+    author: "maintainer",
+    author_id: 1,
+    author_name: null,
+    author_association: "MEMBER",
+    trigger: "mention",
+    command: "re-review",
     status,
     intent: "re_review",
+    trusted_bot: false,
+    trusted_bot_author: null,
+    automation_source: null,
+    repair_reason: null,
+    expected_head_sha: null,
+    finding_id: null,
+    target: null,
     actions: [{ action: "dispatch_clawsweeper", status }],
   };
 }
+
+function writeRawLedger(file: string, value: unknown) {
+  fs.writeFileSync(file, `${JSON.stringify(value)}\n`);
+}
+
+test("ledger reads reject malformed active entries and active-capacity overflow", () => {
+  const root = fs.mkdtempSync(path.join(tmpdir(), "clawsweeper-ledger-schema-"));
+  const malformed = path.join(root, "malformed-entry.json");
+  const oversized = path.join(root, "oversized.json");
+  fs.writeFileSync(
+    malformed,
+    JSON.stringify({
+      commands: [{ ...routerLedgerEntry(0, "waiting"), idempotency_key: "" }],
+    }),
+  );
+  assert.throws(() => readLedger(malformed), /command 1 has invalid idempotency_key/);
+
+  fs.writeFileSync(
+    malformed,
+    JSON.stringify({
+      commands: [
+        {
+          ...routerLedgerEntry(0, "waiting"),
+          target: { kind: "pull_request", forged_workspace: "/tmp/forged" },
+        },
+      ],
+    }),
+  );
+  assert.throws(() => readLedger(malformed), /command 1 has invalid target\.forged_workspace/);
+
+  fs.writeFileSync(
+    malformed,
+    JSON.stringify({
+      commands: [
+        {
+          ...routerLedgerEntry(0, "waiting"),
+          target: { kind: "pull_request", job_path: "jobs/../../outside.md" },
+        },
+      ],
+    }),
+  );
+  assert.throws(() => readLedger(malformed), /command 1 has invalid target\.job_path/);
+
+  fs.writeFileSync(
+    malformed,
+    JSON.stringify({
+      commands: [
+        {
+          ...routerLedgerEntry(0, "claimed"),
+          actions: Array.from({ length: 65 }, () => ({
+            action: "dispatch_clawsweeper",
+            status: "claimed",
+          })),
+        },
+      ],
+    }),
+  );
+  assert.throws(() => readLedger(malformed), /command 1 has invalid actions/);
+
+  fs.writeFileSync(
+    oversized,
+    JSON.stringify({
+      commands: Array.from({ length: COMMENT_ROUTER_LEDGER_ENTRY_LIMIT + 1 }, (_, index) =>
+        routerLedgerEntry(index, index % 2 === 0 ? "waiting" : "claimed"),
+      ),
+    }),
+  );
+  assert.throws(
+    () => readLedger(oversized),
+    /comment router ledger has 1001 commands; maximum is 1000/,
+  );
+});
 
 test("exact terminal comment versions short-circuit duplicate created deliveries", () => {
   const body = "@clawsweeper re-review";
@@ -1725,23 +1813,23 @@ test("readLedger rejects malformed forced replay identity", (t) => {
     processed_at: "2026-07-12T20:05:00Z",
   };
 
-  writeLedger(ledgerPath, {
+  writeRawLedger(ledgerPath, {
     updated_at: null,
     commands: [{ ...base, forced_replay: true }],
   });
   assert.throws(() => readLedger(ledgerPath), /attempt_id must be a non-empty token/);
 
-  writeLedger(ledgerPath, {
+  writeRawLedger(ledgerPath, {
     updated_at: null,
     commands: [{ ...base, attempt_id: "forced-replay-41001" }],
   });
-  assert.throws(() => readLedger(ledgerPath), /requires forced_replay=true/);
+  assert.throws(() => readLedger(ledgerPath), /requires forced_replay=true|invalid forced_replay/);
 
-  writeLedger(ledgerPath, {
+  writeRawLedger(ledgerPath, {
     updated_at: null,
     commands: [{ ...base, forced_replay: "true", attempt_id: "forced-replay-41001" }],
   });
-  assert.throws(() => readLedger(ledgerPath), /requires forced_replay=true/);
+  assert.throws(() => readLedger(ledgerPath), /requires forced_replay=true|invalid forced_replay/);
 });
 
 test("readLedger fails closed on malformed claimed state before restart dispatch", (t) => {
@@ -1749,7 +1837,7 @@ test("readLedger fails closed on malformed claimed state before restart dispatch
   const ledgerPath = path.join(directory, "comment-router.json");
   t.after(() => rmSync(directory, { recursive: true, force: true }));
 
-  writeLedger(ledgerPath, {
+  writeRawLedger(ledgerPath, {
     updated_at: "2026-07-12T20:05:00Z",
     commands: [
       {
@@ -1785,31 +1873,37 @@ test("readLedger validates compact command entry structure", (t) => {
     processed_at: "2026-07-12T20:05:00Z",
   };
 
-  writeLedger(ledgerPath, {
+  writeRawLedger(ledgerPath, {
     updated_at: null,
     commands: [{ ...base, status: "ready" }],
   });
-  assert.throws(() => readLedger(ledgerPath), /command status is invalid/);
+  assert.throws(() => readLedger(ledgerPath), /command status is invalid|invalid status/);
 
-  writeLedger(ledgerPath, {
+  writeRawLedger(ledgerPath, {
     updated_at: null,
     commands: [{ ...base, processed_at: "not-a-timestamp" }],
   });
-  assert.throws(() => readLedger(ledgerPath), /processed_at must be a valid timestamp/);
+  assert.throws(
+    () => readLedger(ledgerPath),
+    /processed_at must be a valid timestamp|invalid processed_at/,
+  );
 
-  writeLedger(ledgerPath, {
+  writeRawLedger(ledgerPath, {
     updated_at: null,
     commands: [{ ...base, actions: {} }],
   });
-  assert.throws(() => readLedger(ledgerPath), /actions must be an array of objects/);
+  assert.throws(
+    () => readLedger(ledgerPath),
+    /actions must be an array of objects|invalid actions/,
+  );
 
-  writeLedger(ledgerPath, {
+  writeRawLedger(ledgerPath, {
     updated_at: null,
     commands: [{ ...base, target: [] }],
   });
-  assert.throws(() => readLedger(ledgerPath), /target must be an object or null/);
+  assert.throws(() => readLedger(ledgerPath), /target must be an object or null|invalid target/);
 
-  writeLedger(ledgerPath, {
+  writeRawLedger(ledgerPath, {
     updated_at: null,
     commands: [
       base,

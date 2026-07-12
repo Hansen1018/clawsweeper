@@ -266,7 +266,7 @@ test("repair workflow resolves producer artifacts by trusted id across rerun att
       /uses: actions\/download-artifact@v8\n\s+with:\n([\s\S]*?)(?=\n\s{6}- (?:name|uses):|\n\n)/g,
     ),
   ];
-  assert.equal(downloadBlocks.length, 16);
+  assert.equal(downloadBlocks.length, 17);
   for (const block of downloadBlocks) {
     assert.match(block[1]!, /artifact-ids: \$\{\{ steps\.[^.]+\.outputs\.artifact_id \}\}/);
     assert.match(block[1]!, /github-token: \$\{\{ github\.token \}\}/);
@@ -282,7 +282,6 @@ test("repair workflow resolves producer artifacts by trusted id across rerun att
     "clawsweeper-repair-authorized",
     "clawsweeper-repair-execution",
     "clawsweeper-repair-validation",
-    "clawsweeper-repair-proof-events",
     "clawsweeper-repair-publication",
   ]) {
     assert.match(workflow, new RegExp(`--prefix ${prefix}`));
@@ -329,7 +328,7 @@ test("repair workflow resolves producer artifacts by trusted id across rerun att
         /CLAWSWEEPER_ALLOW_PRIOR_ARTIFACT: \$\{\{ needs\.[^.]+\.outputs\.producer_attempt != '' && needs\.[^.]+\.outputs\.producer_attempt != github\.run_attempt && '1' \|\| '0' \}\}/g,
       ),
     ].length,
-    8,
+    9,
   );
   assert.match(
     workflow,

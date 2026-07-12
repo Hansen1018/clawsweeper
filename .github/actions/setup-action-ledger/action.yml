@@ -27,11 +27,12 @@ runs:
           worktree_root="$worktree_root/${{ inputs.worktree-path }}"
         fi
         worktree_root="$(cd "$worktree_root" && pwd -P)"
-        output_root="$worktree_root/.clawsweeper-repair/action-ledger-state"
+        output_root="$RUNNER_TEMP/clawsweeper-action-ledger/${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT}/${GITHUB_JOB}"
         mkdir -p "$output_root"
         output_root="$(cd "$output_root" && pwd -P)"
         {
           echo "CLAWSWEEPER_ACTION_LEDGER_FORCE=1"
+          echo "CLAWSWEEPER_ACTION_LEDGER_ROOT=$worktree_root"
           echo "CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT=$output_root"
           echo "GITHUB_RUN_STARTED_AT=$run_started_at"
         } >> "$GITHUB_ENV"

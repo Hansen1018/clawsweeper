@@ -2096,7 +2096,7 @@ function shouldRetryValidationCommand({
   return true;
 }
 
-function targetValidationEnv() {
+export function targetValidationEnv() {
   const env: NodeJS.ProcessEnv = {
     ...process.env,
     CI: process.env.CI ?? "true",
@@ -2108,16 +2108,21 @@ function targetValidationEnv() {
   delete env.CODEX_HOME;
   delete env.GH_TOKEN;
   delete env.GITHUB_TOKEN;
-  delete env.GITHUB_ENV;
-  delete env.GITHUB_OUTPUT;
-  delete env.GITHUB_PATH;
-  delete env.GITHUB_STEP_SUMMARY;
   delete env.ACTIONS_ID_TOKEN_REQUEST_TOKEN;
   delete env.ACTIONS_ID_TOKEN_REQUEST_URL;
   delete env.ACTIONS_RUNTIME_TOKEN;
   delete env.ACTIONS_RUNTIME_URL;
   for (const key of Object.keys(env)) {
-    if (/^CLAWSWEEPER_.*GH_TOKEN$/.test(key)) delete env[key];
+    if (
+      key.startsWith("GITHUB_") ||
+      key.startsWith("RUNNER_") ||
+      key.startsWith("ACTIONS_") ||
+      key.startsWith("CLAWSWEEPER_ACTION_LEDGER_") ||
+      key.startsWith("CLAWSWEEPER_CRABFLEET_") ||
+      /(?:^|_)(?:TOKEN|SECRET|PASSWORD|PRIVATE_KEY|API_KEY|CREDENTIALS?)$/i.test(key)
+    ) {
+      delete env[key];
+    }
   }
   return env;
 }

@@ -2189,7 +2189,7 @@ test("repair workers hydrate only durable jobs from generated state", () => {
   assert.doesNotMatch(reportJob, /target_post_flight_token|permission-pull-requests/);
   assert.match(
     mutateJob,
-    /- publish-proof-action-ledger[\s\S]*if: \$\{\{ needs\.execute\.result == 'success' && needs\.execute\.outputs\.execute_fix_outcome == 'success' && needs\.execute\.outputs\.mutation_ready == 'true' && needs\.validate\.result == 'success' && needs\.report\.result == 'success' && \(needs\.publish-proof-action-ledger\.result == 'success' \|\| \(needs\.publish-proof-action-ledger\.result == 'skipped' && needs\.authorize\.outputs\.checkpoint_recovered == '1'\)\) \}\}/,
+    /- publish-proof-action-ledger[\s\S]*if: \$\{\{ needs\.execute\.result == 'success' && needs\.execute\.outputs\.execute_fix_outcome == 'success' && needs\.execute\.outputs\.mutation_ready == 'true' && needs\.validate\.result == 'success' && needs\.report\.result == 'success' && needs\.publish-proof-action-ledger\.result == 'success' \}\}/,
   );
   assert.match(mutateJob, /repair:execution-handoff -- verify-publication/);
   assert.match(mutateJob, /--publication-receipt-sha256/);

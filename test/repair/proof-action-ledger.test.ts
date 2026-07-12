@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -9,6 +10,7 @@ import {
   recordProofBindingCompleted,
   recordProofStageCompleted,
   recordProofStageFailed,
+  validateProofActionLedgerArtifact,
 } from "../../dist/repair/proof-action-ledger.js";
 import {
   buildStagedProofPlan,
@@ -139,6 +141,59 @@ test("independent staged proof events preserve immutable source and dispatch ide
     const bindingEvidence = evidenceByKind(events[1]);
     assert.equal(bindingEvidence.get("validation_receipt")?.sha256, "6".repeat(64));
     assert.equal(bindingEvidence.get("validation_receipt")?.snapshot_id, plan.plan_id);
+
+    const paths = walk(outputRoot)
+      .filter((file) => file.endsWith(".jsonl"))
+      .map((file) => path.relative(outputRoot, file).split(path.sep).join("/"))
+      .sort();
+    const identity = {
+      schema_version: 1 as const,
+      authorization_sha256: "1".repeat(64),
+      validation_receipt_sha256: "6".repeat(64),
+      paths,
+      events: [stage, binding],
+    };
+    const manifest = {
+      ...identity,
+      identity_sha256: crypto.createHash("sha256").update(JSON.stringify(identity)).digest("hex"),
+    };
+    assert.deepEqual(
+      validateProofActionLedgerArtifact({
+        sourceRoot: outputRoot,
+        manifest,
+        expectedAuthorizationSha256: "1".repeat(64),
+        expectedReceiptSha256: "6".repeat(64),
+      }),
+      events,
+    );
+
+    process.env.GITHUB_WORKFLOW_REF =
+      "openclaw/clawsweeper/.github/workflows/forged.yml@refs/heads/main";
+    assert.throws(
+      () =>
+        validateProofActionLedgerArtifact({
+          sourceRoot: outputRoot,
+          manifest,
+          expectedAuthorizationSha256: "1".repeat(64),
+          expectedReceiptSha256: "6".repeat(64),
+        }),
+      /producer identity is invalid/,
+    );
+    process.env.GITHUB_WORKFLOW_REF =
+      "openclaw/clawsweeper/.github/workflows/repair-cluster-worker.yml@refs/heads/main";
+
+    const forged = path.join(outputRoot, "ledger", "forged.jsonl");
+    fs.writeFileSync(forged, `${JSON.stringify(events[0])}\n`);
+    assert.throws(
+      () =>
+        validateProofActionLedgerArtifact({
+          sourceRoot: outputRoot,
+          manifest,
+          expectedAuthorizationSha256: "1".repeat(64),
+          expectedReceiptSha256: "6".repeat(64),
+        }),
+      /unexpected shard set/,
+    );
   } finally {
     for (const key of Object.keys(process.env)) {
       if (!(key in previous)) delete process.env[key];
@@ -240,64 +295,70 @@ test("failed proof stages preserve the available trace without claiming a bindin
   }
 });
 
-test("proof lifecycle emission stays behind proof creation and receipt binding", () => {
+test("proof lifecycle is created in an isolated trusted job before state credentials", () => {
   const source = readText("src/repair/execution-handoff.ts");
-  const replay = source.indexOf("independentProof = replayStagedValidationProof(");
-  const stage = source.indexOf("const proofStageEvent = recordProofStageCompleted(", replay);
-  const receiptWrite = source.indexOf("writeJson(outputPath, receipt);", stage);
-  const binding = source.indexOf("recordProofBindingCompleted(", receiptWrite);
-
-  assert.ok(replay >= 0);
-  assert.ok(stage > replay);
-  assert.ok(receiptWrite > stage);
-  assert.ok(binding > receiptWrite);
-  assert.match(
-    source.slice(replay, stage),
-    /recordProofStageFailed\(\{[\s\S]*stagedProofTraceFromError\(error\)/,
-  );
+  assert.match(source, /independentProof = replayStagedValidationProof\(/);
+  assert.match(source, /writeJson\(outputPath, receipt\)/);
+  assert.doesNotMatch(source, /recordProof(?:Stage|Binding)/);
 
   const workflow = readText(".github/workflows/repair-cluster-worker.yml");
   const validateJob = workflow.indexOf("\n  validate:");
-  const setupLedger = workflow.indexOf("uses: ./.github/actions/setup-action-ledger", validateJob);
   const replayStep = workflow.indexOf(
     "- name: Independently replay exact repair proof",
     validateJob,
   );
-  const finalize = workflow.indexOf(
-    "- name: Finalize independent staged proof action ledger",
-    replayStep,
-  );
-  const upload = workflow.indexOf(
-    "- name: Upload independent staged proof action ledger",
-    finalize,
-  );
-  const publishJob = workflow.indexOf("\n  publish-proof-action-ledger:", upload);
+  const publishJob = workflow.indexOf("\n  publish-proof-action-ledger:", replayStep);
   const mutateJob = workflow.indexOf("\n  mutate:", publishJob);
+  const publishBlock = workflow.slice(publishJob, mutateJob);
+  const setupLedger = publishBlock.indexOf("uses: ./.github/actions/setup-action-ledger");
+  const createProof = publishBlock.indexOf("- name: Create and validate exact staged proof events");
+  const stateToken = publishBlock.indexOf("- name: Create proof ledger state token");
+  const publishProof = publishBlock.indexOf(
+    "- name: Revalidate and publish exact staged proof events",
+  );
 
   assert.ok(validateJob >= 0);
-  assert.ok(setupLedger > validateJob);
-  assert.ok(replayStep > setupLedger);
-  assert.ok(finalize > replayStep);
-  assert.ok(upload > finalize);
-  assert.ok(publishJob > upload);
+  assert.ok(replayStep > validateJob);
+  assert.ok(publishJob > replayStep);
   assert.ok(mutateJob > publishJob);
-  assert.match(workflow.slice(validateJob, replayStep), /CLAWSWEEPER_ACTION_LEDGER_DISPATCH_KEY/);
+  assert.doesNotMatch(workflow.slice(validateJob, publishJob), /setup-action-ledger/);
+  assert.doesNotMatch(workflow.slice(validateJob, publishJob), /repair:action-ledger/);
   assert.match(
     workflow.slice(validateJob, publishJob),
-    /action_ledger_artifact_digest:[\s\S]*artifact-digest[\s\S]*checkpoint_recovered != '1'[\s\S]*if-no-files-found: error/,
+    /github_output="\$GITHUB_OUTPUT"[\s\S]*GITHUB_\*\|RUNNER_\*\|ACTIONS_\*\|CLAWSWEEPER_ACTION_LEDGER_\*\|CLAWSWEEPER_CRABFLEET_\*[\s\S]*\*_PRIVATE_KEY\|\*_API_KEY[\s\S]*unset "\$name"[\s\S]*repair:execution-handoff -- validate[\s\S]*receipt_sha256=.*jq[\s\S]*>> "\$github_output"/,
   );
-  assert.match(
-    workflow.slice(publishJob, mutateJob),
-    /--message "chore: append staged proof action ledger"/,
-  );
+  assert.ok(setupLedger >= 0);
+  assert.ok(createProof > setupLedger);
+  assert.ok(stateToken > createProof);
+  assert.ok(publishProof > stateToken);
+  assert.match(publishBlock, /Download sealed execution handoff/);
+  assert.match(publishBlock, /Download validation receipt/);
+  assert.match(publishBlock, /GH_TOKEN:\s*""[\s\S]*GITHUB_TOKEN:\s*""[\s\S]*create-proof/);
+  assert.match(publishBlock, /publish-proof[\s\S]*--authorization-sha256[\s\S]*--receipt-sha256/);
+  assert.match(publishBlock, /--message "chore: append staged proof action ledger"/);
   assert.match(
     workflow.slice(mutateJob, mutateJob + 800),
-    /publish-proof-action-ledger[\s\S]*needs\.publish-proof-action-ledger\.result == 'success'[\s\S]*needs\.publish-proof-action-ledger\.result == 'skipped'[\s\S]*needs\.authorize\.outputs\.checkpoint_recovered == '1'/,
+    /needs\.publish-proof-action-ledger\.result == 'success'/,
+  );
+  assert.doesNotMatch(
+    workflow.slice(mutateJob, mutateJob + 800),
+    /publish-proof-action-ledger\.result == 'skipped'/,
   );
 
   const cli = readText("src/repair/action-ledger-cli.ts");
-  assert.match(cli, /flushWorkflowActionEvents\(actionLedgerRoot\(\)\)/);
-  assert.doesNotMatch(cli, /command-action-ledger/);
+  assert.match(cli, /finalizeCommandActionLedgerManifest/);
+  assert.match(cli, /parseCommandActionLedgerManifest/);
+  assert.match(cli, /createProofActionLedgerArtifact/);
+  assert.match(cli, /publishProofActionLedgerArtifact/);
+
+  const setupAction = readText(".github/actions/setup-action-ledger/action.yml");
+  assert.match(setupAction, /CLAWSWEEPER_ACTION_LEDGER_ROOT=\$worktree_root/);
+
+  const targetValidation = readText("src/repair/target-validation.ts");
+  assert.match(targetValidation, /key\.startsWith\("GITHUB_"\)/);
+  assert.match(targetValidation, /key\.startsWith\("RUNNER_"\)/);
+  assert.match(targetValidation, /key\.startsWith\("ACTIONS_"\)/);
+  assert.match(targetValidation, /key\.startsWith\("CLAWSWEEPER_ACTION_LEDGER_"\)/);
 });
 
 function evidenceByKind(event: Record<string, any>): Map<string, Record<string, any>> {

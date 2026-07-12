@@ -9,6 +9,11 @@ import {
   serializeCommandActionLedgerManifest,
 } from "./command-action-ledger-manifest.js";
 import { repoRoot } from "./paths.js";
+import {
+  createProofActionLedgerArtifact,
+  publishProofActionLedgerArtifact,
+  type ProofActionLedgerArtifactManifest,
+} from "./proof-action-ledger.js";
 
 const rawArgv = process.argv.slice(2);
 const [command, ...argv] = rawArgv[0] === "--" ? rawArgv.slice(1) : rawArgv;
@@ -43,26 +48,73 @@ if (command === "finalize") {
       2,
     ),
   );
+} else if (command === "create-proof") {
+  const manifest = await createProofActionLedgerArtifact({
+    root: requiredPath(args.root, "--root"),
+    receiptPath: requiredPath(args.receipt, "--receipt"),
+    expectedAuthorizationSha256: requiredArg(args.authorizationSha256, "--authorization-sha256"),
+    expectedReceiptSha256: requiredArg(args.receiptSha256, "--receipt-sha256"),
+    dispatchKey: args.dispatchKey ?? null,
+    ledgerRoot: actionLedgerRoot(),
+    outputRoot: actionLedgerOutputRoot(),
+  });
+  const manifestPath = requiredPath(args.manifest, "--manifest");
+  fs.mkdirSync(path.dirname(manifestPath), { recursive: true });
+  fs.writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+  console.log(JSON.stringify({ manifest: manifestPath, paths: manifest.paths }, null, 2));
+} else if (command === "publish-proof") {
+  const manifestPath = requiredPath(args.manifest, "--manifest");
+  const manifest = JSON.parse(
+    fs.readFileSync(manifestPath, "utf8"),
+  ) as ProofActionLedgerArtifactManifest;
+  console.log(
+    JSON.stringify(
+      publishProofActionLedgerArtifact({
+        root: requiredPath(args.root, "--root"),
+        receiptPath: requiredPath(args.receipt, "--receipt"),
+        expectedAuthorizationSha256: requiredArg(
+          args.authorizationSha256,
+          "--authorization-sha256",
+        ),
+        expectedReceiptSha256: requiredArg(args.receiptSha256, "--receipt-sha256"),
+        dispatchKey: args.dispatchKey ?? null,
+        sourceRoot: path.resolve(args.sourceRoot ?? actionLedgerOutputRoot()),
+        stateRoot: path.resolve(args.stateRoot ?? repoRoot()),
+        manifest,
+      }),
+      null,
+      2,
+    ),
+  );
 } else {
   throw new Error(
-    "usage: action-ledger-cli.ts <finalize|publish> --lane name [--allow-empty --manifest path --source-root path --state-root path]",
+    "usage: action-ledger-cli.ts <finalize|publish|create-proof|publish-proof> [--allow-empty] [options]",
   );
+}
+
+function actionLedgerRoot(): string {
+  return process.env.CLAWSWEEPER_ACTION_LEDGER_ROOT?.trim() || repoRoot();
 }
 
 function actionLedgerOutputRoot(): string {
   return (
     process.env.CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT?.trim() ||
-    path.join(repoRoot(), ".clawsweeper-repair", "action-ledger-state")
+    path.join(actionLedgerRoot(), ".clawsweeper-repair", "action-ledger-state")
   );
 }
 
 function parseArgs(argv: readonly string[]) {
   const parsed: {
     lane?: string;
-    manifest?: string;
+    allowEmpty?: boolean;
     sourceRoot?: string;
     stateRoot?: string;
-    allowEmpty?: boolean;
+    root?: string;
+    receipt?: string;
+    authorizationSha256?: string;
+    receiptSha256?: string;
+    dispatchKey?: string;
+    manifest?: string;
   } = {};
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
@@ -71,9 +123,24 @@ function parseArgs(argv: readonly string[]) {
     else if (arg === "--source-root") parsed.sourceRoot = requiredValue(argv, ++index, arg);
     else if (arg === "--state-root") parsed.stateRoot = requiredValue(argv, ++index, arg);
     else if (arg === "--allow-empty") parsed.allowEmpty = true;
+    else if (arg === "--root") parsed.root = requiredValue(argv, ++index, arg);
+    else if (arg === "--receipt") parsed.receipt = requiredValue(argv, ++index, arg);
+    else if (arg === "--authorization-sha256")
+      parsed.authorizationSha256 = requiredValue(argv, ++index, arg);
+    else if (arg === "--receipt-sha256") parsed.receiptSha256 = requiredValue(argv, ++index, arg);
+    else if (arg === "--dispatch-key") parsed.dispatchKey = optionalValue(argv, ++index, arg);
     else throw new Error(`unknown argument: ${arg}`);
   }
   return parsed;
+}
+
+function requiredArg(value: string | undefined, flag: string): string {
+  if (!value) throw new Error(`${flag} is required`);
+  return value;
+}
+
+function requiredPath(value: string | undefined, flag: string): string {
+  return path.resolve(requiredArg(value, flag));
 }
 
 function requiredValue(argv: readonly string[], index: number, flag: string): string {
@@ -82,7 +149,8 @@ function requiredValue(argv: readonly string[], index: number, flag: string): st
   return value;
 }
 
-function requiredArg(value: string | undefined, flag: string): string {
-  if (!value) throw new Error(`${flag} is required`);
+function optionalValue(argv: readonly string[], index: number, flag: string): string {
+  const value = argv[index];
+  if (value === undefined || value.startsWith("--")) throw new Error(`${flag} requires a value`);
   return value;
 }

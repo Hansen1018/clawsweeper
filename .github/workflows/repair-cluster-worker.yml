@@ -1035,10 +1035,7 @@ jobs:
       artifact_id: ${{ needs.authorize.outputs.recovery_validation_artifact_id || steps.upload.outputs.artifact-id }}
       artifact_digest: ${{ needs.authorize.outputs.recovery_validation_artifact_digest || steps.upload.outputs.artifact-digest }}
       producer_attempt: ${{ needs.authorize.outputs.checkpoint_recovered == '1' && needs.authorize.outputs.producer_attempt || steps.producer_attempt.outputs.value }}
-      action_ledger_artifact_id: ${{ steps.upload_action_ledger.outputs.artifact-id }}
-      action_ledger_artifact_digest: ${{ steps.upload_action_ledger.outputs.artifact-digest }}
     env:
-      CLAWSWEEPER_ACTION_LEDGER_DISPATCH_KEY: ${{ inputs.dispatch_key }}
       OPENCLAW_LOCAL_CHECK: "0"
     steps:
       - name: Record producer attempt
@@ -1051,10 +1048,7 @@ jobs:
           filter: blob:none
           persist-credentials: false
 
-      - uses: ./.github/actions/setup-action-ledger
-
       - uses: ./.github/actions/setup-pnpm
-        id: validate_setup_pnpm
         env:
           npm_config_ignore_scripts: "true"
         with:
@@ -1096,10 +1090,18 @@ jobs:
           GH_TOKEN: ""
           GITHUB_TOKEN: ""
         run: |
+          github_output="$GITHUB_OUTPUT"
+          while IFS='=' read -r name _; do
+            case "$name" in
+              GITHUB_*|RUNNER_*|ACTIONS_*|CLAWSWEEPER_ACTION_LEDGER_*|CLAWSWEEPER_CRABFLEET_*|*_TOKEN|*_SECRET|*_PASSWORD|*_PRIVATE_KEY|*_API_KEY|*_CREDENTIAL|*_CREDENTIALS) unset "$name" ;;
+            esac
+          done < <(env)
           pnpm run repair:execution-handoff -- validate \
             --root .clawsweeper-repair/execution \
             --authorization-sha256 "${{ needs.authorize.outputs.authorization_sha256 }}" \
             --receipt .clawsweeper-repair/validation/receipt.json
+          receipt_sha256="$(jq -er '.identity_sha256 | strings | select(test("^[a-f0-9]{64}$"))' .clawsweeper-repair/validation/receipt.json)"
+          printf 'receipt_sha256=%s\n' "$receipt_sha256" >> "$github_output"
 
       - name: Resolve checkpointed validation receipt
         id: recovered_validation_artifact
@@ -1146,27 +1148,13 @@ jobs:
           if-no-files-found: error
           retention-days: 90
 
-      - name: Finalize independent staged proof action ledger
-        id: finalize_action_ledger
-        if: ${{ always() && steps.validate_setup_pnpm.outcome == 'success' }}
-        run: pnpm run --silent repair:action-ledger -- finalize
-
-      - name: Upload independent staged proof action ledger
-        id: upload_action_ledger
-        if: ${{ always() && needs.authorize.outputs.checkpoint_recovered != '1' && steps.finalize_action_ledger.outcome == 'success' }}
-        uses: actions/upload-artifact@v7
-        with:
-          name: clawsweeper-repair-proof-events-${{ github.run_id }}-${{ github.run_attempt }}
-          path: .clawsweeper-repair/action-ledger-state/**
-          include-hidden-files: true
-          if-no-files-found: error
-          retention-days: 7
-
   publish-proof-action-ledger:
     name: Publish immutable staged proof action ledger
     needs:
+      - authorize
+      - execute
       - validate
-    if: ${{ always() && needs.validate.outputs.action_ledger_artifact_id != '' }}
+    if: ${{ needs.validate.result == 'success' && needs.validate.outputs.receipt_sha256 != '' && needs.validate.outputs.artifact_id != '' && needs.execute.outputs.artifact_id != '' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -1178,6 +1166,76 @@ jobs:
           ref: ${{ github.sha }}
           filter: blob:none
           persist-credentials: false
+
+      - uses: ./.github/actions/setup-pnpm
+        with:
+          build-script: build:repair
+
+      - name: Resolve sealed execution handoff producer
+        id: execution_artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CLAWSWEEPER_ALLOW_PRIOR_ARTIFACT: ${{ needs.execute.outputs.producer_attempt != '' && needs.execute.outputs.producer_attempt != github.run_attempt && '1' || '0' }}
+        run: |
+          pnpm run repair:resolve-run-artifact -- \
+            --repository "${{ github.repository }}" \
+            --run-id "${{ github.run_id }}" \
+            --current-attempt "${{ github.run_attempt }}" \
+            --prefix clawsweeper-repair-execution \
+            --expected-artifact-id "${{ needs.execute.outputs.artifact_id }}" \
+            --expected-artifact-digest "${{ needs.execute.outputs.artifact_digest }}"
+
+      - name: Download sealed execution handoff
+        uses: actions/download-artifact@v8
+        with:
+          artifact-ids: ${{ steps.execution_artifact.outputs.artifact_id }}
+          path: .clawsweeper-repair/proof-input/execution
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+
+      - name: Resolve validation receipt producer
+        id: validation_artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CLAWSWEEPER_ALLOW_PRIOR_ARTIFACT: ${{ needs.validate.outputs.producer_attempt != '' && needs.validate.outputs.producer_attempt != github.run_attempt && '1' || '0' }}
+        run: |
+          pnpm run repair:resolve-run-artifact -- \
+            --repository "${{ github.repository }}" \
+            --run-id "${{ github.run_id }}" \
+            --current-attempt "${{ github.run_attempt }}" \
+            --prefix clawsweeper-repair-validation \
+            --expected-artifact-id "${{ needs.validate.outputs.artifact_id }}" \
+            --expected-artifact-digest "${{ needs.validate.outputs.artifact_digest }}"
+
+      - name: Download validation receipt
+        uses: actions/download-artifact@v8
+        with:
+          artifact-ids: ${{ steps.validation_artifact.outputs.artifact_id }}
+          path: .clawsweeper-repair/proof-input/validation
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+
+      - name: Prepare isolated trusted proof ledger
+        run: mkdir -p .clawsweeper-repair/trusted-proof-ledger
+
+      - uses: ./.github/actions/setup-action-ledger
+        with:
+          worktree-path: .clawsweeper-repair/trusted-proof-ledger
+
+      - name: Create and validate exact staged proof events
+        env:
+          GH_TOKEN: ""
+          GITHUB_TOKEN: ""
+        run: |
+          pnpm run --silent repair:action-ledger -- create-proof \
+            --root .clawsweeper-repair/proof-input/execution \
+            --receipt .clawsweeper-repair/proof-input/validation/receipt.json \
+            --authorization-sha256 "${{ needs.authorize.outputs.authorization_sha256 }}" \
+            --receipt-sha256 "${{ needs.validate.outputs.receipt_sha256 }}" \
+            --dispatch-key "${{ inputs.dispatch_key }}" \
+            --manifest .clawsweeper-repair/trusted-proof-ledger/proof-manifest.json
 
       - name: Create proof ledger state token
         id: state-token
@@ -1191,45 +1249,24 @@ jobs:
           token: ${{ steps.state-token.outputs.token }}
           fetch-depth: 1
 
-      - uses: ./.github/actions/setup-pnpm
-        with:
-          build-script: build:repair
-
-      - name: Resolve independent staged proof action ledger producer
-        id: proof_action_ledger_artifact
-        env:
-          GH_TOKEN: ${{ github.token }}
-          CLAWSWEEPER_ALLOW_PRIOR_ARTIFACT: ${{ needs.validate.outputs.producer_attempt != '' && needs.validate.outputs.producer_attempt != github.run_attempt && '1' || '0' }}
-        run: |
-          pnpm run repair:resolve-run-artifact -- \
-            --repository "${{ github.repository }}" \
-            --run-id "${{ github.run_id }}" \
-            --current-attempt "${{ github.run_attempt }}" \
-            --prefix clawsweeper-repair-proof-events \
-            --expected-artifact-id "${{ needs.validate.outputs.action_ledger_artifact_id }}" \
-            --expected-artifact-digest "${{ needs.validate.outputs.action_ledger_artifact_digest }}"
-
-      - name: Download independent staged proof action ledger
-        uses: actions/download-artifact@v8
-        with:
-          artifact-ids: ${{ steps.proof_action_ledger_artifact.outputs.artifact_id }}
-          path: .clawsweeper-repair/action-ledger-proof
-          github-token: ${{ github.token }}
-          repository: ${{ github.repository }}
-          run-id: ${{ github.run_id }}
-
-      - name: Publish independent staged proof action events
+      - name: Revalidate and publish exact staged proof events
         run: |
           set -euo pipefail
           test -n "${CLAWSWEEPER_STATE_DIR:-}"
-          source_root=".clawsweeper-repair/action-ledger-proof"
+          source_root=".clawsweeper-repair/trusted-proof-ledger/.clawsweeper-repair/action-ledger-state"
           if [ ! -d "$source_root/ledger" ]; then
-            echo "The uploaded staged proof artifact did not contain action event shards." >&2
+            echo "The trusted staged proof ledger did not contain action event shards." >&2
             exit 1
           fi
           event_paths_file=".artifacts/staged-proof-action-ledger-paths.txt"
           mkdir -p .artifacts
-          pnpm run --silent repair:action-ledger -- publish \
+          pnpm run --silent repair:action-ledger -- publish-proof \
+            --root .clawsweeper-repair/proof-input/execution \
+            --receipt .clawsweeper-repair/proof-input/validation/receipt.json \
+            --authorization-sha256 "${{ needs.authorize.outputs.authorization_sha256 }}" \
+            --receipt-sha256 "${{ needs.validate.outputs.receipt_sha256 }}" \
+            --dispatch-key "${{ inputs.dispatch_key }}" \
+            --manifest .clawsweeper-repair/trusted-proof-ledger/proof-manifest.json \
             --source-root "$source_root" \
             --state-root "$CLAWSWEEPER_STATE_DIR" |
             jq -r '.paths[]?' |
@@ -1541,7 +1578,7 @@ jobs:
       - validate
       - report
       - publish-proof-action-ledger
-    if: ${{ needs.execute.result == 'success' && needs.execute.outputs.execute_fix_outcome == 'success' && needs.execute.outputs.mutation_ready == 'true' && needs.validate.result == 'success' && needs.report.result == 'success' && (needs.publish-proof-action-ledger.result == 'success' || (needs.publish-proof-action-ledger.result == 'skipped' && needs.authorize.outputs.checkpoint_recovered == '1')) }}
+    if: ${{ needs.execute.result == 'success' && needs.execute.outputs.execute_fix_outcome == 'success' && needs.execute.outputs.mutation_ready == 'true' && needs.validate.result == 'success' && needs.report.result == 'success' && needs.publish-proof-action-ledger.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 25
     permissions:

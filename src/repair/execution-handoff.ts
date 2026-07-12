@@ -30,17 +30,11 @@ import {
 import { replacementLabelsToCopy } from "./replacement-labels.js";
 import { hasDeterministicSecuritySignal } from "./security-signals.js";
 import {
-  recordProofBindingCompleted,
-  recordProofStageCompleted,
-  recordProofStageFailed,
-  type ProofActionLedgerContext,
-} from "./proof-action-ledger.js";
-import {
   isPassedStagedProofBundle,
   stagedProofBundle,
   stagedProofPlanArtifact,
-  stagedProofTraceFromError,
   type StagedProofPlanArtifact,
+  type StagedProofTrace,
 } from "./staged-proof-gates.js";
 import {
   buildTargetValidationProofPlan,
@@ -667,64 +661,22 @@ export function validateExecutionHandoff({
     ) {
       throw new Error("execution proof is not bound to the prepared repair head and base");
     }
-    const proofLedgerContext: ProofActionLedgerContext = {
-      repository: authorization.target_repo,
-      clusterId: authorization.cluster_id,
-      source: intent.source,
-      dispatchKey: process.env.CLAWSWEEPER_ACTION_LEDGER_DISPATCH_KEY ?? null,
-      authorizationSha256: expectedAuthorizationSha256,
-      executionManifestSha256: manifest.identity_sha256,
-      executionIntentSha256: intent.identity_sha256,
-      actionIdentitySha256: intent.action_identity_sha256,
-      preparedPublicationSha256: publication.identity_sha256,
-      repairDeltaBaseSha: publication.repair_delta_base_sha,
-      validatedHeadSha: publication.prepared_head_sha,
-      validatedBaseSha: publication.target_base_sha,
-    };
-    const independentProofArtifacts = (() => {
-      let trace = null;
-      let proof: LooseRecord | null = null;
-      try {
-        const independentProof = replayStagedValidationProof(
-          independentlyRequiredPlan,
-          checkout,
-          validationPlan.options,
-          publication.target_base_ref,
-        );
-        trace = independentProof.trace;
-        const plan = stagedProofPlanArtifact(independentProof.plan);
-        if (JSON.stringify(plan) !== JSON.stringify(independentlyRequiredPlan)) {
-          throw new Error("independent validation did not replay the exact normalized proof plan");
-        }
+    const independentProof = replayStagedValidationProof(
+      independentlyRequiredPlan,
+      checkout,
+      validationPlan.options,
+      publication.target_base_ref,
+    );
+    const independentProofPlan = stagedProofPlanArtifact(independentProof.plan);
+    if (JSON.stringify(independentProofPlan) !== JSON.stringify(independentlyRequiredPlan)) {
+      throw new Error("independent validation did not replay the exact normalized proof plan");
+    }
 
-        verifyExecutionHandoff(root, expectedAuthorizationSha256);
-        proof = stagedProofBundle([trace]) as LooseRecord;
-        if (!isPassedStagedProofBundle(proof, plan)) {
-          throw new Error("independent validation proof did not pass");
-        }
-        return { plan, proof, trace };
-      } catch (error) {
-        recordProofStageFailed({
-          context: proofLedgerContext,
-          plan: independentlyRequiredPlan,
-          trace: trace ?? stagedProofTraceFromError(error),
-          proof,
-          error,
-        });
-        throw error;
-      }
-    })();
-    const {
-      plan: independentProofPlan,
-      proof: validationProof,
-      trace: independentProofTrace,
-    } = independentProofArtifacts;
-    const proofStageEvent = recordProofStageCompleted({
-      context: proofLedgerContext,
-      plan: independentProofPlan,
-      trace: independentProofTrace,
-      proof: validationProof,
-    });
+    verifyExecutionHandoff(root, expectedAuthorizationSha256);
+    const validationProof = stagedProofBundle([independentProof.trace]) as LooseRecord;
+    if (!isPassedStagedProofBundle(validationProof, independentProofPlan)) {
+      throw new Error("independent validation proof did not pass");
+    }
     const identity = {
       schema_version: VALIDATION_RECEIPT_SCHEMA_VERSION,
       authorization_sha256: expectedAuthorizationSha256,
@@ -749,13 +701,6 @@ export function validateExecutionHandoff({
       identity_sha256: digestJson(identity),
     };
     writeJson(outputPath, receipt);
-    recordProofBindingCompleted({
-      context: proofLedgerContext,
-      plan: independentProofPlan,
-      proof: validationProof,
-      receiptSha256: receipt.identity_sha256,
-      parentEventId: proofStageEvent?.event_id ?? null,
-    });
     return receipt;
   } finally {
     fs.rmSync(path.dirname(checkout), { recursive: true, force: true });
@@ -815,6 +760,73 @@ export function verifyValidationReceipt({
     throw new Error("validation receipt does not authorize this exact execution handoff");
   }
   return receipt;
+}
+
+export function verifiedProofActionLedgerInput({
+  root,
+  receiptPath,
+  expectedAuthorizationSha256,
+  expectedReceiptSha256,
+  dispatchKey,
+}: {
+  root: string;
+  receiptPath: string;
+  expectedAuthorizationSha256: string;
+  expectedReceiptSha256: string;
+  dispatchKey?: string | null | undefined;
+}): {
+  context: {
+    repository: string;
+    clusterId: string;
+    source: LooseRecord;
+    dispatchKey: string | null;
+    authorizationSha256: string;
+    executionManifestSha256: string;
+    executionIntentSha256: string;
+    actionIdentitySha256: string;
+    preparedPublicationSha256: string;
+    repairDeltaBaseSha: string;
+    validatedHeadSha: string;
+    validatedBaseSha: string;
+  };
+  plan: StagedProofPlanArtifact;
+  trace: StagedProofTrace;
+  proof: LooseRecord;
+  receiptSha256: string;
+} {
+  const receipt = verifyValidationReceipt({
+    root,
+    receiptPath,
+    expectedAuthorizationSha256,
+    expectedReceiptSha256,
+  });
+  const authorization = verifyExecutionAuthorization(root, expectedAuthorizationSha256);
+  const manifest = verifyExecutionHandoff(root, expectedAuthorizationSha256);
+  const intent = readExecutionIntent(root);
+  const publication = verifyAuthorizedPreparedPublication(root, expectedAuthorizationSha256);
+  const traces = receipt.validation_proof.runs;
+  const trace = Array.isArray(traces) ? (traces.at(-1) as StagedProofTrace | undefined) : undefined;
+  if (!trace) throw new Error("validation receipt is missing its final staged proof trace");
+  return {
+    context: {
+      repository: authorization.target_repo,
+      clusterId: authorization.cluster_id,
+      source: intent.source,
+      dispatchKey: dispatchKey?.trim() || null,
+      authorizationSha256: expectedAuthorizationSha256,
+      executionManifestSha256: manifest.identity_sha256,
+      executionIntentSha256: intent.identity_sha256,
+      actionIdentitySha256: intent.action_identity_sha256,
+      preparedPublicationSha256: publication.identity_sha256,
+      repairDeltaBaseSha: publication.repair_delta_base_sha,
+      validatedHeadSha: publication.prepared_head_sha,
+      validatedBaseSha: publication.target_base_sha,
+    },
+    plan: receipt.validation_proof_plan,
+    trace,
+    proof: receipt.validation_proof,
+    receiptSha256: receipt.identity_sha256,
+  };
 }
 
 export function publishValidatedExecution({
