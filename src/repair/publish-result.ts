@@ -2,6 +2,11 @@
 import type { JsonValue, LooseRecord } from "./json-types.js";
 import fs from "node:fs";
 import path from "node:path";
+import {
+  ACTION_EVENT_REASON_CODES,
+  ACTION_EVENT_STATUSES,
+  ACTION_EVENT_TYPES,
+} from "../action-ledger.js";
 import { githubActionsRunUrl, parseArgs, repoRoot } from "./lib.js";
 import { readJsonFile as readJson } from "./json-file.js";
 import { escapeRegExp, slug } from "./text-utils.js";
@@ -30,6 +35,12 @@ import {
   hydrateClosureRows,
   sortNewestClosureRowFirst,
 } from "./publish-tracked-rows.js";
+import {
+  flushRepairActionEvents,
+  recordRepairLifecycleEvent,
+  recordRepairLifecycleFailure,
+  type RepairLifecycleInput,
+} from "./repair-action-ledger.js";
 
 const DASHBOARD_START = "<!-- clawsweeper-repair-dashboard:start -->";
 const DASHBOARD_END = "<!-- clawsweeper-repair-dashboard:end -->";
@@ -52,17 +63,51 @@ const inputs = args._.length > 0 ? args._ : [path.join(root, ".clawsweeper-repai
 const metadataByRunId = readRunMetadata(args["runs-json"]);
 const published: LooseRecord[] = [];
 
-for (const input of inputs) {
-  for (const resultPath of findResultPaths(path.resolve(input))) {
-    const record = publishResult(resultPath);
-    published.push(record);
+await runPublishResult();
+
+async function runPublishResult() {
+  let commandError: unknown = null;
+  try {
+    for (const input of inputs) {
+      for (const resultPath of findResultPaths(path.resolve(input))) {
+        const record = publishResult(resultPath);
+        published.push(record);
+      }
+    }
+
+    writeAggregateApplyReport();
+    recordAggregatePublication("apply_report", "repair-apply-report.json");
+    if (args["write-dashboard"]) {
+      updateDashboard();
+      recordAggregatePublication("repair_dashboard", "docs/repair/README.md");
+    }
+
+    console.log(JSON.stringify({ published: published.length, records: published }, null, 2));
+  } catch (error) {
+    commandError = error;
+    recordRepairLifecycleFailure(aggregateLifecycle("publish_result"), {
+      component: "publish_result",
+      operation: "publication",
+      phase: "publish",
+      error,
+    });
   }
+
+  try {
+    await flushRepairActionEvents();
+  } catch (error) {
+    if (commandError) {
+      console.error(
+        `[action-ledger] failed to finalize result publication receipts: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    } else {
+      commandError = error;
+    }
+  }
+  if (commandError) throw commandError;
 }
-
-writeAggregateApplyReport();
-if (args["write-dashboard"]) updateDashboard();
-
-console.log(JSON.stringify({ published: published.length, records: published }, null, 2));
 
 function publishResult(resultPath: string) {
   const runDir = path.dirname(resultPath);
@@ -156,6 +201,27 @@ function publishResult(resultPath: string) {
   )) {
     writeClosedRecord({ report, action, owner, root });
   }
+
+  recordRepairLifecycleEvent(
+    {
+      repository: repo,
+      workKey: `${repo}:${clusterId}`,
+      clusterId,
+      sourceRevision: headSha,
+      recordPath: path.posix.join("results", owner, `${slug(clusterId)}.md`),
+    },
+    {
+      type: ACTION_EVENT_TYPES.repairPublish,
+      status: ACTION_EVENT_STATUSES.completed,
+      reasonCode: ACTION_EVENT_REASON_CODES.published,
+      mutation: true,
+      component: "publish_result",
+      operation: "publication",
+      state: "published",
+      publicationKind: "cluster_result",
+      idempotencySlot: `cluster_result:${runId || clusterId}`,
+    },
+  );
 
   return {
     cluster_id: report.cluster_id,
@@ -417,6 +483,35 @@ function writeAggregateApplyReport() {
     `${JSON.stringify(uniquePlainActionRows(rows), null, 2)}\n`,
     "utf8",
   );
+}
+
+function recordAggregatePublication(publicationKind: string, recordPath: string) {
+  recordRepairLifecycleEvent(aggregateLifecycle(publicationKind, recordPath), {
+    type:
+      publicationKind === "repair_dashboard"
+        ? ACTION_EVENT_TYPES.dashboardLifecycle
+        : ACTION_EVENT_TYPES.publicationLifecycle,
+    status: ACTION_EVENT_STATUSES.completed,
+    reasonCode: ACTION_EVENT_REASON_CODES.published,
+    mutation: true,
+    component: "publish_result",
+    operation: "publication",
+    state: "published",
+    publicationKind,
+    idempotencySlot: `${publicationKind}:${String(args["run-id"] ?? "latest")}`,
+  });
+}
+
+function aggregateLifecycle(publicationKind: string, recordPath?: string): RepairLifecycleInput {
+  const repository = String(process.env.GITHUB_REPOSITORY ?? "openclaw/clawsweeper");
+  const runId = String(args["run-id"] ?? process.env.GITHUB_RUN_ID ?? "local");
+  return {
+    repository,
+    workKey: `${repository}:${publicationKind}:${runId}`,
+    clusterId: `publication-${publicationKind}`,
+    sourceRevision: String(args["head-sha"] ?? process.env.GITHUB_SHA ?? ""),
+    ...(recordPath ? { recordPath } : {}),
+  };
 }
 
 function summarizeActions(actions: LooseRecord[]) {
