@@ -110,7 +110,7 @@ import {
   selectCommentsForRouting,
   selectRouterItemFanoutPage,
   shouldSuppressProcessedCommentVersion,
-  stageForcedReplayCommands,
+  stageSelectedRouterCommands,
   stripAnsi,
   supersededReReviewCommentVersions,
   summarizeChecks,
@@ -127,8 +127,9 @@ import {
   ghErrorText,
   ghJsonWithRetry as ghJson,
   ghJsonWithRetryAsync as ghJsonAsync,
+  ghPagedLimitWithRetry as ghPagedLimit,
+  ghPagedLimitWithRetryAsync as ghPagedLimitAsync,
   ghPagedWithRetry as ghPaged,
-  ghPagedWithRetryAsync as ghPagedAsync,
   ghSpawn,
   ghText,
   type GhRetryOptions,
@@ -165,6 +166,7 @@ const {
   execute,
   forceReprocess,
   attemptId,
+  stageSelectedCommands,
   writeReport,
   waitForCapacity,
   maxLiveWorkers,
@@ -251,14 +253,23 @@ const collaboratorPermissionCache = new Map();
 const activeRepairRunsByPrefix = new Map<string, LooseRecord[]>();
 const liveTargetCache = new Map<number, LooseRecord>();
 const issueCommentsCache = new Map<number, JsonValue[]>();
+const candidateIssueCommentCache = new Map<string, LooseRecord | null>();
 const MAX_MEDIA_PREPROCESSING_TIMEOUT_MS = 480_000;
 const PROOF_OVERRIDE_DESCRIPTION_MARKER = "<!-- clawsweeper-proof-override-note -->";
 const cachedIssueComments = createCachedIssueCommentsLookup(
-  (number) => ghPaged<JsonValue>(`repos/${targetRepo}/issues/${number}/comments?per_page=100`),
+  (number) =>
+    ghPagedLimit<JsonValue>(
+      `repos/${targetRepo}/issues/${number}/comments?since=${encodeURIComponent(since)}`,
+      maxComments,
+    ),
   issueCommentsCache,
 );
 const cachedIssueCommentsAsync = createCachedIssueCommentsLookupAsync(
-  (number) => ghPagedAsync<JsonValue>(`repos/${targetRepo}/issues/${number}/comments?per_page=100`),
+  (number) =>
+    ghPagedLimitAsync<JsonValue>(
+      `repos/${targetRepo}/issues/${number}/comments?since=${encodeURIComponent(since)}`,
+      maxComments,
+    ),
   issueCommentsCache,
 );
 const openIssueNumbersByLabel = createCachedLabelNumberLookup((label) =>
@@ -281,9 +292,7 @@ for (const comment of comments) {
 }
 let supersededReReviewVersions = supersededReReviewCommentVersions(rawCommands);
 
-await measureAsync("prehydrate_comment_commands", () =>
-  prehydrateCommandLookups(rawCommands, { refreshIssueComments: true }),
-);
+await measureAsync("prehydrate_comment_commands", () => prehydrateCommandLookups(rawCommands));
 const classifiedCommentCommands = measure("classify_comment_commands", () =>
   rawCommands.map((command) => classifyAndRecordCommand(command)),
 );
@@ -297,9 +306,7 @@ for (const command of repairLoopSweepSelection.commands) {
 }
 
 const sweepCommands = rawCommands.slice(classifiedCommentCommands.length);
-await measureAsync("prehydrate_repair_loop_sweeps", () =>
-  prehydrateCommandLookups(sweepCommands, { refreshIssueComments: true }),
-);
+await measureAsync("prehydrate_repair_loop_sweeps", () => prehydrateCommandLookups(sweepCommands));
 const commands = [
   ...classifiedCommentCommands,
   ...measure("classify_repair_loop_sweeps", () =>
@@ -342,13 +349,6 @@ const report: LooseRecord = {
   exact_comment_version_fast_path: exactCommentVersionFastPath,
   short_circuited: exactCommentVersionFastPath.suppress,
 };
-
-if (!execute && forceReprocess && writeReport && itemNumbers.size !== 1) {
-  const staged = stageForcedReplayCommands(commands, attemptId!);
-  report.forced_replay_staged = staged.length;
-  report.ledger_staged = measure("stage_forced_replays", () => appendLedger(ledger, staged));
-  if (report.ledger_staged) writeLedger(ledgerPath(), ledger);
-}
 
 if (execute && exactCommentVersionFastPath.suppress && exactCommentVersionFastPathCommand) {
   const versionStillCurrent = measure("verify_exact_comment_version_cleanup", () =>
@@ -411,6 +411,30 @@ if (execute && exactCommentVersionFastPath.suppress && exactCommentVersionFastPa
     report.exact_comment_version_fast_path = exactCommentVersionFastPath;
     report.short_circuited = false;
   }
+}
+
+if (!execute && stageSelectedCommands && writeReport) {
+  const selectedItems = new Set<number>(routerItemFanout.selected_item_numbers ?? []);
+  const staged = stageSelectedRouterCommands({
+    commands,
+    selectedItemNumbers: selectedItems,
+    forcedReplay: forceReprocess,
+    attemptId,
+  });
+  for (const stagedCommand of staged) {
+    const command = commands.find(
+      (candidate) =>
+        (stagedCommand.comment_version_key &&
+          candidate.comment_version_key === stagedCommand.comment_version_key) ||
+        (!stagedCommand.comment_version_key &&
+          candidate.idempotency_key === stagedCommand.idempotency_key),
+    );
+    if (command) Object.assign(command, stagedCommand);
+  }
+  report.commands_staged = staged.length;
+  report.actionable = commands.filter((command: JsonValue) => command.status === "ready").length;
+  report.ledger_staged = measure("stage_selected_commands", () => appendLedger(ledger, staged));
+  if (report.ledger_staged) writeLedger(ledgerPath(), ledger);
 }
 
 if (execute && !exactCommentVersionFastPath.suppress) {
@@ -4236,11 +4260,13 @@ function listCandidateComments() {
     };
   }
   if (itemNumbers.size > 0) {
+    const durable = listDurableRouterComments([...itemNumbers]);
     return {
       ...emptyCandidateSelection(),
       comments: selectCommentsForRouting({
-        recentComments: [],
-        durableComments: [...itemNumbers].flatMap((number) => issueCommentsFor(number)),
+        recentComments: [...itemNumbers].flatMap((number) => issueCommentsFor(number)),
+        durableComments: durable.markerComments,
+        priorityComments: [...forwardedExactComments(), ...durable.pendingComments],
         maxComments,
       }),
     };
@@ -4251,7 +4277,7 @@ function listCandidateComments() {
       comments: selectCommentsForRouting({
         recentComments: [...effectiveCommentIds]
           .filter((commentId) => /^[1-9]\d*$/.test(commentId))
-          .map((commentId) => fetchIssueComment(commentId))
+          .map((commentId) => fetchCandidateIssueComment(commentId))
           .filter((comment) => comment !== null),
         durableComments: [],
         maxComments,
@@ -4275,12 +4301,14 @@ function listCandidateComments() {
     limit: maxComments,
   });
   const selectedItems = new Set(broadPage.itemNumbers);
+  const durable = listDurableRouterComments(broadPage.itemNumbers);
   return {
     comments: selectCommentsForRouting({
       recentComments: recentComments.filter((comment) =>
         selectedItems.has(issueNumberFromUrl(comment.issue_url)),
       ),
-      durableComments: listDurableRouterComments(broadPage.itemNumbers),
+      durableComments: durable.markerComments,
+      priorityComments: durable.pendingComments,
       maxComments,
     }),
     broadPage,
@@ -4291,7 +4319,7 @@ function listCandidateComments() {
 function forwardedExactComments() {
   return [...effectiveCommentIds]
     .filter((commentId) => /^[1-9]\d*$/.test(commentId))
-    .map((commentId) => fetchIssueComment(commentId))
+    .map((commentId) => fetchCandidateIssueComment(commentId))
     .filter(
       (comment): comment is LooseRecord =>
         comment !== null && itemNumbers.has(issueNumberFromUrl(comment.issue_url) ?? 0),
@@ -4327,28 +4355,34 @@ function listRepairLoopTargets(): RepairLoopTarget[] {
 }
 
 function listDurableRouterComments(numbers: number[]) {
-  const pendingCommentIds = new Set(
-    (ledger.commands ?? [])
-      .filter((command: JsonValue) =>
-        ["waiting", "claimed"].includes(String(command?.status ?? "")),
-      )
-      .filter(
-        (command: JsonValue) =>
-          String(command?.repo ?? "")
-            .trim()
-            .toLowerCase() === targetRepo.toLowerCase(),
-      )
-      .filter((command: JsonValue) => numbers.includes(Number(command?.issue_number)))
-      .map((command: JsonValue) => String(command?.comment_id ?? ""))
-      .filter((commentId: string) => /^[1-9]\d*$/.test(commentId)),
-  );
-  return numbers.flatMap((number) =>
-    issueCommentsFor(number).filter(
-      (comment: JsonValue) =>
-        isClawSweeperReviewMarkerComment(comment) ||
-        pendingCommentIds.has(String(comment?.id ?? "")),
+  const selectedItems = new Set(numbers);
+  const pendingCommentIds = [
+    ...new Set(
+      (ledger.commands ?? [])
+        .filter((command: JsonValue) =>
+          ["waiting", "claimed"].includes(String(command?.status ?? "")),
+        )
+        .filter(
+          (command: JsonValue) =>
+            String(command?.repo ?? "")
+              .trim()
+              .toLowerCase() === targetRepo.toLowerCase(),
+        )
+        .filter((command: JsonValue) => selectedItems.has(Number(command?.issue_number)))
+        .map((command: JsonValue) => String(command?.comment_id ?? ""))
+        .filter((commentId: string) => /^[1-9]\d*$/.test(commentId)),
     ),
-  );
+  ];
+  return {
+    pendingComments: pendingCommentIds
+      .map((commentId) => fetchCandidateIssueComment(commentId))
+      .filter((comment): comment is LooseRecord => comment !== null),
+    markerComments: numbers.flatMap((number) =>
+      issueCommentsFor(number).filter((comment: JsonValue) =>
+        isClawSweeperReviewMarkerComment(comment),
+      ),
+    ),
+  };
 }
 
 function listRepairLoopSweepCommands(
@@ -4485,6 +4519,16 @@ function fetchIssueComment(commentId: JsonValue): LooseRecord | null {
     }
     throw error;
   }
+}
+
+function fetchCandidateIssueComment(commentId: JsonValue): LooseRecord | null {
+  const key = String(commentId ?? "");
+  if (candidateIssueCommentCache.has(key)) {
+    return candidateIssueCommentCache.get(key) ?? null;
+  }
+  const comment = fetchIssueComment(commentId);
+  candidateIssueCommentCache.set(key, comment);
+  return comment;
 }
 
 function isGitHubNotFoundError(error: unknown) {

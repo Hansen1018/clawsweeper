@@ -112,18 +112,24 @@ export function ghPagedLimit<T = JsonValue>(
   limit: number,
   options: GhRunOptions = {},
 ): T[] {
+  return collectLimitedPages(limit, (perPage, page) =>
+    ghJson<JsonValue[]>(["api", githubLimitedPagePath(apiPath, perPage, page)], options),
+  );
+}
+
+export function collectLimitedPages<T>(
+  limit: number,
+  fetchPage: (perPage: number, page: number) => T[],
+): T[] {
   const max = Number.isFinite(limit) ? Math.max(0, Math.floor(limit)) : 0;
   if (max <= 0) return [];
 
   const perPage = Math.min(100, max);
   const out: T[] = [];
   for (let page = 1; out.length < max; page += 1) {
-    const entries = ghJson<JsonValue[]>(
-      ["api", githubLimitedPagePath(apiPath, perPage, page)],
-      options,
-    );
+    const entries = fetchPage(perPage, page);
     if (!Array.isArray(entries) || entries.length === 0) break;
-    out.push(...(entries as T[]));
+    out.push(...entries);
     if (entries.length < perPage) break;
   }
   return out.slice(0, max);
@@ -148,6 +154,38 @@ export function ghPagedLimitWithRetry<T = JsonValue>(
     }
   }
   throw lastError instanceof Error ? lastError : new Error(String(lastError));
+}
+
+export async function ghPagedLimitWithRetryAsync<T = JsonValue>(
+  apiPath: string,
+  limit: number,
+  options: GhRetryOptions | number = {},
+): Promise<T[]> {
+  const resolved = resolveRetryOptions(options);
+  return collectLimitedPagesAsync(limit, (perPage, page) =>
+    ghJsonWithRetryAsync<JsonValue[]>(
+      ["api", githubLimitedPagePath(apiPath, perPage, page)],
+      resolved,
+    ),
+  );
+}
+
+export async function collectLimitedPagesAsync<T>(
+  limit: number,
+  fetchPage: (perPage: number, page: number) => Promise<T[]>,
+): Promise<T[]> {
+  const max = Number.isFinite(limit) ? Math.max(0, Math.floor(limit)) : 0;
+  if (max <= 0) return [];
+
+  const perPage = Math.min(100, max);
+  const out: T[] = [];
+  for (let page = 1; out.length < max; page += 1) {
+    const entries = await fetchPage(perPage, page);
+    if (!Array.isArray(entries) || entries.length === 0) break;
+    out.push(...entries);
+    if (entries.length < perPage) break;
+  }
+  return out.slice(0, max);
 }
 
 export function ghText(ghArgs: string[], options: GhRunOptions = {}): string {

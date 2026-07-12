@@ -31,6 +31,7 @@ import {
   shouldSuppressProcessedCommentVersion,
   sortCommentsForRouting,
   stageForcedReplayCommands,
+  stageSelectedRouterCommands,
   supersededReReviewCommentVersions,
   summarizeChecks,
   writeLedger,
@@ -466,7 +467,88 @@ test("coalesced same-item forced replays recover every durable pending comment",
   );
 });
 
-test("comment router ledger merge preserves disjoint claims and attempt progress", () => {
+test("selected fanout commands are staged durably and idempotently before dispatch", () => {
+  const commands = [42, 43, 44].map((issueNumber) => ({
+    idempotency_key: `command-${issueNumber}`,
+    comment_id: String(1000 + issueNumber),
+    comment_version_key: `${1000 + issueNumber}:2026-07-12T20:00:00Z`,
+    comment_updated_at: "2026-07-12T20:00:00Z",
+    repo: "openclaw/openclaw",
+    issue_number: issueNumber,
+    status: "ready",
+    intent: "re_review",
+    actions: [{ action: "dispatch_clawsweeper", status: "planned" }],
+  }));
+  const ledger = { updated_at: null, commands: [] };
+  const staged = stageSelectedRouterCommands({
+    commands,
+    selectedItemNumbers: new Set([42, 43]),
+    processedAt: "2026-07-12T20:01:00Z",
+  });
+
+  assert.deepEqual(
+    staged.map((entry) => [entry.issue_number, entry.status, entry.actions[0]?.status]),
+    [
+      [42, "waiting", "waiting"],
+      [43, "waiting", "waiting"],
+    ],
+  );
+  assert.equal(appendLedger(ledger, staged), true);
+  assert.equal(appendLedger(ledger, staged), false);
+  assert.deepEqual(routerPendingItemNumbers(ledger.commands, "openclaw/openclaw"), [42, 43]);
+});
+
+test("continuation staging cannot downgrade an exact-lane terminal result", () => {
+  const command = {
+    idempotency_key: "command-42",
+    comment_id: "1042",
+    comment_version_key: "1042:2026-07-12T20:00:00Z",
+    comment_updated_at: "2026-07-12T20:00:00Z",
+    repo: "openclaw/openclaw",
+    issue_number: 42,
+    status: "ready",
+    intent: "re_review",
+    actions: [{ action: "dispatch_clawsweeper", status: "planned" }],
+  };
+  const continuation = { updated_at: null, commands: [] };
+  const exactLane = { updated_at: null, commands: [] };
+  appendLedger(
+    continuation,
+    stageSelectedRouterCommands({
+      commands: [command],
+      selectedItemNumbers: new Set([42]),
+      forcedReplay: true,
+      attemptId: "forced-replay-41001",
+      processedAt: "2026-07-12T20:05:00Z",
+    }),
+  );
+  appendLedger(exactLane, [
+    {
+      ...command,
+      status: "executed",
+      processed_at: "2026-07-12T20:04:00Z",
+      actions: [{ action: "dispatch_clawsweeper", status: "executed" }],
+    },
+  ]);
+
+  const merged = mergeCommentRouterLedgers(continuation, exactLane);
+  assert.equal(merged.commands[0]?.status, "executed");
+  assert.equal(merged.commands[0]?.actions[0]?.status, "executed");
+});
+
+test("forced replay staging fails closed without a durable attempt id", () => {
+  assert.throws(
+    () =>
+      stageSelectedRouterCommands({
+        commands: [],
+        selectedItemNumbers: new Set(),
+        forcedReplay: true,
+      }),
+    /requires an attempt id/,
+  );
+});
+
+test("comment router ledger merge preserves disjoint claims and terminal progress", () => {
   const firstClaim = {
     idempotency_key: "repair-loop-label-sweep:openclaw/openclaw:autofix:101",
     comment_id: "repair-loop-label-sweep:autofix:101",
@@ -505,8 +587,8 @@ test("comment router ledger merge preserves disjoint claims and attempt progress
   assert.deepEqual(
     merged.commands.map((entry) => [entry.issue_number, entry.status, entry.processed_at]),
     [
+      [101, "executed", "2026-07-12T20:00:00Z"],
       [202, "claimed", "2026-07-12T20:00:00Z"],
-      [101, "claimed", "2026-07-12T21:00:00Z"],
     ],
   );
   assert.equal(
@@ -1414,7 +1496,7 @@ test("sortCommentsForRouting prioritizes edited durable review comments", () => 
   );
 });
 
-test("selectCommentsForRouting merges durable history from the preselected item window", () => {
+test("selectCommentsForRouting caps durable history from the preselected item window", () => {
   const selected = selectCommentsForRouting({
     maxComments: 1,
     recentComments: [
@@ -1446,7 +1528,36 @@ test("selectCommentsForRouting merges durable history from the preselected item 
 
   assert.deepEqual(
     selected.map((comment) => comment.id),
-    [1, 2],
+    [1],
+  );
+});
+
+test("selectCommentsForRouting reserves the cap for exact pending comments", () => {
+  const pending = {
+    id: 1,
+    issue_url: "https://api.github.com/repos/openclaw/openclaw/issues/74742",
+    body: "@clawsweeper re-review",
+    created_at: "2026-04-30T01:00:00Z",
+    updated_at: "2026-04-30T01:00:00Z",
+  };
+  const selected = selectCommentsForRouting({
+    maxComments: 1,
+    recentComments: [
+      {
+        id: 2,
+        issue_url: pending.issue_url,
+        body: "@clawsweeper status",
+        created_at: "2026-04-30T03:40:00Z",
+        updated_at: "2026-04-30T03:40:00Z",
+      },
+    ],
+    durableComments: [],
+    priorityComments: [pending],
+  });
+
+  assert.deepEqual(
+    selected.map((comment) => comment.id),
+    [1],
   );
 });
 

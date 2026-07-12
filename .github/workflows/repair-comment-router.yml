@@ -90,6 +90,8 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       concurrency_group: ${{ steps.lane.outputs.concurrency_group }}
+      dispatch_concurrency_group: ${{ steps.lane.outputs.dispatch_concurrency_group }}
+      exact_item: ${{ steps.lane.outputs.exact_item }}
     steps:
       - name: Normalize exact item lane
         id: lane
@@ -131,7 +133,11 @@ jobs:
           else
             concurrency_group="repair-comment-router-$target_repo-scan"
           fi
-          echo "concurrency_group=$concurrency_group" >> "$GITHUB_OUTPUT"
+          {
+            echo "concurrency_group=$concurrency_group"
+            echo "dispatch_concurrency_group=repair-comment-router-$target_repo-worker-dispatch"
+            echo "exact_item=$([ -n "$item_number" ] && echo true || echo false)"
+          } >> "$GITHUB_OUTPUT"
 
   route-comments:
     needs: normalize-lane
@@ -383,12 +389,12 @@ jobs:
             args+=(--force-reprocess)
             args+=(--attempt-id "$attempt_id")
           fi
-          if { [ "${{ github.event_name }}" = "repository_dispatch" ] && [ -n "$item_numbers" ]; } ||
+          if { [ "${{ github.event_name }}" = "repository_dispatch" ]; } ||
              { [ "${{ github.event_name }}" = "workflow_dispatch" ] &&
-               [ "${{ inputs.execute }}" = "true" ] &&
-               [ -n "$item_numbers" ] &&
-               [[ "$item_numbers" != *,* ]]; }; then
-            args+=(--execute)
+               [ "${{ inputs.execute }}" = "true" ]; } ||
+             { [ "${{ github.event_name }}" = "schedule" ] &&
+               [ "${{ vars.CLAWSWEEPER_COMMENT_ROUTER_EXECUTE || '0' }}" = "1" ]; }; then
+            args+=(--stage-selected-commands)
           fi
           pnpm run repair:comment-router -- "${args[@]}"
 
@@ -503,29 +509,150 @@ jobs:
               -f execution_runner="$execution_runner"
           fi
 
-      - name: Detect waiting repair dispatches
-        id: waiting-repair-dispatches
-        if: ${{ success() }}
+  dispatch-waiting-commands:
+    needs: [normalize-lane, route-comments]
+    if: ${{ needs.normalize-lane.outputs.exact_item == 'true' && (github.event_name == 'repository_dispatch' || github.event_name == 'workflow_dispatch' && inputs.execute) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    concurrency:
+      group: ${{ needs.normalize-lane.outputs.dispatch_concurrency_group }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          filter: blob:none
+          fetch-depth: 0
+          sparse-checkout: |
+            .github
+            config
+            jobs
+            prompts/pr-close-coverage-proof.md
+            results
+            schema/clawsweeper-pr-close-coverage-proof.schema.json
+            scripts/hydrate-state.ts
+            src/clawsweeper-text.ts
+            src/command.ts
+            src/codex-env.ts
+            src/codex-output-capture.ts
+            src/codex-spawn.ts
+            src/codex-process-worker.ts
+            src/codex-process.ts
+            src/codex-transient.ts
+            src/github-json.ts
+            src/github-retry.ts
+            src/pr-close-coverage-proof.ts
+            src/repair
+            src/repository-profiles.ts
+            package.json
+            pnpm-lock.yaml
+            pnpm-workspace.yaml
+            tsconfig.repair.json
+          sparse-checkout-cone-mode: false
+
+      - name: Resolve target repository
+        id: dispatch-target
+        env:
+          TARGET_REPO: ${{ github.event_name == 'workflow_dispatch' && inputs.target_repo || github.event.client_payload.target_repo || vars.CLAWSWEEPER_TARGET_REPO || 'openclaw/openclaw' }}
         run: |
           set -euo pipefail
-          count="0"
-          if [ -f results/comment-router-latest.json ]; then
-            count="$(pnpm run --silent workflow -- count-command-actions --report results/comment-router-latest.json --action dispatch_repair --status waiting,active)"
+          target_repo="${TARGET_REPO:-openclaw/openclaw}"
+          if ! printf '%s' "$target_repo" | grep -Eq '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'; then
+            echo "Invalid target_repo: $target_repo" >&2
+            exit 1
           fi
-          echo "count=$count" >> "$GITHUB_OUTPUT"
+          {
+            echo "target_repo=$target_repo"
+            echo "target_repo_owner=${target_repo%%/*}"
+            echo "target_repo_name=${target_repo#*/}"
+          } >> "$GITHUB_OUTPUT"
 
-      - name: Retry waiting repair dispatches
-        if: ${{ steps.waiting-repair-dispatches.outputs.count != '' && steps.waiting-repair-dispatches.outputs.count != '0' && (github.event_name == 'repository_dispatch' && github.event.client_payload.item_number || github.event_name == 'workflow_dispatch' && inputs.execute && inputs.item_numbers != '' && !contains(inputs.item_numbers, ',')) }}
+      - name: Create target GitHub App token
+        id: dispatch-app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ env.CLAWSWEEPER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
+          owner: ${{ steps.dispatch-target.outputs.target_repo_owner }}
+          repositories: ${{ steps.dispatch-target.outputs.target_repo_name }}
+          permission-actions: write
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
+
+      - name: Create central dispatch token
+        id: worker-dispatch-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ env.CLAWSWEEPER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
+          owner: openclaw
+          repositories: clawsweeper
+          permission-actions: write
+          permission-contents: write
+
+      - name: Create state token
+        id: dispatch-state-token
+        uses: ./.github/actions/create-state-token
+        with:
+          client-id: ${{ env.CLAWSWEEPER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
+
+      - uses: ./.github/actions/setup-state
+        with:
+          token: ${{ steps.dispatch-state-token.outputs.token }}
+          fetch-depth: 1
+
+      - uses: ./.github/actions/setup-pnpm
+        with:
+          build-script: build:repair
+
+      - name: Create isolated ruleset verifier token
+        id: dispatch-ruleset-verifier-token
+        if: ${{ vars.CLAWSWEEPER_ALLOW_MERGE == '1' }}
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ env.CLAWSWEEPER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
+          owner: ${{ steps.dispatch-target.outputs.target_repo_owner }}
+          repositories: ${{ steps.dispatch-target.outputs.target_repo_name }}
+          permission-administration: write
+
+      - name: Bind authenticated mutation App identity
+        id: dispatch-mutation-app
+        if: ${{ vars.CLAWSWEEPER_ALLOW_MERGE == '1' }}
         env:
-          GH_TOKEN: ${{ steps.app_token.outputs.token }}
-          CLAWSWEEPER_AUTHENTICATED_APP_ID: ${{ steps.mutation-app.outputs.app_id }}
-          CLAWSWEEPER_AUTHENTICATED_APP_SLUG: ${{ steps.app_token.outputs.app-slug }}
-          CLAWSWEEPER_AUTHENTICATED_INSTALLATION_ID: ${{ steps.app_token.outputs.installation-id }}
-          CLAWSWEEPER_RULESET_APP_ID: ${{ steps.ruleset-app.outputs.app_id }}
-          CLAWSWEEPER_RULESET_APP_SLUG: ${{ steps.ruleset-verifier-token.outputs.app-slug }}
-          CLAWSWEEPER_RULESET_INSTALLATION_ID: ${{ steps.ruleset-verifier-token.outputs.installation-id }}
-          CLAWSWEEPER_RULESET_GH_TOKEN: ${{ steps.ruleset-verifier-token.outputs.token }}
-          CLAWSWEEPER_DISPATCH_TOKEN: ${{ steps.dispatch-token.outputs.token }}
+          GH_TOKEN: ${{ steps.dispatch-app-token.outputs.token }}
+          APP_SLUG: ${{ steps.dispatch-app-token.outputs.app-slug }}
+        run: |
+          set -euo pipefail
+          app_id="$(gh api "apps/$APP_SLUG" --jq '.id')"
+          test "$app_id" -gt 0
+          echo "app_id=$app_id" >> "$GITHUB_OUTPUT"
+
+      - name: Bind authenticated ruleset App identity
+        id: dispatch-ruleset-app
+        if: ${{ vars.CLAWSWEEPER_ALLOW_MERGE == '1' && steps.dispatch-ruleset-verifier-token.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ steps.dispatch-ruleset-verifier-token.outputs.token }}
+          APP_SLUG: ${{ steps.dispatch-ruleset-verifier-token.outputs.app-slug }}
+        run: |
+          set -euo pipefail
+          app_id="$(gh api "apps/$APP_SLUG" --jq '.id')"
+          test "$app_id" -gt 0
+          echo "app_id=$app_id" >> "$GITHUB_OUTPUT"
+
+      - name: Dispatch waiting commands under the central capacity gate
+        env:
+          GH_TOKEN: ${{ steps.dispatch-app-token.outputs.token }}
+          CLAWSWEEPER_AUTHENTICATED_APP_ID: ${{ steps.dispatch-mutation-app.outputs.app_id }}
+          CLAWSWEEPER_AUTHENTICATED_APP_SLUG: ${{ steps.dispatch-app-token.outputs.app-slug }}
+          CLAWSWEEPER_AUTHENTICATED_INSTALLATION_ID: ${{ steps.dispatch-app-token.outputs.installation-id }}
+          CLAWSWEEPER_RULESET_APP_ID: ${{ steps.dispatch-ruleset-app.outputs.app_id }}
+          CLAWSWEEPER_RULESET_APP_SLUG: ${{ steps.dispatch-ruleset-verifier-token.outputs.app-slug }}
+          CLAWSWEEPER_RULESET_INSTALLATION_ID: ${{ steps.dispatch-ruleset-verifier-token.outputs.installation-id }}
+          CLAWSWEEPER_RULESET_GH_TOKEN: ${{ steps.dispatch-ruleset-verifier-token.outputs.token }}
+          CLAWSWEEPER_DISPATCH_TOKEN: ${{ steps.worker-dispatch-token.outputs.token }}
           CLAWSWEEPER_MUTATION_TOKEN_SOURCE: clawsweeper-app
           CLAWSWEEPER_ALLOW_MERGE: ${{ vars.CLAWSWEEPER_ALLOW_MERGE || '0' }}
           CLAWSWEEPER_ACTION_LEDGER_INVOCATION: retry
@@ -584,6 +711,7 @@ jobs:
             --runner "$runner"
             --execution-runner "$execution_runner"
             --wait-for-capacity
+            --execute
           )
           if [ -n "$target_branch" ]; then
             args+=(--target-branch "$target_branch")
@@ -622,16 +750,14 @@ jobs:
             args+=(--force-reprocess)
             args+=(--attempt-id "$attempt_id")
           fi
-          args+=(--execute)
 
-          echo "Retrying ${{ steps.waiting-repair-dispatches.outputs.count }} waiting repair dispatch(es) after publishing router state."
           pnpm run repair:comment-router -- "${args[@]}"
 
-      - name: Commit comment router retry ledger
-        if: ${{ always() && steps.waiting-repair-dispatches.outputs.count != '' && steps.waiting-repair-dispatches.outputs.count != '0' }}
+      - name: Commit comment router dispatch ledger
+        if: always()
         run: |
           pnpm run repair:publish-main -- \
-            --message "chore: record ClawSweeper repair dispatch retry" \
+            --message "chore: record ClawSweeper repair dispatch" \
             --path results/comment-router.json \
             --path results/comment-router-latest.json \
             --path jobs \

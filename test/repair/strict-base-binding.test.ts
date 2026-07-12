@@ -638,6 +638,7 @@ test("exact router dispatch concurrency is item-specific and cannot replace anot
   const workflow = readWorkflow(".github/workflows/repair-comment-router.yml");
   const normalize = workflow.jobs?.["normalize-lane"];
   const route = workflow.jobs?.["route-comments"];
+  const dispatch = workflow.jobs?.["dispatch-waiting-commands"];
   const group = String(route?.concurrency?.group ?? "");
 
   assert.ok(normalize);
@@ -696,7 +697,7 @@ test("exact router dispatch concurrency is item-specific and cannot replace anot
   assert.ok(candidateSelection.indexOf("forceReprocess && itemNumbers.size > 0") >= 0);
   assert.match(
     candidateSelection,
-    /itemNumbers[\s\S]*recentComments: \[\],[\s\S]*durableComments: \[\.\.\.itemNumbers\]\.flatMap/,
+    /itemNumbers[\s\S]*const durable = listDurableRouterComments\(\[\.\.\.itemNumbers\]\)[\s\S]*recentComments: \[\.\.\.itemNumbers\]\.flatMap[\s\S]*durableComments: durable\.markerComments[\s\S]*priorityComments: \[\.\.\.forwardedExactComments\(\), \.\.\.durable\.pendingComments\]/,
   );
   assert.ok(
     candidateSelection.indexOf("selectRouterItemFanoutPage({") <
@@ -747,13 +748,28 @@ test("exact router dispatch concurrency is item-specific and cannot replace anot
   );
   assert.match(
     source,
-    /Route ClawSweeper comments[\s\S]*repository_dispatch[\s\S]*-n "\$item_numbers"[\s\S]*workflow_dispatch[\s\S]*\[\[ "\$item_numbers" != \*,\* \]\][\s\S]*args\+=\(--execute\)/,
+    /Route ClawSweeper comments[\s\S]*repository_dispatch[\s\S]*workflow_dispatch[\s\S]*schedule[\s\S]*args\+=\(--stage-selected-commands\)/,
+  );
+  assert.ok(dispatch);
+  assert.deepEqual(dispatch.needs, ["normalize-lane", "route-comments"]);
+  assert.match(
+    String(dispatch.if ?? ""),
+    /exact_item == 'true'[\s\S]*repository_dispatch[\s\S]*workflow_dispatch[\s\S]*inputs\.execute/,
   );
   assert.match(
-    source,
-    /Retry waiting repair dispatches[\s\S]*github\.event\.client_payload\.item_number[\s\S]*!contains\(inputs\.item_numbers, ','\)/,
+    String(dispatch.concurrency?.group ?? ""),
+    /needs\.normalize-lane\.outputs\.dispatch_concurrency_group/,
   );
-  for (const stepName of ["Commit comment router ledger", "Commit comment router retry ledger"]) {
+  assert.equal(dispatch.concurrency?.["cancel-in-progress"], false);
+  assert.match(
+    source,
+    /Dispatch waiting commands under the central capacity gate[\s\S]*--wait-for-capacity[\s\S]*--execute/,
+  );
+  assert.doesNotMatch(source, /Retry waiting repair dispatches/);
+  for (const stepName of [
+    "Commit comment router ledger",
+    "Commit comment router dispatch ledger",
+  ]) {
     const start = source.indexOf(`- name: ${stepName}`);
     const nextStep = source.indexOf("\n      - name:", start + 1);
     const block = source.slice(start, nextStep === -1 ? undefined : nextStep);

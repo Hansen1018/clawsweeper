@@ -137,6 +137,17 @@ test("comment router config validates canonical item fanout cursors", () => {
   }
 });
 
+test("comment router config enables durable selected-command staging explicitly", () => {
+  const config = readCommentRouterConfig({
+    repo: "openclaw/example",
+    "repair-repo": "openclaw/clawsweeper",
+    "review-repo": "openclaw/clawsweeper",
+    "stage-selected-commands": true,
+  });
+
+  assert.equal(config.stageSelectedCommands, true);
+});
+
 test("comment router config rejects noncanonical item number representations", () => {
   const base = {
     repo: "openclaw/example",

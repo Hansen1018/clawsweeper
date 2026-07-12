@@ -33,6 +33,7 @@ export type CommentRouterConfig = {
   execute: boolean;
   forceReprocess: boolean;
   attemptId: string | null;
+  stageSelectedCommands: boolean;
   writeReport: boolean;
   waitForCapacity: boolean;
   maxLiveWorkers: number;
@@ -135,6 +136,11 @@ export function readCommentRouterConfig(args: LooseRecord): CommentRouterConfig 
     execute: Boolean(args.execute),
     forceReprocess,
     attemptId,
+    stageSelectedCommands: Boolean(
+      args["stage-selected-commands"] ||
+      args.stage_selected_commands ||
+      process.env.CLAWSWEEPER_COMMENT_STAGE_SELECTED_COMMANDS === "1",
+    ),
     writeReport: Boolean(args["write-report"] || args.execute),
     waitForCapacity: Boolean(args["wait-for-capacity"]),
     maxLiveWorkers: readMaxLiveWorkers(args),

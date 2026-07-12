@@ -363,14 +363,23 @@ export function sortCommentsForRouting(comments: LooseRecord[]) {
 export function selectCommentsForRouting({
   recentComments,
   durableComments,
+  priorityComments = [],
   maxComments,
 }: {
   recentComments: LooseRecord[];
   durableComments: LooseRecord[];
+  priorityComments?: LooseRecord[];
   maxComments: number;
 }) {
-  const cappedRecent = sortCommentsForRouting(recentComments).slice(0, Math.max(0, maxComments));
-  return sortCommentsForRouting(uniqueCommentsById([...cappedRecent, ...durableComments]));
+  const limit = Math.max(0, maxComments);
+  const priority = uniqueCommentsById(priorityComments).slice(0, limit);
+  const priorityIds = new Set(priority.map((comment) => String(comment.id ?? "")));
+  const remaining = sortCommentsForRouting(
+    uniqueCommentsById([...recentComments, ...durableComments]).filter(
+      (comment) => !priorityIds.has(String(comment.id ?? "")),
+    ),
+  ).slice(0, Math.max(0, limit - priority.length));
+  return [...priority, ...remaining];
 }
 
 export function routerPendingItemNumbers(commands: LooseRecord[], repo?: string) {
@@ -392,19 +401,48 @@ export function routerPendingItemNumbers(commands: LooseRecord[], repo?: string)
   ].sort((left, right) => left - right);
 }
 
-export function stageForcedReplayCommands(commands: LooseRecord[], attemptId: string) {
+export function stageSelectedRouterCommands({
+  commands,
+  selectedItemNumbers,
+  forcedReplay = false,
+  attemptId = null,
+  processedAt = new Date().toISOString(),
+}: {
+  commands: LooseRecord[];
+  selectedItemNumbers: ReadonlySet<number>;
+  forcedReplay?: boolean;
+  attemptId?: string | null;
+  processedAt?: string;
+}) {
+  if (forcedReplay && !attemptId) {
+    throw new Error("forced replay staging requires an attempt id");
+  }
   return commands
+    .filter((command) => selectedItemNumbers.has(Number(command.issue_number)))
     .filter(routerCommandNeedsExactLane)
     .filter((command) => validRouterCommentId(command.comment_id, command.issue_number))
     .map((command) => ({
       ...command,
-      forced_replay: true,
-      attempt_id: attemptId,
+      ...(forcedReplay ? { forced_replay: true, attempt_id: attemptId } : {}),
+      processed_at: processedAt,
       status: "waiting",
       actions: (Array.isArray(command.actions) ? command.actions : []).map((action: JsonValue) =>
         action?.status === "executed" ? action : { ...action, status: "waiting" },
       ),
     }));
+}
+
+export function stageForcedReplayCommands(commands: LooseRecord[], attemptId: string) {
+  return stageSelectedRouterCommands({
+    commands,
+    selectedItemNumbers: new Set(
+      commands
+        .map((command) => Number(command.issue_number))
+        .filter((number) => Number.isSafeInteger(number) && number > 0),
+    ),
+    forcedReplay: true,
+    attemptId,
+  });
 }
 
 export function durableForcedReplayCommentIds({
@@ -778,6 +816,9 @@ function ledgerEntryKey(entry: LooseRecord) {
 }
 
 function preferredLedgerEntry(left: LooseRecord, right: LooseRecord): LooseRecord {
+  const leftTerminal = ledgerStatusRank(left.status) >= 3;
+  const rightTerminal = ledgerStatusRank(right.status) >= 3;
+  if (leftTerminal !== rightTerminal) return leftTerminal ? left : right;
   const leftTime = ledgerEntryTime(left);
   const rightTime = ledgerEntryTime(right);
   if (leftTime !== rightTime) return leftTime > rightTime ? left : right;

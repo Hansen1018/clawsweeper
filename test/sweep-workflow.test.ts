@@ -1746,7 +1746,7 @@ test("event re-review status lets the durable queue reconcile interruptions", ()
   assert.doesNotMatch(block, /state="Superseded"/);
 });
 
-test("trusted comment router owns command ledger capacity retries", () => {
+test("trusted comment router publishes durable staging before centralized capacity dispatch", () => {
   const sweepWorkflow = readText(".github/workflows/sweep.yml");
   const routerWorkflow = readText(".github/workflows/repair-comment-router.yml");
   const eventStart = sweepWorkflow.indexOf("\n  event-review-apply:");
@@ -1764,11 +1764,21 @@ test("trusted comment router owns command ledger capacity retries", () => {
   );
   assert.match(
     routerWorkflow,
-    /Commit comment router retry ledger[\s\S]*--rebase-strategy merge-comment-router/,
+    /--stage-selected-commands[\s\S]*Commit comment router ledger[\s\S]*Dispatch discovered items through exact router lanes/,
   );
-  assert.match(routerWorkflow, /Detect waiting repair dispatches/);
-  assert.match(routerWorkflow, /--status waiting,active/);
-  assert.match(routerWorkflow, /--wait-for-capacity/);
+  assert.match(
+    routerWorkflow,
+    /dispatch-waiting-commands:[\s\S]*dispatch_concurrency_group[\s\S]*cancel-in-progress: false/,
+  );
+  assert.match(
+    routerWorkflow,
+    /Dispatch waiting commands under the central capacity gate[\s\S]*--wait-for-capacity[\s\S]*--execute/,
+  );
+  assert.match(
+    routerWorkflow,
+    /Commit comment router dispatch ledger[\s\S]*--rebase-strategy merge-comment-router/,
+  );
+  assert.doesNotMatch(routerWorkflow, /Detect waiting repair dispatches|--status waiting,active/);
 });
 
 test("comment commands keep the router-to-sweep dispatch contract", () => {

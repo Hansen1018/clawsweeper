@@ -1563,7 +1563,7 @@ test("forced exact-item replay scopes forwarded comment ids before item-wide rec
   );
   assert.match(
     source,
-    /stageForcedReplayCommands\(commands, attemptId!\)[\s\S]*appendLedger\(ledger, staged\)[\s\S]*writeLedger/,
+    /stageSelectedRouterCommands\(\{[\s\S]*selectedItemNumbers: selectedItems,[\s\S]*forcedReplay: forceReprocess,[\s\S]*attemptId,[\s\S]*appendLedger\(ledger, staged\)[\s\S]*writeLedger/,
   );
 });
 
@@ -1575,7 +1575,7 @@ test("broad router selects its cursor page before bounded durable comment hydrat
   );
   const page = candidates.indexOf("const broadPage = selectRouterItemFanoutPage({");
   const durableHydration = candidates.indexOf(
-    "durableComments: listDurableRouterComments(broadPage.itemNumbers)",
+    "const durable = listDurableRouterComments(broadPage.itemNumbers)",
   );
 
   assert.ok(page >= 0);
@@ -1588,9 +1588,22 @@ test("broad router selects its cursor page before bounded durable comment hydrat
     source.indexOf("function listDurableRouterComments"),
     source.indexOf("function listRepairLoopSweepCommands"),
   );
-  assert.match(durable, /numbers\.flatMap\(\(number\) =>[\s\S]*issueCommentsFor\(number\)/);
+  assert.match(
+    durable,
+    /pendingCommentIds[\s\S]*\.map\(\(commentId\) => fetchCandidateIssueComment/,
+  );
+  assert.match(durable, /markerComments: numbers\.flatMap\(\(number\) =>/);
   assert.match(durable, /isClawSweeperReviewMarkerComment\(comment\)/);
-  assert.match(durable, /pendingCommentIds\.has\(String\(comment\?\.id \?\? ""\)\)/);
+  assert.doesNotMatch(durable, /ghPaged/);
+  assert.match(
+    source,
+    /ghPagedLimit<JsonValue>\([\s\S]*issues\/\$\{number\}\/comments\?since=[\s\S]*maxComments/,
+  );
+  assert.match(source, /priorityComments: durable\.pendingComments[\s\S]*maxComments/);
+  assert.match(
+    source,
+    /candidateIssueCommentCache\.has\(key\)[\s\S]*candidateIssueCommentCache\.set\(key, comment\)/,
+  );
 });
 
 test("label sweeps honor fresh trusted exact-head review start leases", () => {
@@ -1934,11 +1947,11 @@ test("label-sweep classification checks the exact-head review lease before dispa
   assert.match(source, /same-head ClawSweeper review is active until/);
   assert.match(
     source,
-    /prehydrate_comment_commands[\s\S]*?prehydrateCommandLookups\(rawCommands,\s*\{\s*refreshIssueComments:\s*true\s*\}\)/,
+    /prehydrate_comment_commands[\s\S]*?prehydrateCommandLookups\(rawCommands\)/,
   );
   assert.match(
     source,
-    /prehydrate_repair_loop_sweeps[\s\S]*?prehydrateCommandLookups\(sweepCommands,\s*\{\s*refreshIssueComments:\s*true\s*\}\)/,
+    /prehydrate_repair_loop_sweeps[\s\S]*?prehydrateCommandLookups\(sweepCommands\)/,
   );
   const prehydrate = source.slice(
     source.indexOf("async function prehydrateCommandLookups"),
