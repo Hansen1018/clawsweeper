@@ -22,6 +22,7 @@ import {
   readLedger,
   routerDispatchReceiptKey,
   selectCommentsForRouting,
+  selectRepairLoopSweepPage,
   shouldSuppressProcessedCommentVersion,
   sortCommentsForRouting,
   supersededReReviewCommentVersions,
@@ -260,6 +261,35 @@ test("synthetic repair-loop command ids parse only exact positive item targets",
   ]) {
     assert.equal(parseRepairLoopSweepCommandId(invalid), null);
   }
+});
+
+test("synthetic repair-loop sweep pages are bounded and resume deterministically", () => {
+  const targets = [
+    { intent: "automerge" as const, number: 43 },
+    { intent: "autofix" as const, number: 42 },
+    { intent: "automerge" as const, number: 42 },
+    { intent: "autofix" as const, number: 44 },
+    { intent: "autofix" as const, number: 42 },
+  ];
+  const first = selectRepairLoopSweepPage({ targets, after: null, limit: 2 });
+
+  assert.deepEqual(
+    first.targets.map((target) => target.commentId),
+    ["repair-loop-label-sweep:autofix:42", "repair-loop-label-sweep:automerge:42"],
+  );
+  assert.equal(first.candidateCount, 4);
+  assert.equal(first.nextAfterCommentId, "repair-loop-label-sweep:automerge:42");
+
+  const second = selectRepairLoopSweepPage({
+    targets,
+    after: parseRepairLoopSweepCommandId(first.nextAfterCommentId),
+    limit: 2,
+  });
+  assert.deepEqual(
+    second.targets.map((target) => target.commentId),
+    ["repair-loop-label-sweep:automerge:43", "repair-loop-label-sweep:autofix:44"],
+  );
+  assert.equal(second.nextAfterCommentId, null);
 });
 
 test("synthetic dispatch receipt material is stable within an attempt and changes next attempt", () => {

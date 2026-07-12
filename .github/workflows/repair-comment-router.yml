@@ -55,6 +55,11 @@ on:
         required: false
         default: ""
         type: string
+      repair_loop_sweep_after:
+        description: "Internal synthetic repair-loop sweep continuation cursor"
+        required: false
+        default: ""
+        type: string
       runner:
         description: "Runner label for repair planning/review work"
         required: true
@@ -243,6 +248,7 @@ jobs:
           max_comments="${{ github.event_name == 'workflow_dispatch' && inputs.max_comments || vars.CLAWSWEEPER_COMMENT_MAX_COMMENTS || '100' }}"
           item_numbers="${{ github.event_name == 'workflow_dispatch' && inputs.item_numbers || '' }}"
           comment_ids="${{ github.event_name == 'workflow_dispatch' && inputs.comment_ids || '' }}"
+          repair_loop_sweep_after="${{ github.event_name == 'workflow_dispatch' && inputs.repair_loop_sweep_after || '' }}"
           runner="${{ github.event_name == 'workflow_dispatch' && inputs.runner || vars.CLAWSWEEPER_WORKER_RUNNER || 'blacksmith-4vcpu-ubuntu-2404' }}"
           execution_runner="${{ github.event_name == 'workflow_dispatch' && inputs.execution_runner || vars.CLAWSWEEPER_EXECUTION_RUNNER || 'blacksmith-16vcpu-ubuntu-2404' }}"
           force_reprocess="${{ github.event_name == 'workflow_dispatch' && inputs.force_reprocess || 'false' }}"
@@ -301,6 +307,9 @@ jobs:
           fi
           if [ -n "$comment_ids" ]; then
             args+=(--comment-ids "$comment_ids")
+          fi
+          if [ -n "$repair_loop_sweep_after" ]; then
+            args+=(--repair-loop-sweep-after "$repair_loop_sweep_after")
           fi
           if [ -n "$status_comment_id" ]; then
             args+=(--status-comment-id "$status_comment_id")
@@ -419,6 +428,27 @@ jobs:
             fi
             gh "${dispatch_args[@]}"
           done
+
+          repair_loop_sweep_after="$(
+            jq -r '.repair_loop_sweep_fanout.next_after_comment_id // empty' \
+              results/comment-router-latest.json
+          )"
+          if [ -n "$repair_loop_sweep_after" ]; then
+            gh workflow run repair-comment-router.yml \
+              --repo "$GITHUB_REPOSITORY" \
+              -f execute=true \
+              -f force_reprocess="$force_reprocess" \
+              -f target_repo="$target_repo" \
+              -f target_branch="$target_branch" \
+              -f lookback_minutes="$lookback_minutes" \
+              -f since="$since" \
+              -f max_comments="$max_comments" \
+              -f item_numbers="" \
+              -f comment_ids="" \
+              -f repair_loop_sweep_after="$repair_loop_sweep_after" \
+              -f runner="$runner" \
+              -f execution_runner="$execution_runner"
+          fi
 
       - name: Detect waiting repair dispatches
         id: waiting-repair-dispatches

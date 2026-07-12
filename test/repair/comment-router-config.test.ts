@@ -113,3 +113,28 @@ test("comment router config accepts only numeric or exact repair-loop command id
     /expected positive integer or repair-loop sweep id/,
   );
 });
+
+test("comment router config validates synthetic sweep continuation cursors", () => {
+  const config = readCommentRouterConfig({
+    repo: "openclaw/example",
+    "repair-repo": "openclaw/clawsweeper",
+    "review-repo": "openclaw/clawsweeper",
+    "repair-loop-sweep-after": "repair-loop-label-sweep:AUTOFIX:42",
+  });
+
+  assert.deepEqual(config.repairLoopSweepAfter, {
+    intent: "autofix",
+    number: 42,
+    commentId: "repair-loop-label-sweep:autofix:42",
+  });
+  assert.throws(
+    () =>
+      readCommentRouterConfig({
+        repo: "openclaw/example",
+        "repair-repo": "openclaw/clawsweeper",
+        "review-repo": "openclaw/clawsweeper",
+        "repair-loop-sweep-after": "repair-loop-label-sweep:autofix:0",
+      }),
+    /invalid repair-loop-sweep-after/,
+  );
+});

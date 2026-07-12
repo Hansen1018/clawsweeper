@@ -45,6 +45,7 @@ export type CommentRouterConfig = {
   lookupConcurrency: number;
   lookbackMinutes: number;
   since: string;
+  repairLoopSweepAfter: ReturnType<typeof parseRepairLoopSweepCommandId>;
   itemNumbers: Set<number>;
   commentIds: Set<string>;
   statusCommentId: number | null;
@@ -172,6 +173,7 @@ export function readCommentRouterConfig(args: LooseRecord): CommentRouterConfig 
       args.since,
       new Date(Date.now() - lookbackMinutes * 60 * 1000).toISOString(),
     ),
+    repairLoopSweepAfter: optionalRepairLoopSweepCommandId(args["repair-loop-sweep-after"]),
     itemNumbers: numberSet(
       [args["item-number"], args["item-numbers"], process.env.CLAWSWEEPER_COMMENT_ITEM_NUMBERS]
         .filter((value) => value !== undefined && value !== null)
@@ -210,6 +212,17 @@ export function forcedReplayCommandFields(
 ): LooseRecord {
   if (!config.forceReprocess || !config.attemptId) return {};
   return { forced_replay: true, attempt_id: config.attemptId };
+}
+
+function optionalRepairLoopSweepCommandId(value: JsonValue) {
+  if (value === undefined || value === null || String(value).trim() === "") return null;
+  const parsed = parseRepairLoopSweepCommandId(value);
+  if (!parsed) {
+    throw new Error(
+      `invalid repair-loop-sweep-after: expected repair-loop sweep id, got ${String(value).trim()}`,
+    );
+  }
+  return parsed;
 }
 
 function stringSetting(value: JsonValue, fallback: string): string {

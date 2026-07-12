@@ -103,6 +103,7 @@ import {
   readLedger,
   routerDispatchReceiptKey,
   selectCommentsForRouting,
+  selectRepairLoopSweepPage,
   shouldSuppressProcessedCommentVersion,
   stripAnsi,
   supersededReReviewCommentVersions,
@@ -169,6 +170,7 @@ const {
   maxAutoRepairsPerPr,
   lookupConcurrency,
   since,
+  repairLoopSweepAfter,
   itemNumbers,
   commentIds,
   statusCommentId,
@@ -269,7 +271,8 @@ await measureAsync("prehydrate_comment_commands", () =>
 const classifiedCommentCommands = measure("classify_comment_commands", () =>
   rawCommands.map((command) => classifyAndRecordCommand(command)),
 );
-for (const command of listRepairLoopSweepCommands(classifiedCommentCommands)) {
+let repairLoopSweepSelection = listRepairLoopSweepCommands(classifiedCommentCommands);
+for (const command of repairLoopSweepSelection.commands) {
   rawCommands.push(command);
   recordCommandReceived(command);
 }
@@ -297,6 +300,7 @@ const report: LooseRecord = {
   force_reprocess: forceReprocess,
   forced_replay_attempt_id: attemptId,
   max_comments: maxComments,
+  repair_loop_sweep_fanout: repairLoopSweepSelection.fanout,
   item_numbers: [...itemNumbers],
   comment_ids: [...commentIds],
   status_comment_id: statusCommentId,
@@ -350,7 +354,8 @@ if (execute && exactCommentVersionFastPath.suppress && exactCommentVersionFastPa
     const resumedClassified = measure("classify_cleanup_drift_commands", () =>
       resumedRawCommands.map((command) => classifyAndRecordCommand(command)),
     );
-    const resumedSweepCommands = listRepairLoopSweepCommands(resumedClassified);
+    repairLoopSweepSelection = listRepairLoopSweepCommands(resumedClassified);
+    const resumedSweepCommands = repairLoopSweepSelection.commands;
     rawCommands.push(...resumedSweepCommands);
     for (const command of resumedSweepCommands) recordCommandReceived(command);
     await measureAsync("prehydrate_cleanup_drift_sweeps", () =>
@@ -364,6 +369,7 @@ if (execute && exactCommentVersionFastPath.suppress && exactCommentVersionFastPa
     report.scanned_comments = Number(report.scanned_comments ?? 0) + resumedComments.length;
     report.commands_seen = commands.length;
     report.actionable = actionable.length;
+    report.repair_loop_sweep_fanout = repairLoopSweepSelection.fanout;
     report.exact_comment_version_fast_path = exactCommentVersionFastPath;
     report.short_circuited = false;
   }
@@ -4210,7 +4216,17 @@ function listRepairLoopSweepCommands(existingCommands: LooseRecord[]) {
   const requestedSweeps = [...commentIds]
     .map((commentId) => parseRepairLoopSweepCommandId(commentId))
     .filter((command) => command !== null);
-  if ((itemNumbers.size > 0 || commentIds.size > 0) && requestedSweeps.length === 0) return [];
+  if ((itemNumbers.size > 0 || commentIds.size > 0) && requestedSweeps.length === 0) {
+    return {
+      commands: [],
+      fanout: {
+        limit: maxComments,
+        candidate_count: 0,
+        selected_count: 0,
+        next_after_comment_id: null,
+      },
+    };
+  }
   const paused = new Set(
     existingCommands
       .filter(isReadyHumanReviewPause)
@@ -4231,8 +4247,17 @@ function listRepairLoopSweepCommands(existingCommands: LooseRecord[]) {
       seen.add(key);
       commands.push(repairLoopSweepCommand(intent, number));
     }
-    return commands;
+    return {
+      commands,
+      fanout: {
+        limit: maxComments,
+        candidate_count: commands.length,
+        selected_count: commands.length,
+        next_after_comment_id: null,
+      },
+    };
   }
+  const targets: Array<{ intent: "autofix" | "automerge"; number: number }> = [];
   for (const [intent, label] of [
     ["autofix", AUTOFIX_LABEL],
     ["automerge", AUTOMERGE_LABEL],
@@ -4241,10 +4266,26 @@ function listRepairLoopSweepCommands(existingCommands: LooseRecord[]) {
       const key = `${intent}:${number}`;
       if (seen.has(key) || paused.has(number)) continue;
       seen.add(key);
-      commands.push(repairLoopSweepCommand(intent, number));
+      targets.push({ intent, number });
     }
   }
-  return commands;
+  const page = selectRepairLoopSweepPage({
+    targets,
+    after: repairLoopSweepAfter,
+    limit: maxComments,
+  });
+  commands.push(
+    ...page.targets.map(({ intent, number }) => repairLoopSweepCommand(intent, number)),
+  );
+  return {
+    commands,
+    fanout: {
+      limit: maxComments,
+      candidate_count: page.candidateCount,
+      selected_count: commands.length,
+      next_after_comment_id: page.nextAfterCommentId,
+    },
+  };
 }
 
 function repairLoopSweepCommand(intent: "autofix" | "automerge", number: number): LooseRecord {

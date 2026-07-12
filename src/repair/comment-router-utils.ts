@@ -855,6 +855,46 @@ export function parseRepairLoopSweepCommandId(value: JsonValue) {
   };
 }
 
+export function selectRepairLoopSweepPage({
+  targets,
+  after,
+  limit,
+}: {
+  targets: Array<{ intent: "autofix" | "automerge"; number: number }>;
+  after: ReturnType<typeof parseRepairLoopSweepCommandId>;
+  limit: number;
+}) {
+  const sorted = [
+    ...new Map(
+      targets.map((target) => [
+        `repair-loop-label-sweep:${target.intent}:${target.number}`,
+        {
+          ...target,
+          commentId: `repair-loop-label-sweep:${target.intent}:${target.number}`,
+        },
+      ]),
+    ).values(),
+  ].sort(compareRepairLoopSweepTargets);
+  const remaining = after
+    ? sorted.filter((target) => compareRepairLoopSweepTargets(target, after) > 0)
+    : sorted;
+  const selected = remaining.slice(0, limit);
+  return {
+    targets: selected,
+    candidateCount: remaining.length,
+    nextAfterCommentId:
+      remaining.length > selected.length ? (selected.at(-1)?.commentId ?? null) : null,
+  };
+}
+
+function compareRepairLoopSweepTargets(
+  left: { intent: "autofix" | "automerge"; number: number },
+  right: { intent: "autofix" | "automerge"; number: number },
+) {
+  if (left.number !== right.number) return left.number - right.number;
+  return left.intent.localeCompare(right.intent);
+}
+
 export function stripAnsi(text: string) {
   return String(text ?? "").replace(
     new RegExp(`${String.fromCharCode(27)}\\[[0-?]*[ -/]*[@-~]`, "g"),
