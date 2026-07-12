@@ -1746,7 +1746,7 @@ test("event re-review status lets the durable queue reconcile interruptions", ()
   assert.doesNotMatch(block, /state="Superseded"/);
 });
 
-test("trusted comment router publishes durable staging before centralized capacity dispatch", () => {
+test("trusted comment router publishes item-keyed staging before serialized durable dispatch", () => {
   const sweepWorkflow = readText(".github/workflows/sweep.yml");
   const routerWorkflow = readText(".github/workflows/repair-comment-router.yml");
   const eventStart = sweepWorkflow.indexOf("\n  event-review-apply:");
@@ -1772,8 +1772,13 @@ test("trusted comment router publishes durable staging before centralized capaci
   );
   assert.match(
     routerWorkflow,
-    /Dispatch waiting commands under the central capacity gate[\s\S]*--wait-for-capacity[\s\S]*--execute/,
+    /Drain durable waiting commands under the serialized capacity gate[\s\S]*results\/comment-router\.json[\s\S]*--wait-for-capacity[\s\S]*--execute/,
   );
+  assert.match(
+    routerWorkflow,
+    /group_by\(\[[\s\S]*\.issue_number,[\s\S]*\.comment_id,[\s\S]*\.attempt_id/,
+  );
+  assert.match(routerWorkflow, /dispatch_context\.since/);
   assert.match(
     routerWorkflow,
     /Commit comment router dispatch ledger[\s\S]*--rebase-strategy merge-comment-router/,

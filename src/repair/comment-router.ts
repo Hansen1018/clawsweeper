@@ -430,6 +430,14 @@ if (execute && exactCommentVersionFastPath.suppress && exactCommentVersionFastPa
   }
 }
 
+const dispatchContext = {
+  target_branch: targetBranch,
+  runner,
+  execution_runner: executionRunner,
+  since,
+};
+for (const command of commands) command.dispatch_context = dispatchContext;
+
 if (!execute && stageSelectedCommands && writeReport) {
   const selectedItems = new Set<number>(routerItemFanout.selected_item_numbers ?? []);
   const staged = stageSelectedRouterCommands({
@@ -438,6 +446,7 @@ if (!execute && stageSelectedCommands && writeReport) {
     forcedReplay: forceReprocess,
     attemptId,
     claimedCommands: ledger.commands ?? [],
+    dispatchContext,
   });
   for (const stagedCommand of staged) {
     const command = commands.find(
@@ -4292,6 +4301,20 @@ function listRecentComments() {
   return list;
 }
 
+function isBroadRouterCommentCandidate(comment: LooseRecord) {
+  if (!parseRoutedCommentCommand(comment, { trustedAuthors: trustedBots })) return false;
+  const versionKey = commentVersionKey({
+    comment_id: comment.id,
+    comment_updated_at: comment.updated_at,
+  });
+  return (
+    forceReprocess ||
+    !versionKey ||
+    retryPendingCommentVersions.has(versionKey) ||
+    !processedCommentVersions.has(versionKey)
+  );
+}
+
 type RepairLoopTarget = {
   intent: "autofix" | "automerge";
   number: number;
@@ -4349,9 +4372,10 @@ function listCandidateComments() {
   }
 
   const recentComments = listRecentComments();
+  const routableRecentComments = recentComments.filter(isBroadRouterCommentCandidate);
   const repairLoopTargets = listRepairLoopTargets();
   const broadPage = selectRouterCommentItemPage({
-    comments: recentComments,
+    comments: routableRecentComments,
     additionalItemNumbers: [
       ...repairLoopTargets.map((target) => target.number),
       ...routerPendingItemNumbers(ledger.commands ?? [], targetRepo),
@@ -4363,7 +4387,7 @@ function listCandidateComments() {
   const durable = listDurableRouterComments(broadPage.itemNumbers);
   return {
     comments: selectCommentsForRouting({
-      recentComments: recentComments.filter((comment) =>
+      recentComments: routableRecentComments.filter((comment) =>
         selectedItems.has(issueNumberFromUrl(comment.issue_url)),
       ),
       durableComments: durable.markerComments,

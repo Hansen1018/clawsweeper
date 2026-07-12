@@ -141,13 +141,15 @@ checkpoint, and status-only commits are intentionally omitted.
   active-item timeout recovery, and item/revision-stable apply and retry
   idempotency across checkpoint and batch reordering.
 - Revalidated live per-PR automerge authorization immediately before
-  replacement merges; centralized comment-router worker dispatch behind one
-  capacity gate; separated complete autoclose safety hydration from bounded
-  routing discovery; preserved forced replays as durable distinct attempts;
-  paged broad discovery by complete distinct-item candidate sets before bounded
-  newest-first per-item hydration with one reserved candidate per selected
-  item; retained claimed dispatch recovery state during continuation staging;
-  and made requeue dispatch identities deterministic across ambiguous retries.
+  replacement merges; isolated comment-router routing by exact item and drained
+  its durable waiting queue through one serialized live-capacity gate;
+  separated complete autoclose safety hydration from bounded routing discovery;
+  preserved forced replays as durable
+  distinct attempts; paged broad discovery by unprocessed routable comments and
+  complete distinct-item candidate sets before bounded per-item hydration;
+  retained claimed dispatch recovery state and a fixed scan timestamp across
+  continuations; and required authenticated one-shot requeue context with
+  deterministic dispatch identities across ambiguous retries.
 - Raised staged-proof entry capacity above supported OpenClaw installs while
   retaining byte, depth, and deadline traversal bounds.
 - Bounded missing repair handoff retries, terminated deterministic handoff verification failures, removed repository-wide gate mutation from requeue, scoped router comment IDs per item, and bounded post-command proof snapshot verification.
@@ -208,9 +210,10 @@ checkpoint, and status-only commits are intentionally omitted.
   validation source mutation, stopped retries when their command budget is
   exhausted, and made proof-budget exhaustion terminal instead of sending it
   through Codex validation-fix.
-- Made exact comment-router dispatch concurrency item/comment-specific so
-  unrelated pending exact items cannot replace one another, and required
-  already-merged post-flight PRs to match the authorized publication commit.
+- Made exact comment-router routing item/comment-specific and its serialized
+  dispatcher input-independent so replaced pending runs cannot lose durable
+  items, and required already-merged post-flight PRs to match the authorized
+  publication commit.
 - Bound structural, semantic, and content review reuse to the canonical
   persisted durable-comment body hash under the acquired lease, normalizing
   surrounding whitespace while preserving label

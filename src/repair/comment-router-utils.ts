@@ -431,6 +431,7 @@ export function stageSelectedRouterCommands({
   attemptId = null,
   claimedCommands = [],
   processedAt = new Date().toISOString(),
+  dispatchContext,
 }: {
   commands: LooseRecord[];
   selectedItemNumbers: ReadonlySet<number>;
@@ -438,6 +439,7 @@ export function stageSelectedRouterCommands({
   attemptId?: string | null;
   claimedCommands?: LooseRecord[];
   processedAt?: string;
+  dispatchContext?: LooseRecord;
 }) {
   if (forcedReplay && !attemptId) {
     throw new Error("forced replay staging requires an attempt id");
@@ -469,6 +471,7 @@ export function stageSelectedRouterCommands({
               attempt_id: forcedReplayAttemptId(command) ?? stagedAttemptId,
             }
           : {}),
+        ...(dispatchContext ? { dispatch_context: dispatchContext } : {}),
         processed_at: processedAt,
         status: "waiting",
         actions: (Array.isArray(command.actions) ? command.actions : []).map((action: JsonValue) =>
@@ -660,6 +663,8 @@ export function appendLedger(current: LooseRecord, entries: LooseRecord[]) {
       const actions = compactLedgerActions(entry.actions);
       const forcedReplayIdentity = forcedReplayIdentityFields(entry);
       const attemptIds = ledgerAttemptIds({ ...entry, ...forcedReplayIdentity });
+      const statusCommentId = compactRouterStatusCommentId(entry.status_comment_id);
+      const dispatchContext = compactRouterDispatchContext(entry.dispatch_context);
       return attemptIds.map((attemptId) => ({
         idempotency_key: entry.idempotency_key,
         comment_id: entry.comment_id,
@@ -667,6 +672,7 @@ export function appendLedger(current: LooseRecord, entries: LooseRecord[]) {
         comment_url: entry.comment_url,
         comment_created_at: entry.comment_created_at ?? null,
         comment_updated_at: entry.comment_updated_at ?? null,
+        ...(statusCommentId ? { status_comment_id: statusCommentId } : {}),
         ...(entry.comment_body_sha256 ? { comment_body_sha256: entry.comment_body_sha256 } : {}),
         ...(attemptId ? { forced_replay: true, attempt_id: attemptId } : {}),
         repo: entry.repo,
@@ -684,6 +690,7 @@ export function appendLedger(current: LooseRecord, entries: LooseRecord[]) {
         repair_reason: entry.repair_reason ?? null,
         expected_head_sha: entry.expected_head_sha ?? null,
         finding_id: entry.finding_id ?? null,
+        ...(dispatchContext ? { dispatch_context: dispatchContext } : {}),
         status: entry.status,
         processed_at: entry.processed_at ?? new Date().toISOString(),
         target: entry.target
@@ -756,7 +763,27 @@ function validatedLedgerCommand(entry: JsonValue): LooseRecord {
   if (command.status === "claimed" && dispatchClaimLookupKeys(command).length === 0) {
     throw new Error("claimed comment router ledger command requires a durable lookup identity");
   }
-  return command;
+  const statusCommentId = compactRouterStatusCommentId(command.status_comment_id);
+  if (
+    command.status_comment_id !== undefined &&
+    command.status_comment_id !== null &&
+    statusCommentId === null
+  ) {
+    throw new Error("comment router ledger command status_comment_id must be a positive integer");
+  }
+  const dispatchContext = compactRouterDispatchContext(command.dispatch_context);
+  if (
+    command.dispatch_context !== undefined &&
+    command.dispatch_context !== null &&
+    dispatchContext === null
+  ) {
+    throw new Error("comment router ledger command dispatch_context is invalid");
+  }
+  return {
+    ...command,
+    ...(statusCommentId ? { status_comment_id: statusCommentId } : {}),
+    ...(dispatchContext ? { dispatch_context: dispatchContext } : {}),
+  };
 }
 
 function forcedReplayIdentityFields(entry: LooseRecord): LooseRecord {
@@ -783,6 +810,40 @@ function forcedReplayIdentityFields(entry: LooseRecord): LooseRecord {
     );
   }
   return { forced_replay: true, attempt_id: attemptId };
+}
+
+function compactRouterDispatchContext(value: JsonValue) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const targetBranch = boundedRouterContextString(value.target_branch, 255, true);
+  const runner = boundedRouterContextString(value.runner, 128);
+  const executionRunner = boundedRouterContextString(value.execution_runner, 128);
+  const since = boundedRouterContextString(value.since, 64);
+  if (targetBranch === null || !runner || !executionRunner || !since) return null;
+  return {
+    target_branch: targetBranch,
+    runner,
+    execution_runner: executionRunner,
+    since,
+  };
+}
+
+function compactRouterStatusCommentId(value: JsonValue) {
+  const number = Number(value);
+  return Number.isSafeInteger(number) && number > 0 ? number : null;
+}
+
+function boundedRouterContextString(value: JsonValue, maxLength: number, allowEmpty = false) {
+  if (typeof value !== "string") return null;
+  const text = value.trim();
+  if (
+    (!text && !allowEmpty) ||
+    text.length > maxLength ||
+    /[\r\n]/.test(text) ||
+    text.includes("\0")
+  ) {
+    return null;
+  }
+  return text;
 }
 
 export function mergeCommentRouterLedgers(...values: JsonValue[]) {

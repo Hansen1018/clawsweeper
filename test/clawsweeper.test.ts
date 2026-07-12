@@ -2129,6 +2129,12 @@ test("repair workers hydrate only durable jobs from generated state", () => {
   assert.match(workflow, /authority === "maintainer"/);
   assert.match(workflow, /authenticated human workflow-dispatch actor/);
   assert.match(workflow, /context\.dispatch_key !== dispatchKey/);
+  assert.match(
+    workflow,
+    /requeue=true requires captured context, authenticated authority, and dispatch key/,
+  );
+  assert.match(workflow, /context\.depth !== 1/);
+  assert.match(workflow, /requeue-1-\[0-9a-f\]\{24\}/);
   assert.match(workflow, /Buffer\.from\(encoded, "base64url"\)/);
   assert.match(
     repairDocs,
@@ -2457,7 +2463,7 @@ test("repair workflows preserve existing dispatch while scheduled cluster intake
   );
   assert.match(
     router,
-    /dispatch-waiting-commands:[\s\S]*dispatch_concurrency_group[\s\S]*Dispatch waiting commands under the central capacity gate[\s\S]*--execute/,
+    /dispatch-waiting-commands:[\s\S]*dispatch_concurrency_group[\s\S]*Drain durable waiting commands under the serialized capacity gate[\s\S]*--execute/,
   );
   assert.match(issueImplementation, /ENABLED: \$\{\{ github\.event\.inputs\.enabled/);
   assert.match(commitFinding, /ENABLED: \$\{\{ github\.event\.inputs\.enabled/);

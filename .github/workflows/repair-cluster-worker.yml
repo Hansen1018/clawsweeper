@@ -238,16 +238,23 @@ jobs:
           const dispatchKey = String(process.env.REQUEUE_DISPATCH_KEY || "");
           const actor = String(process.env.REQUEUE_ACTOR || "");
           let depth = 0;
-          if (encoded) {
+          if (!requested) {
+            if (encoded || authority) {
+              throw new Error("captured requeue context requires requeue=true");
+            }
+          } else {
+            if (!encoded || !authority || !dispatchKey) {
+              throw new Error(
+                "requeue=true requires captured context, authenticated authority, and dispatch key",
+              );
+            }
             const context = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8"));
             if (
-              !requested ||
               context.schema_version !== 1 ||
               context.authority !== authority ||
-              !dispatchKey ||
               context.dispatch_key !== dispatchKey ||
-              !Number.isSafeInteger(context.depth) ||
-              context.depth < 1 ||
+              context.depth !== 1 ||
+              !/^requeue-1-[0-9a-f]{24}$/.test(dispatchKey) ||
               !["0", "1"].includes(context.allow_execute) ||
               !["0", "1"].includes(context.allow_fix_pr)
             ) {

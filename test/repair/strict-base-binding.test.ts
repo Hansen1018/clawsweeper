@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -634,7 +634,7 @@ test("repair execution and validation cannot mutate GitHub before trusted public
   assert.match(source, /--dashboard-only/);
 });
 
-test("exact router dispatch concurrency is item-specific and cannot replace another item", () => {
+test("exact router lanes are item-specific and durable dispatch is globally serialized", () => {
   const source = fs.readFileSync(".github/workflows/repair-comment-router.yml", "utf8");
   const workflow = readWorkflow(".github/workflows/repair-comment-router.yml");
   const normalize = workflow.jobs?.["normalize-lane"];
@@ -714,6 +714,10 @@ test("exact router dispatch concurrency is item-specific and cannot replace anot
     item42.dispatch_concurrency_group,
     "repair-comment-router-openclaw/openclaw-worker-dispatch",
   );
+  assert.equal(
+    item43.dispatch_concurrency_group,
+    "repair-comment-router-openclaw/openclaw-worker-dispatch",
+  );
   assert.equal(item43.dispatch_concurrency_group, item42.dispatch_concurrency_group);
   const routerSource = fs.readFileSync("src/repair/comment-router.ts", "utf8");
   const candidateSelection = routerSource.slice(
@@ -749,7 +753,11 @@ test("exact router dispatch concurrency is item-specific and cannot replace anot
   for (const input of ["force_reprocess", "lookback_minutes", "since", "max_comments"]) {
     assert.match(fanout, new RegExp(`-f ${input}="\\$${input}"`));
   }
-  assert.match(fanout, /since="\$\{\{ github\.event\.client_payload\.since \|\| '' \}\}"/);
+  assert.match(
+    fanout,
+    /since="\$\([\s\S]*jq -er '\.since \| strings \| select\(length > 0\)'[\s\S]*results\/comment-router-latest\.json[\s\S]*\)"/,
+  );
+  assert.doesNotMatch(fanout, /since="\$\{\{ github\.event\.(?:inputs|client_payload)/);
   assert.match(fanout, /router_item_fanout\.selected_item_numbers/);
   assert.match(fanout, /group_by\(\.issue_number\)/);
   assert.match(fanout, /\.\[\]\.comment_id.*test\("\^\[0-9\]\+\$"\)/s);
@@ -778,11 +786,22 @@ test("exact router dispatch concurrency is item-specific and cannot replace anot
   );
   const dispatchStep = dispatch.steps?.find(
     (step: { name?: string }) =>
-      step.name === "Dispatch waiting commands under the central capacity gate",
+      step.name === "Drain durable waiting commands under the serialized capacity gate",
   );
   assert.doesNotMatch(String(routeStep?.run ?? ""), /--execute/);
   assert.match(String(dispatchStep?.run ?? ""), /--wait-for-capacity/);
   assert.match(String(dispatchStep?.run ?? ""), /--execute/);
+  assert.match(String(dispatchStep?.run ?? ""), /results\/comment-router\.json/);
+  assert.match(String(dispatchStep?.run ?? ""), /\.status == "waiting" or \.status == "claimed"/);
+  assert.match(
+    String(dispatchStep?.run ?? ""),
+    /group_by\(\[[\s\S]*\.issue_number,[\s\S]*\.comment_id,[\s\S]*\.attempt_id/,
+  );
+  assert.match(String(dispatchStep?.run ?? ""), /dispatch_context\.since/);
+  assert.match(String(dispatchStep?.run ?? ""), /status_comment_id/);
+  assert.match(String(dispatchStep?.run ?? ""), /--attempt-id "\$attempt_id"/);
+  assert.doesNotMatch(String(dispatchStep?.run ?? ""), /inputs\.item_numbers/);
+  assert.equal(dispatch["timeout-minutes"], 40);
   assert.match(
     source,
     /Route ClawSweeper comments[\s\S]*repository_dispatch[\s\S]*workflow_dispatch[\s\S]*schedule[\s\S]*args\+=\(--stage-selected-commands\)/,
@@ -800,7 +819,7 @@ test("exact router dispatch concurrency is item-specific and cannot replace anot
   assert.equal(dispatch.concurrency?.["cancel-in-progress"], false);
   assert.match(
     source,
-    /Dispatch waiting commands under the central capacity gate[\s\S]*--wait-for-capacity[\s\S]*--execute/,
+    /Drain durable waiting commands under the serialized capacity gate[\s\S]*--wait-for-capacity[\s\S]*--execute/,
   );
   assert.doesNotMatch(source, /Retry waiting repair dispatches/);
   for (const stepName of [
@@ -814,6 +833,58 @@ test("exact router dispatch concurrency is item-specific and cannot replace anot
     assert.match(block, /--rebase-strategy merge-comment-router/);
     assert.doesNotMatch(block, /--rebase-strategy theirs/);
   }
+});
+
+test("repair requeues require one authenticated bounded context and stable key", () => {
+  const workflow = readWorkflow(".github/workflows/repair-cluster-worker.yml");
+  const step = workflow.jobs?.cluster?.steps?.find(
+    (candidate: { id?: string }) => candidate.id === "requeue_context",
+  );
+  const script = String(step?.run ?? "");
+  const missing = runRequeueContextScript(script, {
+    REQUEUE_REQUESTED: "true",
+    REQUEUE_ACTOR: "openclaw-clawsweeper[bot]",
+  });
+  assert.notEqual(missing.status, 0);
+  assert.match(
+    missing.stderr,
+    /requeue=true requires captured context, authenticated authority, and dispatch key/,
+  );
+
+  const dispatchKey = "requeue-1-0123456789abcdef01234567";
+  const context = Buffer.from(
+    JSON.stringify({
+      schema_version: 1,
+      authority: "clawsweeper-app",
+      depth: 1,
+      allow_execute: "1",
+      allow_fix_pr: "1",
+      dispatch_key: dispatchKey,
+    }),
+  ).toString("base64url");
+  const valid = runRequeueContextScript(script, {
+    REQUEUE_REQUESTED: "true",
+    REQUEUE_CONTEXT: context,
+    REQUEUE_AUTHORITY: "clawsweeper-app",
+    REQUEUE_DISPATCH_KEY: dispatchKey,
+    REQUEUE_ACTOR: "openclaw-clawsweeper[bot]",
+    REQUEUE_EVENT_NAME: "workflow_dispatch",
+  });
+  assert.equal(valid.status, 0, valid.stderr);
+  assert.equal(valid.outputs.depth, "1");
+  assert.match(valid.environment, /CLAWSWEEPER_ALLOW_EXECUTE=1/);
+  assert.match(valid.environment, /CLAWSWEEPER_ALLOW_FIX_PR=1/);
+
+  const unstable = runRequeueContextScript(script, {
+    REQUEUE_REQUESTED: "true",
+    REQUEUE_CONTEXT: context,
+    REQUEUE_AUTHORITY: "clawsweeper-app",
+    REQUEUE_DISPATCH_KEY: "manual-retry",
+    REQUEUE_ACTOR: "openclaw-clawsweeper[bot]",
+    REQUEUE_EVENT_NAME: "workflow_dispatch",
+  });
+  assert.notEqual(unstable.status, 0);
+  assert.match(unstable.stderr, /captured requeue context is invalid/);
 });
 
 function runRouterLaneScript(script: string, overrides: NodeJS.ProcessEnv) {
@@ -841,6 +912,46 @@ function runRouterLaneScript(script: string, overrides: NodeJS.ProcessEnv) {
         return [entry.slice(0, separator), entry.slice(separator + 1)];
       }),
   );
+}
+
+function runRequeueContextScript(script: string, overrides: NodeJS.ProcessEnv) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-requeue-context-"));
+  const output = path.join(root, "output");
+  const environment = path.join(root, "environment");
+  const result = spawnSync("bash", ["-c", script], {
+    env: {
+      ...process.env,
+      REQUEUE_CONTEXT: "",
+      REQUEUE_REQUESTED: "false",
+      REQUEUE_AUTHORITY: "",
+      REQUEUE_DISPATCH_KEY: "",
+      REQUEUE_ACTOR: "",
+      REQUEUE_EVENT_NAME: "workflow_dispatch",
+      ...overrides,
+      GITHUB_OUTPUT: output,
+      GITHUB_ENV: environment,
+    },
+    encoding: "utf8",
+  });
+  const readKeyValues = (file: string) =>
+    fs.existsSync(file)
+      ? Object.fromEntries(
+          fs
+            .readFileSync(file, "utf8")
+            .split(/\r?\n/)
+            .filter(Boolean)
+            .map((entry) => {
+              const separator = entry.indexOf("=");
+              return [entry.slice(0, separator), entry.slice(separator + 1)];
+            }),
+        )
+      : {};
+  return {
+    status: result.status,
+    stderr: result.stderr,
+    outputs: readKeyValues(output),
+    environment: fs.existsSync(environment) ? fs.readFileSync(environment, "utf8") : "",
+  };
 }
 
 test("workflow App identity is derived from authenticated tokens, never a configured numeric id", () => {
@@ -1020,6 +1131,7 @@ type Workflow = {
     {
       if?: string;
       needs?: string;
+      "timeout-minutes"?: number;
       concurrency?: {
         group?: string;
         "cancel-in-progress"?: boolean;

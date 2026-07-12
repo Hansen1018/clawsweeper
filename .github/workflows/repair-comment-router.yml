@@ -133,9 +133,10 @@ jobs:
           else
             concurrency_group="repair-comment-router-$target_repo-scan"
           fi
+          dispatch_concurrency_group="repair-comment-router-$target_repo-worker-dispatch"
           {
             echo "concurrency_group=$concurrency_group"
-            echo "dispatch_concurrency_group=repair-comment-router-$target_repo-worker-dispatch"
+            echo "dispatch_concurrency_group=$dispatch_concurrency_group"
             echo "exact_item=$([ -n "$item_number" ] && echo true || echo false)"
           } >> "$GITHUB_OUTPUT"
 
@@ -421,7 +422,6 @@ jobs:
           target_repo="${{ github.event_name == 'workflow_dispatch' && inputs.target_repo || vars.CLAWSWEEPER_TARGET_REPO || 'openclaw/openclaw' }}"
           target_branch="${{ github.event_name == 'workflow_dispatch' && inputs.target_branch || '' }}"
           lookback_minutes="${{ github.event_name == 'workflow_dispatch' && inputs.lookback_minutes || vars.CLAWSWEEPER_COMMENT_LOOKBACK_MINUTES || '180' }}"
-          since="${{ github.event_name == 'workflow_dispatch' && inputs.since || '' }}"
           max_comments="${{ github.event_name == 'workflow_dispatch' && inputs.max_comments || vars.CLAWSWEEPER_COMMENT_MAX_COMMENTS || '100' }}"
           runner="${{ github.event_name == 'workflow_dispatch' && inputs.runner || vars.CLAWSWEEPER_WORKER_RUNNER || 'blacksmith-4vcpu-ubuntu-2404' }}"
           execution_runner="${{ github.event_name == 'workflow_dispatch' && inputs.execution_runner || vars.CLAWSWEEPER_EXECUTION_RUNNER || 'blacksmith-16vcpu-ubuntu-2404' }}"
@@ -432,7 +432,6 @@ jobs:
             target_repo="${{ github.event.client_payload.target_repo || 'openclaw/openclaw' }}"
             target_branch="${{ github.event.client_payload.target_branch || '' }}"
             lookback_minutes="${{ github.event.client_payload.lookback_minutes || vars.CLAWSWEEPER_COMMENT_LOOKBACK_MINUTES || '180' }}"
-            since="${{ github.event.client_payload.since || '' }}"
             max_comments="${{ github.event.client_payload.max_comments || '1' }}"
             runner="${{ github.event.client_payload.runner || vars.CLAWSWEEPER_WORKER_RUNNER || 'blacksmith-4vcpu-ubuntu-2404' }}"
             execution_runner="${{ github.event.client_payload.execution_runner || vars.CLAWSWEEPER_EXECUTION_RUNNER || 'blacksmith-16vcpu-ubuntu-2404' }}"
@@ -440,6 +439,10 @@ jobs:
             item_numbers="${{ github.event.client_payload.item_number || '' }}"
             comment_ids="${{ github.event.client_payload.comment_id || '' }}"
           fi
+          since="$(
+            jq -er '.since | strings | select(length > 0)' \
+              results/comment-router-latest.json
+          )"
           jq -r '
             (.router_item_fanout.selected_item_numbers // []) as $selected
             | .commands
@@ -513,7 +516,7 @@ jobs:
     needs: [normalize-lane, route-comments]
     if: ${{ needs.normalize-lane.outputs.exact_item == 'true' && (github.event_name == 'repository_dispatch' || github.event_name == 'workflow_dispatch' && inputs.execute) }}
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 40
     concurrency:
       group: ${{ needs.normalize-lane.outputs.dispatch_concurrency_group }}
       cancel-in-progress: false
@@ -642,7 +645,7 @@ jobs:
           test "$app_id" -gt 0
           echo "app_id=$app_id" >> "$GITHUB_OUTPUT"
 
-      - name: Dispatch waiting commands under the central capacity gate
+      - name: Drain durable waiting commands under the serialized capacity gate
         env:
           GH_TOKEN: ${{ steps.dispatch-app-token.outputs.token }}
           CLAWSWEEPER_AUTHENTICATED_APP_ID: ${{ steps.dispatch-mutation-app.outputs.app_id }}
@@ -659,99 +662,114 @@ jobs:
         run: |
           set -euo pipefail
           target_repo="${{ github.event_name == 'workflow_dispatch' && inputs.target_repo || vars.CLAWSWEEPER_TARGET_REPO || 'openclaw/openclaw' }}"
-          target_branch="${{ github.event_name == 'workflow_dispatch' && inputs.target_branch || '' }}"
-          lookback_minutes="${{ github.event_name == 'workflow_dispatch' && inputs.lookback_minutes || vars.CLAWSWEEPER_COMMENT_LOOKBACK_MINUTES || '180' }}"
-          since="${{ github.event_name == 'workflow_dispatch' && inputs.since || '' }}"
-          max_comments="${{ github.event_name == 'workflow_dispatch' && inputs.max_comments || vars.CLAWSWEEPER_COMMENT_MAX_COMMENTS || '100' }}"
-          item_numbers="${{ github.event_name == 'workflow_dispatch' && inputs.item_numbers || '' }}"
-          comment_ids="${{ github.event_name == 'workflow_dispatch' && inputs.comment_ids || '' }}"
-          runner="${{ github.event_name == 'workflow_dispatch' && inputs.runner || vars.CLAWSWEEPER_WORKER_RUNNER || 'blacksmith-4vcpu-ubuntu-2404' }}"
-          execution_runner="${{ github.event_name == 'workflow_dispatch' && inputs.execution_runner || vars.CLAWSWEEPER_EXECUTION_RUNNER || 'blacksmith-16vcpu-ubuntu-2404' }}"
-          force_reprocess="${{ github.event_name == 'workflow_dispatch' && inputs.force_reprocess || 'false' }}"
-          attempt_id="${{ github.event_name == 'workflow_dispatch' && inputs.attempt_id || '' }}"
           if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
             target_repo="${{ github.event.client_payload.target_repo || 'openclaw/openclaw' }}"
-            target_branch="${{ github.event.client_payload.target_branch || '' }}"
-            lookback_minutes="${{ github.event.client_payload.lookback_minutes || vars.CLAWSWEEPER_COMMENT_LOOKBACK_MINUTES || '180' }}"
-            since="${{ github.event.client_payload.since || '' }}"
-            max_comments="${{ github.event.client_payload.max_comments || '1' }}"
-            item_numbers="${{ github.event.client_payload.item_number || '' }}"
-            comment_ids="${{ github.event.client_payload.comment_id || '' }}"
-            status_comment_id="${{ github.event.client_payload.status_comment_id || '' }}"
-            source_event="${{ github.event.client_payload.source_event || '' }}"
-            source_action="${{ github.event.client_payload.source_action || '' }}"
-            dispatch_actor="${{ github.actor }}"
-            comment_event_auth="${{ github.event.client_payload.comment_event_auth || '' }}"
-            comment_updated_at="${{ github.event.client_payload.comment_updated_at || '' }}"
-            comment_body_sha256="${{ github.event.client_payload.comment_body_sha256 || '' }}"
-            force_reprocess="${{ github.event.client_payload.force_reprocess || 'false' }}"
-            attempt_id="${{ github.event.client_payload.attempt_id || '' }}"
-          else
-            status_comment_id=""
-            source_event=""
-            source_action=""
-            dispatch_actor=""
-            comment_event_auth=""
-            comment_updated_at=""
-            comment_body_sha256=""
           fi
-          if [ "$force_reprocess" = "true" ] && [ -z "$attempt_id" ]; then
-            attempt_id="forced-replay-${GITHUB_RUN_ID}"
-          fi
-          if [ "$force_reprocess" != "true" ] && [ -n "$attempt_id" ]; then
-            echo "attempt_id requires force_reprocess=true" >&2
-            exit 1
-          fi
+          normalized_target_repo="$(printf '%s' "$target_repo" | tr '[:upper:]' '[:lower:]')"
+          default_runner="${{ vars.CLAWSWEEPER_WORKER_RUNNER || 'blacksmith-4vcpu-ubuntu-2404' }}"
+          default_execution_runner="${{ vars.CLAWSWEEPER_EXECUTION_RUNNER || 'blacksmith-16vcpu-ubuntu-2404' }}"
+          queue_file="$RUNNER_TEMP/comment-router-dispatch-queue.jsonl"
 
-          args=(
-            --write-report
-            --repo "$target_repo"
-            --lookback-minutes "$lookback_minutes"
-            --max-comments "$max_comments"
-            --runner "$runner"
-            --execution-runner "$execution_runner"
-            --wait-for-capacity
-            --execute
-          )
-          if [ -n "$target_branch" ]; then
-            args+=(--target-branch "$target_branch")
-          fi
-          if [ -n "$since" ]; then
-            args+=(--since "$since")
-          fi
-          if [ -n "$item_numbers" ]; then
-            args+=(--item-numbers "$item_numbers")
-          fi
-          if [ -n "$comment_ids" ]; then
-            args+=(--comment-ids "$comment_ids")
-          fi
-          if [ -n "$status_comment_id" ]; then
-            args+=(--status-comment-id "$status_comment_id")
-          fi
-          if [ -n "$source_event" ]; then
-            args+=(--source-event "$source_event")
-          fi
-          if [ -n "$source_action" ]; then
-            args+=(--source-action "$source_action")
-          fi
-          if [ -n "$dispatch_actor" ]; then
-            args+=(--dispatch-actor "$dispatch_actor")
-          fi
-          if [ -n "$comment_event_auth" ]; then
-            args+=(--comment-event-auth "$comment_event_auth")
-          fi
-          if [ -n "$comment_updated_at" ]; then
-            args+=(--comment-updated-at "$comment_updated_at")
-          fi
-          if [ -n "$comment_body_sha256" ]; then
-            args+=(--comment-body-sha256 "$comment_body_sha256")
-          fi
-          if [ "$force_reprocess" = "true" ]; then
-            args+=(--force-reprocess)
-            args+=(--attempt-id "$attempt_id")
-          fi
+          jq -c \
+            --arg repo "$normalized_target_repo" \
+            --arg default_runner "$default_runner" \
+            --arg default_execution_runner "$default_execution_runner" '
+            [
+              .commands[]?
+              | select(.status == "waiting" or .status == "claimed")
+              | select((.repo | strings | ascii_downcase) == $repo)
+              | select(.issue_number | type == "number" and . > 0)
+              | select(
+                  .comment_id
+                  | strings
+                  | test(
+                      "^[1-9][0-9]*$|^repair-loop-label-sweep:(autofix|automerge):[1-9][0-9]*$"
+                    )
+              )
+            ]
+            | group_by([
+                .issue_number,
+                .comment_id,
+                (if .forced_replay == true then .attempt_id else "" end)
+              ])
+            | map(
+                sort_by(.processed_at // "")
+                | .[-1] as $latest
+                | {
+                    item_number: $latest.issue_number,
+                    comment_id: $latest.comment_id,
+                    status_comment_id: (
+                      [.[] | .status_comment_id // empty]
+                      | last // ""
+                    ),
+                    force_reprocess: ($latest.forced_replay == true),
+                    attempt_id: (
+                      if $latest.forced_replay == true then $latest.attempt_id else ""
+                      end
+                    ),
+                    dispatch_context: {
+                      target_branch: ($latest.dispatch_context.target_branch // ""),
+                      runner: ($latest.dispatch_context.runner // $default_runner),
+                      execution_runner: (
+                        $latest.dispatch_context.execution_runner // $default_execution_runner
+                      ),
+                      since: (
+                        $latest.dispatch_context.since //
+                        $latest.comment_created_at //
+                        $latest.comment_updated_at //
+                        $latest.processed_at
+                      )
+                    }
+                  }
+              )
+            | sort_by(.item_number, .comment_id)
+            | .[]
+          ' results/comment-router.json > "$queue_file"
 
-          pnpm run repair:comment-router -- "${args[@]}"
+          while IFS= read -r queued_command; do
+            item_number="$(jq -er '.item_number' <<<"$queued_command")"
+            comment_id="$(jq -er '.comment_id' <<<"$queued_command")"
+            target_branch="$(jq -r '.dispatch_context.target_branch // empty' <<<"$queued_command")"
+            since="$(jq -er '.dispatch_context.since | strings | select(length > 0)' <<<"$queued_command")"
+            runner="$(jq -er '.dispatch_context.runner | strings | select(length > 0)' <<<"$queued_command")"
+            execution_runner="$(jq -er '.dispatch_context.execution_runner | strings | select(length > 0)' <<<"$queued_command")"
+            status_comment_id="$(jq -r '.status_comment_id // empty' <<<"$queued_command")"
+            force_reprocess="$(jq -r '.force_reprocess' <<<"$queued_command")"
+            attempt_id="$(jq -r '.attempt_id // empty' <<<"$queued_command")"
+            if [ "$force_reprocess" = "true" ] && [ -z "$attempt_id" ]; then
+              echo "forced replay queue entry requires attempt_id" >&2
+              exit 1
+            fi
+            if [ "$force_reprocess" != "true" ] && [ -n "$attempt_id" ]; then
+              echo "attempt_id requires force_reprocess=true" >&2
+              exit 1
+            fi
+
+            args=(
+              --write-report
+              --repo "$target_repo"
+              --item-numbers "$item_number"
+              --comment-ids "$comment_id"
+              --max-comments 1
+              --since "$since"
+              --runner "$runner"
+              --execution-runner "$execution_runner"
+              --wait-for-capacity
+              --execute
+            )
+            if [ -n "$target_branch" ]; then
+              args+=(--target-branch "$target_branch")
+            fi
+            if [ -n "$status_comment_id" ]; then
+              args+=(--status-comment-id "$status_comment_id")
+            fi
+            if [ "$force_reprocess" = "true" ]; then
+              args+=(--force-reprocess)
+              args+=(--attempt-id "$attempt_id")
+            fi
+
+            pnpm run repair:comment-router -- "${args[@]}"
+          done < "$queue_file"
 
       - name: Commit comment router dispatch ledger
         if: always()

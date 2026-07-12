@@ -1582,14 +1582,18 @@ test("broad router selects distinct item cursors before bounded comment hydratio
     source.indexOf("function forwardedExactComments()"),
   );
   const recentDiscovery = candidates.indexOf("const recentComments = listRecentComments();");
+  const routableDiscovery = candidates.indexOf(
+    "const routableRecentComments = recentComments.filter(isBroadRouterCommentCandidate);",
+  );
   const page = candidates.indexOf("const broadPage = selectRouterCommentItemPage({");
   const durableHydration = candidates.indexOf(
     "const durable = listDurableRouterComments(broadPage.itemNumbers)",
   );
 
   assert.ok(recentDiscovery >= 0);
+  assert.ok(routableDiscovery > recentDiscovery);
   assert.ok(page >= 0);
-  assert.ok(page > recentDiscovery);
+  assert.ok(page > routableDiscovery);
   assert.ok(durableHydration > page);
   assert.doesNotMatch(
     candidates.slice(recentDiscovery, page),
@@ -1597,7 +1601,20 @@ test("broad router selects distinct item cursors before bounded comment hydratio
   );
   assert.match(
     candidates,
-    /comments: recentComments,[\s\S]*routerPendingItemNumbers\(ledger\.commands \?\? \[\], targetRepo\)[\s\S]*after: routerFanoutAfter[\s\S]*limit: maxComments/,
+    /comments: routableRecentComments,[\s\S]*routerPendingItemNumbers\(ledger\.commands \?\? \[\], targetRepo\)[\s\S]*after: routerFanoutAfter[\s\S]*limit: maxComments/,
+  );
+  assert.match(
+    candidates,
+    /recentComments: routableRecentComments\.filter\([\s\S]*reservedItemNumbers: broadPage\.itemNumbers/,
+  );
+  const broadCandidate = source.slice(
+    source.indexOf("function isBroadRouterCommentCandidate"),
+    source.indexOf("type RepairLoopTarget"),
+  );
+  assert.match(broadCandidate, /parseRoutedCommentCommand\(comment/);
+  assert.match(
+    broadCandidate,
+    /retryPendingCommentVersions\.has\(versionKey\)[\s\S]*!processedCommentVersions\.has\(versionKey\)/,
   );
   const durable = source.slice(
     source.indexOf("function listDurableRouterComments"),

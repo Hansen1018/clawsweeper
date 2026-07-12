@@ -530,6 +530,7 @@ test("selected fanout commands are staged durably and idempotently before dispat
     comment_id: String(1000 + issueNumber),
     comment_version_key: `${1000 + issueNumber}:2026-07-12T20:00:00Z`,
     comment_updated_at: "2026-07-12T20:00:00Z",
+    status_comment_id: 2000 + issueNumber,
     repo: "openclaw/openclaw",
     issue_number: issueNumber,
     status: "ready",
@@ -541,6 +542,12 @@ test("selected fanout commands are staged durably and idempotently before dispat
     commands,
     selectedItemNumbers: new Set([42, 43]),
     processedAt: "2026-07-12T20:01:00Z",
+    dispatchContext: {
+      target_branch: "main",
+      runner: "blacksmith-4vcpu-ubuntu-2404",
+      execution_runner: "blacksmith-16vcpu-ubuntu-2404",
+      since: "2026-07-12T19:00:00Z",
+    },
   });
 
   assert.deepEqual(
@@ -553,6 +560,13 @@ test("selected fanout commands are staged durably and idempotently before dispat
   assert.equal(appendLedger(ledger, staged), true);
   assert.equal(appendLedger(ledger, staged), false);
   assert.deepEqual(routerPendingItemNumbers(ledger.commands, "openclaw/openclaw"), [42, 43]);
+  assert.deepEqual(ledger.commands[0].dispatch_context, {
+    target_branch: "main",
+    runner: "blacksmith-4vcpu-ubuntu-2404",
+    execution_runner: "blacksmith-16vcpu-ubuntu-2404",
+    since: "2026-07-12T19:00:00Z",
+  });
+  assert.equal(ledger.commands[0].status_comment_id, 2042);
 });
 
 test("restaging preserves an existing dispatch claim and its recovery timestamp", () => {

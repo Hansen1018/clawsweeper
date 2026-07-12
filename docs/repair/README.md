@@ -249,6 +249,12 @@ comments in `results/comment-router.json`. The scheduled workflow is dry by
 default; set `CLAWSWEEPER_COMMENT_ROUTER_EXECUTE=1` to let scheduled runs post
 replies and dispatch workers.
 
+Selected commands are persisted before exact-item fanout. Exact routing stays
+item-keyed, while worker dispatch is serialized through an input-independent
+queue drainer that reads every durable waiting command and its captured
+branch, runner, and scan timestamp. Replacing a pending drainer run therefore
+cannot replace the queued item.
+
 Scheduled runs also sweep open PRs with `clawsweeper:autofix` or
 `clawsweeper:automerge` labels. When a labelled PR is stale, failing checks, or
 dirty/behind its base branch, the router can synthesize an internal trusted
@@ -316,6 +322,8 @@ pnpm run repair:requeue -- 24947178021
 # Requeue one reviewed job/run into the live queue. This waits for capacity,
 # then forwards the explicit captured gate values through an authenticated
 # maintainer workflow dispatch without changing repository-wide variables.
+# Direct workflow runs with requeue=true are rejected unless they carry the
+# bounded context and deterministic dispatch key produced by this command.
 pnpm run repair:requeue -- 24947178021 --execute --open-execute-window \
   --requeue-authority maintainer \
   --allow-execute 1 \
