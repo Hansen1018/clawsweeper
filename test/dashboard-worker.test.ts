@@ -7,7 +7,9 @@ import worker, {
   automaticIssueWork,
   ExactReviewQueue,
   exactReviewQueueCapacity,
+  mergeBayTerminalState,
   StatusStore,
+  summarizeBayTimings,
   workerWorkKind,
 } from "../dashboard/worker.ts";
 import {
@@ -57,6 +59,327 @@ test("issue triage exposes impact-group controls without changing PR proof triag
   assert.doesNotMatch(await proofPage.text(), /id="routing-group"/);
 });
 
+test("OpenClaw Bay is an unlisted, hardened demo route", async () => {
+  const response = await worker.fetch(new Request("https://clawsweeper.openclaw.ai/bay-demo"), {});
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("content-type"), "text/html; charset=utf-8");
+  assert.equal(response.headers.get("cache-control"), "no-store");
+  assert.equal(response.headers.get("x-robots-tag"), "noindex, nofollow, noarchive");
+  assert.equal(response.headers.get("referrer-policy"), "no-referrer");
+  assert.equal(response.headers.get("x-content-type-options"), "nosniff");
+  assert.equal(response.headers.get("x-frame-options"), "DENY");
+  const contentSecurityPolicy = response.headers.get("content-security-policy") || "";
+  assert.match(contentSecurityPolicy, /connect-src 'self' https:\/\/\*\.openclaw\.ai/);
+  assert.match(contentSecurityPolicy, /frame-ancestors 'none'/);
+  const body = await response.text();
+  assert.match(body, /<title>OpenClaw Bay · ClawSweeper<\/title>/);
+  assert.match(body, /<meta name="robots" content="noindex,nofollow,noarchive">/);
+  assert.match(body, /Experimental demo/);
+  assert.match(body, /href="\/bay-demo" aria-current="page"/);
+  assert.match(body, /Where's my crustacean\?/);
+  assert.match(body, /Terminal pools clear together at 20 outcomes/);
+  assert.match(body, /Master Sweeper/);
+  assert.match(body, /id="tunnel-layer"/);
+  assert.match(body, /function startTunnelJourney/);
+  assert.doesNotMatch(body, /function drawTunnels/);
+  assert.match(body, /function visualBackwardTransitionKey/);
+  assert.match(body, /class="ready-flag"/);
+  assert.match(body, /function sweepPendingForward/);
+  assert.match(body, /function laneLinesSvg/);
+  assert.match(body, /function laneWeightFor/);
+  assert.match(body, /gridTemplateColumns=laneWeights/);
+  assert.match(body, /function fitStageDensity/);
+  assert.match(body, /lane-nudge/);
+  assert.match(body, /id="overall-average"/);
+  assert.doesNotMatch(body, /function laneTimingHtml/);
+  assert.doesNotMatch(body, /lane-average/);
+  assert.doesNotMatch(body, /AVG WAIT|AVG TIME|AVG RUN/);
+  assert.match(body, /function packActiveStages/);
+  assert.match(body, /id="chat-overlay"/);
+  assert.match(body, /id="chat-overlay" aria-hidden="true"/);
+  assert.doesNotMatch(body, /id="chat-overlay" aria-live=/);
+  assert.match(body, /function showLaneChat/);
+  assert.match(body, /z-index:90/);
+  assert.match(body, /id="tide-preview"/);
+  assert.match(body, /id="tide-visual"/);
+  assert.match(body, /class="tide-carriage wave"/);
+  assert.match(body, /tide-water-texture/);
+  assert.match(body, /tide-washing/);
+  assert.match(body, /dataset\.tidePhase="incoming"/);
+  assert.match(body, /duration:"520ms"|end:520/);
+  assert.match(body, /function previewTide/);
+  assert.match(body, /live outcome data was unchanged/);
+  assert.match(body, /realTidePending/);
+  assert.match(body, /loadInFlight/);
+  assert.match(body, /replaceChildren\(journey\)/);
+  assert.match(body, /master\.getAnimations\(\)/);
+  assert.match(body, /Let the current beach movement finish first/);
+  assert.match(body, /function visualTransitionKey/);
+  assert.match(body, /pendingItems/);
+  assert.match(body, /OUTCOME_CONFIRM_MS=150000/);
+  assert.match(body, /function reconcileConfirmingOutcomes/);
+  assert.match(body, /confirming-flag/);
+  assert.match(body, /confirming outcome/);
+  assert.match(body, /data-key=/);
+  assert.match(body, /aria-pressed=/);
+  assert.match(body, /How long has your ClawSweeper run been going\?/);
+  assert.match(body, /I'm keeping my claws crossed\./);
+  assert.doesNotMatch(body, /Things are moving|30m end to end/);
+  const runChangedSource = body.match(/function runChanged\([^}]+\}/)?.[0];
+  const transitionKindSource = body.match(
+    /function transitionKind\([^]*?return oldIndex>=0&&nextIndex>oldIndex\?"forward":null;\}/,
+  )?.[0];
+  assert.ok(runChangedSource);
+  assert.ok(transitionKindSource);
+  const classifyTransition = new Script(
+    `${runChangedSource};(${transitionKindSource})`,
+  ).runInNewContext({
+    STAGES: ["arriving", "setting-up", "reviewing", "repairing", "applying"],
+  });
+  for (const stage of ["setting-up", "reviewing", "applying"]) {
+    assert.equal(
+      classifyTransition({ run_id: "old", stage: "reviewing" }, { run_id: "new", stage }),
+      "retrigger",
+    );
+  }
+  assert.equal(
+    classifyTransition(
+      { run_id: "same", stage: "reviewing" },
+      { run_id: "same", stage: "repairing" },
+    ),
+    "forward",
+  );
+  assert.match(body, /hasBaySchema\(live\.bay\)\?live\.bay:previewBay/);
+  assert.match(body, /state\.previewSource=false/);
+  assert.match(body, /record\.outcome==="failure"\?"failed"/);
+  assert.match(body, /master\.classList\.add\("resting"\)/);
+  assert.match(body, /fetch\("\/api\/status"/);
+  assert.match(body, /setInterval\(load,20000\)/);
+  assert.doesNotMatch(body, /api\.github\.com|fetch\("\/repos\//);
+  assert.match(body, /Disappearing workers remain CHECKING/);
+  assert.match(body, /renderRepos\(state\.filter\)/);
+  assert.match(body, /replacement\.focus\(\{preventScroll:true\}\)/);
+  const script = [...body.matchAll(/<script>\n([\s\S]*?)\n<\/script>/g)].at(-1)?.[1];
+  assert.ok(script);
+  assert.doesNotThrow(() => new Script(script));
+  const confirmingStart = script.indexOf("function reconcileConfirmingOutcomes");
+  const confirmingEnd = script.indexOf("function reposFor", confirmingStart);
+  assert.ok(confirmingStart > 0 && confirmingEnd > confirmingStart);
+  const confirmingSource = script.slice(confirmingStart, confirmingEnd);
+  const activeVisual = {
+    id: "active:1:97722",
+    key: "openclaw/openclaw#97722",
+    number: 97722,
+    repository: "openclaw/openclaw",
+    stage: "reviewing",
+    status: "in_progress",
+    outcome: null,
+    run_id: 1,
+    current_step: "Review exact event item",
+  };
+  const confirmingContext = createContext({
+    state: { items: [activeVisual], confirmingOutcomes: {} },
+    OUTCOME_CONFIRM_MS: 150_000,
+    Date,
+    Object,
+    nextItems: [],
+    result: null,
+  });
+  new Script(`${confirmingSource}\nresult = reconcileConfirmingOutcomes(nextItems);`).runInContext(
+    confirmingContext,
+  );
+  assert.equal(confirmingContext.result.length, 1);
+  assert.equal(confirmingContext.result[0].confirming, true);
+  assert.equal(confirmingContext.result[0].stage, "reviewing");
+  assert.equal(confirmingContext.result[0].current_step, "Confirming terminal outcome");
+
+  confirmingContext.state.items = confirmingContext.result;
+  confirmingContext.nextItems = [
+    {
+      ...activeVisual,
+      id: "terminal:1",
+      stage: "completed",
+      status: "success",
+      outcome: "success",
+    },
+  ];
+  new Script("result = reconcileConfirmingOutcomes(nextItems);").runInContext(confirmingContext);
+  assert.equal(confirmingContext.result.length, 1);
+  assert.equal(confirmingContext.result[0].stage, "completed");
+  assert.equal(Object.keys(confirmingContext.state.confirmingOutcomes).length, 0);
+
+  for (const path of ["/bay", "/bay.html", "/bay-demo.html"]) {
+    const missing = await worker.fetch(new Request(`https://clawsweeper.openclaw.ai${path}`), {});
+    assert.equal(missing.status, 404, `${path} should remain unpublished`);
+  }
+
+  for (const path of ["/", "/triage", "/pr-proof-triage"]) {
+    const page = await worker.fetch(new Request(`https://clawsweeper.openclaw.ai${path}`), {});
+    const pageBody = await page.text();
+    assert.doesNotMatch(pageBody, /href="\/bay-demo"/);
+    if (path === "/") assert.match(pageBody, /setInterval\(load, 15000\)/);
+  }
+});
+
+test("OpenClaw Bay shares a bounded 20-outcome tide buffer", () => {
+  const attempts = Array.from({ length: 20 }, (_, index) => ({
+    run_id: index + 1,
+    job_id: 1000 + index,
+    repository: "openclaw/openclaw",
+    item_numbers: [9000 + index],
+    outcome: index === 18 ? "failure" : index === 19 ? "cancelled" : "success",
+    terminal_outcome: index === 18 ? "failure" : index === 19 ? "cancelled" : "success",
+    workflow_title: `Review event item openclaw/openclaw#${9000 + index}`,
+    completed_at: `2026-07-10T20:00:${String(index).padStart(2, "0")}Z`,
+  }));
+  const beforeTide = mergeBayTerminalState(null, attempts.slice(0, 19), [], "2026-07-10T20:00:19Z");
+  assert.equal(beforeTide.terminal_count, 19);
+  assert.equal(beforeTide.tide_generation, 0);
+  assert.equal(beforeTide.recently_washed.length, 0);
+
+  const tide = mergeBayTerminalState(beforeTide, attempts, [], "2026-07-10T20:00:20Z");
+  assert.equal(tide.terminal_count, 0);
+  assert.equal(tide.tide_generation, 1);
+  assert.equal(tide.recently_washed.length, 20);
+  assert.equal(tide.last_tide_at, "2026-07-10T20:00:20Z");
+  assert.deepEqual(
+    tide.recently_washed.slice(-2).map((item: { outcome: string }) => item.outcome),
+    ["failure", "cancelled"],
+  );
+
+  const burst = Array.from({ length: 50 }, (_, index) => ({
+    run_id: 2000 + index,
+    job_id: 3000 + index,
+    repository: "openclaw/openclaw",
+    item_numbers: [10_000 + index],
+    outcome: "success",
+    terminal_outcome: "success",
+    workflow_title: `Review event item openclaw/openclaw#${10_000 + index}`,
+    completed_at: `2026-07-10T21:00:${String(index).padStart(2, "0")}Z`,
+  }));
+  const burstTides = mergeBayTerminalState(null, burst, [], "2026-07-10T21:00:50Z");
+  assert.equal(burstTides.tide_generation, 2);
+  assert.equal(burstTides.terminal_count, 10);
+  assert.equal(burstTides.recently_washed.length, 20);
+  assert.deepEqual(
+    burstTides.terminal_buffer.map((item: { number: number }) => item.number),
+    Array.from({ length: 10 }, (_, index) => 10_040 + index),
+  );
+
+  const deferredWhileActive = mergeBayTerminalState(
+    null,
+    attempts.slice(0, 1),
+    [],
+    "2026-07-10T21:01:00Z",
+    ["openclaw/openclaw#9000"],
+  );
+  assert.equal(deferredWhileActive.terminal_count, 0);
+  assert.equal(deferredWhileActive.seen_events.length, 0);
+  const visibleAfterActiveFeedSettles = mergeBayTerminalState(
+    deferredWhileActive,
+    attempts.slice(0, 1),
+    [],
+    "2026-07-10T21:01:01Z",
+  );
+  assert.equal(visibleAfterActiveFeedSettles.terminal_count, 1);
+  assert.equal(visibleAfterActiveFeedSettles.seen_events.length, 1);
+
+  const replay = mergeBayTerminalState(tide, attempts, [], "2026-07-10T20:00:30Z");
+  assert.equal(replay.terminal_count, 0);
+  assert.equal(replay.tide_generation, 1);
+
+  const nextRun = {
+    ...attempts[0],
+    run_id: 101,
+    job_id: 1101,
+    completed_at: "2026-07-10T20:00:31Z",
+  };
+  const nextBuffer = mergeBayTerminalState(replay, [nextRun], [], "2026-07-10T20:00:31Z");
+  assert.equal(nextBuffer.terminal_count, 1);
+  assert.equal(nextBuffer.terminal_buffer[0].number, 9000);
+
+  const terminalBeforeRetrigger = mergeBayTerminalState(
+    null,
+    attempts.slice(0, 2),
+    [],
+    "2026-07-10T20:00:02Z",
+  );
+  const activeAgain = mergeBayTerminalState(
+    terminalBeforeRetrigger,
+    attempts.slice(0, 2),
+    [],
+    "2026-07-10T20:00:03Z",
+    ["openclaw/openclaw#9000"],
+  );
+  assert.equal(activeAgain.terminal_count, 1);
+  assert.deepEqual(
+    activeAgain.terminal_buffer.map((item: { number: number }) => item.number),
+    [9001],
+  );
+  assert.equal(activeAgain.seen_events.length, 2);
+  const reterminal = mergeBayTerminalState(activeAgain, [nextRun], [], "2026-07-10T20:00:31Z");
+  assert.equal(reterminal.terminal_count, 2);
+  assert.deepEqual(
+    reterminal.terminal_buffer.map((item: { number: number }) => item.number),
+    [9001, 9000],
+  );
+
+  const ancillaryFailure = mergeBayTerminalState(
+    null,
+    [
+      {
+        run_id: 301,
+        job_id: 401,
+        repository: "openclaw/openclaw",
+        item_numbers: [12_345],
+        outcome: "failure",
+        terminal_outcome: "success",
+        workflow_title: "Review with a non-terminal ancillary step failure",
+        completed_at: "2026-07-10T20:00:40Z",
+      },
+    ],
+    [],
+    "2026-07-10T20:00:40Z",
+  );
+  assert.equal(ancillaryFailure.terminal_buffer[0].outcome, "success");
+
+  const expiredWash = mergeBayTerminalState(replay, attempts, [], "2026-07-10T20:01:21Z");
+  assert.equal(expiredWash.tide_generation, 1);
+  assert.equal(expiredWash.recently_washed.length, 0);
+});
+
+test("OpenClaw Bay averages only evidenced end-to-end timings from the last hour", () => {
+  const generatedAt = "2026-07-11T12:00:00.000Z";
+  const freshCompletedAt = "2026-07-11T11:45:00.000Z";
+  const timings = summarizeBayTimings(
+    [
+      {
+        outcome: "success",
+        terminal_outcome: "success",
+        completed_at: freshCompletedAt,
+        total_duration_ms: 180_000,
+      },
+      {
+        outcome: "failure",
+        terminal_outcome: "failure",
+        completed_at: "2026-07-11T11:30:00.000Z",
+        total_duration_ms: 240_000,
+      },
+      {
+        outcome: "cancelled",
+        terminal_outcome: "cancelled",
+        completed_at: "2026-07-11T10:59:59.000Z",
+        total_duration_ms: 9_999_999,
+      },
+    ],
+    generatedAt,
+  );
+
+  assert.equal(timings.window_minutes, 60);
+  assert.equal("lanes" in timings, false);
+  assert.deepEqual(timings.overall, { average_ms: 210_000, samples: 2 });
+});
+
 class MemoryKv {
   private values = new Map<string, string>();
 
@@ -71,6 +394,7 @@ class MemoryKv {
 
 class MemoryDurableStorage {
   private values = new Map<string, unknown>();
+  private putCounts = new Map<string, number>();
   private alarmAt: number | null = null;
 
   async get(key: string) {
@@ -79,6 +403,7 @@ class MemoryDurableStorage {
 
   async put(key: string, value: unknown) {
     this.values.set(key, value);
+    this.putCounts.set(key, (this.putCounts.get(key) || 0) + 1);
   }
 
   async delete(key: string) {
@@ -103,6 +428,10 @@ class MemoryDurableStorage {
 
   has(key: string) {
     return this.values.has(key);
+  }
+
+  putCount(key: string) {
+    return this.putCounts.get(key) || 0;
   }
 }
 
@@ -184,6 +513,64 @@ test("dashboard durable status store persists, expires, and prepends events", as
     [{ id: "second" }, { id: "first" }],
   );
 
+  const bayStoreUrl = `https://clawsweeper-status-store/${encodeURIComponent(
+    "openclaw-bay:terminal-state:v1",
+  )}`;
+  for (const number of [501, 502]) {
+    const response = await store.fetch(
+      new Request(bayStoreUrl, {
+        method: "POST",
+        body: JSON.stringify({
+          attempts: [
+            {
+              run_id: number,
+              job_id: number,
+              repository: "openclaw/openclaw",
+              item_numbers: [number],
+              outcome: "success",
+              terminal_outcome: "success",
+              completed_at: `2026-07-11T12:00:${String(number - 500).padStart(2, "0")}Z`,
+            },
+          ],
+          closed_items: [],
+          generated_at: `2026-07-11T12:00:${String(number - 500).padStart(2, "0")}Z`,
+          ttl_seconds: 60,
+        }),
+      }),
+    );
+    assert.equal(response.status, 200);
+  }
+  const persistedBay = JSON.parse(await (await store.fetch(new Request(bayStoreUrl))).text());
+  const bayPutsBeforeReplay = storage.putCount("openclaw-bay:terminal-state:v1");
+  const replay = await store.fetch(
+    new Request(bayStoreUrl, {
+      method: "POST",
+      body: JSON.stringify({
+        attempts: [
+          {
+            run_id: 502,
+            job_id: 502,
+            repository: "openclaw/openclaw",
+            item_numbers: [502],
+            outcome: "success",
+            terminal_outcome: "success",
+            completed_at: "2026-07-11T12:00:02Z",
+          },
+        ],
+        closed_items: [],
+        generated_at: "2026-07-11T12:00:03Z",
+        ttl_seconds: 60,
+      }),
+    }),
+  );
+  assert.equal(replay.status, 200);
+  assert.equal(storage.putCount("openclaw-bay:terminal-state:v1"), bayPutsBeforeReplay);
+  assert.equal(JSON.parse(await replay.text()).updated_at, persistedBay.updated_at);
+  assert.deepEqual(
+    persistedBay.terminal_buffer.map((item: { number: number }) => item.number),
+    [501, 502],
+  );
+
   await store.fetch(
     new Request("https://clawsweeper-status-store/events", {
       method: "PUT",
@@ -215,6 +602,50 @@ test("dashboard durable status store persists, expires, and prepends events", as
   assert.equal(storage.has("cold-expired"), true);
   await store.alarm();
   assert.equal(storage.has("cold-expired"), false);
+});
+
+test("dashboard reuses a current Bay snapshot from the shared status store", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalCaches = globalThis.caches;
+  Object.defineProperty(globalThis, "caches", {
+    configurable: true,
+    value: { default: new MemoryCache() },
+  });
+  const statusStore = new MemoryKv();
+  await statusStore.put(
+    "snapshot",
+    JSON.stringify({
+      schema_version: 1,
+      generated_at: new Date().toISOString(),
+      health: {},
+      bay: {
+        timings: { sample_kind: "latest_completed_jobs" },
+      },
+      pipeline: [{ id: "shared-snapshot" }],
+    }),
+  );
+  let networkRequests = 0;
+  globalThis.fetch = async () => {
+    networkRequests += 1;
+    throw new Error("shared snapshot should avoid GitHub requests");
+  };
+
+  try {
+    const response = await worker.fetch(
+      new Request("https://clawsweeper.openclaw.ai/api/status"),
+      {
+        CACHE_TTL_SECONDS: "60",
+        STATUS_STORE: statusStore,
+      },
+      { waitUntil: () => undefined },
+    );
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).pipeline[0].id, "shared-snapshot");
+    assert.equal(networkRequests, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+    Object.defineProperty(globalThis, "caches", { configurable: true, value: originalCaches });
+  }
 });
 
 test("exact-review queue coalesces deliveries, dispatches a bound rollout snapshot, and rejects duplicate claims", async () => {
@@ -2123,6 +2554,7 @@ function isoAgo(ms: number) {
 }
 
 function completedReviewRun(id: number, itemNumber: number, conclusion: string, ageMs: number) {
+  const now = Date.now();
   return {
     id,
     name: "Review ClawSweeper items",
@@ -2130,8 +2562,8 @@ function completedReviewRun(id: number, itemNumber: number, conclusion: string, 
     status: "completed",
     conclusion,
     html_url: `https://github.com/openclaw/clawsweeper/actions/runs/${id}`,
-    created_at: isoAgo(ageMs),
-    updated_at: isoAgo(Math.max(0, ageMs - 10_000)),
+    created_at: new Date(now - ageMs).toISOString(),
+    updated_at: new Date(now - Math.max(0, ageMs - 10_000)).toISOString(),
   };
 }
 
@@ -2936,29 +3368,38 @@ test("dashboard reports worker error and recovery rates from completed job steps
       const runId = Number(jobMatch[1]);
       const itemNumber = runId === 1 || runId === 2 ? 100 : runId === 3 ? 200 : 300;
       const failed = runId === 1 || runId === 3;
+      const run = runs.find((candidate) => candidate.id === runId);
+      const runStartedAt = Date.parse(run?.created_at || "");
+      const jobStartedAt = new Date(runStartedAt + 1_000).toISOString();
+      const reviewStartedAt = new Date(runStartedAt + 3_000).toISOString();
       return jsonResponse({
         jobs: [
           {
             id: runId * 10,
             name: `Review shard 0 · openclaw/openclaw#${itemNumber}`,
             status: "completed",
-            conclusion: "success",
+            conclusion: runId === 4 ? "neutral" : "success",
             html_url: `https://github.com/openclaw/clawsweeper/actions/runs/${runId}/job/${
               runId * 10
             }`,
-            started_at: runs.find((run) => run.id === runId)?.created_at,
+            started_at: jobStartedAt,
+            completed_at: run?.updated_at,
             steps: [
               {
                 number: 1,
                 name: "Run ./clawsweeper/.github/actions/setup-codex",
                 status: "completed",
                 conclusion: "success",
+                started_at: jobStartedAt,
+                completed_at: reviewStartedAt,
               },
               {
                 number: 2,
                 name: "Review shard",
                 status: "completed",
                 conclusion: failed ? "failure" : "success",
+                started_at: reviewStartedAt,
+                completed_at: run?.updated_at,
               },
             ],
           },
@@ -2996,6 +3437,16 @@ test("dashboard reports worker error and recovery rates from completed job steps
     assert.equal(status.health.unresolved_failures, 1);
     assert.equal(status.health.error_rate_percent, 50);
     assert.equal(status.health.recovery_rate_percent, 50);
+    assert.equal(status.bay.tide_threshold, 20);
+    assert.equal(status.bay.tide_generation, 0);
+    assert.equal(status.bay.terminal_count, 3);
+    assert.equal(status.bay.timings.lanes, undefined);
+    assert.deepEqual(status.bay.timings.overall, { average_ms: 10_000, samples: 4 });
+    assert.deepEqual(
+      status.bay.terminal_buffer.map((item: { number: number }) => item.number),
+      [100, 200, 300],
+    );
+    assert.equal(status.health.recent_attempts, undefined);
     assert.equal(status.health.failures[0].item_numbers[0], 200);
     assert.equal(status.health.failures[0].recovered, false);
     assert.equal(status.health.failures[0].failed_step, "Review shard");
@@ -3424,7 +3875,7 @@ test("dashboard serves stale status while coalescing one background refresh", as
     value: { default: cache },
   });
   await cache.put(
-    new Request("https://clawsweeper.openclaw.ai/api/status-cache/stale"),
+    new Request("https://clawsweeper.openclaw.ai/api/status-cache/v2/stale"),
     jsonResponse({
       schema_version: 1,
       generated_at: "2026-06-13T18:00:00Z",

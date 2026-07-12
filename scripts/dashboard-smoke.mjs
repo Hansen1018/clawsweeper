@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 
+import { pathToFileURL } from "node:url";
+
 const cliUrl = process.argv.find((arg, index) => index > 1 && arg !== "--");
 const baseUrl = cliUrl || process.env.CLAWSWEEPER_STATUS_URL || "http://127.0.0.1:8787";
 
@@ -21,6 +23,15 @@ async function main() {
   }
   if (!Array.isArray(status.workers)) throw new Error("status response is missing worker details");
   if (!Array.isArray(status.pipeline)) throw new Error("status response is missing pipeline rows");
+  if (!status.bay || status.bay.tide_threshold !== 20) {
+    throw new Error("status response is missing the bounded Bay tide contract");
+  }
+  if (!Array.isArray(status.bay.terminal_buffer) || !Array.isArray(status.bay.recently_washed)) {
+    throw new Error("status response is missing Bay terminal outcome arrays");
+  }
+  if (status.bay.timings?.sample_kind !== "latest_completed_jobs") {
+    throw new Error("status response is missing the evidenced Bay timing sample");
+  }
 
   const exactReviewQueue = await fetchJson(`${baseUrl}/api/exact-review-queue`);
   for (const field of ["pending", "dispatching", "leased"]) {
@@ -44,6 +55,52 @@ async function main() {
   if (!html.includes("ClawSweeper Live")) throw new Error("dashboard HTML title missing");
   if (!html.includes("System Overview")) throw new Error("dashboard system overview missing");
   if (!html.includes('id="worker-dialog"')) throw new Error("dashboard worker drill-down missing");
+  if (html.includes('href="/bay-demo"')) {
+    throw new Error("experimental Bay route leaked into the overview navigation");
+  }
+
+  const bayResponse = await fetch(`${baseUrl}/bay-demo`);
+  if (!bayResponse.ok) throw new Error(`${baseUrl}/bay-demo returned ${bayResponse.status}`);
+  if (bayResponse.headers.get("cache-control") !== "no-store") {
+    throw new Error("Bay demo HTML is not marked no-store");
+  }
+  if (bayResponse.headers.get("x-robots-tag") !== "noindex, nofollow, noarchive") {
+    throw new Error("Bay demo is missing its noindex response policy");
+  }
+  const bayCsp = bayResponse.headers.get("content-security-policy") || "";
+  if (
+    !bayCsp.includes("connect-src 'self' https://*.openclaw.ai") ||
+    !bayCsp.includes("frame-ancestors 'none'")
+  ) {
+    throw new Error("Bay demo is missing its expected content security policy");
+  }
+  const bayHtml = await bayResponse.text();
+  if (!bayHtml.includes("OpenClaw Bay · ClawSweeper")) {
+    throw new Error("Bay demo HTML title missing");
+  }
+  if (!bayHtml.includes('fetch("/api/status"')) {
+    throw new Error("Bay demo does not use the shared status endpoint");
+  }
+  if (containsDirectGitHubApiUrl(bayHtml)) {
+    throw new Error("Bay demo contains a direct browser-to-GitHub request");
+  }
+
+  const unpublishedBay = await fetch(`${baseUrl}/bay`);
+  if (unpublishedBay.status !== 404) {
+    throw new Error(`${baseUrl}/bay returned ${unpublishedBay.status}, expected 404`);
+  }
+
+  const bayAssets = {};
+  for (const asset of ["bay-background.webp", "crustaceans-atlas.webp", "master-sweeper.webp"]) {
+    const response = await fetch(`${baseUrl}/bay-assets/${asset}`);
+    if (!response.ok) throw new Error(`${baseUrl}/bay-assets/${asset} returned ${response.status}`);
+    if (response.headers.get("content-type") !== "image/webp") {
+      throw new Error(`${asset} did not return image/webp`);
+    }
+    const bytes = (await response.arrayBuffer()).byteLength;
+    if (bytes < 1_000) throw new Error(`${asset} is unexpectedly small`);
+    bayAssets[asset] = bytes;
+  }
 
   console.log(
     JSON.stringify(
@@ -59,6 +116,12 @@ async function main() {
         cache_state: cacheState,
         status_fetch_ms: statusFetchMs,
         diagnostic_errors: status.diagnostics?.errors || [],
+        bay_demo: {
+          route: "/bay-demo",
+          unlisted: true,
+          direct_github_requests: 0,
+          assets: bayAssets,
+        },
       },
       null,
       2,
@@ -78,7 +141,13 @@ async function fetchText(url) {
   return response.text();
 }
 
-main().catch((error) => {
-  console.error(error instanceof Error ? error.message : String(error));
-  process.exitCode = 1;
-});
+export function containsDirectGitHubApiUrl(html) {
+  return /(?:^|[^a-z0-9.-])api\.github\.com\.?(?=$|[^a-z0-9.-])/iu.test(html);
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch((error) => {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exitCode = 1;
+  });
+}

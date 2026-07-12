@@ -3,6 +3,7 @@ import {
   isClawSweeperReReviewCommandText,
 } from "../src/repair/comment-command-text.ts";
 import { isExactReviewCloseGuardLabel } from "../src/repair/exact-review-guard-labels.ts";
+import { bayHtml } from "./bay-page.ts";
 import { TRIAGE_ROUTING_GROUPS, triageRoutingGroupsForLabels } from "./triage-routing-groups.ts";
 
 const ACTIVE_RUN_STATUSES = new Set(["queued", "in_progress", "waiting", "requested", "pending"]);
@@ -86,6 +87,12 @@ const ACTIVE_RUN_STATUS_FILTERS = ["in_progress", "queued", "waiting", "requeste
 const TERMINAL_BAD_CONCLUSIONS = new Set(["failure", "timed_out", "action_required"]);
 const EVENT_LIMIT = 200;
 const EVENT_STORE_TTL_SECONDS = 7 * 24 * 60 * 60;
+const BAY_TERMINAL_STATE_KEY = "openclaw-bay:terminal-state:v1";
+const BAY_TIDE_THRESHOLD = 20;
+const BAY_SEEN_EVENT_LIMIT = 256;
+const BAY_WASH_VISIBLE_MS = 60_000;
+const BAY_TIMING_WINDOW_MS = 60 * 60 * 1000;
+const BAY_TIMING_MAX_SAMPLE_MS = 24 * 60 * 60 * 1000;
 const AVERAGE_LIMIT = 4;
 const RECENT_CLOSED_LIMIT = 8;
 const CLOSED_STATS_HOURS = 24;
@@ -312,6 +319,36 @@ export class StatusStore {
       await this.storage.put(key, stored);
       if (stored.expires_at) await this.scheduleCleanup(stored.expires_at);
       return new Response(null, { status: 204 });
+    }
+
+    if (request.method === "POST" && key === BAY_TERMINAL_STATE_KEY) {
+      const body = await request.json();
+      const current = (await this.storage.get(key)) as StoredValue | undefined;
+      const currentValue =
+        current?.value && (!current.expires_at || current.expires_at > Date.now())
+          ? JSON.parse(current.value)
+          : null;
+      const generatedAt = String(body?.generated_at || new Date().toISOString());
+      const next = mergeBayTerminalState(
+        currentValue,
+        body?.attempts,
+        body?.closed_items,
+        generatedAt,
+        body?.active_item_keys,
+      );
+      if (
+        currentValue &&
+        bayTerminalStateSignature(currentValue) === bayTerminalStateSignature(next)
+      ) {
+        return json(currentValue);
+      }
+      const expiresAt = Date.now() + numberFrom(body?.ttl_seconds, EVENT_STORE_TTL_SECONDS) * 1000;
+      await this.storage.put(key, {
+        value: JSON.stringify(next),
+        expires_at: expiresAt,
+      });
+      await this.scheduleCleanup(expiresAt);
+      return json(next);
     }
 
     if (request.method === "POST" && key === "events") {
@@ -883,6 +920,7 @@ export default {
     if (url.pathname === "/api/triage") return triageJson(request, env, ctx);
     if (url.pathname === "/api/pr-proof-triage") return prProofTriageJson(request, env, ctx);
     if (url.pathname === "/" || url.pathname === "/index.html") return html(dashboardHtml(env));
+    if (url.pathname === "/bay-demo") return demoHtml(bayHtml());
     if (url.pathname === "/triage" || url.pathname === "/triage.html")
       return html(triageHtml(issueTriagePageConfig()));
     if (url.pathname === "/pr-proof-triage" || url.pathname === "/pr-proof-triage.html")
@@ -982,7 +1020,7 @@ async function refreshStatusCaches(request, env) {
 }
 
 function statusCacheRequest(request, bucket) {
-  return new Request(new URL(`/api/status-cache/${bucket}`, request.url).toString(), {
+  return new Request(new URL(`/api/status-cache/v2/${bucket}`, request.url).toString(), {
     method: "GET",
   });
 }
@@ -2565,7 +2603,7 @@ function constantTimeEqual(left, right) {
 async function statusSnapshot(env) {
   const ttl = numberFrom(env.CACHE_TTL_SECONDS, 20);
   const cached = await readCachedSnapshot(env, ttl);
-  if (cached) return cached;
+  if (cached?.bay?.timings?.sample_kind === "latest_completed_jobs") return cached;
 
   const github = createGithubJsonCache(env);
   const generatedAt = new Date().toISOString();
@@ -2663,6 +2701,21 @@ async function statusSnapshot(env) {
     ]);
   errors.push(...activeJobs.errors);
   errors.push(...workerHealth.errors);
+  const terminalBay = await updateBayTerminalState(
+    env,
+    workerHealth.recent_attempts,
+    closed.items,
+    generatedAt,
+    activeBayItemKeys(activeJobs.workers),
+  ).catch((error) => {
+    errors.push(`OpenClaw Bay terminal state: ${error instanceof Error ? error.message : error}`);
+    return emptyBayTerminalState(generatedAt);
+  });
+  const bay = {
+    ...terminalBay,
+    timings: summarizeBayTimings(workerHealth.recent_attempts, generatedAt),
+  };
+  const { recent_attempts: _recentAttempts, ...publicWorkerHealth } = workerHealth;
 
   const snapshot = {
     schema_version: 1,
@@ -2684,7 +2737,7 @@ async function statusSnapshot(env) {
       worker_detail_runs: activeJobs.detailRuns,
       worker_detail_fallbacks: activeJobs.fallbacks,
     },
-    health: workerHealth,
+    health: publicWorkerHealth,
     averages: {
       automerge_command_to_merge_ms: automerge.average_ms,
       automerge_samples: automerge.samples,
@@ -2692,6 +2745,7 @@ async function statusSnapshot(env) {
     workers: activeJobs.workers,
     automatic_work: automaticIssueWork(storedEvents, activeJobs.workers),
     pipeline,
+    bay,
     recent: {
       cluster_repair: clusterRepair,
       apply_health: applyHealth,
@@ -3667,7 +3721,7 @@ async function recentWorkerHealth(
   runs: WorkflowRunSummary[],
   github: GithubJsonReader = (path) => githubJson(env, path),
 ) {
-  const cacheKey = `worker-health:v1:${String(repo || "").toLowerCase()}`;
+  const cacheKey = `worker-health:v3:${String(repo || "").toLowerCase()}`;
   const cached = await readStoredJson(env, cacheKey);
   if (cached) return cached;
 
@@ -3739,6 +3793,13 @@ async function recentWorkerHealth(
     unresolved_failures: failures.length - recoveredFailures,
     error_rate_percent: ratePercent(failures.length, measuredAttempts),
     recovery_rate_percent: failures.length ? ratePercent(recoveredFailures, failures.length) : null,
+    recent_attempts: [...attempts]
+      .sort(
+        (left, right) =>
+          Date.parse(right.completed_at || right.started_at || "") -
+          Date.parse(left.completed_at || left.started_at || ""),
+      )
+      .slice(0, 50),
     failures: failures.slice(0, 10),
     errors: results.flatMap((result) => (result.error ? [result.error] : [])).slice(0, 10),
     updated_at: new Date().toISOString(),
@@ -3763,9 +3824,51 @@ function emptyWorkerHealth(updatedAt) {
     unresolved_failures: 0,
     error_rate_percent: 0,
     recovery_rate_percent: null,
+    recent_attempts: [],
     failures: [],
     errors: [],
     updated_at: updatedAt,
+  };
+}
+
+function boundedBayTimingDuration(startedAt, completedAt) {
+  const started = Date.parse(String(startedAt || ""));
+  const completed = Date.parse(String(completedAt || ""));
+  const duration = completed - started;
+  if (!Number.isFinite(started) || !Number.isFinite(completed) || duration < 0) return null;
+  if (duration > BAY_TIMING_MAX_SAMPLE_MS) return null;
+  return duration;
+}
+
+export function summarizeBayTimings(attempts, generatedAt) {
+  const parsedNow = Date.parse(String(generatedAt || ""));
+  const now = Number.isFinite(parsedNow) ? parsedNow : Date.now();
+  const cutoff = now - BAY_TIMING_WINDOW_MS;
+  const overallDurations: number[] = [];
+  for (const attempt of Array.isArray(attempts) ? attempts : []) {
+    const completedAt = Date.parse(String(attempt?.completed_at || ""));
+    if (!Number.isFinite(completedAt) || completedAt < cutoff || completedAt > now) continue;
+    const totalDuration = Number(attempt?.total_duration_ms);
+    if (
+      Number.isFinite(totalDuration) &&
+      totalDuration >= 0 &&
+      totalDuration <= BAY_TIMING_MAX_SAMPLE_MS
+    ) {
+      overallDurations.push(totalDuration);
+    }
+  }
+  return {
+    window_minutes: BAY_TIMING_WINDOW_MS / 60_000,
+    sample_kind: "latest_completed_jobs",
+    sample_limit: 50,
+    overall: {
+      average_ms: overallDurations.length
+        ? Math.round(
+            overallDurations.reduce((total, value) => total + value, 0) / overallDurations.length,
+          )
+        : null,
+      samples: overallDurations.length,
+    },
   };
 }
 
@@ -3787,6 +3890,15 @@ function workerHealthAttempt(run, job) {
           ? "success"
           : null;
   if (!outcome) return null;
+  const jobConclusion = String(job?.conclusion || run?.conclusion || "");
+  const terminalOutcome =
+    jobConclusion === "cancelled"
+      ? "cancelled"
+      : TERMINAL_BAD_CONCLUSIONS.has(jobConclusion)
+        ? "failure"
+        : jobConclusion === "success" || jobConclusion === "neutral"
+          ? "success"
+          : null;
   const itemNumbers = [...target.itemNumbers].sort((left, right) => left - right);
   const targetKey =
     target.repository && itemNumbers.length
@@ -3796,9 +3908,12 @@ function workerHealthAttempt(run, job) {
           .replace(/\[clawsweeper-recovery-attempt=\d+\]/g, "")
           .replace(/\s+/g, " ")
           .trim()}`;
+  const startedAt = job?.started_at || run.created_at || null;
+  const completedAt = job?.completed_at || run.updated_at || startedAt;
   return {
     key: targetKey,
     outcome,
+    terminal_outcome: terminalOutcome,
     workflow_title: runItem.title,
     job_name: String(job?.name || runItem.title || "Codex worker"),
     repository: target.repository,
@@ -3806,7 +3921,242 @@ function workerHealthAttempt(run, job) {
     conclusion: conclusion || null,
     failed_step: failedStep ? String(failedStep.name || "Unknown step") : null,
     url: job?.html_url || run.html_url,
-    started_at: job?.started_at || run.created_at || null,
+    run_id: run.id,
+    job_id: job?.id || null,
+    started_at: startedAt,
+    completed_at: completedAt,
+    total_duration_ms: boundedBayTimingDuration(run.created_at || startedAt, completedAt),
+  };
+}
+
+function activeBayItemKeys(workers) {
+  const keys = new Set();
+  for (const worker of Array.isArray(workers) ? workers : []) {
+    const targets = new Map<number, Record<string, unknown>>(
+      (Array.isArray(worker?.target_items) ? worker.target_items : []).map(
+        (item): [number, Record<string, unknown>] => {
+          const target = objectValue(item);
+          return [Number(target.number), target];
+        },
+      ),
+    );
+    const numbers = Array.isArray(worker?.item_numbers)
+      ? worker.item_numbers
+      : worker?.item_number
+        ? [worker.item_number]
+        : [];
+    for (const value of numbers) {
+      const number = Number(value);
+      const target = targets.get(number);
+      const repository = nullableString(worker?.repository || target?.repository);
+      if (repository && Number.isInteger(number) && number > 0) keys.add(`${repository}#${number}`);
+    }
+  }
+  return [...keys];
+}
+
+async function updateBayTerminalState(env, attempts, closedItems, generatedAt, activeItemKeys) {
+  if (isDurableStatusStore(env.STATUS_STORE)) {
+    const response = await durableStatusStoreStub(env.STATUS_STORE).fetch(
+      statusStoreRequest(BAY_TERMINAL_STATE_KEY, "POST"),
+      {
+        method: "POST",
+        body: JSON.stringify({
+          attempts,
+          closed_items: closedItems,
+          generated_at: generatedAt,
+          ttl_seconds: EVENT_STORE_TTL_SECONDS,
+          active_item_keys: activeItemKeys,
+        }),
+      },
+    );
+    if (!response.ok) throw new Error(`status store Bay merge failed: ${response.status}`);
+    return publicBayTerminalState(await response.json());
+  }
+  const stored = await readStoredJson(env, BAY_TERMINAL_STATE_KEY);
+  const next = mergeBayTerminalState(stored, attempts, closedItems, generatedAt, activeItemKeys);
+  if (!stored || bayTerminalStateSignature(stored) !== bayTerminalStateSignature(next)) {
+    await writeStoredJson(env, BAY_TERMINAL_STATE_KEY, next, EVENT_STORE_TTL_SECONDS);
+    return publicBayTerminalState(next);
+  }
+  return publicBayTerminalState(stored);
+}
+
+export function mergeBayTerminalState(
+  previous,
+  attempts,
+  closedItems,
+  generatedAt,
+  activeItemKeys = [],
+) {
+  const now = Date.parse(generatedAt);
+  const source = previous && previous.schema_version === 1 ? previous : {};
+  const activeKeys = new Set(
+    (Array.isArray(activeItemKeys) ? activeItemKeys : []).map((value) => String(value)),
+  );
+  const buffer = Array.isArray(source.terminal_buffer)
+    ? source.terminal_buffer.filter(
+        (item) => item?.event_id && item?.item_key && !activeKeys.has(String(item.item_key)),
+      )
+    : [];
+  const seenEvents = Array.isArray(source.seen_events)
+    ? source.seen_events.filter((item) => item?.event_id)
+    : [];
+  const seenIds = new Set(seenEvents.map((item) => item.event_id));
+  const recentlyWashed =
+    Array.isArray(source.recently_washed) &&
+    Number.isFinite(now) &&
+    now - Date.parse(source.washed_at || "") <= BAY_WASH_VISIBLE_MS
+      ? source.recently_washed
+      : [];
+  let washedAt = recentlyWashed.length ? source.washed_at || null : null;
+  let tideGeneration = Math.max(0, Number(source.tide_generation) || 0);
+  let lastTideAt = nullableString(source.last_tide_at);
+
+  for (const candidate of bayTerminalCandidates(attempts, closedItems)) {
+    if (activeKeys.has(candidate.item_key)) continue;
+    if (seenIds.has(candidate.event_id)) continue;
+    seenIds.add(candidate.event_id);
+    seenEvents.push({ event_id: candidate.event_id, seen_at: candidate.completed_at });
+    const existingIndex = buffer.findIndex((item) => item.item_key === candidate.item_key);
+    if (existingIndex === -1) {
+      buffer.push(candidate);
+      continue;
+    }
+    if (
+      Date.parse(candidate.completed_at || "") >=
+      Date.parse(buffer[existingIndex]?.completed_at || "")
+    ) {
+      buffer[existingIndex] = candidate;
+    }
+  }
+  buffer.sort(
+    (left, right) => Date.parse(left.completed_at || "") - Date.parse(right.completed_at || ""),
+  );
+
+  let washed = recentlyWashed;
+  while (buffer.length >= BAY_TIDE_THRESHOLD) {
+    washed = buffer.splice(0, BAY_TIDE_THRESHOLD);
+    washedAt = generatedAt;
+    lastTideAt = generatedAt;
+    tideGeneration += 1;
+  }
+
+  return {
+    schema_version: 1,
+    tide_threshold: BAY_TIDE_THRESHOLD,
+    tide_generation: tideGeneration,
+    last_tide_at: lastTideAt,
+    terminal_count: buffer.length,
+    terminal_buffer: buffer,
+    washed_at: washedAt,
+    recently_washed: washed,
+    seen_events: seenEvents.slice(-BAY_SEEN_EVENT_LIMIT),
+    updated_at: generatedAt,
+  };
+}
+
+function bayTerminalStateSignature(state) {
+  return JSON.stringify({
+    schema_version: state?.schema_version,
+    tide_threshold: state?.tide_threshold,
+    tide_generation: state?.tide_generation,
+    last_tide_at: state?.last_tide_at,
+    terminal_count: state?.terminal_count,
+    terminal_buffer: state?.terminal_buffer,
+    washed_at: state?.washed_at,
+    recently_washed: state?.recently_washed,
+    seen_events: state?.seen_events,
+  });
+}
+
+function bayTerminalCandidates(attempts, closedItems) {
+  const candidates = [];
+  for (const attempt of Array.isArray(attempts) ? attempts : []) {
+    const outcome = String(attempt?.terminal_outcome || "");
+    if (!new Set(["success", "failure", "cancelled"]).has(outcome)) continue;
+    const repository = nullableString(attempt?.repository);
+    const completedAt = nullableString(attempt?.completed_at || attempt?.started_at);
+    if (!repository || !completedAt) continue;
+    for (const numberValue of Array.isArray(attempt?.item_numbers) ? attempt.item_numbers : []) {
+      const number = Number(numberValue);
+      if (!Number.isInteger(number) || number <= 0) continue;
+      const itemKey = `${repository}#${number}`;
+      const eventId = [
+        "worker",
+        attempt?.run_id || "run",
+        attempt?.job_id || "job",
+        itemKey,
+        outcome,
+        completedAt,
+      ].join(":");
+      candidates.push({
+        event_id: eventId,
+        item_key: itemKey,
+        repository,
+        number,
+        outcome,
+        title: nullableString(attempt?.workflow_title || attempt?.job_name) || itemKey,
+        item_url: `https://github.com/${repository}/issues/${number}`,
+        job_url: nullableString(attempt?.url),
+        run_id: attempt?.run_id || null,
+        completed_at: completedAt,
+        current_step: nullableString(attempt?.failed_step || attempt?.conclusion),
+        source: "worker_attempt",
+      });
+    }
+  }
+  for (const item of Array.isArray(closedItems) ? closedItems : []) {
+    const repository = nullableString(item?.repository);
+    const number = Number(item?.number);
+    const completedAt = nullableString(item?.closed_at);
+    if (!repository || !Number.isInteger(number) || number <= 0 || !completedAt) continue;
+    const itemKey = `${repository}#${number}`;
+    candidates.push({
+      event_id: ["closed", itemKey, completedAt].join(":"),
+      item_key: itemKey,
+      repository,
+      number,
+      outcome: "success",
+      title: nullableString(item?.title) || itemKey,
+      item_url: nullableString(item?.url) || `https://github.com/${repository}/issues/${number}`,
+      job_url: null,
+      run_id: null,
+      completed_at: completedAt,
+      current_step: "Closed by ClawSweeper",
+      source: "closed_item",
+    });
+  }
+  return candidates.sort(
+    (left, right) => Date.parse(left.completed_at) - Date.parse(right.completed_at),
+  );
+}
+
+function publicBayTerminalState(state) {
+  return {
+    schema_version: 1,
+    tide_threshold: state.tide_threshold,
+    tide_generation: state.tide_generation,
+    last_tide_at: state.last_tide_at,
+    terminal_count: state.terminal_count,
+    terminal_buffer: state.terminal_buffer,
+    washed_at: state.washed_at,
+    recently_washed: state.recently_washed,
+    updated_at: state.updated_at,
+  };
+}
+
+function emptyBayTerminalState(generatedAt) {
+  return {
+    schema_version: 1,
+    tide_threshold: BAY_TIDE_THRESHOLD,
+    tide_generation: 0,
+    last_tide_at: null,
+    terminal_count: 0,
+    terminal_buffer: [],
+    washed_at: null,
+    recently_washed: [],
+    updated_at: generatedAt,
   };
 }
 
@@ -5249,6 +5599,7 @@ async function readCachedSnapshot(env, ttlSeconds) {
   const text = await readStatusStoreText(env.STATUS_STORE, "snapshot");
   if (!text) return null;
   const snapshot = JSON.parse(text);
+  if (!snapshot?.bay) return null;
   if (Date.now() - Date.parse(snapshot.generated_at || "") > ttlSeconds * 1000) return null;
   return snapshot;
 }
@@ -5817,6 +6168,22 @@ function html(value) {
     headers: {
       "content-type": "text/html; charset=utf-8",
       "cache-control": "no-store",
+    },
+  });
+}
+
+function demoHtml(value) {
+  return new Response(value, {
+    headers: {
+      "content-type": "text/html; charset=utf-8",
+      "cache-control": "no-store",
+      "content-security-policy":
+        "default-src 'self'; img-src 'self' data:; connect-src 'self' https://*.openclaw.ai; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+      "permissions-policy": "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
+      "referrer-policy": "no-referrer",
+      "x-content-type-options": "nosniff",
+      "x-frame-options": "DENY",
+      "x-robots-tag": "noindex, nofollow, noarchive",
     },
   });
 }
