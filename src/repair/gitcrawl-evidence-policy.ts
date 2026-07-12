@@ -25,7 +25,7 @@ export function deriveGitcrawlThreadPolicySignals(
   title: string,
   body: string,
 ): GitcrawlThreadPolicySignals {
-  const text = `${title}\n${body}`;
+  const text = `${stripGitcrawlHtmlComments(title)}\n${stripGitcrawlHtmlComments(body)}`;
   return {
     blankTemplate: blankTemplateSignal(body),
     issueReference: /#\d+\b/.test(text),

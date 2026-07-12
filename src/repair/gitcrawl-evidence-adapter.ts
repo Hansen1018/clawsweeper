@@ -1269,8 +1269,16 @@ function normalizeThread(row: Record<string, unknown>): GitcrawlThreadEvidence {
     complete: securityMetadataComplete,
   };
   const fingerprintHash = boundedString(row.fingerprint_hash, 256);
+  const fingerprintAlgorithm = boundedString(row.fingerprint_algorithm, 64);
   const revisionHash = boundedString(row.revision_content_hash, 256);
-  if (fingerprintHash) assertSha256(fingerprintHash, "Gitcrawl thread fingerprint");
+  if (fingerprintHash) {
+    if (fingerprintAlgorithm !== "thread-fingerprint-v2") {
+      throw new Error(
+        `unsupported Gitcrawl thread fingerprint algorithm: ${fingerprintAlgorithm || "missing"}`,
+      );
+    }
+    assertSha256(fingerprintHash, "Gitcrawl thread fingerprint");
+  }
   if (revisionHash) assertSha256(revisionHash, "Gitcrawl source revision");
   const revisionId = optionalPositive(row.revision_id);
   const revisionUpdatedAt = boundedString(
@@ -1287,7 +1295,7 @@ function normalizeThread(row: Record<string, unknown>): GitcrawlThreadEvidence {
         };
   const threadFingerprint = fingerprintHash
     ? {
-        algorithm: boundedString(row.fingerprint_algorithm, 64) || "thread-fingerprint-v2",
+        algorithm: fingerprintAlgorithm,
         sha256: fingerprintHash,
       }
     : undefined;

@@ -296,9 +296,7 @@ export function renderPrompt(
       ? ["## Low-signal PR policy", readText("instructions/low-signal-prs.md")]
       : []),
     "## Job file",
-    "````md",
-    job.raw.trim(),
-    "````",
+    ...markdownCodeBlock(job.raw.trim(), "md"),
   ];
 
   for (const [title, filePath] of [
@@ -314,9 +312,7 @@ export function renderPrompt(
       artifact.compacted
         ? `Note: compacted for the Codex input budget; use counts, refs, timestamps, review-bot excerpts, and safety gates as authoritative.`
         : "",
-      "```json",
-      artifact.text,
-      "```",
+      ...markdownCodeBlock(artifact.text, "json"),
     );
   }
 
@@ -334,6 +330,15 @@ export function renderPrompt(
   );
 
   return parts.join("\n\n");
+}
+
+function markdownCodeBlock(contents: string, language: string): string[] {
+  const longestEmbeddedFence = Math.max(
+    0,
+    ...[...contents.matchAll(/`+/g)].map((match) => match[0].length),
+  );
+  const fence = "`".repeat(Math.max(4, longestEmbeddedFence + 1));
+  return [`${fence}${language}`, contents, fence];
 }
 
 function gitcrawlEvidencePolicy(frontmatter: LooseRecord): {

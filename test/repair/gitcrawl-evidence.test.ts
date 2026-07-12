@@ -910,6 +910,53 @@ test("Gitcrawl local enrichment selects revisions by RFC3339 instant", async () 
   fs.rmSync(dir, { force: true, recursive: true });
 });
 
+test("Gitcrawl local enrichment falls back to revision creation time and exact v2 fingerprints", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-gitcrawl-revision-fallback-"));
+  const dbPath = path.join(dir, "gitcrawl.db");
+  seedLocalDatabase(dbPath);
+  const db = new DatabaseSync(dbPath);
+  db.prepare("insert into thread_revisions values (?, ?, ?, ?, ?)").run(
+    12,
+    42,
+    "",
+    "d".repeat(64),
+    "2026-07-12T11:59:00Z",
+  );
+  db.prepare("insert into thread_fingerprints values (?, ?, ?, ?, ?, ?)").run(
+    13,
+    12,
+    "thread-fingerprint-v2",
+    "e".repeat(64),
+    "exact-v2",
+    "2026-07-12T11:59:10Z",
+  );
+  db.prepare("insert into thread_fingerprints values (?, ?, ?, ?, ?, ?)").run(
+    14,
+    12,
+    "thread-fingerprint-v3",
+    "f".repeat(64),
+    "newer-unsupported",
+    "2026-07-12T11:59:20Z",
+  );
+  db.close();
+
+  const adapter = await GitcrawlEvidenceAdapter.open({
+    repository: "openclaw/openclaw",
+    provider: "local",
+    dbPath,
+    now: () => now,
+  });
+  const member = (await adapter.clusterMembers(7)).rows[0]!;
+  assert.equal(member.sourceRevision?.id, 12);
+  assert.equal(member.sourceRevision?.updated_at, "2026-07-12T11:59:00Z");
+  assert.deepEqual(member.threadFingerprint, {
+    algorithm: "thread-fingerprint-v2",
+    sha256: "e".repeat(64),
+  });
+  await adapter.close();
+  fs.rmSync(dir, { force: true, recursive: true });
+});
+
 test("Gitcrawl local PR review context matches the cloud cluster projection", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-gitcrawl-review-parity-"));
   const dbPath = path.join(dir, "gitcrawl.db");
@@ -1109,6 +1156,27 @@ test("Gitcrawl evidence rejects missing PR details and malformed fingerprints", 
   await assert.rejects(adapter.reviewContext(42), /missing PR details/);
   await assert.rejects(adapter.clusterMembers(7), /must be a lowercase hexadecimal SHA-256/);
   await adapter.close();
+
+  const unsupported = await GitcrawlEvidenceAdapter.fromSources({
+    repository: "openclaw/openclaw",
+    provider: "cloud",
+    primarySource: new FixtureSource({
+      rows: {
+        "gitcrawl.clusters.members": [
+          memberRow({
+            fingerprint_algorithm: "thread-fingerprint-v3",
+            fingerprint_hash: "f".repeat(64),
+          }),
+        ],
+      },
+    }),
+    now: () => now,
+  });
+  await assert.rejects(
+    unsupported.clusterMembers(7),
+    /unsupported Gitcrawl thread fingerprint algorithm: thread-fingerprint-v3/,
+  );
+  await unsupported.close();
 });
 
 test("Gitcrawl evidence rejects missing required numeric fields", async () => {
@@ -1384,6 +1452,27 @@ test("Gitcrawl blank-template scoring requires empty template answers", () => {
     ).blankTemplate,
     false,
   );
+});
+
+test("Gitcrawl policy signals ignore HTML-comment instructions", () => {
+  const hidden = deriveGitcrawlThreadPolicySignals(
+    "docs: update guide",
+    [
+      "<!-- Fixes #42 by adding a provider plugin for the root cause. -->",
+      "Routine documentation cleanup.",
+    ].join("\n"),
+  );
+  assert.equal(hidden.issueReference, false);
+  assert.equal(hidden.concreteFix, false);
+  assert.equal(hidden.thirdPartyCapability, false);
+
+  const visible = deriveGitcrawlThreadPolicySignals(
+    "fix: add provider plugin",
+    "Fixes #42 by addressing the root cause.",
+  );
+  assert.equal(visible.issueReference, true);
+  assert.equal(visible.concreteFix, true);
+  assert.equal(visible.thirdPartyCapability, true);
 });
 
 test("Gitcrawl HTML comment stripping cannot reconstruct an injection marker", () => {

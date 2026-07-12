@@ -833,11 +833,13 @@ export class LocalGitcrawlQuerySource implements GitcrawlQuerySource {
     }
     const latestRevision = `(select revision.id from thread_revisions revision
       where revision.thread_id = ${alias}.id
-      order by julianday(revision.source_updated_at) desc, revision.id desc limit 1)`;
+      order by julianday(coalesce(nullif(revision.source_updated_at, ''), revision.created_at)) desc,
+               revision.id desc limit 1)`;
     const revisionId = latestRevision;
     const revisionHash = `(select revision.content_hash from thread_revisions revision
       where revision.id = ${latestRevision})`;
-    const revisionUpdated = `(select revision.source_updated_at from thread_revisions revision
+    const revisionUpdated = `(select coalesce(nullif(revision.source_updated_at, ''), revision.created_at)
+      from thread_revisions revision
       where revision.id = ${latestRevision})`;
     const summary = tableExists(this.db, "thread_key_summaries")
       ? `(select summary.key_text from thread_key_summaries summary
@@ -847,16 +849,19 @@ export class LocalGitcrawlQuerySource implements GitcrawlQuerySource {
     const fingerprintAlgorithm = tableExists(this.db, "thread_fingerprints")
       ? `(select fingerprint.algorithm_version from thread_fingerprints fingerprint
           where fingerprint.thread_revision_id = ${latestRevision}
+            and fingerprint.algorithm_version = 'thread-fingerprint-v2'
           order by fingerprint.created_at desc, fingerprint.id desc limit 1)`
       : "''";
     const fingerprintHash = tableExists(this.db, "thread_fingerprints")
       ? `(select fingerprint.fingerprint_hash from thread_fingerprints fingerprint
           where fingerprint.thread_revision_id = ${latestRevision}
+            and fingerprint.algorithm_version = 'thread-fingerprint-v2'
           order by fingerprint.created_at desc, fingerprint.id desc limit 1)`
       : "''";
     const fingerprintSlug = tableExists(this.db, "thread_fingerprints")
       ? `(select fingerprint.fingerprint_slug from thread_fingerprints fingerprint
           where fingerprint.thread_revision_id = ${latestRevision}
+            and fingerprint.algorithm_version = 'thread-fingerprint-v2'
           order by fingerprint.created_at desc, fingerprint.id desc limit 1)`
       : "''";
     return `${revisionId} as revision_id,

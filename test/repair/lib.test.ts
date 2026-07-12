@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 
 import {
@@ -36,6 +39,40 @@ test("renderPrompt loads tracked repair prompt templates", () => {
   );
   assert.match(prompt, /## Job file/);
   assert.match(prompt, /Repair smoke\./);
+});
+
+test("renderPrompt sizes Markdown fences beyond embedded job and artifact backticks", () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-prompt-fence-"));
+  const artifactPath = path.join(directory, "artifact.json");
+  const jobBackticks = "``````";
+  const artifactBackticks = "````````";
+  fs.writeFileSync(artifactPath, JSON.stringify({ payload: artifactBackticks }));
+  try {
+    const prompt = renderPrompt(
+      {
+        raw: `---\nrepo: openclaw/clawsweeper\ncluster_id: smoke\nmode: autonomous\nrefs:\n  - 1\n---\n${jobBackticks}\nunsafe`,
+        frontmatter: {
+          repo: "openclaw/clawsweeper",
+          cluster_id: "smoke",
+          mode: "autonomous",
+          refs: [1],
+        },
+      },
+      "autonomous",
+      { clusterPlanPath: artifactPath },
+    );
+    const jobFence = prompt.slice(prompt.indexOf("## Job file")).match(/^(`+)md$/m)?.[1];
+    const artifactFence = prompt
+      .slice(prompt.indexOf("## Cluster preflight artifact"))
+      .match(/^(`+)json$/m)?.[1];
+    assert.ok(jobFence);
+    assert.ok(artifactFence);
+    assert.ok(jobFence.length > jobBackticks.length);
+    assert.ok(artifactFence.length > artifactBackticks.length);
+    assert.match(prompt, new RegExp(`${artifactBackticks}`));
+  } finally {
+    fs.rmSync(directory, { force: true, recursive: true });
+  }
 });
 
 test("validateJob rejects unknown canonical job intents", () => {
