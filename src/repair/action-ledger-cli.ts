@@ -2,7 +2,7 @@
 import fs from "node:fs";
 import path from "node:path";
 
-import { importActionEventShards } from "../action-ledger-runtime.js";
+import { flushWorkflowActionEvents, importActionEventShards } from "../action-ledger-runtime.js";
 import {
   finalizeCommandActionLedgerManifest,
   parseCommandActionLedgerManifest,
@@ -15,37 +15,45 @@ const [command, ...argv] = rawArgv[0] === "--" ? rawArgv.slice(1) : rawArgv;
 const args = parseArgs(argv);
 
 if (command === "finalize") {
-  const lane = requiredArg(args.lane, "--lane");
-  const manifest = await finalizeCommandActionLedgerManifest(lane, {
-    allowEmpty: args.allowEmpty === true,
-  });
-  if (manifest) process.stdout.write(serializeCommandActionLedgerManifest(manifest));
+  if (args.lane) {
+    const manifest = await finalizeCommandActionLedgerManifest(args.lane, {
+      allowEmpty: args.allowEmpty === true,
+    });
+    if (manifest) process.stdout.write(serializeCommandActionLedgerManifest(manifest));
+  } else {
+    const paths = await flushWorkflowActionEvents(repoRoot());
+    console.log(JSON.stringify({ paths }, null, 2));
+  }
 } else if (command === "publish") {
-  const lane = requiredArg(args.lane, "--lane");
-  const manifestPath = path.resolve(requiredArg(args.manifest, "--manifest"));
-  const manifest = parseCommandActionLedgerManifest(fs.readFileSync(manifestPath, "utf8"), lane);
   const sourceRoot = path.resolve(args.sourceRoot ?? actionLedgerOutputRoot());
   const stateRoot = path.resolve(args.stateRoot ?? repoRoot());
-  console.log(
-    JSON.stringify(
-      importActionEventShards(sourceRoot, stateRoot, {
-        expectedProducer: {
-          repository: manifest.repository,
-          sha: manifest.sha,
-          workflow: manifest.workflow,
-          job: manifest.job,
-          runId: manifest.run_id,
-          runAttempt: manifest.run_attempt,
-        },
-        expectedEventPaths: manifest.event_paths,
-      }),
-      null,
-      2,
-    ),
-  );
+  if (args.lane || args.manifest) {
+    const lane = requiredArg(args.lane, "--lane");
+    const manifestPath = path.resolve(requiredArg(args.manifest, "--manifest"));
+    const manifest = parseCommandActionLedgerManifest(fs.readFileSync(manifestPath, "utf8"), lane);
+    console.log(
+      JSON.stringify(
+        importActionEventShards(sourceRoot, stateRoot, {
+          expectedProducer: {
+            repository: manifest.repository,
+            sha: manifest.sha,
+            workflow: manifest.workflow,
+            job: manifest.job,
+            runId: manifest.run_id,
+            runAttempt: manifest.run_attempt,
+          },
+          expectedEventPaths: manifest.event_paths,
+        }),
+        null,
+        2,
+      ),
+    );
+  } else {
+    console.log(JSON.stringify(importActionEventShards(sourceRoot, stateRoot), null, 2));
+  }
 } else {
   throw new Error(
-    "usage: action-ledger-cli.ts <finalize|publish> --lane name [--allow-empty --manifest path --source-root path --state-root path]",
+    "usage: action-ledger-cli.ts <finalize|publish> [--lane name --allow-empty --manifest path] [--source-root path --state-root path]",
   );
 }
 
