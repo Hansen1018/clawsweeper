@@ -2101,6 +2101,8 @@ test("repair workers hydrate only durable jobs from generated state", () => {
   assert.match(requeue, /"requeue=true"/);
   assert.match(requeue, /requeue_authority=\$\{requeueContext\.authority\}/);
   assert.match(requeue, /dispatch_key=\$\{requeueContext\.dispatch_key\}/);
+  assert.match(requeue, /job_path:\s*sourceJobPath/);
+  assert.match(requeue, /job_sha256:\s*authorizationSha256/);
   assert.match(requeue, /deterministicRequeueDispatchKey/);
   assert.doesNotMatch(requeue, /randomUUID/);
   assert.match(requeue, /--allow-execute 0\|1 --allow-fix-pr 0\|1/);
@@ -2129,6 +2131,9 @@ test("repair workers hydrate only durable jobs from generated state", () => {
   assert.match(workflow, /authority === "maintainer"/);
   assert.match(workflow, /authenticated human workflow-dispatch actor/);
   assert.match(workflow, /context\.dispatch_key !== dispatchKey/);
+  assert.match(workflow, /context\.job_path !== jobPath/);
+  assert.match(workflow, /liveJobSha256 !== context\.job_sha256/);
+  assert.match(workflow, /captured requeue job content changed before execution/);
   assert.match(
     workflow,
     /requeue=true requires captured context, authenticated authority, and dispatch key/,

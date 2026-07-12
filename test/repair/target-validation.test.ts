@@ -1647,26 +1647,31 @@ test("bun-based target toolchain installs deps and runs configured validation", 
   ]);
 });
 
-test("bun lockfile fallback keeps lifecycle hooks disabled", () => {
+test("bun lockfile fallback fails closed when the restored lockfile is still stale", () => {
   const cwd = gitBunPackageFixture({ check: "bun x tsc --noEmit" });
   git(cwd, "add", ".");
   git(cwd, "commit", "-m", "initial");
   attachOrigin(cwd);
 
   const { binDir, logPath } = fakeBunFixture({ failFrozenInstall: true });
-  withPathPrefix(binDir, () => {
-    prepareTargetToolchain(cwd, {
-      ...validationOptions("openclaw/clawhub", clawhubToolchain()),
-      installTargetDeps: true,
-      installTimeoutMs: FAKE_TOOLCHAIN_TIMEOUT_MS,
-      setupTimeoutMs: FAKE_TOOLCHAIN_TIMEOUT_MS,
-    });
-  });
+  assert.throws(
+    () =>
+      withPathPrefix(binDir, () => {
+        prepareTargetToolchain(cwd, {
+          ...validationOptions("openclaw/clawhub", clawhubToolchain()),
+          installTargetDeps: true,
+          installTimeoutMs: FAKE_TOOLCHAIN_TIMEOUT_MS,
+          setupTimeoutMs: FAKE_TOOLCHAIN_TIMEOUT_MS,
+        });
+      }),
+    /lockfile is out of date/,
+  );
 
   assert.deepEqual(fs.readFileSync(logPath, "utf8").trim().split(/\r?\n/), [
     "--version",
     "install --frozen-lockfile --ignore-scripts",
     "install --no-frozen-lockfile --ignore-scripts",
+    "install --frozen-lockfile --ignore-scripts",
   ]);
 });
 
@@ -1681,7 +1686,7 @@ test("pnpm fallback shares one setup and install identity deadline", () => {
   const invocationPath = path.join(binDir, "pnpm-count");
   fs.writeFileSync(
     corepackPath,
-    "Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 180);\n",
+    "Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 80);\n",
   );
   fs.writeFileSync(
     pnpmPath,
@@ -1691,11 +1696,11 @@ const count = fs.existsSync(${JSON.stringify(invocationPath)})
   : 0;
 fs.writeFileSync(${JSON.stringify(invocationPath)}, String(count + 1));
 if (count === 0) {
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 250);
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 140);
   console.error("ERR_PNPM_OUTDATED_LOCKFILE");
   process.exit(1);
 }
-Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 450);
+Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 400);
 `,
   );
   const previousCorepackBin = process.env.COREPACK_BIN;
@@ -1717,6 +1722,7 @@ Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 450);
           }),
           installTargetDeps: true,
           installTimeoutMs: 500,
+          proofBudgetMs: 500,
           setupTimeoutMs: 500,
         }),
       /command timed out after \d+ms: pnpm install --no-frozen-lockfile/,
@@ -1728,6 +1734,63 @@ Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 450);
     restoreEnv("PNPM_BIN_ARGS", previousPnpmBinArgs);
   }
   assert.equal(fs.readFileSync(invocationPath, "utf8"), "2");
+});
+
+test("pnpm fallback must pass a frozen reinstall after restoring the committed lockfile", () => {
+  const cwd = gitPackageFixture({ check: "node check.js" });
+  git(cwd, "add", ".");
+  git(cwd, "commit", "-m", "initial");
+  const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-pnpm-reinstall-"));
+  const corepackPath = path.join(binDir, "corepack.js");
+  const pnpmPath = path.join(binDir, "pnpm.js");
+  const logPath = path.join(binDir, "pnpm.log");
+  fs.writeFileSync(corepackPath, "");
+  fs.writeFileSync(
+    pnpmPath,
+    `const fs = require("node:fs");
+const args = process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(logPath)}, args.join(" ") + "\\n");
+if (args.includes("--frozen-lockfile")) {
+  console.error("ERR_PNPM_OUTDATED_LOCKFILE");
+  process.exit(1);
+}
+`,
+  );
+  const previousCorepackBin = process.env.COREPACK_BIN;
+  const previousCorepackBinArgs = process.env.COREPACK_BIN_ARGS;
+  const previousPnpmBin = process.env.PNPM_BIN;
+  const previousPnpmBinArgs = process.env.PNPM_BIN_ARGS;
+  Object.assign(process.env, mockCommandBinEnv("corepack", corepackPath));
+  Object.assign(process.env, mockCommandBinEnv("pnpm", pnpmPath));
+  try {
+    assert.throws(
+      () =>
+        prepareTargetToolchain(cwd, {
+          ...validationOptions("steipete/example", {
+            toolchain: {
+              packageManager: "pnpm",
+              baseValidationCommands: ["pnpm check"],
+              changedGate: null,
+            },
+          }),
+          installTargetDeps: true,
+          installTimeoutMs: FAKE_TOOLCHAIN_TIMEOUT_MS,
+          setupTimeoutMs: FAKE_TOOLCHAIN_TIMEOUT_MS,
+        }),
+      /ERR_PNPM_OUTDATED_LOCKFILE/,
+    );
+  } finally {
+    restoreEnv("COREPACK_BIN", previousCorepackBin);
+    restoreEnv("COREPACK_BIN_ARGS", previousCorepackBinArgs);
+    restoreEnv("PNPM_BIN", previousPnpmBin);
+    restoreEnv("PNPM_BIN_ARGS", previousPnpmBinArgs);
+  }
+
+  assert.deepEqual(fs.readFileSync(logPath, "utf8").trim().split(/\r?\n/), [
+    "install --frozen-lockfile --prefer-offline --ignore-scripts --config.engine-strict=false --config.enable-pre-post-scripts=false",
+    "install --no-frozen-lockfile --prefer-offline --ignore-scripts --config.engine-strict=false --config.enable-pre-post-scripts=false",
+    "install --frozen-lockfile --prefer-offline --ignore-scripts --config.engine-strict=false --config.enable-pre-post-scripts=false",
+  ]);
 });
 
 test("npm target setup without a lockfile preserves a clean proof checkout", () => {

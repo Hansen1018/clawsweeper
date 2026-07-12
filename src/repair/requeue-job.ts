@@ -176,12 +176,14 @@ let commandError: unknown = null;
 
 try {
   dispatchJob(sourceJobPath, mode, dispatchKey, requeueLifecycle, {
-    schema_version: 1,
+    schema_version: 2,
     authority: requeueAuthority,
     depth: nextRequeueDepth,
     allow_execute: forwardedGates.allowExecute,
     allow_fix_pr: forwardedGates.allowFixPr,
     dispatch_key: dispatchKey,
+    job_path: sourceJobPath,
+    job_sha256: authorizationSha256,
   });
   recordCommandRequeue(requeueLifecycle, {
     dispatchKey,
@@ -276,12 +278,14 @@ function dispatchJob(
   dispatchKey: string,
   lifecycle: CommandLifecycleInput,
   requeueContext: {
-    schema_version: 1;
+    schema_version: 2;
     authority: "clawsweeper-app" | "maintainer";
     depth: number;
     allow_execute: "0" | "1";
     allow_fix_pr: "0" | "1";
     dispatch_key: string;
+    job_path: string;
+    job_sha256: string;
   },
 ) {
   const result = runCommandLifecycleMutation(lifecycle, {

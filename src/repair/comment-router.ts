@@ -1290,7 +1290,9 @@ function classifyCommand(command: LooseRecord): JsonValue {
       status: "ready",
       actions: [
         ...actions,
-        { action: "label", label: modeLabel, status: execute ? "pending" : "planned" },
+        ...(approvedProofOverride && command.automation_source === "repair_loop_label_sweep"
+          ? []
+          : [{ action: "label", label: modeLabel, status: execute ? "pending" : "planned" }]),
         ...(approvedProofOverride
           ? [
               {
@@ -2110,8 +2112,16 @@ function revalidateCommandImmediatelyBeforeMutation(command: LooseRecord) {
     command.author_association = String(liveComment.author_association ?? "").toUpperCase();
     collaboratorPermissionCache.delete(liveAuthor.toLowerCase());
     const authorization = resolveMaintainerCommandAuthorization(command);
+    const authorReadOnlyAllowed =
+      !authorization.allowed &&
+      isAuthorReadOnlyCommandAllowed({
+        command,
+        target: command.target,
+      });
     command.author_repository_permission = authorization.repositoryPermission;
-    if (!authorization.allowed) {
+    command.maintainer_authorized = authorization.allowed;
+    command.author_readonly_authorized = authorReadOnlyAllowed;
+    if (!authorization.allowed && !authorReadOnlyAllowed) {
       terminalizeWithdrawnCommand(
         command,
         `command authorization was withdrawn before execution: ${authorization.reason}`,
@@ -2244,6 +2254,7 @@ function executeCommand(command: LooseRecord) {
         return;
       }
       const repair = dispatchRepair(command);
+      if (repair.status === "guard_blocked") return;
       dispatched = REPAIR_INTENTS.has(command.intent) ? repair : { repair };
       if (repair.status === "claimed") {
         command.actions = command.actions.map((action: JsonValue) =>
@@ -2382,6 +2393,7 @@ function executeCommand(command: LooseRecord) {
         return;
       }
       const clawsweeper = dispatchClawSweeperReview(command);
+      if (clawsweeper.status === "guard_blocked") return;
       dispatched = { ...dispatched, clawsweeper };
       command.actions = command.actions.map((action: JsonValue) => {
         if (action.action === "label")
@@ -2467,17 +2479,25 @@ function executeCommand(command: LooseRecord) {
       command.issue_number &&
       shouldMerge
     ) {
-      if (commandHasAction(command, "label")) {
+      if (
+        command.automation_source !== "repair_loop_label_sweep" &&
+        commandHasAction(command, "label")
+      ) {
         applyLabelActions(command);
       }
       if (commandHasAction(command, "update_description_note")) {
+        const descriptionMutationBlock = repairLoopReviewDispatchBlockReason(command);
+        if (descriptionMutationBlock) {
+          applyReviewLeaseGuardBlock(command, descriptionMutationBlock);
+          return;
+        }
         applyDescriptionNoteActions(command);
       }
       const pauseLabels = command.actions
         .filter((action: JsonValue) => action.action === "remove_label")
         .map((action: JsonValue) => String(action.label ?? ""))
         .filter(Boolean);
-      if (pauseLabels.length > 0) {
+      if (pauseLabels.length > 0 && command.automation_source !== "repair_loop_label_sweep") {
         for (const pausedLabel of pauseLabels) {
           runGitHubBestEffortMutation(
             command,
@@ -2506,7 +2526,14 @@ function executeCommand(command: LooseRecord) {
       dispatched = { ...dispatched, merge };
       command.actions = command.actions.map((action: JsonValue) =>
         action.action === "label"
-          ? { ...action, status: "executed", label: action.label }
+          ? command.automation_source === "repair_loop_label_sweep"
+            ? {
+                ...action,
+                status: "skipped",
+                label: action.label,
+                reason: "scheduled merge sweep preserves live opt-in label state",
+              }
+            : { ...action, status: "executed", label: action.label }
           : action.action === "remove_label"
             ? { ...action, status: "executed", label: action.label }
             : action.action === "update_description_note"
@@ -2543,6 +2570,7 @@ function executeCommand(command: LooseRecord) {
             return;
           }
           const repair = dispatchRepair(command);
+          if (repair.status === "guard_blocked") return;
           dispatched = { ...dispatched, repair };
           command.actions.push({
             action: "dispatch_repair",
@@ -3422,6 +3450,8 @@ function dispatchClawSweeperReview(command: LooseRecord): LooseRecord {
       ...commandStatus,
     },
   });
+  const repositoryDispatchBlock = blockScheduledRepairLoopDispatch(command);
+  if (repositoryDispatchBlock) return repositoryDispatchBlock;
   const result = runGitHubSpawnMutation(
     command,
     "review_dispatch",
@@ -3438,6 +3468,8 @@ function dispatchClawSweeperReview(command: LooseRecord): LooseRecord {
     },
   );
   if (result.status !== 0) {
+    const workflowDispatchBlock = blockScheduledRepairLoopDispatch(command);
+    if (workflowDispatchBlock) return workflowDispatchBlock;
     const fallback = runGitHubSpawnMutation(
       command,
       "review_dispatch",
@@ -3618,6 +3650,8 @@ function dispatchRepair(command: LooseRecord) {
       run_status: activeRun.status,
     };
   }
+  const dispatchBlock = blockScheduledRepairLoopDispatch(command);
+  if (dispatchBlock) return dispatchBlock;
   const result = runGitHubSpawnMutation(
     command,
     "repair_dispatch",
@@ -3663,6 +3697,28 @@ function dispatchRepair(command: LooseRecord) {
     execution_runner: executionRunner,
     model,
     ...(runUrl ? { run_url: runUrl } : {}),
+  };
+}
+
+function blockScheduledRepairLoopDispatch(command: LooseRecord): LooseRecord | null {
+  const block = repairLoopReviewDispatchBlockReason(command);
+  if (!block) return null;
+  applyReviewLeaseGuardBlock(command, block);
+  return {
+    status: "guard_blocked",
+    reason: block.reason,
+    retryable: block.retryable,
+  };
+}
+
+function scheduledAutomergeMutationBlock(command: LooseRecord): LooseRecord | null {
+  const block = repairLoopReviewDispatchBlockReason(command);
+  if (!block) return null;
+  return {
+    action: "merge",
+    status: block.retryable ? "waiting" : "blocked",
+    reason: block.reason,
+    merge_method: "squash",
   };
 }
 
@@ -4055,8 +4111,14 @@ function executeAutomerge(command: LooseRecord) {
   }
   const gateBlock = automergeGateBlockReason(process.env);
   if (gateBlock) {
+    const humanReviewLabelBlock = scheduledAutomergeMutationBlock(command);
+    if (humanReviewLabelBlock) return humanReviewLabelBlock;
     ensureHumanReviewLabel(command);
+    const mergeReadyLabelBlock = scheduledAutomergeMutationBlock(command);
+    if (mergeReadyLabelBlock) return mergeReadyLabelBlock;
     ensureMergeReadyLabel(command);
+    const issueLabelBlock = scheduledAutomergeMutationBlock(command);
+    if (issueLabelBlock) return issueLabelBlock;
     runGitHubBestEffortMutation(
       command,
       "label_add",
@@ -4127,6 +4189,10 @@ function executeAutomerge(command: LooseRecord) {
       merge_method: "squash",
     };
   }
+  const scheduledMergeBlock = scheduledAutomergeMutationBlock(command);
+  if (scheduledMergeBlock) {
+    return scheduledMergeBlock;
+  }
   const result = runGitHubSpawnMutation(
     command,
     "pull_request_merge",
@@ -4156,7 +4222,11 @@ function executeAutomerge(command: LooseRecord) {
         merge_method: "squash",
       };
     }
+    const mergeReadyLabelBlock = scheduledAutomergeMutationBlock(command);
+    if (mergeReadyLabelBlock) return mergeReadyLabelBlock;
     ensureMergeReadyLabel(command);
+    const issueLabelBlock = scheduledAutomergeMutationBlock(command);
+    if (issueLabelBlock) return issueLabelBlock;
     runGitHubBestEffortMutation(
       command,
       "label_add",

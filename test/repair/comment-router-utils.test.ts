@@ -1068,6 +1068,53 @@ test("comment router ledger merge preserves disjoint claims and terminal progres
   );
 });
 
+test("same-attempt ledger merge cannot downgrade claimed work to a newer waiting snapshot", () => {
+  const claimed = {
+    idempotency_key: "repair-loop-label-sweep:openclaw/openclaw:automerge:101",
+    comment_id: "repair-loop-label-sweep:automerge:101",
+    comment_version_key: null,
+    automation_source: "repair_loop_label_sweep",
+    issue_number: 101,
+    attempt_id: "automerge-attempt-1",
+    attempt_sequence: 1,
+    status: "claimed",
+    processed_at: "2026-07-12T20:00:00Z",
+    actions: [{ action: "dispatch_clawsweeper", status: "claimed" }],
+  };
+  const staleRestage = {
+    ...claimed,
+    status: "waiting",
+    processed_at: "2026-07-12T20:05:00Z",
+    actions: [{ action: "dispatch_clawsweeper", status: "waiting" }],
+  };
+
+  for (const ledgers of [
+    [
+      { updated_at: claimed.processed_at, commands: [claimed] },
+      { updated_at: staleRestage.processed_at, commands: [staleRestage] },
+    ],
+    [
+      { updated_at: staleRestage.processed_at, commands: [staleRestage] },
+      { updated_at: claimed.processed_at, commands: [claimed] },
+    ],
+  ]) {
+    const merged = mergeCommentRouterLedgers(...ledgers);
+    assert.equal(merged.commands.length, 1);
+    assert.equal(merged.commands[0]?.status, "claimed");
+    assert.equal(merged.commands[0]?.processed_at, claimed.processed_at);
+    assert.equal(merged.commands[0]?.actions[0]?.status, "claimed");
+  }
+
+  const terminal = mergeCommentRouterLedgers(
+    { updated_at: staleRestage.processed_at, commands: [staleRestage] },
+    {
+      updated_at: "2026-07-12T19:59:00Z",
+      commands: [{ ...claimed, status: "executed", processed_at: "2026-07-12T19:59:00Z" }],
+    },
+  );
+  assert.equal(terminal.commands[0]?.status, "executed");
+});
+
 test("ledger append trims terminal history before active commands", () => {
   const waiting = routerLedgerEntry(0, "waiting");
   const terminal = Array.from({ length: COMMENT_ROUTER_LEDGER_ENTRY_LIMIT - 1 }, (_, index) =>

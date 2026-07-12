@@ -229,14 +229,17 @@ jobs:
           REQUEUE_DISPATCH_KEY: ${{ inputs.dispatch_key }}
           REQUEUE_ACTOR: ${{ github.actor }}
           REQUEUE_EVENT_NAME: ${{ github.event_name }}
+          REQUEUE_JOB_PATH: ${{ inputs.job }}
         run: |
           node <<'NODE'
+          const crypto = require("node:crypto");
           const fs = require("node:fs");
           const encoded = String(process.env.REQUEUE_CONTEXT || "");
           const requested = process.env.REQUEUE_REQUESTED === "true";
           const authority = String(process.env.REQUEUE_AUTHORITY || "");
           const dispatchKey = String(process.env.REQUEUE_DISPATCH_KEY || "");
           const actor = String(process.env.REQUEUE_ACTOR || "");
+          const jobPath = String(process.env.REQUEUE_JOB_PATH || "");
           let depth = 0;
           if (!requested) {
             if (encoded || authority) {
@@ -250,15 +253,27 @@ jobs:
             }
             const context = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8"));
             if (
-              context.schema_version !== 1 ||
+              context.schema_version !== 2 ||
               context.authority !== authority ||
               context.dispatch_key !== dispatchKey ||
               context.depth !== 1 ||
+              context.job_path !== jobPath ||
               !/^requeue-1-[0-9a-f]{24}$/.test(dispatchKey) ||
+              !/^[0-9a-f]{64}$/.test(context.job_sha256) ||
               !["0", "1"].includes(context.allow_execute) ||
               !["0", "1"].includes(context.allow_fix_pr)
             ) {
               throw new Error("captured requeue context is invalid");
+            }
+            if (!jobPath || !fs.existsSync(jobPath)) {
+              throw new Error("captured requeue job is unavailable");
+            }
+            const liveJobSha256 = crypto
+              .createHash("sha256")
+              .update(fs.readFileSync(jobPath))
+              .digest("hex");
+            if (liveJobSha256 !== context.job_sha256) {
+              throw new Error("captured requeue job content changed before execution");
             }
             if (authority === "clawsweeper-app") {
               if (actor !== "openclaw-clawsweeper[bot]") {

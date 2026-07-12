@@ -261,7 +261,13 @@ export function prepareTargetToolchain(cwd: string, options: TargetValidationOpt
     options.installTimeoutMs ?? DEFAULT_TARGET_INSTALL_TIMEOUT_MS,
     options.installTimeoutMs,
   );
-  const identityLimits = proofInputLimits(options, Date.now() + setupTimeoutMs + installTimeoutMs);
+  const remainingBudgetMs = targetValidationTimeoutMs(
+    "CLAWSWEEPER_TARGET_PROOF_BUDGET_MS",
+    options.proofBudgetMs ?? Math.max(setupTimeoutMs, installTimeoutMs),
+    options.proofBudgetMs,
+  );
+  const toolchainBudgetMs = Math.min(remainingBudgetMs, Math.max(setupTimeoutMs, installTimeoutMs));
+  const identityLimits = proofInputLimits(options, Date.now() + toolchainBudgetMs);
   const sourceIdentity = validationSourceIdentity(cwd, identityLimits);
   if (sourceIdentity.status) {
     throw new Error("target dependency setup requires a clean source checkout");
@@ -369,6 +375,15 @@ function preparePnpmToolchain({
       },
     );
     restoreTargetLockfile(cwd, "pnpm-lock.yaml");
+    run("pnpm", installArgs, {
+      cwd,
+      env: validationEnv,
+      timeoutMs: targetToolchainCommandTimeout(
+        identityLimits,
+        installTimeoutMs,
+        "pnpm frozen reinstall",
+      ),
+    });
   }
 }
 
@@ -417,6 +432,15 @@ function prepareBunToolchain({
     for (const lockfile of ["bun.lock", "bun.lockb"]) {
       restoreTargetLockfile(cwd, lockfile);
     }
+    run("bun", installArgs, {
+      cwd,
+      env: bunEnv,
+      timeoutMs: targetToolchainCommandTimeout(
+        identityLimits,
+        installTimeoutMs,
+        "bun frozen reinstall",
+      ),
+    });
   }
 }
 

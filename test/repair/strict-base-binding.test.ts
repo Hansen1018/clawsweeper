@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -620,6 +621,8 @@ test("repair execution and validation cannot mutate GitHub before trusted public
     /always\(\)/,
   );
   assert.match(source, /context\.dispatch_key !== dispatchKey/);
+  assert.match(source, /context\.job_path !== jobPath/);
+  assert.match(source, /liveJobSha256 !== context\.job_sha256/);
   assert.doesNotMatch(
     String(
       report.steps?.find((step: { id?: string }) => step.id === "requeue_missing_execution")?.if ??
@@ -852,14 +855,21 @@ test("repair requeues require one authenticated bounded context and stable key",
   );
 
   const dispatchKey = "requeue-1-0123456789abcdef01234567";
+  const jobRoot = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-requeue-job-"));
+  const jobPath = path.join(jobRoot, "job.md");
+  const jobBody = "---\nrepo: openclaw/openclaw\n---\n\n# repair\n";
+  fs.writeFileSync(jobPath, jobBody);
+  const jobSha256 = createHash("sha256").update(jobBody).digest("hex");
   const context = Buffer.from(
     JSON.stringify({
-      schema_version: 1,
+      schema_version: 2,
       authority: "clawsweeper-app",
       depth: 1,
       allow_execute: "1",
       allow_fix_pr: "1",
       dispatch_key: dispatchKey,
+      job_path: jobPath,
+      job_sha256: jobSha256,
     }),
   ).toString("base64url");
   const valid = runRequeueContextScript(script, {
@@ -869,6 +879,7 @@ test("repair requeues require one authenticated bounded context and stable key",
     REQUEUE_DISPATCH_KEY: dispatchKey,
     REQUEUE_ACTOR: "openclaw-clawsweeper[bot]",
     REQUEUE_EVENT_NAME: "workflow_dispatch",
+    REQUEUE_JOB_PATH: jobPath,
   });
   assert.equal(valid.status, 0, valid.stderr);
   assert.equal(valid.outputs.depth, "1");
@@ -882,9 +893,23 @@ test("repair requeues require one authenticated bounded context and stable key",
     REQUEUE_DISPATCH_KEY: "manual-retry",
     REQUEUE_ACTOR: "openclaw-clawsweeper[bot]",
     REQUEUE_EVENT_NAME: "workflow_dispatch",
+    REQUEUE_JOB_PATH: jobPath,
   });
   assert.notEqual(unstable.status, 0);
   assert.match(unstable.stderr, /captured requeue context is invalid/);
+
+  fs.appendFileSync(jobPath, "\nchanged\n");
+  const changed = runRequeueContextScript(script, {
+    REQUEUE_REQUESTED: "true",
+    REQUEUE_CONTEXT: context,
+    REQUEUE_AUTHORITY: "clawsweeper-app",
+    REQUEUE_DISPATCH_KEY: dispatchKey,
+    REQUEUE_ACTOR: "openclaw-clawsweeper[bot]",
+    REQUEUE_EVENT_NAME: "workflow_dispatch",
+    REQUEUE_JOB_PATH: jobPath,
+  });
+  assert.notEqual(changed.status, 0);
+  assert.match(changed.stderr, /captured requeue job content changed before execution/);
 });
 
 function runRouterLaneScript(script: string, overrides: NodeJS.ProcessEnv) {
@@ -927,6 +952,7 @@ function runRequeueContextScript(script: string, overrides: NodeJS.ProcessEnv) {
       REQUEUE_DISPATCH_KEY: "",
       REQUEUE_ACTOR: "",
       REQUEUE_EVENT_NAME: "workflow_dispatch",
+      REQUEUE_JOB_PATH: "",
       ...overrides,
       GITHUB_OUTPUT: output,
       GITHUB_ENV: environment,

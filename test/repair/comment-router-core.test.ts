@@ -2131,6 +2131,149 @@ test("label-sweep classification checks the exact-head review lease before dispa
   assert.match(trustedVerdictGuard, /trustedAutomationPredatesReviewStartLease\(\{/);
 });
 
+test("scheduled repair loops preserve live opt-in through mutation and dispatch boundaries", () => {
+  const source = readFileSync("src/repair/comment-router.ts", "utf8");
+  const classify = source.slice(
+    source.indexOf('if (["autofix", "automerge"].includes(command.intent))'),
+    source.indexOf("if (AUTOCLOSE_INTENTS.has(command.intent))"),
+  );
+  assert.match(
+    classify,
+    /approvedProofOverride &&\s*command\.automation_source === "repair_loop_label_sweep"\s*\? \[\]/,
+  );
+
+  const executeCommand = source.slice(
+    source.indexOf("function executeCommand"),
+    source.indexOf("function applyRemoveLabelActions"),
+  );
+  assert.match(
+    executeCommand,
+    /command\.automation_source !== "repair_loop_label_sweep" &&\s*commandHasAction\(command, "label"\)/,
+  );
+  assert.match(
+    executeCommand,
+    /pauseLabels\.length > 0 &&\s*command\.automation_source !== "repair_loop_label_sweep"/,
+  );
+  assert.equal(
+    [...executeCommand.matchAll(/if \(repair\.status === "guard_blocked"\) return;/g)].length,
+    2,
+  );
+  const descriptionGuard = executeCommand.indexOf(
+    "const descriptionMutationBlock = repairLoopReviewDispatchBlockReason(command)",
+  );
+  const descriptionMutation = executeCommand.indexOf(
+    "applyDescriptionNoteActions(command)",
+    descriptionGuard,
+  );
+  assert.ok(descriptionGuard >= 0);
+  assert.ok(descriptionMutation > descriptionGuard);
+
+  const reviewDispatch = source.slice(
+    source.indexOf("function dispatchClawSweeperReview"),
+    source.indexOf("function dispatchClawSweeperAssist"),
+  );
+  const reviewClaim = reviewDispatch.indexOf("claimedDispatchState({");
+  const repositoryGuard = reviewDispatch.indexOf(
+    "blockScheduledRepairLoopDispatch(command)",
+    reviewClaim,
+  );
+  const repositoryDispatch = reviewDispatch.indexOf(
+    "const result = runGitHubSpawnMutation",
+    repositoryGuard,
+  );
+  const fallbackGuard = reviewDispatch.indexOf(
+    "blockScheduledRepairLoopDispatch(command)",
+    repositoryGuard + 1,
+  );
+  const fallbackDispatch = reviewDispatch.indexOf(
+    "const fallback = runGitHubSpawnMutation",
+    fallbackGuard,
+  );
+  assert.ok(reviewClaim >= 0);
+  assert.ok(repositoryGuard > reviewClaim);
+  assert.ok(repositoryDispatch > repositoryGuard);
+  assert.ok(fallbackGuard > repositoryDispatch);
+  assert.ok(fallbackDispatch > fallbackGuard);
+
+  const repairDispatch = source.slice(
+    source.indexOf("function dispatchRepair"),
+    source.indexOf("function dispatchRepairActionStatus"),
+  );
+  const activeRunLookup = repairDispatch.indexOf("activeRepairRunForCommand(command)");
+  const repairGuard = repairDispatch.indexOf(
+    "blockScheduledRepairLoopDispatch(command)",
+    activeRunLookup,
+  );
+  const workflowDispatch = repairDispatch.indexOf(
+    "const result = runGitHubSpawnMutation",
+    repairGuard,
+  );
+  assert.ok(activeRunLookup >= 0);
+  assert.ok(repairGuard > activeRunLookup);
+  assert.ok(workflowDispatch > repairGuard);
+
+  const automerge = source.slice(
+    source.indexOf("function executeAutomerge"),
+    source.indexOf("function latestAutomergeTarget"),
+  );
+  const finalView = automerge.indexOf("const finalView = fetchPullRequestView");
+  const finalGuard = automerge.indexOf(
+    "const scheduledMergeBlock = scheduledAutomergeMutationBlock(command)",
+    finalView,
+  );
+  const merge = automerge.indexOf("const result = runGitHubSpawnMutation", finalGuard);
+  assert.ok(finalView >= 0);
+  assert.ok(finalGuard > finalView);
+  assert.ok(merge > finalGuard);
+
+  const gateBlock = automerge.indexOf("const gateBlock = automergeGateBlockReason");
+  const humanLabelGuard = automerge.indexOf(
+    "const humanReviewLabelBlock = scheduledAutomergeMutationBlock(command)",
+    gateBlock,
+  );
+  const humanLabelMutation = automerge.indexOf("ensureHumanReviewLabel(command)", humanLabelGuard);
+  const mergeReadyGuard = automerge.indexOf(
+    "const mergeReadyLabelBlock = scheduledAutomergeMutationBlock(command)",
+    humanLabelMutation,
+  );
+  const mergeReadyMutation = automerge.indexOf("ensureMergeReadyLabel(command)", mergeReadyGuard);
+  const issueLabelGuard = automerge.indexOf(
+    "const issueLabelBlock = scheduledAutomergeMutationBlock(command)",
+    mergeReadyMutation,
+  );
+  const issueLabelMutation = automerge.indexOf("runGitHubBestEffortMutation(", issueLabelGuard);
+  assert.ok(gateBlock >= 0);
+  assert.ok(humanLabelGuard > gateBlock);
+  assert.ok(humanLabelMutation > humanLabelGuard);
+  assert.ok(mergeReadyGuard > humanLabelMutation);
+  assert.ok(mergeReadyMutation > mergeReadyGuard);
+  assert.ok(issueLabelGuard > mergeReadyMutation);
+  assert.ok(issueLabelMutation > issueLabelGuard);
+
+  const mergeFailure = automerge.indexOf("if (result.status !== 0)", merge);
+  const failureLabelGuard = automerge.indexOf(
+    "const mergeReadyLabelBlock = scheduledAutomergeMutationBlock(command)",
+    mergeFailure,
+  );
+  const failureLabelMutation = automerge.indexOf(
+    "ensureMergeReadyLabel(command)",
+    failureLabelGuard,
+  );
+  const failureIssueLabelGuard = automerge.indexOf(
+    "const issueLabelBlock = scheduledAutomergeMutationBlock(command)",
+    failureLabelMutation,
+  );
+  const failureIssueLabelMutation = automerge.indexOf(
+    "runGitHubBestEffortMutation(",
+    failureIssueLabelGuard,
+  );
+  assert.ok(mergeFailure > merge);
+  assert.ok(failureLabelGuard > mergeFailure);
+  assert.ok(failureLabelMutation > failureLabelGuard);
+  assert.ok(failureIssueLabelGuard > failureLabelMutation);
+  assert.ok(failureIssueLabelMutation > failureIssueLabelGuard);
+});
+
 test("execution revalidates exact live comment and authorization after capacity waiting", () => {
   const source = readFileSync("src/repair/comment-router.ts", "utf8");
   const executeBlock = source.slice(
@@ -2158,6 +2301,9 @@ test("execution revalidates exact live comment and authorization after capacity 
   assert.match(guard, /parseRoutedCommentCommand\(liveComment/);
   assert.match(guard, /collaboratorPermissionCache\.delete\(liveAuthor\.toLowerCase\(\)\)/);
   assert.match(guard, /resolveMaintainerCommandAuthorization\(command\)/);
+  assert.match(guard, /isAuthorReadOnlyCommandAllowed\(\{/);
+  assert.match(guard, /target:\s*command\.target/);
+  assert.match(guard, /if \(!authorization\.allowed && !authorReadOnlyAllowed\)/);
   assert.match(
     guard,
     /if \(!\/\^\[1-9\]\\d\*\$\/\.test\(commentId\)\)\s*return revalidateLiveRepairLoopWithdrawal\(command\)/,

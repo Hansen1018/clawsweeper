@@ -1233,11 +1233,12 @@ function preferredLedgerEntry(left: LooseRecord, right: LooseRecord): LooseRecor
   const leftTerminal = ledgerStatusRank(left.status) >= 3;
   const rightTerminal = ledgerStatusRank(right.status) >= 3;
   if (leftTerminal !== rightTerminal) return leftTerminal ? left : right;
+  const leftRank = ledgerStatusRank(left.status);
+  const rightRank = ledgerStatusRank(right.status);
+  if (!leftTerminal && leftRank !== rightRank) return leftRank > rightRank ? left : right;
   const leftTime = ledgerEntryTime(left);
   const rightTime = ledgerEntryTime(right);
   if (leftTime !== rightTime) return leftTime > rightTime ? left : right;
-  const leftRank = ledgerStatusRank(left.status);
-  const rightRank = ledgerStatusRank(right.status);
   if (leftRank !== rightRank) return leftRank > rightRank ? left : right;
   return canonicalJson(left).localeCompare(canonicalJson(right)) >= 0 ? left : right;
 }
@@ -1282,9 +1283,9 @@ function ledgerStatusRank(value: JsonValue): number {
     case "executed":
     case "skipped":
       return 3;
-    case "waiting":
-      return 2;
     case "claimed":
+      return 2;
+    case "waiting":
       return 1;
     default:
       return 0;

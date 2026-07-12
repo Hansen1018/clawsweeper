@@ -131,6 +131,11 @@ checkpoint, and status-only commits are intentionally omitted.
   scheduled retry failures remain failed after cleanup; active coverage-proof
   yields cannot become kept-open terminals; and review mutation, retryability,
   and cancellation status survive finalization.
+- Closed remaining durable-router race windows by preserving withdrawn scheduled
+  opt-ins, rechecking live repair-loop state at each dispatch and merge boundary,
+  keeping exact-attempt claims monotonic, retaining issue-author read-only
+  re-review authorization, binding requeues to exact job bytes, and requiring
+  reproducible frozen dependency setup within one shared repair deadline.
 - Revalidated exact command comments and scheduled repair-loop authorization
   immediately before mutation, terminalizing edited, deleted, withdrawn, or
   deauthorized work without GitHub side effects; scoped durable queue drains to
