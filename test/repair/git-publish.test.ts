@@ -254,6 +254,9 @@ test("comment router ledger publication retains a newer synthetic attempt", () =
   const terminalAttempt = routerClaim(101, "autofix", "2026-07-12T20:00:00Z", "executed", 1);
   writeJson(path.join(seed, ledgerPath), {
     updated_at: "2026-07-12T20:00:00Z",
+    attempt_sequences: {
+      "repair-loop-label-sweep:openclaw/openclaw:autofix:101": 1,
+    },
     commands: [terminalAttempt],
   });
   run("git", ["add", "."], seed);
@@ -268,10 +271,17 @@ test("comment router ledger publication retains a newer synthetic attempt", () =
   fs.mkdirSync(workB);
   writeJson(path.join(workA, ledgerPath), {
     updated_at: "2026-07-12T20:01:00Z",
+    attempt_sequences: {
+      "repair-loop-label-sweep:openclaw/openclaw:autofix:101": 2,
+    },
     commands: [terminalAttempt, routerClaim(101, "autofix", "2026-07-12T20:01:00Z", "waiting", 2)],
   });
   writeJson(path.join(workB, ledgerPath), {
     updated_at: "2026-07-12T20:02:00Z",
+    attempt_sequences: {
+      "repair-loop-label-sweep:openclaw/openclaw:autofix:101": 1,
+      "repair-loop-label-sweep:openclaw/openclaw:automerge:202": 1,
+    },
     commands: [
       terminalAttempt,
       routerClaim(202, "automerge", "2026-07-12T20:02:00Z", "claimed", 1),
@@ -321,6 +331,10 @@ test("comment router ledger publication retains a newer synthetic attempt", () =
       [202, "claimed", 1],
     ],
   );
+  assert.deepEqual(published.attempt_sequences, {
+    "repair-loop-label-sweep:openclaw/openclaw:autofix:101": 2,
+    "repair-loop-label-sweep:openclaw/openclaw:automerge:202": 1,
+  });
 });
 
 test("publishMainCommit drops a status commit fully superseded by the remote", () => {

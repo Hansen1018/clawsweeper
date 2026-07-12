@@ -14,6 +14,7 @@ import {
   dispatchClaimLookupKeys,
   dispatchReceiptKeyMaterial,
   durableForcedReplayCommentIds,
+  durableForcedReplayCommands,
   exactCommentVersionFastPathDecision,
   exactCommentVersionMatchesLive,
   finalizeRouterItemFanout,
@@ -485,6 +486,74 @@ test("repair-loop sweeps reuse one active attempt and advance only after termina
   );
 });
 
+test("repair-loop attempt identity survives bounded terminal history eviction", () => {
+  const idempotencyKey = "repair-loop-label-sweep:openclaw/openclaw:automerge:74499";
+  const first = repairLoopSweepAttemptIdentity({ commands: [], idempotencyKey });
+  const ledger = { updated_at: null, attempt_sequences: {}, commands: [] };
+  appendLedger(ledger, [
+    {
+      idempotency_key: idempotencyKey,
+      comment_id: "repair-loop-label-sweep:automerge:74499",
+      automation_source: "repair_loop_label_sweep",
+      attempt_id: first.attemptId,
+      attempt_sequence: first.attemptSequence,
+      repo: "openclaw/openclaw",
+      issue_number: 74499,
+      status: "executed",
+      processed_at: "2026-07-12T19:00:00Z",
+    },
+    ...Array.from({ length: COMMENT_ROUTER_LEDGER_ENTRY_LIMIT }, (_, index) =>
+      routerLedgerEntry(index, "executed"),
+    ),
+  ]);
+
+  assert.equal(
+    ledger.commands.some((entry) => entry.idempotency_key === idempotencyKey),
+    false,
+  );
+  assert.equal(ledger.attempt_sequences[idempotencyKey], 1);
+  const second = repairLoopSweepAttemptIdentity({
+    commands: ledger.commands,
+    idempotencyKey,
+    attemptSequences: ledger.attempt_sequences,
+  });
+  assert.equal(second.attemptSequence, 2);
+  assert.notEqual(second.attemptId, first.attemptId);
+
+  appendLedger(ledger, [
+    {
+      idempotency_key: idempotencyKey,
+      comment_id: "repair-loop-label-sweep:automerge:74499",
+      automation_source: "repair_loop_label_sweep",
+      attempt_id: second.attemptId,
+      attempt_sequence: second.attemptSequence,
+      repo: "openclaw/openclaw",
+      issue_number: 74499,
+      status: "waiting",
+      processed_at: "2026-07-12T21:00:00Z",
+    },
+  ]);
+  assert.equal(ledger.attempt_sequences[idempotencyKey], 2);
+});
+
+test("forced replay receipt material changes across durable attempt identities", () => {
+  const command = {
+    idempotency_key: "comment-router:openclaw/openclaw:74499:101:re_review",
+  };
+
+  assert.notEqual(
+    dispatchReceiptKeyMaterial({ ...command, forced_replay: true, attempt_id: "attempt-a" }, null),
+    dispatchReceiptKeyMaterial({ ...command, forced_replay: true, attempt_id: "attempt-b" }, null),
+  );
+  assert.equal(
+    dispatchReceiptKeyMaterial({ ...command, forced_replay: true, attempt_id: "attempt-a" }, null),
+    JSON.stringify({
+      idempotency_key: command.idempotency_key,
+      forced_replay_attempt_id: "attempt-a",
+    }),
+  );
+});
+
 test("production forced replay parsing scopes claims and dispatch keys by durable attempt", () => {
   const baseArgs = {
     repo: "openclaw/openclaw",
@@ -862,19 +931,35 @@ test("new forced replay attempts survive terminal history for the same comment v
   );
 });
 
-test("one coalesced forced execution completes every pending attempt identity", () => {
+test("one forced execution terminalizes only its exact pending attempt identity", () => {
+  const base = {
+    idempotency_key: "command-42",
+    comment_id: "1042",
+    comment_version_key: "1042:2026-07-12T20:00:00Z",
+    comment_updated_at: "2026-07-12T20:00:00Z",
+    repo: "openclaw/openclaw",
+    issue_number: 42,
+    intent: "re_review",
+    forced_replay: true,
+    actions: [{ action: "dispatch_clawsweeper", status: "waiting" }],
+  };
   const ledger = { updated_at: null, commands: [] };
   appendLedger(ledger, [
     {
-      idempotency_key: "command-42",
-      comment_id: "1042",
-      comment_version_key: "1042:2026-07-12T20:00:00Z",
-      comment_updated_at: "2026-07-12T20:00:00Z",
-      repo: "openclaw/openclaw",
-      issue_number: 42,
+      ...base,
+      status: "waiting",
+      attempt_id: "forced-attempt-1",
+    },
+    {
+      ...base,
+      status: "waiting",
+      attempt_id: "forced-attempt-2",
+    },
+  ]);
+  appendLedger(ledger, [
+    {
+      ...base,
       status: "executed",
-      intent: "re_review",
-      forced_replay: true,
       attempt_id: "forced-attempt-2",
       forced_replay_attempt_ids: ["forced-attempt-1", "forced-attempt-2"],
       actions: [{ action: "dispatch_clawsweeper", status: "executed" }],
@@ -884,9 +969,40 @@ test("one coalesced forced execution completes every pending attempt identity", 
   assert.deepEqual(
     ledger.commands.map((entry) => [entry.status, entry.attempt_id]),
     [
-      ["executed", "forced-attempt-1"],
+      ["waiting", "forced-attempt-1"],
       ["executed", "forced-attempt-2"],
     ],
+  );
+  assert.deepEqual(
+    durableForcedReplayCommands({
+      commands: ledger.commands,
+      repo: "openclaw/openclaw",
+      itemNumbers: new Set([42]),
+      commentIds: new Set(["1042"]),
+      attemptId: "forced-attempt-1",
+    }).map((entry) => entry.attempt_id),
+    ["forced-attempt-1"],
+  );
+
+  const scheduledAttempt = {
+    ...base,
+    comment_id: "repair-loop-label-sweep:automerge:42",
+    comment_version_key: null,
+    automation_source: "repair_loop_label_sweep",
+    forced_replay: false,
+    attempt_id: "scheduled-attempt-3",
+    attempt_sequence: 3,
+    status: "waiting",
+  };
+  assert.deepEqual(
+    durableForcedReplayCommands({
+      commands: [scheduledAttempt],
+      repo: "openclaw/openclaw",
+      itemNumbers: new Set([42]),
+      commentIds: new Set(["repair-loop-label-sweep:automerge:42"]),
+      attemptId: "scheduled-attempt-3",
+    }).map((entry) => entry.attempt_id),
+    ["scheduled-attempt-3"],
   );
 });
 
@@ -1395,7 +1511,11 @@ test("readLedger initializes only missing files and fails closed on torn state",
   const ledgerPath = path.join(directory, "comment-router.json");
   t.after(() => rmSync(directory, { recursive: true, force: true }));
 
-  assert.deepEqual(readLedger(ledgerPath), { updated_at: null, commands: [] });
+  assert.deepEqual(readLedger(ledgerPath), {
+    updated_at: null,
+    attempt_sequences: {},
+    commands: [],
+  });
 
   fs.writeFileSync(ledgerPath, '{"updated_at":null,"commands":[');
   assert.throws(() => readLedger(ledgerPath), /failed to parse comment router ledger/);

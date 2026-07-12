@@ -668,80 +668,94 @@ jobs:
           normalized_target_repo="$(printf '%s' "$target_repo" | tr '[:upper:]' '[:lower:]')"
           default_runner="${{ vars.CLAWSWEEPER_WORKER_RUNNER || 'blacksmith-4vcpu-ubuntu-2404' }}"
           default_execution_runner="${{ vars.CLAWSWEEPER_EXECUTION_RUNNER || 'blacksmith-16vcpu-ubuntu-2404' }}"
-          queue_file="$RUNNER_TEMP/comment-router-dispatch-queue.jsonl"
+          processed_queue_keys="$RUNNER_TEMP/comment-router-processed-queue-keys.json"
+          printf '[]\n' > "$processed_queue_keys"
 
-          jq -c \
-            --arg repo "$normalized_target_repo" \
-            --arg default_runner "$default_runner" \
-            --arg default_execution_runner "$default_execution_runner" '
-            [
-              .commands[]?
-              | select(.status == "waiting" or .status == "claimed")
-              | select((.repo | strings | ascii_downcase) == $repo)
-              | select(.issue_number | type == "number" and . > 0)
-              | select(
-                  .comment_id
-                  | strings
-                  | test(
-                      "^[1-9][0-9]*$|^repair-loop-label-sweep:(autofix|automerge):[1-9][0-9]*$"
+          while true; do
+            queued_command="$(
+              jq -c \
+                --arg repo "$normalized_target_repo" \
+                --arg default_runner "$default_runner" \
+                --arg default_execution_runner "$default_execution_runner" \
+                --slurpfile processed "$processed_queue_keys" '
+                [
+                  .commands[]?
+                  | select(.status == "waiting" or .status == "claimed")
+                  | select((.repo | strings | ascii_downcase) == $repo)
+                  | select(.issue_number | type == "number" and . > 0)
+                  | select(
+                      .comment_id
+                      | strings
+                      | test(
+                          "^[1-9][0-9]*$|^repair-loop-label-sweep:(autofix|automerge):[1-9][0-9]*$"
+                        )
                     )
-              )
-            ]
-            | group_by([
-                .issue_number,
-                (.comment_version_key // .idempotency_key // .comment_id),
-                (.attempt_id // "")
-              ])
-            | map(
-                sort_by(.processed_at // "")
-                | .[-1] as $latest
-                | {
-                    item_number: $latest.issue_number,
-                    comment_id: $latest.comment_id,
-                    status_comment_id: (
-                      [.[] | .status_comment_id // empty]
-                      | last // ""
-                    ),
-                    force_reprocess: ($latest.forced_replay == true),
-                    attempt_id: (
-                      if $latest.forced_replay == true then $latest.attempt_id else ""
-                      end
-                    ),
-                    dispatch_context: {
-                      target_branch: ($latest.dispatch_context.target_branch // ""),
-                      runner: ($latest.dispatch_context.runner // $default_runner),
-                      execution_runner: (
-                        $latest.dispatch_context.execution_runner // $default_execution_runner
-                      ),
-                      since: (
-                        $latest.dispatch_context.since //
-                        $latest.comment_created_at //
-                        $latest.comment_updated_at //
-                        $latest.processed_at
-                      )
-                    }
-                  }
-              )
-            | sort_by(.item_number, .comment_id)
-            | .[]
-          ' results/comment-router.json > "$queue_file"
+                ]
+                | group_by([
+                    .issue_number,
+                    (.comment_version_key // .idempotency_key // .comment_id),
+                    (.attempt_id // "")
+                  ])
+                | map(
+                    sort_by(.processed_at // "")
+                    | .[-1] as $latest
+                    | {
+                        queue_key: (
+                          [
+                            $latest.issue_number,
+                            (
+                              $latest.comment_version_key //
+                              $latest.idempotency_key //
+                              $latest.comment_id
+                            ),
+                            ($latest.attempt_id // "")
+                          ]
+                          | @json
+                        ),
+                        item_number: $latest.issue_number,
+                        comment_id: $latest.comment_id,
+                        attempt_id: ($latest.attempt_id // ""),
+                        status_comment_id: (
+                          [.[] | .status_comment_id // empty]
+                          | last // ""
+                        ),
+                        force_reprocess: any(.[]; .forced_replay == true),
+                        dispatch_context: {
+                          target_branch: ($latest.dispatch_context.target_branch // ""),
+                          runner: ($latest.dispatch_context.runner // $default_runner),
+                          execution_runner: (
+                            $latest.dispatch_context.execution_runner // $default_execution_runner
+                          ),
+                          since: (
+                            $latest.dispatch_context.since //
+                            $latest.comment_created_at //
+                            $latest.comment_updated_at //
+                            $latest.processed_at
+                          )
+                        }
+                      }
+                  )
+                | map(select(.queue_key as $key | ($processed[0] | index($key)) == null))
+                | sort_by(.item_number, .comment_id, .attempt_id)
+                | .[0] // empty
+              ' results/comment-router.json
+            )"
+            if [ -z "$queued_command" ]; then
+              break
+            fi
 
-          while IFS= read -r queued_command; do
+            queue_key="$(jq -er '.queue_key' <<<"$queued_command")"
             item_number="$(jq -er '.item_number' <<<"$queued_command")"
             comment_id="$(jq -er '.comment_id' <<<"$queued_command")"
+            attempt_id="$(jq -r '.attempt_id // empty' <<<"$queued_command")"
             target_branch="$(jq -r '.dispatch_context.target_branch // empty' <<<"$queued_command")"
             since="$(jq -er '.dispatch_context.since | strings | select(length > 0)' <<<"$queued_command")"
             runner="$(jq -er '.dispatch_context.runner | strings | select(length > 0)' <<<"$queued_command")"
             execution_runner="$(jq -er '.dispatch_context.execution_runner | strings | select(length > 0)' <<<"$queued_command")"
             status_comment_id="$(jq -r '.status_comment_id // empty' <<<"$queued_command")"
             force_reprocess="$(jq -r '.force_reprocess' <<<"$queued_command")"
-            attempt_id="$(jq -r '.attempt_id // empty' <<<"$queued_command")"
-            if [ "$force_reprocess" = "true" ] && [ -z "$attempt_id" ]; then
-              echo "forced replay queue entry requires attempt_id" >&2
-              exit 1
-            fi
-            if [ "$force_reprocess" != "true" ] && [ -n "$attempt_id" ]; then
-              echo "attempt_id requires force_reprocess=true" >&2
+            if [[ "$comment_id" == repair-loop-label-sweep:* ]] && [ -z "$attempt_id" ]; then
+              echo "Scheduled repair-loop queue row is missing an attempt identity." >&2
               exit 1
             fi
 
@@ -763,13 +777,20 @@ jobs:
             if [ -n "$status_comment_id" ]; then
               args+=(--status-comment-id "$status_comment_id")
             fi
-            if [ "$force_reprocess" = "true" ]; then
+            if [ -n "$attempt_id" ]; then
               args+=(--force-reprocess)
               args+=(--attempt-id "$attempt_id")
+            elif [ "$force_reprocess" = "true" ]; then
+              echo "Forced replay queue row is missing an attempt identity." >&2
+              exit 1
             fi
 
             pnpm run repair:comment-router -- "${args[@]}"
-          done < "$queue_file"
+            next_processed_queue_keys="${processed_queue_keys}.next"
+            jq --arg key "$queue_key" '. + [$key] | unique' \
+              "$processed_queue_keys" > "$next_processed_queue_keys"
+            mv "$next_processed_queue_keys" "$processed_queue_keys"
+          done
 
       - name: Commit comment router dispatch ledger
         if: always()

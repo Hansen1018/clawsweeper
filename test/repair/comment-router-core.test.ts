@@ -1530,15 +1530,29 @@ test("exact synthetic label sweeps revalidate live opt-in before recreating the 
     source,
     /existingCommands[\s\S]*\.filter\(routerCommandNeedsExactLane\)[\s\S]*\.filter\(\(command\) => \["autofix", "automerge"\]/,
   );
+  assert.match(
+    source,
+    /selected\?\.automation_source === "repair_loop_label_sweep"[\s\S]*forced_replay: false[\s\S]*attempt_sequence/,
+  );
 });
 
-test("durable dispatch queue separates comment versions and synthetic attempts", () => {
+test("durable dispatch queue separates and reloads exact comment-version attempts", () => {
   const workflow = readFileSync(".github/workflows/repair-comment-router.yml", "utf8");
 
   assert.match(
     workflow,
     /group_by\(\[\s*\.issue_number,\s*\(\.comment_version_key \/\/ \.idempotency_key \/\/ \.comment_id\),\s*\(\.attempt_id \/\/ ""\)\s*\]\)/,
   );
+  assert.match(workflow, /attempt_id: \(\$latest\.attempt_id \/\/ ""\)/);
+  assert.match(workflow, /while true; do[\s\S]*results\/comment-router\.json/);
+  assert.match(workflow, /--slurpfile processed "\$processed_queue_keys"/);
+  assert.match(workflow, /if \[ -n "\$attempt_id" \]; then[\s\S]*--force-reprocess/);
+  assert.match(workflow, /args\+=\(--attempt-id "\$attempt_id"\)/);
+  assert.match(
+    workflow,
+    /comment_id" == repair-loop-label-sweep:\*[\s\S]*missing an attempt identity/,
+  );
+  assert.doesNotMatch(workflow, /done < "\$queue_file"/);
 });
 
 test("forced exact-item replay scopes forwarded comment ids before item-wide reconciliation", () => {
@@ -1580,11 +1594,17 @@ test("forced exact-item replay scopes forwarded comment ids before item-wide rec
   );
   assert.match(
     source,
-    /durableForcedReplayCommands\(\{[\s\S]*commands: ledger\.commands \?\? \[\],[\s\S]*itemNumbers/,
+    /durableForcedReplayCommands\(\{[\s\S]*commands: ledger\.commands \?\? \[\],[\s\S]*itemNumbers,[\s\S]*commentIds,[\s\S]*attemptId: requestedAttemptId/,
   );
   assert.match(
     source,
-    /bindRecoveredForcedReplayAttempts[\s\S]*forced_replay_attempt_ids:\s*attemptIds/,
+    /bindRecoveredForcedReplayAttempts[\s\S]*selectedAttemptId[\s\S]*attempt_id: selectedAttemptId/,
+  );
+  assert.doesNotMatch(source, /forced_replay_attempt_ids:\s*attemptIds/);
+  assert.match(candidates, /if \(!requestedAttemptIsActive\) return emptyCandidateSelection\(\)/);
+  assert.match(
+    source,
+    /function listRepairLoopSweepCommands[\s\S]*if \(!requestedAttemptIsActive\)[\s\S]*commands: \[\]/,
   );
   assert.match(
     source,
@@ -2028,6 +2048,9 @@ test("label-sweep classification checks the exact-head review lease before dispa
   const trustedVerdictCheck = executeCommand.indexOf(
     "trustedAutomationReviewLeaseBlockReason(command)",
   );
+  const scheduledRepairCheck = executeCommand.indexOf(
+    "repairLoopReviewDispatchBlockReason(command)",
+  );
   const preMutationCheck = executeCommand.indexOf("repairLoopReviewDispatchBlockReason(command)");
   const firstMutation = executeCommand.indexOf("ensureAutomergeJob(command)", preMutationCheck);
   const dispatchRecheck = executeCommand.indexOf(
@@ -2036,11 +2059,26 @@ test("label-sweep classification checks the exact-head review lease before dispa
   );
   const dispatch = executeCommand.indexOf("dispatchClawSweeperReview(command)", dispatchRecheck);
   assert.ok(trustedVerdictCheck >= 0);
+  assert.ok(scheduledRepairCheck >= 0);
+  assert.ok(scheduledRepairCheck < trustedVerdictCheck);
   assert.ok(trustedVerdictCheck < executeCommand.indexOf("let dispatched"));
   assert.ok(preMutationCheck >= 0);
   assert.ok(firstMutation > preMutationCheck);
   assert.ok(dispatchRecheck > firstMutation);
   assert.ok(dispatch > dispatchRecheck);
+  assert.match(
+    executeCommand,
+    /command\.automation_source !== "repair_loop_label_sweep"[\s\S]*applyRepairLoopOptIn\(command\)/,
+  );
+  assert.match(
+    executeCommand,
+    /command\.automation_source !== "repair_loop_label_sweep"[\s\S]*--add-label[\s\S]*modeLabel/,
+  );
+  assert.match(
+    executeCommand,
+    /const labelsToRemove =\s*command\.automation_source === "repair_loop_label_sweep"\s*\? \[\]/,
+  );
+  assert.match(executeCommand, /scheduled review sweep preserves live label state/);
 
   const dispatchGuard = source.slice(
     source.indexOf("function repairLoopReviewDispatchBlockReason"),
@@ -2052,6 +2090,11 @@ test("label-sweep classification checks the exact-head review lease before dispa
   assert.match(dispatchGuard, /trustedExactHeadReviewCompletionSince\(\{/);
   assert.match(dispatchGuard, /sinceMs:\s*sweepStartedAtMs/);
   assert.match(dispatchGuard, /next router pass will route it/);
+  assert.match(dispatchGuard, /expectedHead !== headAfter/);
+  assert.match(dispatchGuard, /!hasLabel\(after, modeLabel\)/);
+  assert.match(dispatchGuard, /pauseLabelsOn\(after\)/);
+  assert.match(dispatchGuard, /scheduled repair opt-in label/);
+  assert.match(dispatchGuard, /scheduled repair was paused before dispatch/);
   const sourceRevisionGuard = source.slice(
     source.indexOf("function trustedAutomationSourceRevisionBlockReason"),
     source.indexOf("function trustedAutomationReviewLeaseBlockReason"),
@@ -2088,6 +2131,51 @@ test("label-sweep classification checks the exact-head review lease before dispa
   assert.match(trustedVerdictGuard, /trustedAutomationPredatesReviewStartLease\(\{/);
 });
 
+test("execution revalidates exact live comment and authorization after capacity waiting", () => {
+  const source = readFileSync("src/repair/comment-router.ts", "utf8");
+  const executeBlock = source.slice(
+    source.indexOf('measureAsync("execute_commands"'),
+    source.indexOf("report.ledger_changed"),
+  );
+  const capacityWait = executeBlock.indexOf("waitForLiveWorkerCapacity");
+  const revalidation = executeBlock.indexOf("revalidateCommandImmediatelyBeforeMutation(command)");
+  const claim = executeBlock.indexOf("claimDispatchCommands([command])");
+  const acknowledgement = executeBlock.indexOf("convergePrecreatedCommandAckComments(command)");
+  const execute = executeBlock.indexOf("executeCommandWithReceipt(command)");
+
+  assert.ok(capacityWait >= 0);
+  assert.ok(revalidation > capacityWait);
+  assert.ok(claim > revalidation);
+  assert.ok(acknowledgement > revalidation);
+  assert.ok(execute > acknowledgement);
+
+  const guard = source.slice(
+    source.indexOf("function revalidateCommandImmediatelyBeforeMutation"),
+    source.indexOf("function terminalizeWithdrawnCommand"),
+  );
+  assert.match(guard, /fetchIssueComment\(commentId\)/);
+  assert.match(guard, /exactCommentVersionMatchesLive\(command, liveComment\)/);
+  assert.match(guard, /parseRoutedCommentCommand\(liveComment/);
+  assert.match(guard, /collaboratorPermissionCache\.delete\(liveAuthor\.toLowerCase\(\)\)/);
+  assert.match(guard, /resolveMaintainerCommandAuthorization\(command\)/);
+  assert.match(
+    guard,
+    /if \(!\/\^\[1-9\]\\d\*\$\/\.test\(commentId\)\)\s*return revalidateLiveRepairLoopWithdrawal\(command\)/,
+  );
+  assert.match(guard, /return revalidateLiveRepairLoopWithdrawal\(command\)/);
+  assert.match(guard, /DELETED_DURABLE_COMMENT_VERSION_REASON/);
+  assert.match(guard, /EDITED_DURABLE_COMMENT_VERSION_REASON/);
+
+  const withdrawalGuard = source.slice(
+    source.indexOf("function liveRepairLoopWithdrawalReason"),
+    source.indexOf("function terminalizeWithdrawnCommand"),
+  );
+  assert.match(withdrawalGuard, /issues\/\$\{command\.issue_number\}\/comments/);
+  assert.match(withdrawalGuard, /collaboratorPermissionCache\.delete\(author\)/);
+  assert.match(withdrawalGuard, /resolveMaintainerCommandAuthorization\(entry\)/);
+  assert.match(withdrawalGuard, /repairLoopStopPauseReason\(\{ command, entries \}\)/);
+});
+
 test("comment router durably claims dispatch commands and recovers exact workflow receipts", () => {
   const source = readFileSync("src/repair/comment-router.ts", "utf8");
   const sweepWorkflow = readFileSync(".github/workflows/sweep.yml", "utf8");
@@ -2097,7 +2185,10 @@ test("comment router durably claims dispatch commands and recovers exact workflo
     source.indexOf('await measureAsync("execute_commands"'),
     source.indexOf('report.ledger_changed = measure("append_ledger"'),
   );
-  const claimIndex = executeBlock.indexOf("claimDispatchCommands(actionable)");
+  const revalidationIndex = executeBlock.indexOf(
+    "revalidateCommandImmediatelyBeforeMutation(command)",
+  );
+  const claimIndex = executeBlock.indexOf("claimDispatchCommands([command])");
   const ackIndex = executeBlock.indexOf("convergePrecreatedCommandAckComments(command)");
   const executeIndex = executeBlock.indexOf("executeCommandWithReceipt(command)");
   const claimFunction = source.slice(
@@ -2105,7 +2196,9 @@ test("comment router durably claims dispatch commands and recovers exact workflo
     source.indexOf("function assertMutationActorIsClawsweeperBot"),
   );
 
+  assert.ok(revalidationIndex >= 0);
   assert.ok(claimIndex >= 0);
+  assert.ok(claimIndex > revalidationIndex);
   assert.ok(ackIndex > claimIndex);
   assert.ok(executeIndex > claimIndex);
   assert.match(claimFunction, /status:\s*"claimed"/);

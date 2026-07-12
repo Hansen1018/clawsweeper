@@ -131,6 +131,12 @@ checkpoint, and status-only commits are intentionally omitted.
   scheduled retry failures remain failed after cleanup; active coverage-proof
   yields cannot become kept-open terminals; and review mutation, retryability,
   and cancellation status survive finalization.
+- Revalidated exact command comments and scheduled repair-loop authorization
+  immediately before mutation, terminalizing edited, deleted, withdrawn, or
+  deauthorized work without GitHub side effects; scoped durable queue drains to
+  one exact replay attempt while reloading state between rows; and preserved
+  monotonic synthetic attempt identities beyond bounded ledger-history
+  eviction.
 - Preserved distinct durable repair-loop sweep attempts across ledger merges and
   state publication, while terminalizing edited or deleted staged comment
   versions before dispatch so stale content cannot consume capacity or execute.

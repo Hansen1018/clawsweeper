@@ -88,6 +88,8 @@ import {
 } from "./comment-router-core.js";
 import { mergeAutomergeTimelineSection } from "./automerge-status-timeline.js";
 import {
+  DELETED_DURABLE_COMMENT_VERSION_REASON,
+  EDITED_DURABLE_COMMENT_VERSION_REASON,
   SUPERSEDED_RE_REVIEW_REASON,
   appendLedger,
   commentBodySha256,
@@ -195,12 +197,18 @@ const {
 const startedAtMs = Date.now();
 const timings: LooseRecord[] = [];
 const ledger = readLedger(ledgerPath());
+const requestedAttemptId = normalizedRequestedAttemptId(args["attempt-id"]);
+if (requestedAttemptId && !forceReprocess) {
+  throw new Error("--attempt-id requires --force-reprocess");
+}
 const recoveredForcedReplayCommands =
   forceReprocess && itemNumbers.size > 0
     ? durableForcedReplayCommands({
         commands: ledger.commands ?? [],
         repo: targetRepo,
         itemNumbers,
+        commentIds,
+        attemptId: requestedAttemptId,
       })
     : [];
 const recoveredForcedReplayCommentIds = durableForcedReplayCommentIds({
@@ -209,6 +217,7 @@ const recoveredForcedReplayCommentIds = durableForcedReplayCommentIds({
   itemNumbers,
 });
 const effectiveCommentIds = new Set([...commentIds, ...recoveredForcedReplayCommentIds]);
+const requestedAttemptIsActive = !requestedAttemptId || recoveredForcedReplayCommands.length === 1;
 const TARGET_LOOKUP_RETRY_ATTEMPTS = 3;
 let exactCommentVersionFastPath = exactCommentVersionFastPathDecision({
   authenticated:
@@ -352,6 +361,8 @@ const report: LooseRecord = {
   execute,
   force_reprocess: forceReprocess,
   forced_replay_attempt_id: attemptId,
+  requested_attempt_id: requestedAttemptId,
+  requested_attempt_is_active: requestedAttemptIsActive,
   max_comments: maxComments,
   router_item_fanout: routerItemFanout,
   item_numbers: [...itemNumbers],
@@ -480,20 +491,30 @@ if (execute && !exactCommentVersionFastPath.suppress) {
       report.live_worker_capacity_before_dispatch =
         capacities.length === 1 ? capacities[0] : capacities;
     }
-    const claimedCommands = measure("claim_dispatch_commands", () =>
-      claimDispatchCommands(actionable),
-    );
-    report.ledger_claimed = appendLedger(ledger, claimedCommands);
-    if (report.ledger_claimed) {
-      writeLedger(ledgerPath(), ledger);
-      for (const command of claimedCommands) recordCommandClaimed(command);
-    }
-    for (const command of commands) convergePrecreatedCommandAckComments(command);
-    for (const command of commands) acknowledgeSkippedMaintainerCommand(command);
+    let ledgerClaimed = false;
     for (const command of commands) {
+      if (!revalidateCommandImmediatelyBeforeMutation(command)) {
+        recordCommandOutcome(command);
+        clearTerminalMaintainerCommandReaction(command);
+        continue;
+      }
+      if (actionable.includes(command)) {
+        const claimedCommands = measure("claim_dispatch_command", () =>
+          claimDispatchCommands([command]),
+        );
+        const commandClaimed = appendLedger(ledger, claimedCommands);
+        if (commandClaimed) {
+          ledgerClaimed = true;
+          writeLedger(ledgerPath(), ledger);
+          for (const claimedCommand of claimedCommands) recordCommandClaimed(claimedCommand);
+        }
+      }
+      convergePrecreatedCommandAckComments(command);
+      acknowledgeSkippedMaintainerCommand(command);
       if (command.status !== "ready") recordCommandOutcome(command);
+      if (actionable.includes(command)) executeCommandWithReceipt(command);
     }
-    for (const command of actionable) executeCommandWithReceipt(command);
+    report.ledger_claimed = ledgerClaimed;
   });
   report.ledger_changed = measure("append_ledger", () => appendLedger(ledger, commands));
   if (report.ledger_changed) writeLedger(ledgerPath(), ledger);
@@ -608,20 +629,23 @@ function bindRecoveredForcedReplayAttempts(command: LooseRecord): LooseRecord {
         Date.parse(String(left.processed_at ?? "")) - Date.parse(String(right.processed_at ?? "")),
     );
   if (matches.length === 0) return command;
-  const currentAttemptId = String(command.attempt_id ?? "").trim();
-  const attemptIds = [
-    ...new Map(
-      [...matches.map((entry) => String(entry.attempt_id ?? "").trim()), currentAttemptId]
-        .filter(Boolean)
-        .map((attemptId) => [attemptId, attemptId] as const),
-    ).values(),
-  ];
-  const latestAttemptId = currentAttemptId || String(matches.at(-1)?.attempt_id ?? "").trim();
+  const selected = matches.at(-1);
+  const selectedAttemptId = String(selected?.attempt_id ?? "").trim();
+  if (
+    selected?.automation_source === "repair_loop_label_sweep" &&
+    selected.forced_replay !== true
+  ) {
+    return {
+      ...command,
+      forced_replay: false,
+      ...(selectedAttemptId ? { attempt_id: selectedAttemptId } : {}),
+      ...(selected.attempt_sequence ? { attempt_sequence: selected.attempt_sequence } : {}),
+    };
+  }
   return {
     ...command,
     forced_replay: true,
-    attempt_id: latestAttemptId,
-    forced_replay_attempt_ids: attemptIds,
+    ...(selectedAttemptId ? { attempt_id: selectedAttemptId } : {}),
   };
 }
 
@@ -2037,18 +2061,132 @@ function isRepairLoopControlIntent(command: LooseRecord) {
   );
 }
 
+function revalidateCommandImmediatelyBeforeMutation(command: LooseRecord) {
+  if (!["ready", "skipped", "waiting", "claimed"].includes(String(command.status ?? ""))) {
+    return false;
+  }
+  const commentId = String(command.comment_id ?? "");
+  if (!/^[1-9]\d*$/.test(commentId)) return revalidateLiveRepairLoopWithdrawal(command);
+
+  const liveComment = fetchIssueComment(commentId);
+  if (!liveComment) {
+    terminalizeWithdrawnCommand(command, DELETED_DURABLE_COMMENT_VERSION_REASON);
+    return false;
+  }
+  if (
+    issueNumberFromUrl(liveComment.issue_url) !== Number(command.issue_number) ||
+    !exactCommentVersionMatchesLive(command, liveComment)
+  ) {
+    terminalizeWithdrawnCommand(command, EDITED_DURABLE_COMMENT_VERSION_REASON);
+    return false;
+  }
+
+  const parsed = parseRoutedCommentCommand(liveComment, { trustedAuthors: trustedBots });
+  const liveAuthor = String(liveComment.user?.login ?? "").trim();
+  const sameAuthor =
+    liveAuthor.toLowerCase() ===
+      String(command.author ?? "")
+        .trim()
+        .toLowerCase() && String(liveComment.user?.id ?? "") === String(command.author_id ?? "");
+  if (
+    !parsed ||
+    parsed.intent !== command.intent ||
+    Boolean(parsed.trusted_bot) !== Boolean(command.trusted_bot) ||
+    !sameAuthor
+  ) {
+    terminalizeWithdrawnCommand(command, EDITED_DURABLE_COMMENT_VERSION_REASON);
+    return false;
+  }
+
+  if (command.trusted_bot) {
+    if (!trustedBots.has(liveAuthor.toLowerCase())) {
+      terminalizeWithdrawnCommand(
+        command,
+        "trusted command authorization was withdrawn before execution",
+      );
+      return false;
+    }
+  } else {
+    command.author_association = String(liveComment.author_association ?? "").toUpperCase();
+    collaboratorPermissionCache.delete(liveAuthor.toLowerCase());
+    const authorization = resolveMaintainerCommandAuthorization(command);
+    command.author_repository_permission = authorization.repositoryPermission;
+    if (!authorization.allowed) {
+      terminalizeWithdrawnCommand(
+        command,
+        `command authorization was withdrawn before execution: ${authorization.reason}`,
+      );
+      return false;
+    }
+  }
+
+  return revalidateLiveRepairLoopWithdrawal(command);
+}
+
+function revalidateLiveRepairLoopWithdrawal(command: LooseRecord) {
+  try {
+    const withdrawalReason = liveRepairLoopWithdrawalReason(command);
+    if (!withdrawalReason) return true;
+    terminalizeWithdrawnCommand(command, withdrawalReason);
+  } catch (error) {
+    applyReviewLeaseGuardBlock(command, {
+      reason: `live command withdrawal check failed; next router pass will retry: ${compactGhError(error)}`,
+      retryable: true,
+    });
+  }
+  return false;
+}
+
+function liveRepairLoopWithdrawalReason(command: LooseRecord) {
+  const intent = String(command.intent ?? "");
+  const canBeWithdrawn =
+    ["autofix", "automerge"].includes(intent) ||
+    MERGE_INTENTS.has(intent) ||
+    (command.trusted_bot === true && REPAIR_INTENTS.has(intent));
+  if (!canBeWithdrawn) return null;
+
+  const entries = (ledger.commands ?? []).filter(
+    (entry: JsonValue) =>
+      isRepairLoopControlIntent(entry) &&
+      ["executed", "waiting"].includes(String(entry.status ?? "")),
+  );
+  const comments = ghPaged<JsonValue>(
+    `repos/${targetRepo}/issues/${command.issue_number}/comments?per_page=100`,
+  );
+  for (const comment of comments) {
+    const entry = routedCommandForComment(comment);
+    if (!entry || entry.trusted_bot || !isRepairLoopControlIntent(entry)) continue;
+    const author = String(entry.author ?? "")
+      .trim()
+      .toLowerCase();
+    collaboratorPermissionCache.delete(author);
+    if (resolveMaintainerCommandAuthorization(entry).allowed) entries.push(entry);
+  }
+  return repairLoopStopPauseReason({ command, entries });
+}
+
+function terminalizeWithdrawnCommand(command: LooseRecord, reason: string) {
+  command.status = "skipped";
+  command.reason = reason;
+  command.resolution_reason = reason;
+  command.processed_at = new Date().toISOString();
+  command.actions = Array.isArray(command.actions)
+    ? command.actions.map((action: JsonValue) =>
+        action?.status === "executed" ? action : { ...action, status: "skipped", reason },
+      )
+    : command.actions;
+}
+
 function executeCommand(command: LooseRecord) {
   try {
+    const scheduledRepairLoopBlock = repairLoopReviewDispatchBlockReason(command);
+    if (scheduledRepairLoopBlock) {
+      applyReviewLeaseGuardBlock(command, scheduledRepairLoopBlock);
+      return;
+    }
     const trustedAutomationLeaseBlock = trustedAutomationReviewLeaseBlockReason(command);
     if (trustedAutomationLeaseBlock) {
-      const status = trustedAutomationLeaseBlock.retryable ? "waiting" : "skipped";
-      command.status = status;
-      command.reason = trustedAutomationLeaseBlock.reason;
-      command.actions = command.actions.map((action: JsonValue) => ({
-        ...action,
-        status,
-        reason: trustedAutomationLeaseBlock.reason,
-      }));
+      applyReviewLeaseGuardBlock(command, trustedAutomationLeaseBlock);
       return;
     }
     let dispatched = null;
@@ -2065,7 +2203,10 @@ function executeCommand(command: LooseRecord) {
       (canRepairPullTarget(command.target) ||
         ["autofix", "automerge", "implement_issue"].includes(command.intent))
     ) {
-      if (["autofix", "automerge"].includes(command.intent)) {
+      if (
+        ["autofix", "automerge"].includes(command.intent) &&
+        command.automation_source !== "repair_loop_label_sweep"
+      ) {
         applyRepairLoopOptIn(command);
       }
       const job =
@@ -2097,6 +2238,11 @@ function executeCommand(command: LooseRecord) {
         command.status = "waiting";
         return;
       }
+      const repairDispatchBlock = repairLoopReviewDispatchBlockReason(command);
+      if (repairDispatchBlock) {
+        applyReviewLeaseGuardBlock(command, repairDispatchBlock);
+        return;
+      }
       const repair = dispatchRepair(command);
       dispatched = REPAIR_INTENTS.has(command.intent) ? repair : { repair };
       if (repair.status === "claimed") {
@@ -2113,10 +2259,13 @@ function executeCommand(command: LooseRecord) {
         keepCommandClaimed(command);
         return;
       }
-      const labelsToRemove = command.actions
-        .filter((action: JsonValue) => action.action === "remove_label")
-        .map((action: JsonValue) => String(action.label ?? ""))
-        .filter(Boolean);
+      const labelsToRemove =
+        command.automation_source === "repair_loop_label_sweep"
+          ? []
+          : command.actions
+              .filter((action: JsonValue) => action.action === "remove_label")
+              .map((action: JsonValue) => String(action.label ?? ""))
+              .filter(Boolean);
       for (const pausedLabel of labelsToRemove) {
         runGitHubBestEffortMutation(
           command,
@@ -2142,8 +2291,15 @@ function executeCommand(command: LooseRecord) {
           return { ...action, status: "executed", ...job };
         if (action.action === "label")
           return { ...action, status: "executed", label: action.label };
-        if (action.action === "remove_label")
-          return { ...action, status: "executed", label: action.label };
+        if (action.action === "remove_label") {
+          return command.automation_source === "repair_loop_label_sweep"
+            ? {
+                ...action,
+                status: "skipped",
+                reason: "scheduled repair sweep preserves live label state",
+              }
+            : { ...action, status: "executed", label: action.label };
+        }
         if (action.action === "dispatch_repair") {
           return {
             ...action,
@@ -2164,77 +2320,65 @@ function executeCommand(command: LooseRecord) {
       const oppositeModeLabel = command.intent === "autofix" ? AUTOMERGE_LABEL : AUTOFIX_LABEL;
       const preMutationBlock = repairLoopReviewDispatchBlockReason(command);
       if (preMutationBlock) {
-        const status = preMutationBlock.retryable ? "waiting" : "skipped";
-        command.status = status;
-        command.reason = preMutationBlock.reason;
-        command.actions = command.actions.map((action: JsonValue) => ({
-          ...action,
-          status,
-          reason: preMutationBlock.reason,
-        }));
+        applyReviewLeaseGuardBlock(command, preMutationBlock);
         return;
       }
       const job = ensureAutomergeJob(command);
-      ensureRepairLoopLabel(command, modeLabel);
-      for (const pausedLabel of pauseLabelsOn(command.target)) {
+      if (command.automation_source !== "repair_loop_label_sweep") {
+        ensureRepairLoopLabel(command, modeLabel);
+        for (const pausedLabel of pauseLabelsOn(command.target)) {
+          runGitHubBestEffortMutation(
+            command,
+            "label_remove",
+            { repository: command.repo, number: command.issue_number, label: pausedLabel },
+            [
+              "issue",
+              "edit",
+              String(command.issue_number),
+              "--repo",
+              command.repo,
+              "--remove-label",
+              pausedLabel,
+            ],
+            githubNotFoundNoMutation,
+          );
+        }
+        if (hasLabel(command.target, oppositeModeLabel)) {
+          runGitHubBestEffortMutation(
+            command,
+            "label_remove",
+            { repository: command.repo, number: command.issue_number, label: oppositeModeLabel },
+            [
+              "issue",
+              "edit",
+              String(command.issue_number),
+              "--repo",
+              command.repo,
+              "--remove-label",
+              oppositeModeLabel,
+            ],
+            githubNotFoundNoMutation,
+          );
+        }
         runGitHubBestEffortMutation(
           command,
-          "label_remove",
-          { repository: command.repo, number: command.issue_number, label: pausedLabel },
+          "label_add",
+          { repository: command.repo, number: command.issue_number, label: modeLabel },
           [
             "issue",
             "edit",
             String(command.issue_number),
             "--repo",
             command.repo,
-            "--remove-label",
-            pausedLabel,
+            "--add-label",
+            modeLabel,
           ],
-          githubNotFoundNoMutation,
+          githubAlreadyExistsNoMutation,
         );
       }
-      if (hasLabel(command.target, oppositeModeLabel)) {
-        runGitHubBestEffortMutation(
-          command,
-          "label_remove",
-          { repository: command.repo, number: command.issue_number, label: oppositeModeLabel },
-          [
-            "issue",
-            "edit",
-            String(command.issue_number),
-            "--repo",
-            command.repo,
-            "--remove-label",
-            oppositeModeLabel,
-          ],
-          githubNotFoundNoMutation,
-        );
-      }
-      runGitHubBestEffortMutation(
-        command,
-        "label_add",
-        { repository: command.repo, number: command.issue_number, label: modeLabel },
-        [
-          "issue",
-          "edit",
-          String(command.issue_number),
-          "--repo",
-          command.repo,
-          "--add-label",
-          modeLabel,
-        ],
-        githubAlreadyExistsNoMutation,
-      );
       const dispatchBlock = repairLoopReviewDispatchBlockReason(command);
       if (dispatchBlock) {
-        const status = dispatchBlock.retryable ? "waiting" : "skipped";
-        command.status = status;
-        command.reason = dispatchBlock.reason;
-        command.actions = command.actions.map((action: JsonValue) => ({
-          ...action,
-          status,
-          reason: dispatchBlock.reason,
-        }));
+        applyReviewLeaseGuardBlock(command, dispatchBlock);
         return;
       }
       const clawsweeper = dispatchClawSweeperReview(command);
@@ -2242,8 +2386,15 @@ function executeCommand(command: LooseRecord) {
       command.actions = command.actions.map((action: JsonValue) => {
         if (action.action === "label")
           return { ...action, status: "executed", label: action.label ?? modeLabel };
-        if (action.action === "remove_label")
-          return { ...action, status: "executed", label: action.label };
+        if (action.action === "remove_label") {
+          return command.automation_source === "repair_loop_label_sweep"
+            ? {
+                ...action,
+                status: "skipped",
+                reason: "scheduled review sweep preserves live label state",
+              }
+            : { ...action, status: "executed", label: action.label };
+        }
         if (action.action === "ensure_automerge_job")
           return { ...action, status: "executed", ...job };
         if (action.action === "dispatch_clawsweeper") {
@@ -2980,6 +3131,17 @@ function repairJobModeForCommand(command: LooseRecord) {
 
 type ReviewLeaseGuardBlock = { reason: string; retryable: boolean };
 
+function applyReviewLeaseGuardBlock(command: LooseRecord, block: ReviewLeaseGuardBlock) {
+  const status = block.retryable ? "waiting" : "skipped";
+  command.status = status;
+  command.reason = block.reason;
+  command.actions = command.actions.map((action: JsonValue) => ({
+    ...action,
+    status,
+    reason: block.reason,
+  }));
+}
+
 function repairLoopReviewDispatchBlockReason(command: LooseRecord): ReviewLeaseGuardBlock | null {
   if (command.automation_source !== "repair_loop_label_sweep") return null;
   const number = Number(command.issue_number);
@@ -3011,6 +3173,29 @@ function repairLoopReviewDispatchBlockReason(command: LooseRecord): ReviewLeaseG
         retryable: true,
       };
     }
+    const expectedHead = String(command.target?.head_sha ?? "")
+      .trim()
+      .toLowerCase();
+    if (expectedHead && expectedHead !== headAfter) {
+      return {
+        reason: `PR head changed from classified head ${expectedHead} to ${headAfter}; next sweep will retry`,
+        retryable: false,
+      };
+    }
+    const modeLabel = command.intent === "autofix" ? AUTOFIX_LABEL : AUTOMERGE_LABEL;
+    if (!hasLabel(after, modeLabel)) {
+      return {
+        reason: `scheduled repair opt-in label ${modeLabel} was removed before dispatch`,
+        retryable: false,
+      };
+    }
+    const pauseLabels = pauseLabelsOn(after);
+    if (pauseLabels.length > 0) {
+      return {
+        reason: `scheduled repair was paused before dispatch by ${pauseLabels.join(", ")}`,
+        retryable: false,
+      };
+    }
     const activeReviewLease = freshExactHeadReviewStartLease({
       comments: comments as LooseRecord[],
       itemNumber: number,
@@ -3038,6 +3223,11 @@ function repairLoopReviewDispatchBlockReason(command: LooseRecord): ReviewLeaseG
         retryable: false,
       };
     }
+    command.target = {
+      ...command.target,
+      head_sha: headAfter,
+      labels: normalizedLabelNames(after.labels),
+    };
     return null;
   } catch (error) {
     return {
@@ -4346,6 +4536,7 @@ function emptyCandidateSelection(): CandidateCommentSelection {
 }
 
 function listCandidateComments() {
+  if (!requestedAttemptIsActive) return emptyCandidateSelection();
   if (forceReprocess && itemNumbers.size > 0 && effectiveCommentIds.size > 0) {
     reconcileDurableRouterCommentIds(
       [...effectiveCommentIds].filter((commentId) => /^[1-9]\d*$/.test(commentId)),
@@ -4533,6 +4724,16 @@ function listRepairLoopSweepCommands(
   existingCommands: LooseRecord[],
   candidateSelection: CandidateCommentSelection,
 ) {
+  if (!requestedAttemptIsActive) {
+    return {
+      commands: [],
+      page: selectRouterItemFanoutPage({
+        itemNumbers: [],
+        after: routerFanoutAfter,
+        limit: maxComments,
+      }),
+    };
+  }
   const requestedSweeps = [...effectiveCommentIds]
     .map((commentId) => parseRepairLoopSweepCommandId(commentId))
     .filter(
@@ -4631,6 +4832,7 @@ function repairLoopSweepCommand(intent: "autofix" | "automerge", number: number)
     : repairLoopSweepAttemptIdentity({
         commands: ledger.commands ?? [],
         idempotencyKey,
+        attemptSequences: ledger.attempt_sequences,
       });
   return bindRecoveredForcedReplayAttempts({
     idempotency_key: idempotencyKey,
@@ -5461,13 +5663,24 @@ function ensureMergeReadyLabel(command: LooseRecord) {
 }
 
 function hasLabel(target: LooseRecord, name: string) {
-  return (target?.labels ?? []).some(
-    (labelName: JsonValue) => String(labelName).toLowerCase() === String(name).toLowerCase(),
+  return normalizedLabelNames(target?.labels).some(
+    (labelName) => labelName.toLowerCase() === String(name).toLowerCase(),
   );
 }
 
 function pauseLabelsOn(target: LooseRecord) {
-  return repairLoopPauseLabels(target?.labels ?? []);
+  return repairLoopPauseLabels(normalizedLabelNames(target?.labels));
+}
+
+function normalizedLabelNames(labels: JsonValue): string[] {
+  if (!Array.isArray(labels)) return [];
+  return labels
+    .map((label) =>
+      label && typeof label === "object" && !Array.isArray(label)
+        ? String(label.name ?? "").trim()
+        : String(label ?? "").trim(),
+    )
+    .filter(Boolean);
 }
 
 function unique<T>(items: T[]): T[] {
@@ -5526,4 +5739,13 @@ function commentVersionKey(entry: LooseRecord) {
   const updatedAt = entry?.comment_updated_at;
   if (!id || !updatedAt) return null;
   return `${id}:${updatedAt}`;
+}
+
+function normalizedRequestedAttemptId(value: JsonValue) {
+  const attemptId = String(value ?? "").trim();
+  if (!attemptId) return null;
+  if (attemptId.length > 128 || /\s/.test(attemptId) || attemptId.includes("\0")) {
+    throw new Error("--attempt-id must be a non-empty token of at most 128 characters");
+  }
+  return attemptId;
 }

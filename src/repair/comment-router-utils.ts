@@ -243,9 +243,11 @@ export function exactCommentVersionMatchesLive(command: LooseRecord, live: JsonV
 export function repairLoopSweepAttemptIdentity({
   commands,
   idempotencyKey,
+  attemptSequences = {},
 }: {
   commands: LooseRecord[];
   idempotencyKey: string;
+  attemptSequences?: JsonValue;
 }) {
   const matching = commands.filter(
     (entry) =>
@@ -270,9 +272,13 @@ export function repairLoopSweepAttemptIdentity({
     };
   }
 
+  const persistedSequence =
+    normalizedRepairLoopAttemptSequences(attemptSequences)[idempotencyKey] ?? 0;
   const attemptSequence =
-    matching.reduce((maximum, entry) => Math.max(maximum, ledgerAttemptSequence(entry) ?? 0), 0) +
-    1;
+    Math.max(
+      persistedSequence,
+      matching.reduce((maximum, entry) => Math.max(maximum, ledgerAttemptSequence(entry) ?? 0), 0),
+    ) + 1;
   const attemptId = createHash("sha256")
     .update(`${idempotencyKey}:attempt:${attemptSequence}`, "utf8")
     .digest("hex");
@@ -461,6 +467,7 @@ function normalizeExactTimestamp(value: JsonValue) {
 function stableLedgerSnapshot(ledger: LooseRecord) {
   return JSON.stringify({
     updated_at: ledger.updated_at ?? null,
+    attempt_sequences: normalizedRepairLoopAttemptSequences(ledger.attempt_sequences),
     commands: Array.isArray(ledger.commands) ? ledger.commands : [],
   });
 }
@@ -655,20 +662,29 @@ export function durableForcedReplayCommands({
   commands,
   repo,
   itemNumbers,
+  commentIds,
+  attemptId,
 }: {
   commands: LooseRecord[];
   repo: string;
   itemNumbers: ReadonlySet<number>;
+  commentIds?: ReadonlySet<string>;
+  attemptId?: string | null;
 }) {
   const normalizedRepo = repo.trim().toLowerCase();
+  const normalizedAttemptId = String(attemptId ?? "").trim();
   return commands.filter(
     (command) =>
-      command.forced_replay === true &&
+      (command.forced_replay === true ||
+        (Boolean(normalizedAttemptId) &&
+          command.automation_source === "repair_loop_label_sweep")) &&
       ["waiting", "claimed"].includes(String(command.status ?? "")) &&
       String(command.repo ?? "")
         .trim()
         .toLowerCase() === normalizedRepo &&
       itemNumbers.has(Number(command.issue_number)) &&
+      (!commentIds || commentIds.size === 0 || commentIds.has(String(command.comment_id ?? ""))) &&
+      (!normalizedAttemptId || String(command.attempt_id ?? "").trim() === normalizedAttemptId) &&
       validRouterCommentId(command.comment_id, command.issue_number),
   );
 }
@@ -788,7 +804,7 @@ export function readLedger(file: JsonValue) {
     contents = fs.readFileSync(file, "utf8");
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      return { updated_at: null, commands: [] };
+      return { updated_at: null, attempt_sequences: {}, commands: [] };
     }
     throw error;
   }
@@ -806,6 +822,7 @@ export function readLedger(file: JsonValue) {
   }
   return {
     updated_at: data.updated_at ?? null,
+    attempt_sequences: normalizedRepairLoopAttemptSequences(data.attempt_sequences),
     commands: data.commands.map((entry: JsonValue) => validatedLedgerCommand(entry)),
   };
 }
@@ -869,6 +886,14 @@ export function appendLedger(current: LooseRecord, entries: LooseRecord[]) {
       }));
     });
   if (compact.length === 0) return false;
+  const attemptSequences = mergedRepairLoopAttemptSequences(
+    current.attempt_sequences,
+    current.commands,
+    compact,
+  );
+  const attemptSequencesChanged =
+    canonicalJson(normalizedRepairLoopAttemptSequences(current.attempt_sequences)) !==
+    canonicalJson(attemptSequences);
   const byCommentVersion = new Map<string, LooseRecord>(
     (current.commands ?? []).map((entry: LooseRecord) => [ledgerEntryKey(entry), entry] as const),
   );
@@ -881,9 +906,10 @@ export function appendLedger(current: LooseRecord, entries: LooseRecord[]) {
     byCommentVersion.set(key, entry);
     changed = true;
   }
-  if (!changed) return false;
+  if (!changed && !attemptSequencesChanged) return false;
   const commands = boundedCommentRouterLedgerEntries(byCommentVersion);
   current.updated_at = new Date().toISOString();
+  current.attempt_sequences = attemptSequences;
   current.commands = commands;
   return true;
 }
@@ -1082,6 +1108,9 @@ export function mergeCommentRouterLedgers(...values: JsonValue[]) {
     }
   }
   const commands = boundedCommentRouterLedgerEntries(byKey);
+  const attemptSequences = mergedRepairLoopAttemptSequences(
+    ...ledgers.flatMap((ledger) => [ledger.attempt_sequences, ledger.commands]),
+  );
   const updatedAt = ledgers
     .map((ledger) => String(ledger.updated_at ?? ""))
     .filter((value) => Number.isFinite(Date.parse(value)))
@@ -1089,6 +1118,7 @@ export function mergeCommentRouterLedgers(...values: JsonValue[]) {
     .at(-1);
   return {
     updated_at: updatedAt || null,
+    attempt_sequences: attemptSequences,
     commands,
   };
 }
@@ -1144,20 +1174,59 @@ function ledgerAttemptIds(entry: LooseRecord): Array<string | null> {
   if (entry.forced_replay !== true) {
     return [repairLoopSweepAttemptId(entry)];
   }
-  if (!Array.isArray(entry.forced_replay_attempt_ids)) {
-    return [forcedReplayAttemptId(entry)];
-  }
-  const attempts = new Map<string, string>();
-  for (const value of entry.forced_replay_attempt_ids) {
-    const attemptId = forcedReplayAttemptId({ forced_replay: true, attempt_id: value });
-    if (attemptId) attempts.set(attemptId, attemptId);
-  }
-  return attempts.size > 0 ? [...attempts.values()] : [forcedReplayAttemptId(entry)];
+  return [forcedReplayAttemptId(entry)];
 }
 
 function ledgerAttemptSequence(entry: LooseRecord): number | null {
   const sequence = Number(entry.attempt_sequence);
   return Number.isSafeInteger(sequence) && sequence > 0 ? sequence : null;
+}
+
+function normalizedRepairLoopAttemptSequences(value: JsonValue): Record<string, number> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  return Object.fromEntries(
+    Object.entries(value)
+      .filter(([key, sequence]) => {
+        const number = Number(sequence);
+        return (
+          key.startsWith("repair-loop-label-sweep:") &&
+          key.length <= 512 &&
+          Number.isSafeInteger(number) &&
+          number > 0
+        );
+      })
+      .map(([key, sequence]) => [key, Number(sequence)] as [string, number])
+      .sort(([left], [right]) => left.localeCompare(right)),
+  );
+}
+
+function mergedRepairLoopAttemptSequences(...values: JsonValue[]): Record<string, number> {
+  const merged = new Map<string, number>();
+  const retain = (key: string, sequence: number) => {
+    if (
+      !key.startsWith("repair-loop-label-sweep:") ||
+      key.length > 512 ||
+      !Number.isSafeInteger(sequence) ||
+      sequence <= 0
+    ) {
+      return;
+    }
+    merged.set(key, Math.max(merged.get(key) ?? 0, sequence));
+  };
+  for (const value of values) {
+    if (Array.isArray(value)) {
+      for (const entry of value) {
+        if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+        if (entry.automation_source !== "repair_loop_label_sweep") continue;
+        retain(String(entry.idempotency_key ?? ""), Number(entry.attempt_sequence));
+      }
+      continue;
+    }
+    for (const [key, sequence] of Object.entries(normalizedRepairLoopAttemptSequences(value))) {
+      retain(key, sequence);
+    }
+  }
+  return Object.fromEntries([...merged].sort(([left], [right]) => left.localeCompare(right)));
 }
 
 function preferredLedgerEntry(left: LooseRecord, right: LooseRecord): LooseRecord {

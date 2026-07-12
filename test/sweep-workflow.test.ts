@@ -1776,8 +1776,14 @@ test("trusted comment router publishes item-keyed staging before serialized dura
   );
   assert.match(
     routerWorkflow,
-    /group_by\(\[[\s\S]*\.issue_number,[\s\S]*\.comment_id,[\s\S]*\.attempt_id/,
+    /group_by\(\[\s*\.issue_number,\s*\(\.comment_version_key \/\/ \.idempotency_key \/\/ \.comment_id\),\s*\(\.attempt_id \/\/ ""\)\s*\]\)/,
   );
+  assert.match(
+    routerWorkflow,
+    /while true; do[\s\S]*--slurpfile processed "\$processed_queue_keys"[\s\S]*results\/comment-router\.json/,
+  );
+  assert.match(routerWorkflow, /if \[ -n "\$attempt_id" \]; then[\s\S]*--force-reprocess/);
+  assert.match(routerWorkflow, /args\+=\(--attempt-id "\$attempt_id"\)/);
   assert.match(routerWorkflow, /dispatch_context\.since/);
   assert.match(
     routerWorkflow,
