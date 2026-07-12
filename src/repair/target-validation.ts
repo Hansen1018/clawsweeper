@@ -374,7 +374,11 @@ function preparePnpmToolchain({
         ),
       },
     );
-    restoreTargetLockfile(cwd, "pnpm-lock.yaml");
+    restoreTargetLockfile(
+      cwd,
+      "pnpm-lock.yaml",
+      targetToolchainCommandTimeout(identityLimits, installTimeoutMs, "pnpm lockfile restoration"),
+    );
     run("pnpm", installArgs, {
       cwd,
       env: validationEnv,
@@ -430,7 +434,11 @@ function prepareBunToolchain({
       ),
     });
     for (const lockfile of ["bun.lock", "bun.lockb"]) {
-      restoreTargetLockfile(cwd, lockfile);
+      restoreTargetLockfile(
+        cwd,
+        lockfile,
+        targetToolchainCommandTimeout(identityLimits, installTimeoutMs, `${lockfile} restoration`),
+      );
     }
     run("bun", installArgs, {
       cwd,
@@ -2016,9 +2024,9 @@ export function canSkipInternalCodexReviewForRepairDelta(plan: LooseRecord) {
   return String(plan?.scope ?? "") === "repair-delta-docs";
 }
 
-function restoreTargetLockfile(cwd: string, lockfile: string) {
+function restoreTargetLockfile(cwd: string, lockfile: string, timeoutMs: number) {
   if (!fs.existsSync(path.join(cwd, lockfile))) return;
-  run("git", ["checkout", "--", lockfile], { cwd });
+  run("git", ["checkout", "--", lockfile], { cwd, timeoutMs });
 }
 
 function isChangedGateStall(error: JsonValue) {

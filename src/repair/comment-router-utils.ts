@@ -25,6 +25,7 @@ const LEDGER_COMMAND_STRING_FIELDS = [
   "processed_at",
 ] as const;
 const COMMENT_ROUTER_LEDGER_ENTRY_LIMIT = 1000;
+export const COMMENT_ROUTER_ATTEMPT_SEQUENCE_LIMIT = 1000;
 const ACTIVE_COMMENT_ROUTER_STATUSES = new Set(["waiting", "claimed"]);
 export const EDITED_DURABLE_COMMENT_VERSION_REASON =
   "durable comment version was edited before dispatch";
@@ -244,10 +245,12 @@ export function repairLoopSweepAttemptIdentity({
   commands,
   idempotencyKey,
   attemptSequences = {},
+  attemptHighWater = 0,
 }: {
   commands: LooseRecord[];
   idempotencyKey: string;
   attemptSequences?: JsonValue;
+  attemptHighWater?: JsonValue;
 }) {
   const matching = commands.filter(
     (entry) =>
@@ -266,9 +269,11 @@ export function repairLoopSweepAttemptIdentity({
   if (active) {
     const attemptId = repairLoopSweepAttemptId(active);
     const attemptSequence = ledgerAttemptSequence(active);
+    const attemptNonce = ledgerAttemptNonce(active);
     return {
       ...(attemptId ? { attemptId } : {}),
       ...(attemptSequence !== null ? { attemptSequence } : {}),
+      ...(attemptNonce !== null ? { attemptNonce } : {}),
     };
   }
 
@@ -279,10 +284,19 @@ export function repairLoopSweepAttemptIdentity({
       persistedSequence,
       matching.reduce((maximum, entry) => Math.max(maximum, ledgerAttemptSequence(entry) ?? 0), 0),
     ) + 1;
+  const attemptNonce =
+    Math.max(
+      normalizedRepairLoopAttemptHighWater(attemptHighWater),
+      matching.reduce(
+        (maximum, entry) =>
+          Math.max(maximum, ledgerAttemptNonce(entry) ?? ledgerAttemptSequence(entry) ?? 0),
+        0,
+      ),
+    ) + 1;
   const attemptId = createHash("sha256")
-    .update(`${idempotencyKey}:attempt:${attemptSequence}`, "utf8")
+    .update(`repair-loop-attempt-v2:${idempotencyKey}:nonce:${attemptNonce}`, "utf8")
     .digest("hex");
-  return { attemptId, attemptSequence };
+  return { attemptId, attemptSequence, attemptNonce };
 }
 
 export function reconcileDurableCommentVersions({
@@ -467,6 +481,7 @@ function normalizeExactTimestamp(value: JsonValue) {
 function stableLedgerSnapshot(ledger: LooseRecord) {
   return JSON.stringify({
     updated_at: ledger.updated_at ?? null,
+    attempt_high_water: normalizedRepairLoopAttemptHighWater(ledger.attempt_high_water),
     attempt_sequences: normalizedRepairLoopAttemptSequences(ledger.attempt_sequences),
     commands: Array.isArray(ledger.commands) ? ledger.commands : [],
   });
@@ -820,8 +835,10 @@ export function readLedger(file: JsonValue) {
   if (!Array.isArray(data.commands)) {
     throw new Error("comment router ledger commands must be an array");
   }
+  const attemptHighWater = normalizedRepairLoopAttemptHighWater(data.attempt_high_water);
   return {
     updated_at: data.updated_at ?? null,
+    ...(attemptHighWater > 0 ? { attempt_high_water: attemptHighWater } : {}),
     attempt_sequences: normalizedRepairLoopAttemptSequences(data.attempt_sequences),
     commands: data.commands.map((entry: JsonValue) => validatedLedgerCommand(entry)),
   };
@@ -839,6 +856,7 @@ export function appendLedger(current: LooseRecord, entries: LooseRecord[]) {
       const normalizedEntry = { ...entry, ...identityFields };
       const attemptIds = ledgerAttemptIds(normalizedEntry);
       const attemptSequence = ledgerAttemptSequence(normalizedEntry);
+      const attemptNonce = ledgerAttemptNonce(normalizedEntry);
       const statusCommentId = compactRouterStatusCommentId(entry.status_comment_id);
       const dispatchContext = compactRouterDispatchContext(entry.dispatch_context);
       const resolutionReason = boundedRouterContextString(entry.resolution_reason, 255);
@@ -854,6 +872,7 @@ export function appendLedger(current: LooseRecord, entries: LooseRecord[]) {
         ...(normalizedEntry.forced_replay === true ? { forced_replay: true } : {}),
         ...(attemptId ? { attempt_id: attemptId } : {}),
         ...(attemptSequence !== null ? { attempt_sequence: attemptSequence } : {}),
+        ...(attemptNonce !== null ? { attempt_nonce: attemptNonce } : {}),
         ...(resolutionReason ? { resolution_reason: resolutionReason } : {}),
         repo: entry.repo,
         issue_number: entry.issue_number,
@@ -891,9 +910,16 @@ export function appendLedger(current: LooseRecord, entries: LooseRecord[]) {
     current.commands,
     compact,
   );
+  const attemptHighWater = mergedRepairLoopAttemptHighWater(
+    current.attempt_high_water,
+    current.commands,
+    compact,
+  );
   const attemptSequencesChanged =
     canonicalJson(normalizedRepairLoopAttemptSequences(current.attempt_sequences)) !==
     canonicalJson(attemptSequences);
+  const attemptHighWaterChanged =
+    normalizedRepairLoopAttemptHighWater(current.attempt_high_water) !== attemptHighWater;
   const byCommentVersion = new Map<string, LooseRecord>(
     (current.commands ?? []).map((entry: LooseRecord) => [ledgerEntryKey(entry), entry] as const),
   );
@@ -906,9 +932,10 @@ export function appendLedger(current: LooseRecord, entries: LooseRecord[]) {
     byCommentVersion.set(key, entry);
     changed = true;
   }
-  if (!changed && !attemptSequencesChanged) return false;
+  if (!changed && !attemptSequencesChanged && !attemptHighWaterChanged) return false;
   const commands = boundedCommentRouterLedgerEntries(byCommentVersion);
   current.updated_at = new Date().toISOString();
+  if (attemptHighWater > 0) current.attempt_high_water = attemptHighWater;
   current.attempt_sequences = attemptSequences;
   current.commands = commands;
   return true;
@@ -1007,11 +1034,14 @@ function durableAttemptIdentityFields(entry: LooseRecord): LooseRecord {
   const hasAttemptId = entry.attempt_id !== undefined && entry.attempt_id !== null;
   const hasAttemptSequence =
     entry.attempt_sequence !== undefined && entry.attempt_sequence !== null;
+  const hasAttemptNonce = entry.attempt_nonce !== undefined && entry.attempt_nonce !== null;
   const hasForcedReplayAttempts =
     entry.forced_replay_attempt_ids !== undefined && entry.forced_replay_attempt_ids !== null;
   if (entry.forced_replay === true) {
-    if (hasAttemptSequence) {
-      throw new Error("forced replay dispatch identity cannot include attempt_sequence");
+    if (hasAttemptSequence || hasAttemptNonce) {
+      throw new Error(
+        "forced replay dispatch identity cannot include attempt_sequence or attempt_nonce",
+      );
     }
     return forcedReplayIdentityFields(entry);
   }
@@ -1019,7 +1049,7 @@ function durableAttemptIdentityFields(entry: LooseRecord): LooseRecord {
     if (hasForcedReplayAttempts) {
       throw new Error("repair-loop sweep identity cannot include forced replay attempts");
     }
-    if (!hasAttemptId && !hasAttemptSequence) return {};
+    if (!hasAttemptId && !hasAttemptSequence && !hasAttemptNonce) return {};
     if (!hasAttemptId || !hasAttemptSequence) {
       throw new Error("repair-loop sweep identity requires attempt_id and attempt_sequence");
     }
@@ -1028,12 +1058,20 @@ function durableAttemptIdentityFields(entry: LooseRecord): LooseRecord {
     if (attemptSequence === null) {
       throw new Error("repair-loop sweep attempt_sequence must be a positive integer");
     }
-    return { attempt_id: attemptId, attempt_sequence: attemptSequence };
+    const attemptNonce = ledgerAttemptNonce(entry);
+    if (hasAttemptNonce && attemptNonce === null) {
+      throw new Error("repair-loop sweep attempt_nonce must be a positive integer");
+    }
+    return {
+      attempt_id: attemptId,
+      attempt_sequence: attemptSequence,
+      ...(attemptNonce !== null ? { attempt_nonce: attemptNonce } : {}),
+    };
   }
   if (hasAttemptId || hasForcedReplayAttempts) {
     throw new Error("forced replay dispatch identity requires forced_replay=true");
   }
-  if (hasAttemptSequence) {
+  if (hasAttemptSequence || hasAttemptNonce) {
     throw new Error("durable dispatch attempt identity is not valid for this command");
   }
   return {};
@@ -1111,6 +1149,9 @@ export function mergeCommentRouterLedgers(...values: JsonValue[]) {
   const attemptSequences = mergedRepairLoopAttemptSequences(
     ...ledgers.flatMap((ledger) => [ledger.attempt_sequences, ledger.commands]),
   );
+  const attemptHighWater = mergedRepairLoopAttemptHighWater(
+    ...ledgers.flatMap((ledger) => [ledger.attempt_high_water, ledger.commands]),
+  );
   const updatedAt = ledgers
     .map((ledger) => String(ledger.updated_at ?? ""))
     .filter((value) => Number.isFinite(Date.parse(value)))
@@ -1118,6 +1159,7 @@ export function mergeCommentRouterLedgers(...values: JsonValue[]) {
     .at(-1);
   return {
     updated_at: updatedAt || null,
+    ...(attemptHighWater > 0 ? { attempt_high_water: attemptHighWater } : {}),
     attempt_sequences: attemptSequences,
     commands,
   };
@@ -1182,6 +1224,11 @@ function ledgerAttemptSequence(entry: LooseRecord): number | null {
   return Number.isSafeInteger(sequence) && sequence > 0 ? sequence : null;
 }
 
+function ledgerAttemptNonce(entry: LooseRecord): number | null {
+  const nonce = Number(entry.attempt_nonce);
+  return Number.isSafeInteger(nonce) && nonce > 0 ? nonce : null;
+}
+
 function normalizedRepairLoopAttemptSequences(value: JsonValue): Record<string, number> {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {};
   return Object.fromEntries(
@@ -1196,12 +1243,18 @@ function normalizedRepairLoopAttemptSequences(value: JsonValue): Record<string, 
         );
       })
       .map(([key, sequence]) => [key, Number(sequence)] as [string, number])
+      .sort(
+        ([leftKey, leftSequence], [rightKey, rightSequence]) =>
+          rightSequence - leftSequence || leftKey.localeCompare(rightKey),
+      )
+      .slice(0, COMMENT_ROUTER_ATTEMPT_SEQUENCE_LIMIT)
       .sort(([left], [right]) => left.localeCompare(right)),
   );
 }
 
 function mergedRepairLoopAttemptSequences(...values: JsonValue[]): Record<string, number> {
   const merged = new Map<string, number>();
+  const activeKeys = new Set<string>();
   const retain = (key: string, sequence: number) => {
     if (
       !key.startsWith("repair-loop-label-sweep:") ||
@@ -1218,7 +1271,9 @@ function mergedRepairLoopAttemptSequences(...values: JsonValue[]): Record<string
       for (const entry of value) {
         if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
         if (entry.automation_source !== "repair_loop_label_sweep") continue;
-        retain(String(entry.idempotency_key ?? ""), Number(entry.attempt_sequence));
+        const key = String(entry.idempotency_key ?? "");
+        retain(key, Number(entry.attempt_sequence));
+        if (ACTIVE_COMMENT_ROUTER_STATUSES.has(String(entry.status ?? ""))) activeKeys.add(key);
       }
       continue;
     }
@@ -1226,7 +1281,43 @@ function mergedRepairLoopAttemptSequences(...values: JsonValue[]): Record<string
       retain(key, sequence);
     }
   }
-  return Object.fromEntries([...merged].sort(([left], [right]) => left.localeCompare(right)));
+  if (activeKeys.size > COMMENT_ROUTER_ATTEMPT_SEQUENCE_LIMIT) {
+    throw new Error(
+      `comment router ledger has ${activeKeys.size} active attempt sequences; maximum is ${COMMENT_ROUTER_ATTEMPT_SEQUENCE_LIMIT}`,
+    );
+  }
+  const retained = [...merged]
+    .sort(([leftKey, leftSequence], [rightKey, rightSequence]) => {
+      const activeDifference = Number(activeKeys.has(rightKey)) - Number(activeKeys.has(leftKey));
+      return activeDifference || rightSequence - leftSequence || leftKey.localeCompare(rightKey);
+    })
+    .slice(0, COMMENT_ROUTER_ATTEMPT_SEQUENCE_LIMIT)
+    .sort(([left], [right]) => left.localeCompare(right));
+  return Object.fromEntries(retained);
+}
+
+function normalizedRepairLoopAttemptHighWater(value: JsonValue): number {
+  const highWater = Number(value);
+  return Number.isSafeInteger(highWater) && highWater > 0 ? highWater : 0;
+}
+
+function mergedRepairLoopAttemptHighWater(...values: JsonValue[]): number {
+  let highWater = 0;
+  for (const value of values) {
+    if (Array.isArray(value)) {
+      for (const entry of value) {
+        if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+        if (entry.automation_source !== "repair_loop_label_sweep") continue;
+        highWater = Math.max(
+          highWater,
+          ledgerAttemptNonce(entry) ?? ledgerAttemptSequence(entry) ?? 0,
+        );
+      }
+      continue;
+    }
+    highWater = Math.max(highWater, normalizedRepairLoopAttemptHighWater(value));
+  }
+  return highWater;
 }
 
 function preferredLedgerEntry(left: LooseRecord, right: LooseRecord): LooseRecord {
@@ -1235,11 +1326,10 @@ function preferredLedgerEntry(left: LooseRecord, right: LooseRecord): LooseRecor
   if (leftTerminal !== rightTerminal) return leftTerminal ? left : right;
   const leftRank = ledgerStatusRank(left.status);
   const rightRank = ledgerStatusRank(right.status);
-  if (!leftTerminal && leftRank !== rightRank) return leftRank > rightRank ? left : right;
+  if (leftRank !== rightRank) return leftRank > rightRank ? left : right;
   const leftTime = ledgerEntryTime(left);
   const rightTime = ledgerEntryTime(right);
   if (leftTime !== rightTime) return leftTime > rightTime ? left : right;
-  if (leftRank !== rightRank) return leftRank > rightRank ? left : right;
   return canonicalJson(left).localeCompare(canonicalJson(right)) >= 0 ? left : right;
 }
 
@@ -1281,6 +1371,7 @@ function boundedCommentRouterLedgerEntries(
 function ledgerStatusRank(value: JsonValue): number {
   switch (String(value ?? "")) {
     case "executed":
+      return 4;
     case "skipped":
       return 3;
     case "claimed":

@@ -342,6 +342,21 @@ test("all repair merge owners repeat the shared strict base guard immediately be
       (match) => match.index,
     );
     const merge = owner.indexOf(mergeCall);
+    if (file === "src/repair/comment-router.ts") {
+      assert.equal(guards.length, 1, `${file} must check strict base binding before preparation`);
+      const helperStart = source.indexOf("function finalAutomergeMutationBlock");
+      const helperEnd = source.indexOf("\nfunction ", helperStart + 1);
+      const helper = source.slice(helperStart, helperEnd);
+      assert.match(helper, /runtimeStrictBaseBindingBlock\(\{/);
+      assert.match(helper, /policyReadJson: rulesetPolicyReader\(\)/);
+      const finalGuard = owner.indexOf(
+        "const finalMergeBlock = finalAutomergeMutationBlock(command)",
+      );
+      assert.ok(finalGuard > guards[0]!, `${file} does not repeat the strict guard`);
+      assert.ok(merge > finalGuard, `${file} does not guard the final merge call`);
+      assert.doesNotMatch(owner.slice(finalGuard, merge), /gh(?:Json|Text|Spawn|WithRetry)\(/);
+      continue;
+    }
     assert.equal(guards.length, 2, `${file} must check strict base binding twice`);
     assert.ok(merge > guards[1]!, `${file} does not guard the final merge call`);
     const finalGuard = owner.slice(guards[1]!, merge);

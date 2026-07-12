@@ -511,6 +511,11 @@ if (execute && !exactCommentVersionFastPath.suppress) {
       }
       convergePrecreatedCommandAckComments(command);
       acknowledgeSkippedMaintainerCommand(command);
+      if (!revalidateCommandImmediatelyBeforeMutation(command)) {
+        recordCommandOutcome(command);
+        clearTerminalMaintainerCommandReaction(command);
+        continue;
+      }
       if (command.status !== "ready") recordCommandOutcome(command);
       if (actionable.includes(command)) executeCommandWithReceipt(command);
     }
@@ -640,6 +645,7 @@ function bindRecoveredForcedReplayAttempts(command: LooseRecord): LooseRecord {
       forced_replay: false,
       ...(selectedAttemptId ? { attempt_id: selectedAttemptId } : {}),
       ...(selected.attempt_sequence ? { attempt_sequence: selected.attempt_sequence } : {}),
+      ...(selected.attempt_nonce ? { attempt_nonce: selected.attempt_nonce } : {}),
     };
   }
   return {
@@ -3450,7 +3456,7 @@ function dispatchClawSweeperReview(command: LooseRecord): LooseRecord {
       ...commandStatus,
     },
   });
-  const repositoryDispatchBlock = blockScheduledRepairLoopDispatch(command);
+  const repositoryDispatchBlock = blockCommandImmediatelyBeforeSideEffect(command);
   if (repositoryDispatchBlock) return repositoryDispatchBlock;
   const result = runGitHubSpawnMutation(
     command,
@@ -3468,7 +3474,7 @@ function dispatchClawSweeperReview(command: LooseRecord): LooseRecord {
     },
   );
   if (result.status !== 0) {
-    const workflowDispatchBlock = blockScheduledRepairLoopDispatch(command);
+    const workflowDispatchBlock = blockCommandImmediatelyBeforeSideEffect(command);
     if (workflowDispatchBlock) return workflowDispatchBlock;
     const fallback = runGitHubSpawnMutation(
       command,
@@ -3545,6 +3551,8 @@ function dispatchClawSweeperAssist(command: LooseRecord): LooseRecord {
     client_payload: { ...baseDispatchPayload.client_payload, dispatch_key: dispatchKey },
   };
   const payload = JSON.stringify(dispatchPayload);
+  const dispatchBlock = blockCommandImmediatelyBeforeSideEffect(command);
+  if (dispatchBlock) return dispatchBlock;
   const result = runGitHubSpawnMutation(
     command,
     "assist_dispatch",
@@ -3650,7 +3658,7 @@ function dispatchRepair(command: LooseRecord) {
       run_status: activeRun.status,
     };
   }
-  const dispatchBlock = blockScheduledRepairLoopDispatch(command);
+  const dispatchBlock = blockCommandImmediatelyBeforeSideEffect(command);
   if (dispatchBlock) return dispatchBlock;
   const result = runGitHubSpawnMutation(
     command,
@@ -3700,24 +3708,94 @@ function dispatchRepair(command: LooseRecord) {
   };
 }
 
-function blockScheduledRepairLoopDispatch(command: LooseRecord): LooseRecord | null {
-  const block = repairLoopReviewDispatchBlockReason(command);
-  if (!block) return null;
-  applyReviewLeaseGuardBlock(command, block);
+function blockCommandImmediatelyBeforeSideEffect(command: LooseRecord): LooseRecord | null {
+  const block =
+    repairLoopReviewDispatchBlockReason(command) ??
+    trustedAutomationReviewLeaseBlockReason(command);
+  if (block) {
+    applyReviewLeaseGuardBlock(command, block);
+    return {
+      status: "guard_blocked",
+      reason: block.reason,
+      retryable: block.retryable,
+    };
+  }
+  if (revalidateCommandImmediatelyBeforeMutation(command)) return null;
   return {
     status: "guard_blocked",
-    reason: block.reason,
-    retryable: block.retryable,
+    reason: String(command.reason ?? "command was withdrawn before execution"),
+    retryable: String(command.status ?? "") === "waiting",
   };
 }
 
-function scheduledAutomergeMutationBlock(command: LooseRecord): LooseRecord | null {
-  const block = repairLoopReviewDispatchBlockReason(command);
-  if (!block) return null;
+function finalAutomergeMutationBlock(command: LooseRecord): LooseRecord | null {
+  const scheduledBlock = repairLoopReviewDispatchBlockReason(command);
+  if (scheduledBlock) {
+    return automergeGuardBlockResult(scheduledBlock.reason, scheduledBlock.retryable);
+  }
+  const trustedReviewBlock = trustedAutomationReviewLeaseBlockReason(command);
+  if (trustedReviewBlock) {
+    return automergeGuardBlockResult(trustedReviewBlock.reason, trustedReviewBlock.retryable);
+  }
+
+  let view: LooseRecord;
+  try {
+    view = fetchPullRequestView(command.issue_number);
+  } catch (error) {
+    return automergeGuardBlockResult(
+      `final automerge readiness lookup failed; next router pass will retry: ${compactGhError(error)}`,
+      true,
+    );
+  }
+  const target = latestAutomergeTarget(command, view);
+  const readinessBlock = validateAutomergeReadiness({ command, view, target });
+  if (readinessBlock) return automergeReadinessBlockResult(readinessBlock);
+
+  const strictBaseBindingBlock = runtimeStrictBaseBindingBlock({
+    repo: command.repo,
+    baseBranch: String(view.baseRefName ?? target.base_ref ?? targetBranch ?? "main"),
+    policyReadJson: rulesetPolicyReader(),
+  });
+  if (strictBaseBindingBlock) return automergeGuardBlockResult(strictBaseBindingBlock, false);
+
+  if (!revalidateCommandImmediatelyBeforeMutation(command)) {
+    return automergeGuardBlockResult(
+      String(command.reason ?? "command was withdrawn before automerge mutation"),
+      String(command.status ?? "") === "waiting",
+    );
+  }
+  return null;
+}
+
+function automergeReadinessBlockResult(reason: string): LooseRecord {
+  if (isTransientAutomergeBlock(reason)) return automergeGuardBlockResult(reason, true);
+  if (isAutomergeCheckBlock(reason)) {
+    return {
+      action: "merge",
+      status: "repair_needed",
+      reason,
+      repair_reason: `failed required checks before automerge: ${reason.replace(/^checks are not green:\s*/i, "")}`,
+      merge_method: "squash",
+    };
+  }
+  const repairReason = automergeReadinessRepairReason(reason);
+  if (repairReason) {
+    return {
+      action: "merge",
+      status: "repair_needed",
+      reason,
+      repair_reason: repairReason,
+      merge_method: "squash",
+    };
+  }
+  return automergeGuardBlockResult(reason, false);
+}
+
+function automergeGuardBlockResult(reason: string, retryable: boolean): LooseRecord {
   return {
     action: "merge",
-    status: block.retryable ? "waiting" : "blocked",
-    reason: block.reason,
+    status: retryable ? "waiting" : "blocked",
+    reason,
     merge_method: "squash",
   };
 }
@@ -4111,13 +4189,13 @@ function executeAutomerge(command: LooseRecord) {
   }
   const gateBlock = automergeGateBlockReason(process.env);
   if (gateBlock) {
-    const humanReviewLabelBlock = scheduledAutomergeMutationBlock(command);
+    const humanReviewLabelBlock = finalAutomergeMutationBlock(command);
     if (humanReviewLabelBlock) return humanReviewLabelBlock;
     ensureHumanReviewLabel(command);
-    const mergeReadyLabelBlock = scheduledAutomergeMutationBlock(command);
+    const mergeReadyLabelBlock = finalAutomergeMutationBlock(command);
     if (mergeReadyLabelBlock) return mergeReadyLabelBlock;
     ensureMergeReadyLabel(command);
-    const issueLabelBlock = scheduledAutomergeMutationBlock(command);
+    const issueLabelBlock = finalAutomergeMutationBlock(command);
     if (issueLabelBlock) return issueLabelBlock;
     runGitHubBestEffortMutation(
       command,
@@ -4174,25 +4252,8 @@ function executeAutomerge(command: LooseRecord) {
       merge_method: "squash",
     };
   }
-  const finalView = fetchPullRequestView(command.issue_number);
-  const finalTarget = latestAutomergeTarget(command, finalView);
-  const finalStrictBaseBindingBlock = runtimeStrictBaseBindingBlock({
-    repo: command.repo,
-    baseBranch: String(finalView.baseRefName ?? finalTarget.base_ref ?? targetBranch ?? "main"),
-    policyReadJson: rulesetPolicyReader(),
-  });
-  if (finalStrictBaseBindingBlock) {
-    return {
-      action: "merge",
-      status: "blocked",
-      reason: finalStrictBaseBindingBlock,
-      merge_method: "squash",
-    };
-  }
-  const scheduledMergeBlock = scheduledAutomergeMutationBlock(command);
-  if (scheduledMergeBlock) {
-    return scheduledMergeBlock;
-  }
+  const finalMergeBlock = finalAutomergeMutationBlock(command);
+  if (finalMergeBlock) return finalMergeBlock;
   const result = runGitHubSpawnMutation(
     command,
     "pull_request_merge",
@@ -4222,10 +4283,10 @@ function executeAutomerge(command: LooseRecord) {
         merge_method: "squash",
       };
     }
-    const mergeReadyLabelBlock = scheduledAutomergeMutationBlock(command);
+    const mergeReadyLabelBlock = finalAutomergeMutationBlock(command);
     if (mergeReadyLabelBlock) return mergeReadyLabelBlock;
     ensureMergeReadyLabel(command);
-    const issueLabelBlock = scheduledAutomergeMutationBlock(command);
+    const issueLabelBlock = finalAutomergeMutationBlock(command);
     if (issueLabelBlock) return issueLabelBlock;
     runGitHubBestEffortMutation(
       command,
@@ -4903,6 +4964,7 @@ function repairLoopSweepCommand(intent: "autofix" | "automerge", number: number)
         commands: ledger.commands ?? [],
         idempotencyKey,
         attemptSequences: ledger.attempt_sequences,
+        attemptHighWater: ledger.attempt_high_water,
       });
   return bindRecoveredForcedReplayAttempts({
     idempotency_key: idempotencyKey,
@@ -4927,6 +4989,7 @@ function repairLoopSweepCommand(intent: "autofix" | "automerge", number: number)
       : {
           ...(attempt?.attemptId ? { attempt_id: attempt.attemptId } : {}),
           ...(attempt?.attemptSequence ? { attempt_sequence: attempt.attemptSequence } : {}),
+          ...(attempt?.attemptNonce ? { attempt_nonce: attempt.attemptNonce } : {}),
         }),
     status: "pending",
     actions: [],

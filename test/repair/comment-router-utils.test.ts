@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 
 import {
+  COMMENT_ROUTER_ATTEMPT_SEQUENCE_LIMIT,
   DELETED_DURABLE_COMMENT_VERSION_REASON,
   EDITED_DURABLE_COMMENT_VERSION_REASON,
   SUPERSEDED_RE_REVIEW_REASON,
@@ -44,7 +45,7 @@ import {
 } from "../../dist/repair/comment-router-utils.js";
 import { forcedReplayCommandFields, readCommentRouterConfig } from "../../dist/repair/config.js";
 
-const COMMENT_ROUTER_LEDGER_ENTRY_LIMIT = 1000;
+const COMMENT_ROUTER_LEDGER_ENTRY_LIMIT = COMMENT_ROUTER_ATTEMPT_SEQUENCE_LIMIT;
 
 function routerLedgerEntry(index: number, status: "waiting" | "claimed" | "executed") {
   const commentId = String(index + 1);
@@ -448,6 +449,7 @@ test("repair-loop sweeps reuse one active attempt and advance only after termina
     automation_source: "repair_loop_label_sweep",
     attempt_id: first.attemptId,
     attempt_sequence: first.attemptSequence,
+    attempt_nonce: first.attemptNonce,
     status: "waiting",
     processed_at: "2026-07-12T20:00:00Z",
   };
@@ -476,6 +478,7 @@ test("repair-loop sweeps reuse one active attempt and advance only after termina
           ...activeFirst,
           attempt_id: second.attemptId,
           attempt_sequence: second.attemptSequence,
+          attempt_nonce: second.attemptNonce,
           status: "claimed",
           processed_at: "2026-07-12T21:00:00Z",
         },
@@ -497,6 +500,7 @@ test("repair-loop attempt identity survives bounded terminal history eviction", 
       automation_source: "repair_loop_label_sweep",
       attempt_id: first.attemptId,
       attempt_sequence: first.attemptSequence,
+      attempt_nonce: first.attemptNonce,
       repo: "openclaw/openclaw",
       issue_number: 74499,
       status: "executed",
@@ -512,10 +516,12 @@ test("repair-loop attempt identity survives bounded terminal history eviction", 
     false,
   );
   assert.equal(ledger.attempt_sequences[idempotencyKey], 1);
+  assert.equal(ledger.attempt_high_water, 1);
   const second = repairLoopSweepAttemptIdentity({
     commands: ledger.commands,
     idempotencyKey,
     attemptSequences: ledger.attempt_sequences,
+    attemptHighWater: ledger.attempt_high_water,
   });
   assert.equal(second.attemptSequence, 2);
   assert.notEqual(second.attemptId, first.attemptId);
@@ -527,6 +533,7 @@ test("repair-loop attempt identity survives bounded terminal history eviction", 
       automation_source: "repair_loop_label_sweep",
       attempt_id: second.attemptId,
       attempt_sequence: second.attemptSequence,
+      attempt_nonce: second.attemptNonce,
       repo: "openclaw/openclaw",
       issue_number: 74499,
       status: "waiting",
@@ -534,6 +541,57 @@ test("repair-loop attempt identity survives bounded terminal history eviction", 
     },
   ]);
   assert.equal(ledger.attempt_sequences[idempotencyKey], 2);
+  assert.equal(ledger.attempt_high_water, 2);
+});
+
+test("repair-loop attempt sequence state is bounded without reusing evicted identities", () => {
+  const idempotencyKey = "repair-loop-label-sweep:openclaw/openclaw:automerge:zzzz";
+  const first = repairLoopSweepAttemptIdentity({ commands: [], idempotencyKey });
+  const ledger = { updated_at: null, attempt_sequences: {}, commands: [] };
+  const entries = [
+    {
+      idempotency_key: idempotencyKey,
+      comment_id: "repair-loop-label-sweep:automerge:zzzz",
+      automation_source: "repair_loop_label_sweep",
+      attempt_id: first.attemptId,
+      attempt_sequence: first.attemptSequence,
+      attempt_nonce: first.attemptNonce,
+      repo: "openclaw/openclaw",
+      issue_number: 1,
+      status: "executed",
+      processed_at: "2026-07-12T19:00:00Z",
+    },
+    ...Array.from({ length: COMMENT_ROUTER_ATTEMPT_SEQUENCE_LIMIT }, (_, index) => ({
+      idempotency_key: `repair-loop-label-sweep:openclaw/openclaw:automerge:${String(index).padStart(4, "0")}`,
+      comment_id: `repair-loop-label-sweep:automerge:${index}`,
+      automation_source: "repair_loop_label_sweep",
+      attempt_id: `attempt-${index}`,
+      attempt_sequence: 1,
+      attempt_nonce: index + 2,
+      repo: "openclaw/openclaw",
+      issue_number: index + 2,
+      status: "executed",
+      processed_at: `2026-07-12T20:${String(Math.floor(index / 60) % 60).padStart(2, "0")}:${String(index % 60).padStart(2, "0")}Z`,
+    })),
+  ];
+
+  assert.equal(appendLedger(ledger, entries), true);
+  assert.equal(Object.keys(ledger.attempt_sequences).length, COMMENT_ROUTER_ATTEMPT_SEQUENCE_LIMIT);
+  assert.equal(ledger.attempt_sequences[idempotencyKey], undefined);
+  assert.equal(
+    ledger.commands.some((entry) => entry.idempotency_key === idempotencyKey),
+    false,
+  );
+
+  const next = repairLoopSweepAttemptIdentity({
+    commands: ledger.commands,
+    idempotencyKey,
+    attemptSequences: ledger.attempt_sequences,
+    attemptHighWater: ledger.attempt_high_water,
+  });
+  assert.equal(next.attemptSequence, 1);
+  assert.equal(next.attemptNonce, COMMENT_ROUTER_ATTEMPT_SEQUENCE_LIMIT + 2);
+  assert.notEqual(next.attemptId, first.attemptId);
 });
 
 test("forced replay receipt material changes across durable attempt identities", () => {
@@ -1113,6 +1171,43 @@ test("same-attempt ledger merge cannot downgrade claimed work to a newer waiting
     },
   );
   assert.equal(terminal.commands[0]?.status, "executed");
+});
+
+test("same-attempt ledger merge preserves executed over newer skipped snapshots", () => {
+  const executed = {
+    idempotency_key: "repair-loop-label-sweep:openclaw/openclaw:automerge:101",
+    comment_id: "repair-loop-label-sweep:automerge:101",
+    comment_version_key: null,
+    automation_source: "repair_loop_label_sweep",
+    issue_number: 101,
+    attempt_id: "automerge-attempt-1",
+    attempt_sequence: 1,
+    status: "executed",
+    processed_at: "2026-07-12T20:00:00Z",
+    actions: [{ action: "merge", status: "executed" }],
+  };
+  const newerSkipped = {
+    ...executed,
+    status: "skipped",
+    processed_at: "2026-07-12T20:05:00Z",
+    actions: [{ action: "merge", status: "skipped" }],
+  };
+
+  for (const ledgers of [
+    [
+      { updated_at: executed.processed_at, commands: [executed] },
+      { updated_at: newerSkipped.processed_at, commands: [newerSkipped] },
+    ],
+    [
+      { updated_at: newerSkipped.processed_at, commands: [newerSkipped] },
+      { updated_at: executed.processed_at, commands: [executed] },
+    ],
+  ]) {
+    const merged = mergeCommentRouterLedgers(...ledgers);
+    assert.equal(merged.commands[0]?.status, "executed");
+    assert.equal(merged.commands[0]?.processed_at, executed.processed_at);
+    assert.equal(merged.commands[0]?.actions[0]?.status, "executed");
+  }
 });
 
 test("ledger append trims terminal history before active commands", () => {

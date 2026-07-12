@@ -1736,6 +1736,87 @@ Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 400);
   assert.equal(fs.readFileSync(invocationPath, "utf8"), "2");
 });
 
+test("pnpm lockfile restoration uses the remaining absolute toolchain deadline", () => {
+  const cwd = gitPackageFixture({ check: "node check.js" });
+  fs.writeFileSync(path.join(cwd, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\n");
+  git(cwd, "add", ".");
+  git(cwd, "commit", "-m", "initial");
+  const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-lock-restore-deadline-"));
+  const corepackPath = path.join(binDir, "corepack.js");
+  const pnpmPath = path.join(binDir, "pnpm.js");
+  const gitPath = path.join(binDir, "git.js");
+  const invocationPath = path.join(binDir, "pnpm-count");
+  const actualGit = execFileSync("which", ["git"], { encoding: "utf8" }).trim();
+  fs.writeFileSync(corepackPath, "");
+  fs.writeFileSync(
+    pnpmPath,
+    `const fs = require("node:fs");
+const count = fs.existsSync(${JSON.stringify(invocationPath)})
+  ? Number(fs.readFileSync(${JSON.stringify(invocationPath)}, "utf8"))
+  : 0;
+fs.writeFileSync(${JSON.stringify(invocationPath)}, String(count + 1));
+if (count === 0) {
+  console.error("ERR_PNPM_OUTDATED_LOCKFILE");
+  process.exit(1);
+}
+fs.writeFileSync("pnpm-lock.yaml", "lockfileVersion: '9.1'\\n");
+Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 900);
+`,
+  );
+  fs.writeFileSync(
+    gitPath,
+    `const { spawnSync } = require("node:child_process");
+const args = process.argv.slice(2);
+if (args[0] === "checkout" && args[1] === "--" && args[2] === "pnpm-lock.yaml") {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2_000);
+  process.exit(0);
+}
+const result = spawnSync(${JSON.stringify(actualGit)}, args, { encoding: "utf8" });
+if (result.stdout) process.stdout.write(result.stdout);
+if (result.stderr) process.stderr.write(result.stderr);
+process.exit(result.status ?? 1);
+`,
+  );
+  const previousCorepackBin = process.env.COREPACK_BIN;
+  const previousCorepackBinArgs = process.env.COREPACK_BIN_ARGS;
+  const previousPnpmBin = process.env.PNPM_BIN;
+  const previousPnpmBinArgs = process.env.PNPM_BIN_ARGS;
+  const previousGitBin = process.env.GIT_BIN;
+  const previousGitBinArgs = process.env.GIT_BIN_ARGS;
+  Object.assign(process.env, mockCommandBinEnv("corepack", corepackPath));
+  Object.assign(process.env, mockCommandBinEnv("pnpm", pnpmPath));
+  Object.assign(process.env, mockCommandBinEnv("git", gitPath));
+  const startedAt = Date.now();
+  try {
+    assert.throws(
+      () =>
+        prepareTargetToolchain(cwd, {
+          ...validationOptions("steipete/example", {
+            toolchain: {
+              packageManager: "pnpm",
+              baseValidationCommands: ["pnpm check"],
+              changedGate: null,
+            },
+          }),
+          installTargetDeps: true,
+          installTimeoutMs: 5_000,
+          proofBudgetMs: 1_500,
+          setupTimeoutMs: 5_000,
+        }),
+      /command timed out after \d+ms: git checkout -- pnpm-lock\.yaml/,
+    );
+  } finally {
+    restoreEnv("COREPACK_BIN", previousCorepackBin);
+    restoreEnv("COREPACK_BIN_ARGS", previousCorepackBinArgs);
+    restoreEnv("PNPM_BIN", previousPnpmBin);
+    restoreEnv("PNPM_BIN_ARGS", previousPnpmBinArgs);
+    restoreEnv("GIT_BIN", previousGitBin);
+    restoreEnv("GIT_BIN_ARGS", previousGitBinArgs);
+  }
+  assert.ok(Date.now() - startedAt < 2_500);
+  assert.equal(fs.readFileSync(invocationPath, "utf8"), "2");
+});
+
 test("pnpm fallback must pass a frozen reinstall after restoring the committed lockfile", () => {
   const cwd = gitPackageFixture({ check: "node check.js" });
   git(cwd, "add", ".");

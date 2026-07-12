@@ -2174,7 +2174,7 @@ test("scheduled repair loops preserve live opt-in through mutation and dispatch 
   );
   const reviewClaim = reviewDispatch.indexOf("claimedDispatchState({");
   const repositoryGuard = reviewDispatch.indexOf(
-    "blockScheduledRepairLoopDispatch(command)",
+    "blockCommandImmediatelyBeforeSideEffect(command)",
     reviewClaim,
   );
   const repositoryDispatch = reviewDispatch.indexOf(
@@ -2182,7 +2182,7 @@ test("scheduled repair loops preserve live opt-in through mutation and dispatch 
     repositoryGuard,
   );
   const fallbackGuard = reviewDispatch.indexOf(
-    "blockScheduledRepairLoopDispatch(command)",
+    "blockCommandImmediatelyBeforeSideEffect(command)",
     repositoryGuard + 1,
   );
   const fallbackDispatch = reviewDispatch.indexOf(
@@ -2201,7 +2201,7 @@ test("scheduled repair loops preserve live opt-in through mutation and dispatch 
   );
   const activeRunLookup = repairDispatch.indexOf("activeRepairRunForCommand(command)");
   const repairGuard = repairDispatch.indexOf(
-    "blockScheduledRepairLoopDispatch(command)",
+    "blockCommandImmediatelyBeforeSideEffect(command)",
     activeRunLookup,
   );
   const workflowDispatch = repairDispatch.indexOf(
@@ -2216,29 +2216,26 @@ test("scheduled repair loops preserve live opt-in through mutation and dispatch 
     source.indexOf("function executeAutomerge"),
     source.indexOf("function latestAutomergeTarget"),
   );
-  const finalView = automerge.indexOf("const finalView = fetchPullRequestView");
   const finalGuard = automerge.indexOf(
-    "const scheduledMergeBlock = scheduledAutomergeMutationBlock(command)",
-    finalView,
+    "const finalMergeBlock = finalAutomergeMutationBlock(command)",
   );
   const merge = automerge.indexOf("const result = runGitHubSpawnMutation", finalGuard);
-  assert.ok(finalView >= 0);
-  assert.ok(finalGuard > finalView);
+  assert.ok(finalGuard >= 0);
   assert.ok(merge > finalGuard);
 
   const gateBlock = automerge.indexOf("const gateBlock = automergeGateBlockReason");
   const humanLabelGuard = automerge.indexOf(
-    "const humanReviewLabelBlock = scheduledAutomergeMutationBlock(command)",
+    "const humanReviewLabelBlock = finalAutomergeMutationBlock(command)",
     gateBlock,
   );
   const humanLabelMutation = automerge.indexOf("ensureHumanReviewLabel(command)", humanLabelGuard);
   const mergeReadyGuard = automerge.indexOf(
-    "const mergeReadyLabelBlock = scheduledAutomergeMutationBlock(command)",
+    "const mergeReadyLabelBlock = finalAutomergeMutationBlock(command)",
     humanLabelMutation,
   );
   const mergeReadyMutation = automerge.indexOf("ensureMergeReadyLabel(command)", mergeReadyGuard);
   const issueLabelGuard = automerge.indexOf(
-    "const issueLabelBlock = scheduledAutomergeMutationBlock(command)",
+    "const issueLabelBlock = finalAutomergeMutationBlock(command)",
     mergeReadyMutation,
   );
   const issueLabelMutation = automerge.indexOf("runGitHubBestEffortMutation(", issueLabelGuard);
@@ -2252,7 +2249,7 @@ test("scheduled repair loops preserve live opt-in through mutation and dispatch 
 
   const mergeFailure = automerge.indexOf("if (result.status !== 0)", merge);
   const failureLabelGuard = automerge.indexOf(
-    "const mergeReadyLabelBlock = scheduledAutomergeMutationBlock(command)",
+    "const mergeReadyLabelBlock = finalAutomergeMutationBlock(command)",
     mergeFailure,
   );
   const failureLabelMutation = automerge.indexOf(
@@ -2260,7 +2257,7 @@ test("scheduled repair loops preserve live opt-in through mutation and dispatch 
     failureLabelGuard,
   );
   const failureIssueLabelGuard = automerge.indexOf(
-    "const issueLabelBlock = scheduledAutomergeMutationBlock(command)",
+    "const issueLabelBlock = finalAutomergeMutationBlock(command)",
     failureLabelMutation,
   );
   const failureIssueLabelMutation = automerge.indexOf(
@@ -2272,6 +2269,17 @@ test("scheduled repair loops preserve live opt-in through mutation and dispatch 
   assert.ok(failureLabelMutation > failureLabelGuard);
   assert.ok(failureIssueLabelGuard > failureLabelMutation);
   assert.ok(failureIssueLabelMutation > failureIssueLabelGuard);
+
+  const finalMutationGuard = source.slice(
+    source.indexOf("function finalAutomergeMutationBlock"),
+    source.indexOf("function dispatchRepairActionStatus"),
+  );
+  assert.match(finalMutationGuard, /repairLoopReviewDispatchBlockReason\(command\)/);
+  assert.match(finalMutationGuard, /trustedAutomationReviewLeaseBlockReason\(command\)/);
+  assert.match(finalMutationGuard, /fetchPullRequestView\(command\.issue_number\)/);
+  assert.match(finalMutationGuard, /validateAutomergeReadiness\(\{ command, view, target \}\)/);
+  assert.match(finalMutationGuard, /runtimeStrictBaseBindingBlock\(\{/);
+  assert.match(finalMutationGuard, /revalidateCommandImmediatelyBeforeMutation\(command\)/);
 });
 
 test("execution revalidates exact live comment and authorization after capacity waiting", () => {
@@ -2281,16 +2289,23 @@ test("execution revalidates exact live comment and authorization after capacity 
     source.indexOf("report.ledger_changed"),
   );
   const capacityWait = executeBlock.indexOf("waitForLiveWorkerCapacity");
-  const revalidation = executeBlock.indexOf("revalidateCommandImmediatelyBeforeMutation(command)");
+  const initialRevalidation = executeBlock.indexOf(
+    "revalidateCommandImmediatelyBeforeMutation(command)",
+  );
   const claim = executeBlock.indexOf("claimDispatchCommands([command])");
   const acknowledgement = executeBlock.indexOf("convergePrecreatedCommandAckComments(command)");
+  const finalRevalidation = executeBlock.indexOf(
+    "revalidateCommandImmediatelyBeforeMutation(command)",
+    acknowledgement,
+  );
   const execute = executeBlock.indexOf("executeCommandWithReceipt(command)");
 
   assert.ok(capacityWait >= 0);
-  assert.ok(revalidation > capacityWait);
-  assert.ok(claim > revalidation);
-  assert.ok(acknowledgement > revalidation);
-  assert.ok(execute > acknowledgement);
+  assert.ok(initialRevalidation > capacityWait);
+  assert.ok(claim > initialRevalidation);
+  assert.ok(acknowledgement > initialRevalidation);
+  assert.ok(finalRevalidation > acknowledgement);
+  assert.ok(execute > finalRevalidation);
 
   const guard = source.slice(
     source.indexOf("function revalidateCommandImmediatelyBeforeMutation"),
@@ -2336,6 +2351,10 @@ test("comment router durably claims dispatch commands and recovers exact workflo
   );
   const claimIndex = executeBlock.indexOf("claimDispatchCommands([command])");
   const ackIndex = executeBlock.indexOf("convergePrecreatedCommandAckComments(command)");
+  const finalRevalidationIndex = executeBlock.indexOf(
+    "revalidateCommandImmediatelyBeforeMutation(command)",
+    ackIndex,
+  );
   const executeIndex = executeBlock.indexOf("executeCommandWithReceipt(command)");
   const claimFunction = source.slice(
     source.indexOf("function claimDispatchCommands"),
@@ -2346,12 +2365,21 @@ test("comment router durably claims dispatch commands and recovers exact workflo
   assert.ok(claimIndex >= 0);
   assert.ok(claimIndex > revalidationIndex);
   assert.ok(ackIndex > claimIndex);
-  assert.ok(executeIndex > claimIndex);
+  assert.ok(finalRevalidationIndex > ackIndex);
+  assert.ok(executeIndex > finalRevalidationIndex);
   assert.match(claimFunction, /status:\s*"claimed"/);
   assert.match(claimFunction, /commandHasAction\(command,\s*"dispatch_clawsweeper"\)/);
   assert.match(claimFunction, /commandHasAction\(command,\s*"dispatch_repair"\)/);
   assert.match(claimFunction, /commandHasAction\(command,\s*"dispatch_assist"\)/);
   assert.match(source, /function claimedDispatchState/);
+  const finalSideEffectGuard = source.slice(
+    source.indexOf("function blockCommandImmediatelyBeforeSideEffect"),
+    source.indexOf("function finalAutomergeMutationBlock"),
+  );
+  assert.match(
+    finalSideEffectGuard,
+    /repairLoopReviewDispatchBlockReason\(command\)[\s\S]*trustedAutomationReviewLeaseBlockReason\(command\)[\s\S]*revalidateCommandImmediatelyBeforeMutation\(command\)/,
+  );
   assert.match(source, /function refreshDispatchClaim/);
   assert.match(source, /writeLedger\(ledgerPath\(\), ledger\)/);
   assert.match(source, /function verifyDispatchExecutionRuns/);
