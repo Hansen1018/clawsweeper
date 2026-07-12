@@ -35,14 +35,19 @@ const repo = String(args.repo ?? currentProjectRepo());
 const model = String(args.model ?? process.env.CLAWSWEEPER_MODEL ?? "internal");
 const waitForCapacity = Boolean(args["wait-for-capacity"]);
 const ref = args.ref ? String(args.ref) : "";
+const dispatchKey = args["dispatch-key"] ? String(args["dispatch-key"]) : "";
 const files = args._;
 const activeRepairRunsByPrefix = new Map<string, LooseRecord[]>();
 const jobWorkerLanes = new Map<string, WorkerLane>();
 
 if (files.length === 0) {
   console.error(
-    `usage: node scripts/dispatch-jobs.ts <job.md> [...] [--mode plan|execute|autonomous] [--runner label] [--execution-runner label] [--model model] [--max-live-workers ${AUTOMATION_LIMITS.repair_live_runs.default}] [--wait-for-capacity]`,
+    `usage: node scripts/dispatch-jobs.ts <job.md> [...] [--mode plan|execute|autonomous] [--runner label] [--execution-runner label] [--model model] [--max-live-workers ${AUTOMATION_LIMITS.repair_live_runs.default}] [--wait-for-capacity] [--dispatch-key key]`,
   );
+  process.exit(2);
+}
+if (dispatchKey && files.length !== 1) {
+  console.error("--dispatch-key requires exactly one job");
   process.exit(2);
 }
 
@@ -133,6 +138,7 @@ function dispatchJob(relative: JsonValue, position: JsonValue, total: JsonValue)
       `execution_runner=${executionRunner}`,
       "-f",
       `model=${model}`,
+      ...(dispatchKey ? ["-f", `dispatch_key=${dispatchKey}`] : []),
     ],
     { cwd: repoRoot(), encoding: "utf8", stdio: "pipe" },
   );
@@ -147,6 +153,7 @@ function dispatchJob(relative: JsonValue, position: JsonValue, total: JsonValue)
 }
 
 function shouldDispatchJob(relative: JsonValue) {
+  if (dispatchKey) return true;
   const activeRun = activeRepairWorkflowRunForJob({
     repo,
     workflow,

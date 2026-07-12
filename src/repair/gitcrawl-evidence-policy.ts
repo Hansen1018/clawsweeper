@@ -1,4 +1,4 @@
-import { canonicalJson } from "./gitcrawl-evidence-contract.js";
+import { GITCRAWL_CANONICAL_JSON_MAX_DEPTH, canonicalJson } from "./gitcrawl-evidence-contract.js";
 
 export type GitcrawlThreadPolicySignals = {
   blankTemplate: boolean;
@@ -143,5 +143,26 @@ export function stripGitcrawlHtmlComments(value: string): string {
     if (commentEnd === -1) break;
     cursor = commentEnd + 3;
   }
-  return chunks.join("");
+  return chunks.join("").replaceAll("<!--", "\n").replaceAll("-->", "\n");
+}
+
+export function sanitizeGitcrawlPromptValue<T>(value: T, depth = 0): T {
+  if (depth > GITCRAWL_CANONICAL_JSON_MAX_DEPTH) {
+    throw new Error(
+      `Gitcrawl prompt data exceeds ${GITCRAWL_CANONICAL_JSON_MAX_DEPTH} levels of nesting`,
+    );
+  }
+  if (typeof value === "string") return stripGitcrawlHtmlComments(value) as T;
+  if (Array.isArray(value)) {
+    return value.map((entry) => sanitizeGitcrawlPromptValue(entry, depth + 1)) as T;
+  }
+  if (typeof value === "object" && value !== null) {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, entry]) => [
+        key,
+        sanitizeGitcrawlPromptValue(entry, depth + 1),
+      ]),
+    ) as T;
+  }
+  return value;
 }

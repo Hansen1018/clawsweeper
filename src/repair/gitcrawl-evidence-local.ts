@@ -7,6 +7,7 @@ import { DatabaseSync, type SQLOutputValue } from "node:sqlite";
 import {
   GITCRAWL_QUERY_COVERAGE,
   GITCRAWL_QUERY_CONTRACT_VERSION,
+  GITCRAWL_QUERY_NAMES,
   type GitcrawlCoverageRow,
   type GitcrawlQueryEnvelope,
   type GitcrawlQueryName,
@@ -961,6 +962,19 @@ export class LocalGitcrawlQuerySource implements GitcrawlQuerySource {
       columns,
       rows: rows.map((row) => columns.map((column) => row[column])),
       values: rows,
+      snapshot: {
+        id: this.snapshotId,
+        source_sha256: this.snapshotId.slice("local:".length),
+        schema_name: this.portable ? "gitcrawl-portable-sqlite" : "gitcrawl-legacy-sqlite",
+        schema_version: Number(this.db.prepare("pragma user_version").get()?.user_version ?? 0),
+        schema_hash: this.portable ? "gitcrawl-portable-sqlite" : "gitcrawl-legacy-sqlite",
+        capabilities: [...GITCRAWL_QUERY_NAMES],
+        source_sync_at: this.sourceSyncAt,
+        dataset_generated_at: this.datasetGeneratedAt,
+        coverage_complete: this.queryCoverageComplete(name),
+        published_at: this.datasetGeneratedAt,
+        cutover_at: this.datasetGeneratedAt,
+      },
       stats: {
         contract_version: GITCRAWL_QUERY_CONTRACT_VERSION,
         repository: this.repository,

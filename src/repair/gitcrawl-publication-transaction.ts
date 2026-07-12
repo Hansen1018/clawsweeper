@@ -8,10 +8,14 @@ import {
   readActionEventShard,
   type ActionEvent,
 } from "../action-ledger.js";
+import { assertSha256, sha256Canonical } from "./gitcrawl-evidence-contract.js";
 import { verifyEmbeddedGitcrawlEvidencePacket } from "./gitcrawl-evidence-graph.js";
 
-export const GITCRAWL_PUBLICATION_TRANSACTION_SCHEMA =
+const LEGACY_GITCRAWL_PUBLICATION_TRANSACTION_SCHEMA =
   "clawsweeper-gitcrawl-publication-transaction-v1";
+export const GITCRAWL_PUBLICATION_TRANSACTION_SCHEMA =
+  "clawsweeper-gitcrawl-publication-transaction-v2";
+export const GITCRAWL_DISPATCH_RECEIPT_SCHEMA = "clawsweeper-gitcrawl-dispatch-receipt-v1";
 
 export type GitcrawlPublicationTransaction = {
   schema: typeof GITCRAWL_PUBLICATION_TRANSACTION_SCHEMA;
@@ -21,11 +25,33 @@ export type GitcrawlPublicationTransaction = {
     path: string;
     packet_sha256: string;
     binding_event_id: string;
+    dispatch_key: string;
   }>;
   action_event_shards: string[];
   cursor_path?: string;
   intake_path?: string;
   publish_paths: string[];
+};
+
+export type PendingGitcrawlDispatch = {
+  transaction_path: string;
+  job_path: string;
+  packet_sha256: string;
+  binding_event_id: string;
+  dispatch_key: string;
+  receipt_path: string;
+};
+
+export type GitcrawlDispatchReceipt = {
+  schema: typeof GITCRAWL_DISPATCH_RECEIPT_SCHEMA;
+  transaction_path: string;
+  job_path: string;
+  packet_sha256: string;
+  binding_event_id: string;
+  dispatch_key: string;
+  dispatched_at: string;
+  run_id: string;
+  run_attempt: string;
 };
 
 export function prepareGitcrawlPublicationTransaction(input: {
@@ -94,6 +120,11 @@ export function prepareGitcrawlPublicationTransaction(input: {
       path: generatedPath,
       packet_sha256: packet.sha256,
       binding_event_id: binding.bindingEventId,
+      dispatch_key: gitcrawlDispatchKey({
+        path: generatedPath,
+        packetSha256: packet.sha256,
+        bindingEventId: binding.bindingEventId,
+      }),
     };
   });
 
@@ -123,6 +154,110 @@ export function prepareGitcrawlPublicationTransaction(input: {
   };
   writeJsonAtomic(root, manifestPath, transaction);
   return transaction;
+}
+
+export function listPendingGitcrawlDispatches(input: {
+  root: string;
+  transactionsDirectory: string;
+  receiptsDirectory: string;
+}): PendingGitcrawlDispatch[] {
+  const root = fs.realpathSync(input.root);
+  const transactionsDirectory = safeRelativePath(
+    input.transactionsDirectory,
+    "Gitcrawl transactions directory",
+  );
+  const receiptsDirectory = safeRelativePath(
+    input.receiptsDirectory,
+    "Gitcrawl dispatch receipts directory",
+  );
+  const absoluteTransactions = path.resolve(root, transactionsDirectory);
+  if (!insideRoot(root, absoluteTransactions)) {
+    throw new Error("Gitcrawl transactions directory escapes the publication root");
+  }
+  if (!fs.existsSync(absoluteTransactions)) return [];
+  if (!fs.lstatSync(absoluteTransactions).isDirectory()) {
+    throw new Error("Gitcrawl transactions path is not a directory");
+  }
+
+  const pending: PendingGitcrawlDispatch[] = [];
+  for (const entry of fs.readdirSync(absoluteTransactions, { withFileTypes: true })) {
+    if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+    const transactionPath = path.posix.join(transactionsDirectory, entry.name);
+    const transaction = readPublicationTransaction(root, transactionPath);
+    if (transaction === undefined) continue;
+    for (const job of transaction.generated_jobs) {
+      const receiptPath = gitcrawlDispatchReceiptPath(receiptsDirectory, job.dispatch_key);
+      const expected = {
+        transaction_path: transactionPath,
+        job_path: job.path,
+        packet_sha256: job.packet_sha256,
+        binding_event_id: job.binding_event_id,
+        dispatch_key: job.dispatch_key,
+      };
+      if (fs.existsSync(path.resolve(root, receiptPath))) {
+        assertDispatchReceipt(root, receiptPath, expected);
+        continue;
+      }
+      verifyTransactionJob(root, job);
+      pending.push({ ...expected, receipt_path: receiptPath });
+    }
+  }
+  return pending.sort((left, right) =>
+    `${left.transaction_path}:${left.job_path}`.localeCompare(
+      `${right.transaction_path}:${right.job_path}`,
+    ),
+  );
+}
+
+export function recordGitcrawlDispatchReceipt(input: {
+  root: string;
+  transactionPath: string;
+  jobPath: string;
+  dispatchKey: string;
+  receiptsDirectory: string;
+  runId?: string;
+  runAttempt?: string;
+  dispatchedAt?: string;
+}): { path: string; receipt: GitcrawlDispatchReceipt } {
+  const root = fs.realpathSync(input.root);
+  const transactionPath = safeRelativePath(input.transactionPath, "Gitcrawl transaction manifest");
+  const transaction = readPublicationTransaction(root, transactionPath);
+  if (transaction === undefined) {
+    throw new Error("legacy Gitcrawl publication transactions cannot accept dispatch receipts");
+  }
+  const jobPath = safeRelativePath(input.jobPath, "Gitcrawl dispatch job");
+  const job = transaction.generated_jobs.find((candidate) => candidate.path === jobPath);
+  if (!job || job.dispatch_key !== input.dispatchKey) {
+    throw new Error("Gitcrawl dispatch receipt does not match its transaction job");
+  }
+  verifyTransactionJob(root, job);
+  const receiptsDirectory = safeRelativePath(
+    input.receiptsDirectory,
+    "Gitcrawl dispatch receipts directory",
+  );
+  const receiptPath = gitcrawlDispatchReceiptPath(receiptsDirectory, job.dispatch_key);
+  const identity = {
+    transaction_path: transactionPath,
+    job_path: job.path,
+    packet_sha256: job.packet_sha256,
+    binding_event_id: job.binding_event_id,
+    dispatch_key: job.dispatch_key,
+  };
+  if (fs.existsSync(path.resolve(root, receiptPath))) {
+    return {
+      path: receiptPath,
+      receipt: assertDispatchReceipt(root, receiptPath, identity),
+    };
+  }
+  const receipt: GitcrawlDispatchReceipt = {
+    schema: GITCRAWL_DISPATCH_RECEIPT_SCHEMA,
+    ...identity,
+    dispatched_at: input.dispatchedAt ?? new Date().toISOString(),
+    run_id: input.runId ?? "",
+    run_attempt: input.runAttempt ?? "",
+  };
+  writeJsonAtomic(root, receiptPath, receipt, true);
+  return { path: receiptPath, receipt };
 }
 
 function bindingFromEvent(event: ActionEvent): {
@@ -167,6 +302,123 @@ function optionalExistingPath(
   return relativePath;
 }
 
+function readPublicationTransaction(
+  root: string,
+  transactionPath: string,
+): GitcrawlPublicationTransaction | undefined {
+  const absolutePath = existingRegularFile(root, transactionPath, "Gitcrawl transaction manifest");
+  let value: unknown;
+  try {
+    value = JSON.parse(fs.readFileSync(absolutePath, "utf8"));
+  } catch {
+    throw new Error(`Gitcrawl transaction manifest is malformed: ${transactionPath}`);
+  }
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error(`Gitcrawl transaction manifest is malformed: ${transactionPath}`);
+  }
+  const record = value as Record<string, unknown>;
+  if (record.schema === LEGACY_GITCRAWL_PUBLICATION_TRANSACTION_SCHEMA) return undefined;
+  if (record.schema !== GITCRAWL_PUBLICATION_TRANSACTION_SCHEMA) {
+    throw new Error(
+      `unsupported Gitcrawl publication transaction schema: ${String(record.schema)}`,
+    );
+  }
+  if (!Array.isArray(record.generated_jobs)) {
+    throw new Error(`Gitcrawl transaction manifest has no generated jobs: ${transactionPath}`);
+  }
+  for (const candidate of record.generated_jobs) {
+    if (typeof candidate !== "object" || candidate === null || Array.isArray(candidate)) {
+      throw new Error(`Gitcrawl transaction manifest has a malformed job: ${transactionPath}`);
+    }
+    const job = candidate as Record<string, unknown>;
+    safeRelativePath(String(job.path ?? ""), "Gitcrawl generated job");
+    assertSha256(String(job.packet_sha256 ?? ""), "Gitcrawl transaction packet sha256");
+    if (!String(job.binding_event_id ?? "").trim()) {
+      throw new Error(`Gitcrawl transaction binding event id is missing: ${transactionPath}`);
+    }
+    assertDispatchKey(String(job.dispatch_key ?? ""));
+    const expectedKey = gitcrawlDispatchKey({
+      path: String(job.path),
+      packetSha256: String(job.packet_sha256),
+      bindingEventId: String(job.binding_event_id),
+    });
+    if (job.dispatch_key !== expectedKey) {
+      throw new Error(`Gitcrawl transaction dispatch key mismatch: ${transactionPath}`);
+    }
+  }
+  return value as GitcrawlPublicationTransaction;
+}
+
+function verifyTransactionJob(
+  root: string,
+  job: GitcrawlPublicationTransaction["generated_jobs"][number],
+): void {
+  const absolutePath = existingRegularFile(root, job.path, "Gitcrawl generated job");
+  const packet = verifyEmbeddedGitcrawlEvidencePacket(
+    fs.readFileSync(absolutePath, "utf8"),
+    undefined,
+    true,
+  )!;
+  if (packet.sha256 !== job.packet_sha256) {
+    throw new Error(`Gitcrawl transaction packet digest does not match job: ${job.path}`);
+  }
+}
+
+function gitcrawlDispatchKey(input: {
+  path: string;
+  packetSha256: string;
+  bindingEventId: string;
+}): string {
+  return `gitcrawl-${sha256Canonical({
+    path: input.path,
+    packet_sha256: input.packetSha256,
+    binding_event_id: input.bindingEventId,
+  })}`;
+}
+
+function gitcrawlDispatchReceiptPath(receiptsDirectory: string, dispatchKey: string): string {
+  assertDispatchKey(dispatchKey);
+  return path.posix.join(receiptsDirectory, `${dispatchKey}.json`);
+}
+
+function assertDispatchKey(value: string): void {
+  if (!/^gitcrawl-[a-f0-9]{64}$/.test(value)) {
+    throw new Error("Gitcrawl dispatch key is malformed");
+  }
+}
+
+function assertDispatchReceipt(
+  root: string,
+  receiptPath: string,
+  expected: Omit<GitcrawlDispatchReceipt, "schema" | "dispatched_at" | "run_id" | "run_attempt">,
+): GitcrawlDispatchReceipt {
+  const absolutePath = existingRegularFile(root, receiptPath, "Gitcrawl dispatch receipt");
+  let value: unknown;
+  try {
+    value = JSON.parse(fs.readFileSync(absolutePath, "utf8"));
+  } catch {
+    throw new Error(`Gitcrawl dispatch receipt is malformed: ${receiptPath}`);
+  }
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error(`Gitcrawl dispatch receipt is malformed: ${receiptPath}`);
+  }
+  const receipt = value as GitcrawlDispatchReceipt;
+  if (
+    receipt.schema !== GITCRAWL_DISPATCH_RECEIPT_SCHEMA ||
+    receipt.transaction_path !== expected.transaction_path ||
+    receipt.job_path !== expected.job_path ||
+    receipt.packet_sha256 !== expected.packet_sha256 ||
+    receipt.binding_event_id !== expected.binding_event_id ||
+    receipt.dispatch_key !== expected.dispatch_key ||
+    typeof receipt.dispatched_at !== "string" ||
+    typeof receipt.run_id !== "string" ||
+    typeof receipt.run_attempt !== "string"
+  ) {
+    throw new Error(`Gitcrawl dispatch receipt identity mismatch: ${receiptPath}`);
+  }
+  return receipt;
+}
+
 function existingRegularFile(root: string, relativePath: string, label: string): string {
   const absolutePath = path.resolve(root, relativePath);
   if (!insideRoot(root, absolutePath)) {
@@ -207,7 +459,8 @@ function uniqueSorted(values: Iterable<string>): string[] {
 function writeJsonAtomic(
   root: string,
   relativePath: string,
-  value: GitcrawlPublicationTransaction,
+  value: GitcrawlPublicationTransaction | GitcrawlDispatchReceipt,
+  noClobber = false,
 ): void {
   const destination = path.resolve(root, relativePath);
   if (!insideRoot(root, destination)) {
@@ -217,22 +470,64 @@ function writeJsonAtomic(
   const temporary = `${destination}.tmp-${process.pid}`;
   try {
     fs.writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, { flag: "wx" });
-    fs.renameSync(temporary, destination);
+    if (noClobber) fs.linkSync(temporary, destination);
+    else fs.renameSync(temporary, destination);
   } finally {
     fs.rmSync(temporary, { force: true });
   }
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  const args = parseArgs(process.argv.slice(2));
+  const argv = process.argv.slice(2);
+  const command = argv[0]?.startsWith("--") || argv[0] === undefined ? "prepare" : argv.shift()!;
+  const args = parseArgs(argv);
   const root = process.cwd();
-  const eventPaths = readPathList(path.resolve(root, args.eventPathsFile));
-  const generatedPaths = readPathList(path.resolve(root, args.generatedPathsFile));
+  if (command === "pending") {
+    const durableRoot = args["--root"]
+      ? fs.realpathSync(path.resolve(root, requiredArg(args, "--root")))
+      : root;
+    const pending = listPendingGitcrawlDispatches({
+      root: durableRoot,
+      transactionsDirectory: requiredArg(args, "--transactions-dir"),
+      receiptsDirectory: requiredArg(args, "--receipts-dir"),
+    });
+    writeLines(
+      path.resolve(root, requiredArg(args, "--pending-file")),
+      pending.map((entry) =>
+        [entry.transaction_path, entry.job_path, entry.dispatch_key, entry.receipt_path].join("\t"),
+      ),
+    );
+    console.log(JSON.stringify({ pending }));
+    process.exit(0);
+  }
+  if (command === "receipt") {
+    const result = recordGitcrawlDispatchReceipt({
+      root,
+      transactionPath: requiredArg(args, "--transaction"),
+      jobPath: requiredArg(args, "--job"),
+      dispatchKey: requiredArg(args, "--dispatch-key"),
+      receiptsDirectory: requiredArg(args, "--receipts-dir"),
+      ...(process.env.GITHUB_RUN_ID === undefined ? {} : { runId: process.env.GITHUB_RUN_ID }),
+      ...(process.env.GITHUB_RUN_ATTEMPT === undefined
+        ? {}
+        : { runAttempt: process.env.GITHUB_RUN_ATTEMPT }),
+    });
+    const pathsFile = path.resolve(root, requiredArg(args, "--paths-file"));
+    fs.mkdirSync(path.dirname(pathsFile), { recursive: true });
+    fs.appendFileSync(pathsFile, `${result.path}\n`);
+    console.log(JSON.stringify(result.receipt));
+    process.exit(0);
+  }
+  if (command !== "prepare") throw new Error(`Unknown Gitcrawl publication command: ${command}`);
+  const eventPaths = readPathList(path.resolve(root, requiredArg(args, "--event-paths-file")));
+  const generatedPaths = readPathList(
+    path.resolve(root, requiredArg(args, "--generated-paths-file")),
+  );
   const transaction = prepareGitcrawlPublicationTransaction({
     root,
     eventPaths,
     generatedPaths,
-    manifestPath: args.manifest,
+    manifestPath: requiredArg(args, "--manifest"),
     ...(args.cursor === undefined ? {} : { cursorPath: args.cursor }),
     ...(args.intake === undefined ? {} : { intakePath: args.intake }),
     ...(process.env.GITHUB_RUN_ID === undefined ? {} : { runId: process.env.GITHUB_RUN_ID }),
@@ -240,9 +535,15 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
       ? {}
       : { runAttempt: process.env.GITHUB_RUN_ATTEMPT }),
   });
-  fs.mkdirSync(path.dirname(path.resolve(root, args.pathsFile)), { recursive: true });
-  fs.writeFileSync(path.resolve(root, args.pathsFile), `${transaction.publish_paths.join("\n")}\n`);
+  const pathsFile = path.resolve(root, requiredArg(args, "--paths-file"));
+  fs.mkdirSync(path.dirname(pathsFile), { recursive: true });
+  fs.writeFileSync(pathsFile, `${transaction.publish_paths.join("\n")}\n`);
   console.log(JSON.stringify(transaction));
+}
+
+function writeLines(filePath: string, lines: string[]): void {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(filePath, lines.length === 0 ? "" : `${lines.join("\n")}\n`);
 }
 
 function readPathList(filePath: string): string[] {
@@ -254,7 +555,7 @@ function readPathList(filePath: string): string[] {
     .filter(Boolean);
 }
 
-function parseArgs(argv: readonly string[]): {
+function parseArgs(argv: readonly string[]): Record<string, string> & {
   eventPathsFile: string;
   generatedPathsFile: string;
   manifest: string;
@@ -271,17 +572,25 @@ function parseArgs(argv: readonly string[]): {
     if (!value || value.startsWith("--")) throw new Error(`${arg} requires a value`);
     values.set(arg, value);
   }
-  const required = (flag: string): string => {
-    const value = values.get(flag);
-    if (!value) throw new Error(`${flag} is required`);
-    return value;
+  const parsed = Object.fromEntries(values) as Record<string, string> & {
+    eventPathsFile: string;
+    generatedPathsFile: string;
+    manifest: string;
+    pathsFile: string;
+    cursor?: string;
+    intake?: string;
   };
-  return {
-    eventPathsFile: required("--event-paths-file"),
-    generatedPathsFile: required("--generated-paths-file"),
-    manifest: required("--manifest"),
-    pathsFile: required("--paths-file"),
-    ...(values.has("--cursor") ? { cursor: values.get("--cursor")! } : {}),
-    ...(values.has("--intake") ? { intake: values.get("--intake")! } : {}),
-  };
+  parsed.eventPathsFile = values.get("--event-paths-file") ?? "";
+  parsed.generatedPathsFile = values.get("--generated-paths-file") ?? "";
+  parsed.manifest = values.get("--manifest") ?? "";
+  parsed.pathsFile = values.get("--paths-file") ?? "";
+  if (values.has("--cursor")) parsed.cursor = values.get("--cursor")!;
+  if (values.has("--intake")) parsed.intake = values.get("--intake")!;
+  return parsed;
+}
+
+function requiredArg(args: Record<string, string>, flag: string): string {
+  const value = args[flag];
+  if (!value) throw new Error(`${flag} is required`);
+  return value;
 }

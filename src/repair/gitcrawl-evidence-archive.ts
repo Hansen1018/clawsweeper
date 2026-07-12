@@ -16,6 +16,12 @@ export type GitcrawlEvidenceArchiveTestHooks = {
 
 export type GitcrawlEvidenceArchiveOptions = {
   writerExcluded?: boolean;
+  expectedSource?: {
+    sha256: string;
+    size: number;
+    device?: number;
+    inode?: number;
+  };
 };
 
 let archiveTestHooks: GitcrawlEvidenceArchiveTestHooks = {};
@@ -36,7 +42,10 @@ export function moveGitcrawlEvidenceNoClobber(
   destination: string,
   options: GitcrawlEvidenceArchiveOptions = {},
 ): void {
-  const pinnedSource = createPinnedSourceAnchor(mode, source);
+  if (!options.writerExcluded) {
+    throw new Error(`Gitcrawl evidence ${mode} requires --writer-excluded`);
+  }
+  const pinnedSource = createPinnedSourceAnchor(mode, source, options.expectedSource);
   let destinationDescriptor: number | undefined;
   try {
     archiveTestHooks.afterSourceAnchor?.({
@@ -44,6 +53,7 @@ export function moveGitcrawlEvidenceNoClobber(
       destination,
       anchor: pinnedSource.path,
     });
+    assertPinnedSourceBinding(mode, source, pinnedSource);
     fs.mkdirSync(path.dirname(destination), { recursive: true });
     const sameFilesystem = publishSameFilesystemLink(
       pinnedSource.path,
@@ -52,11 +62,6 @@ export function moveGitcrawlEvidenceNoClobber(
     );
     let copiedDigest: string | undefined;
     if (!sameFilesystem) {
-      if (!options.writerExcluded) {
-        throw new Error(
-          `Gitcrawl evidence ${mode} crosses filesystems and requires --writer-excluded`,
-        );
-      }
       copiedDigest = copyPinnedFileNoClobber(
         pinnedSource.descriptor,
         pinnedSource.stat,
@@ -70,6 +75,7 @@ export function moveGitcrawlEvidenceNoClobber(
     verifyPublishedDestination({
       sourceDescriptor: pinnedSource.descriptor,
       pinnedSource: pinnedSource.stat,
+      pinnedSourceSha256: pinnedSource.sha256,
       destination,
       destinationDescriptor,
       sameFilesystem,
@@ -82,6 +88,7 @@ export function moveGitcrawlEvidenceNoClobber(
       destination,
       sourceDescriptor: pinnedSource.descriptor,
       pinnedSource: pinnedSource.stat,
+      pinnedSourceSha256: pinnedSource.sha256,
       destinationDescriptor,
       sameFilesystem,
       ...(copiedDigest === undefined ? {} : { copiedDigest }),
@@ -97,11 +104,13 @@ type PinnedSourceAnchor = {
   path: string;
   descriptor: number;
   stat: fs.Stats;
+  sha256: string;
 };
 
 function createPinnedSourceAnchor(
   mode: GitcrawlEvidenceArchiveMode,
   source: string,
+  expected: GitcrawlEvidenceArchiveOptions["expectedSource"],
 ): PinnedSourceAnchor {
   const sourceStat = fs.lstatSync(source);
   if (!sourceStat.isFile() || sourceStat.isSymbolicLink()) {
@@ -118,6 +127,11 @@ function createPinnedSourceAnchor(
     if (!pinned.isFile() || !sameFileIdentity(sourceStat, pinned)) {
       throw new Error(`Gitcrawl evidence ${mode} source changed before anchoring: ${source}`);
     }
+    assertExpectedSourceBinding(mode, source, pinned, expected);
+    const sha256 = digestDescriptor(descriptor, pinned.size);
+    if (expected !== undefined && sha256 !== expected.sha256) {
+      throw new Error(`Gitcrawl evidence ${mode} source digest changed since preflight: ${source}`);
+    }
     archiveTestHooks.beforeSourceAnchorLink?.({ source, anchor });
     fs.linkSync(source, anchor);
     const anchorStat = fs.lstatSync(anchor);
@@ -128,7 +142,13 @@ function createPinnedSourceAnchor(
     ) {
       throw new Error(`Gitcrawl evidence ${mode} source changed before anchoring: ${source}`);
     }
-    return { path: anchor, descriptor, stat: pinned };
+    if (
+      !sameFileIdentity(pinned, fs.fstatSync(descriptor)) ||
+      digestDescriptor(descriptor, pinned.size) !== sha256
+    ) {
+      throw new Error(`Gitcrawl evidence ${mode} source changed while anchoring: ${source}`);
+    }
+    return { path: anchor, descriptor, stat: pinned, sha256 };
   } catch (error) {
     if (descriptor !== undefined) fs.closeSync(descriptor);
     fs.rmSync(anchor, { force: true });
@@ -283,6 +303,7 @@ function openPinnedDestination(destination: string, sourceStat?: fs.Stats): numb
 function verifyPublishedDestination(input: {
   sourceDescriptor: number;
   pinnedSource: fs.Stats;
+  pinnedSourceSha256: string;
   destination: string;
   destinationDescriptor: number;
   sameFilesystem: boolean;
@@ -302,14 +323,19 @@ function verifyPublishedDestination(input: {
   if (input.sameFilesystem) {
     if (
       !sameInodeIdentity(input.pinnedSource, sourceCurrent) ||
-      !sameInodeIdentity(sourceCurrent, destinationPinned)
+      !sameInodeIdentity(sourceCurrent, destinationPinned) ||
+      digestDescriptor(input.sourceDescriptor, input.pinnedSource.size) !==
+        input.pinnedSourceSha256 ||
+      digestDescriptor(input.destinationDescriptor, destinationPinned.size) !==
+        input.pinnedSourceSha256
     ) {
-      throw new Error("Gitcrawl evidence linked destination does not preserve source identity");
+      throw new Error("Gitcrawl evidence linked destination does not preserve source binding");
     }
     return;
   }
   if (
     input.copiedDigest === undefined ||
+    input.copiedDigest !== input.pinnedSourceSha256 ||
     !sameFileIdentity(input.pinnedSource, sourceCurrent) ||
     digestDescriptor(input.sourceDescriptor, input.pinnedSource.size) !== input.copiedDigest ||
     digestDescriptor(input.destinationDescriptor, destinationPinned.size) !== input.copiedDigest
@@ -324,10 +350,18 @@ function quarantineAndRemovePinnedSource(input: {
   destination: string;
   sourceDescriptor: number;
   pinnedSource: fs.Stats;
+  pinnedSourceSha256: string;
   destinationDescriptor: number;
   sameFilesystem: boolean;
   copiedDigest?: string;
 }): void {
+  assertPinnedSourceBinding(input.mode, input.source, {
+    path: "",
+    descriptor: input.sourceDescriptor,
+    stat: input.pinnedSource,
+    sha256: input.pinnedSourceSha256,
+  });
+  verifyPublishedDestination(input);
   const quarantine = `${input.source}.moving-${crypto.randomUUID()}`;
   try {
     fs.renameSync(input.source, quarantine);
@@ -343,9 +377,10 @@ function quarantineAndRemovePinnedSource(input: {
       quarantined.isSymbolicLink() ||
       !quarantined.isFile() ||
       !sameInodeIdentity(input.pinnedSource, quarantined) ||
-      !sameInodeIdentity(input.pinnedSource, fs.fstatSync(input.sourceDescriptor))
+      !sameInodeIdentity(input.pinnedSource, fs.fstatSync(input.sourceDescriptor)) ||
+      digestDescriptor(input.sourceDescriptor, input.pinnedSource.size) !== input.pinnedSourceSha256
     ) {
-      throw new Error("source ownership changed during transfer");
+      throw new Error("source binding changed during transfer");
     }
     verifyPublishedDestination(input);
   } catch (error) {
@@ -424,28 +459,120 @@ function sameInodeIdentity(expected: fs.Stats, actual: fs.Stats): boolean {
   );
 }
 
-function runCli(): void {
-  const [mode, sourceArg, destinationArg, ...flags] = process.argv.slice(2);
+function assertExpectedSourceBinding(
+  mode: GitcrawlEvidenceArchiveMode,
+  source: string,
+  actual: fs.Stats,
+  expected: GitcrawlEvidenceArchiveOptions["expectedSource"],
+): void {
+  if (expected === undefined) return;
   if (
-    (mode !== "archive" && mode !== "rollback") ||
-    !sourceArg ||
-    !destinationArg ||
-    flags.some((flag) => flag !== "--writer-excluded")
+    !/^[a-f0-9]{64}$/.test(expected.sha256) ||
+    !Number.isSafeInteger(expected.size) ||
+    expected.size < 0 ||
+    (expected.device !== undefined &&
+      (!Number.isSafeInteger(expected.device) || expected.device < 0)) ||
+    (expected.inode !== undefined && (!Number.isSafeInteger(expected.inode) || expected.inode < 0))
   ) {
-    console.error(
-      "usage: node dist/repair/gitcrawl-evidence-archive.js archive|rollback <source> <destination> [--writer-excluded]",
-    );
+    throw new Error(`Gitcrawl evidence ${mode} expected source binding is malformed`);
+  }
+  if (
+    actual.size !== expected.size ||
+    (expected.device !== undefined && actual.dev !== expected.device) ||
+    (expected.inode !== undefined && actual.ino !== expected.inode)
+  ) {
+    throw new Error(`Gitcrawl evidence ${mode} source identity changed since preflight: ${source}`);
+  }
+}
+
+function assertPinnedSourceBinding(
+  mode: GitcrawlEvidenceArchiveMode,
+  source: string,
+  pinned: PinnedSourceAnchor,
+): void {
+  assertPinnedPath(source, pinned.stat, "source changed before removal");
+  const current = fs.fstatSync(pinned.descriptor);
+  if (
+    !sameFileIdentity(pinned.stat, current) ||
+    digestDescriptor(pinned.descriptor, pinned.stat.size) !== pinned.sha256
+  ) {
+    throw new Error(`Gitcrawl evidence ${mode} source bytes changed before removal: ${source}`);
+  }
+}
+
+function runCli(): void {
+  const [mode, sourceArg, destinationArg, ...flagArgs] = process.argv.slice(2);
+  if ((mode !== "archive" && mode !== "rollback") || !sourceArg || !destinationArg) {
+    printUsage();
     process.exitCode = 2;
     return;
   }
   try {
+    const flags = parseCliFlags(flagArgs);
+    const expectedSha256 = flags.get("--expected-sha256");
+    const expectedSize = flags.get("--expected-size");
+    if (!expectedSha256 || expectedSize === undefined) {
+      throw new Error("--expected-sha256 and --expected-size are required");
+    }
+    const expectedDevice = flags.get("--expected-dev");
+    const expectedInode = flags.get("--expected-ino");
+    if ((expectedDevice === undefined) !== (expectedInode === undefined)) {
+      throw new Error("--expected-dev and --expected-ino must be provided together");
+    }
     moveGitcrawlEvidenceNoClobber(mode, path.resolve(sourceArg), path.resolve(destinationArg), {
-      writerExcluded: flags.includes("--writer-excluded"),
+      writerExcluded: flags.has("--writer-excluded"),
+      expectedSource: {
+        sha256: expectedSha256,
+        size: nonnegativeSafeInteger(expectedSize, "--expected-size"),
+        ...(expectedDevice === undefined
+          ? {}
+          : {
+              device: nonnegativeSafeInteger(expectedDevice, "--expected-dev"),
+              inode: nonnegativeSafeInteger(expectedInode!, "--expected-ino"),
+            }),
+      },
     });
   } catch (error) {
     console.error(error instanceof Error ? error.message : String(error));
     process.exitCode = 1;
   }
+}
+
+function parseCliFlags(args: string[]): Map<string, string> {
+  const flags = new Map<string, string>();
+  for (let index = 0; index < args.length; index += 1) {
+    const flag = args[index]!;
+    if (flag === "--writer-excluded") {
+      flags.set(flag, "true");
+      continue;
+    }
+    if (
+      flag !== "--expected-sha256" &&
+      flag !== "--expected-size" &&
+      flag !== "--expected-dev" &&
+      flag !== "--expected-ino"
+    ) {
+      throw new Error(`unknown archive flag: ${flag}`);
+    }
+    const value = args[++index];
+    if (!value || value.startsWith("--")) throw new Error(`${flag} requires a value`);
+    flags.set(flag, value);
+  }
+  if (!flags.has("--writer-excluded")) throw new Error("--writer-excluded is required");
+  return flags;
+}
+
+function nonnegativeSafeInteger(value: string, label: string): number {
+  if (!/^\d+$/.test(value)) throw new Error(`${label} must be a nonnegative integer`);
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed)) throw new Error(`${label} must be a safe integer`);
+  return parsed;
+}
+
+function printUsage(): void {
+  console.error(
+    "usage: node dist/repair/gitcrawl-evidence-archive.js archive|rollback <source> <destination> --expected-sha256 <digest> --expected-size <bytes> [--expected-dev <device> --expected-ino <inode>] --writer-excluded",
+  );
 }
 
 if (

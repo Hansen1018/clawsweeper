@@ -21,7 +21,10 @@ import {
   writeGitcrawlScanOffset,
 } from "./gitcrawl-scan-cursor.js";
 import { publishGitcrawlGeneratedJob } from "./gitcrawl-job-publication.js";
-import { assertGitcrawlThreadSafetyProjectionMatches } from "./gitcrawl-evidence-policy.js";
+import {
+  assertGitcrawlThreadSafetyProjectionMatches,
+  stripGitcrawlHtmlComments,
+} from "./gitcrawl-evidence-policy.js";
 import { renderJobIntentFrontmatter } from "./job-intent.js";
 import { parseArgs, parseSimpleYaml, repoRoot } from "./lib.js";
 import { flushRepairActionEvents, repairActionLedgerRoot } from "./repair-action-ledger.js";
@@ -359,7 +362,7 @@ function scoreCandidate(
     score: blockers.length > 0 ? 0 : signals.length,
     signals,
     blockers,
-    bodyExcerpt: excerpt(body),
+    bodyExcerpt: excerpt(stripGitcrawlHtmlComments(body)),
   };
 }
 

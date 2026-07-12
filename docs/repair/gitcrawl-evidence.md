@@ -40,11 +40,15 @@ response URL must remain on the configured HTTPS origin.
 
 Every cloud request asks for `gitcrawl-query-safety-v2` and sends the expected
 repository plus archive identity. Every response must echo that exact contract,
-repository, and archive in `stats`. Cloud and parity mode fail closed until
-crawl-remote advertises this contract and supplies the complete title, body,
-labels, assignees, author association, membership count, and PR review fields
-consumed by ClawSweeper. An older successful HTTP response is not treated as
-compatible evidence.
+repository, and archive in `stats`. It must also include crawl-remote's
+top-level snapshot manifest. ClawSweeper requires the manifest `id`,
+`source_sha256`, and `stats.snapshot_id` to be the same lowercase SHA-256
+digest, and binds schema metadata, capabilities, source and dataset timestamps,
+coverage, publication time, and cutover time across every page. Missing,
+arbitrary, or mismatched snapshot identities fail closed. Cloud and parity mode
+also require the complete title, body, labels, assignees, author association,
+membership count, and PR review fields consumed by ClawSweeper. An older
+successful HTTP response is not treated as compatible evidence.
 
 `parity` runs every query against the cloud source and a local SQLite snapshot.
 It returns cloud data only after normalized rows and coverage counts match.
@@ -170,14 +174,19 @@ low-signal candidates.
 
 Low-signal policy bits such as issue references, focused-fix language, blank
 templates, and external-capability requests are derived from the complete body
-before the body is reduced to prompt size. The bounded claim carries only those
-derived booleans and the excerpt. Blank-template detection removes multiline
-HTML instructions and permits only known template headings before empty fields;
-arbitrary prose or headings remain substantive.
+before the body is reduced to prompt size. Trusted blank-template extraction
+uses the raw source long enough to recognize known template headings, but HTML
+comment bodies are removed before titles, bodies, summaries, labels, excerpts,
+claims, packets, jobs, or prompt artifacts are rendered. Any residual HTML
+comment marker quarantines the claim. Arbitrary prose or headings remain
+substantive.
 
 Imported cluster and low-signal PR job files embed the packet under
 `Gitcrawl Evidence Packet`. Normal repair prompt rendering includes the job
-verbatim, so review and repair workers receive the same digest-bound evidence.
+after reverifying the original digest-bound evidence and stripping HTML
+comments again. Review and repair workers therefore receive the same verified
+evidence without comment-hidden instructions. The prompt also marks all
+Gitcrawl fields and artifacts as quoted untrusted data.
 New jobs use versioned IDs, set
 `gitcrawl_evidence_schema: gitcrawl-evidence-job-v1`, and set
 `gitcrawl_evidence_required: true`. Job parsing and prompt rendering
@@ -198,6 +207,7 @@ node dist/repair/gitcrawl-evidence-preflight.js \
   --jobs jobs \
   --gitcrawl-provider local \
   --write-manifest artifacts/gitcrawl-evidence-migration.json \
+  --writer-excluded \
   --require-replacements
 ```
 
@@ -205,12 +215,13 @@ The preflight is non-mutating. It inventories valid current jobs, malformed or
 invalid generated jobs, and every legacy cluster or low-signal job. Each legacy entry
 contains structured `reimport`, no-clobber `archive`, and no-clobber `rollback`
 command argv, its original target refs, matching replacement paths, and
-`ready_to_archive`. Cross-filesystem entries also report whether writer
-exclusion is required and confirmed. Cluster jobs re-import the exact source
-cluster into a collision-free migration-suffixed path, including when a malformed
-deterministic replacement path already exists. Low-signal jobs rerun the current
-policy against a fresh snapshot while preserving the old candidate inventory in
-the manifest.
+`ready_to_archive`. The preflight descriptor-pins each legacy file and records
+its exact SHA-256 digest, size, device, and inode in the manifest and emitted
+archive argv. Every entry reports whether writer exclusion is confirmed.
+Cluster jobs re-import the exact source cluster into a collision-free
+migration-suffixed path, including when a malformed deterministic replacement
+path already exists. Low-signal jobs rerun the current policy against a fresh
+snapshot while preserving the old candidate inventory in the manifest.
 
 Run missing re-import commands, validate the generated replacement jobs, rerun
 with `--require-replacements`, then execute archive commands only for entries
@@ -218,13 +229,14 @@ marked ready. Archive commands refuse to replace an existing quarantine file;
 retain the emitted rollback command until the replacement queue is validated.
 Same-filesystem archive and rollback moves publish from a random hard-link
 anchor and preserve the source inode before removing the identity-checked source
-name. The destination is verified before source deletion.
-When the archive is on another filesystem, stop every queue writer and rerun the
-preflight with `--writer-excluded`; only that explicit assertion marks the entry
-ready and adds the same flag to its archive and rollback commands. Cross-filesystem
-copies remain descriptor-pinned and digest-verified, but writer exclusion is
-mandatory because an open source descriptor can still receive writes during a
-copy.
+name. The command rejects path replacement or byte drift from the preflight
+binding, then revalidates inode, size, and digest immediately before source
+quarantine and removal. The destination is verified before source deletion.
+Stop every queue writer and rerun the preflight with `--writer-excluded` for
+both same- and cross-filesystem moves; only that explicit assertion marks an
+entry ready and adds the flag to its archive and rollback commands. Writer
+exclusion is mandatory because an already-open descriptor can mutate a
+same-filesystem hard link or a cross-filesystem copy after a path-only check.
 Finally run `--require-clean`; exit code 2 means legacy or invalid current jobs
 still block the cutover. Pass the same `--db`, Cloudflare provider, archive, and
 snapshot-age flags used by the importer so emitted commands are directly
@@ -241,6 +253,7 @@ cannot consume dispatch capacity or suppress a replacement job.
 Import fails closed for:
 
 - an absent or incompatible cloud safety contract
+- absent, arbitrary, or mismatched crawl-remote snapshot provenance
 - stale source sync or dataset generation
 - incomplete required dataset coverage
 - mixed dataset generations
@@ -356,8 +369,16 @@ The ledger never stores SQL, query arguments, returned rows, raw payloads,
 prompt text, logs, or cloud failure bodies. Snapshot identifiers are stored
 only when they match the durable public snapshot format; all other identifiers
 remain digest-only. The cluster intake workflow finalizes and imports these
-events with the shared `repair:action-ledger` command before dispatching
-generated jobs.
+events with the shared `repair:action-ledger` command before publishing a
+transaction. A transaction is created only after the importer succeeds and
+binds each job to a stable dispatch key. Every healthy intake run replays
+receipt-less transactions; the worker deduplicates the stable key, and a
+durable dispatch receipt ends replay. A crash after publication, dispatch, or
+receipt creation can therefore cause only an idempotent retry, not a stranded
+job. Recovery enumerates only the hydrated durable state checkout, so an older
+pending transaction still dispatches when a later importer fails, while a
+locally prepared transaction cannot dispatch unless its state publication
+succeeded.
 
 ## Merge Dependencies
 

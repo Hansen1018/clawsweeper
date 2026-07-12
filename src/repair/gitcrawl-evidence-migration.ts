@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { GITCRAWL_JOB_EVIDENCE_SCHEMA, sha256Canonical } from "./gitcrawl-evidence-contract.js";
@@ -22,6 +23,10 @@ export type GitcrawlMigrationEntry = {
   ready_to_archive: boolean;
   writer_exclusion_required: boolean;
   writer_exclusion_confirmed: boolean;
+  source_sha256: string;
+  source_size: number;
+  source_device: number;
+  source_inode: number;
   reimport_strategy: "exact_cluster" | "current_policy_rescan";
   reimport: GitcrawlMigrationCommand;
   archive: GitcrawlMigrationCommand;
@@ -29,7 +34,7 @@ export type GitcrawlMigrationEntry = {
 };
 
 export type GitcrawlMigrationReport = {
-  schema: "clawsweeper-gitcrawl-evidence-migration-v1";
+  schema: "clawsweeper-gitcrawl-evidence-migration-v2";
   jobs_directory: string;
   archive_directory: string;
   summary: {
@@ -61,23 +66,11 @@ type LegacyJob = {
   clusterNumber?: number;
   mode: string;
   targets: string[];
+  sourceSha256: string;
+  sourceSize: number;
+  sourceDevice: number;
+  sourceInode: number;
 };
-
-export type GitcrawlEvidenceMigrationTestHooks = {
-  forceCrossFilesystem?: boolean;
-};
-
-let migrationTestHooks: GitcrawlEvidenceMigrationTestHooks = {};
-
-export function __setGitcrawlEvidenceMigrationTestHooks(
-  hooks: GitcrawlEvidenceMigrationTestHooks,
-): () => void {
-  const previous = migrationTestHooks;
-  migrationTestHooks = { ...hooks };
-  return () => {
-    migrationTestHooks = previous;
-  };
-}
 
 export function inventoryGitcrawlEvidenceMigration(input: {
   jobsDirectory: string;
@@ -115,7 +108,8 @@ export function inventoryGitcrawlEvidenceMigration(input: {
 
   for (const absolutePath of files) {
     const relativePath = portablePath(path.relative(jobsDirectory, absolutePath));
-    const raw = fs.readFileSync(absolutePath, "utf8");
+    const source = readPinnedMigrationSource(absolutePath);
+    const raw = source.raw;
     const match = raw.match(/^---\n([\s\S]*?)\n---/);
     if (!match?.[1]) {
       recordMalformedGeneratedJob(relativePath, raw, "missing YAML frontmatter", invalid);
@@ -193,6 +187,10 @@ export function inventoryGitcrawlEvidenceMigration(input: {
         ? String(frontmatter.mode)
         : "plan",
       targets,
+      sourceSha256: source.sha256,
+      sourceSize: source.size,
+      sourceDevice: source.device,
+      sourceInode: source.inode,
     });
   }
 
@@ -201,7 +199,7 @@ export function inventoryGitcrawlEvidenceMigration(input: {
     .sort((left, right) => left.path.localeCompare(right.path));
   invalid.sort((left, right) => left.path.localeCompare(right.path));
   return {
-    schema: "clawsweeper-gitcrawl-evidence-migration-v1",
+    schema: "clawsweeper-gitcrawl-evidence-migration-v2",
     jobs_directory: jobsDirectory,
     archive_directory: archiveDirectory,
     summary: {
@@ -221,7 +219,7 @@ export function inventoryGitcrawlEvidenceMigration(input: {
         (entry) => entry.writer_exclusion_required && !entry.writer_exclusion_confirmed,
       )
         ? [
-            "Exclude active queue writers, then rerun the preflight with --writer-excluded before cross-filesystem archive commands.",
+            "Exclude active queue writers, then rerun the preflight with --writer-excluded before any archive command.",
           ]
         : []),
       "Run archive commands only for entries marked ready_to_archive.",
@@ -244,12 +242,15 @@ function migrationEntry(
     .sort();
   const outputDirectory = path.dirname(job.absolutePath);
   const archiveDestination = path.join(archiveDirectory, job.relativePath);
-  const writerExclusionRequired =
-    migrationTestHooks.forceCrossFilesystem === true ||
-    fs.statSync(job.absolutePath).dev !== existingPathDevice(path.dirname(archiveDestination));
-  const writerExclusionConfirmed = !writerExclusionRequired || options.writerExcluded === true;
-  const archiveFlags =
-    writerExclusionRequired && writerExclusionConfirmed ? ["--writer-excluded"] : [];
+  const writerExclusionRequired = true;
+  const writerExclusionConfirmed = options.writerExcluded === true;
+  const archiveFlags = writerExclusionConfirmed ? ["--writer-excluded"] : [];
+  const sourceBindingFlags = [
+    "--expected-sha256",
+    job.sourceSha256,
+    "--expected-size",
+    String(job.sourceSize),
+  ];
   const clusterMigrationSuffix =
     job.kind === "cluster" ? availableClusterMigrationSuffix(job, outputDirectory) : undefined;
   const reimport =
@@ -297,6 +298,10 @@ function migrationEntry(
     ready_to_archive: replacements.length > 0 && writerExclusionConfirmed,
     writer_exclusion_required: writerExclusionRequired,
     writer_exclusion_confirmed: writerExclusionConfirmed,
+    source_sha256: job.sourceSha256,
+    source_size: job.sourceSize,
+    source_device: job.sourceDevice,
+    source_inode: job.sourceInode,
     reimport_strategy: job.kind === "cluster" ? "exact_cluster" : "current_policy_rescan",
     reimport,
     archive: command("node", [
@@ -304,6 +309,11 @@ function migrationEntry(
       "archive",
       path.join(jobsDirectory, job.relativePath),
       archiveDestination,
+      ...sourceBindingFlags,
+      "--expected-dev",
+      String(job.sourceDevice),
+      "--expected-ino",
+      String(job.sourceInode),
       ...archiveFlags,
     ]),
     rollback: command("node", [
@@ -311,6 +321,7 @@ function migrationEntry(
       "rollback",
       archiveDestination,
       path.join(jobsDirectory, job.relativePath),
+      ...sourceBindingFlags,
       ...archiveFlags,
     ]),
   };
@@ -444,23 +455,62 @@ function resolveThroughExistingParents(candidate: string): string {
   }
 }
 
-function existingPathDevice(candidate: string): number {
-  let current = candidate;
-  for (;;) {
-    const stat = fs.statSync(current, { throwIfNoEntry: false });
-    if (stat !== undefined) return stat.dev;
-    const parent = path.dirname(current);
-    if (parent === current) {
-      throw new Error(`Gitcrawl migration archive parent not found: ${candidate}`);
-    }
-    current = parent;
-  }
-}
-
 function command(commandName: string, args: string[]): GitcrawlMigrationCommand {
   return { command: commandName, args };
 }
 
 function portablePath(value: string): string {
   return value.split(path.sep).join("/");
+}
+
+function readPinnedMigrationSource(filePath: string): {
+  raw: string;
+  sha256: string;
+  size: number;
+  device: number;
+  inode: number;
+} {
+  const pathStat = fs.lstatSync(filePath);
+  if (!pathStat.isFile() || pathStat.isSymbolicLink()) {
+    throw new Error(`Gitcrawl migration source must be a regular file: ${filePath}`);
+  }
+  const descriptor = fs.openSync(filePath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+  try {
+    const pinned = fs.fstatSync(descriptor);
+    if (!sameMigrationIdentity(pathStat, pinned)) {
+      throw new Error(`Gitcrawl migration source changed before preflight: ${filePath}`);
+    }
+    const bytes = fs.readFileSync(descriptor);
+    const afterRead = fs.fstatSync(descriptor);
+    const currentPath = fs.lstatSync(filePath, { throwIfNoEntry: false });
+    if (
+      currentPath === undefined ||
+      !sameMigrationIdentity(pinned, afterRead) ||
+      !sameMigrationIdentity(pinned, currentPath) ||
+      bytes.byteLength !== pinned.size
+    ) {
+      throw new Error(`Gitcrawl migration source changed during preflight: ${filePath}`);
+    }
+    return {
+      raw: bytes.toString("utf8"),
+      sha256: crypto.createHash("sha256").update(bytes).digest("hex"),
+      size: pinned.size,
+      device: pinned.dev,
+      inode: pinned.ino,
+    };
+  } finally {
+    fs.closeSync(descriptor);
+  }
+}
+
+function sameMigrationIdentity(expected: fs.Stats, actual: fs.Stats): boolean {
+  return (
+    actual.isFile() &&
+    !actual.isSymbolicLink() &&
+    expected.dev === actual.dev &&
+    expected.ino === actual.ino &&
+    expected.mode === actual.mode &&
+    expected.size === actual.size &&
+    expected.mtimeMs === actual.mtimeMs
+  );
 }

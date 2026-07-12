@@ -85,10 +85,25 @@ export type GitcrawlQueryStats = {
   next_cursor: string;
 };
 
+export type GitcrawlSnapshotProvenance = {
+  id: string;
+  source_sha256: string;
+  schema_name: string;
+  schema_version: number;
+  schema_hash: string;
+  capabilities: string[];
+  source_sync_at: string;
+  dataset_generated_at: string;
+  coverage_complete: boolean;
+  published_at: string;
+  cutover_at: string;
+};
+
 export type GitcrawlQueryEnvelope = {
   columns?: string[];
   rows?: unknown[][];
   values: Record<string, unknown>[];
+  snapshot: GitcrawlSnapshotProvenance;
   stats: GitcrawlQueryStats;
 };
 
@@ -169,6 +184,9 @@ export function createGitcrawlEvidenceClaim<T>(input: {
 }): GitcrawlEvidenceClaim<T> {
   assertSnapshotId(input.snapshotId);
   if (input.paritySnapshotId !== undefined) assertSnapshotId(input.paritySnapshotId);
+  assertNoGitcrawlHtmlCommentMarkers(input.subject, "Gitcrawl claim subject");
+  assertNoGitcrawlHtmlCommentMarkers(input.relations ?? [], "Gitcrawl claim relations");
+  assertNoGitcrawlHtmlCommentMarkers(input.data, "Gitcrawl claim data");
   if (!GITCRAWL_QUERY_NAMES.includes(input.queryName)) {
     throw new Error(`unsupported Gitcrawl query: ${input.queryName}`);
   }
@@ -275,6 +293,29 @@ export function assertSnapshotId(value: string): void {
     })
   ) {
     throw new Error("Gitcrawl snapshot id is missing or malformed");
+  }
+}
+
+export function assertNoGitcrawlHtmlCommentMarkers(value: unknown, label: string): void {
+  const pending: unknown[] = [value];
+  const seen = new Set<object>();
+  while (pending.length > 0) {
+    const current = pending.pop();
+    if (typeof current === "string") {
+      if (current.includes("<!--") || current.includes("-->")) {
+        throw new Error(`${label} contains quarantined HTML comment content`);
+      }
+      continue;
+    }
+    if (current === null || typeof current !== "object") continue;
+    if (seen.has(current)) continue;
+    seen.add(current);
+    if (Array.isArray(current)) pending.push(...current);
+    else {
+      for (const [key, child] of Object.entries(current as Record<string, unknown>)) {
+        pending.push(key, child);
+      }
+    }
   }
 }
 

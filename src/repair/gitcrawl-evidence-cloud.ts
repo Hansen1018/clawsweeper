@@ -4,7 +4,9 @@ import {
   type GitcrawlQueryRequest,
   type GitcrawlQuerySource,
   assertGitcrawlProviderCursor,
+  assertSha256,
   canonicalJson,
+  parseRfc3339Timestamp,
 } from "./gitcrawl-evidence-contract.js";
 
 const MAX_CLOUD_RESPONSE_BYTES = 512 * 1024;
@@ -146,6 +148,7 @@ function parseCloudEnvelope(
   }
   const nextCursor = requiredString(rawStats.next_cursor, "next_cursor", true);
   assertGitcrawlProviderCursor(nextCursor, `Gitcrawl cloud ${queryName} stats next_cursor`);
+  const snapshot = parseSnapshotProvenance(body.snapshot, queryName, rawStats);
   const stats: GitcrawlQueryEnvelope["stats"] = {
     contract_version: GITCRAWL_QUERY_CONTRACT_VERSION,
     repository,
@@ -156,7 +159,71 @@ function parseCloudEnvelope(
     coverage_complete: requiredBoolean(rawStats.coverage_complete, "coverage_complete"),
     next_cursor: nextCursor,
   };
-  return { columns, rows, values, stats };
+  return { columns, rows, values, snapshot, stats };
+}
+
+function parseSnapshotProvenance(
+  value: unknown,
+  queryName: string,
+  stats: Record<string, unknown>,
+): GitcrawlQueryEnvelope["snapshot"] {
+  const snapshot = record(value, `Gitcrawl cloud ${queryName} snapshot`);
+  const id = requiredSnapshotString(snapshot.id, "id");
+  const sourceSha256 = requiredSnapshotString(snapshot.source_sha256, "source_sha256");
+  assertSha256(id, "Gitcrawl cloud snapshot id");
+  assertSha256(sourceSha256, "Gitcrawl cloud snapshot source sha256");
+  if (id !== sourceSha256 || id !== stats.snapshot_id) {
+    throw new Error(`Gitcrawl cloud query ${queryName} returned mismatched snapshot provenance`);
+  }
+  const schemaName = requiredSnapshotString(snapshot.schema_name, "schema_name");
+  const schemaVersion = snapshot.schema_version;
+  if (!Number.isSafeInteger(schemaVersion) || Number(schemaVersion) <= 0) {
+    throw new Error("Gitcrawl cloud snapshot schema_version must be a positive integer");
+  }
+  const schemaHash = requiredSnapshotString(snapshot.schema_hash, "schema_hash");
+  const capabilities = requiredSnapshotStringArray(snapshot.capabilities, "capabilities");
+  if (!capabilities.includes(queryName)) {
+    throw new Error(`Gitcrawl cloud snapshot does not declare ${queryName} capability`);
+  }
+  const sourceSyncAt = requiredSnapshotString(snapshot.source_sync_at, "source_sync_at");
+  const datasetGeneratedAt = requiredSnapshotString(
+    snapshot.dataset_generated_at,
+    "dataset_generated_at",
+  );
+  const publishedAt = requiredSnapshotString(snapshot.published_at, "published_at");
+  const cutoverAt = requiredSnapshotString(snapshot.cutover_at, "cutover_at");
+  for (const [timestamp, label] of [
+    [sourceSyncAt, "source_sync_at"],
+    [datasetGeneratedAt, "dataset_generated_at"],
+    [publishedAt, "published_at"],
+    [cutoverAt, "cutover_at"],
+  ] as const) {
+    parseRfc3339Timestamp(timestamp, `Gitcrawl cloud snapshot ${label}`);
+  }
+  const coverageComplete = requiredBoolean(
+    snapshot.coverage_complete,
+    "snapshot coverage_complete",
+  );
+  if (
+    sourceSyncAt !== stats.source_sync_at ||
+    datasetGeneratedAt !== stats.dataset_generated_at ||
+    coverageComplete !== stats.coverage_complete
+  ) {
+    throw new Error(`Gitcrawl cloud query ${queryName} returned mismatched snapshot metadata`);
+  }
+  return {
+    id,
+    source_sha256: sourceSha256,
+    schema_name: schemaName,
+    schema_version: Number(schemaVersion),
+    schema_hash: schemaHash,
+    capabilities,
+    source_sync_at: sourceSyncAt,
+    dataset_generated_at: datasetGeneratedAt,
+    coverage_complete: coverageComplete,
+    published_at: publishedAt,
+    cutover_at: cutoverAt,
+  };
 }
 
 function record(value: unknown, label: string): Record<string, unknown> {
@@ -260,4 +327,26 @@ function requiredBoolean(value: unknown, field: string): boolean {
     throw new Error(`Gitcrawl cloud stats ${field} must be a boolean`);
   }
   return value;
+}
+
+function requiredSnapshotString(value: unknown, field: string): string {
+  if (typeof value !== "string" || !value.trim() || value !== value.trim()) {
+    throw new Error(`Gitcrawl cloud snapshot ${field} must be a non-empty trimmed string`);
+  }
+  return value;
+}
+
+function requiredSnapshotStringArray(value: unknown, field: string): string[] {
+  if (
+    !Array.isArray(value) ||
+    value.length === 0 ||
+    value.some((entry) => typeof entry !== "string" || !entry.trim() || entry !== entry.trim())
+  ) {
+    throw new Error(`Gitcrawl cloud snapshot ${field} must be non-empty trimmed strings`);
+  }
+  const strings = value as string[];
+  if (new Set(strings).size !== strings.length) {
+    throw new Error(`Gitcrawl cloud snapshot ${field} must not contain duplicates`);
+  }
+  return strings;
 }

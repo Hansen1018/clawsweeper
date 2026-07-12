@@ -31,6 +31,8 @@ import { CloudGitcrawlQuerySource } from "./gitcrawl-evidence-cloud.js";
 import { LocalGitcrawlQuerySource } from "./gitcrawl-evidence-local.js";
 import {
   deriveGitcrawlThreadPolicySignals,
+  sanitizeGitcrawlPromptValue,
+  stripGitcrawlHtmlComments,
   type GitcrawlThreadPolicySignals,
 } from "./gitcrawl-evidence-policy.js";
 import { hasSecuritySignalText } from "./security-signals.js";
@@ -174,6 +176,14 @@ type SessionState = {
   repository: string;
   archive: string;
   snapshotId: string;
+  sourceSha256: string;
+  snapshotSchemaName: string;
+  snapshotSchemaVersion: number;
+  snapshotSchemaHash: string;
+  snapshotCapabilities: string[];
+  snapshotPublishedAt: string;
+  snapshotCutoverAt: string;
+  snapshotCoverageComplete: boolean;
   sourceSyncAt: string;
   datasetGeneratedAt: string;
   coverage: GitcrawlCoverageRow[];
@@ -900,6 +910,14 @@ async function initializeSession(
     repository: options.repository,
     archive: "",
     snapshotId: "",
+    sourceSha256: "",
+    snapshotSchemaName: "",
+    snapshotSchemaVersion: 0,
+    snapshotSchemaHash: "",
+    snapshotCapabilities: [],
+    snapshotPublishedAt: "",
+    snapshotCutoverAt: "",
+    snapshotCoverageComplete: false,
     sourceSyncAt: "",
     datasetGeneratedAt: "",
     coverage: [],
@@ -1111,16 +1129,69 @@ function bindEnvelope(
     throw new Error(`Gitcrawl ${name} returned mismatched source identity`);
   }
   assertSnapshotId(stats.snapshot_id);
+  const snapshotValue: unknown = envelope.snapshot;
+  if (typeof snapshotValue !== "object" || snapshotValue === null || Array.isArray(snapshotValue)) {
+    throw new Error(`Gitcrawl ${name} returned no snapshot provenance`);
+  }
+  const snapshot = snapshotValue as GitcrawlQueryEnvelope["snapshot"];
+  if (
+    !Array.isArray(snapshot.capabilities) ||
+    snapshot.capabilities.some((capability) => typeof capability !== "string")
+  ) {
+    throw new Error(`Gitcrawl ${name} returned malformed snapshot capabilities`);
+  }
+  assertSha256(snapshot.source_sha256, "Gitcrawl snapshot source sha256");
+  if (
+    snapshot.id !== stats.snapshot_id ||
+    snapshot.source_sync_at !== stats.source_sync_at ||
+    snapshot.dataset_generated_at !== stats.dataset_generated_at ||
+    snapshot.coverage_complete !== stats.coverage_complete
+  ) {
+    throw new Error(`Gitcrawl ${name} returned mismatched snapshot provenance`);
+  }
+  if (state.source.provider === "cloud") {
+    assertSha256(snapshot.id, "Gitcrawl cloud snapshot id");
+    if (
+      snapshot.id !== snapshot.source_sha256 ||
+      !snapshot.schema_name.trim() ||
+      !Number.isSafeInteger(snapshot.schema_version) ||
+      snapshot.schema_version <= 0 ||
+      !snapshot.schema_hash.trim() ||
+      !snapshot.capabilities.includes(name) ||
+      !snapshot.published_at ||
+      !snapshot.cutover_at
+    ) {
+      throw new Error(`Gitcrawl ${name} returned incomplete cloud snapshot provenance`);
+    }
+    parseRfc3339Timestamp(snapshot.published_at, "Gitcrawl cloud snapshot published_at");
+    parseRfc3339Timestamp(snapshot.cutover_at, "Gitcrawl cloud snapshot cutover_at");
+  }
   if (!stats.coverage_complete && name !== "gitcrawl.coverage") {
     throw new Error(`Gitcrawl ${name} returned incomplete coverage`);
   }
   if (!state.snapshotId) {
     state.archive = stats.archive;
     state.snapshotId = stats.snapshot_id;
+    state.sourceSha256 = snapshot.source_sha256;
+    state.snapshotSchemaName = snapshot.schema_name;
+    state.snapshotSchemaVersion = snapshot.schema_version;
+    state.snapshotSchemaHash = snapshot.schema_hash;
+    state.snapshotCapabilities = [...snapshot.capabilities];
+    state.snapshotPublishedAt = snapshot.published_at;
+    state.snapshotCutoverAt = snapshot.cutover_at;
+    state.snapshotCoverageComplete = snapshot.coverage_complete;
     state.sourceSyncAt = stats.source_sync_at;
     state.datasetGeneratedAt = stats.dataset_generated_at;
   } else if (
     stats.snapshot_id !== state.snapshotId ||
+    snapshot.source_sha256 !== state.sourceSha256 ||
+    snapshot.schema_name !== state.snapshotSchemaName ||
+    snapshot.schema_version !== state.snapshotSchemaVersion ||
+    snapshot.schema_hash !== state.snapshotSchemaHash ||
+    canonicalJson(snapshot.capabilities) !== canonicalJson(state.snapshotCapabilities) ||
+    snapshot.published_at !== state.snapshotPublishedAt ||
+    snapshot.cutover_at !== state.snapshotCutoverAt ||
+    snapshot.coverage_complete !== state.snapshotCoverageComplete ||
     stats.archive !== state.archive ||
     stats.source_sync_at !== state.sourceSyncAt ||
     stats.dataset_generated_at !== state.datasetGeneratedAt
@@ -1202,13 +1273,18 @@ function normalizeCluster(row: Record<string, unknown>): GitcrawlClusterEvidence
     stableSlug: boundedString(row.stable_slug, 512),
     status: boundedString(row.status, 64),
     clusterType: boundedString(row.cluster_type, 64),
-    title: boundedString(row.title, 512),
+    title: boundedString(stripGitcrawlHtmlComments(safetyString(row.title, "cluster title")), 512),
     representative: {
       threadId: optionalPositive(row.representative_thread_id),
       number: optionalPositive(row.representative_number),
       kind: boundedString(row.representative_kind, 32),
       state: boundedString(row.representative_state, 32),
-      title: boundedString(row.representative_title, 512),
+      title: boundedString(
+        stripGitcrawlHtmlComments(
+          safetyString(row.representative_title, "cluster representative title"),
+        ),
+        512,
+      ),
     },
     memberCount: safeNonNegative(row.member_count, "member count"),
     createdAt: boundedString(row.created_at, 64),
@@ -1239,6 +1315,8 @@ function normalizeThread(row: Record<string, unknown>): GitcrawlThreadEvidence {
   }
   const safetyTitle = safetyString(row.title, "thread title");
   const safetyBody = safetyString(row.body, "thread body");
+  const promptTitle = stripGitcrawlHtmlComments(safetyTitle);
+  const promptBody = stripGitcrawlHtmlComments(safetyBody);
   const hasBodyField = typeof row.body === "string";
   const hasLabelsField = row.labels_json !== undefined && row.labels_json !== null;
   const hasAssigneesField = row.assignees_json !== undefined && row.assignees_json !== null;
@@ -1250,6 +1328,8 @@ function normalizeThread(row: Record<string, unknown>): GitcrawlThreadEvidence {
   const safetyAssignees = hasAssigneesField
     ? unboundedJsonArray(row.assignees_json, "thread assignees")
     : [];
+  const promptLabels = sanitizeGitcrawlPromptValue(safetyLabels);
+  const promptAssignees = sanitizeGitcrawlPromptValue(safetyAssignees);
   const securityMetadataComplete =
     completeSecurityMetadata &&
     hasBodyField &&
@@ -1327,18 +1407,21 @@ function normalizeThread(row: Record<string, unknown>): GitcrawlThreadEvidence {
     number: safePositive(row.number, "thread number"),
     kind: boundedString(row.kind, 32),
     state: boundedString(row.state, 32),
-    title: boundedString(safetyTitle, 512),
-    body: boundedString(safetyBody, 2_048),
+    title: boundedString(promptTitle, 512),
+    body: boundedString(promptBody, 2_048),
     authorLogin,
     authorType,
     ...(authorAssociation ? { authorAssociation } : {}),
     htmlUrl: boundedString(row.html_url, 2_048),
-    ...(hasLabelsField ? { labels: boundedJsonArray(safetyLabels, 32, 256) } : {}),
-    ...(hasAssigneesField ? { assignees: boundedJsonArray(safetyAssignees, 16, 256) } : {}),
+    ...(hasLabelsField ? { labels: boundedJsonArray(promptLabels, 32, 256) } : {}),
+    ...(hasAssigneesField ? { assignees: boundedJsonArray(promptAssignees, 16, 256) } : {}),
     isDraft: booleanValue(row.is_draft),
     createdAt: boundedString(row.created_at_gh, 64),
     updatedAt: boundedString(row.updated_at_gh || row.updated_at, 64),
-    keySummary: boundedString(row.key_summary, 2_048),
+    keySummary: boundedString(
+      stripGitcrawlHtmlComments(safetyString(row.key_summary, "thread key summary")),
+      2_048,
+    ),
     securitySensitive: hasSecuritySignalText(safetyTitle, safetyBody, safetyLabels),
     securityMetadataComplete,
     securityProjectionSha256: sha256Canonical(securityProjection),
@@ -1365,7 +1448,10 @@ function normalizeReviewContext(
     detailsUpdatedAt: boundedString(row.details_updated_at, 64),
     clusterId: optionalPositive(row.cluster_id),
     clusterSlug: boundedString(row.cluster_slug, 512),
-    clusterTitle: boundedString(row.cluster_title, 512),
+    clusterTitle: boundedString(
+      stripGitcrawlHtmlComments(safetyString(row.cluster_title, "review cluster title")),
+      512,
+    ),
     clusterStatus: boundedString(row.cluster_status, 64),
     clusterRole: boundedString(row.cluster_role, 64),
     scoreToRepresentative: optionalNumber(row.score_to_representative),

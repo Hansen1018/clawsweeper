@@ -68,6 +68,12 @@ checkpoint, and status-only commits are intentionally omitted.
 
 ### Changed
 
+- Made Gitcrawl intake dispatch recoverable with stable packet-bound dispatch
+  keys and durable receipts, while refusing to publish importer failures.
+  Cloud evidence now requires crawl-remote content-addressed snapshot
+  provenance, HTML-comment content is removed from excerpts, packets, jobs, and
+  prompts, and migration archive commands bind and revalidate the exact source
+  digest, size, device, and inode under mandatory writer exclusion.
 - Made action-ledger publication include every transactional import binding,
   added pre-dispatch apply and retry receipts with conservative unknown-outcome
   recovery, failed active apply items on runtime yield, and made ambiguous retry

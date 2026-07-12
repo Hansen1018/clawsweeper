@@ -220,6 +220,14 @@ jobs:
           if [ "$import_status" -eq 0 ] && [ "${pipeline_status[1]}" -ne 0 ]; then
             import_status="${pipeline_status[1]}"
           fi
+          if [ "$import_status" -ne 0 ]; then
+            : > .artifacts/cluster-repair-intake/generated-paths.txt
+            {
+              echo "count=0"
+              echo "should_dispatch=false"
+            } >> "$GITHUB_OUTPUT"
+            exit "$import_status"
+          fi
 
           mapfile -t generated < <(grep '^jobs/' "$generated_log" || true)
           printf '%s\n' "${generated[@]}" > .artifacts/cluster-repair-intake/generated-paths.txt
@@ -231,10 +239,9 @@ jobs:
               echo "should_dispatch=false"
             fi
           } >> "$GITHUB_OUTPUT"
-          exit "$import_status"
 
       - name: Record intake ledger
-        if: ${{ steps.prepare.outputs.should_import == 'true' }}
+        if: ${{ steps.prepare.outputs.should_import == 'true' && steps.import.outcome == 'success' }}
         env:
           LEDGER_PATH: ${{ steps.prepare.outputs.ledger_path }}
           TARGET_REPO: ${{ steps.prepare.outputs.target_repo }}
@@ -268,7 +275,7 @@ jobs:
 
       - name: Finalize Gitcrawl evidence action ledger
         id: gitcrawl-action-ledger-finalize
-        if: ${{ always() && steps.gitcrawl-action-ledger.outcome == 'success' }}
+        if: ${{ always() && steps.gitcrawl-action-ledger.outcome == 'success' && (steps.prepare.outputs.should_import != 'true' || steps.import.outcome == 'success') }}
         run: pnpm run --silent repair:action-ledger -- finalize
 
       - name: Stage immutable Gitcrawl evidence action ledger
@@ -303,7 +310,7 @@ jobs:
 
       - name: Prepare Gitcrawl intake publication transaction
         id: gitcrawl-publication
-        if: ${{ always() && steps.prepare.outputs.should_import == 'true' && steps.gitcrawl-action-ledger-paths.outcome == 'success' }}
+        if: ${{ always() && steps.prepare.outputs.should_import == 'true' && steps.import.outcome == 'success' && steps.gitcrawl-action-ledger-paths.outcome == 'success' }}
         env:
           TARGET_REPO: ${{ steps.prepare.outputs.target_repo }}
           LEDGER_PATH: ${{ steps.prepare.outputs.ledger_path }}
@@ -326,6 +333,7 @@ jobs:
           echo "paths_file=$publication_paths_file" >> "$GITHUB_OUTPUT"
 
       - name: Publish Gitcrawl intake transaction
+        id: gitcrawl-publication-publish
         if: ${{ always() && steps.gitcrawl-publication.outcome == 'success' }}
         run: |
           set -euo pipefail
@@ -342,8 +350,9 @@ jobs:
             --push-attempts 4 \
             --rebase-strategy normal
 
-      - name: Dispatch imported cluster repair
-        if: ${{ steps.import.outputs.should_dispatch == 'true' }}
+      - name: Recover pending Gitcrawl dispatches
+        id: gitcrawl-dispatch-recovery
+        if: ${{ always() && !cancelled() && steps.prepare.outcome == 'success' && steps.prepare.outputs.target_repo != '' && steps.gitcrawl-publication-publish.outcome != 'failure' }}
         env:
           GH_TOKEN: ${{ steps.central-token.outputs.token }}
           RUNNER: ${{ github.event.inputs.runner || vars.CLAWSWEEPER_WORKER_RUNNER || 'blacksmith-4vcpu-ubuntu-2404' }}
@@ -351,11 +360,57 @@ jobs:
           MODEL: internal
         run: |
           set -euo pipefail
-          mapfile -t jobs < .artifacts/cluster-repair-intake/generated-paths.txt
-          pnpm run repair:dispatch -- "${jobs[@]}" \
-            --mode autonomous \
-            --wait-for-capacity \
-            --runner "$RUNNER" \
-            --execution-runner "$EXECUTION_RUNNER" \
-            --model "$MODEL" \
-            --ref main
+          transactions_dir="results/cluster-repair-intake/transactions"
+          receipts_dir="results/cluster-repair-intake/dispatch-receipts"
+          pending_file=".artifacts/cluster-repair-intake/pending-dispatches.tsv"
+          receipt_paths_file=".artifacts/cluster-repair-intake/dispatch-receipt-paths.txt"
+          : > "$receipt_paths_file"
+          pnpm run --silent repair:gitcrawl-publication -- pending \
+            --root "$CLAWSWEEPER_STATE_DIR" \
+            --transactions-dir "$transactions_dir" \
+            --receipts-dir "$receipts_dir" \
+            --pending-file "$pending_file"
+
+          count=0
+          while IFS=$'\t' read -r transaction_path job_path dispatch_key receipt_path; do
+            test -n "$transaction_path"
+            test -n "$job_path"
+            test -n "$dispatch_key"
+            test -n "$receipt_path"
+            pnpm run repair:dispatch -- "$job_path" \
+              --mode autonomous \
+              --wait-for-capacity \
+              --runner "$RUNNER" \
+              --execution-runner "$EXECUTION_RUNNER" \
+              --model "$MODEL" \
+              --dispatch-key "$dispatch_key" \
+              --ref main
+            pnpm run --silent repair:gitcrawl-publication -- receipt \
+              --transaction "$transaction_path" \
+              --job "$job_path" \
+              --dispatch-key "$dispatch_key" \
+              --receipts-dir "$receipts_dir" \
+              --paths-file "$receipt_paths_file"
+            count=$((count + 1))
+          done < "$pending_file"
+          {
+            echo "count=$count"
+            echo "paths_file=$receipt_paths_file"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Publish Gitcrawl dispatch receipts
+        if: ${{ always() && steps.gitcrawl-dispatch-recovery.outcome == 'success' && steps.gitcrawl-dispatch-recovery.outputs.count != '0' }}
+        run: |
+          set -euo pipefail
+          publication_args=()
+          while IFS= read -r publication_path; do
+            test -n "$publication_path"
+            publication_args+=(--path "$publication_path")
+          done < "${{ steps.gitcrawl-dispatch-recovery.outputs.paths_file }}"
+          test "${#publication_args[@]}" -gt 0
+          pnpm run repair:publish-main -- \
+            --message "chore: record cluster repair dispatch receipts" \
+            "${publication_args[@]}" \
+            --max-attempts 12 \
+            --push-attempts 4 \
+            --rebase-strategy normal

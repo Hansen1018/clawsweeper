@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -16,8 +17,16 @@ import {
   buildGitcrawlEvidencePacket,
   renderGitcrawlEvidencePacket,
 } from "../../dist/repair/gitcrawl-evidence-graph.js";
-import { prepareGitcrawlPublicationTransaction } from "../../dist/repair/gitcrawl-publication-transaction.js";
+import {
+  listPendingGitcrawlDispatches,
+  prepareGitcrawlPublicationTransaction,
+  recordGitcrawlDispatchReceipt,
+} from "../../dist/repair/gitcrawl-publication-transaction.js";
 
+const GITCRAWL_PUBLICATION_CLI = path.join(
+  process.cwd(),
+  "dist/repair/gitcrawl-publication-transaction.js",
+);
 const now = new Date("2026-07-12T12:00:00.000Z");
 const env = {
   GITHUB_ACTIONS: "true",
@@ -265,19 +274,92 @@ test("Gitcrawl durable publication transaction binds jobs, cursor, and event sha
     runId: "123",
     runAttempt: "1",
   });
-  assert.deepEqual(transaction.generated_jobs, [
+  assert.equal(transaction.generated_jobs.length, 1);
+  assert.deepEqual(
+    {
+      path: transaction.generated_jobs[0]!.path,
+      packet_sha256: transaction.generated_jobs[0]!.packet_sha256,
+      binding_event_id: transaction.generated_jobs[0]!.binding_event_id,
+    },
     {
       path: jobPath,
       packet_sha256: packet.sha256,
       binding_event_id: readActionEventShard(path.join(root, shardPath)).at(-1)!.event_id,
     },
-  ]);
+  );
+  assert.match(transaction.generated_jobs[0]!.dispatch_key, /^gitcrawl-[a-f0-9]{64}$/);
   for (const requiredPath of [jobPath, shardPath, cursorPath, intakePath]) {
     assert.ok(transaction.publish_paths.includes(requiredPath), requiredPath);
   }
   assert.ok(
     transaction.publish_paths.includes("results/cluster-repair-intake/transactions/123-1.json"),
   );
+  const durableRoot = fs.realpathSync(
+    fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-gitcrawl-durable-")),
+  );
+  fs.mkdirSync(path.join(durableRoot, path.dirname(jobPath)), { recursive: true });
+  fs.copyFileSync(path.join(root, jobPath), path.join(durableRoot, jobPath));
+  const durableTransactionPath = "results/cluster-repair-intake/transactions/123-1.json";
+  fs.mkdirSync(path.join(durableRoot, path.dirname(durableTransactionPath)), {
+    recursive: true,
+  });
+  fs.copyFileSync(
+    path.join(root, durableTransactionPath),
+    path.join(durableRoot, durableTransactionPath),
+  );
+  const pendingInput = {
+    root,
+    transactionsDirectory: "results/cluster-repair-intake/transactions",
+    receiptsDirectory: "results/cluster-repair-intake/dispatch-receipts",
+  };
+  const pending = listPendingGitcrawlDispatches(pendingInput);
+  assert.equal(pending.length, 1);
+  assert.equal(pending[0]!.job_path, jobPath);
+  assert.equal(pending[0]!.dispatch_key, transaction.generated_jobs[0]!.dispatch_key);
+  const dispatchReceipt = recordGitcrawlDispatchReceipt({
+    root,
+    transactionPath: "results/cluster-repair-intake/transactions/123-1.json",
+    jobPath,
+    dispatchKey: transaction.generated_jobs[0]!.dispatch_key,
+    receiptsDirectory: "results/cluster-repair-intake/dispatch-receipts",
+    runId: "456",
+    runAttempt: "2",
+    dispatchedAt: now.toISOString(),
+  });
+  assert.equal(fs.existsSync(path.join(root, dispatchReceipt.path)), true);
+  assert.deepEqual(listPendingGitcrawlDispatches(pendingInput), []);
+
+  prepareGitcrawlPublicationTransaction({
+    root,
+    eventPaths: [shardPath],
+    generatedPaths: [jobPath],
+    cursorPath,
+    intakePath,
+    manifestPath: "results/cluster-repair-intake/transactions/unpublished.json",
+    runId: "unpublished",
+    runAttempt: "1",
+  });
+  const pendingFile = ".artifacts/cluster-repair-intake/pending.tsv";
+  execFileSync(
+    process.execPath,
+    [
+      GITCRAWL_PUBLICATION_CLI,
+      "pending",
+      "--root",
+      durableRoot,
+      "--transactions-dir",
+      "results/cluster-repair-intake/transactions",
+      "--receipts-dir",
+      "results/cluster-repair-intake/dispatch-receipts",
+      "--pending-file",
+      pendingFile,
+    ],
+    { cwd: root, stdio: "pipe" },
+  );
+  const durablePending = fs.readFileSync(path.join(root, pendingFile), "utf8").trim().split("\n");
+  assert.equal(durablePending.length, 1);
+  assert.match(durablePending[0]!, /transactions\/123-1\.json/);
+  assert.doesNotMatch(durablePending[0]!, /unpublished\.json/);
 
   const differentPacket = buildGitcrawlEvidencePacket({
     provider: "local",
@@ -346,6 +428,7 @@ test("Gitcrawl importers bind only after atomic publication and before cursor ad
 
 test("cluster intake publishes jobs, cursor, and Gitcrawl bindings in one durable transaction", () => {
   const workflow = fs.readFileSync(".github/workflows/repair-cluster-intake.yml", "utf8");
+  const dispatchSource = fs.readFileSync("src/repair/dispatch-jobs.ts", "utf8");
   assert.match(workflow, /name: Setup Gitcrawl evidence action ledger/);
   assert.match(workflow, /uses: \.\/\.github\/actions\/setup-action-ledger/);
   assert.match(workflow, /name: Finalize Gitcrawl evidence action ledger/);
@@ -358,11 +441,29 @@ test("cluster intake publishes jobs, cursor, and Gitcrawl bindings in one durabl
   assert.match(workflow, /repair:action-ledger -- publish/);
   assert.match(workflow, /--state-root "\$CLAWSWEEPER_STATE_DIR"/);
   assert.match(workflow, /name: Prepare Gitcrawl intake publication transaction/);
+  assert.match(
+    workflow,
+    /steps\.prepare\.outputs\.should_import == 'true' && steps\.import\.outcome == 'success'/,
+  );
   assert.match(workflow, /repair:gitcrawl-publication/);
   assert.match(workflow, /--generated-paths-file "\$generated_paths_file"/);
   assert.match(workflow, /--cursor "\$cursor_path"/);
   assert.match(workflow, /name: Publish Gitcrawl intake transaction/);
-  assert.equal(workflow.match(/pnpm run repair:publish-main/g)?.length, 1);
+  assert.match(workflow, /name: Recover pending Gitcrawl dispatches/);
+  assert.match(workflow, /repair:gitcrawl-publication -- pending/);
+  assert.match(workflow, /--root "\$CLAWSWEEPER_STATE_DIR"/);
+  assert.match(workflow, /--dispatch-key "\$dispatch_key"/);
+  assert.match(workflow, /repair:gitcrawl-publication -- receipt/);
+  assert.match(workflow, /name: Publish Gitcrawl dispatch receipts/);
+  assert.match(dispatchSource, /if \(dispatchKey\) return true;/);
+  assert.match(dispatchSource, /`dispatch_key=\$\{dispatchKey\}`/);
+  const recoveryCondition = workflow.match(
+    /- name: Recover pending Gitcrawl dispatches\n[\s\S]*?\n\s+if: (\$\{\{[^\n]+\}\})/,
+  )?.[1];
+  assert.ok(recoveryCondition);
+  assert.match(recoveryCondition, /steps\.gitcrawl-publication-publish\.outcome != 'failure'/);
+  assert.doesNotMatch(recoveryCondition, /steps\.import\.outcome == 'success'/);
+  assert.equal(workflow.match(/pnpm run repair:publish-main/g)?.length, 2);
   assert.doesNotMatch(workflow, /chore: append Gitcrawl evidence action ledger/);
   assert.ok(
     workflow.indexOf("Stage immutable Gitcrawl evidence action ledger") <
