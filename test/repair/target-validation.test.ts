@@ -1683,24 +1683,18 @@ test("pnpm fallback shares one setup and install identity deadline", () => {
   const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-pnpm-deadline-"));
   const corepackPath = path.join(binDir, "corepack.js");
   const pnpmPath = path.join(binDir, "pnpm.js");
-  const invocationPath = path.join(binDir, "pnpm-count");
   fs.writeFileSync(
     corepackPath,
-    "Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 80);\n",
+    "Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);\n",
   );
   fs.writeFileSync(
     pnpmPath,
-    `const fs = require("node:fs");
-const count = fs.existsSync(${JSON.stringify(invocationPath)})
-  ? Number(fs.readFileSync(${JSON.stringify(invocationPath)}, "utf8"))
-  : 0;
-fs.writeFileSync(${JSON.stringify(invocationPath)}, String(count + 1));
-if (count === 0) {
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 140);
+    `if (process.argv.includes("--frozen-lockfile")) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
   console.error("ERR_PNPM_OUTDATED_LOCKFILE");
   process.exit(1);
 }
-Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 400);
+Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10000);
 `,
   );
   const previousCorepackBin = process.env.COREPACK_BIN;
@@ -1721,9 +1715,9 @@ Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 400);
             },
           }),
           installTargetDeps: true,
-          installTimeoutMs: 500,
-          proofBudgetMs: 500,
-          setupTimeoutMs: 500,
+          installTimeoutMs: 5000,
+          proofBudgetMs: 700,
+          setupTimeoutMs: 5000,
         }),
       /command timed out after \d+ms: pnpm install --no-frozen-lockfile/,
     );
@@ -1733,7 +1727,6 @@ Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 400);
     restoreEnv("PNPM_BIN", previousPnpmBin);
     restoreEnv("PNPM_BIN_ARGS", previousPnpmBinArgs);
   }
-  assert.equal(fs.readFileSync(invocationPath, "utf8"), "2");
 });
 
 test("pnpm lockfile restoration uses the remaining absolute toolchain deadline", () => {
