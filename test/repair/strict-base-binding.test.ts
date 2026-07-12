@@ -727,7 +727,7 @@ test("exact router lanes are item-specific and durable dispatch is globally seri
   assert.ok(candidateSelection.indexOf("forceReprocess && itemNumbers.size > 0") >= 0);
   assert.match(
     candidateSelection,
-    /itemNumbers[\s\S]*const durable = listDurableRouterComments\(\[\.\.\.itemNumbers\]\)[\s\S]*recentComments: \[\.\.\.itemNumbers\]\.flatMap[\s\S]*durableComments: durable\.markerComments[\s\S]*priorityComments: \[\.\.\.forwardedExactComments\(\), \.\.\.durable\.pendingComments\]/,
+    /itemNumbers[\s\S]*recentComments: \[\.\.\.itemNumbers\][\s\S]*\.flatMap[\s\S]*isSuppressedStaleDurableComment[\s\S]*priorityComments: \[\.\.\.forwardedExactComments\(\), \.\.\.durable\.pendingComments\]/,
   );
   assert.ok(
     candidateSelection.indexOf("selectRouterItemFanoutPage({") <
@@ -795,7 +795,7 @@ test("exact router lanes are item-specific and durable dispatch is globally seri
   assert.match(String(dispatchStep?.run ?? ""), /\.status == "waiting" or \.status == "claimed"/);
   assert.match(
     String(dispatchStep?.run ?? ""),
-    /group_by\(\[[\s\S]*\.issue_number,[\s\S]*\.comment_id,[\s\S]*\.attempt_id/,
+    /group_by\(\[\s*\.issue_number,\s*\(\.comment_version_key \/\/ \.idempotency_key \/\/ \.comment_id\),\s*\(\.attempt_id \/\/ ""\)\s*\]\)/,
   );
   assert.match(String(dispatchStep?.run ?? ""), /dispatch_context\.since/);
   assert.match(String(dispatchStep?.run ?? ""), /status_comment_id/);

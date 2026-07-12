@@ -1532,6 +1532,15 @@ test("exact synthetic label sweeps revalidate live opt-in before recreating the 
   );
 });
 
+test("durable dispatch queue separates comment versions and synthetic attempts", () => {
+  const workflow = readFileSync(".github/workflows/repair-comment-router.yml", "utf8");
+
+  assert.match(
+    workflow,
+    /group_by\(\[\s*\.issue_number,\s*\(\.comment_version_key \/\/ \.idempotency_key \/\/ \.comment_id\),\s*\(\.attempt_id \/\/ ""\)\s*\]\)/,
+  );
+});
+
 test("forced exact-item replay scopes forwarded comment ids before item-wide reconciliation", () => {
   const source = readFileSync("src/repair/comment-router.ts", "utf8");
   const candidates = source.slice(
@@ -1550,6 +1559,14 @@ test("forced exact-item replay scopes forwarded comment ids before item-wide rec
   assert.match(
     candidates,
     /recentComments: forwardedExactComments\(\)[\s\S]*durableComments: \[\]/,
+  );
+  assert.match(
+    candidates,
+    /flatMap\(\(number\) => issueCommentsFor\(number\)\)[\s\S]*filter\(\(comment\) => !isSuppressedStaleDurableComment\(comment\)\)/,
+  );
+  assert.match(
+    candidates,
+    /forwardedExactComments\(\)[\s\S]*filter\(\(commentId\) => !isSuppressedStaleDurableComment\(\{ id: commentId \}\)\)/,
   );
   assert.match(candidates, /maxComments: Math\.max\(maxComments, effectiveCommentIds\.size\)/);
   assert.match(candidates, /itemNumbers\.has\(issueNumberFromUrl\(comment\.issue_url\) \?\? 0\)/);
@@ -1622,7 +1639,13 @@ test("broad router selects distinct item cursors before bounded comment hydratio
   );
   assert.match(
     durable,
-    /pendingCommentIds[\s\S]*\.map\(\(commentId\) => fetchCandidateIssueComment/,
+    /pendingCommentIds[\s\S]*reconcileDurableRouterCommentIds\(pendingCommentIds, selectedItems\)/,
+  );
+  assert.match(durable, /liveComments\.set\(commentId, fetchCandidateIssueComment\(commentId\)\)/);
+  assert.match(durable, /reconcileDurableCommentVersions\(\{/);
+  assert.match(
+    durable,
+    /appendLedger\(ledger, reconciliation\.resolutions\)[\s\S]*writeLedger\(ledgerPath\(\), ledger\)/,
   );
   assert.match(durable, /markerComments: numbers\.flatMap\(\(number\) =>/);
   assert.match(durable, /isClawSweeperReviewMarkerComment\(comment\)/);

@@ -26,36 +26,43 @@ const LEDGER_COMMAND_STRING_FIELDS = [
 ] as const;
 const COMMENT_ROUTER_LEDGER_ENTRY_LIMIT = 1000;
 const ACTIVE_COMMENT_ROUTER_STATUSES = new Set(["waiting", "claimed"]);
+export const EDITED_DURABLE_COMMENT_VERSION_REASON =
+  "durable comment version was edited before dispatch";
+export const DELETED_DURABLE_COMMENT_VERSION_REASON =
+  "durable comment version was deleted before dispatch";
 
 export function dispatchClaimLookupKeys(entry: LooseRecord) {
   const keys: string[] = [];
-  const attemptId = forcedReplayAttemptId(entry);
+  const attempt = dispatchAttemptIdentity(entry);
   const commentId = String(entry.comment_id ?? "").trim();
   const commentUpdatedAt = String(entry.comment_updated_at ?? "").trim();
   if (commentId && commentUpdatedAt) {
-    keys.push(scopedDispatchLookupKey(`comment:${commentId}:${commentUpdatedAt}`, attemptId));
+    keys.push(scopedDispatchLookupKey(`comment:${commentId}:${commentUpdatedAt}`, attempt));
   }
   const idempotencyKey = String(entry.idempotency_key ?? "").trim();
   if (idempotencyKey) {
-    keys.push(scopedDispatchLookupKey(`idempotency:${idempotencyKey}`, attemptId));
+    keys.push(scopedDispatchLookupKey(`idempotency:${idempotencyKey}`, attempt));
   }
   return keys;
 }
 
 export function dispatchReceiptKeyMaterial(entry: LooseRecord, claim: LooseRecord | null) {
   const idempotencyKey = String(entry.idempotency_key ?? entry.comment_version_key ?? "unknown");
-  const attemptId = forcedReplayAttemptId(entry);
-  if (attemptId) {
+  const attempt = dispatchAttemptIdentity(entry);
+  if (attempt?.kind === "forced_replay") {
     return JSON.stringify({
       idempotency_key: idempotencyKey,
-      forced_replay_attempt_id: attemptId,
+      forced_replay_attempt_id: attempt.attemptId,
     });
   }
+  if (attempt?.kind === "repair_loop_label_sweep") {
+    return `${idempotencyKey}:attempt:${attempt.attemptId}`;
+  }
   if (entry.automation_source !== "repair_loop_label_sweep") return idempotencyKey;
-  const attempt = String(
+  const legacyAttempt = String(
     claim?.processed_at ?? entry.processed_at ?? entry.comment_updated_at ?? "unknown-attempt",
   );
-  return `${idempotencyKey}:${attempt}`;
+  return `${idempotencyKey}:${legacyAttempt}`;
 }
 
 export function routerDispatchReceiptKey(entry: LooseRecord, claim: LooseRecord | null) {
@@ -66,12 +73,45 @@ export function routerDispatchReceiptKey(entry: LooseRecord, claim: LooseRecord 
 }
 
 function forcedReplayAttemptId(entry: LooseRecord): string | null {
+  if (entry.forced_replay !== true) return null;
   const identity = forcedReplayIdentityFields(entry);
   return identity.attempt_id ? String(identity.attempt_id) : null;
 }
 
-function scopedDispatchLookupKey(key: string, attemptId: string | null): string {
-  return attemptId ? `forced-replay:${JSON.stringify([key, attemptId])}` : key;
+function repairLoopSweepAttemptId(entry: LooseRecord): string | null {
+  if (
+    entry.forced_replay === true ||
+    entry.automation_source !== "repair_loop_label_sweep" ||
+    entry.attempt_id === undefined ||
+    entry.attempt_id === null
+  ) {
+    return null;
+  }
+  return validatedAttemptId(entry.attempt_id, "repair-loop sweep");
+}
+
+function dispatchAttemptIdentity(
+  entry: LooseRecord,
+): { kind: "forced_replay" | "repair_loop_label_sweep"; attemptId: string } | null {
+  const forcedReplayAttempt = forcedReplayAttemptId(entry);
+  if (forcedReplayAttempt) {
+    return { kind: "forced_replay", attemptId: forcedReplayAttempt };
+  }
+  const repairLoopAttempt = repairLoopSweepAttemptId(entry);
+  return repairLoopAttempt
+    ? { kind: "repair_loop_label_sweep", attemptId: repairLoopAttempt }
+    : null;
+}
+
+function scopedDispatchLookupKey(
+  key: string,
+  attempt: ReturnType<typeof dispatchAttemptIdentity>,
+): string {
+  if (!attempt) return key;
+  if (attempt.kind === "forced_replay") {
+    return `forced-replay:${JSON.stringify([key, attempt.attemptId])}`;
+  }
+  return `repair-loop-attempt:${JSON.stringify([key, attempt.attemptId])}`;
 }
 
 export function hasSuccessfulDispatchExecutionJob(jobs: LooseRecord[], requiredJobName: string) {
@@ -198,6 +238,121 @@ export function exactCommentVersionMatchesLive(command: LooseRecord, live: JsonV
     String(comment.updated_at ?? "") === String(command.comment_updated_at ?? "") &&
     commentBodySha256(comment.body) === String(command.comment_body_sha256 ?? "")
   );
+}
+
+export function repairLoopSweepAttemptIdentity({
+  commands,
+  idempotencyKey,
+}: {
+  commands: LooseRecord[];
+  idempotencyKey: string;
+}) {
+  const matching = commands.filter(
+    (entry) =>
+      entry.automation_source === "repair_loop_label_sweep" &&
+      entry.forced_replay !== true &&
+      String(entry.idempotency_key ?? "") === idempotencyKey,
+  );
+  const active = matching
+    .filter((entry) => ACTIVE_COMMENT_ROUTER_STATUSES.has(String(entry.status ?? "")))
+    .sort((left, right) => {
+      const sequenceDifference =
+        (ledgerAttemptSequence(left) ?? 0) - (ledgerAttemptSequence(right) ?? 0);
+      return sequenceDifference || ledgerEntryTime(left) - ledgerEntryTime(right);
+    })
+    .at(-1);
+  if (active) {
+    const attemptId = repairLoopSweepAttemptId(active);
+    const attemptSequence = ledgerAttemptSequence(active);
+    return {
+      ...(attemptId ? { attemptId } : {}),
+      ...(attemptSequence !== null ? { attemptSequence } : {}),
+    };
+  }
+
+  const attemptSequence =
+    matching.reduce((maximum, entry) => Math.max(maximum, ledgerAttemptSequence(entry) ?? 0), 0) +
+    1;
+  const attemptId = createHash("sha256")
+    .update(`${idempotencyKey}:attempt:${attemptSequence}`, "utf8")
+    .digest("hex");
+  return { attemptId, attemptSequence };
+}
+
+export function reconcileDurableCommentVersions({
+  commands,
+  liveComments,
+  repo,
+  itemNumbers,
+  processedAt = new Date().toISOString(),
+}: {
+  commands: LooseRecord[];
+  liveComments: ReadonlyMap<string, LooseRecord | null>;
+  repo: string;
+  itemNumbers: ReadonlySet<number>;
+  processedAt?: string;
+}) {
+  const normalizedRepo = repo.trim().toLowerCase();
+  const activeByCommentId = new Map<string, LooseRecord[]>();
+  for (const command of commands) {
+    if (!ACTIVE_COMMENT_ROUTER_STATUSES.has(String(command.status ?? ""))) continue;
+    if (
+      String(command.repo ?? "")
+        .trim()
+        .toLowerCase() !== normalizedRepo
+    ) {
+      continue;
+    }
+    if (!itemNumbers.has(Number(command.issue_number))) continue;
+    const commentId = String(command.comment_id ?? "");
+    if (!/^[1-9]\d*$/.test(commentId) || !liveComments.has(commentId)) continue;
+    const entries = activeByCommentId.get(commentId) ?? [];
+    entries.push(command);
+    activeByCommentId.set(commentId, entries);
+  }
+
+  const pendingComments: LooseRecord[] = [];
+  const resolutions: LooseRecord[] = [];
+  const suppressedCommentIds: string[] = [];
+  for (const [commentId, active] of activeByCommentId) {
+    const live = liveComments.get(commentId) ?? null;
+    const matching = live
+      ? active.filter((command) => durableCommentVersionMatchesLive(command, live))
+      : [];
+    const matchingCommands = new Set(matching);
+    if (live && matching.length > 0) pendingComments.push(live);
+    if (matching.length === 0) suppressedCommentIds.push(commentId);
+
+    const resolutionReason = live
+      ? EDITED_DURABLE_COMMENT_VERSION_REASON
+      : DELETED_DURABLE_COMMENT_VERSION_REASON;
+    for (const command of active) {
+      if (matchingCommands.has(command)) continue;
+      resolutions.push({
+        ...command,
+        status: "skipped",
+        processed_at: processedAt,
+        resolution_reason: resolutionReason,
+        actions: Array.isArray(command.actions)
+          ? command.actions.map((action: JsonValue) =>
+              action?.status === "executed" ? action : { ...action, status: "skipped" },
+            )
+          : command.actions,
+      });
+    }
+  }
+  return { pendingComments, resolutions, suppressedCommentIds };
+}
+
+function durableCommentVersionMatchesLive(command: LooseRecord, live: LooseRecord) {
+  if (
+    String(command.comment_id ?? "") !== String(live.id ?? "") ||
+    String(command.comment_updated_at ?? "") !== String(live.updated_at ?? "")
+  ) {
+    return false;
+  }
+  const expectedDigest = String(command.comment_body_sha256 ?? "");
+  return !expectedDigest || expectedDigest === commentBodySha256(live.body);
 }
 
 export function exactCommentVersionFastPathDecision({
@@ -663,10 +818,13 @@ export function appendLedger(current: LooseRecord, entries: LooseRecord[]) {
     .filter((entry: JsonValue) => !isNoopSkip(entry))
     .flatMap((entry: JsonValue) => {
       const actions = compactLedgerActions(entry.actions);
-      const forcedReplayIdentity = forcedReplayIdentityFields(entry);
-      const attemptIds = ledgerAttemptIds({ ...entry, ...forcedReplayIdentity });
+      const identityFields = durableAttemptIdentityFields(entry);
+      const normalizedEntry = { ...entry, ...identityFields };
+      const attemptIds = ledgerAttemptIds(normalizedEntry);
+      const attemptSequence = ledgerAttemptSequence(normalizedEntry);
       const statusCommentId = compactRouterStatusCommentId(entry.status_comment_id);
       const dispatchContext = compactRouterDispatchContext(entry.dispatch_context);
+      const resolutionReason = boundedRouterContextString(entry.resolution_reason, 255);
       return attemptIds.map((attemptId) => ({
         idempotency_key: entry.idempotency_key,
         comment_id: entry.comment_id,
@@ -676,7 +834,10 @@ export function appendLedger(current: LooseRecord, entries: LooseRecord[]) {
         comment_updated_at: entry.comment_updated_at ?? null,
         ...(statusCommentId ? { status_comment_id: statusCommentId } : {}),
         ...(entry.comment_body_sha256 ? { comment_body_sha256: entry.comment_body_sha256 } : {}),
-        ...(attemptId ? { forced_replay: true, attempt_id: attemptId } : {}),
+        ...(normalizedEntry.forced_replay === true ? { forced_replay: true } : {}),
+        ...(attemptId ? { attempt_id: attemptId } : {}),
+        ...(attemptSequence !== null ? { attempt_sequence: attemptSequence } : {}),
+        ...(resolutionReason ? { resolution_reason: resolutionReason } : {}),
         repo: entry.repo,
         issue_number: entry.issue_number,
         author: entry.author,
@@ -731,7 +892,7 @@ function validatedLedgerCommand(entry: JsonValue): LooseRecord {
   if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
     throw new Error("comment router ledger commands must be objects");
   }
-  const command = { ...entry, ...forcedReplayIdentityFields(entry) };
+  const command = { ...entry, ...durableAttemptIdentityFields(entry) };
   for (const field of LEDGER_COMMAND_STRING_FIELDS) {
     const value = command[field];
     if (value !== undefined && value !== null && (typeof value !== "string" || !value.trim())) {
@@ -782,26 +943,78 @@ function validatedLedgerCommand(entry: JsonValue): LooseRecord {
   ) {
     throw new Error("comment router ledger command dispatch_context is invalid");
   }
+  const resolutionReason = boundedRouterContextString(command.resolution_reason, 255);
+  if (
+    command.resolution_reason !== undefined &&
+    command.resolution_reason !== null &&
+    resolutionReason === null
+  ) {
+    throw new Error("comment router ledger command resolution_reason is invalid");
+  }
   return {
     ...command,
     ...(statusCommentId ? { status_comment_id: statusCommentId } : {}),
     ...(dispatchContext ? { dispatch_context: dispatchContext } : {}),
+    ...(resolutionReason ? { resolution_reason: resolutionReason } : {}),
   };
 }
 
 function forcedReplayIdentityFields(entry: LooseRecord): LooseRecord {
   const forcedReplay = entry.forced_replay;
-  const hasAttemptId = entry.attempt_id !== undefined && entry.attempt_id !== null;
-  const attemptId = String(entry.attempt_id ?? "").trim();
-  if (
-    (forcedReplay === undefined || forcedReplay === null || forcedReplay === false) &&
-    !hasAttemptId
-  ) {
-    return {};
-  }
+  if (forcedReplay === undefined || forcedReplay === null || forcedReplay === false) return {};
   if (forcedReplay !== true) {
     throw new Error("forced replay dispatch identity requires forced_replay=true");
   }
+  const attemptId = validatedAttemptId(entry.attempt_id, "forced replay");
+  return { forced_replay: true, attempt_id: attemptId };
+}
+
+function durableAttemptIdentityFields(entry: LooseRecord): LooseRecord {
+  if (
+    entry.forced_replay !== undefined &&
+    entry.forced_replay !== null &&
+    entry.forced_replay !== false &&
+    entry.forced_replay !== true
+  ) {
+    throw new Error("forced replay dispatch identity requires forced_replay=true");
+  }
+  const hasAttemptId = entry.attempt_id !== undefined && entry.attempt_id !== null;
+  const hasAttemptSequence =
+    entry.attempt_sequence !== undefined && entry.attempt_sequence !== null;
+  const hasForcedReplayAttempts =
+    entry.forced_replay_attempt_ids !== undefined && entry.forced_replay_attempt_ids !== null;
+  if (entry.forced_replay === true) {
+    if (hasAttemptSequence) {
+      throw new Error("forced replay dispatch identity cannot include attempt_sequence");
+    }
+    return forcedReplayIdentityFields(entry);
+  }
+  if (entry.automation_source === "repair_loop_label_sweep") {
+    if (hasForcedReplayAttempts) {
+      throw new Error("repair-loop sweep identity cannot include forced replay attempts");
+    }
+    if (!hasAttemptId && !hasAttemptSequence) return {};
+    if (!hasAttemptId || !hasAttemptSequence) {
+      throw new Error("repair-loop sweep identity requires attempt_id and attempt_sequence");
+    }
+    const attemptId = validatedAttemptId(entry.attempt_id, "repair-loop sweep");
+    const attemptSequence = ledgerAttemptSequence(entry);
+    if (attemptSequence === null) {
+      throw new Error("repair-loop sweep attempt_sequence must be a positive integer");
+    }
+    return { attempt_id: attemptId, attempt_sequence: attemptSequence };
+  }
+  if (hasAttemptId || hasForcedReplayAttempts) {
+    throw new Error("forced replay dispatch identity requires forced_replay=true");
+  }
+  if (hasAttemptSequence) {
+    throw new Error("durable dispatch attempt identity is not valid for this command");
+  }
+  return {};
+}
+
+function validatedAttemptId(value: JsonValue, kind: string): string {
+  const attemptId = String(value ?? "").trim();
   if (
     !attemptId ||
     attemptId.length > 128 ||
@@ -809,10 +1022,10 @@ function forcedReplayIdentityFields(entry: LooseRecord): LooseRecord {
     attemptId.includes(String.fromCharCode(0))
   ) {
     throw new Error(
-      "forced replay dispatch attempt_id must be a non-empty token of at most 128 characters",
+      `${kind} dispatch attempt_id must be a non-empty token of at most 128 characters`,
     );
   }
-  return { forced_replay: true, attempt_id: attemptId };
+  return attemptId;
 }
 
 function compactRouterDispatchContext(value: JsonValue) {
@@ -923,12 +1136,15 @@ function ledgerEntryKey(entry: LooseRecord) {
       entry.comment_version_key ??
       `${entry.comment_id ?? "unknown"}:${entry.comment_updated_at ?? "unknown"}`;
   }
-  const attemptId = forcedReplayAttemptId(entry);
-  return attemptId ? `${key}:attempt:${attemptId}` : key;
+  const attempt = dispatchAttemptIdentity(entry);
+  return attempt ? `${key}:${attempt.kind}:attempt:${attempt.attemptId}` : key;
 }
 
 function ledgerAttemptIds(entry: LooseRecord): Array<string | null> {
-  if (entry.forced_replay !== true || !Array.isArray(entry.forced_replay_attempt_ids)) {
+  if (entry.forced_replay !== true) {
+    return [repairLoopSweepAttemptId(entry)];
+  }
+  if (!Array.isArray(entry.forced_replay_attempt_ids)) {
     return [forcedReplayAttemptId(entry)];
   }
   const attempts = new Map<string, string>();
@@ -937,6 +1153,11 @@ function ledgerAttemptIds(entry: LooseRecord): Array<string | null> {
     if (attemptId) attempts.set(attemptId, attemptId);
   }
   return attempts.size > 0 ? [...attempts.values()] : [forcedReplayAttemptId(entry)];
+}
+
+function ledgerAttemptSequence(entry: LooseRecord): number | null {
+  const sequence = Number(entry.attempt_sequence);
+  return Number.isSafeInteger(sequence) && sequence > 0 ? sequence : null;
 }
 
 function preferredLedgerEntry(left: LooseRecord, right: LooseRecord): LooseRecord {

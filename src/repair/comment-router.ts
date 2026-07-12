@@ -104,6 +104,8 @@ import {
   isGitHubAppIntegrationAuthError,
   parseRepairLoopSweepCommandId,
   readLedger,
+  reconcileDurableCommentVersions,
+  repairLoopSweepAttemptIdentity,
   routerDispatchReceiptKey,
   routerCommandNeedsExactLane,
   routerFanoutItemNumbers,
@@ -263,6 +265,9 @@ const liveTargetCache = new Map<number, LooseRecord>();
 const issueCommentsCache = new Map<number, JsonValue[]>();
 const autocloseSafetyCommentsCache = new Map<number, JsonValue[]>();
 const candidateIssueCommentCache = new Map<string, LooseRecord | null>();
+const staleDurableCommentIds = new Set<string>();
+const durableCommentVersionResolutions: LooseRecord[] = [];
+let durableCommentVersionLedgerChanged = false;
 const MAX_MEDIA_PREPROCESSING_TIMEOUT_MS = 480_000;
 const PROOF_OVERRIDE_DESCRIPTION_MARKER = "<!-- clawsweeper-proof-override-note -->";
 const cachedIssueComments = createCachedIssueCommentsLookup(
@@ -498,6 +503,12 @@ report.timings = {
   total_ms: Date.now() - startedAtMs,
   phases: timings,
 };
+report.durable_comment_versions_resolved = durableCommentVersionResolutions.map((command) => ({
+  comment_id: command.comment_id,
+  comment_version_key: command.comment_version_key,
+  resolution_reason: command.resolution_reason,
+}));
+report.ledger_reconciled = durableCommentVersionLedgerChanged;
 if (writeReport) writeReportFile(repoRoot(), report);
 await flushCommandActionEvents();
 console.log(JSON.stringify(report, null, 2));
@@ -4336,6 +4347,10 @@ function emptyCandidateSelection(): CandidateCommentSelection {
 
 function listCandidateComments() {
   if (forceReprocess && itemNumbers.size > 0 && effectiveCommentIds.size > 0) {
+    reconcileDurableRouterCommentIds(
+      [...effectiveCommentIds].filter((commentId) => /^[1-9]\d*$/.test(commentId)),
+      itemNumbers,
+    );
     return {
       ...emptyCandidateSelection(),
       comments: selectCommentsForRouting({
@@ -4350,7 +4365,9 @@ function listCandidateComments() {
     return {
       ...emptyCandidateSelection(),
       comments: selectCommentsForRouting({
-        recentComments: [...itemNumbers].flatMap((number) => issueCommentsFor(number)),
+        recentComments: [...itemNumbers]
+          .flatMap((number) => issueCommentsFor(number))
+          .filter((comment) => !isSuppressedStaleDurableComment(comment)),
         durableComments: durable.markerComments,
         priorityComments: [...forwardedExactComments(), ...durable.pendingComments],
         maxComments,
@@ -4400,9 +4417,14 @@ function listCandidateComments() {
   };
 }
 
+function isSuppressedStaleDurableComment(comment: JsonValue) {
+  return execute && staleDurableCommentIds.has(String(comment?.id ?? ""));
+}
+
 function forwardedExactComments() {
   return [...effectiveCommentIds]
     .filter((commentId) => /^[1-9]\d*$/.test(commentId))
+    .filter((commentId) => !isSuppressedStaleDurableComment({ id: commentId }))
     .map((commentId) => fetchCandidateIssueComment(commentId))
     .filter(
       (comment): comment is LooseRecord =>
@@ -4449,9 +4471,9 @@ function listRepairLoopTargets(): RepairLoopTarget[] {
 
 function listDurableRouterComments(numbers: number[]) {
   const selectedItems = new Set(numbers);
-  const pendingCommentIds = [
+  const pendingCommentIds: string[] = [
     ...new Set(
-      (ledger.commands ?? [])
+      ((ledger.commands ?? []) as JsonValue[])
         .filter((command: JsonValue) =>
           ["waiting", "claimed"].includes(String(command?.status ?? "")),
         )
@@ -4466,16 +4488,45 @@ function listDurableRouterComments(numbers: number[]) {
         .filter((commentId: string) => /^[1-9]\d*$/.test(commentId)),
     ),
   ];
+  const reconciliation = reconcileDurableRouterCommentIds(pendingCommentIds, selectedItems);
   return {
-    pendingComments: pendingCommentIds
-      .map((commentId) => fetchCandidateIssueComment(commentId))
-      .filter((comment): comment is LooseRecord => comment !== null),
+    pendingComments: reconciliation.pendingComments,
     markerComments: numbers.flatMap((number) =>
-      issueCommentsFor(number).filter((comment: JsonValue) =>
-        isClawSweeperReviewMarkerComment(comment),
-      ),
+      issueCommentsFor(number)
+        .filter((comment: JsonValue) => isClawSweeperReviewMarkerComment(comment))
+        .filter((comment: JsonValue) => !isSuppressedStaleDurableComment(comment)),
     ),
   };
+}
+
+function reconcileDurableRouterCommentIds(
+  commentIdsToReconcile: string[],
+  selectedItems: ReadonlySet<number>,
+) {
+  const liveComments = new Map<string, LooseRecord | null>();
+  for (const commentId of commentIdsToReconcile) {
+    liveComments.set(commentId, fetchCandidateIssueComment(commentId));
+  }
+  const reconciliation = reconcileDurableCommentVersions({
+    commands: ledger.commands ?? [],
+    liveComments,
+    repo: targetRepo,
+    itemNumbers: selectedItems,
+  });
+  for (const commentId of reconciliation.suppressedCommentIds) {
+    staleDurableCommentIds.add(commentId);
+  }
+  if (
+    reconciliation.resolutions.length > 0 &&
+    (execute || (stageSelectedCommands && writeReport))
+  ) {
+    durableCommentVersionResolutions.push(...reconciliation.resolutions);
+    if (appendLedger(ledger, reconciliation.resolutions)) {
+      durableCommentVersionLedgerChanged = true;
+      writeLedger(ledgerPath(), ledger);
+    }
+  }
+  return reconciliation;
 }
 
 function listRepairLoopSweepCommands(
@@ -4574,8 +4625,15 @@ function listRepairLoopSweepCommands(
 }
 
 function repairLoopSweepCommand(intent: "autofix" | "automerge", number: number): LooseRecord {
+  const idempotencyKey = `repair-loop-label-sweep:${targetRepo}:${intent}:${number}`;
+  const attempt = forceReprocess
+    ? null
+    : repairLoopSweepAttemptIdentity({
+        commands: ledger.commands ?? [],
+        idempotencyKey,
+      });
   return bindRecoveredForcedReplayAttempts({
-    idempotency_key: `repair-loop-label-sweep:${targetRepo}:${intent}:${number}`,
+    idempotency_key: idempotencyKey,
     comment_id: `repair-loop-label-sweep:${intent}:${number}`,
     comment_version_key: null,
     comment_url: `https://github.com/${targetRepo}/pull/${number}`,
@@ -4592,7 +4650,12 @@ function repairLoopSweepCommand(intent: "autofix" | "automerge", number: number)
     trusted_bot_author: "clawsweeper[bot]",
     automation_source: "repair_loop_label_sweep",
     repair_reason: "scheduled ClawSweeper repair-loop label sweep",
-    ...forcedReplayCommandFields({ forceReprocess, attemptId }),
+    ...(forceReprocess
+      ? forcedReplayCommandFields({ forceReprocess, attemptId })
+      : {
+          ...(attempt?.attemptId ? { attempt_id: attempt.attemptId } : {}),
+          ...(attempt?.attemptSequence ? { attempt_sequence: attempt.attemptSequence } : {}),
+        }),
     status: "pending",
     actions: [],
   });

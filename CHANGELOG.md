@@ -131,6 +131,9 @@ checkpoint, and status-only commits are intentionally omitted.
   scheduled retry failures remain failed after cleanup; active coverage-proof
   yields cannot become kept-open terminals; and review mutation, retryability,
   and cancellation status survive finalization.
+- Preserved distinct durable repair-loop sweep attempts across ledger merges and
+  state publication, while terminalizing edited or deleted staged comment
+  versions before dispatch so stale content cannot consume capacity or execute.
 - Recovered exact-review intake from Cloudflare SQLite value-size exhaustion by normalizing delivery receipts and queue items into independently bounded rows, committing dedupe and admission atomically, restoring the seven-day idempotency window, and migrating live queue state through a transaction-coupled, generation-aware, size-bounded rollback bridge that retains the complete active dedupe set and safely reimports rollback-era changes. Thanks @brokemac79.
 - Hardened action-ledger privacy, import identity and causal validation,
   multi-shard capacity, crash-safe completion publication, portable paths,

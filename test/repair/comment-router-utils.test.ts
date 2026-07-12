@@ -5,6 +5,8 @@ import path from "node:path";
 import test from "node:test";
 
 import {
+  DELETED_DURABLE_COMMENT_VERSION_REASON,
+  EDITED_DURABLE_COMMENT_VERSION_REASON,
   SUPERSEDED_RE_REVIEW_REASON,
   appendLedger,
   commentBodySha256,
@@ -22,6 +24,8 @@ import {
   normalizeGitHubActor,
   parseRepairLoopSweepCommandId,
   readLedger,
+  reconcileDurableCommentVersions,
+  repairLoopSweepAttemptIdentity,
   routerDispatchReceiptKey,
   routerCommandNeedsExactLane,
   routerFanoutItemNumbers,
@@ -412,6 +416,73 @@ test("synthetic dispatch receipt material is stable within an attempt and change
     dispatchReceiptKeyMaterial(command, firstClaim),
     dispatchReceiptKeyMaterial(command, nextClaim),
   );
+
+  const firstAttempt = { ...command, attempt_id: "synthetic-attempt-1" };
+  const secondAttempt = { ...command, attempt_id: "synthetic-attempt-2" };
+  assert.equal(
+    dispatchReceiptKeyMaterial(firstAttempt, firstClaim),
+    dispatchReceiptKeyMaterial(firstAttempt, nextClaim),
+  );
+  assert.notEqual(
+    dispatchReceiptKeyMaterial(firstAttempt, firstClaim),
+    dispatchReceiptKeyMaterial(secondAttempt, firstClaim),
+  );
+  assert.equal(
+    dispatchReceiptKeyMaterial(firstAttempt, firstClaim),
+    `${command.idempotency_key}:attempt:synthetic-attempt-1`,
+  );
+});
+
+test("repair-loop sweeps reuse one active attempt and advance only after terminal state", () => {
+  const idempotencyKey = "repair-loop-label-sweep:openclaw/openclaw:automerge:74499";
+  const first = repairLoopSweepAttemptIdentity({ commands: [], idempotencyKey });
+  const repeatedFirst = repairLoopSweepAttemptIdentity({ commands: [], idempotencyKey });
+
+  assert.equal(first.attemptSequence, 1);
+  assert.match(first.attemptId, /^[a-f0-9]{64}$/);
+  assert.deepEqual(repeatedFirst, first);
+
+  const activeFirst = {
+    idempotency_key: idempotencyKey,
+    automation_source: "repair_loop_label_sweep",
+    attempt_id: first.attemptId,
+    attempt_sequence: first.attemptSequence,
+    status: "waiting",
+    processed_at: "2026-07-12T20:00:00Z",
+  };
+  assert.deepEqual(
+    repairLoopSweepAttemptIdentity({ commands: [activeFirst], idempotencyKey }),
+    first,
+  );
+
+  const terminalFirst = { ...activeFirst, status: "executed" };
+  const second = repairLoopSweepAttemptIdentity({
+    commands: [terminalFirst],
+    idempotencyKey,
+  });
+  const repeatedSecond = repairLoopSweepAttemptIdentity({
+    commands: [terminalFirst],
+    idempotencyKey,
+  });
+  assert.equal(second.attemptSequence, 2);
+  assert.notEqual(second.attemptId, first.attemptId);
+  assert.deepEqual(repeatedSecond, second);
+  assert.deepEqual(
+    repairLoopSweepAttemptIdentity({
+      commands: [
+        terminalFirst,
+        {
+          ...activeFirst,
+          attempt_id: second.attemptId,
+          attempt_sequence: second.attemptSequence,
+          status: "claimed",
+          processed_at: "2026-07-12T21:00:00Z",
+        },
+      ],
+      idempotencyKey,
+    }),
+    second,
+  );
 });
 
 test("production forced replay parsing scopes claims and dispatch keys by durable attempt", () => {
@@ -466,6 +537,8 @@ test("synthetic dispatch attempt replaces its durable claim in the ledger", () =
     repo: "openclaw/openclaw",
     issue_number: 74499,
     intent: "automerge",
+    attempt_id: "synthetic-attempt-1",
+    attempt_sequence: 1,
   };
 
   assert.equal(
@@ -492,6 +565,77 @@ test("synthetic dispatch attempt replaces its durable claim in the ledger", () =
   );
   assert.equal(ledger.commands.length, 1);
   assert.equal(ledger.commands[0]?.status, "executed");
+  assert.equal(ledger.commands[0]?.attempt_sequence, 1);
+});
+
+test("edited and deleted staged comment versions resolve terminally before dispatch", () => {
+  const staged = {
+    idempotency_key: "comment-router:openclaw/openclaw:42:123:old:re_review",
+    comment_id: "123",
+    comment_version_key: "123:2026-07-12T20:00:00Z",
+    comment_updated_at: "2026-07-12T20:00:00Z",
+    comment_body_sha256: commentBodySha256("@clawsweeper re-review"),
+    repo: "openclaw/openclaw",
+    issue_number: 42,
+    intent: "re_review",
+    status: "waiting",
+    actions: [{ action: "dispatch_clawsweeper", status: "waiting" }],
+  };
+  const edited = {
+    id: 123,
+    updated_at: "2026-07-12T20:05:00Z",
+    body: "never mind",
+  };
+  const editedResolution = reconcileDurableCommentVersions({
+    commands: [staged],
+    liveComments: new Map([["123", edited]]),
+    repo: "openclaw/openclaw",
+    itemNumbers: new Set([42]),
+    processedAt: "2026-07-12T20:06:00Z",
+  });
+
+  assert.deepEqual(editedResolution.pendingComments, []);
+  assert.deepEqual(editedResolution.suppressedCommentIds, ["123"]);
+  assert.equal(editedResolution.resolutions[0]?.status, "skipped");
+  assert.equal(
+    editedResolution.resolutions[0]?.resolution_reason,
+    EDITED_DURABLE_COMMENT_VERSION_REASON,
+  );
+  assert.equal(editedResolution.resolutions[0]?.actions[0]?.status, "skipped");
+
+  const ledger = { updated_at: null, commands: [] };
+  appendLedger(ledger, [staged]);
+  appendLedger(ledger, editedResolution.resolutions);
+  assert.equal(ledger.commands[0]?.status, "skipped");
+  assert.equal(ledger.commands[0]?.resolution_reason, EDITED_DURABLE_COMMENT_VERSION_REASON);
+
+  const current = {
+    ...staged,
+    idempotency_key: "comment-router:openclaw/openclaw:42:123:current:re_review",
+    comment_version_key: "123:2026-07-12T20:05:00Z",
+    comment_updated_at: "2026-07-12T20:05:00Z",
+    comment_body_sha256: commentBodySha256("never mind"),
+  };
+  const currentResolution = reconcileDurableCommentVersions({
+    commands: [...ledger.commands, current],
+    liveComments: new Map([["123", edited]]),
+    repo: "openclaw/openclaw",
+    itemNumbers: new Set([42]),
+  });
+  assert.deepEqual(currentResolution.pendingComments, [edited]);
+  assert.deepEqual(currentResolution.resolutions, []);
+  assert.deepEqual(currentResolution.suppressedCommentIds, []);
+
+  const deleted = reconcileDurableCommentVersions({
+    commands: [{ ...staged, comment_id: "124", comment_version_key: "124:old" }],
+    liveComments: new Map([["124", null]]),
+    repo: "openclaw/openclaw",
+    itemNumbers: new Set([42]),
+    processedAt: "2026-07-12T20:07:00Z",
+  });
+  assert.equal(deleted.resolutions[0]?.status, "skipped");
+  assert.equal(deleted.resolutions[0]?.resolution_reason, DELETED_DURABLE_COMMENT_VERSION_REASON);
+  assert.deepEqual(deleted.suppressedCommentIds, ["124"]);
 });
 
 test("coalesced same-item forced replays recover every durable pending comment", () => {
@@ -753,6 +897,8 @@ test("comment router ledger merge preserves disjoint claims and terminal progres
     comment_version_key: null,
     automation_source: "repair_loop_label_sweep",
     issue_number: 101,
+    attempt_id: "autofix-attempt-1",
+    attempt_sequence: 1,
     status: "claimed",
     processed_at: "2026-07-12T20:00:00Z",
   };
@@ -765,6 +911,8 @@ test("comment router ledger merge preserves disjoint claims and terminal progres
   const executedFirstClaim = { ...firstClaim, status: "executed" };
   const nextFirstAttempt = {
     ...firstClaim,
+    attempt_id: "autofix-attempt-2",
+    attempt_sequence: 2,
     status: "claimed",
     processed_at: "2026-07-12T21:00:00Z",
   };
@@ -783,10 +931,16 @@ test("comment router ledger merge preserves disjoint claims and terminal progres
   assert.deepEqual(merged, reversed);
   assert.equal(merged.updated_at, "2026-07-12T21:01:00Z");
   assert.deepEqual(
-    merged.commands.map((entry) => [entry.issue_number, entry.status, entry.processed_at]),
+    merged.commands.map((entry) => [
+      entry.issue_number,
+      entry.status,
+      entry.attempt_id,
+      entry.processed_at,
+    ]),
     [
-      [101, "executed", "2026-07-12T20:00:00Z"],
-      [202, "claimed", "2026-07-12T20:00:00Z"],
+      [101, "executed", "autofix-attempt-1", "2026-07-12T20:00:00Z"],
+      [202, "claimed", "autofix-attempt-1", "2026-07-12T20:00:00Z"],
+      [101, "claimed", "autofix-attempt-2", "2026-07-12T21:00:00Z"],
     ],
   );
   assert.equal(

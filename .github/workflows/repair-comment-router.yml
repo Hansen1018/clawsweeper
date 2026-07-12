@@ -689,8 +689,8 @@ jobs:
             ]
             | group_by([
                 .issue_number,
-                .comment_id,
-                (if .forced_replay == true then .attempt_id else "" end)
+                (.comment_version_key // .idempotency_key // .comment_id),
+                (.attempt_id // "")
               ])
             | map(
                 sort_by(.processed_at // "")

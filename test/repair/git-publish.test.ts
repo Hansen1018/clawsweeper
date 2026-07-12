@@ -239,7 +239,7 @@ test("publishMainCommit preserves status and health across apply and theirs publ
   assert.deepEqual(second.last_close_apply_health, secondCloseHealth);
 });
 
-test("comment router ledger publication converges stale per-item lanes", () => {
+test("comment router ledger publication retains a newer synthetic attempt", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-publish-"));
   const origin = path.join(root, "origin.git");
   const seed = path.join(root, "seed");
@@ -251,7 +251,11 @@ test("comment router ledger publication converges stale per-item lanes", () => {
   run("git", ["init", "--bare", origin], root);
   run("git", ["clone", origin, seed], root);
   configureUser(seed);
-  writeJson(path.join(seed, ledgerPath), { updated_at: null, commands: [] });
+  const terminalAttempt = routerClaim(101, "autofix", "2026-07-12T20:00:00Z", "executed", 1);
+  writeJson(path.join(seed, ledgerPath), {
+    updated_at: "2026-07-12T20:00:00Z",
+    commands: [terminalAttempt],
+  });
   run("git", ["add", "."], seed);
   run("git", ["commit", "-m", "initial state"], seed);
   run("git", ["push", "origin", "HEAD:state"], seed);
@@ -264,11 +268,14 @@ test("comment router ledger publication converges stale per-item lanes", () => {
   fs.mkdirSync(workB);
   writeJson(path.join(workA, ledgerPath), {
     updated_at: "2026-07-12T20:01:00Z",
-    commands: [routerClaim(101, "autofix", "2026-07-12T20:01:00Z")],
+    commands: [terminalAttempt, routerClaim(101, "autofix", "2026-07-12T20:01:00Z", "waiting", 2)],
   });
   writeJson(path.join(workB, ledgerPath), {
     updated_at: "2026-07-12T20:02:00Z",
-    commands: [routerClaim(202, "automerge", "2026-07-12T20:02:00Z")],
+    commands: [
+      terminalAttempt,
+      routerClaim(202, "automerge", "2026-07-12T20:02:00Z", "claimed", 1),
+    ],
   });
 
   const first = withEnv(
@@ -279,7 +286,7 @@ test("comment router ledger publication converges stale per-item lanes", () => {
     () =>
       withCwd(workA, () =>
         publishMainCommit({
-          message: "chore: publish router claim 101",
+          message: "chore: publish router attempt 101",
           paths: [ledgerPath],
           maxAttempts: 1,
           pushAttempts: 2,
@@ -307,10 +314,11 @@ test("comment router ledger publication converges stale per-item lanes", () => {
   assert.deepEqual([first, second], ["committed", "committed"]);
   const published = readOriginJson(origin, `state:${ledgerPath}`, root);
   assert.deepEqual(
-    published.commands.map((entry) => [entry.issue_number, entry.status]),
+    published.commands.map((entry) => [entry.issue_number, entry.status, entry.attempt_sequence]),
     [
-      [101, "claimed"],
-      [202, "claimed"],
+      [101, "executed", 1],
+      [101, "waiting", 2],
+      [202, "claimed", 1],
     ],
   );
 });
@@ -2399,7 +2407,7 @@ function sweepHealth(generatedAt, mode, processed) {
   };
 }
 
-function routerClaim(number, intent, processedAt) {
+function routerClaim(number, intent, processedAt, status = "claimed", attemptSequence = 1) {
   return {
     idempotency_key: `repair-loop-label-sweep:openclaw/openclaw:${intent}:${number}`,
     comment_id: `repair-loop-label-sweep:${intent}:${number}`,
@@ -2408,7 +2416,9 @@ function routerClaim(number, intent, processedAt) {
     repo: "openclaw/openclaw",
     issue_number: number,
     intent,
-    status: "claimed",
+    attempt_id: `${intent}-attempt-${attemptSequence}`,
+    attempt_sequence: attemptSequence,
+    status,
     processed_at: processedAt,
   };
 }
