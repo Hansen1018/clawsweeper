@@ -547,6 +547,10 @@ test("repair execution and validation cannot mutate GitHub before trusted public
   );
   assert.match(String(mutate.if ?? ""), /needs\.validate\.result == 'success'/);
   assert.match(String(report.if ?? ""), /always\(\)/);
+  assert.match(reportText, /Verify immutable authorization for fallback reporting/);
+  assert.match(reportText, /Requeue execution missing a sealed handoff/);
+  assert.match(reportText, /\.clawsweeper-repair\/authorized\/job\.md/);
+  assert.match(reportText, /steps\.verify_execution\.outcome != 'success'/);
   assert.match(reportText, /count-requeue-required/);
   assert.match(reportText, /repair:requeue/);
   assert.doesNotMatch(reportText, /target_post_flight_token|permission-pull-requests/);

@@ -440,6 +440,20 @@ test("repair workflow binds one run through no-credential proof and token-only m
   assert.doesNotMatch(validate, /create-github-app-token|setup-codex|OPENAI_API_KEY/);
   assert.match(report, /count-requeue-required/);
   assert.match(report, /--dashboard-only/);
+  assert.match(
+    report,
+    /Resolve immutable authorization producer[\s\S]*Verify immutable authorization for fallback reporting[\s\S]*Resolve sealed execution handoff producer/,
+  );
+  assert.match(
+    report,
+    /Requeue execution missing a sealed handoff[\s\S]*needs\.authorize\.outputs\.source_job_path/,
+  );
+  assert.match(report, /Publish authorization-only terminal status/);
+  assert.match(
+    report,
+    /Publish authorization-only terminal status[\s\S]*always\(\) && steps\.verify_execution\.outcome != 'success'/,
+  );
+  assert.match(report, /\.clawsweeper-repair\/authorized\/job\.md/);
   assert.match(report, /repositories: clawsweeper/);
   assert.doesNotMatch(
     report,

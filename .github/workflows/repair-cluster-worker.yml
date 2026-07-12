@@ -1050,7 +1050,7 @@ jobs:
       - authorize
       - execute
       - validate
-    if: ${{ always() && needs.authorize.result == 'success' && needs.execute.result != 'skipped' }}
+    if: ${{ always() && needs.authorize.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -1086,8 +1086,39 @@ jobs:
         with:
           build-script: build:repair
 
+      - name: Resolve immutable authorization producer
+        id: authorized_artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CLAWSWEEPER_ALLOW_PRIOR_ARTIFACT: ${{ needs.authorize.outputs.producer_attempt != '' && needs.authorize.outputs.producer_attempt != github.run_attempt && '1' || '0' }}
+        run: |
+          pnpm run repair:resolve-run-artifact -- \
+            --repository "${{ github.repository }}" \
+            --run-id "${{ github.run_id }}" \
+            --current-attempt "${{ github.run_attempt }}" \
+            --prefix clawsweeper-repair-authorized \
+            --expected-artifact-id "${{ needs.authorize.outputs.artifact_id }}" \
+            --expected-artifact-digest "${{ needs.authorize.outputs.artifact_digest }}"
+
+      - name: Download immutable authorization
+        uses: actions/download-artifact@v8
+        with:
+          artifact-ids: ${{ steps.authorized_artifact.outputs.artifact_id }}
+          path: .clawsweeper-repair/authorized
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+
+      - name: Verify immutable authorization for fallback reporting
+        run: |
+          pnpm run repair:execution-handoff -- verify \
+            --root .clawsweeper-repair/authorized \
+            --authorization-sha256 "${{ needs.authorize.outputs.authorization_sha256 }}"
+
       - name: Resolve sealed execution handoff producer
         id: execution_artifact
+        if: ${{ needs.execute.outputs.artifact_id != '' && needs.execute.outputs.artifact_digest != '' }}
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
           CLAWSWEEPER_ALLOW_PRIOR_ARTIFACT: ${{ needs.execute.outputs.producer_attempt != '' && needs.execute.outputs.producer_attempt != github.run_attempt && '1' || '0' }}
@@ -1101,6 +1132,8 @@ jobs:
             --expected-artifact-digest "${{ needs.execute.outputs.artifact_digest }}"
 
       - name: Download sealed execution handoff
+        if: ${{ steps.execution_artifact.outcome == 'success' }}
+        continue-on-error: true
         uses: actions/download-artifact@v8
         with:
           artifact-ids: ${{ steps.execution_artifact.outputs.artifact_id }}
@@ -1110,6 +1143,9 @@ jobs:
           run-id: ${{ github.run_id }}
 
       - name: Verify report-only handoff
+        id: verify_execution
+        if: ${{ steps.execution_artifact.outcome == 'success' }}
+        continue-on-error: true
         run: |
           pnpm run repair:execution-handoff -- verify-execution \
             --root .clawsweeper-repair/execution \
@@ -1117,6 +1153,7 @@ jobs:
 
       - name: Detect repair requeue requests
         id: repair_requeue
+        if: ${{ steps.verify_execution.outcome == 'success' }}
         run: |
           set -euo pipefail
           count="$(pnpm run --silent workflow -- count-requeue-required --dir .clawsweeper-repair/execution/run)"
@@ -1124,7 +1161,7 @@ jobs:
 
       - name: Create central requeue token
         id: requeue_token
-        if: ${{ steps.repair_requeue.outputs.count != '' && steps.repair_requeue.outputs.count != '0' }}
+        if: ${{ steps.verify_execution.outcome != 'success' || steps.repair_requeue.outputs.count != '' && steps.repair_requeue.outputs.count != '0' }}
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           client-id: ${{ env.CLAWSWEEPER_APP_CLIENT_ID }}
@@ -1135,7 +1172,7 @@ jobs:
           permission-contents: write
 
       - name: Requeue retryable report-only outcomes
-        if: ${{ steps.repair_requeue.outputs.count != '' && steps.repair_requeue.outputs.count != '0' }}
+        if: ${{ steps.verify_execution.outcome == 'success' && steps.repair_requeue.outputs.count != '' && steps.repair_requeue.outputs.count != '0' }}
         env:
           GH_TOKEN: ${{ steps.requeue_token.outputs.token }}
           CLAWSWEEPER_MUTATION_TOKEN_SOURCE: clawsweeper-app
@@ -1153,8 +1190,38 @@ jobs:
             --execution-runner "${{ inputs.execution_runner }}" \
             --model "${{ inputs.model }}"
 
+      - name: Requeue execution missing a sealed handoff
+        if: ${{ steps.verify_execution.outcome != 'success' }}
+        env:
+          GH_TOKEN: ${{ steps.requeue_token.outputs.token }}
+          CLAWSWEEPER_MUTATION_TOKEN_SOURCE: clawsweeper-app
+        run: |
+          pnpm run repair:requeue -- "${{ needs.authorize.outputs.source_job_path }}" \
+            --mode "${{ inputs.mode }}" \
+            --execute \
+            --open-execute-window \
+            --wait-for-capacity \
+            --runner "${{ inputs.runner }}" \
+            --execution-runner "${{ inputs.execution_runner }}" \
+            --model "${{ inputs.model }}"
+
+      - name: Publish authorization-only terminal status
+        if: ${{ always() && steps.verify_execution.outcome != 'success' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ""
+          GITHUB_TOKEN: ""
+          CLAWSWEEPER_STATUS_INGEST_TOKEN: ${{ secrets.CLAWSWEEPER_STATUS_INGEST_TOKEN }}
+        run: |
+          pnpm run repair:issue-implementation-status -- \
+            --job .clawsweeper-repair/authorized/job.md \
+            --dashboard-only \
+            --state "Blocked" \
+            --detail "The automatic implementation worker stopped before it sealed the execution handoff. A fresh authorized retry was queued." \
+            --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
       - name: Publish terminal report-only status
-        if: ${{ needs.execute.result != 'success' || needs.execute.outputs.execute_fix_outcome != 'success' || needs.execute.outputs.mutation_ready != 'true' || needs.validate.result != 'success' }}
+        if: ${{ steps.verify_execution.outcome == 'success' && (needs.execute.result != 'success' || needs.execute.outputs.execute_fix_outcome != 'success' || needs.execute.outputs.mutation_ready != 'true' || needs.validate.result != 'success') }}
         continue-on-error: true
         env:
           GH_TOKEN: ""

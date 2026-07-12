@@ -266,7 +266,7 @@ test("repair workflow resolves producer artifacts by trusted id across rerun att
       /uses: actions\/download-artifact@v8\n\s+with:\n([\s\S]*?)(?=\n\s{6}- (?:name|uses):|\n\n)/g,
     ),
   ];
-  assert.equal(downloadBlocks.length, 14);
+  assert.equal(downloadBlocks.length, 15);
   for (const block of downloadBlocks) {
     assert.match(block[1]!, /artifact-ids: \$\{\{ steps\.[^.]+\.outputs\.artifact_id \}\}/);
     assert.match(block[1]!, /github-token: \$\{\{ github\.token \}\}/);
@@ -328,7 +328,7 @@ test("repair workflow resolves producer artifacts by trusted id across rerun att
         /CLAWSWEEPER_ALLOW_PRIOR_ARTIFACT: \$\{\{ needs\.[^.]+\.outputs\.producer_attempt != '' && needs\.[^.]+\.outputs\.producer_attempt != github\.run_attempt && '1' \|\| '0' \}\}/g,
       ),
     ].length,
-    6,
+    7,
   );
   assert.match(
     workflow,
