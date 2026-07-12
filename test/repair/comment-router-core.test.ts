@@ -2280,6 +2280,20 @@ test("scheduled repair loops preserve live opt-in through mutation and dispatch 
   assert.match(finalMutationGuard, /validateAutomergeReadiness\(\{ command, view, target \}\)/);
   assert.match(finalMutationGuard, /runtimeStrictBaseBindingBlock\(\{/);
   assert.match(finalMutationGuard, /revalidateCommandImmediatelyBeforeMutation\(command\)/);
+  const strictBase = finalMutationGuard.indexOf("runtimeStrictBaseBindingBlock({");
+  const commandRevalidation = finalMutationGuard.indexOf(
+    "revalidateCommandImmediatelyBeforeMutation(command)",
+  );
+  const finalReadinessFetch = finalMutationGuard.lastIndexOf(
+    "fetchPullRequestView(command.issue_number)",
+  );
+  const finalReadinessValidation = finalMutationGuard.indexOf(
+    "validateAutomergeReadiness({ command, view, target })",
+  );
+  assert.ok(strictBase >= 0);
+  assert.ok(commandRevalidation > strictBase);
+  assert.ok(finalReadinessFetch > commandRevalidation);
+  assert.ok(finalReadinessValidation > finalReadinessFetch);
 });
 
 test("execution revalidates exact live comment and authorization after capacity waiting", () => {
@@ -2298,6 +2312,9 @@ test("execution revalidates exact live comment and authorization after capacity 
     "revalidateCommandImmediatelyBeforeMutation(command)",
     acknowledgement,
   );
+  const skippedAcknowledgement = executeBlock.indexOf(
+    "acknowledgeSkippedMaintainerCommand(command)",
+  );
   const execute = executeBlock.indexOf("executeCommandWithReceipt(command)");
 
   assert.ok(capacityWait >= 0);
@@ -2305,6 +2322,7 @@ test("execution revalidates exact live comment and authorization after capacity 
   assert.ok(claim > initialRevalidation);
   assert.ok(acknowledgement > initialRevalidation);
   assert.ok(finalRevalidation > acknowledgement);
+  assert.ok(skippedAcknowledgement > finalRevalidation);
   assert.ok(execute > finalRevalidation);
 
   const guard = source.slice(
@@ -2314,8 +2332,9 @@ test("execution revalidates exact live comment and authorization after capacity 
   assert.match(guard, /fetchIssueComment\(commentId\)/);
   assert.match(guard, /exactCommentVersionMatchesLive\(command, liveComment\)/);
   assert.match(guard, /parseRoutedCommentCommand\(liveComment/);
-  assert.match(guard, /collaboratorPermissionCache\.delete\(liveAuthor\.toLowerCase\(\)\)/);
-  assert.match(guard, /resolveMaintainerCommandAuthorization\(command\)/);
+  assert.match(guard, /collaboratorPermissionCache\.delete\(author\.toLowerCase\(\)\)/);
+  assert.match(guard, /fetchCollaboratorPermission\(author\)/);
+  assert.match(guard, /maintainerCommandAuthorization\(command, repositoryPermission\)/);
   assert.match(guard, /isAuthorReadOnlyCommandAllowed\(\{/);
   assert.match(guard, /target:\s*command\.target/);
   assert.match(guard, /if \(!authorization\.allowed && !authorReadOnlyAllowed\)/);
@@ -2323,7 +2342,16 @@ test("execution revalidates exact live comment and authorization after capacity 
     guard,
     /if \(!\/\^\[1-9\]\\d\*\$\/\.test\(commentId\)\)\s*return revalidateLiveRepairLoopWithdrawal\(command\)/,
   );
-  assert.match(guard, /return revalidateLiveRepairLoopWithdrawal\(command\)/);
+  const withdrawal = guard.indexOf("revalidateLiveRepairLoopWithdrawal(command)");
+  const permission = guard.indexOf("fetchCollaboratorPermission(author)");
+  const exactSnapshot = guard.indexOf(
+    "revalidateExactCommandSnapshot(command, repositoryPermission)",
+  );
+  const exactFetch = guard.indexOf("fetchIssueComment(commentId)");
+  assert.ok(withdrawal >= 0);
+  assert.ok(permission > withdrawal);
+  assert.ok(exactSnapshot > permission);
+  assert.ok(exactFetch > exactSnapshot);
   assert.match(guard, /DELETED_DURABLE_COMMENT_VERSION_REASON/);
   assert.match(guard, /EDITED_DURABLE_COMMENT_VERSION_REASON/);
 
@@ -2355,6 +2383,7 @@ test("comment router durably claims dispatch commands and recovers exact workflo
     "revalidateCommandImmediatelyBeforeMutation(command)",
     ackIndex,
   );
+  const skippedAckIndex = executeBlock.indexOf("acknowledgeSkippedMaintainerCommand(command)");
   const executeIndex = executeBlock.indexOf("executeCommandWithReceipt(command)");
   const claimFunction = source.slice(
     source.indexOf("function claimDispatchCommands"),
@@ -2366,6 +2395,7 @@ test("comment router durably claims dispatch commands and recovers exact workflo
   assert.ok(claimIndex > revalidationIndex);
   assert.ok(ackIndex > claimIndex);
   assert.ok(finalRevalidationIndex > ackIndex);
+  assert.ok(skippedAckIndex > finalRevalidationIndex);
   assert.ok(executeIndex > finalRevalidationIndex);
   assert.match(claimFunction, /status:\s*"claimed"/);
   assert.match(claimFunction, /commandHasAction\(command,\s*"dispatch_clawsweeper"\)/);
@@ -2483,6 +2513,18 @@ test("exact comment fast path converges terminal acknowledgement before own reac
   assert.doesNotMatch(ackConvergence, /renderResponse\(/);
   assert.doesNotMatch(ackConvergence, /"DELETE"/);
   assert.doesNotMatch(ackConvergence, /clearTerminalMaintainerCommandReaction/);
+  const precreatedAckConvergence = source.slice(
+    source.indexOf("function convergePrecreatedCommandAckCommentsInner"),
+    source.indexOf("function commandAckMarkerForCommentId"),
+  );
+  const ackPlan = precreatedAckConvergence.indexOf("planCommandAckConvergence(");
+  const ackRevalidation = precreatedAckConvergence.indexOf(
+    "revalidateCommandImmediatelyBeforeMutation(command)",
+  );
+  const ackDeletion = precreatedAckConvergence.indexOf('"DELETE"');
+  assert.ok(ackPlan >= 0);
+  assert.ok(ackRevalidation > ackPlan);
+  assert.ok(ackDeletion > ackRevalidation);
   const reactionCleanup = source.slice(
     source.indexOf("function removeOwnCommentReaction"),
     source.indexOf("function ensureAutomergeLabel"),

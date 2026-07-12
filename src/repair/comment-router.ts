@@ -510,12 +510,12 @@ if (execute && !exactCommentVersionFastPath.suppress) {
         }
       }
       convergePrecreatedCommandAckComments(command);
-      acknowledgeSkippedMaintainerCommand(command);
       if (!revalidateCommandImmediatelyBeforeMutation(command)) {
         recordCommandOutcome(command);
         clearTerminalMaintainerCommandReaction(command);
         continue;
       }
+      acknowledgeSkippedMaintainerCommand(command);
       if (command.status !== "ready") recordCommandOutcome(command);
       if (actionable.includes(command)) executeCommandWithReceipt(command);
     }
@@ -2076,6 +2076,18 @@ function revalidateCommandImmediatelyBeforeMutation(command: LooseRecord) {
   const commentId = String(command.comment_id ?? "");
   if (!/^[1-9]\d*$/.test(commentId)) return revalidateLiveRepairLoopWithdrawal(command);
 
+  if (!revalidateLiveRepairLoopWithdrawal(command)) return false;
+  let repositoryPermission = null;
+  if (!command.trusted_bot) {
+    const author = String(command.author ?? "").trim();
+    collaboratorPermissionCache.delete(author.toLowerCase());
+    repositoryPermission = author ? fetchCollaboratorPermission(author) : null;
+  }
+  return revalidateExactCommandSnapshot(command, repositoryPermission);
+}
+
+function revalidateExactCommandSnapshot(command: LooseRecord, repositoryPermission: string | null) {
+  const commentId = String(command.comment_id ?? "");
   const liveComment = fetchIssueComment(commentId);
   if (!liveComment) {
     terminalizeWithdrawnCommand(command, DELETED_DURABLE_COMMENT_VERSION_REASON);
@@ -2116,8 +2128,7 @@ function revalidateCommandImmediatelyBeforeMutation(command: LooseRecord) {
     }
   } else {
     command.author_association = String(liveComment.author_association ?? "").toUpperCase();
-    collaboratorPermissionCache.delete(liveAuthor.toLowerCase());
-    const authorization = resolveMaintainerCommandAuthorization(command);
+    const authorization = maintainerCommandAuthorization(command, repositoryPermission);
     const authorReadOnlyAllowed =
       !authorization.allowed &&
       isAuthorReadOnlyCommandAllowed({
@@ -2135,8 +2146,7 @@ function revalidateCommandImmediatelyBeforeMutation(command: LooseRecord) {
       return false;
     }
   }
-
-  return revalidateLiveRepairLoopWithdrawal(command);
+  return true;
 }
 
 function revalidateLiveRepairLoopWithdrawal(command: LooseRecord) {
@@ -3738,6 +3748,33 @@ function finalAutomergeMutationBlock(command: LooseRecord): LooseRecord | null {
     return automergeGuardBlockResult(trustedReviewBlock.reason, trustedReviewBlock.retryable);
   }
 
+  let preliminaryView: LooseRecord;
+  try {
+    preliminaryView = fetchPullRequestView(command.issue_number);
+  } catch (error) {
+    return automergeGuardBlockResult(
+      `automerge target lookup failed; next router pass will retry: ${compactGhError(error)}`,
+      true,
+    );
+  }
+  const preliminaryTarget = latestAutomergeTarget(command, preliminaryView);
+
+  const strictBaseBindingBlock = runtimeStrictBaseBindingBlock({
+    repo: command.repo,
+    baseBranch: String(
+      preliminaryView.baseRefName ?? preliminaryTarget.base_ref ?? targetBranch ?? "main",
+    ),
+    policyReadJson: rulesetPolicyReader(),
+  });
+  if (strictBaseBindingBlock) return automergeGuardBlockResult(strictBaseBindingBlock, false);
+
+  if (!revalidateCommandImmediatelyBeforeMutation(command)) {
+    return automergeGuardBlockResult(
+      String(command.reason ?? "command was withdrawn before automerge mutation"),
+      String(command.status ?? "") === "waiting",
+    );
+  }
+
   let view: LooseRecord;
   try {
     view = fetchPullRequestView(command.issue_number);
@@ -3750,20 +3787,6 @@ function finalAutomergeMutationBlock(command: LooseRecord): LooseRecord | null {
   const target = latestAutomergeTarget(command, view);
   const readinessBlock = validateAutomergeReadiness({ command, view, target });
   if (readinessBlock) return automergeReadinessBlockResult(readinessBlock);
-
-  const strictBaseBindingBlock = runtimeStrictBaseBindingBlock({
-    repo: command.repo,
-    baseBranch: String(view.baseRefName ?? target.base_ref ?? targetBranch ?? "main"),
-    policyReadJson: rulesetPolicyReader(),
-  });
-  if (strictBaseBindingBlock) return automergeGuardBlockResult(strictBaseBindingBlock, false);
-
-  if (!revalidateCommandImmediatelyBeforeMutation(command)) {
-    return automergeGuardBlockResult(
-      String(command.reason ?? "command was withdrawn before automerge mutation"),
-      String(command.status ?? "") === "waiting",
-    );
-  }
   return null;
 }
 
@@ -5177,6 +5200,10 @@ function compactGhError(error: unknown): string {
 function resolveMaintainerCommandAuthorization(command: LooseRecord) {
   const login = String(command.author ?? "").trim();
   const repositoryPermission = login ? fetchCollaboratorPermission(login) : null;
+  return maintainerCommandAuthorization(command, repositoryPermission);
+}
+
+function maintainerCommandAuthorization(command: LooseRecord, repositoryPermission: string | null) {
   const authorizationInput = {
     authorAssociation: command.author_association,
     repositoryPermission,
@@ -5468,6 +5495,7 @@ function convergePrecreatedCommandAckCommentsInner(command: LooseRecord) {
     commandStatusMarker(command),
   );
   if (!keep) return null;
+  if (prunable.length > 0 && !revalidateCommandImmediatelyBeforeMutation(command)) return null;
   let deleted = false;
   for (const comment of prunable) {
     const id = Number(comment.id ?? 0) || 0;

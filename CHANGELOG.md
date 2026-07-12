@@ -131,12 +131,13 @@ checkpoint, and status-only commits are intentionally omitted.
   scheduled retry failures remain failed after cleanup; active coverage-proof
   yields cannot become kept-open terminals; and review mutation, retryability,
   and cancellation status survive finalization.
-- Closed remaining durable-router race windows by rerunning exact command
-  authorization and full live automerge readiness after acknowledgements,
-  receipt lookups, and transient waits immediately before every dispatch,
-  automerge label mutation, and merge; preserved executed attempts over skipped
-  snapshots; bounded per-target attempt sequences behind a durable high-water
-  identity; retained issue-author read-only re-review authorization; bound
+- Closed remaining durable-router race windows by completing acknowledgement,
+  receipt, lease, ruleset, permission, and withdrawal lookups before the final
+  exact command snapshot, then fetching full live automerge readiness as the
+  last read before every automerge label mutation and merge; preserved executed
+  attempts over skipped snapshots; bounded per-target attempt sequences behind
+  a durable high-water identity; retained issue-author read-only re-review
+  authorization; bound
   requeues to exact job bytes; and kept lockfile restoration plus reproducible
   frozen dependency setup within one shared repair deadline.
 - Revalidated exact command comments and scheduled repair-loop authorization
