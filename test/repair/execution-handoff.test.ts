@@ -17,6 +17,7 @@ import {
   checkpointedSourceClosures,
   completePendingSourceClosureReceipt,
   finalizePendingSourceClosureReceipt,
+  hasTrustedExistingPublicationComment,
   missingRequiredPublicationLabels,
   pendingSourceReopenClosures,
   pendingSourceClosures,
@@ -1120,7 +1121,7 @@ test("source close rechecks replacement immediately and compensates post-close d
   assert.equal(state, "open");
 });
 
-test("post-receipt replacement drift overwrites the terminal close with compensation", () => {
+test("final replacement drift compensates before any terminal close receipt", () => {
   const closeActor = "openclaw-clawsweeper[bot]";
   const attempt = {
     expected_close_actor: closeActor,
@@ -1135,7 +1136,7 @@ test("post-receipt replacement drift overwrites the terminal close with compensa
     assertReplacementOpen: () => {
       calls.push("replacement");
       replacementChecks += 1;
-      if (replacementChecks === 4) throw new Error("replacement drifted after receipt");
+      if (replacementChecks === 3) throw new Error("replacement drifted before receipt");
     },
     closeSource: () => {
       calls.push("close");
@@ -1155,9 +1156,41 @@ test("post-receipt replacement drift overwrites the terminal close with compensa
   });
 
   assert.equal(result.status, "compensated");
-  assert.ok(calls.indexOf("persist") < calls.indexOf("checkpoint"));
+  assert.equal(calls.includes("persist"), false);
   assert.ok(calls.indexOf("checkpoint") < calls.indexOf("compensate"));
   assert.equal(state, "open");
+});
+
+test("successful source close persists its terminal receipt after every final live check", () => {
+  const closeActor = "openclaw-clawsweeper[bot]";
+  const attempt = {
+    expected_close_actor: closeActor,
+    last_state_event_id: 10,
+  };
+  const calls: string[] = [];
+  let state = "open";
+  let events: SourcePullStateEvent[] = [];
+  const result = runReplacementBoundSourceClose({
+    assertSourceOpen: () => calls.push("source"),
+    assertReplacementOpen: () => calls.push("replacement"),
+    closeSource: () => {
+      calls.push("close");
+      state = "closed";
+      events = [sourceStateEvent(11, "closed", closeActor)];
+    },
+    readRecovery: () => sourceCloseRecovery({ attempt, state, events }),
+    assertClosedSourceIdentity: () => calls.push("source-identity"),
+    persistClosedReceipt: () => calls.push("persist"),
+    checkpointCompensation: () => calls.push("checkpoint"),
+    compensateSource: () => calls.push("compensate"),
+    readCompensatedRecovery: () => sourceCloseRecovery({ attempt, state, events }),
+  });
+
+  assert.equal(result.status, "closed");
+  assert.equal(calls.at(-1), "persist");
+  assert.equal(calls.filter((call) => call === "replacement").length, 3);
+  assert.equal(calls.filter((call) => call === "source-identity").length, 2);
+  assert.equal(calls.includes("checkpoint"), false);
 });
 
 test("bot-attributed close with source head or base drift triggers reopen compensation", () => {
@@ -1365,6 +1398,20 @@ test("publication checkpoint binds source closeout and every mutation rechecks l
     const end = source.indexOf("\nfunction ", start + mutationOwner.length);
     assert.match(source.slice(start, end), /runPublicationMutation\(/, mutationOwner);
   }
+  const exactComment = source.slice(
+    source.indexOf("function publishExactPullComment"),
+    source.indexOf("function publishRequiredPullLabels"),
+  );
+  assert.ok(
+    exactComment.indexOf("runPublicationMutation({") < exactComment.indexOf("ghPagedArray(") &&
+      exactComment.indexOf("ghPagedArray(") <
+        exactComment.indexOf("hasTrustedExistingPublicationComment("),
+  );
+  assert.match(exactComment, /expectedMutationActor/);
+  assert.match(
+    exactComment,
+    /hasTrustedExistingPublicationComment\([\s\S]*\) return;[\s\S]*"pr", "comment"/,
+  );
   const replacement = source.slice(
     source.indexOf("function publishReplacementRepair"),
     source.indexOf("export function selectAuthorizedReplacementPull"),
@@ -1429,10 +1476,16 @@ test("publication checkpoint binds source closeout and every mutation rechecks l
     closeout.indexOf("checkpointPendingSourceReopenReceipt") <
       closeout.indexOf("compensateSource:"),
   );
-  assert.match(
-    closeout,
-    /for \(const source of pendingAttempts\)[\s\S]*readLiveRecovery\([\s\S]*finalizePendingSourceClosureReceipt\(\{[\s\S]*writeJson\(publicationReceiptPath, currentReceipt\)/,
+  const recoveredClosedStart = closeout.indexOf(
+    'if (recovery.status === "closed") {',
+    closeout.indexOf('if (recovery.status === "retry") continue;'),
   );
+  const recoveredClosedEnd = closeout.indexOf("    } else {", recoveredClosedStart);
+  const recoveredClosed = closeout.slice(recoveredClosedStart, recoveredClosedEnd);
+  assert.match(recoveredClosed, /checkpointPendingSourceReopenReceipt\(\{/);
+  assert.match(recoveredClosed, /writeJson\(publicationReceiptPath, currentReceipt\)/);
+  assert.match(recoveredClosed, /reopenCheckpointedSource\(revision, attempt\)/);
+  assert.doesNotMatch(recoveredClosed, /finalizePendingSourceClosureReceipt/);
   assert.doesNotMatch(closeout, /instanceof SourceCloseCompensationFailure/);
   assert.match(
     closeout,
@@ -1444,6 +1497,27 @@ test("publication checkpoint binds source closeout and every mutation rechecks l
   );
   assert.match(closeout, /preservedReopens\.has\(action\.source\.url\)\) continue/);
   assert.ok(closeout.indexOf("sourceCloseoutStateBlock") < closeout.indexOf('["pr", "close"'));
+  const closeRunner = source.slice(
+    source.indexOf("export function runReplacementBoundSourceClose"),
+    source.indexOf("function closeSupersededReplacementSources"),
+  );
+  const finalReplacementCheck = closeRunner.lastIndexOf("assertReplacementOpen()");
+  const finalSourceCheck = closeRunner.lastIndexOf("assertClosedSourceIdentity()");
+  const terminalReceipt = closeRunner.indexOf("persistClosedReceipt(recovery.evidence)");
+  const successfulReturn = closeRunner.indexOf("if (!closeoutError) return recovery");
+  assert.ok(
+    finalReplacementCheck < terminalReceipt &&
+      finalSourceCheck < terminalReceipt &&
+      terminalReceipt < successfulReturn,
+  );
+  assert.doesNotMatch(
+    closeRunner.slice(terminalReceipt, successfulReturn),
+    /assertReplacementOpen/,
+  );
+  assert.doesNotMatch(
+    closeRunner.slice(terminalReceipt, successfulReturn),
+    /assertClosedSourceIdentity/,
+  );
   const resolver = source.slice(
     source.indexOf("function resolveLiveExecutionIntent"),
     source.indexOf("function verifyAuthorizedPreparedPublication"),
@@ -1993,6 +2067,27 @@ test("trusted publication rejects forged deterministic comment metadata", () => 
     );
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("publication comment no-op accepts only the exact trusted App author", () => {
+  const body = "<!-- clawsweeper-publication -->\nPublished exact repair.";
+  const actor = "openclaw-clawsweeper[bot]";
+  assert.equal(
+    hasTrustedExistingPublicationComment(
+      [{ body, user: { login: actor, type: "Bot" } }],
+      body,
+      actor,
+    ),
+    true,
+  );
+  for (const comments of [
+    [{ body, user: { login: "contributor", type: "User" } }],
+    [{ body, user: { login: actor, type: "User" } }],
+    [{ body, user: { login: "another-app[bot]", type: "Bot" } }],
+    [{ body: `${body}\nforged`, user: { login: actor, type: "Bot" } }],
+  ]) {
+    assert.equal(hasTrustedExistingPublicationComment(comments, body, actor), false);
   }
 });
 

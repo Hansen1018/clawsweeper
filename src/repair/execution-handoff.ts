@@ -808,6 +808,7 @@ export function publishValidatedExecution({
             publication,
             mutations,
             checkpointedClosures: authorizedSourceClosures,
+            expectedMutationActor,
           })
         : publishReplacementRepair({
             checkout,
@@ -2366,6 +2367,7 @@ function publishExactPullComment({
   publication,
   number,
   body,
+  expectedMutationActor,
   targetNumbers = [],
   checkpointedClosures = new Set(),
 }: {
@@ -2374,23 +2376,39 @@ function publishExactPullComment({
   publication: PreparedPublication;
   number: number;
   body: string;
+  expectedMutationActor: string;
   targetNumbers?: ReadonlyArray<number | null>;
   checkpointedClosures?: ReadonlySet<string>;
 }) {
-  const comments = ghPagedArray(
-    `repos/${intent.target_repo}/issues/${number}/comments?per_page=100`,
-  );
-  if (comments.some((comment) => comment.body === body)) return;
   runPublicationMutation({
     intent,
     publication,
     checkpointedClosures,
     targetNumbers: [...targetNumbers, number],
-    mutation: () =>
+    mutation: () => {
+      const comments = ghPagedArray(
+        `repos/${intent.target_repo}/issues/${number}/comments?per_page=100`,
+      );
+      if (hasTrustedExistingPublicationComment(comments, body, expectedMutationActor)) return;
       run("gh", ["pr", "comment", String(number), "--repo", intent.target_repo, "--body", body], {
         cwd: checkout,
-      }),
+      });
+    },
   });
+}
+
+export function hasTrustedExistingPublicationComment(
+  comments: readonly LooseRecord[],
+  body: string,
+  expectedMutationActor: string,
+) {
+  const expectedActor = normalizeActor(requiredCloseActor(expectedMutationActor));
+  return comments.some(
+    (comment) =>
+      comment.body === body &&
+      normalizeActor(comment.user?.login) === expectedActor &&
+      String(comment.user?.type ?? "").toLowerCase() === "bot",
+  );
 }
 
 function publishRequiredPullLabels({
@@ -2447,12 +2465,14 @@ function publishSourceBranchRepair({
   publication,
   mutations,
   checkpointedClosures,
+  expectedMutationActor,
 }: {
   checkout: string;
   intent: ExecutionIntent;
   publication: PreparedPublication;
   mutations: LooseRecord[];
   checkpointedClosures: ReadonlySet<string>;
+  expectedMutationActor: string;
 }): number {
   if (
     intent.source.kind !== "pull_request" ||
@@ -2485,6 +2505,7 @@ function publishSourceBranchRepair({
     publication,
     number: intent.source.number,
     body: publication.source_comment,
+    expectedMutationActor,
     targetNumbers: [intent.source.number],
     checkpointedClosures,
   });
@@ -3014,8 +3035,6 @@ export function runReplacementBoundSourceClose({
       assertReplacementOpen();
       assertClosedSourceIdentity();
       persistClosedReceipt(recovery.evidence);
-      assertReplacementOpen();
-      assertClosedSourceIdentity();
     } catch (error) {
       closeoutError = error;
     }
@@ -3170,8 +3189,7 @@ function closeSupersededReplacementSources({
     ) {
       throw new Error("pending source closeout actor changed across workflow attempts");
     }
-    const live = readLiveSourceClosure(revision, attempt);
-    const recovery = live.recovery;
+    const recovery = readLiveRecovery(revision, attempt);
     if (pendingReopenAttempts.has(source)) {
       if (recovery.status === "awaiting_reopen" || recovery.status === "retry") {
         throw new Error("source reopen compensation is waiting for durable actor evidence");
@@ -3198,44 +3216,16 @@ function closeSupersededReplacementSources({
     }
     if (recovery.status === "retry") continue;
     if (recovery.status === "closed") {
-      let compensationReason: unknown = null;
-      try {
-        assertSourcePullRevision(revision, live.pull, { allowClosed: true });
-      } catch (error) {
-        compensationReason = error;
-      }
-      if (!compensationReason) {
-        try {
-          assertExactPublishedReplacementAvailable({
-            intent,
-            publication,
-            publicationCheckpoint: currentReceipt,
-            targetPrNumber,
-          });
-        } catch (error) {
-          compensationReason = error;
-        }
-      }
-      if (compensationReason) {
-        currentReceipt = checkpointPendingSourceReopenReceipt({
-          publication,
-          receipt: currentReceipt,
-          intent,
-          revision,
-          evidence: recovery.evidence,
-        });
-        writeJson(publicationReceiptPath, currentReceipt);
-        pendingReopenAttempts = pendingSourceReopenClosures(publication, currentReceipt, intent);
-        currentReceipt = reopenCheckpointedSource(revision, attempt);
-      } else {
-        currentReceipt = finalizePendingSourceClosureReceipt({
-          publication,
-          receipt: currentReceipt,
-          intent,
-          revision,
-          readRecovery: () => readLiveRecovery(revision, attempt),
-        });
-      }
+      currentReceipt = checkpointPendingSourceReopenReceipt({
+        publication,
+        receipt: currentReceipt,
+        intent,
+        revision,
+        evidence: recovery.evidence,
+      });
+      writeJson(publicationReceiptPath, currentReceipt);
+      pendingReopenAttempts = pendingSourceReopenClosures(publication, currentReceipt, intent);
+      currentReceipt = reopenCheckpointedSource(revision, attempt);
     } else {
       currentReceipt = finalizePendingSourceClosureReceipt({
         publication,
@@ -3332,6 +3322,7 @@ function closeSupersededReplacementSources({
       publication,
       number: action.source.number,
       body: comment,
+      expectedMutationActor: expectedCloseActor,
       targetNumbers: [targetPrNumber],
       checkpointedClosures: completedClosures,
     });
