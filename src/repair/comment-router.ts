@@ -93,6 +93,7 @@ import {
   commentBodySha256,
   dispatchClaimDecision,
   dispatchClaimLookupKeys,
+  durableForcedReplayCommentIds,
   exactCommentVersionFastPathDecision,
   exactCommentVersionMatchesLive,
   finalizeRouterItemFanout,
@@ -105,9 +106,11 @@ import {
   routerDispatchReceiptKey,
   routerCommandNeedsExactLane,
   routerFanoutItemNumbers,
+  routerPendingItemNumbers,
   selectCommentsForRouting,
   selectRouterItemFanoutPage,
   shouldSuppressProcessedCommentVersion,
+  stageForcedReplayCommands,
   stripAnsi,
   supersededReReviewCommentVersions,
   summarizeChecks,
@@ -185,6 +188,15 @@ const {
 const startedAtMs = Date.now();
 const timings: LooseRecord[] = [];
 const ledger = readLedger(ledgerPath());
+const recoveredForcedReplayCommentIds =
+  forceReprocess && itemNumbers.size > 0
+    ? durableForcedReplayCommentIds({
+        commands: ledger.commands ?? [],
+        repo: targetRepo,
+        itemNumbers,
+      })
+    : [];
+const effectiveCommentIds = new Set([...commentIds, ...recoveredForcedReplayCommentIds]);
 const TARGET_LOOKUP_RETRY_ATTEMPTS = 3;
 let exactCommentVersionFastPath = exactCommentVersionFastPathDecision({
   authenticated:
@@ -254,9 +266,10 @@ const openIssueNumbersByLabel = createCachedLabelNumberLookup((label) =>
     `repos/${targetRepo}/issues?state=open&labels=${encodeURIComponent(label)}&per_page=100`,
   ).map((issue: JsonValue) => issue.number),
 );
-const comments = measure("list_candidate_comments", () =>
-  exactCommentVersionFastPath.suppress ? [] : listCandidateComments(),
+const candidateSelection = measure("list_candidate_comments", () =>
+  exactCommentVersionFastPath.suppress ? emptyCandidateSelection() : listCandidateComments(),
 );
+const comments = candidateSelection.comments;
 const rawCommands: LooseRecord[] = [];
 
 for (const comment of comments) {
@@ -274,7 +287,10 @@ await measureAsync("prehydrate_comment_commands", () =>
 const classifiedCommentCommands = measure("classify_comment_commands", () =>
   rawCommands.map((command) => classifyAndRecordCommand(command)),
 );
-let repairLoopSweepSelection = listRepairLoopSweepCommands(classifiedCommentCommands);
+let repairLoopSweepSelection = listRepairLoopSweepCommands(
+  classifiedCommentCommands,
+  candidateSelection,
+);
 for (const command of repairLoopSweepSelection.commands) {
   rawCommands.push(command);
   recordCommandReceived(command);
@@ -311,6 +327,7 @@ const report: LooseRecord = {
   router_item_fanout: routerItemFanout,
   item_numbers: [...itemNumbers],
   comment_ids: [...commentIds],
+  recovered_forced_replay_comment_ids: recoveredForcedReplayCommentIds,
   status_comment_id: statusCommentId,
   max_autoclose_targets: maxAutocloseTargets,
   scanned_comments: comments.length,
@@ -325,6 +342,13 @@ const report: LooseRecord = {
   exact_comment_version_fast_path: exactCommentVersionFastPath,
   short_circuited: exactCommentVersionFastPath.suppress,
 };
+
+if (!execute && forceReprocess && writeReport && itemNumbers.size !== 1) {
+  const staged = stageForcedReplayCommands(commands, attemptId!);
+  report.forced_replay_staged = staged.length;
+  report.ledger_staged = measure("stage_forced_replays", () => appendLedger(ledger, staged));
+  if (report.ledger_staged) writeLedger(ledgerPath(), ledger);
+}
 
 if (execute && exactCommentVersionFastPath.suppress && exactCommentVersionFastPathCommand) {
   const versionStillCurrent = measure("verify_exact_comment_version_cleanup", () =>
@@ -347,9 +371,10 @@ if (execute && exactCommentVersionFastPath.suppress && exactCommentVersionFastPa
     : "skipped_source_drift";
   if (!versionStillCurrent) {
     exactCommentVersionFastPath = { suppress: false, reason: "cleanup_source_drift" };
-    const resumedComments = measure("list_candidate_comments_after_cleanup_drift", () =>
+    const resumedSelection = measure("list_candidate_comments_after_cleanup_drift", () =>
       listCandidateComments(),
     );
+    const resumedComments = resumedSelection.comments;
     const resumedRawCommands = resumedComments
       .map((comment) => routedCommandForComment(comment))
       .filter((command): command is LooseRecord => Boolean(command));
@@ -362,7 +387,7 @@ if (execute && exactCommentVersionFastPath.suppress && exactCommentVersionFastPa
     const resumedClassified = measure("classify_cleanup_drift_commands", () =>
       resumedRawCommands.map((command) => classifyAndRecordCommand(command)),
     );
-    repairLoopSweepSelection = listRepairLoopSweepCommands(resumedClassified);
+    repairLoopSweepSelection = listRepairLoopSweepCommands(resumedClassified, resumedSelection);
     const resumedSweepCommands = repairLoopSweepSelection.commands;
     rawCommands.push(...resumedSweepCommands);
     for (const command of resumedSweepCommands) recordCommandReceived(command);
@@ -4180,40 +4205,91 @@ function listRecentComments() {
   return list;
 }
 
+type RepairLoopTarget = {
+  intent: "autofix" | "automerge";
+  number: number;
+};
+
+type CandidateCommentSelection = {
+  comments: JsonValue[];
+  broadPage: ReturnType<typeof selectRouterItemFanoutPage> | null;
+  repairLoopTargets: RepairLoopTarget[];
+};
+
+function emptyCandidateSelection(): CandidateCommentSelection {
+  return {
+    comments: [],
+    broadPage: null,
+    repairLoopTargets: [],
+  };
+}
+
 function listCandidateComments() {
-  if (forceReprocess && itemNumbers.size > 0 && commentIds.size > 0) {
-    return selectCommentsForRouting({
-      recentComments: forwardedExactComments(),
-      durableComments: [],
-      maxComments,
-    });
+  if (forceReprocess && itemNumbers.size > 0 && effectiveCommentIds.size > 0) {
+    return {
+      ...emptyCandidateSelection(),
+      comments: selectCommentsForRouting({
+        recentComments: forwardedExactComments(),
+        durableComments: [],
+        maxComments: Math.max(maxComments, effectiveCommentIds.size),
+      }),
+    };
   }
   if (itemNumbers.size > 0) {
-    return selectCommentsForRouting({
-      recentComments: [],
-      durableComments: [...itemNumbers].flatMap((number) => issueCommentsFor(number)),
-      maxComments,
-    });
+    return {
+      ...emptyCandidateSelection(),
+      comments: selectCommentsForRouting({
+        recentComments: [],
+        durableComments: [...itemNumbers].flatMap((number) => issueCommentsFor(number)),
+        maxComments,
+      }),
+    };
   }
-  if (commentIds.size > 0) {
-    return selectCommentsForRouting({
-      recentComments: [...commentIds]
-        .filter((commentId) => /^[1-9]\d*$/.test(commentId))
-        .map((commentId) => fetchIssueComment(commentId))
-        .filter((comment) => comment !== null),
-      durableComments: [],
-      maxComments,
-    });
+  if (effectiveCommentIds.size > 0) {
+    return {
+      ...emptyCandidateSelection(),
+      comments: selectCommentsForRouting({
+        recentComments: [...effectiveCommentIds]
+          .filter((commentId) => /^[1-9]\d*$/.test(commentId))
+          .map((commentId) => fetchIssueComment(commentId))
+          .filter((comment) => comment !== null),
+        durableComments: [],
+        maxComments,
+      }),
+    };
   }
-  return selectCommentsForRouting({
+
+  const recentComments = selectCommentsForRouting({
     recentComments: listRecentComments(),
-    durableComments: listRepairLoopReviewComments(),
+    durableComments: [],
     maxComments,
   });
+  const repairLoopTargets = listRepairLoopTargets();
+  const broadPage = selectRouterItemFanoutPage({
+    itemNumbers: [
+      ...recentComments.map((comment) => issueNumberFromUrl(comment.issue_url)),
+      ...repairLoopTargets.map((target) => target.number),
+      ...routerPendingItemNumbers(ledger.commands ?? [], targetRepo),
+    ],
+    after: routerFanoutAfter,
+    limit: maxComments,
+  });
+  const selectedItems = new Set(broadPage.itemNumbers);
+  return {
+    comments: selectCommentsForRouting({
+      recentComments: recentComments.filter((comment) =>
+        selectedItems.has(issueNumberFromUrl(comment.issue_url)),
+      ),
+      durableComments: listDurableRouterComments(broadPage.itemNumbers),
+      maxComments,
+    }),
+    broadPage,
+    repairLoopTargets,
+  };
 }
 
 function forwardedExactComments() {
-  return [...commentIds]
+  return [...effectiveCommentIds]
     .filter((commentId) => /^[1-9]\d*$/.test(commentId))
     .map((commentId) => fetchIssueComment(commentId))
     .filter(
@@ -4237,20 +4313,49 @@ function issueCommentsFor(number: JsonValue): JsonValue[] {
   return cachedIssueComments(number);
 }
 
-function listRepairLoopReviewComments() {
-  const numbers = unique([
-    ...listOpenIssueNumbersWithLabel(AUTOFIX_LABEL),
-    ...listOpenIssueNumbersWithLabel(AUTOMERGE_LABEL),
-  ]);
+function listRepairLoopTargets(): RepairLoopTarget[] {
+  return [
+    ...listOpenIssueNumbersWithLabel(AUTOFIX_LABEL).map((number) => ({
+      intent: "autofix" as const,
+      number,
+    })),
+    ...listOpenIssueNumbersWithLabel(AUTOMERGE_LABEL).map((number) => ({
+      intent: "automerge" as const,
+      number,
+    })),
+  ];
+}
+
+function listDurableRouterComments(numbers: number[]) {
+  const pendingCommentIds = new Set(
+    (ledger.commands ?? [])
+      .filter((command: JsonValue) =>
+        ["waiting", "claimed"].includes(String(command?.status ?? "")),
+      )
+      .filter(
+        (command: JsonValue) =>
+          String(command?.repo ?? "")
+            .trim()
+            .toLowerCase() === targetRepo.toLowerCase(),
+      )
+      .filter((command: JsonValue) => numbers.includes(Number(command?.issue_number)))
+      .map((command: JsonValue) => String(command?.comment_id ?? ""))
+      .filter((commentId: string) => /^[1-9]\d*$/.test(commentId)),
+  );
   return numbers.flatMap((number) =>
-    ghPaged<JsonValue>(`repos/${targetRepo}/issues/${number}/comments?per_page=100`).filter(
-      isClawSweeperReviewMarkerComment,
+    issueCommentsFor(number).filter(
+      (comment: JsonValue) =>
+        isClawSweeperReviewMarkerComment(comment) ||
+        pendingCommentIds.has(String(comment?.id ?? "")),
     ),
   );
 }
 
-function listRepairLoopSweepCommands(existingCommands: LooseRecord[]) {
-  const requestedSweeps = [...commentIds]
+function listRepairLoopSweepCommands(
+  existingCommands: LooseRecord[],
+  candidateSelection: CandidateCommentSelection,
+) {
+  const requestedSweeps = [...effectiveCommentIds]
     .map((commentId) => parseRepairLoopSweepCommandId(commentId))
     .filter(
       (command): command is NonNullable<ReturnType<typeof parseRepairLoopSweepCommandId>> =>
@@ -4280,6 +4385,24 @@ function listRepairLoopSweepCommands(existingCommands: LooseRecord[]) {
       .map((command) => `${command.intent}:${Number(command.issue_number)}`),
   );
   const commands: LooseRecord[] = [];
+  if (candidateSelection.broadPage) {
+    const selectedItems = new Set(candidateSelection.broadPage.itemNumbers);
+    commands.push(
+      ...candidateSelection.repairLoopTargets
+        .filter(({ number }) => selectedItems.has(number))
+        .filter(({ intent, number }) => {
+          const key = `${intent}:${number}`;
+          if (seen.has(key) || paused.has(number)) return false;
+          seen.add(key);
+          return true;
+        })
+        .map(({ intent, number }) => repairLoopSweepCommand(intent, number)),
+    );
+    return {
+      commands,
+      page: candidateSelection.broadPage,
+    };
+  }
   if (requestedSweeps.length > 0) {
     const page = selectRouterItemFanoutPage({
       itemNumbers: [...existingItemNumbers, ...requestedSweeps.map(({ number }) => number)],
@@ -4299,17 +4422,12 @@ function listRepairLoopSweepCommands(existingCommands: LooseRecord[]) {
       page,
     };
   }
-  const targets: Array<{ intent: "autofix" | "automerge"; number: number }> = [];
-  for (const [intent, label] of [
-    ["autofix", AUTOFIX_LABEL],
-    ["automerge", AUTOMERGE_LABEL],
-  ] as const) {
-    for (const number of listOpenIssueNumbersWithLabel(label)) {
-      const key = `${intent}:${number}`;
-      if (seen.has(key) || paused.has(number)) continue;
-      seen.add(key);
-      targets.push({ intent, number });
-    }
+  const targets: RepairLoopTarget[] = [];
+  for (const { intent, number } of listRepairLoopTargets()) {
+    const key = `${intent}:${number}`;
+    if (seen.has(key) || paused.has(number)) continue;
+    seen.add(key);
+    targets.push({ intent, number });
   }
   const page = selectRouterItemFanoutPage({
     itemNumbers: [...existingItemNumbers, ...targets.map(({ number }) => number)],

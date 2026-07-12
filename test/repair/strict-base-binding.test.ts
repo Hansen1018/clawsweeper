@@ -698,6 +698,14 @@ test("exact router dispatch concurrency is item-specific and cannot replace anot
     candidateSelection,
     /itemNumbers[\s\S]*recentComments: \[\],[\s\S]*durableComments: \[\.\.\.itemNumbers\]\.flatMap/,
   );
+  assert.ok(
+    candidateSelection.indexOf("selectRouterItemFanoutPage({") <
+      candidateSelection.indexOf("listDurableRouterComments(broadPage.itemNumbers)"),
+  );
+  assert.match(
+    candidateSelection,
+    /routerPendingItemNumbers\(ledger\.commands \?\? \[\], targetRepo\)/,
+  );
   assert.match(
     source,
     /Dispatch discovered items through exact router lanes[\s\S]*-f item_numbers="\$item_number"/,

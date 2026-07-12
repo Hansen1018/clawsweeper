@@ -373,6 +373,75 @@ export function selectCommentsForRouting({
   return sortCommentsForRouting(uniqueCommentsById([...cappedRecent, ...durableComments]));
 }
 
+export function routerPendingItemNumbers(commands: LooseRecord[], repo?: string) {
+  const normalizedRepo = repo?.trim().toLowerCase();
+  return [
+    ...new Set(
+      commands
+        .filter(
+          (command) =>
+            ["waiting", "claimed"].includes(String(command.status ?? "")) &&
+            (!normalizedRepo ||
+              String(command.repo ?? "")
+                .trim()
+                .toLowerCase() === normalizedRepo),
+        )
+        .map((command) => Number(command.issue_number))
+        .filter((number) => Number.isSafeInteger(number) && number > 0),
+    ),
+  ].sort((left, right) => left - right);
+}
+
+export function stageForcedReplayCommands(commands: LooseRecord[], attemptId: string) {
+  return commands
+    .filter(routerCommandNeedsExactLane)
+    .filter((command) => validRouterCommentId(command.comment_id, command.issue_number))
+    .map((command) => ({
+      ...command,
+      forced_replay: true,
+      attempt_id: attemptId,
+      status: "waiting",
+      actions: (Array.isArray(command.actions) ? command.actions : []).map((action: JsonValue) =>
+        action?.status === "executed" ? action : { ...action, status: "waiting" },
+      ),
+    }));
+}
+
+export function durableForcedReplayCommentIds({
+  commands,
+  repo,
+  itemNumbers,
+}: {
+  commands: LooseRecord[];
+  repo: string;
+  itemNumbers: ReadonlySet<number>;
+}) {
+  const normalizedRepo = repo.trim().toLowerCase();
+  return [
+    ...new Set(
+      commands
+        .filter(
+          (command) =>
+            command.forced_replay === true &&
+            ["waiting", "claimed"].includes(String(command.status ?? "")) &&
+            String(command.repo ?? "")
+              .trim()
+              .toLowerCase() === normalizedRepo &&
+            itemNumbers.has(Number(command.issue_number)) &&
+            validRouterCommentId(command.comment_id, command.issue_number),
+        )
+        .map((command) => String(command.comment_id)),
+    ),
+  ];
+}
+
+function validRouterCommentId(value: JsonValue, issueNumber: JsonValue) {
+  const commentId = String(value ?? "").trim();
+  if (/^[1-9]\d*$/.test(commentId)) return true;
+  const sweep = parseRepairLoopSweepCommandId(commentId);
+  return sweep !== null && sweep.number === Number(issueNumber);
+}
+
 export const SUPERSEDED_RE_REVIEW_REASON = "newer re-review command supersedes this request";
 
 export function supersededReReviewCommentVersions(commands: LooseRecord[]) {
@@ -509,6 +578,7 @@ export function appendLedger(current: LooseRecord, entries: LooseRecord[]) {
         comment_created_at: entry.comment_created_at ?? null,
         comment_updated_at: entry.comment_updated_at ?? null,
         ...(entry.comment_body_sha256 ? { comment_body_sha256: entry.comment_body_sha256 } : {}),
+        ...(entry.forced_replay === true ? { forced_replay: true } : {}),
         repo: entry.repo,
         issue_number: entry.issue_number,
         author: entry.author,

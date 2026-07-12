@@ -1502,7 +1502,9 @@ test("ready human-review commands block same-run label sweeps", () => {
 test("router classifies fresh human-review pauses before label sweeps", () => {
   const source = readFileSync("src/repair/comment-router.ts", "utf8");
   const classifyComments = source.indexOf("const classifiedCommentCommands");
-  const repairLoopSweeps = source.indexOf("listRepairLoopSweepCommands(classifiedCommentCommands)");
+  const repairLoopSweeps = source.indexOf(
+    "let repairLoopSweepSelection = listRepairLoopSweepCommands(",
+  );
 
   assert.ok(classifyComments >= 0);
   assert.ok(repairLoopSweeps > classifyComments);
@@ -1518,7 +1520,7 @@ test("exact synthetic label sweeps revalidate live opt-in before recreating the 
   );
   assert.match(
     source,
-    /requestedSweeps = \[\.\.\.commentIds\][\s\S]*parseRepairLoopSweepCommandId[\s\S]*repairLoopSweepCommand\(intent, number\)/,
+    /requestedSweeps = \[\.\.\.effectiveCommentIds\][\s\S]*parseRepairLoopSweepCommandId[\s\S]*repairLoopSweepCommand\(intent, number\)/,
   );
   assert.match(
     source,
@@ -1538,17 +1540,57 @@ test("forced exact-item replay scopes forwarded comment ids before item-wide rec
   );
 
   assert.ok(
-    candidates.indexOf("forceReprocess && itemNumbers.size > 0 && commentIds.size > 0") >= 0,
+    candidates.indexOf("forceReprocess && itemNumbers.size > 0 && effectiveCommentIds.size > 0") >=
+      0,
   );
   assert.ok(
-    candidates.indexOf("forceReprocess && itemNumbers.size > 0 && commentIds.size > 0") <
+    candidates.indexOf("forceReprocess && itemNumbers.size > 0 && effectiveCommentIds.size > 0") <
       candidates.indexOf("if (itemNumbers.size > 0)"),
   );
   assert.match(
     candidates,
     /recentComments: forwardedExactComments\(\)[\s\S]*durableComments: \[\]/,
   );
+  assert.match(candidates, /maxComments: Math\.max\(maxComments, effectiveCommentIds\.size\)/);
   assert.match(candidates, /itemNumbers\.has\(issueNumberFromUrl\(comment\.issue_url\) \?\? 0\)/);
+  assert.match(
+    source,
+    /effectiveCommentIds = new Set\(\[\.\.\.commentIds, \.\.\.recoveredForcedReplayCommentIds\]\)/,
+  );
+  assert.match(
+    source,
+    /durableForcedReplayCommentIds\(\{[\s\S]*commands: ledger\.commands \?\? \[\],[\s\S]*itemNumbers/,
+  );
+  assert.match(
+    source,
+    /stageForcedReplayCommands\(commands, attemptId!\)[\s\S]*appendLedger\(ledger, staged\)[\s\S]*writeLedger/,
+  );
+});
+
+test("broad router selects its cursor page before bounded durable comment hydration", () => {
+  const source = readFileSync("src/repair/comment-router.ts", "utf8");
+  const candidates = source.slice(
+    source.indexOf("function listCandidateComments()"),
+    source.indexOf("function forwardedExactComments()"),
+  );
+  const page = candidates.indexOf("const broadPage = selectRouterItemFanoutPage({");
+  const durableHydration = candidates.indexOf(
+    "durableComments: listDurableRouterComments(broadPage.itemNumbers)",
+  );
+
+  assert.ok(page >= 0);
+  assert.ok(durableHydration > page);
+  assert.match(
+    candidates,
+    /routerPendingItemNumbers\(ledger\.commands \?\? \[\], targetRepo\)[\s\S]*after: routerFanoutAfter[\s\S]*limit: maxComments/,
+  );
+  const durable = source.slice(
+    source.indexOf("function listDurableRouterComments"),
+    source.indexOf("function listRepairLoopSweepCommands"),
+  );
+  assert.match(durable, /numbers\.flatMap\(\(number\) =>[\s\S]*issueCommentsFor\(number\)/);
+  assert.match(durable, /isClawSweeperReviewMarkerComment\(comment\)/);
+  assert.match(durable, /pendingCommentIds\.has\(String\(comment\?\.id \?\? ""\)\)/);
 });
 
 test("label sweeps honor fresh trusted exact-head review start leases", () => {

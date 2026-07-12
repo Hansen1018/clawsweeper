@@ -11,6 +11,7 @@ import {
   dispatchClaimDecision,
   dispatchClaimLookupKeys,
   dispatchReceiptKeyMaterial,
+  durableForcedReplayCommentIds,
   exactCommentVersionFastPathDecision,
   exactCommentVersionMatchesLive,
   finalizeRouterItemFanout,
@@ -24,10 +25,12 @@ import {
   routerDispatchReceiptKey,
   routerCommandNeedsExactLane,
   routerFanoutItemNumbers,
+  routerPendingItemNumbers,
   selectCommentsForRouting,
   selectRouterItemFanoutPage,
   shouldSuppressProcessedCommentVersion,
   sortCommentsForRouting,
+  stageForcedReplayCommands,
   supersededReReviewCommentVersions,
   summarizeChecks,
   writeLedger,
@@ -266,24 +269,29 @@ test("synthetic repair-loop command ids parse only exact positive item targets",
   }
 });
 
-test("combined router item fanout is bounded, distinct, and resumes deterministically", () => {
-  const first = selectRouterItemFanoutPage({
-    itemNumbers: [43, 42, 42, 44],
-    after: null,
-    limit: 2,
-  });
+test("combined router item fanout stays bounded across continuations without starvation", () => {
+  const candidates = [46, 43, 42, 45, 42, 44];
+  const pages = [];
+  let after: number | null = null;
+  do {
+    const page = selectRouterItemFanoutPage({
+      itemNumbers: candidates,
+      after,
+      limit: 2,
+    });
+    pages.push(page);
+    after = page.nextAfterItemNumber;
+  } while (after !== null);
 
-  assert.deepEqual(first.itemNumbers, [42, 43]);
-  assert.equal(first.candidateCount, 3);
-  assert.equal(first.nextAfterItemNumber, 43);
-
-  const second = selectRouterItemFanoutPage({
-    itemNumbers: [43, 42, 42, 44],
-    after: first.nextAfterItemNumber,
-    limit: 2,
-  });
-  assert.deepEqual(second.itemNumbers, [44]);
-  assert.equal(second.nextAfterItemNumber, null);
+  assert.deepEqual(
+    pages.map((page) => page.itemNumbers),
+    [[42, 43], [44, 45], [46]],
+  );
+  assert.ok(pages.every((page) => page.itemNumbers.length <= 2));
+  assert.deepEqual(
+    pages.flatMap((page) => page.itemNumbers),
+    [42, 43, 44, 45, 46],
+  );
 });
 
 test("router item fanout reports only final actionable selections", () => {
@@ -408,6 +416,54 @@ test("synthetic dispatch attempt replaces its durable claim in the ledger", () =
   );
   assert.equal(ledger.commands.length, 1);
   assert.equal(ledger.commands[0]?.status, "executed");
+});
+
+test("coalesced same-item forced replays recover every durable pending comment", () => {
+  const command = (commentId: string, updatedAt: string) => ({
+    idempotency_key: `comment-router:openclaw/openclaw:74499:${commentId}:${updatedAt}:re_review`,
+    comment_id: commentId,
+    comment_version_key: `${commentId}:${updatedAt}`,
+    comment_updated_at: updatedAt,
+    repo: "openclaw/openclaw",
+    issue_number: 74499,
+    status: "ready",
+    intent: "re_review",
+    actions: [{ action: "dispatch_clawsweeper", status: "planned" }],
+  });
+  const first = { updated_at: null, commands: [] };
+  const second = { updated_at: null, commands: [] };
+  appendLedger(
+    first,
+    stageForcedReplayCommands([command("101", "2026-07-12T20:01:00Z")], "forced-replay-41001"),
+  );
+  appendLedger(
+    second,
+    stageForcedReplayCommands([command("102", "2026-07-12T20:02:00Z")], "forced-replay-41002"),
+  );
+
+  const merged = mergeCommentRouterLedgers(first, second);
+  assert.deepEqual(routerPendingItemNumbers(merged.commands, "openclaw/openclaw"), [74499]);
+  assert.deepEqual(
+    durableForcedReplayCommentIds({
+      commands: merged.commands,
+      repo: "openclaw/openclaw",
+      itemNumbers: new Set([74499]),
+    }),
+    ["101", "102"],
+  );
+  assert.deepEqual(
+    merged.commands.map((entry) => [
+      entry.comment_id,
+      entry.status,
+      entry.forced_replay,
+      entry.attempt_id,
+      entry.actions[0]?.status,
+    ]),
+    [
+      ["101", "waiting", true, "forced-replay-41001", "waiting"],
+      ["102", "waiting", true, "forced-replay-41002", "waiting"],
+    ],
+  );
 });
 
 test("comment router ledger merge preserves disjoint claims and attempt progress", () => {
@@ -1358,18 +1414,20 @@ test("sortCommentsForRouting prioritizes edited durable review comments", () => 
   );
 });
 
-test("selectCommentsForRouting keeps durable review comments beyond the recent cap", () => {
+test("selectCommentsForRouting merges durable history from the preselected item window", () => {
   const selected = selectCommentsForRouting({
     maxComments: 1,
     recentComments: [
       {
         id: 2,
+        issue_url: "https://api.github.com/repos/openclaw/openclaw/issues/74742",
         body: "@clawsweeper status",
         created_at: "2026-04-30T03:40:00Z",
         updated_at: "2026-04-30T03:40:00Z",
       },
       {
         id: 3,
+        issue_url: "https://api.github.com/repos/openclaw/openclaw/issues/74742",
         body: "@clawsweeper rebase",
         created_at: "2026-04-30T03:39:00Z",
         updated_at: "2026-04-30T03:39:00Z",
@@ -1378,6 +1436,7 @@ test("selectCommentsForRouting keeps durable review comments beyond the recent c
     durableComments: [
       {
         id: 1,
+        issue_url: "https://api.github.com/repos/openclaw/openclaw/issues/74742",
         body: "<!-- clawsweeper-verdict:pass item=74742 sha=abc confidence=high -->",
         created_at: "2026-04-30T02:00:00Z",
         updated_at: "2026-04-30T03:45:00Z",
