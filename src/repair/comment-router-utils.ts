@@ -24,6 +24,8 @@ const LEDGER_COMMAND_STRING_FIELDS = [
   "repo",
   "processed_at",
 ] as const;
+const COMMENT_ROUTER_LEDGER_ENTRY_LIMIT = 1000;
+const ACTIVE_COMMENT_ROUTER_STATUSES = new Set(["waiting", "claimed"]);
 
 export function dispatchClaimLookupKeys(entry: LooseRecord) {
   const keys: string[] = [];
@@ -706,8 +708,8 @@ export function appendLedger(current: LooseRecord, entries: LooseRecord[]) {
       }));
     });
   if (compact.length === 0) return false;
-  const byCommentVersion = new Map(
-    (current.commands ?? []).map((entry: JsonValue) => [ledgerEntryKey(entry), entry]),
+  const byCommentVersion = new Map<string, LooseRecord>(
+    (current.commands ?? []).map((entry: LooseRecord) => [ledgerEntryKey(entry), entry] as const),
   );
   let changed = false;
   for (const entry of compact) {
@@ -719,8 +721,9 @@ export function appendLedger(current: LooseRecord, entries: LooseRecord[]) {
     changed = true;
   }
   if (!changed) return false;
+  const commands = boundedCommentRouterLedgerEntries(byCommentVersion);
   current.updated_at = new Date().toISOString();
-  current.commands = [...byCommentVersion.values()].slice(-1000);
+  current.commands = commands;
   return true;
 }
 
@@ -865,13 +868,7 @@ export function mergeCommentRouterLedgers(...values: JsonValue[]) {
       byKey.set(key, previous ? preferredLedgerEntry(previous, entry) : entry);
     }
   }
-  const commands = [...byKey.entries()]
-    .sort(([leftKey, left], [rightKey, right]) => {
-      const timeDifference = ledgerEntryTime(left) - ledgerEntryTime(right);
-      return timeDifference || leftKey.localeCompare(rightKey);
-    })
-    .slice(-1000)
-    .map(([, entry]) => entry);
+  const commands = boundedCommentRouterLedgerEntries(byKey);
   const updatedAt = ledgers
     .map((ledger) => String(ledger.updated_at ?? ""))
     .filter((value) => Number.isFinite(Date.parse(value)))
@@ -961,6 +958,33 @@ function ledgerEntryTime(entry: LooseRecord): number {
     if (Number.isFinite(parsed)) return parsed;
   }
   return 0;
+}
+
+function boundedCommentRouterLedgerEntries(
+  entries: ReadonlyMap<string, LooseRecord>,
+): LooseRecord[] {
+  const sorted = [...entries.entries()].sort(([leftKey, left], [rightKey, right]) => {
+    const timeDifference = ledgerEntryTime(left) - ledgerEntryTime(right);
+    return timeDifference || leftKey.localeCompare(rightKey);
+  });
+  const active = sorted.filter(([, entry]) =>
+    ACTIVE_COMMENT_ROUTER_STATUSES.has(String(entry.status ?? "")),
+  );
+  if (active.length > COMMENT_ROUTER_LEDGER_ENTRY_LIMIT) {
+    throw new Error(
+      `comment router ledger has ${active.length} active commands; maximum is ${COMMENT_ROUTER_LEDGER_ENTRY_LIMIT}`,
+    );
+  }
+
+  const terminalCapacity = COMMENT_ROUTER_LEDGER_ENTRY_LIMIT - active.length;
+  const retainedTerminal =
+    terminalCapacity > 0
+      ? sorted
+          .filter(([, entry]) => !ACTIVE_COMMENT_ROUTER_STATUSES.has(String(entry.status ?? "")))
+          .slice(-terminalCapacity)
+      : [];
+  const retainedKeys = new Set([...active, ...retainedTerminal].map(([key]) => key));
+  return sorted.filter(([key]) => retainedKeys.has(key)).map(([, entry]) => entry);
 }
 
 function ledgerStatusRank(value: JsonValue): number {

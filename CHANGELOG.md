@@ -143,6 +143,8 @@ checkpoint, and status-only commits are intentionally omitted.
 - Revalidated live per-PR automerge authorization immediately before
   replacement merges; isolated comment-router routing by exact item and drained
   its durable waiting queue through one serialized live-capacity gate;
+  retained every active waiting or claimed command while trimming bounded
+  terminal ledger history, failing closed if active work alone exceeds the cap;
   separated complete autoclose safety hydration from bounded routing discovery;
   preserved forced replays as durable
   distinct attempts; paged broad discovery by unprocessed routable comments and

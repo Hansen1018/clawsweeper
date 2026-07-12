@@ -39,6 +39,24 @@ import {
 } from "../../dist/repair/comment-router-utils.js";
 import { forcedReplayCommandFields, readCommentRouterConfig } from "../../dist/repair/config.js";
 
+const COMMENT_ROUTER_LEDGER_ENTRY_LIMIT = 1000;
+
+function routerLedgerEntry(index: number, status: "waiting" | "claimed" | "executed") {
+  const commentId = String(index + 1);
+  return {
+    idempotency_key: `command-${commentId}`,
+    comment_id: commentId,
+    comment_version_key: `${commentId}:2026-07-12T20:00:00Z`,
+    comment_updated_at: "2026-07-12T20:00:00Z",
+    processed_at: new Date(Date.UTC(2026, 6, 12, 20, 0, index)).toISOString(),
+    repo: "openclaw/openclaw",
+    issue_number: index + 1,
+    status,
+    intent: "re_review",
+    actions: [{ action: "dispatch_clawsweeper", status }],
+  };
+}
+
 test("exact terminal comment versions short-circuit duplicate created deliveries", () => {
   const body = "@clawsweeper re-review";
   const ledger = exactVersionLedger({
@@ -777,6 +795,102 @@ test("comment router ledger merge preserves disjoint claims and terminal progres
       commands: [executedFirstClaim],
     }).commands.find((entry) => entry.issue_number === 101)?.status,
     "executed",
+  );
+});
+
+test("ledger append trims terminal history before active commands", () => {
+  const waiting = routerLedgerEntry(0, "waiting");
+  const terminal = Array.from({ length: COMMENT_ROUTER_LEDGER_ENTRY_LIMIT - 1 }, (_, index) =>
+    routerLedgerEntry(index + 1, "executed"),
+  );
+  const ledger = {
+    updated_at: null,
+    commands: [waiting, ...terminal],
+  };
+  const newestTerminal = routerLedgerEntry(COMMENT_ROUTER_LEDGER_ENTRY_LIMIT, "executed");
+
+  assert.equal(appendLedger(ledger, [newestTerminal]), true);
+  assert.equal(ledger.commands.length, COMMENT_ROUTER_LEDGER_ENTRY_LIMIT);
+  assert.equal(
+    ledger.commands.some((entry) => entry.comment_id === waiting.comment_id),
+    true,
+  );
+  assert.equal(
+    ledger.commands.some((entry) => entry.comment_id === terminal[0]?.comment_id),
+    false,
+  );
+  assert.equal(
+    ledger.commands.some((entry) => entry.comment_id === newestTerminal.comment_id),
+    true,
+  );
+});
+
+test("ledger merge trims terminal history before active commands", () => {
+  const waiting = routerLedgerEntry(0, "claimed");
+  const terminal = Array.from({ length: COMMENT_ROUTER_LEDGER_ENTRY_LIMIT - 1 }, (_, index) =>
+    routerLedgerEntry(index + 1, "executed"),
+  );
+  const newestTerminal = routerLedgerEntry(COMMENT_ROUTER_LEDGER_ENTRY_LIMIT, "executed");
+
+  const merged = mergeCommentRouterLedgers(
+    { updated_at: null, commands: [waiting, ...terminal] },
+    { updated_at: null, commands: [newestTerminal] },
+  );
+
+  assert.equal(merged.commands.length, COMMENT_ROUTER_LEDGER_ENTRY_LIMIT);
+  assert.equal(
+    merged.commands.some((entry) => entry.comment_id === waiting.comment_id),
+    true,
+  );
+  assert.equal(
+    merged.commands.some((entry) => entry.comment_id === terminal[0]?.comment_id),
+    false,
+  );
+  assert.equal(
+    merged.commands.some((entry) => entry.comment_id === newestTerminal.comment_id),
+    true,
+  );
+});
+
+test("active-only ledger capacity fails closed without dropping work", () => {
+  const active = Array.from({ length: COMMENT_ROUTER_LEDGER_ENTRY_LIMIT }, (_, index) =>
+    routerLedgerEntry(index, index % 2 === 0 ? "waiting" : "claimed"),
+  );
+  const terminal = routerLedgerEntry(COMMENT_ROUTER_LEDGER_ENTRY_LIMIT, "executed");
+  const appended = { updated_at: null, commands: structuredClone(active) };
+
+  assert.equal(appendLedger(appended, [terminal]), true);
+  assert.equal(appended.commands.length, COMMENT_ROUTER_LEDGER_ENTRY_LIMIT);
+  assert.equal(
+    appended.commands.every((entry) => entry.status !== "executed"),
+    true,
+  );
+
+  const merged = mergeCommentRouterLedgers(
+    { updated_at: null, commands: active },
+    { updated_at: null, commands: [terminal] },
+  );
+  assert.equal(merged.commands.length, COMMENT_ROUTER_LEDGER_ENTRY_LIMIT);
+  assert.equal(
+    merged.commands.every((entry) => entry.status !== "executed"),
+    true,
+  );
+
+  const overflow = routerLedgerEntry(COMMENT_ROUTER_LEDGER_ENTRY_LIMIT, "waiting");
+  const appendOverflow = { updated_at: null, commands: structuredClone(active) };
+  assert.throws(
+    () => appendLedger(appendOverflow, [overflow]),
+    /comment router ledger has 1001 active commands; maximum is 1000/,
+  );
+  assert.equal(appendOverflow.updated_at, null);
+  assert.deepEqual(appendOverflow.commands, active);
+  assert.throws(
+    () =>
+      mergeCommentRouterLedgers(
+        { updated_at: null, commands: active },
+        { updated_at: null, commands: [overflow] },
+      ),
+    /comment router ledger has 1001 active commands; maximum is 1000/,
   );
 });
 
