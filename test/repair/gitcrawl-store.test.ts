@@ -3,13 +3,10 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 
 test("gitcrawl readers prefer portable gitcrawl-store before legacy local DB", () => {
-  const sources = [
-    readFileSync("src/clawsweeper.ts", "utf8"),
-    readFileSync("src/repair/import-gitcrawl-clusters.ts", "utf8"),
-    readFileSync("src/repair/import-gitcrawl-low-signal-prs.ts", "utf8"),
-  ];
+  const reviewSource = readFileSync("src/clawsweeper.ts", "utf8");
+  const repairSource = readFileSync("src/repair/gitcrawl-evidence-adapter.ts", "utf8");
 
-  for (const source of sources) {
+  for (const source of [reviewSource, repairSource]) {
     assert.match(source, /CLAWSWEEPER_GITCRAWL_DB/);
     assert.match(source, /gitcrawl-store/);
     assert.match(source, /\.sync\.db/);
@@ -38,10 +35,8 @@ test("gitcrawl cluster import drip-feeds mostly open clusters by default", () =>
   assert.match(source, /const skipClosedPercent = percentArg\("skip-closed-percent", 75\)/);
   assert.match(source, /skip mostly-closed cluster/);
   assert.match(source, /closedPercent >= skipClosedPercent/);
-  assert.match(
-    source,
-    /\(\(closed_count \* 100\) \/ member_count\) < \$\{sqlNumber\(skipClosedPercent\)\}/,
-  );
+  assert.match(source, /adapter\.listClusters/);
+  assert.match(source, /adapter\.clusterMembers/);
   assert.match(limitsDocs, /75% closed members are skipped/);
   assert.match(repairDocs, /75%\+ closed clusters by default/);
 });

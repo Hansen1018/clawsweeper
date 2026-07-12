@@ -35,6 +35,22 @@ test("imported cluster jobs use the cluster worker lane", () => {
     repairJobUsesClusterLane({ job_intent: "repair_cluster", cluster_id: "gitcrawl-123" }),
     true,
   );
+  assert.equal(
+    repairJobUsesClusterLane({
+      job_intent: "repair_cluster",
+      cluster_id: "gitcrawl-evidence-v1-123-runtime-refresh",
+      gitcrawl_evidence_schema: "gitcrawl-evidence-job-v1",
+    }),
+    true,
+  );
+  assert.equal(
+    repairJobUsesClusterLane({
+      job_intent: "repair_cluster",
+      cluster_id: "manual-cluster",
+      gitcrawl_evidence_schema: "unknown",
+    }),
+    false,
+  );
   assert.equal(repairJobUsesClusterLane({ job_intent: "low_signal_pr_cleanup" }), false);
   assert.equal(
     repairJobUsesClusterLane({

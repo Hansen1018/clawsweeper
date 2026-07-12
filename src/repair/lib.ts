@@ -3,6 +3,11 @@ import path from "node:path";
 import { repoRoot } from "./paths.js";
 import type { JsonValue, LooseRecord } from "./json-types.js";
 import { isRepairMode, type RepairJobFrontmatter } from "./domain-types.js";
+import { GITCRAWL_JOB_EVIDENCE_SCHEMA } from "./gitcrawl-evidence-contract.js";
+import {
+  verifyEmbeddedGitcrawlEvidencePacket,
+  verifyGitcrawlEvidenceJobTargets,
+} from "./gitcrawl-evidence-graph.js";
 import { isRepairJobIntent } from "./job-intent.js";
 
 export { repoRoot } from "./paths.js";
@@ -59,10 +64,20 @@ export function parseJob(filePath: string): ParsedJob {
   if (!match) {
     throw new Error(`missing YAML frontmatter: ${filePath}`);
   }
+  const frontmatter = parseSimpleYaml(match[1] ?? "") as JobFrontmatter;
+  const evidencePolicy = gitcrawlEvidencePolicy(frontmatter);
+  if (evidencePolicy.required) {
+    const packet = verifyEmbeddedGitcrawlEvidencePacket(
+      raw,
+      typeof frontmatter.repo === "string" ? frontmatter.repo : undefined,
+      true,
+    );
+    verifyGitcrawlEvidenceJobTargets(packet!, frontmatter);
+  }
   return {
     path: absolute,
     relativePath: path.relative(repoRoot(), absolute),
-    frontmatter: parseSimpleYaml(match[1] ?? "") as JobFrontmatter,
+    frontmatter,
     body: (match[2] ?? "").trim(),
     raw,
   };
@@ -120,6 +135,15 @@ export function validateJob(job: ParsedJob | LooseRecord) {
   const errors: string[] = [];
   const fm = job.frontmatter;
   const commitFindingJob = fm.source === "clawsweeper_commit";
+  try {
+    if (gitcrawlEvidencePolicy(fm).legacy) {
+      errors.push(
+        "legacy pre-evidence Gitcrawl job is quarantined; re-import it with gitcrawl-evidence-job-v1",
+      );
+    }
+  } catch (error) {
+    errors.push(error instanceof Error ? error.message : String(error));
+  }
 
   requireString(errors, fm, "repo");
   requireString(errors, fm, "cluster_id");
@@ -234,6 +258,22 @@ export function renderPrompt(
   requestedMode?: JsonValue,
   context: LooseRecord = {},
 ) {
+  if (typeof job.raw === "string") {
+    const evidencePolicy = gitcrawlEvidencePolicy(job.frontmatter);
+    if (evidencePolicy.legacy) {
+      throw new Error(
+        "legacy pre-evidence Gitcrawl job is quarantined; re-import it with gitcrawl-evidence-job-v1",
+      );
+    }
+    if (evidencePolicy.required) {
+      const packet = verifyEmbeddedGitcrawlEvidencePacket(
+        job.raw,
+        typeof job.frontmatter.repo === "string" ? job.frontmatter.repo : undefined,
+        true,
+      );
+      verifyGitcrawlEvidenceJobTargets(packet!, job.frontmatter);
+    }
+  }
   const mode = requestedMode ?? job.frontmatter.mode;
   const modePrompt =
     mode === "autonomous"
@@ -256,9 +296,9 @@ export function renderPrompt(
       ? ["## Low-signal PR policy", readText("instructions/low-signal-prs.md")]
       : []),
     "## Job file",
-    "```md",
+    "````md",
     job.raw.trim(),
-    "```",
+    "````",
   ];
 
   for (const [title, filePath] of [
@@ -294,6 +334,47 @@ export function renderPrompt(
   );
 
   return parts.join("\n\n");
+}
+
+function gitcrawlEvidencePolicy(frontmatter: LooseRecord): {
+  required: boolean;
+  legacy: boolean;
+} {
+  const clusterId = typeof frontmatter.cluster_id === "string" ? frontmatter.cluster_id.trim() : "";
+  const versionedClusterId = /^(?:gitcrawl|ghcrawl)-evidence-v1-\d+-/.test(clusterId);
+  const versionedLowSignalId = /^low-signal-pr-sweep-v1-\d/.test(clusterId);
+  const versionedGitcrawlId = versionedClusterId || versionedLowSignalId;
+  const legacyGitcrawlId =
+    /^(?:gitcrawl|ghcrawl)-\d+(?:-|$)/.test(clusterId) || /^low-signal-pr-sweep-\d/.test(clusterId);
+  const schema = frontmatter.gitcrawl_evidence_schema;
+  if (versionedGitcrawlId && schema !== GITCRAWL_JOB_EVIDENCE_SCHEMA) {
+    throw new Error(
+      `generated Gitcrawl job is missing gitcrawl_evidence_schema: ${GITCRAWL_JOB_EVIDENCE_SCHEMA}`,
+    );
+  }
+  if (schema !== undefined && schema !== GITCRAWL_JOB_EVIDENCE_SCHEMA) {
+    throw new Error(`unsupported Gitcrawl job evidence schema: ${String(schema)}`);
+  }
+  if (
+    (versionedGitcrawlId || schema === GITCRAWL_JOB_EVIDENCE_SCHEMA) &&
+    frontmatter.gitcrawl_evidence_required !== true
+  ) {
+    throw new Error("versioned Gitcrawl job is missing gitcrawl_evidence_required: true");
+  }
+  if (versionedLowSignalId && frontmatter.job_intent !== "low_signal_pr_cleanup") {
+    throw new Error("versioned low-signal Gitcrawl job requires job_intent: low_signal_pr_cleanup");
+  }
+  if (versionedLowSignalId && frontmatter.triage_policy !== "low_signal_prs") {
+    throw new Error("versioned low-signal Gitcrawl job requires triage_policy: low_signal_prs");
+  }
+  if (versionedClusterId && frontmatter.job_intent !== "repair_cluster") {
+    throw new Error("versioned cluster Gitcrawl job requires job_intent: repair_cluster");
+  }
+  return {
+    required: frontmatter.gitcrawl_evidence_required === true,
+    legacy:
+      legacyGitcrawlId && schema === undefined && frontmatter.gitcrawl_evidence_required !== true,
+  };
 }
 
 function promptArtifactText(title: string, absolutePath: string) {

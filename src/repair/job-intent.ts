@@ -1,5 +1,6 @@
 import type { WorkerLane } from "./limits.js";
 import type { JsonValue, LooseRecord } from "./json-types.js";
+import { GITCRAWL_JOB_EVIDENCE_SCHEMA } from "./gitcrawl-evidence-contract.js";
 
 export const REPAIR_JOB_INTENTS = [
   "repair_cluster",
@@ -58,6 +59,7 @@ export function workerLaneForRepairJobIntent(intent: RepairJobIntent): WorkerLan
 export function repairJobUsesClusterLane(frontmatter: LooseRecord): boolean {
   const intent = repairJobIntentForFrontmatter(frontmatter);
   if (intent !== "repair_cluster") return false;
+  if (frontmatter.gitcrawl_evidence_schema === GITCRAWL_JOB_EVIDENCE_SCHEMA) return true;
 
   const clusterId = String(frontmatter.cluster_id ?? "")
     .trim()

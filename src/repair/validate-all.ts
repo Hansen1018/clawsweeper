@@ -11,7 +11,12 @@ const files: LooseRecord[] = [];
 function walk(dir: string) {
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
     const full = path.join(dir, entry.name);
-    if (entry.isDirectory() && entry.name === "closed") continue;
+    if (
+      entry.isDirectory() &&
+      (entry.name === "closed" || entry.name === ".legacy-gitcrawl-quarantine")
+    ) {
+      continue;
+    }
     if (entry.isDirectory()) walk(full);
     if (entry.isFile() && entry.name.endsWith(".md")) files.push(full);
   }

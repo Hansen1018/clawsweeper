@@ -51,6 +51,46 @@ candidates:
   assert.deepEqual(validateJob({ frontmatter }), ["unsupported job_intent: surprise"]);
 });
 
+test("versioned Gitcrawl jobs bind their worker and policy intent", () => {
+  const base = {
+    repo: "openclaw/openclaw",
+    mode: "plan",
+    allowed_actions: ["comment"],
+    candidates: ["#1"],
+    gitcrawl_evidence_schema: "gitcrawl-evidence-job-v1",
+    gitcrawl_evidence_required: true,
+  };
+  assert.deepEqual(
+    validateJob({
+      frontmatter: {
+        ...base,
+        cluster_id: "low-signal-pr-sweep-v1-20260712T1200-01",
+      },
+    }),
+    ["versioned low-signal Gitcrawl job requires job_intent: low_signal_pr_cleanup"],
+  );
+  assert.deepEqual(
+    validateJob({
+      frontmatter: {
+        ...base,
+        cluster_id: "low-signal-pr-sweep-v1-20260712T1200-01",
+        job_intent: "low_signal_pr_cleanup",
+      },
+    }),
+    ["versioned low-signal Gitcrawl job requires triage_policy: low_signal_prs"],
+  );
+  assert.deepEqual(
+    validateJob({
+      frontmatter: {
+        ...base,
+        cluster_id: "gitcrawl-evidence-v1-7-current",
+        job_intent: "low_signal_pr_cleanup",
+      },
+    }),
+    ["versioned cluster Gitcrawl job requires job_intent: repair_cluster"],
+  );
+});
+
 test("security signal detection ignores non-security advisory wording", () => {
   assert.equal(
     hasSecuritySignalText(
