@@ -248,6 +248,26 @@ test("synthetic dispatch claims retain a stable idempotency lookup across router
   );
 });
 
+test("forced replay attempts scope durable dispatch claims", () => {
+  const command = {
+    idempotency_key: "comment-router:openclaw/openclaw:74499:101:re_review",
+    comment_id: "101",
+    comment_updated_at: "2026-07-12T20:00:00Z",
+  };
+
+  assert.deepEqual(
+    dispatchClaimLookupKeys({ ...command, forced_replay: true, attempt_id: "attempt-a" }),
+    [
+      'forced-replay:["comment:101:2026-07-12T20:00:00Z","attempt-a"]',
+      'forced-replay:["idempotency:comment-router:openclaw/openclaw:74499:101:re_review","attempt-a"]',
+    ],
+  );
+  assert.notDeepEqual(
+    dispatchClaimLookupKeys({ ...command, forced_replay: true, attempt_id: "attempt-a" }),
+    dispatchClaimLookupKeys({ ...command, forced_replay: true, attempt_id: "attempt-b" }),
+  );
+});
+
 test("synthetic repair-loop command ids parse only exact positive item targets", () => {
   assert.deepEqual(parseRepairLoopSweepCommandId("repair-loop-label-sweep:AUTOMERGE:74499"), {
     intent: "automerge",
@@ -548,6 +568,85 @@ test("forced replay staging fails closed without a durable attempt id", () => {
   );
 });
 
+test("new forced replay attempts survive terminal history for the same comment version", () => {
+  const command = {
+    idempotency_key: "command-42",
+    comment_id: "1042",
+    comment_version_key: "1042:2026-07-12T20:00:00Z",
+    comment_updated_at: "2026-07-12T20:00:00Z",
+    repo: "openclaw/openclaw",
+    issue_number: 42,
+    status: "ready",
+    intent: "re_review",
+    actions: [{ action: "dispatch_clawsweeper", status: "planned" }],
+  };
+  const terminal = { updated_at: null, commands: [] };
+  const forcedReplay = { updated_at: null, commands: [] };
+  appendLedger(terminal, [
+    {
+      ...command,
+      status: "executed",
+      processed_at: "2026-07-12T20:04:00Z",
+      actions: [{ action: "dispatch_clawsweeper", status: "executed" }],
+    },
+  ]);
+  appendLedger(
+    forcedReplay,
+    stageSelectedRouterCommands({
+      commands: [command],
+      selectedItemNumbers: new Set([42]),
+      forcedReplay: true,
+      processedAt: "2026-07-12T20:05:00Z",
+      attemptId: "forced-attempt-2",
+    }),
+  );
+
+  const merged = mergeCommentRouterLedgers(terminal, forcedReplay);
+  assert.deepEqual(
+    merged.commands.map((entry) => [entry.status, entry.attempt_id ?? null]),
+    [
+      ["executed", null],
+      ["waiting", "forced-attempt-2"],
+    ],
+  );
+  assert.deepEqual(
+    durableForcedReplayCommentIds({
+      commands: merged.commands,
+      repo: "openclaw/openclaw",
+      itemNumbers: new Set([42]),
+    }),
+    ["1042"],
+  );
+});
+
+test("one coalesced forced execution completes every pending attempt identity", () => {
+  const ledger = { updated_at: null, commands: [] };
+  appendLedger(ledger, [
+    {
+      idempotency_key: "command-42",
+      comment_id: "1042",
+      comment_version_key: "1042:2026-07-12T20:00:00Z",
+      comment_updated_at: "2026-07-12T20:00:00Z",
+      repo: "openclaw/openclaw",
+      issue_number: 42,
+      status: "executed",
+      intent: "re_review",
+      forced_replay: true,
+      attempt_id: "forced-attempt-2",
+      forced_replay_attempt_ids: ["forced-attempt-1", "forced-attempt-2"],
+      actions: [{ action: "dispatch_clawsweeper", status: "executed" }],
+    },
+  ]);
+
+  assert.deepEqual(
+    ledger.commands.map((entry) => [entry.status, entry.attempt_id]),
+    [
+      ["executed", "forced-attempt-1"],
+      ["executed", "forced-attempt-2"],
+    ],
+  );
+});
+
 test("comment router ledger merge preserves disjoint claims and terminal progress", () => {
   const firstClaim = {
     idempotency_key: "repair-loop-label-sweep:openclaw/openclaw:autofix:101",
@@ -811,8 +910,11 @@ test("forced replay claims survive ledger interruption without cross-attempt ali
     appendLedger(restored, [{ ...firstAttempt, attempt_id: "forced-replay-41002" }]),
     true,
   );
-  assert.equal(restored.commands.length, 1);
-  assert.equal(restored.commands[0]?.attempt_id, "forced-replay-41002");
+  assert.equal(restored.commands.length, 2);
+  assert.deepEqual(
+    restored.commands.map((command) => command.attempt_id),
+    ["forced-replay-41001", "forced-replay-41002"],
+  );
 });
 
 test("refreshed forced replay claims survive bounded ledger trimming and restart", (t) => {

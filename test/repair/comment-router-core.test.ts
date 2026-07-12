@@ -1559,7 +1559,15 @@ test("forced exact-item replay scopes forwarded comment ids before item-wide rec
   );
   assert.match(
     source,
-    /durableForcedReplayCommentIds\(\{[\s\S]*commands: ledger\.commands \?\? \[\],[\s\S]*itemNumbers/,
+    /durableForcedReplayCommentIds\(\{[\s\S]*commands: recoveredForcedReplayCommands,[\s\S]*itemNumbers/,
+  );
+  assert.match(
+    source,
+    /durableForcedReplayCommands\(\{[\s\S]*commands: ledger\.commands \?\? \[\],[\s\S]*itemNumbers/,
+  );
+  assert.match(
+    source,
+    /bindRecoveredForcedReplayAttempts[\s\S]*forced_replay_attempt_ids:\s*attemptIds/,
   );
   assert.match(
     source,

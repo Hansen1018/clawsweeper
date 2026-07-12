@@ -417,13 +417,21 @@ export function stageSelectedRouterCommands({
   if (forcedReplay && !attemptId) {
     throw new Error("forced replay staging requires an attempt id");
   }
+  const stagedAttemptId = forcedReplay
+    ? forcedReplayAttemptId({ forced_replay: true, attempt_id: attemptId })
+    : null;
   return commands
     .filter((command) => selectedItemNumbers.has(Number(command.issue_number)))
     .filter(routerCommandNeedsExactLane)
     .filter((command) => validRouterCommentId(command.comment_id, command.issue_number))
     .map((command) => ({
       ...command,
-      ...(forcedReplay ? { forced_replay: true, attempt_id: attemptId } : {}),
+      ...(forcedReplay
+        ? {
+            forced_replay: true,
+            attempt_id: forcedReplayAttemptId(command) ?? stagedAttemptId,
+          }
+        : {}),
       processed_at: processedAt,
       status: "waiting",
       actions: (Array.isArray(command.actions) ? command.actions : []).map((action: JsonValue) =>
@@ -445,7 +453,7 @@ export function stageForcedReplayCommands(commands: LooseRecord[], attemptId: st
   });
 }
 
-export function durableForcedReplayCommentIds({
+export function durableForcedReplayCommands({
   commands,
   repo,
   itemNumbers,
@@ -455,21 +463,25 @@ export function durableForcedReplayCommentIds({
   itemNumbers: ReadonlySet<number>;
 }) {
   const normalizedRepo = repo.trim().toLowerCase();
+  return commands.filter(
+    (command) =>
+      command.forced_replay === true &&
+      ["waiting", "claimed"].includes(String(command.status ?? "")) &&
+      String(command.repo ?? "")
+        .trim()
+        .toLowerCase() === normalizedRepo &&
+      itemNumbers.has(Number(command.issue_number)) &&
+      validRouterCommentId(command.comment_id, command.issue_number),
+  );
+}
+
+export function durableForcedReplayCommentIds(options: {
+  commands: LooseRecord[];
+  repo: string;
+  itemNumbers: ReadonlySet<number>;
+}) {
   return [
-    ...new Set(
-      commands
-        .filter(
-          (command) =>
-            command.forced_replay === true &&
-            ["waiting", "claimed"].includes(String(command.status ?? "")) &&
-            String(command.repo ?? "")
-              .trim()
-              .toLowerCase() === normalizedRepo &&
-            itemNumbers.has(Number(command.issue_number)) &&
-            validRouterCommentId(command.comment_id, command.issue_number),
-        )
-        .map((command) => String(command.comment_id)),
-    ),
+    ...new Set(durableForcedReplayCommands(options).map((command) => String(command.comment_id))),
   ];
 }
 
@@ -606,9 +618,11 @@ export function appendLedger(current: LooseRecord, entries: LooseRecord[]) {
       ["claimed", "executed", "skipped", "waiting"].includes(entry.status),
     )
     .filter((entry: JsonValue) => !isNoopSkip(entry))
-    .map((entry: JsonValue) => {
+    .flatMap((entry: JsonValue) => {
       const actions = compactLedgerActions(entry.actions);
-      return {
+      const forcedReplayIdentity = forcedReplayIdentityFields(entry);
+      const attemptIds = ledgerAttemptIds({ ...entry, ...forcedReplayIdentity });
+      return attemptIds.map((attemptId) => ({
         idempotency_key: entry.idempotency_key,
         comment_id: entry.comment_id,
         comment_version_key: entry.comment_version_key ?? null,
@@ -616,7 +630,7 @@ export function appendLedger(current: LooseRecord, entries: LooseRecord[]) {
         comment_created_at: entry.comment_created_at ?? null,
         comment_updated_at: entry.comment_updated_at ?? null,
         ...(entry.comment_body_sha256 ? { comment_body_sha256: entry.comment_body_sha256 } : {}),
-        ...(entry.forced_replay === true ? { forced_replay: true } : {}),
+        ...(attemptId ? { forced_replay: true, attempt_id: attemptId } : {}),
         repo: entry.repo,
         issue_number: entry.issue_number,
         author: entry.author,
@@ -630,7 +644,6 @@ export function appendLedger(current: LooseRecord, entries: LooseRecord[]) {
         trusted_bot_author: entry.trusted_bot_author ?? null,
         automation_source: entry.automation_source ?? null,
         repair_reason: entry.repair_reason ?? null,
-        ...forcedReplayIdentityFields(entry),
         expected_head_sha: entry.expected_head_sha ?? null,
         finding_id: entry.finding_id ?? null,
         status: entry.status,
@@ -645,7 +658,7 @@ export function appendLedger(current: LooseRecord, entries: LooseRecord[]) {
             }
           : null,
         ...(actions.length > 0 ? { actions } : {}),
-      };
+      }));
     });
   if (compact.length === 0) return false;
   const byCommentVersion = new Map(
@@ -802,17 +815,32 @@ function stableLedgerEntry(entry: LooseRecord) {
 }
 
 function ledgerEntryKey(entry: LooseRecord) {
+  let key: string;
   if (
     !entry.comment_version_key &&
     entry.automation_source === "repair_loop_label_sweep" &&
     entry.idempotency_key
   ) {
-    return `idempotency:${entry.idempotency_key}`;
+    key = `idempotency:${entry.idempotency_key}`;
+  } else {
+    key =
+      entry.comment_version_key ??
+      `${entry.comment_id ?? "unknown"}:${entry.comment_updated_at ?? "unknown"}`;
   }
-  return (
-    entry.comment_version_key ??
-    `${entry.comment_id ?? "unknown"}:${entry.comment_updated_at ?? "unknown"}`
-  );
+  const attemptId = forcedReplayAttemptId(entry);
+  return attemptId ? `${key}:attempt:${attemptId}` : key;
+}
+
+function ledgerAttemptIds(entry: LooseRecord): Array<string | null> {
+  if (entry.forced_replay !== true || !Array.isArray(entry.forced_replay_attempt_ids)) {
+    return [forcedReplayAttemptId(entry)];
+  }
+  const attempts = new Map<string, string>();
+  for (const value of entry.forced_replay_attempt_ids) {
+    const attemptId = forcedReplayAttemptId({ forced_replay: true, attempt_id: value });
+    if (attemptId) attempts.set(attemptId, attemptId);
+  }
+  return attempts.size > 0 ? [...attempts.values()] : [forcedReplayAttemptId(entry)];
 }
 
 function preferredLedgerEntry(left: LooseRecord, right: LooseRecord): LooseRecord {

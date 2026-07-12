@@ -94,6 +94,7 @@ import {
   dispatchClaimDecision,
   dispatchClaimLookupKeys,
   durableForcedReplayCommentIds,
+  durableForcedReplayCommands,
   exactCommentVersionFastPathDecision,
   exactCommentVersionMatchesLive,
   finalizeRouterItemFanout,
@@ -191,14 +192,19 @@ const {
 const startedAtMs = Date.now();
 const timings: LooseRecord[] = [];
 const ledger = readLedger(ledgerPath());
-const recoveredForcedReplayCommentIds =
+const recoveredForcedReplayCommands =
   forceReprocess && itemNumbers.size > 0
-    ? durableForcedReplayCommentIds({
+    ? durableForcedReplayCommands({
         commands: ledger.commands ?? [],
         repo: targetRepo,
         itemNumbers,
       })
     : [];
+const recoveredForcedReplayCommentIds = durableForcedReplayCommentIds({
+  commands: recoveredForcedReplayCommands,
+  repo: targetRepo,
+  itemNumbers,
+});
 const effectiveCommentIds = new Set([...commentIds, ...recoveredForcedReplayCommentIds]);
 const TARGET_LOOKUP_RETRY_ATTEMPTS = 3;
 let exactCommentVersionFastPath = exactCommentVersionFastPathDecision({
@@ -507,7 +513,7 @@ function routedCommandForComment(comment: JsonValue): LooseRecord | null {
   const parsed: LooseRecord = parseRoutedCommentCommand(comment, { trustedAuthors: trustedBots });
   if (!parsed) return null;
   const issueNumber = issueNumberFromUrl(comment.issue_url);
-  return {
+  return bindRecoveredForcedReplayAttempts({
     idempotency_key: idempotencyKey(parsed, issueNumber, comment.id, comment.updated_at),
     comment_id: String(comment.id),
     comment_version_key: commentVersionKey({
@@ -562,6 +568,38 @@ function routedCommandForComment(comment: JsonValue): LooseRecord | null {
     ...forcedReplayCommandFields({ forceReprocess, attemptId }),
     status: "pending",
     actions: [],
+  });
+}
+
+function bindRecoveredForcedReplayAttempts(command: LooseRecord): LooseRecord {
+  if (!forceReprocess) return command;
+  const matches = recoveredForcedReplayCommands
+    .filter((entry) => String(entry.comment_id ?? "") === String(command.comment_id ?? ""))
+    .filter(
+      (entry) =>
+        !entry.comment_version_key ||
+        !command.comment_version_key ||
+        entry.comment_version_key === command.comment_version_key,
+    )
+    .sort(
+      (left, right) =>
+        Date.parse(String(left.processed_at ?? "")) - Date.parse(String(right.processed_at ?? "")),
+    );
+  if (matches.length === 0) return command;
+  const currentAttemptId = String(command.attempt_id ?? "").trim();
+  const attemptIds = [
+    ...new Map(
+      [...matches.map((entry) => String(entry.attempt_id ?? "").trim()), currentAttemptId]
+        .filter(Boolean)
+        .map((attemptId) => [attemptId, attemptId] as const),
+    ).values(),
+  ];
+  const latestAttemptId = currentAttemptId || String(matches.at(-1)?.attempt_id ?? "").trim();
+  return {
+    ...command,
+    forced_replay: true,
+    attempt_id: latestAttemptId,
+    forced_replay_attempt_ids: attemptIds,
   };
 }
 
@@ -4513,7 +4551,7 @@ function listRepairLoopSweepCommands(
 }
 
 function repairLoopSweepCommand(intent: "autofix" | "automerge", number: number): LooseRecord {
-  return {
+  return bindRecoveredForcedReplayAttempts({
     idempotency_key: `repair-loop-label-sweep:${targetRepo}:${intent}:${number}`,
     comment_id: `repair-loop-label-sweep:${intent}:${number}`,
     comment_version_key: null,
@@ -4534,7 +4572,7 @@ function repairLoopSweepCommand(intent: "autofix" | "automerge", number: number)
     ...forcedReplayCommandFields({ forceReprocess, attemptId }),
     status: "pending",
     actions: [],
-  };
+  });
 }
 
 function fetchIssueComment(commentId: JsonValue): LooseRecord | null {
