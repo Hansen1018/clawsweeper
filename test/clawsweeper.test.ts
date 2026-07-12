@@ -2395,7 +2395,10 @@ test("repair workflows preserve existing dispatch while scheduled cluster intake
     /gh workflow run repair-comment-router\.yml[\s\S]*-f item_numbers="\$ITEM_NUMBER"/,
   );
   assert.match(router, /pnpm run repair:comment-router -- "\$\{args\[@\]\}"/);
-  assert.match(router, /\{ \[ "\$\{\{ github\.event_name \}\}" = "repository_dispatch" \]; \}/);
+  assert.match(
+    router,
+    /\{ \[ "\$\{\{ github\.event_name \}\}" = "repository_dispatch" \] && \[ -n "\$item_numbers" \]; \}/,
+  );
   assert.match(issueImplementation, /ENABLED: \$\{\{ github\.event\.inputs\.enabled/);
   assert.match(commitFinding, /ENABLED: \$\{\{ github\.event\.inputs\.enabled/);
   assert.match(clusterIntake, /SCHEDULE_ENABLED/);
