@@ -13,6 +13,7 @@ import {
   dispatchReceiptKeyMaterial,
   exactCommentVersionFastPathDecision,
   exactCommentVersionMatchesLive,
+  finalizeRouterItemFanout,
   hasSuccessfulDispatchExecutionJob,
   isGitHubAppIntegrationAuthError,
   isAllowedMutationActor,
@@ -21,8 +22,10 @@ import {
   parseRepairLoopSweepCommandId,
   readLedger,
   routerDispatchReceiptKey,
+  routerCommandNeedsExactLane,
+  routerFanoutItemNumbers,
   selectCommentsForRouting,
-  selectRepairLoopSweepPage,
+  selectRouterItemFanoutPage,
   shouldSuppressProcessedCommentVersion,
   sortCommentsForRouting,
   supersededReReviewCommentVersions,
@@ -263,33 +266,48 @@ test("synthetic repair-loop command ids parse only exact positive item targets",
   }
 });
 
-test("synthetic repair-loop sweep pages are bounded and resume deterministically", () => {
-  const targets = [
-    { intent: "automerge" as const, number: 43 },
-    { intent: "autofix" as const, number: 42 },
-    { intent: "automerge" as const, number: 42 },
-    { intent: "autofix" as const, number: 44 },
-    { intent: "autofix" as const, number: 42 },
-  ];
-  const first = selectRepairLoopSweepPage({ targets, after: null, limit: 2 });
-
-  assert.deepEqual(
-    first.targets.map((target) => target.commentId),
-    ["repair-loop-label-sweep:autofix:42", "repair-loop-label-sweep:automerge:42"],
-  );
-  assert.equal(first.candidateCount, 4);
-  assert.equal(first.nextAfterCommentId, "repair-loop-label-sweep:automerge:42");
-
-  const second = selectRepairLoopSweepPage({
-    targets,
-    after: parseRepairLoopSweepCommandId(first.nextAfterCommentId),
+test("combined router item fanout is bounded, distinct, and resumes deterministically", () => {
+  const first = selectRouterItemFanoutPage({
+    itemNumbers: [43, 42, 42, 44],
+    after: null,
     limit: 2,
   });
-  assert.deepEqual(
-    second.targets.map((target) => target.commentId),
-    ["repair-loop-label-sweep:automerge:43", "repair-loop-label-sweep:autofix:44"],
-  );
-  assert.equal(second.nextAfterCommentId, null);
+
+  assert.deepEqual(first.itemNumbers, [42, 43]);
+  assert.equal(first.candidateCount, 3);
+  assert.equal(first.nextAfterItemNumber, 43);
+
+  const second = selectRouterItemFanoutPage({
+    itemNumbers: [43, 42, 42, 44],
+    after: first.nextAfterItemNumber,
+    limit: 2,
+  });
+  assert.deepEqual(second.itemNumbers, [44]);
+  assert.equal(second.nextAfterItemNumber, null);
+});
+
+test("router item fanout reports only final actionable selections", () => {
+  const commands = [
+    { issue_number: 42, status: "ready", actions: [] },
+    { issue_number: 43, status: "skipped", actions: [] },
+    { issue_number: 44, status: "waiting", actions: [{ status: "waiting" }] },
+  ];
+  const page = selectRouterItemFanoutPage({
+    itemNumbers: [42, 43, 44],
+    after: null,
+    limit: 2,
+  });
+
+  assert.deepEqual(routerFanoutItemNumbers(commands), [42, 44]);
+  assert.equal(routerCommandNeedsExactLane(commands[1]), false);
+  assert.deepEqual(finalizeRouterItemFanout(page, commands, 2), {
+    limit: 2,
+    candidate_count: 3,
+    examined_count: 2,
+    selected_count: 1,
+    selected_item_numbers: [42],
+    next_after_item_number: 43,
+  });
 });
 
 test("synthetic dispatch receipt material is stable within an attempt and changes next attempt", () => {

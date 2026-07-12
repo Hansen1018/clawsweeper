@@ -41,7 +41,7 @@ on:
         default: ""
         type: string
       max_comments:
-        description: "Maximum recent comments to inspect"
+        description: "Maximum recent comments and distinct item lanes per page"
         required: true
         default: "100"
         type: string
@@ -55,8 +55,8 @@ on:
         required: false
         default: ""
         type: string
-      repair_loop_sweep_after:
-        description: "Internal synthetic repair-loop sweep continuation cursor"
+      router_fanout_after:
+        description: "Internal distinct-item fanout continuation cursor"
         required: false
         default: ""
         type: string
@@ -97,6 +97,7 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           REPOSITORY_DISPATCH_ITEM_NUMBER: ${{ github.event.client_payload.item_number }}
           WORKFLOW_DISPATCH_ITEM_NUMBERS: ${{ inputs.item_numbers }}
+          ROUTER_FANOUT_AFTER: ${{ inputs.router_fanout_after }}
           TARGET_REPO: ${{ github.event_name == 'workflow_dispatch' && inputs.target_repo || github.event_name == 'repository_dispatch' && github.event.client_payload.target_repo || vars.CLAWSWEEPER_TARGET_REPO || 'openclaw/openclaw' }}
         run: |
           set -euo pipefail
@@ -120,6 +121,13 @@ jobs:
               exit 1
             fi
             concurrency_group="repair-comment-router-$target_repo-item-$item_number"
+          elif [ -n "${ROUTER_FANOUT_AFTER:-}" ]; then
+            if ! printf '%s' "$ROUTER_FANOUT_AFTER" | grep -Eq '^[1-9][0-9]*$' ||
+               ! node -e 'const n = Number(process.argv[1]); process.exit(Number.isSafeInteger(n) && String(n) === process.argv[1] ? 0 : 1)' "$ROUTER_FANOUT_AFTER"; then
+              echo "Invalid router fanout cursor: expected canonical positive decimal, got $ROUTER_FANOUT_AFTER" >&2
+              exit 1
+            fi
+            concurrency_group="repair-comment-router-$target_repo-scan-continuation-$ROUTER_FANOUT_AFTER"
           else
             concurrency_group="repair-comment-router-$target_repo-scan"
           fi
@@ -287,7 +295,7 @@ jobs:
           max_comments="${{ github.event_name == 'workflow_dispatch' && inputs.max_comments || vars.CLAWSWEEPER_COMMENT_MAX_COMMENTS || '100' }}"
           item_numbers="${{ github.event_name == 'workflow_dispatch' && inputs.item_numbers || '' }}"
           comment_ids="${{ github.event_name == 'workflow_dispatch' && inputs.comment_ids || '' }}"
-          repair_loop_sweep_after="${{ github.event_name == 'workflow_dispatch' && inputs.repair_loop_sweep_after || '' }}"
+          router_fanout_after="${{ github.event_name == 'workflow_dispatch' && inputs.router_fanout_after || '' }}"
           runner="${{ github.event_name == 'workflow_dispatch' && inputs.runner || vars.CLAWSWEEPER_WORKER_RUNNER || 'blacksmith-4vcpu-ubuntu-2404' }}"
           execution_runner="${{ github.event_name == 'workflow_dispatch' && inputs.execution_runner || vars.CLAWSWEEPER_EXECUTION_RUNNER || 'blacksmith-16vcpu-ubuntu-2404' }}"
           force_reprocess="${{ github.event_name == 'workflow_dispatch' && inputs.force_reprocess || 'false' }}"
@@ -347,8 +355,8 @@ jobs:
           if [ -n "$comment_ids" ]; then
             args+=(--comment-ids "$comment_ids")
           fi
-          if [ -n "$repair_loop_sweep_after" ]; then
-            args+=(--repair-loop-sweep-after "$repair_loop_sweep_after")
+          if [ -n "$router_fanout_after" ]; then
+            args+=(--router-fanout-after "$router_fanout_after")
           fi
           if [ -n "$status_comment_id" ]; then
             args+=(--status-comment-id "$status_comment_id")
@@ -412,6 +420,8 @@ jobs:
           runner="${{ github.event_name == 'workflow_dispatch' && inputs.runner || vars.CLAWSWEEPER_WORKER_RUNNER || 'blacksmith-4vcpu-ubuntu-2404' }}"
           execution_runner="${{ github.event_name == 'workflow_dispatch' && inputs.execution_runner || vars.CLAWSWEEPER_EXECUTION_RUNNER || 'blacksmith-16vcpu-ubuntu-2404' }}"
           force_reprocess="${{ github.event_name == 'workflow_dispatch' && inputs.force_reprocess || 'false' }}"
+          item_numbers="${{ github.event_name == 'workflow_dispatch' && inputs.item_numbers || '' }}"
+          comment_ids="${{ github.event_name == 'workflow_dispatch' && inputs.comment_ids || '' }}"
           if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
             target_repo="${{ github.event.client_payload.target_repo || 'openclaw/openclaw' }}"
             target_branch="${{ github.event.client_payload.target_branch || '' }}"
@@ -421,11 +431,15 @@ jobs:
             runner="${{ github.event.client_payload.runner || vars.CLAWSWEEPER_WORKER_RUNNER || 'blacksmith-4vcpu-ubuntu-2404' }}"
             execution_runner="${{ github.event.client_payload.execution_runner || vars.CLAWSWEEPER_EXECUTION_RUNNER || 'blacksmith-16vcpu-ubuntu-2404' }}"
             force_reprocess="${{ github.event.client_payload.force_reprocess || 'false' }}"
+            item_numbers="${{ github.event.client_payload.item_number || '' }}"
+            comment_ids="${{ github.event.client_payload.comment_id || '' }}"
           fi
           jq -r '
-            .commands
+            (.router_item_fanout.selected_item_numbers // []) as $selected
+            | .commands
             | map(
                 select(
+                  (.issue_number as $number | ($selected | index($number)) != null) and
                   (.issue_number | type == "number" and . > 0) and
                   (
                     .status == "ready" or
@@ -468,11 +482,11 @@ jobs:
             gh "${dispatch_args[@]}"
           done
 
-          repair_loop_sweep_after="$(
-            jq -r '.repair_loop_sweep_fanout.next_after_comment_id // empty' \
+          router_fanout_after="$(
+            jq -r '.router_item_fanout.next_after_item_number // empty' \
               results/comment-router-latest.json
           )"
-          if [ -n "$repair_loop_sweep_after" ]; then
+          if [ -n "$router_fanout_after" ]; then
             gh workflow run repair-comment-router.yml \
               --repo "$GITHUB_REPOSITORY" \
               -f execute=true \
@@ -482,9 +496,9 @@ jobs:
               -f lookback_minutes="$lookback_minutes" \
               -f since="$since" \
               -f max_comments="$max_comments" \
-              -f item_numbers="" \
-              -f comment_ids="" \
-              -f repair_loop_sweep_after="$repair_loop_sweep_after" \
+              -f item_numbers="$item_numbers" \
+              -f comment_ids="$comment_ids" \
+              -f router_fanout_after="$router_fanout_after" \
               -f runner="$runner" \
               -f execution_runner="$execution_runner"
           fi

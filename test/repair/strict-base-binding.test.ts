@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 import { parse } from "yaml";
 
@@ -639,16 +642,37 @@ test("exact router dispatch concurrency is item-specific and cannot replace anot
     /concurrency_group="repair-comment-router-\$target_repo-item-\$item_number"/,
   );
   assert.match(source, /concurrency_group="repair-comment-router-\$target_repo-scan"/);
+  assert.match(
+    source,
+    /concurrency_group="repair-comment-router-\$target_repo-scan-continuation-\$ROUTER_FANOUT_AFTER"/,
+  );
   assert.match(source, /group: \$\{\{ needs\.normalize-lane\.outputs\.concurrency_group \}\}/);
+  const laneStep = normalize.steps?.find((step: { id?: string }) => step.id === "lane");
+  const laneScript = String(laneStep?.run ?? "");
+  const scanGroup = runRouterLaneScript(laneScript, {
+    EVENT_NAME: "schedule",
+    TARGET_REPO: "openclaw/openclaw",
+  });
+  const continuation42 = runRouterLaneScript(laneScript, {
+    EVENT_NAME: "workflow_dispatch",
+    TARGET_REPO: "openclaw/openclaw",
+    ROUTER_FANOUT_AFTER: "42",
+  });
+  const continuation43 = runRouterLaneScript(laneScript, {
+    EVENT_NAME: "workflow_dispatch",
+    TARGET_REPO: "openclaw/openclaw",
+    ROUTER_FANOUT_AFTER: "43",
+  });
+  assert.equal(scanGroup, "repair-comment-router-openclaw/openclaw-scan");
+  assert.equal(continuation42, "repair-comment-router-openclaw/openclaw-scan-continuation-42");
+  assert.notEqual(continuation42, scanGroup);
+  assert.notEqual(continuation42, continuation43);
   const routerSource = fs.readFileSync("src/repair/comment-router.ts", "utf8");
   const candidateSelection = routerSource.slice(
     routerSource.indexOf("function listCandidateComments()"),
     routerSource.indexOf("function extractMarkdownSection"),
   );
-  assert.ok(
-    candidateSelection.indexOf("if (itemNumbers.size > 0)") <
-      candidateSelection.indexOf("if (commentIds.size > 0)"),
-  );
+  assert.ok(candidateSelection.indexOf("forceReprocess && itemNumbers.size > 0") >= 0);
   assert.match(
     candidateSelection,
     /itemNumbers[\s\S]*recentComments: \[\],[\s\S]*durableComments: \[\.\.\.itemNumbers\]\.flatMap/,
@@ -670,6 +694,7 @@ test("exact router dispatch concurrency is item-specific and cannot replace anot
     assert.match(fanout, new RegExp(`-f ${input}="\\$${input}"`));
   }
   assert.match(fanout, /since="\$\{\{ github\.event\.client_payload\.since \|\| '' \}\}"/);
+  assert.match(fanout, /router_item_fanout\.selected_item_numbers/);
   assert.match(fanout, /group_by\(\.issue_number\)/);
   assert.match(fanout, /\.\[\]\.comment_id.*test\("\^\[0-9\]\+\$"\)/s);
   assert.match(
@@ -679,10 +704,14 @@ test("exact router dispatch concurrency is item-specific and cannot replace anot
   assert.match(fanout, /read -r item_number item_comment_ids/);
   assert.match(
     fanout,
-    /repair_loop_sweep_fanout\.next_after_comment_id[\s\S]*-f repair_loop_sweep_after="\$repair_loop_sweep_after"/,
+    /router_item_fanout\.next_after_item_number[\s\S]*-f router_fanout_after="\$router_fanout_after"/,
   );
+  assert.match(fanout, /-f item_numbers="\$item_numbers"[\s\S]*-f comment_ids="\$comment_ids"/);
   assert.match(fanout, /if \[ -n "\$item_comment_ids" \][\s\S]*comment_ids=\$item_comment_ids/);
-  assert.doesNotMatch(fanout, /comment_ids="\$comment_ids"/);
+  assert.doesNotMatch(
+    fanout.slice(0, fanout.indexOf('router_fanout_after="$(')),
+    /-f comment_ids="\$comment_ids"/,
+  );
   assert.doesNotMatch(
     fanout,
     /-f force_reprocess=false|-f lookback_minutes=180|-f max_comments=100/,
@@ -704,6 +733,28 @@ test("exact router dispatch concurrency is item-specific and cannot replace anot
     assert.doesNotMatch(block, /--rebase-strategy theirs/);
   }
 });
+
+function runRouterLaneScript(script: string, overrides: NodeJS.ProcessEnv) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-router-lane-"));
+  const output = path.join(root, "output");
+  execFileSync("bash", ["-c", script], {
+    env: {
+      ...process.env,
+      EVENT_NAME: "",
+      REPOSITORY_DISPATCH_ITEM_NUMBER: "",
+      WORKFLOW_DISPATCH_ITEM_NUMBERS: "",
+      ROUTER_FANOUT_AFTER: "",
+      TARGET_REPO: "openclaw/openclaw",
+      ...overrides,
+      GITHUB_OUTPUT: output,
+    },
+  });
+  const line = fs
+    .readFileSync(output, "utf8")
+    .split(/\r?\n/)
+    .find((entry) => entry.startsWith("concurrency_group="));
+  return line?.slice("concurrency_group=".length) ?? "";
+}
 
 test("workflow App identity is derived from authenticated tokens, never a configured numeric id", () => {
   for (const file of [

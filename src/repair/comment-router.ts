@@ -95,6 +95,7 @@ import {
   dispatchClaimLookupKeys,
   exactCommentVersionFastPathDecision,
   exactCommentVersionMatchesLive,
+  finalizeRouterItemFanout,
   hasSuccessfulDispatchExecutionJob,
   issueNumberFromUrl,
   isAllowedMutationActor,
@@ -102,8 +103,10 @@ import {
   parseRepairLoopSweepCommandId,
   readLedger,
   routerDispatchReceiptKey,
+  routerCommandNeedsExactLane,
+  routerFanoutItemNumbers,
   selectCommentsForRouting,
-  selectRepairLoopSweepPage,
+  selectRouterItemFanoutPage,
   shouldSuppressProcessedCommentVersion,
   stripAnsi,
   supersededReReviewCommentVersions,
@@ -170,7 +173,7 @@ const {
   maxAutoRepairsPerPr,
   lookupConcurrency,
   since,
-  repairLoopSweepAfter,
+  routerFanoutAfter,
   itemNumbers,
   commentIds,
   statusCommentId,
@@ -287,6 +290,11 @@ const commands = [
     sweepCommands.map((command) => classifyAndRecordCommand(command)),
   ),
 ];
+let routerItemFanout = finalizeRouterItemFanout(
+  repairLoopSweepSelection.page,
+  commands,
+  maxComments,
+);
 
 let actionable = commands.filter((command: JsonValue) => command.status === "ready");
 const report: LooseRecord = {
@@ -300,7 +308,7 @@ const report: LooseRecord = {
   force_reprocess: forceReprocess,
   forced_replay_attempt_id: attemptId,
   max_comments: maxComments,
-  repair_loop_sweep_fanout: repairLoopSweepSelection.fanout,
+  router_item_fanout: routerItemFanout,
   item_numbers: [...itemNumbers],
   comment_ids: [...commentIds],
   status_comment_id: statusCommentId,
@@ -365,11 +373,16 @@ if (execute && exactCommentVersionFastPath.suppress && exactCommentVersionFastPa
       ...resumedClassified,
       ...resumedSweepCommands.map((command) => classifyAndRecordCommand(command)),
     );
+    routerItemFanout = finalizeRouterItemFanout(
+      repairLoopSweepSelection.page,
+      commands,
+      maxComments,
+    );
     actionable = commands.filter((command: JsonValue) => command.status === "ready");
     report.scanned_comments = Number(report.scanned_comments ?? 0) + resumedComments.length;
     report.commands_seen = commands.length;
     report.actionable = actionable.length;
-    report.repair_loop_sweep_fanout = repairLoopSweepSelection.fanout;
+    report.router_item_fanout = routerItemFanout;
     report.exact_comment_version_fast_path = exactCommentVersionFastPath;
     report.short_circuited = false;
   }
@@ -1019,6 +1032,13 @@ function classifyCommand(command: LooseRecord): JsonValue {
         };
       }
       return automergeBlocked(next, `${mode} requires a pull request`);
+    }
+    if (command.automation_source === "repair_loop_label_sweep" && !hasLabel(target, modeLabel)) {
+      return {
+        ...next,
+        status: "skipped",
+        reason: `${mode} label sweep requires the live ${modeLabel} opt-in label`,
+      };
     }
     const stoppedReason = repairLoopStoppedReason(next);
     if (stoppedReason) return { ...next, status: "skipped", reason: stoppedReason };
@@ -4161,6 +4181,13 @@ function listRecentComments() {
 }
 
 function listCandidateComments() {
+  if (forceReprocess && itemNumbers.size > 0 && commentIds.size > 0) {
+    return selectCommentsForRouting({
+      recentComments: forwardedExactComments(),
+      durableComments: [],
+      maxComments,
+    });
+  }
   if (itemNumbers.size > 0) {
     return selectCommentsForRouting({
       recentComments: [],
@@ -4183,6 +4210,16 @@ function listCandidateComments() {
     durableComments: listRepairLoopReviewComments(),
     maxComments,
   });
+}
+
+function forwardedExactComments() {
+  return [...commentIds]
+    .filter((commentId) => /^[1-9]\d*$/.test(commentId))
+    .map((commentId) => fetchIssueComment(commentId))
+    .filter(
+      (comment): comment is LooseRecord =>
+        comment !== null && itemNumbers.has(issueNumberFromUrl(comment.issue_url) ?? 0),
+    );
 }
 
 function extractMarkdownSection(body: JsonValue, heading: string): string | null {
@@ -4215,16 +4252,19 @@ function listRepairLoopReviewComments() {
 function listRepairLoopSweepCommands(existingCommands: LooseRecord[]) {
   const requestedSweeps = [...commentIds]
     .map((commentId) => parseRepairLoopSweepCommandId(commentId))
-    .filter((command) => command !== null);
+    .filter(
+      (command): command is NonNullable<ReturnType<typeof parseRepairLoopSweepCommandId>> =>
+        command !== null && (itemNumbers.size === 0 || itemNumbers.has(command.number)),
+    );
+  const existingItemNumbers = routerFanoutItemNumbers(existingCommands);
   if ((itemNumbers.size > 0 || commentIds.size > 0) && requestedSweeps.length === 0) {
     return {
       commands: [],
-      fanout: {
+      page: selectRouterItemFanoutPage({
+        itemNumbers: existingItemNumbers,
+        after: routerFanoutAfter,
         limit: maxComments,
-        candidate_count: 0,
-        selected_count: 0,
-        next_after_comment_id: null,
-      },
+      }),
     };
   }
   const paused = new Set(
@@ -4235,13 +4275,20 @@ function listRepairLoopSweepCommands(existingCommands: LooseRecord[]) {
   );
   const seen = new Set(
     existingCommands
+      .filter(routerCommandNeedsExactLane)
       .filter((command) => ["autofix", "automerge"].includes(String(command.intent ?? "")))
       .map((command) => `${command.intent}:${Number(command.issue_number)}`),
   );
   const commands: LooseRecord[] = [];
   if (requestedSweeps.length > 0) {
+    const page = selectRouterItemFanoutPage({
+      itemNumbers: [...existingItemNumbers, ...requestedSweeps.map(({ number }) => number)],
+      after: routerFanoutAfter,
+      limit: maxComments,
+    });
+    const selectedItems = new Set(page.itemNumbers);
     for (const { intent, number } of requestedSweeps) {
-      if (itemNumbers.size > 0 && !itemNumbers.has(number)) continue;
+      if (!selectedItems.has(number)) continue;
       const key = `${intent}:${number}`;
       if (seen.has(key) || paused.has(number)) continue;
       seen.add(key);
@@ -4249,12 +4296,7 @@ function listRepairLoopSweepCommands(existingCommands: LooseRecord[]) {
     }
     return {
       commands,
-      fanout: {
-        limit: maxComments,
-        candidate_count: commands.length,
-        selected_count: commands.length,
-        next_after_comment_id: null,
-      },
+      page,
     };
   }
   const targets: Array<{ intent: "autofix" | "automerge"; number: number }> = [];
@@ -4269,22 +4311,20 @@ function listRepairLoopSweepCommands(existingCommands: LooseRecord[]) {
       targets.push({ intent, number });
     }
   }
-  const page = selectRepairLoopSweepPage({
-    targets,
-    after: repairLoopSweepAfter,
+  const page = selectRouterItemFanoutPage({
+    itemNumbers: [...existingItemNumbers, ...targets.map(({ number }) => number)],
+    after: routerFanoutAfter,
     limit: maxComments,
   });
+  const selectedItems = new Set(page.itemNumbers);
   commands.push(
-    ...page.targets.map(({ intent, number }) => repairLoopSweepCommand(intent, number)),
+    ...targets
+      .filter(({ number }) => selectedItems.has(number))
+      .map(({ intent, number }) => repairLoopSweepCommand(intent, number)),
   );
   return {
     commands,
-    fanout: {
-      limit: maxComments,
-      candidate_count: page.candidateCount,
-      selected_count: commands.length,
-      next_after_comment_id: page.nextAfterCommentId,
-    },
+    page,
   };
 }
 

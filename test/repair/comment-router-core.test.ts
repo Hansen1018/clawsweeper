@@ -1509,7 +1509,7 @@ test("router classifies fresh human-review pauses before label sweeps", () => {
   assert.match(source, /\.filter\(isReadyHumanReviewPause\)/);
 });
 
-test("exact synthetic label sweeps bypass GitHub comment lookup and recreate the command", () => {
+test("exact synthetic label sweeps revalidate live opt-in before recreating the command", () => {
   const source = readFileSync("src/repair/comment-router.ts", "utf8");
 
   assert.match(
@@ -1520,6 +1520,35 @@ test("exact synthetic label sweeps bypass GitHub comment lookup and recreate the
     source,
     /requestedSweeps = \[\.\.\.commentIds\][\s\S]*parseRepairLoopSweepCommandId[\s\S]*repairLoopSweepCommand\(intent, number\)/,
   );
+  assert.match(
+    source,
+    /automation_source === "repair_loop_label_sweep"[\s\S]*!hasLabel\(target, modeLabel\)[\s\S]*requires the live \$\{modeLabel\} opt-in label/,
+  );
+  assert.match(
+    source,
+    /existingCommands[\s\S]*\.filter\(routerCommandNeedsExactLane\)[\s\S]*\.filter\(\(command\) => \["autofix", "automerge"\]/,
+  );
+});
+
+test("forced exact-item replay scopes forwarded comment ids before item-wide reconciliation", () => {
+  const source = readFileSync("src/repair/comment-router.ts", "utf8");
+  const candidates = source.slice(
+    source.indexOf("function listCandidateComments()"),
+    source.indexOf("function extractMarkdownSection"),
+  );
+
+  assert.ok(
+    candidates.indexOf("forceReprocess && itemNumbers.size > 0 && commentIds.size > 0") >= 0,
+  );
+  assert.ok(
+    candidates.indexOf("forceReprocess && itemNumbers.size > 0 && commentIds.size > 0") <
+      candidates.indexOf("if (itemNumbers.size > 0)"),
+  );
+  assert.match(
+    candidates,
+    /recentComments: forwardedExactComments\(\)[\s\S]*durableComments: \[\]/,
+  );
+  assert.match(candidates, /itemNumbers\.has\(issueNumberFromUrl\(comment\.issue_url\) \?\? 0\)/);
 });
 
 test("label sweeps honor fresh trusted exact-head review start leases", () => {

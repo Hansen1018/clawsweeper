@@ -45,7 +45,7 @@ export type CommentRouterConfig = {
   lookupConcurrency: number;
   lookbackMinutes: number;
   since: string;
-  repairLoopSweepAfter: ReturnType<typeof parseRepairLoopSweepCommandId>;
+  routerFanoutAfter: number | null;
   itemNumbers: Set<number>;
   commentIds: Set<string>;
   statusCommentId: number | null;
@@ -173,7 +173,10 @@ export function readCommentRouterConfig(args: LooseRecord): CommentRouterConfig 
       args.since,
       new Date(Date.now() - lookbackMinutes * 60 * 1000).toISOString(),
     ),
-    repairLoopSweepAfter: optionalRepairLoopSweepCommandId(args["repair-loop-sweep-after"]),
+    routerFanoutAfter: optionalCanonicalPositiveInteger(
+      args["router-fanout-after"],
+      "router-fanout-after",
+    ),
     itemNumbers: numberSet(
       [args["item-number"], args["item-numbers"], process.env.CLAWSWEEPER_COMMENT_ITEM_NUMBERS]
         .filter((value) => value !== undefined && value !== null)
@@ -212,17 +215,6 @@ export function forcedReplayCommandFields(
 ): LooseRecord {
   if (!config.forceReprocess || !config.attemptId) return {};
   return { forced_replay: true, attempt_id: config.attemptId };
-}
-
-function optionalRepairLoopSweepCommandId(value: JsonValue) {
-  if (value === undefined || value === null || String(value).trim() === "") return null;
-  const parsed = parseRepairLoopSweepCommandId(value);
-  if (!parsed) {
-    throw new Error(
-      `invalid repair-loop-sweep-after: expected repair-loop sweep id, got ${String(value).trim()}`,
-    );
-  }
-  return parsed;
 }
 
 function stringSetting(value: JsonValue, fallback: string): string {
@@ -267,6 +259,19 @@ function optionalAttemptId(value: JsonValue): string | null {
     throw new Error("--attempt-id must be a non-empty token of at most 128 characters");
   }
   return attemptId;
+}
+
+function optionalCanonicalPositiveInteger(value: JsonValue, label: string): number | null {
+  if (value === undefined || value === null || String(value).trim() === "") return null;
+  const text = String(value).trim();
+  if (!/^[1-9]\d*$/.test(text)) {
+    throw new Error(`${label} must be a canonical positive integer`);
+  }
+  const parsed = Number(text);
+  if (!Number.isSafeInteger(parsed)) {
+    throw new Error(`${label} must be a safe positive integer`);
+  }
+  return parsed;
 }
 
 function numberSet(value: JsonValue, name: string): Set<number> {

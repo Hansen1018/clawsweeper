@@ -855,44 +855,60 @@ export function parseRepairLoopSweepCommandId(value: JsonValue) {
   };
 }
 
-export function selectRepairLoopSweepPage({
-  targets,
+export function routerFanoutItemNumbers(commands: LooseRecord[]) {
+  return [
+    ...new Set(
+      commands
+        .filter(routerCommandNeedsExactLane)
+        .map((command) => Number(command.issue_number))
+        .filter((number) => Number.isSafeInteger(number) && number > 0),
+    ),
+  ].sort((left, right) => left - right);
+}
+
+export function routerCommandNeedsExactLane(command: LooseRecord) {
+  if (String(command.status ?? "") === "ready") return true;
+  return (Array.isArray(command.actions) ? command.actions : []).some((action: JsonValue) =>
+    ["waiting", "active"].includes(String(action?.status ?? "")),
+  );
+}
+
+export function selectRouterItemFanoutPage({
+  itemNumbers,
   after,
   limit,
 }: {
-  targets: Array<{ intent: "autofix" | "automerge"; number: number }>;
-  after: ReturnType<typeof parseRepairLoopSweepCommandId>;
+  itemNumbers: Iterable<number>;
+  after: number | null;
   limit: number;
 }) {
-  const sorted = [
-    ...new Map(
-      targets.map((target) => [
-        `repair-loop-label-sweep:${target.intent}:${target.number}`,
-        {
-          ...target,
-          commentId: `repair-loop-label-sweep:${target.intent}:${target.number}`,
-        },
-      ]),
-    ).values(),
-  ].sort(compareRepairLoopSweepTargets);
-  const remaining = after
-    ? sorted.filter((target) => compareRepairLoopSweepTargets(target, after) > 0)
-    : sorted;
+  const sorted = [...new Set(itemNumbers)]
+    .filter((number) => Number.isSafeInteger(number) && number > 0)
+    .sort((left, right) => left - right);
+  const remaining = after === null ? sorted : sorted.filter((number) => number > after);
   const selected = remaining.slice(0, limit);
   return {
-    targets: selected,
+    itemNumbers: selected,
     candidateCount: remaining.length,
-    nextAfterCommentId:
-      remaining.length > selected.length ? (selected.at(-1)?.commentId ?? null) : null,
+    nextAfterItemNumber: remaining.length > selected.length ? (selected.at(-1) ?? null) : null,
   };
 }
 
-function compareRepairLoopSweepTargets(
-  left: { intent: "autofix" | "automerge"; number: number },
-  right: { intent: "autofix" | "automerge"; number: number },
+export function finalizeRouterItemFanout(
+  page: ReturnType<typeof selectRouterItemFanoutPage>,
+  commands: LooseRecord[],
+  limit: number,
 ) {
-  if (left.number !== right.number) return left.number - right.number;
-  return left.intent.localeCompare(right.intent);
+  const eligible = new Set(routerFanoutItemNumbers(commands));
+  const selectedItemNumbers = page.itemNumbers.filter((number) => eligible.has(number));
+  return {
+    limit,
+    candidate_count: page.candidateCount,
+    examined_count: page.itemNumbers.length,
+    selected_count: selectedItemNumbers.length,
+    selected_item_numbers: selectedItemNumbers,
+    next_after_item_number: page.nextAfterItemNumber,
+  };
 }
 
 export function stripAnsi(text: string) {

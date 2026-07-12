@@ -114,29 +114,27 @@ test("comment router config accepts only numeric or exact repair-loop command id
   );
 });
 
-test("comment router config validates synthetic sweep continuation cursors", () => {
+test("comment router config validates canonical item fanout cursors", () => {
   const config = readCommentRouterConfig({
     repo: "openclaw/example",
     "repair-repo": "openclaw/clawsweeper",
     "review-repo": "openclaw/clawsweeper",
-    "repair-loop-sweep-after": "repair-loop-label-sweep:AUTOFIX:42",
+    "router-fanout-after": "42",
   });
 
-  assert.deepEqual(config.repairLoopSweepAfter, {
-    intent: "autofix",
-    number: 42,
-    commentId: "repair-loop-label-sweep:autofix:42",
-  });
-  assert.throws(
-    () =>
-      readCommentRouterConfig({
-        repo: "openclaw/example",
-        "repair-repo": "openclaw/clawsweeper",
-        "review-repo": "openclaw/clawsweeper",
-        "repair-loop-sweep-after": "repair-loop-label-sweep:autofix:0",
-      }),
-    /invalid repair-loop-sweep-after/,
-  );
+  assert.equal(config.routerFanoutAfter, 42);
+  for (const cursor of ["0", "042", "42.0", "9007199254740992"]) {
+    assert.throws(
+      () =>
+        readCommentRouterConfig({
+          repo: "openclaw/example",
+          "repair-repo": "openclaw/clawsweeper",
+          "review-repo": "openclaw/clawsweeper",
+          "router-fanout-after": cursor,
+        }),
+      /router-fanout-after/,
+    );
+  }
 });
 
 test("comment router config rejects noncanonical item number representations", () => {
