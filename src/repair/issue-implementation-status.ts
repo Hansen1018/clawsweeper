@@ -3,6 +3,11 @@ import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
+import {
+  ACTION_EVENT_REASON_CODES,
+  ACTION_EVENT_STATUSES,
+  ACTION_EVENT_TYPES,
+} from "../action-ledger.js";
 import { DEFAULT_TRUSTED_BOTS } from "./config.js";
 import { repoSlug } from "./comment-router-core.js";
 import { isAllowedMutationActor, writePayload } from "./comment-router-utils.js";
@@ -13,6 +18,12 @@ import {
 import { ghJsonWithRetry, ghPagedWithRetry, ghText } from "./github-cli.js";
 import type { JsonValue, LooseRecord } from "./json-types.js";
 import { parseArgs, parseJob, repoRoot } from "./lib.js";
+import {
+  flushRepairActionEvents,
+  recordRepairLifecycleEvent,
+  recordRepairLifecycleFailure,
+  type RepairLifecycleInput,
+} from "./repair-action-ledger.js";
 
 const PROGRESS_START = "<!-- clawsweeper-issue-implementation-progress:start -->";
 const PROGRESS_END = "<!-- clawsweeper-issue-implementation-progress:end -->";
@@ -28,7 +39,7 @@ type StatusOptions = {
 };
 
 if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
-  await main();
+  await runIssueImplementationStatus();
 }
 
 async function main() {
@@ -68,6 +79,7 @@ async function main() {
       title: stringArg(args.title) || `Issue #${itemNumber}`,
     };
     const dashboard = await postDashboardStatus(options);
+    recordDashboardStatus(options, dashboard);
     writeStepOutput("dashboard_status", dashboard);
     console.log(
       JSON.stringify({
@@ -103,6 +115,16 @@ async function main() {
       )
       .at(-1) ?? null;
   if (job && !triggerSource && !existing) {
+    recordRepairLifecycleEvent(issueStatusLifecycle(options), {
+      type: ACTION_EVENT_TYPES.statusLifecycle,
+      status: ACTION_EVENT_STATUSES.skipped,
+      reasonCode: ACTION_EVENT_REASON_CODES.notFound,
+      mutation: false,
+      component: "issue_implementation_status",
+      operation: "status",
+      state,
+      statusKind: "github_comment",
+    });
     console.log(
       JSON.stringify({ status: "skipped", reason: "automatic issue build marker not found" }),
     );
@@ -191,11 +213,30 @@ async function main() {
   } else {
     mutateComment();
   }
+  recordRepairLifecycleEvent(issueStatusLifecycle(options), {
+    type: ACTION_EVENT_TYPES.statusLifecycle,
+    status: ACTION_EVENT_STATUSES.published,
+    reasonCode: ACTION_EVENT_REASON_CODES.published,
+    mutation: true,
+    component: "issue_implementation_status",
+    operation: "status",
+    state,
+    statusKind: existing ? "github_comment_update" : "github_comment_create",
+    idempotencySlot: `issue_status:${state.trim().toLowerCase()}`,
+  });
 
   const dashboard = await postDashboardStatus(options).catch((error) => {
+    recordRepairLifecycleFailure(issueStatusLifecycle(options), {
+      component: "issue_implementation_status",
+      operation: "dashboard",
+      phase: state,
+      workKind: "issue_to_pr",
+      error,
+    });
     console.warn(`dashboard status publish failed: ${errorText(error)}`);
     return "failed";
   });
+  recordDashboardStatus(options, dashboard);
   writeStepOutput("comment_id", String(commentId || ""));
   writeStepOutput("dashboard_status", dashboard);
   console.log(
@@ -208,6 +249,86 @@ async function main() {
       state,
     }),
   );
+}
+
+async function runIssueImplementationStatus() {
+  let commandError: unknown = null;
+  try {
+    await main();
+  } catch (error) {
+    commandError = error;
+    const lifecycle = issueStatusLifecycleFromArgs();
+    if (lifecycle) {
+      recordRepairLifecycleFailure(lifecycle, {
+        component: "issue_implementation_status",
+        operation: "status",
+        error,
+      });
+    }
+  }
+  try {
+    await flushRepairActionEvents();
+  } catch (error) {
+    if (commandError) {
+      console.error(
+        `[action-ledger] failed to finalize issue status receipts: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    } else {
+      commandError = error;
+    }
+  }
+  if (commandError) throw commandError;
+}
+
+function issueStatusLifecycle(options: Pick<StatusOptions, "repo" | "itemNumber">) {
+  return {
+    repository: options.repo,
+    workKey: `issue-implementation:${options.repo}#${options.itemNumber}`,
+    clusterId: `issue-${repoSlug(options.repo)}-${options.itemNumber}`,
+    number: options.itemNumber,
+    sourceRevision: String(process.env.GITHUB_SHA ?? ""),
+  } satisfies RepairLifecycleInput;
+}
+
+function issueStatusLifecycleFromArgs(): RepairLifecycleInput | null {
+  try {
+    const args = parseArgs(process.argv.slice(2));
+    const jobPath = stringArg(args.job);
+    const job = jobPath ? parseJob(path.resolve(jobPath)) : null;
+    const repo = stringArg(args.repo) || String(job?.frontmatter.source_issue_repo ?? "");
+    const itemNumber = positiveInteger(
+      stringArg(args["item-number"]) || String(job?.frontmatter.source_issue_number ?? ""),
+    );
+    return issueStatusLifecycle({ repo, itemNumber });
+  } catch {
+    return null;
+  }
+}
+
+function recordDashboardStatus(options: StatusOptions, dashboard: string) {
+  recordRepairLifecycleEvent(issueStatusLifecycle(options), {
+    type: ACTION_EVENT_TYPES.dashboardLifecycle,
+    status:
+      dashboard === "sent"
+        ? ACTION_EVENT_STATUSES.sent
+        : dashboard === "skipped"
+          ? ACTION_EVENT_STATUSES.skipped
+          : ACTION_EVENT_STATUSES.failed,
+    reasonCode:
+      dashboard === "sent"
+        ? ACTION_EVENT_REASON_CODES.published
+        : dashboard === "skipped"
+          ? ACTION_EVENT_REASON_CODES.notApplicable
+          : ACTION_EVENT_REASON_CODES.unavailable,
+    mutation: dashboard === "sent",
+    component: "issue_implementation_status",
+    operation: "dashboard",
+    state: options.state,
+    statusKind: "issue_implementation",
+    idempotencySlot: `dashboard_status:${options.state.trim().toLowerCase()}`,
+  });
 }
 
 export function issueImplementationStatusMarker(itemNumber: number) {

@@ -2,8 +2,19 @@
 import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import {
+  ACTION_EVENT_REASON_CODES,
+  ACTION_EVENT_STATUSES,
+  ACTION_EVENT_TYPES,
+} from "../action-ledger.js";
 import type { JsonValue, LooseRecord } from "./json-types.js";
 import { parseArgs, parseJob } from "./lib.js";
+import {
+  flushRepairActionEvents,
+  recordRepairLifecycleEvent,
+  recordRepairLifecycleFailure,
+  type RepairLifecycleInput,
+} from "./repair-action-ledger.js";
 
 export type ActionWorkKind = "issue_to_pr" | "pr_repair" | "repair_cluster";
 
@@ -77,83 +88,119 @@ async function main(): Promise<void> {
 
 async function registerActionSession(jobPath: string): Promise<void> {
   if (!jobPath) throw new Error("action-session register requires a job path");
-  const serviceToken = requiredEnv("CLAWSWEEPER_CRABFLEET_SERVICE_TOKEN");
-  const baseUrl = String(
-    process.env.CLAWSWEEPER_CRABFLEET_URL ?? "https://crabfleet.openclaw.ai",
-  ).replace(/\/+$/, "");
   const job = parseJob(jobPath);
-  const sourceUrl = actionSourceUrl(job);
-  const response = await fetch(`${baseUrl}/api/openclaw/action-sessions`, {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${serviceToken}`,
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({
-      workKey: actionWorkKey(job.frontmatter),
-      workKind: actionWorkKind(job.frontmatter),
-      owner: actionSessionOwner(),
-      repo: String(job.frontmatter.repo ?? ""),
-      branch: String(job.frontmatter.target_branch ?? process.env.GITHUB_REF_NAME ?? ""),
-      sourceUrl,
-      runUrl: actionRunUrl(),
-      purpose:
-        actionWorkKind(job.frontmatter) === "issue_to_pr"
-          ? "Convert issue to pull request"
-          : actionWorkKind(job.frontmatter) === "pr_repair"
-            ? "Repair pull request"
-            : "Review and repair related GitHub items",
-      summary: `GitHub Actions work for ${String(job.frontmatter.cluster_id ?? job.relativePath)}`,
-    }),
-  });
-  const body = (await response.json()) as LooseRecord;
-  if (!response.ok) {
-    throw new Error(
-      `CrabFleet action session registration failed (${response.status}): ${String(body.error ?? "unknown error")}`,
-    );
-  }
-  const session = body.session as LooseRecord;
-  const sessionId = String(session?.id ?? "");
-  const agentToken = String(body.agentToken ?? "");
-  const runnerPtyUrl = String(body.runnerPtyUrl ?? "");
-  if (!sessionId || !agentToken || !runnerPtyUrl) {
-    throw new Error("CrabFleet action session response is missing session credentials");
-  }
-  const workStateUrl =
-    String(body.workStateUrl ?? "") ||
-    `${baseUrl}/api/agent/interactive-sessions/${encodeURIComponent(sessionId)}/work-state`;
-  const browserUrl =
-    String(body.browserUrl ?? "") || `${baseUrl}/?session=${encodeURIComponent(sessionId)}`;
-  console.log(`::add-mask::${agentToken}`);
-  console.log(`::add-mask::${runnerPtyUrl}`);
-  writeGitHubEnv({
-    CLAWSWEEPER_CRABFLEET_SESSION_ID: sessionId,
-    CLAWSWEEPER_CRABFLEET_AGENT_TOKEN: agentToken,
-    CLAWSWEEPER_CRABFLEET_RUNNER_PTY_URL: runnerPtyUrl,
-    CLAWSWEEPER_CRABFLEET_WORK_STATE_URL: workStateUrl,
-    CLAWSWEEPER_CRABFLEET_BROWSER_URL: browserUrl,
-  });
-  const metadataPath =
-    process.env.CLAWSWEEPER_ACTION_SESSION_METADATA?.trim() ||
-    path.join(".clawsweeper-repair", "action-session.json");
-  fs.mkdirSync(path.dirname(metadataPath), { recursive: true });
-  fs.writeFileSync(
-    metadataPath,
-    `${JSON.stringify(
-      {
-        sessionId,
+  const lifecycle = actionSessionLifecycle(job);
+  try {
+    const serviceToken = requiredEnv("CLAWSWEEPER_CRABFLEET_SERVICE_TOKEN");
+    const baseUrl = String(
+      process.env.CLAWSWEEPER_CRABFLEET_URL ?? "https://crabfleet.openclaw.ai",
+    ).replace(/\/+$/, "");
+    const sourceUrl = actionSourceUrl(job);
+    const response = await fetch(`${baseUrl}/api/openclaw/action-sessions`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${serviceToken}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
         workKey: actionWorkKey(job.frontmatter),
         workKind: actionWorkKind(job.frontmatter),
+        owner: actionSessionOwner(),
+        repo: String(job.frontmatter.repo ?? ""),
+        branch: String(job.frontmatter.target_branch ?? process.env.GITHUB_REF_NAME ?? ""),
         sourceUrl,
         runUrl: actionRunUrl(),
-        browserUrl,
-        registeredAt: new Date().toISOString(),
-      },
-      null,
-      2,
-    )}\n`,
-  );
-  console.log(`CrabFleet action session: ${browserUrl}`);
+        purpose:
+          actionWorkKind(job.frontmatter) === "issue_to_pr"
+            ? "Convert issue to pull request"
+            : actionWorkKind(job.frontmatter) === "pr_repair"
+              ? "Repair pull request"
+              : "Review and repair related GitHub items",
+        summary: `GitHub Actions work for ${String(job.frontmatter.cluster_id ?? job.relativePath)}`,
+      }),
+    });
+    const body = (await response.json()) as LooseRecord;
+    if (!response.ok) {
+      throw new Error(
+        `CrabFleet action session registration failed (${response.status}): ${String(body.error ?? "unknown error")}`,
+      );
+    }
+    const session = body.session as LooseRecord;
+    const sessionId = String(session?.id ?? "");
+    const agentToken = String(body.agentToken ?? "");
+    const runnerPtyUrl = String(body.runnerPtyUrl ?? "");
+    if (!sessionId || !agentToken || !runnerPtyUrl) {
+      throw new Error("CrabFleet action session response is missing session credentials");
+    }
+    const workStateUrl =
+      String(body.workStateUrl ?? "") ||
+      `${baseUrl}/api/agent/interactive-sessions/${encodeURIComponent(sessionId)}/work-state`;
+    const browserUrl =
+      String(body.browserUrl ?? "") || `${baseUrl}/?session=${encodeURIComponent(sessionId)}`;
+    console.log(`::add-mask::${agentToken}`);
+    console.log(`::add-mask::${runnerPtyUrl}`);
+    writeGitHubEnv({
+      CLAWSWEEPER_CRABFLEET_SESSION_ID: sessionId,
+      CLAWSWEEPER_CRABFLEET_AGENT_TOKEN: agentToken,
+      CLAWSWEEPER_CRABFLEET_RUNNER_PTY_URL: runnerPtyUrl,
+      CLAWSWEEPER_CRABFLEET_WORK_STATE_URL: workStateUrl,
+      CLAWSWEEPER_CRABFLEET_BROWSER_URL: browserUrl,
+    });
+    const metadataPath = actionSessionMetadataPath();
+    fs.mkdirSync(path.dirname(metadataPath), { recursive: true });
+    fs.writeFileSync(
+      metadataPath,
+      `${JSON.stringify(
+        {
+          sessionId,
+          repository: lifecycle.repository,
+          workKey: lifecycle.workKey,
+          workKind: actionWorkKind(job.frontmatter),
+          clusterId: lifecycle.clusterId,
+          sourceRevision: lifecycle.sourceRevision,
+          sourceUrl,
+          runUrl: actionRunUrl(),
+          browserUrl,
+          registeredAt: new Date().toISOString(),
+        },
+        null,
+        2,
+      )}\n`,
+    );
+    recordRepairLifecycleEvent(lifecycle, {
+      type: ACTION_EVENT_TYPES.sessionRegistered,
+      status: ACTION_EVENT_STATUSES.registered,
+      reasonCode: ACTION_EVENT_REASON_CODES.accepted,
+      mutation: true,
+      component: "action_session",
+      operation: "session",
+      state: "registered",
+      workKind: actionWorkKind(job.frontmatter),
+      idempotencySlot: "session_registration",
+    });
+    recordRepairLifecycleEvent(lifecycle, {
+      type: ACTION_EVENT_TYPES.repairQueue,
+      status: ACTION_EVENT_STATUSES.queued,
+      reasonCode: ACTION_EVENT_REASON_CODES.accepted,
+      mutation: false,
+      component: "action_session",
+      state: "queued",
+      phase: "queue",
+      workKind: actionWorkKind(job.frontmatter),
+    });
+    console.log(`CrabFleet action session: ${browserUrl}`);
+  } catch (error) {
+    recordRepairLifecycleFailure(lifecycle, {
+      component: "action_session",
+      operation: "session",
+      phase: "register",
+      workKind: actionWorkKind(job.frontmatter),
+      error,
+    });
+    throw error;
+  } finally {
+    await flushRepairActionEvents();
+  }
 }
 
 async function updateActionSession({
@@ -167,27 +214,137 @@ async function updateActionSession({
   summary: string;
   completionReason: string;
 }): Promise<void> {
-  const url = requiredEnv("CLAWSWEEPER_CRABFLEET_WORK_STATE_URL");
-  const token = requiredEnv("CLAWSWEEPER_CRABFLEET_AGENT_TOKEN");
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${token}`,
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({
+  const metadata = readActionSessionMetadata();
+  const lifecycle = actionSessionLifecycleFromMetadata(metadata);
+  try {
+    const url = requiredEnv("CLAWSWEEPER_CRABFLEET_WORK_STATE_URL");
+    const token = requiredEnv("CLAWSWEEPER_CRABFLEET_AGENT_TOKEN");
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${token}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        state,
+        phase,
+        summary,
+        ...(completionReason ? { completionReason } : {}),
+      }),
+    });
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(
+        `CrabFleet work-state update failed (${response.status}): ${text.slice(0, 300)}`,
+      );
+    }
+    recordRepairLifecycleEvent(lifecycle, {
+      type: sessionEventType(state),
+      status: sessionEventStatus(state),
+      reasonCode: sessionEventReason(state),
+      mutation: true,
+      component: "action_session",
+      operation: "session",
       state,
       phase,
-      summary,
-      ...(completionReason ? { completionReason } : {}),
-    }),
-  });
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(
-      `CrabFleet work-state update failed (${response.status}): ${text.slice(0, 300)}`,
-    );
+      workKind: String(metadata.workKind ?? ""),
+      idempotencySlot: `session_state:${state}:${phase}`,
+    });
+    recordRepairLifecycleEvent(lifecycle, {
+      type: repairEventType(state, phase),
+      status: repairEventStatus(state),
+      reasonCode: sessionEventReason(state),
+      mutation: false,
+      component: "action_session",
+      state,
+      phase,
+      workKind: String(metadata.workKind ?? ""),
+    });
+  } catch (error) {
+    recordRepairLifecycleFailure(lifecycle, {
+      component: "action_session",
+      operation: "session",
+      phase,
+      workKind: String(metadata.workKind ?? ""),
+      error,
+    });
+    throw error;
+  } finally {
+    await flushRepairActionEvents();
   }
+}
+
+function actionSessionLifecycle(job: ReturnType<typeof parseJob>): RepairLifecycleInput {
+  return {
+    repository: String(job.frontmatter.repo ?? ""),
+    workKey: actionWorkKey(job.frontmatter),
+    clusterId: String(job.frontmatter.cluster_id ?? ""),
+    sourceRevision: String(process.env.GITHUB_SHA ?? ""),
+  };
+}
+
+function actionSessionLifecycleFromMetadata(metadata: LooseRecord): RepairLifecycleInput {
+  return {
+    repository: String(metadata.repository ?? ""),
+    workKey: String(metadata.workKey ?? ""),
+    clusterId: String(metadata.clusterId ?? ""),
+    sourceRevision: String(metadata.sourceRevision ?? process.env.GITHUB_SHA ?? ""),
+  };
+}
+
+function actionSessionMetadataPath(): string {
+  return (
+    process.env.CLAWSWEEPER_ACTION_SESSION_METADATA?.trim() ||
+    path.join(".clawsweeper-repair", "action-session.json")
+  );
+}
+
+function readActionSessionMetadata(): LooseRecord {
+  return JSON.parse(fs.readFileSync(actionSessionMetadataPath(), "utf8")) as LooseRecord;
+}
+
+function sessionEventType(state: string) {
+  const normalized = state.trim().toLowerCase();
+  if (normalized === "completed") return ACTION_EVENT_TYPES.sessionCompleted;
+  if (normalized === "blocked" || normalized === "failed") return ACTION_EVENT_TYPES.sessionBlocked;
+  if (normalized === "cancelled") return ACTION_EVENT_TYPES.sessionCancelled;
+  return ACTION_EVENT_TYPES.sessionPhaseChanged;
+}
+
+function sessionEventStatus(state: string) {
+  const normalized = state.trim().toLowerCase();
+  if (normalized === "completed") return ACTION_EVENT_STATUSES.completed;
+  if (normalized === "blocked" || normalized === "failed") return ACTION_EVENT_STATUSES.blocked;
+  if (normalized === "cancelled") return ACTION_EVENT_STATUSES.cancelled;
+  return ACTION_EVENT_STATUSES.inProgress;
+}
+
+function sessionEventReason(state: string) {
+  const normalized = state.trim().toLowerCase();
+  if (normalized === "completed") return ACTION_EVENT_REASON_CODES.completed;
+  if (normalized === "blocked" || normalized === "failed")
+    return ACTION_EVENT_REASON_CODES.workflowFailed;
+  if (normalized === "cancelled") return ACTION_EVENT_REASON_CODES.cancelled;
+  return ACTION_EVENT_REASON_CODES.stateChanged;
+}
+
+function repairEventType(state: string, phase: string) {
+  const normalizedState = state.trim().toLowerCase();
+  const normalizedPhase = phase.trim().toLowerCase();
+  if (normalizedState === "blocked" || normalizedState === "failed")
+    return ACTION_EVENT_TYPES.repairFailed;
+  if (normalizedPhase.includes("post_flight")) return ACTION_EVENT_TYPES.repairPostflight;
+  if (normalizedPhase.includes("plan")) return ACTION_EVENT_TYPES.repairPlan;
+  if (normalizedPhase === "done") return ACTION_EVENT_TYPES.repairPublish;
+  return ACTION_EVENT_TYPES.repairQueue;
+}
+
+function repairEventStatus(state: string) {
+  const normalized = state.trim().toLowerCase();
+  if (normalized === "completed") return ACTION_EVENT_STATUSES.completed;
+  if (normalized === "blocked" || normalized === "failed") return ACTION_EVENT_STATUSES.failed;
+  if (normalized === "cancelled") return ACTION_EVENT_STATUSES.cancelled;
+  return ACTION_EVENT_STATUSES.inProgress;
 }
 
 function writeGitHubEnv(values: Record<string, string>): void {
