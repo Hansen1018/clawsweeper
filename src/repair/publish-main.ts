@@ -59,8 +59,11 @@ function parseRebaseStrategy(value: string): RebaseStrategy {
     value === "normal" ||
     value === "theirs" ||
     value === "apply-records" ||
-    value === "reconcile-records"
+    value === "reconcile-records" ||
+    value === "merge-comment-router"
   )
     return value;
-  throw new Error("--rebase-strategy must be normal, theirs, apply-records, or reconcile-records");
+  throw new Error(
+    "--rebase-strategy must be normal, theirs, apply-records, reconcile-records, or merge-comment-router",
+  );
 }

@@ -1754,6 +1754,14 @@ test("trusted comment router owns command ledger capacity retries", () => {
   assert.doesNotMatch(eventJob, /count-command-actions/);
   assert.doesNotMatch(eventJob, /--wait-for-capacity/);
   assert.match(routerWorkflow, /Commit comment router ledger/);
+  assert.match(
+    routerWorkflow,
+    /Commit comment router ledger[\s\S]*--rebase-strategy merge-comment-router/,
+  );
+  assert.match(
+    routerWorkflow,
+    /Commit comment router retry ledger[\s\S]*--rebase-strategy merge-comment-router/,
+  );
   assert.match(routerWorkflow, /Detect waiting repair dispatches/);
   assert.match(routerWorkflow, /--status waiting,active/);
   assert.match(routerWorkflow, /--wait-for-capacity/);

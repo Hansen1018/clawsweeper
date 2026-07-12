@@ -654,6 +654,14 @@ test("exact router dispatch concurrency is item-specific and cannot replace anot
     source,
     /Retry waiting repair dispatches[\s\S]*github\.event\.client_payload\.item_number[\s\S]*!contains\(inputs\.item_numbers, ','\)/,
   );
+  for (const stepName of ["Commit comment router ledger", "Commit comment router retry ledger"]) {
+    const start = source.indexOf(`- name: ${stepName}`);
+    const nextStep = source.indexOf("\n      - name:", start + 1);
+    const block = source.slice(start, nextStep === -1 ? undefined : nextStep);
+    assert.match(block, /--path results\/comment-router\.json/);
+    assert.match(block, /--rebase-strategy merge-comment-router/);
+    assert.doesNotMatch(block, /--rebase-strategy theirs/);
+  }
 });
 
 test("workflow App identity is derived from authenticated tokens, never a configured numeric id", () => {

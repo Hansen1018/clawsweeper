@@ -239,6 +239,82 @@ test("publishMainCommit preserves status and health across apply and theirs publ
   assert.deepEqual(second.last_close_apply_health, secondCloseHealth);
 });
 
+test("comment router ledger publication converges stale per-item lanes", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-publish-"));
+  const origin = path.join(root, "origin.git");
+  const seed = path.join(root, "seed");
+  const stateA = path.join(root, "state-a");
+  const stateB = path.join(root, "state-b");
+  const workA = path.join(root, "work-a");
+  const workB = path.join(root, "work-b");
+  const ledgerPath = "results/comment-router.json";
+  run("git", ["init", "--bare", origin], root);
+  run("git", ["clone", origin, seed], root);
+  configureUser(seed);
+  writeJson(path.join(seed, ledgerPath), { updated_at: null, commands: [] });
+  run("git", ["add", "."], seed);
+  run("git", ["commit", "-m", "initial state"], seed);
+  run("git", ["push", "origin", "HEAD:state"], seed);
+  run("git", ["--git-dir", origin, "symbolic-ref", "HEAD", "refs/heads/state"], root);
+  run("git", ["clone", origin, stateA], root);
+  run("git", ["clone", origin, stateB], root);
+  configureUser(stateA);
+  configureUser(stateB);
+  fs.mkdirSync(workA);
+  fs.mkdirSync(workB);
+  writeJson(path.join(workA, ledgerPath), {
+    updated_at: "2026-07-12T20:01:00Z",
+    commands: [routerClaim(101, "autofix", "2026-07-12T20:01:00Z")],
+  });
+  writeJson(path.join(workB, ledgerPath), {
+    updated_at: "2026-07-12T20:02:00Z",
+    commands: [routerClaim(202, "automerge", "2026-07-12T20:02:00Z")],
+  });
+
+  const first = withEnv(
+    {
+      CLAWSWEEPER_STATE_DIR: stateA,
+      CLAWSWEEPER_PUBLISH_BRANCH: "state",
+    },
+    () =>
+      withCwd(workA, () =>
+        publishMainCommit({
+          message: "chore: publish router claim 101",
+          paths: [ledgerPath],
+          maxAttempts: 1,
+          pushAttempts: 2,
+          rebaseStrategy: "merge-comment-router",
+        }),
+      ),
+  );
+  const second = withEnv(
+    {
+      CLAWSWEEPER_STATE_DIR: stateB,
+      CLAWSWEEPER_PUBLISH_BRANCH: "state",
+    },
+    () =>
+      withCwd(workB, () =>
+        publishMainCommit({
+          message: "chore: publish router claim 202",
+          paths: [ledgerPath],
+          maxAttempts: 1,
+          pushAttempts: 2,
+          rebaseStrategy: "merge-comment-router",
+        }),
+      ),
+  );
+
+  assert.deepEqual([first, second], ["committed", "committed"]);
+  const published = readOriginJson(origin, `state:${ledgerPath}`, root);
+  assert.deepEqual(
+    published.commands.map((entry) => [entry.issue_number, entry.status]),
+    [
+      [101, "claimed"],
+      [202, "claimed"],
+    ],
+  );
+});
+
 test("publishMainCommit drops a status commit fully superseded by the remote", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-publish-"));
   const origin = path.join(root, "origin.git");
@@ -2134,7 +2210,7 @@ test("publish-main CLI accepts package-manager double dash separators", () => {
       "--path",
       "results",
       "--rebase-strategy",
-      "theirs",
+      "merge-comment-router",
       "--max-attempts",
       "1",
       "--push-attempts",
@@ -2320,6 +2396,20 @@ function sweepHealth(generatedAt, mode, processed) {
     target_repo: "openclaw/openclaw",
     mode,
     processed,
+  };
+}
+
+function routerClaim(number, intent, processedAt) {
+  return {
+    idempotency_key: `repair-loop-label-sweep:openclaw/openclaw:${intent}:${number}`,
+    comment_id: `repair-loop-label-sweep:${intent}:${number}`,
+    comment_version_key: null,
+    automation_source: "repair_loop_label_sweep",
+    repo: "openclaw/openclaw",
+    issue_number: number,
+    intent,
+    status: "claimed",
+    processed_at: processedAt,
   };
 }
 

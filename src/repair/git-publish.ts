@@ -13,6 +13,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 
+import { mergeCommentRouterLedgerJson } from "./comment-router-utils.js";
 import { clawsweeperGitUserEmail, clawsweeperGitUserName } from "./process-env.js";
 import {
   chooseRecordTupleWinner,
@@ -46,7 +47,12 @@ export type GitPublishOptions = {
   rebaseStrategy?: RebaseStrategy | undefined;
 };
 
-export type RebaseStrategy = "normal" | "theirs" | "apply-records" | "reconcile-records";
+export type RebaseStrategy =
+  | "normal"
+  | "theirs"
+  | "apply-records"
+  | "reconcile-records"
+  | "merge-comment-router";
 
 export type GitRunOptions = {
   allowFailure?: boolean;
@@ -68,6 +74,7 @@ const GIT_PATHSPEC_BATCH_SIZE = 256;
 const GIT_OBJECT_BATCH_SIZE = 512;
 const GIT_OBJECT_BATCH_MAX_BUFFER = 64 * 1024 * 1024;
 const RECONCILIATION_TUPLE_CHUNK_SIZE = 128;
+const COMMENT_ROUTER_LEDGER_PATH = "results/comment-router.json";
 const SKIP_CI_DIRECTIVE_PATTERN =
   /\[(?:skip ci|ci skip|no ci|skip actions|actions skip)\]|^skip-checks:\s*true$/im;
 
@@ -349,6 +356,7 @@ function publishMainCommitInternal(options: GitPublishOptions): PublishResult {
       message: commitMessage,
       paths: options.paths,
       sourceCommit,
+      rebaseStrategy,
     });
     if (rebuildResult === "unchanged") {
       return completeStatePublish("unchanged", options.paths, stateBaseCommit);
@@ -694,6 +702,12 @@ function syncStatePublishPaths(
       throw new Error(`Refusing to publish outside state root: ${path}`);
     }
     const statusMerges = planStateSweepStatusSyncs({ path, source, destination });
+    const commentRouterMerges = planStateCommentRouterSyncs({
+      path,
+      source,
+      destination,
+      rebaseStrategy,
+    });
     const preserved = preserveStateOnlyFiles({ path, source, destination, rebaseStrategy });
     try {
       rmSync(destination, { force: true, recursive: true });
@@ -703,6 +717,7 @@ function syncStatePublishPaths(
       }
       restorePreservedFiles(preserved, destination);
       applyStateSweepStatusSyncs(statusMerges, destination);
+      applyStateSweepStatusSyncs(commentRouterMerges, destination);
     } finally {
       rmSync(preserved.root, { force: true, recursive: true });
     }
@@ -779,6 +794,45 @@ function applyStateSweepStatusSyncs(
     mkdirSync(dirname(target), { recursive: true });
     writeFileSync(target, sync.content, "utf8");
   }
+}
+
+function planStateCommentRouterSyncs({
+  path,
+  source,
+  destination,
+  rebaseStrategy,
+}: {
+  path: string;
+  source: string;
+  destination: string;
+  rebaseStrategy: RebaseStrategy;
+}): { rel: string; content: string }[] {
+  if (rebaseStrategy !== "merge-comment-router") return [];
+  const publishedRoot = normalizedPublishPath(path);
+  const rel =
+    publishedRoot === COMMENT_ROUTER_LEDGER_PATH
+      ? ""
+      : COMMENT_ROUTER_LEDGER_PATH.startsWith(`${publishedRoot}/`)
+        ? COMMENT_ROUTER_LEDGER_PATH.slice(publishedRoot.length + 1)
+        : null;
+  if (rel === null) return [];
+  const sourceFile = rel ? resolve(source, rel) : source;
+  const destinationFile = rel ? resolve(destination, rel) : destination;
+  const sourceText =
+    existsSync(sourceFile) && statSync(sourceFile).isFile()
+      ? readFileSync(sourceFile, "utf8")
+      : null;
+  const destinationText =
+    existsSync(destinationFile) && statSync(destinationFile).isFile()
+      ? readFileSync(destinationFile, "utf8")
+      : null;
+  if (sourceText === null && destinationText === null) return [];
+  return [
+    {
+      rel,
+      content: mergeCommentRouterLedgerJson(sourceText, destinationText),
+    },
+  ];
 }
 
 function preserveStateOnlyFiles({
@@ -978,9 +1032,16 @@ export function pushCommit(options: {
       continue;
     }
     const remoteCommit = runGit(["rev-parse", `${remote}/${branch}`], { quiet: true }).trim();
-    const statusMerges = planSweepStatusMerges({ localCommit, remoteCommit });
+    const statusMerges = [
+      ...planSweepStatusMerges({ localCommit, remoteCommit }),
+      ...(rebaseStrategy === "merge-comment-router"
+        ? planCommentRouterLedgerMerge({ localCommit, remoteCommit })
+        : []),
+    ];
     const rebaseArgs =
-      rebaseStrategy === "theirs" || rebaseStrategy === "apply-records"
+      rebaseStrategy === "theirs" ||
+      rebaseStrategy === "apply-records" ||
+      rebaseStrategy === "merge-comment-router"
         ? ["rebase", "-X", "theirs", `${remote}/${branch}`]
         : ["rebase", `${remote}/${branch}`];
     if (spawnGit(rebaseArgs).status === 0) {
@@ -1417,19 +1478,28 @@ function rebuildPublishCommit(options: {
   message: string;
   paths: readonly string[];
   sourceCommit: string;
+  rebaseStrategy: RebaseStrategy;
 }): PublishResult {
   console.log(`Rebuilding publish commit on ${options.remote}/${options.branch}`);
   runGit(["fetch", options.remote, options.branch]);
   const remoteCommit = runGit(["rev-parse", `${options.remote}/${options.branch}`], {
     quiet: true,
   }).trim();
-  const statusMerges = planSweepStatusMerges({
-    baseCommit: runGit(["rev-parse", `${options.sourceCommit}^`], { quiet: true }).trim(),
-    localCommit: options.sourceCommit,
-    remoteCommit,
-    includeIndependent: true,
-    pathspecs: options.paths,
-  });
+  const statusMerges = [
+    ...planSweepStatusMerges({
+      baseCommit: runGit(["rev-parse", `${options.sourceCommit}^`], { quiet: true }).trim(),
+      localCommit: options.sourceCommit,
+      remoteCommit,
+      includeIndependent: true,
+      pathspecs: options.paths,
+    }),
+    ...(options.rebaseStrategy === "merge-comment-router"
+      ? planCommentRouterLedgerMerge({
+          localCommit: options.sourceCommit,
+          remoteCommit,
+        })
+      : []),
+  ];
   runGit(["reset", "--hard", remoteCommit]);
 
   for (const path of uniqueNonEmpty(options.paths)) {
@@ -1558,10 +1628,27 @@ function changedSweepStatusPaths(baseCommit: string, commit: string): Set<string
 function readGitPath(commit: string, path: string): string | null {
   const result = spawnGit(["show", `${commit}:${path}`], {
     allowFailure: true,
-    displayArgs: ["show", "<commit>:<sweep-status-path>"],
+    displayArgs: ["show", "<commit>:<publish-path>"],
     quiet: true,
   });
   return result.status === 0 ? result.stdout : null;
+}
+
+function planCommentRouterLedgerMerge(options: {
+  localCommit: string;
+  remoteCommit: string;
+}): SweepStatusMerge[] {
+  const localText = readGitPath(options.localCommit, COMMENT_ROUTER_LEDGER_PATH);
+  if (localText === null) return [];
+  return [
+    {
+      path: COMMENT_ROUTER_LEDGER_PATH,
+      content: mergeCommentRouterLedgerJson(
+        localText,
+        readGitPath(options.remoteCommit, COMMENT_ROUTER_LEDGER_PATH),
+      ),
+    },
+  ];
 }
 
 function applySweepStatusMergeFiles(statusMerges: readonly SweepStatusMerge[]): void {

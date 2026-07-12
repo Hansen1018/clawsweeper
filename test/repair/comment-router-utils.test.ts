@@ -16,6 +16,7 @@ import {
   hasSuccessfulDispatchExecutionJob,
   isGitHubAppIntegrationAuthError,
   isAllowedMutationActor,
+  mergeCommentRouterLedgers,
   normalizeGitHubActor,
   parseRepairLoopSweepCommandId,
   readLedger,
@@ -359,6 +360,58 @@ test("synthetic dispatch attempt replaces its durable claim in the ledger", () =
   );
   assert.equal(ledger.commands.length, 1);
   assert.equal(ledger.commands[0]?.status, "executed");
+});
+
+test("comment router ledger merge preserves disjoint claims and attempt progress", () => {
+  const firstClaim = {
+    idempotency_key: "repair-loop-label-sweep:openclaw/openclaw:autofix:101",
+    comment_id: "repair-loop-label-sweep:autofix:101",
+    comment_version_key: null,
+    automation_source: "repair_loop_label_sweep",
+    issue_number: 101,
+    status: "claimed",
+    processed_at: "2026-07-12T20:00:00Z",
+  };
+  const secondClaim = {
+    ...firstClaim,
+    idempotency_key: "repair-loop-label-sweep:openclaw/openclaw:automerge:202",
+    comment_id: "repair-loop-label-sweep:automerge:202",
+    issue_number: 202,
+  };
+  const executedFirstClaim = { ...firstClaim, status: "executed" };
+  const nextFirstAttempt = {
+    ...firstClaim,
+    status: "claimed",
+    processed_at: "2026-07-12T21:00:00Z",
+  };
+  const left = {
+    updated_at: "2026-07-12T20:01:00Z",
+    commands: [firstClaim, secondClaim],
+  };
+  const right = {
+    updated_at: "2026-07-12T21:01:00Z",
+    commands: [executedFirstClaim, nextFirstAttempt],
+  };
+
+  const merged = mergeCommentRouterLedgers(left, right);
+  const reversed = mergeCommentRouterLedgers(right, left);
+
+  assert.deepEqual(merged, reversed);
+  assert.equal(merged.updated_at, "2026-07-12T21:01:00Z");
+  assert.deepEqual(
+    merged.commands.map((entry) => [entry.issue_number, entry.status, entry.processed_at]),
+    [
+      [202, "claimed", "2026-07-12T20:00:00Z"],
+      [101, "claimed", "2026-07-12T21:00:00Z"],
+    ],
+  );
+  assert.equal(
+    mergeCommentRouterLedgers(left, {
+      updated_at: "2026-07-12T20:02:00Z",
+      commands: [executedFirstClaim],
+    }).commands.find((entry) => entry.issue_number === 101)?.status,
+    "executed",
+  );
 });
 
 test("newer re-review commands supersede older retries from the same requester", () => {

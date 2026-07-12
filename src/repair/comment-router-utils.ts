@@ -626,6 +626,56 @@ function forcedReplayIdentityFields(entry: LooseRecord): LooseRecord {
   return { forced_replay: true, attempt_id: attemptId };
 }
 
+export function mergeCommentRouterLedgers(...values: JsonValue[]) {
+  const ledgers = values.map((value, index) => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      throw new Error(`invalid comment router ledger ${index + 1}: expected object`);
+    }
+    if (!Array.isArray(value.commands)) {
+      throw new Error(`invalid comment router ledger ${index + 1}: commands must be an array`);
+    }
+    return value;
+  });
+  const byKey = new Map<string, LooseRecord>();
+  for (const ledger of ledgers) {
+    for (const value of ledger.commands) {
+      const entry = validatedLedgerCommand(value);
+      const key = ledgerEntryKey(entry);
+      const previous = byKey.get(key);
+      byKey.set(key, previous ? preferredLedgerEntry(previous, entry) : entry);
+    }
+  }
+  const commands = [...byKey.entries()]
+    .sort(([leftKey, left], [rightKey, right]) => {
+      const timeDifference = ledgerEntryTime(left) - ledgerEntryTime(right);
+      return timeDifference || leftKey.localeCompare(rightKey);
+    })
+    .slice(-1000)
+    .map(([, entry]) => entry);
+  const updatedAt = ledgers
+    .map((ledger) => String(ledger.updated_at ?? ""))
+    .filter((value) => Number.isFinite(Date.parse(value)))
+    .sort((left, right) => Date.parse(left) - Date.parse(right))
+    .at(-1);
+  return {
+    updated_at: updatedAt || null,
+    commands,
+  };
+}
+
+export function mergeCommentRouterLedgerJson(...values: Array<string | null>) {
+  const ledgers = values
+    .filter((value): value is string => value !== null)
+    .map((value, index) => {
+      try {
+        return JSON.parse(value) as JsonValue;
+      } catch {
+        throw new Error(`invalid comment router ledger ${index + 1}: malformed JSON`);
+      }
+    });
+  return `${JSON.stringify(mergeCommentRouterLedgers(...ledgers), null, 2)}\n`;
+}
+
 function isNoopSkip(entry: LooseRecord) {
   if (String(entry.status ?? "") !== "skipped") return false;
   const reason = String(entry.reason ?? "");
@@ -655,6 +705,49 @@ function ledgerEntryKey(entry: LooseRecord) {
     entry.comment_version_key ??
     `${entry.comment_id ?? "unknown"}:${entry.comment_updated_at ?? "unknown"}`
   );
+}
+
+function preferredLedgerEntry(left: LooseRecord, right: LooseRecord): LooseRecord {
+  const leftTime = ledgerEntryTime(left);
+  const rightTime = ledgerEntryTime(right);
+  if (leftTime !== rightTime) return leftTime > rightTime ? left : right;
+  const leftRank = ledgerStatusRank(left.status);
+  const rightRank = ledgerStatusRank(right.status);
+  if (leftRank !== rightRank) return leftRank > rightRank ? left : right;
+  return canonicalJson(left).localeCompare(canonicalJson(right)) >= 0 ? left : right;
+}
+
+function ledgerEntryTime(entry: LooseRecord): number {
+  for (const value of [entry.processed_at, entry.comment_updated_at, entry.comment_created_at]) {
+    const parsed = Date.parse(String(value ?? ""));
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return 0;
+}
+
+function ledgerStatusRank(value: JsonValue): number {
+  switch (String(value ?? "")) {
+    case "executed":
+    case "skipped":
+      return 3;
+    case "waiting":
+      return 2;
+    case "claimed":
+      return 1;
+    default:
+      return 0;
+  }
+}
+
+function canonicalJson(value: JsonValue): string {
+  if (Array.isArray(value)) return `[${value.map((entry) => canonicalJson(entry)).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value);
 }
 
 function compactLedgerActions(actions: JsonValue) {
