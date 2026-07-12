@@ -3,11 +3,12 @@ import path from "node:path";
 
 import { flushWorkflowActionEvents, importActionEventShards } from "../action-ledger-runtime.js";
 import { repoRoot } from "./paths.js";
+import { repairActionLedgerRoot } from "./repair-action-ledger.js";
 
 const [command, ...argv] = process.argv.slice(2);
 
 if (command === "finalize") {
-  const paths = await flushWorkflowActionEvents(repoRoot());
+  const paths = await flushWorkflowActionEvents(repairActionLedgerRoot());
   console.log(JSON.stringify({ paths }, null, 2));
 } else if (command === "publish") {
   const args = parseArgs(argv);
