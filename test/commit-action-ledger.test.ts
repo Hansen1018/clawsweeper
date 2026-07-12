@@ -5,7 +5,10 @@ import path from "node:path";
 import test from "node:test";
 
 import { ACTION_EVENT_TYPES } from "../dist/action-ledger.js";
-import { flushWorkflowActionEvents } from "../dist/action-ledger-runtime.js";
+import {
+  flushWorkflowActionEvents,
+  importActionEventShards,
+} from "../dist/action-ledger-runtime.js";
 import { recordCommitWorkflowEvent, runCommitMutation } from "../dist/commit-action-ledger.js";
 
 test("commit publication uncertainty is preserved by terminal workflow receipts", async () => {
@@ -48,6 +51,114 @@ test("commit publication uncertainty is preserved by terminal workflow receipts"
     assert.equal(failed?.action.mutation, true);
     assert.equal(failed?.action.retryable, true);
     assert.equal(failed?.attributes?.completion_reason, "mutation_outcome_unknown");
+  } finally {
+    restoreEnv(previous);
+    fs.rmSync(root, { force: true, recursive: true });
+  }
+});
+
+test("commit publication preserves its primary failure when receipt recording also fails", () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "commit-primary-error-")));
+  const outputRoot = path.join(root, "output");
+  fs.mkdirSync(outputRoot);
+  const previous = { ...process.env };
+  const originalConsoleError = console.error;
+  const receiptErrors: string[] = [];
+  Object.assign(process.env, workflowEnv(root, outputRoot));
+
+  try {
+    console.error = (message?: unknown) => receiptErrors.push(String(message));
+    const primary = new Error("primary publication failure");
+    assert.throws(
+      () =>
+        runCommitMutation(
+          { repository: "openclaw/openclaw", sha: "b".repeat(40) },
+          {
+            kind: "commit_check_publication",
+            identity: { sha: "b".repeat(40) },
+            operation: () => {
+              process.env.GITHUB_REPOSITORY = "invalid";
+              throw primary;
+            },
+          },
+        ),
+      (error) => error === primary,
+    );
+    assert.match(receiptErrors.join("\n"), /after the primary failure/);
+  } finally {
+    console.error = originalConsoleError;
+    restoreEnv(previous);
+    fs.rmSync(root, { force: true, recursive: true });
+  }
+});
+
+test("commit review matrix invocations publish distinct importable shard paths", async () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "commit-matrix-ledger-")));
+  const outputRoot = path.join(root, "output");
+  const destination = path.join(root, "destination");
+  fs.mkdirSync(outputRoot);
+  fs.mkdirSync(destination);
+  const previous = { ...process.env };
+  const paths: string[] = [];
+  const commits = ["b".repeat(40), "c".repeat(40)];
+
+  try {
+    for (const sha of commits) {
+      const spoolRoot = fs.realpathSync(
+        fs.mkdtempSync(path.join(os.tmpdir(), "commit-matrix-spool-")),
+      );
+      Object.assign(process.env, workflowEnv(spoolRoot, outputRoot), {
+        CLAWSWEEPER_ACTION_LEDGER_INVOCATION: `commit-${sha}`,
+      });
+      const lifecycle = { repository: "openclaw/openclaw", sha };
+      recordCommitWorkflowEvent(lifecycle, "started");
+      recordCommitWorkflowEvent(lifecycle, "completed");
+      recordCommitWorkflowEvent(lifecycle, "finalized");
+      paths.push(...(await flushWorkflowActionEvents(spoolRoot)));
+      fs.rmSync(spoolRoot, { force: true, recursive: true });
+    }
+
+    assert.equal(new Set(paths).size, commits.length);
+    assert.ok(paths.every((entry, index) => entry.includes(`commit-${commits[index]}`)));
+    const imported = importActionEventShards(outputRoot, destination);
+    assert.equal(imported.created, commits.length);
+    const subjects = new Set(
+      readEvents(destination).map((event) => String(event.subject?.source_revision)),
+    );
+    assert.deepEqual(subjects, new Set(commits));
+  } finally {
+    restoreEnv(previous);
+    fs.rmSync(root, { force: true, recursive: true });
+  }
+});
+
+test("commit review check publication completes before the workflow is finalized", async () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "commit-lifecycle-order-")));
+  const outputRoot = path.join(root, "output");
+  fs.mkdirSync(outputRoot);
+  const previous = { ...process.env };
+  Object.assign(process.env, workflowEnv(root, outputRoot));
+  const lifecycle = { repository: "openclaw/openclaw", sha: "b".repeat(40) };
+
+  try {
+    recordCommitWorkflowEvent(lifecycle, "started");
+    runCommitMutation(lifecycle, {
+      kind: "commit_check_publication",
+      identity: { sha: lifecycle.sha },
+      operation: () => undefined,
+    });
+    recordCommitWorkflowEvent(lifecycle, "completed");
+    recordCommitWorkflowEvent(lifecycle, "finalized");
+    await flushWorkflowActionEvents(root);
+
+    const events = readEvents(outputRoot).sort((left, right) => left.phase_seq - right.phase_seq);
+    assert.deepEqual(
+      events
+        .filter((event) => event.event_type === ACTION_EVENT_TYPES.workflowAttempt)
+        .map((event) => event.attributes?.state),
+      ["started", "completed", "finalized"],
+    );
+    assert.equal(events.at(-1)?.attributes?.state, "finalized");
   } finally {
     restoreEnv(previous);
     fs.rmSync(root, { force: true, recursive: true });

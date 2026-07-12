@@ -143,6 +143,7 @@ test("repair worker jobs upload shards and one credentialed job publishes them",
 
 test("repair mutation and Codex boundaries emit exact immutable receipts", () => {
   const ledger = readText("src/repair/repair-action-ledger.ts");
+  const codexLedger = readText("src/repair/repair-codex-action-ledger.ts");
   const handoff = readText("src/repair/execution-handoff.ts");
   const executor = readText("src/repair/execute-fix-artifact.ts");
   const github = readText("src/repair/execute-fix-github.ts");
@@ -166,9 +167,19 @@ test("repair mutation and Codex boundaries emit exact immutable receipts", () =>
   ]) {
     assert.match(handoff, new RegExp(`kind: "${boundary}"`));
   }
-  assert.match(executor, /recordRepairCodexLifecycle\("started", "repair_review"/);
-  assert.match(executor, /publishRepairCodexArtifacts\("repair_review"/);
-  assert.match(executor, /recordRepairCodexLifecycle\("started", "repair_review_fix"/);
+  assert.match(executor, /beginRepairCodexAction/);
+  for (const action of [
+    "repair_edit",
+    "repair_write_preflight",
+    "repair_base_reconcile",
+    "repair_review",
+    "repair_review_fix",
+    "repair_validation_fix",
+  ]) {
+    assert.match(codexLedger, new RegExp(`"${action}"`));
+    assert.match(executor, new RegExp(`action: "${action}"`));
+  }
+  assert.match(executor, /repairCodexAttempt\(attempt, "final"\)/);
   assert.match(executor, /repair_execution_report/);
   for (const boundary of [
     "branch_push",
@@ -200,13 +211,33 @@ test("commit review and notification workflows publish their operation receipts"
   const commit = readText(".github/workflows/commit-review.yml");
   const activity = readText(".github/workflows/github-activity.yml");
   const maintainer = readText(".github/workflows/maintainer-report-discord.yml");
+  const review = commit.slice(commit.indexOf("\n  review:"), commit.indexOf("\n  publish:"));
+  const publisher = commit.slice(commit.indexOf("\n  publish:"));
 
-  assert.match(commit, /setup-action-ledger/);
-  assert.match(commit, /Finalize commit review action ledger/);
-  assert.match(commit, /action-ledger-commit-review-/);
-  assert.match(commit, /codex-logs-commit-review-/);
-  assert.match(commit, /Publish immutable commit review action ledger/);
-  assert.match(commit, /append commit review action ledger/);
+  assert.match(review, /setup-action-ledger/);
+  assert.match(review, /CLAWSWEEPER_ACTION_LEDGER_INVOCATION: commit-\$\{\{ matrix\.sha \}\}/);
+  assert.match(review, /--defer-workflow-completion/);
+  assert.match(review, /--continue-workflow/);
+  assert.match(review, /node dist\/commit-sweeper\.js finish-review/);
+  assert.doesNotMatch(review, /create-state-token|setup-state|CLAWSWEEPER_STATE_DIR/);
+  assert.ok(
+    review.indexOf("- name: Review commit") < review.indexOf("- name: Create target checks token"),
+  );
+  assert.ok(
+    review.indexOf("- name: Publish commit check") <
+      review.indexOf("- name: Finish commit review lifecycle"),
+  );
+  assert.ok(
+    review.indexOf("- name: Finish commit review lifecycle") <
+      review.indexOf("- name: Finalize commit review action ledger"),
+  );
+  assert.match(review, /action-ledger-commit-review-\$\{\{ matrix\.sha \}\}/);
+  assert.match(review, /codex-logs-commit-review-\$\{\{ matrix\.sha \}\}/);
+  assert.match(publisher, /create-state-token/);
+  assert.match(publisher, /setup-state/);
+  assert.match(publisher, /merge-multiple: true/);
+  assert.match(publisher, /Publish immutable commit review action ledger/);
+  assert.match(publisher, /append commit review action ledger/);
   for (const workflow of [activity, maintainer]) {
     assert.match(workflow, /setup-action-ledger/);
     assert.match(workflow, /repair:action-ledger -- finalize/);

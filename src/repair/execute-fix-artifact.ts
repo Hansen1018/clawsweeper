@@ -10,11 +10,7 @@ import {
   type ChildProcess,
   type SpawnSyncOptionsWithStringEncoding,
 } from "node:child_process";
-import {
-  ACTION_EVENT_REASON_CODES,
-  ACTION_EVENT_STATUSES,
-  ACTION_EVENT_TYPES,
-} from "../action-ledger.js";
+import { ACTION_EVENT_TYPES } from "../action-ledger.js";
 import { assertAllowedOwner, parseArgs, parseJob, repoRoot, validateJob } from "./lib.js";
 import {
   automergeRepairOutcomeComment,
@@ -82,11 +78,16 @@ import {
 } from "./constants.js";
 import {
   recordRepairArtifactPublication,
-  recordRepairLifecycleEvent,
   recordRepairWorkflowEvent,
   runRepairMutation,
   type RepairLifecycleInput,
 } from "./repair-action-ledger.js";
+import {
+  beginRepairCodexAction,
+  repairCodexAttempt,
+  repairCodexAttemptLabel,
+  type RepairCodexAttemptIdentity,
+} from "./repair-codex-action-ledger.js";
 
 const AUTOMERGE_LABEL = "clawsweeper:automerge";
 const AUTOFIX_LABEL = "clawsweeper:autofix";
@@ -2424,6 +2425,14 @@ function editValidatePrepareMerge({
         isAutomergeRepair: isAutomergeRepairJob(),
       });
       const summaryPath = path.join(workRoot, `${mode}-codex-summary-${attempt}.md`);
+      const stdoutPath = path.join(workRoot, `${mode}-codex-${attempt}.jsonl`);
+      const stderrPath = path.join(workRoot, `${mode}-codex-${attempt}.stderr.log`);
+      const codexAction = beginRepairCodexAction(directRepairLifecycle(null), {
+        action: "repair_edit",
+        mode: String(mode),
+        attempt: repairCodexAttempt(attempt),
+        paths: { jsonl: stdoutPath, stderr: stderrPath, report: summaryPath },
+      });
       const workerTimeoutMs = currentCodexTimeoutMs(true);
       logProgress("starting Codex edit pass", {
         mode,
@@ -2439,32 +2448,38 @@ function editValidatePrepareMerge({
         details: reconcileWithBase ? "reconciling latest base" : "repairing branch",
         headSha: headBeforeAttempt,
       });
-      const codexResult = spawnCodexSyncWithHeartbeat(
-        `Codex fix worker ${mode} attempt ${attempt}`,
-        [
-          "exec",
-          "--cd",
-          targetDir,
-          ...executionModelArgs,
-          "--sandbox",
-          codexWriteSandbox,
-          ...codexWriteSandboxConfigArgs(),
-          ...codexConfigArgs(),
-          "--output-last-message",
-          summaryPath,
-          "--json",
-          "-",
-        ],
-        {
-          cwd: targetDir,
-          input: prompt,
-          encoding: "utf8",
-          env: codexEnv(),
-          timeout: workerTimeoutMs,
-          stdoutPath: path.join(workRoot, `${mode}-codex-${attempt}.jsonl`),
-          stderrPath: path.join(workRoot, `${mode}-codex-${attempt}.stderr.log`),
-        },
-      );
+      let codexResult;
+      try {
+        codexResult = spawnCodexSyncWithHeartbeat(
+          `Codex fix worker ${mode} attempt ${attempt}`,
+          [
+            "exec",
+            "--cd",
+            targetDir,
+            ...executionModelArgs,
+            "--sandbox",
+            codexWriteSandbox,
+            ...codexWriteSandboxConfigArgs(),
+            ...codexConfigArgs(),
+            "--output-last-message",
+            summaryPath,
+            "--json",
+            "-",
+          ],
+          {
+            cwd: targetDir,
+            input: prompt,
+            encoding: "utf8",
+            env: codexEnv(),
+            timeout: workerTimeoutMs,
+            stdoutPath,
+            stderrPath,
+          },
+        );
+      } catch (error) {
+        codexAction.fail(error);
+        throw error;
+      }
       const timedOut = (codexResult.error as JsonValue)?.code === "ETIMEDOUT";
       const errorDetail = timedOut
         ? `Codex fix worker timed out after ${workerTimeoutMs}ms`
@@ -2486,6 +2501,12 @@ function editValidatePrepareMerge({
             maxEditAttempts,
           });
       if (conflictDecision.action !== "proceed") {
+        codexAction.fail(
+          new Error(
+            conflictDecision.reason ??
+              `unresolved rebase conflicts: ${remainingConflicts.join(", ")}`,
+          ),
+        );
         previousSummary =
           readTextIfExists(summaryPath).trim() ||
           compactText(errorDetail, 360) ||
@@ -2506,8 +2527,14 @@ function editValidatePrepareMerge({
         if (conflictDecision.action === "retry") continue;
         throw new Error(conflictDecision.reason);
       }
-      if (timedOut) throw new Error(errorDetail);
+      if (timedOut) {
+        const error = new Error(errorDetail);
+        codexAction.fail(error);
+        throw error;
+      }
       if (codexResult.error || codexResult.status !== 0) {
+        const error = new Error(codexFailureMessage("Codex fix worker failed", errorDetail));
+        codexAction.fail(error);
         if (attempt < maxEditAttempts && isRetryableCodexErrorMessage(errorDetail)) {
           previousSummary = compactText(errorDetail, 360);
           const retryDelayMs = codexRetryDelayMs(errorDetail, attempt);
@@ -2527,8 +2554,9 @@ function editValidatePrepareMerge({
           sleepMs(retryDelayMs);
           continue;
         }
-        throw new Error(codexFailureMessage("Codex fix worker failed", errorDetail));
+        throw error;
       }
+      codexAction.complete();
       logProgress("Codex edit pass finished", { mode, attempt, status: codexResult.status });
       updateAutomergeProgressStatus({
         id: `codex-edit-${mode}-${attempt}`,
@@ -2867,54 +2895,76 @@ function runCodexBaseReconcile({
       workRoot,
       `${mode}-final-base-reconcile-summary-${attempt}-${codexAttempt}.md`,
     );
-    const reconcileTimeoutMs = currentCodexTimeoutMs(true);
-    const codexResult = spawnCodexSyncWithHeartbeat(
-      `Codex final rebase worker ${mode} attempt ${attempt}.${codexAttempt}`,
-      [
-        "exec",
-        "--cd",
-        targetDir,
-        ...executionModelArgs,
-        "--sandbox",
-        codexWriteSandbox,
-        ...codexWriteSandboxConfigArgs(),
-        ...codexConfigArgs(),
-        "--output-last-message",
-        summaryPath,
-        "--json",
-        "-",
-      ],
-      {
-        cwd: targetDir,
-        input: prompt,
-        encoding: "utf8",
-        env: codexEnv(),
-        timeout: reconcileTimeoutMs,
-        stdoutPath: path.join(
-          workRoot,
-          `${mode}-final-base-reconcile-${attempt}-${codexAttempt}.jsonl`,
-        ),
-        stderrPath: path.join(
-          workRoot,
-          `${mode}-final-base-reconcile-${attempt}-${codexAttempt}.stderr.log`,
-        ),
-      },
+    const stdoutPath = path.join(
+      workRoot,
+      `${mode}-final-base-reconcile-${attempt}-${codexAttempt}.jsonl`,
     );
+    const stderrPath = path.join(
+      workRoot,
+      `${mode}-final-base-reconcile-${attempt}-${codexAttempt}.stderr.log`,
+    );
+    const codexAction = beginRepairCodexAction(directRepairLifecycle(null), {
+      action: "repair_base_reconcile",
+      mode: String(mode),
+      attempt: repairCodexAttempt(Number(attempt), "standard", codexAttempt),
+      paths: { jsonl: stdoutPath, stderr: stderrPath, report: summaryPath },
+    });
+    const reconcileTimeoutMs = currentCodexTimeoutMs(true);
+    let codexResult;
+    try {
+      codexResult = spawnCodexSyncWithHeartbeat(
+        `Codex final rebase worker ${mode} attempt ${attempt}.${codexAttempt}`,
+        [
+          "exec",
+          "--cd",
+          targetDir,
+          ...executionModelArgs,
+          "--sandbox",
+          codexWriteSandbox,
+          ...codexWriteSandboxConfigArgs(),
+          ...codexConfigArgs(),
+          "--output-last-message",
+          summaryPath,
+          "--json",
+          "-",
+        ],
+        {
+          cwd: targetDir,
+          input: prompt,
+          encoding: "utf8",
+          env: codexEnv(),
+          timeout: reconcileTimeoutMs,
+          stdoutPath,
+          stderrPath,
+        },
+      );
+    } catch (error) {
+      codexAction.fail(error);
+      throw error;
+    }
     if ((codexResult.error as JsonValue)?.code === "ETIMEDOUT") {
-      throw new Error(`Codex final rebase worker timed out after ${reconcileTimeoutMs}ms`);
+      const error = new Error(`Codex final rebase worker timed out after ${reconcileTimeoutMs}ms`);
+      codexAction.fail(error);
+      throw error;
     }
     if (codexResult.error) {
-      throw new Error(codexResult.error.message || String(codexResult.error));
+      const error = new Error(codexResult.error.message || String(codexResult.error));
+      codexAction.fail(error);
+      throw error;
     }
     if (codexResult.status !== 0) {
-      throw new Error(
+      const error = new Error(
         codexResult.stderr || codexResult.stdout || "Codex final rebase worker failed",
       );
+      codexAction.fail(error);
+      throw error;
     }
     try {
       completeRebaseIfResolved({ targetDir });
+      codexAction.complete();
       return;
     } catch (error) {
+      codexAction.fail(error);
       if (codexAttempt === maxEditAttempts) throw error;
       previousSummary = readTextIfExists(summaryPath).trim();
     }
@@ -2937,6 +2987,8 @@ function runCodexWritePreflight() {
 
   const smokeDir = fs.mkdtempSync(path.join(workRoot, "codex-write-preflight-"));
   const summaryPath = path.join(workRoot, "codex-write-preflight-summary.md");
+  const stdoutPath = path.join(workRoot, "codex-write-preflight.jsonl");
+  const stderrPath = path.join(workRoot, "codex-write-preflight.stderr.log");
   const expectedPath = path.join(smokeDir, "preflight.txt");
   const prompt = [
     "You are running a ClawSweeper Repair Codex write preflight.",
@@ -2948,50 +3000,72 @@ function runCodexWritePreflight() {
     "Do not inspect environment variables, credentials, tokens, or secrets.",
     "Do not call gh, git push, open PRs, or mutate anything outside the current directory.",
   ].join("\n");
-  const child = spawnCodexSyncWithHeartbeat(
-    "Codex write preflight",
-    [
-      "exec",
-      "--cd",
-      smokeDir,
-      ...executionModelArgs,
-      "--sandbox",
-      codexWriteSandbox,
-      ...codexWriteSandboxConfigArgs(),
-      ...codexConfigArgs(),
-      "--output-last-message",
-      summaryPath,
-      "--json",
-      "--skip-git-repo-check",
-      "-",
-    ],
-    {
-      cwd: smokeDir,
-      input: prompt,
-      encoding: "utf8",
-      env: codexEnv(),
-      timeout: codexPreflightTimeoutMs,
-      stdoutPath: path.join(workRoot, "codex-write-preflight.jsonl"),
-      stderrPath: path.join(workRoot, "codex-write-preflight.stderr.log"),
-    },
-  );
+  const codexAction = beginRepairCodexAction(directRepairLifecycle(null), {
+    action: "repair_write_preflight",
+    mode: "preflight",
+    attempt: repairCodexAttempt(1),
+    paths: { jsonl: stdoutPath, stderr: stderrPath, report: summaryPath },
+  });
+  let child;
+  try {
+    child = spawnCodexSyncWithHeartbeat(
+      "Codex write preflight",
+      [
+        "exec",
+        "--cd",
+        smokeDir,
+        ...executionModelArgs,
+        "--sandbox",
+        codexWriteSandbox,
+        ...codexWriteSandboxConfigArgs(),
+        ...codexConfigArgs(),
+        "--output-last-message",
+        summaryPath,
+        "--json",
+        "--skip-git-repo-check",
+        "-",
+      ],
+      {
+        cwd: smokeDir,
+        input: prompt,
+        encoding: "utf8",
+        env: codexEnv(),
+        timeout: codexPreflightTimeoutMs,
+        stdoutPath,
+        stderrPath,
+      },
+    );
+  } catch (error) {
+    codexAction.fail(error);
+    throw error;
+  }
 
   if ((child.error as JsonValue)?.code === "ETIMEDOUT") {
-    return blockedCodexWritePreflight(
+    const blocked = blockedCodexWritePreflight(
       `Codex write preflight timed out after ${codexPreflightTimeoutMs}ms`,
       child.stderr || child.stdout,
     );
+    codexAction.fail(new Error(blocked.reason));
+    return blocked;
   }
   if (child.status !== 0) {
-    return blockedCodexWritePreflight("Codex write preflight failed", child.stderr || child.stdout);
+    const blocked = blockedCodexWritePreflight(
+      "Codex write preflight failed",
+      child.stderr || child.stdout,
+    );
+    codexAction.fail(new Error(blocked.reason));
+    return blocked;
   }
   const written = readTextIfExists(expectedPath).trim();
   if (written !== "ok") {
-    return blockedCodexWritePreflight(
+    const blocked = blockedCodexWritePreflight(
       "Codex write preflight did not create the expected file",
       readTextIfExists(summaryPath) || child.stderr || child.stdout,
     );
+    codexAction.fail(new Error(blocked.reason));
+    return blocked;
   }
+  codexAction.complete();
   return {
     status: "passed",
     sandbox: codexWriteSandbox,
@@ -3169,7 +3243,7 @@ function validateAndReviewLoop({
           targetDir,
           mode,
           error,
-          attempt,
+          attempt: repairCodexAttempt(attempt),
           validationPlan,
           validationCommands,
           targetBaseSha,
@@ -3184,7 +3258,7 @@ function validateAndReviewLoop({
         fixArtifact,
         targetDir,
         mode,
-        attempt,
+        attempt: repairCodexAttempt(attempt),
         baseBranch,
         targetBaseSha,
         validationCommands,
@@ -3213,7 +3287,7 @@ function validateAndReviewLoop({
         targetDir,
         mode,
         review: lastReview,
-        attempt: `${attempt}-final`,
+        attempt: repairCodexAttempt(attempt, "final"),
         targetBaseSha,
       });
       onReviewFix?.(`${attempt}-final`);
@@ -3250,7 +3324,7 @@ function validateAndReviewLoop({
       targetDir,
       mode,
       review: lastReview,
-      attempt,
+      attempt: repairCodexAttempt(attempt),
       targetBaseSha,
     });
     onReviewFix?.(attempt);
@@ -3311,7 +3385,7 @@ function validateAndReviewSynchronizedTree({
     fixArtifact,
     targetDir,
     mode,
-    attempt: "final-sync",
+    attempt: repairCodexAttempt(1, "final_sync"),
     baseBranch,
     targetBaseSha,
     validationCommands,
@@ -3437,7 +3511,9 @@ function runCodexReview({
   validationCommands = [],
   validationPlan = null,
 }: LooseRecord) {
-  const outputPath = path.join(workRoot, `${mode}-codex-review-${attempt}.json`);
+  const attemptIdentity = attempt as RepairCodexAttemptIdentity;
+  const attemptLabel = repairCodexAttemptLabel(attemptIdentity);
+  const outputPath = path.join(workRoot, `${mode}-codex-review-${attemptLabel}.json`);
   const schemaPath = codexReviewSchemaPath();
   const prompt = [
     "/review",
@@ -3472,12 +3548,17 @@ function runCodexReview({
     "```",
   ].join("\n");
   const reviewTimeoutMs = currentCodexTimeoutMs();
-  const stdoutPath = path.join(workRoot, `${mode}-codex-review-${attempt}.jsonl`);
-  const stderrPath = path.join(workRoot, `${mode}-codex-review-${attempt}.stderr.log`);
-  recordRepairCodexLifecycle("started", "repair_review", mode, attempt);
+  const stdoutPath = path.join(workRoot, `${mode}-codex-review-${attemptLabel}.jsonl`);
+  const stderrPath = path.join(workRoot, `${mode}-codex-review-${attemptLabel}.stderr.log`);
+  const codexAction = beginRepairCodexAction(directRepairLifecycle(null), {
+    action: "repair_review",
+    mode: String(mode),
+    attempt: attemptIdentity,
+    paths: { jsonl: stdoutPath, stderr: stderrPath, report: outputPath },
+  });
   try {
     const child = spawnCodexSyncWithHeartbeat(
-      `Codex /review ${mode} attempt ${attempt}`,
+      `Codex /review ${mode} attempt ${attemptLabel}`,
       [
         "exec",
         "--cd",
@@ -3504,10 +3585,6 @@ function runCodexReview({
         stderrPath,
       },
     );
-    publishRepairCodexArtifacts("repair_review", {
-      jsonl: stdoutPath,
-      stderr: stderrPath,
-    });
     if ((child.error as JsonValue)?.code === "ETIMEDOUT")
       throw new Error(`Codex /review timed out after ${reviewTimeoutMs}ms`);
     if (child.error) throw new Error(child.error.message || String(child.error));
@@ -3516,8 +3593,7 @@ function runCodexReview({
       const fallbackReview = extractCodexReviewFromJsonl(child.stdout);
       if (fallbackReview) {
         fs.writeFileSync(outputPath, `${JSON.stringify(fallbackReview, null, 2)}\n`);
-        publishRepairCodexArtifacts("repair_review", { report: outputPath });
-        recordRepairCodexLifecycle("completed", "repair_review", mode, attempt);
+        codexAction.complete();
         return fallbackReview;
       }
       const stdout = compactText(child.stdout, 800);
@@ -3527,16 +3603,10 @@ function runCodexReview({
       );
     }
     const review = JSON.parse(fs.readFileSync(outputPath, "utf8"));
-    publishRepairCodexArtifacts("repair_review", { report: outputPath });
-    recordRepairCodexLifecycle("completed", "repair_review", mode, attempt);
+    codexAction.complete();
     return review;
   } catch (error) {
-    publishRepairCodexArtifacts("repair_review", {
-      jsonl: stdoutPath,
-      stderr: stderrPath,
-      report: outputPath,
-    });
-    recordRepairCodexLifecycle("failed", "repair_review", mode, attempt, error);
+    codexAction.fail(error);
     throw new Error(
       `Codex /review failed: ${error instanceof Error ? error.message : String(error)}`,
     );
@@ -3587,6 +3657,8 @@ function runCodexReviewFix({
   attempt,
   targetBaseSha,
 }: LooseRecord) {
+  const attemptIdentity = attempt as RepairCodexAttemptIdentity;
+  const attemptLabel = repairCodexAttemptLabel(attemptIdentity);
   const prompt = [
     "Address every actionable finding from Codex /review.",
     "",
@@ -3612,13 +3684,18 @@ function runCodexReviewFix({
     "```",
   ].join("\n");
   const reviewFixTimeoutMs = currentCodexTimeoutMs();
-  const reportPath = path.join(workRoot, `${mode}-codex-review-fix-${attempt}.md`);
-  const stdoutPath = path.join(workRoot, `${mode}-codex-review-fix-${attempt}.jsonl`);
-  const stderrPath = path.join(workRoot, `${mode}-codex-review-fix-${attempt}.stderr.log`);
-  recordRepairCodexLifecycle("started", "repair_review_fix", mode, attempt);
+  const reportPath = path.join(workRoot, `${mode}-codex-review-fix-${attemptLabel}.md`);
+  const stdoutPath = path.join(workRoot, `${mode}-codex-review-fix-${attemptLabel}.jsonl`);
+  const stderrPath = path.join(workRoot, `${mode}-codex-review-fix-${attemptLabel}.stderr.log`);
+  const codexAction = beginRepairCodexAction(directRepairLifecycle(null), {
+    action: "repair_review_fix",
+    mode: String(mode),
+    attempt: attemptIdentity,
+    paths: { jsonl: stdoutPath, stderr: stderrPath, report: reportPath },
+  });
   try {
     const child = spawnCodexSyncWithHeartbeat(
-      `Codex review-fix worker ${mode} attempt ${attempt}`,
+      `Codex review-fix worker ${mode} attempt ${attemptLabel}`,
       [
         "exec",
         "--cd",
@@ -3643,81 +3720,15 @@ function runCodexReviewFix({
         stderrPath,
       },
     );
-    publishRepairCodexArtifacts("repair_review_fix", {
-      jsonl: stdoutPath,
-      stderr: stderrPath,
-      report: reportPath,
-    });
     if ((child.error as JsonValue)?.code === "ETIMEDOUT")
       throw new Error(`Codex review-fix worker timed out after ${reviewFixTimeoutMs}ms`);
     if (child.error) throw new Error(child.error.message || String(child.error));
     if (child.status !== 0)
       throw new Error(child.stderr || child.stdout || "Codex review-fix worker failed");
-    recordRepairCodexLifecycle("completed", "repair_review_fix", mode, attempt);
+    codexAction.complete();
   } catch (error) {
-    publishRepairCodexArtifacts("repair_review_fix", {
-      jsonl: stdoutPath,
-      stderr: stderrPath,
-      report: reportPath,
-    });
-    recordRepairCodexLifecycle("failed", "repair_review_fix", mode, attempt, error);
+    codexAction.fail(error);
     throw error;
-  }
-}
-
-function recordRepairCodexLifecycle(
-  phase: "started" | "completed" | "failed",
-  reviewMode: string,
-  mode: JsonValue,
-  attempt: JsonValue,
-  error?: unknown,
-) {
-  recordRepairLifecycleEvent(directRepairLifecycle(null), {
-    type:
-      phase === "started"
-        ? ACTION_EVENT_TYPES.reviewStarted
-        : phase === "completed"
-          ? ACTION_EVENT_TYPES.reviewCompleted
-          : ACTION_EVENT_TYPES.reviewFailed,
-    status:
-      phase === "started"
-        ? ACTION_EVENT_STATUSES.started
-        : phase === "completed"
-          ? ACTION_EVENT_STATUSES.completed
-          : ACTION_EVENT_STATUSES.failed,
-    reasonCode:
-      phase === "started"
-        ? ACTION_EVENT_REASON_CODES.selected
-        : phase === "completed"
-          ? ACTION_EVENT_REASON_CODES.completed
-          : ACTION_EVENT_REASON_CODES.exception,
-    mutation: false,
-    component: "execute_fix_codex",
-    state: phase,
-    reviewMode,
-    eventIdentity: {
-      mode: String(mode),
-      attempt: Number(attempt),
-      ...(error === undefined
-        ? {}
-        : { errorKind: error instanceof Error ? error.name : typeof error }),
-    },
-  });
-}
-
-function publishRepairCodexArtifacts(
-  reviewMode: string,
-  paths: { jsonl?: string; stderr?: string; report?: string },
-) {
-  for (const [kind, artifactPath] of Object.entries(paths)) {
-    if (!artifactPath) continue;
-    recordRepairArtifactPublication(directRepairLifecycle(null), {
-      path: artifactPath,
-      kind: `${reviewMode}_${kind}`,
-      component: "execute_fix_codex",
-      ...(kind === "report" ? { type: ACTION_EVENT_TYPES.reviewPublished } : {}),
-      reviewMode,
-    });
   }
 }
 
@@ -3731,6 +3742,8 @@ function runCodexValidationFix({
   validationCommands = [],
   targetBaseSha,
 }: LooseRecord) {
+  const attemptIdentity = attempt as RepairCodexAttemptIdentity;
+  const attemptLabel = repairCodexAttemptLabel(attemptIdentity);
   const validationError = compactText(String(error?.message ?? error), 8000);
   const changedFiles = run("git", ["diff", "--name-only"], { cwd: targetDir })
     .split("\n")
@@ -3771,37 +3784,54 @@ function runCodexValidationFix({
     "```",
   ].join("\n");
   const validationFixTimeoutMs = currentCodexTimeoutMs();
-  const child = spawnCodexSyncWithHeartbeat(
-    `Codex validation-fix worker ${mode} attempt ${attempt}`,
-    [
-      "exec",
-      "--cd",
-      targetDir,
-      ...executionModelArgs,
-      "--sandbox",
-      codexWriteSandbox,
-      ...codexWriteSandboxConfigArgs(),
-      ...codexConfigArgs(),
-      "--output-last-message",
-      path.join(workRoot, `${mode}-codex-validation-fix-${attempt}.md`),
-      "--json",
-      "-",
-    ],
-    {
-      cwd: targetDir,
-      input: prompt,
-      encoding: "utf8",
-      env: codexEnv(),
-      timeout: validationFixTimeoutMs,
-      stdoutPath: path.join(workRoot, `${mode}-codex-validation-fix-${attempt}.jsonl`),
-      stderrPath: path.join(workRoot, `${mode}-codex-validation-fix-${attempt}.stderr.log`),
-    },
-  );
-  if ((child.error as JsonValue)?.code === "ETIMEDOUT")
-    throw new Error(`Codex validation-fix worker timed out after ${validationFixTimeoutMs}ms`);
-  if (child.error) throw new Error(child.error.message || String(child.error));
-  if (child.status !== 0)
-    throw new Error(child.stderr || child.stdout || "Codex validation-fix worker failed");
+  const reportPath = path.join(workRoot, `${mode}-codex-validation-fix-${attemptLabel}.md`);
+  const stdoutPath = path.join(workRoot, `${mode}-codex-validation-fix-${attemptLabel}.jsonl`);
+  const stderrPath = path.join(workRoot, `${mode}-codex-validation-fix-${attemptLabel}.stderr.log`);
+  const codexAction = beginRepairCodexAction(directRepairLifecycle(null), {
+    action: "repair_validation_fix",
+    mode: String(mode),
+    attempt: attemptIdentity,
+    paths: { jsonl: stdoutPath, stderr: stderrPath, report: reportPath },
+  });
+  try {
+    const child = spawnCodexSyncWithHeartbeat(
+      `Codex validation-fix worker ${mode} attempt ${attemptLabel}`,
+      [
+        "exec",
+        "--cd",
+        targetDir,
+        ...executionModelArgs,
+        "--sandbox",
+        codexWriteSandbox,
+        ...codexWriteSandboxConfigArgs(),
+        ...codexConfigArgs(),
+        "--output-last-message",
+        reportPath,
+        "--json",
+        "-",
+      ],
+      {
+        cwd: targetDir,
+        input: prompt,
+        encoding: "utf8",
+        env: codexEnv(),
+        timeout: validationFixTimeoutMs,
+        stdoutPath,
+        stderrPath,
+      },
+    );
+    if ((child.error as JsonValue)?.code === "ETIMEDOUT") {
+      throw new Error(`Codex validation-fix worker timed out after ${validationFixTimeoutMs}ms`);
+    }
+    if (child.error) throw new Error(child.error.message || String(child.error));
+    if (child.status !== 0) {
+      throw new Error(child.stderr || child.stdout || "Codex validation-fix worker failed");
+    }
+    codexAction.complete();
+  } catch (failure) {
+    codexAction.fail(failure);
+    throw failure;
+  }
 }
 
 function isCleanCodexReview(review: LooseRecord) {

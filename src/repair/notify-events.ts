@@ -13,7 +13,10 @@ import {
   stringArg,
   stringOrNull,
 } from "./openclaw-hook.js";
-import { deliverNotification, recordNotificationPhase } from "./notification-action-ledger.js";
+import {
+  deliverNotificationAttempt,
+  recordNotificationPhase,
+} from "./notification-action-ledger.js";
 
 type EventSeverity = "info" | "warning" | "error";
 type EventStatus = "sent" | "planned" | "failed" | "skipped";
@@ -366,42 +369,50 @@ export async function runClawSweeperEventNotifier(
       continue;
     }
     try {
-      const result = await deliverNotification(eventNotificationLedgerInput(event), () =>
-        postOpenClawAgentHook({
-          config,
-          fetcher,
-          post: {
-            name: eventName(event),
-            message: renderClawSweeperEventMessage(event),
-            idempotencyKey: event.idempotencyKey,
-            deliver: true,
-          },
-        }),
-      );
+      const ledgerInput = eventNotificationLedgerInput(event);
+      recordNotificationPhase(ledgerInput, "planned");
+      const result = await deliverNotificationAttempt(ledgerInput, {
+        kind: "notification_delivery",
+        destination: "openclaw_hook",
+        operation: () =>
+          postOpenClawAgentHook({
+            config,
+            fetcher,
+            post: {
+              name: eventName(event),
+              message: renderClawSweeperEventMessage(event),
+              idempotencyKey: event.idempotencyKey,
+              deliver: true,
+            },
+          }),
+      });
       let dashboardStatus = "status dashboard not configured";
-      let dashboardDelivered = true;
       if (dashboardConfig) {
-        try {
-          await postStatusDashboardEvent({ config: dashboardConfig, fetcher, event });
-          dashboardStatus = "sent to status dashboard";
-        } catch (error) {
-          dashboardDelivered = false;
-          dashboardStatus = `status dashboard failed: ${errorText(error)}`;
-          reportActions.push(reportRow(event, "failed", dashboardStatus, result.runId));
-        }
-      }
-      if (dashboardDelivered) {
-        const notifiedAt = now().toISOString();
-        nextLedger = addEventLedgerEntry(nextLedger, event, {
-          notifiedAt,
-          hookRunId: result.runId,
-          discordTarget: config.discordTarget,
+        await deliverNotificationAttempt(ledgerInput, {
+          kind: "status_dashboard_delivery",
+          destination: "status_dashboard",
+          operation: () => postStatusDashboardEvent({ config: dashboardConfig, fetcher, event }),
+          knownNoMutation: isRejectedDashboardDelivery,
         });
+        dashboardStatus = "sent to status dashboard";
       }
+      recordNotificationPhase(ledgerInput, "sent");
+      const notifiedAt = now().toISOString();
+      nextLedger = addEventLedgerEntry(nextLedger, event, {
+        notifiedAt,
+        hookRunId: result.runId,
+        discordTarget: config.discordTarget,
+      });
       reportActions.push(
         reportRow(event, "sent", `sent to OpenClaw hook; ${dashboardStatus}`, result.runId),
       );
     } catch (error) {
+      recordNotificationPhase(
+        eventNotificationLedgerInput(event),
+        "failed",
+        error instanceof Error ? error.name : typeof error,
+        isRejectedDashboardDelivery(error) ? "mutation_observed" : "mutation_outcome_unknown",
+      );
       reportActions.push(reportRow(event, "failed", errorText(error)));
     }
   }
@@ -478,8 +489,29 @@ async function postStatusDashboardEvent({
     },
     body: JSON.stringify(statusDashboardPayload(event)),
   });
-  if (!response.ok)
-    throw new Error(`dashboard ingest returned ${response.status}: ${await response.text()}`);
+  if (!response.ok) {
+    throw new StatusDashboardDeliveryError(
+      response.status,
+      `dashboard ingest returned ${response.status}: ${await response.text()}`,
+    );
+  }
+}
+
+class StatusDashboardDeliveryError extends Error {
+  readonly status: number;
+
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = "StatusDashboardDeliveryError";
+    this.status = status;
+  }
+}
+
+function isRejectedDashboardDelivery(error: unknown): boolean {
+  return (
+    error instanceof StatusDashboardDeliveryError &&
+    [400, 401, 403, 404, 405, 413, 415, 422, 429].includes(error.status)
+  );
 }
 
 function statusDashboardPayload(event: ClawSweeperEvent): JsonObject {

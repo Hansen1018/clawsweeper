@@ -192,20 +192,17 @@ export function runCommitMutation<T>(
     eventIdentity: { kind: options.kind, requestSha256, requestAttempt, outcome: "attempted" },
     idempotencyIdentity,
   });
+  let result: T;
   try {
-    const result = options.operation();
-    recordCommitMutationOutcome(
-      input,
-      options.kind,
-      requestSha256,
-      requestAttempt,
-      idempotencyIdentity,
-      "accepted",
-    );
-    return result;
+    result = options.operation();
   } catch (error) {
-    const outcome = options.knownNoMutation?.(error) === true ? "rejected" : "unknown";
-    recordCommitMutationOutcome(
+    let outcome: "rejected" | "unknown" = "unknown";
+    try {
+      if (options.knownNoMutation?.(error) === true) outcome = "rejected";
+    } catch {
+      outcome = "unknown";
+    }
+    recordCommitMutationOutcomeSafely(
       input,
       options.kind,
       requestSha256,
@@ -215,6 +212,15 @@ export function runCommitMutation<T>(
     );
     throw error;
   }
+  recordCommitMutationOutcome(
+    input,
+    options.kind,
+    requestSha256,
+    requestAttempt,
+    idempotencyIdentity,
+    "accepted",
+  );
+  return result;
 }
 
 function recordCommitMutationOutcome(
@@ -253,6 +259,32 @@ function recordCommitMutationOutcome(
     eventIdentity: { kind, requestSha256, requestAttempt, outcome },
     idempotencyIdentity,
   });
+}
+
+function recordCommitMutationOutcomeSafely(
+  input: CommitLifecycleInput,
+  kind: string,
+  requestSha256: string,
+  requestAttempt: number,
+  idempotencyIdentity: unknown,
+  outcome: "rejected" | "unknown",
+): void {
+  try {
+    recordCommitMutationOutcome(
+      input,
+      kind,
+      requestSha256,
+      requestAttempt,
+      idempotencyIdentity,
+      outcome,
+    );
+  } catch (receiptError) {
+    console.error(
+      `[action-ledger] failed to record ${kind} ${outcome} outcome after the primary failure: ${
+        receiptError instanceof Error ? receiptError.message : String(receiptError)
+      }`,
+    );
+  }
 }
 
 function commitOperationIdentity(input: CommitLifecycleInput) {

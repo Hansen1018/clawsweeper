@@ -314,7 +314,7 @@ test("runClawSweeperEventNotifier retries events after dashboard ingest failures
     },
   });
 
-  assert.equal(summary.sent, 1);
+  assert.equal(summary.sent, 0);
   assert.equal(summary.failed, 1);
   assert.equal(
     fs.existsSync(path.join(root, "notifications/clawsweeper-event-ledger.json")),
@@ -323,6 +323,8 @@ test("runClawSweeperEventNotifier retries events after dashboard ingest failures
   const report = JSON.parse(
     fs.readFileSync(path.join(root, "notifications/clawsweeper-event-report.json"), "utf8"),
   );
+  assert.equal(report.actions.length, 1);
+  assert.equal(report.actions[0].status, "failed");
   assert.match(report.actions[0].reason, /dashboard ingest returned 401/);
 });
 

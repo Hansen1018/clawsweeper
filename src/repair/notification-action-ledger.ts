@@ -18,10 +18,13 @@ export type NotificationLedgerInput = {
   sourceRevision?: string | null;
 };
 
+export type NotificationMutationOutcome = "mutation_observed" | "mutation_outcome_unknown";
+
 export function recordNotificationPhase(
   input: NotificationLedgerInput,
   phase: "planned" | "skipped" | "sent" | "failed",
   reason: string = phase,
+  failureOutcome: NotificationMutationOutcome = "mutation_outcome_unknown",
 ): void {
   const lifecycle = notificationLifecycle(input);
   recordRepairLifecycleEvent(lifecycle, {
@@ -50,19 +53,38 @@ export function recordNotificationPhase(
             ? ACTION_EVENT_REASON_CODES.completed
             : ACTION_EVENT_REASON_CODES.exception,
     mutation: phase === "sent" || phase === "failed",
-    retryable: phase === "failed",
+    retryable: phase === "failed" && failureOutcome === "mutation_outcome_unknown",
     component: "notification",
     operation: "notification",
     state: phase,
     ...(phase === "sent"
       ? { completionReason: "mutation_observed" }
       : phase === "failed"
-        ? { completionReason: "mutation_outcome_unknown" }
+        ? { completionReason: failureOutcome }
         : {}),
     eventIdentity: { key: input.key, reason },
     ...(phase === "sent" || phase === "failed"
       ? { idempotencyIdentity: { notification: input.key, outcome: phase } }
       : {}),
+  });
+}
+
+export async function deliverNotificationAttempt<T>(
+  input: NotificationLedgerInput,
+  options: {
+    kind: string;
+    destination: string;
+    operation: () => Promise<T>;
+    knownNoMutation?: (error: unknown) => boolean;
+  },
+): Promise<T> {
+  return runRepairMutationAsync(notificationLifecycle(input), {
+    kind: options.kind,
+    identity: { key: input.key, destination: options.destination },
+    component: "notification",
+    operationName: "notification",
+    operation: options.operation,
+    ...(options.knownNoMutation ? { knownNoMutation: options.knownNoMutation } : {}),
   });
 }
 
@@ -72,11 +94,9 @@ export async function deliverNotification<T>(
 ): Promise<T> {
   recordNotificationPhase(input, "planned");
   try {
-    const result = await runRepairMutationAsync(notificationLifecycle(input), {
+    const result = await deliverNotificationAttempt(input, {
       kind: "notification_delivery",
-      identity: { key: input.key },
-      component: "notification",
-      operationName: "notification",
+      destination: "openclaw_hook",
       operation,
     });
     recordNotificationPhase(input, "sent");

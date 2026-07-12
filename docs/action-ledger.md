@@ -134,12 +134,20 @@ confidential-identifier checks as every other durable machine-text field.
   unknown mutation state survives later verification, reporting, and workflow
   failures. Finalization converts an interrupted open request into an immutable
   `mutation_outcome_unknown` child instead of claiming that no write occurred.
-- Repair `/review`, review-fix, and commit-review Codex runs record lifecycle
-  events plus SHA-256 evidence for JSONL, stderr, and report artifacts.
-  Commit-check publication and notification delivery also use request-boundary
-  receipts. Their workflow shards are finalized and imported into the state
-  repository; GitHub artifact upload is retention, not the durable audit
-  boundary.
+- Every repair Codex subprocess that persists output (write preflight, edit,
+  base reconcile, validation fix, `/review`, and review-fix) records a typed
+  attempt lifecycle plus SHA-256 evidence for JSONL, stderr, and report
+  artifacts. Final and final-sync attempts use explicit variants rather than
+  coercing display labels back into numbers. A configured preflight skip is the
+  deliberate exception: it launches no subprocess and creates no Codex output.
+- Commit-review matrix shards bind their producer invocation to the matrix
+  commit SHA, so multi-leg artifact downloads retain one importable shard per
+  commit. Review and optional check publication share one causal workflow
+  lifecycle, which finalizes only after the check outcome is known.
+- Commit-check publication, OpenClaw-hook delivery, and status-dashboard
+  delivery use separate request-boundary attempts and outcomes. Their workflow
+  shards are finalized and imported into the state repository; GitHub artifact
+  upload is retention, not the durable audit boundary.
 - Repository, producer SHA, workflow, job, run, attempt, and component all bind
   shard identity. They do not define the logical operation.
 - Workflow, step, invocation, and component identifiers keep a readable prefix
@@ -334,10 +342,13 @@ later immutable shard import is the durable publication boundary.
 
 Credential-isolated repair jobs never receive state-repository credentials just
 to publish receipts. Cluster and mutation jobs finalize local immutable shards
-and upload them as workflow artifacts. A dedicated state-authorized collector
-lists the bounded matching artifact set, fails on discovery or download errors,
-imports the shards, and commits only the canonical ledger paths. The mutation
-job downloads the cluster shard by its trusted artifact ID and digest only as
+and upload them as workflow artifacts. Commit-review follows the same boundary:
+the danger-full-access Codex matrix job has no state token, creates its optional
+check-write token only after Codex exits, and leaves state mutation to the
+separate publication job. A dedicated state-authorized collector lists the
+bounded matching artifact set, fails on discovery or download errors, imports
+the shards, and commits only the canonical ledger paths. The mutation job
+downloads the cluster shard by its trusted artifact ID and digest only as
 causal context. It does not receive state-repository credentials.
 Result and open-PR finalizer workflows already own state credentials, so they
 import and publish their own finalized shards directly. Additional lanes can

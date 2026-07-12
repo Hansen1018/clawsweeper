@@ -127,6 +127,13 @@ checkpoint, and status-only commits are intentionally omitted.
 ### Fixed
 
 - Kept exact-review handoff health live when the dashboard serves a stale fleet snapshot, so recovered claims no longer leave the operator rail stuck in a delayed or stalled state.
+- Made commit-review matrix ledger producers unique per commit SHA, preserved
+  all legs through merged artifact publication, kept review and optional check
+  publication in one causal lifecycle, and removed state-write credentials from
+  the danger-full-access Codex job. Added typed final repair attempts, complete
+  digest receipts for every durable repair Codex action, separate hook and
+  status-dashboard delivery outcomes, and primary-error preservation when
+  publication receipt recording also fails.
 - Restored exact-review intake by deriving cancellation from `job.status`, avoiding an unsupported status-check function in step environment expressions that made GitHub reject the sweep workflow, and added checksum-pinned workflow-semantic linting to CI.
 - Made comment-router ledger updates retain refreshed claims at the bounded
   history limit, publish through fsynced atomic replacement, and fail closed on

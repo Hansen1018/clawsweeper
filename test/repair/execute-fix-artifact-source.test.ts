@@ -183,6 +183,39 @@ test("repair Codex heartbeat wrapper uses bounded process capture", () => {
   assert.doesNotMatch(source, /writeFileSync\([^)]*codexResult\.stdout/);
 });
 
+test("every persisted repair Codex action uses the shared typed receipt helper", () => {
+  const source = readText(path.join(process.cwd(), "src/repair/execute-fix-artifact.ts"));
+  const helper = readText(path.join(process.cwd(), "src/repair/repair-codex-action-ledger.ts"));
+  const spawnCount = [...source.matchAll(/spawnCodexSyncWithHeartbeat\(/g)].length - 1;
+  const receiptCount = [...source.matchAll(/beginRepairCodexAction\(/g)].length;
+
+  assert.equal(spawnCount, 6);
+  assert.equal(receiptCount, spawnCount);
+  for (const action of [
+    "repair_edit",
+    "repair_write_preflight",
+    "repair_base_reconcile",
+    "repair_review",
+    "repair_review_fix",
+    "repair_validation_fix",
+  ]) {
+    assert.match(helper, new RegExp(`"${action}"`));
+    assert.match(source, new RegExp(`action: "${action}"`));
+  }
+  assert.match(source, /repairCodexAttempt\(attempt, "final"\)/);
+  assert.match(source, /repairCodexAttempt\(1, "final_sync"\)/);
+  assert.doesNotMatch(source, /Number\(`\$\{attempt\}-final`\)/);
+
+  const preflightStart = source.indexOf("function runCodexWritePreflight()");
+  const preflightEnd = source.indexOf("function blockedCodexWritePreflight(", preflightStart);
+  const preflight = source.slice(preflightStart, preflightEnd);
+  assert.ok(
+    preflight.indexOf("if (skipCodexWritePreflight)") <
+      preflight.indexOf("beginRepairCodexAction("),
+    "a skipped preflight must return before creating a subprocess lifecycle or artifacts",
+  );
+});
+
 test("issue implementation rechecks opt-out labels immediately before branch pushes", () => {
   const source = readText(path.join(process.cwd(), "src/repair/execute-fix-artifact.ts"));
   const pushStart = source.indexOf("function pushRecoverableBranch(");
@@ -285,7 +318,7 @@ test("final synchronized tree is reviewed and reports persist before publication
   assert.match(source, /return \{ status: "already-current", base_sha: baseSha \}/);
   assert.match(source, /validateAndReviewSynchronizedTree\(\{/);
   assert.match(source, /repairDeltaPaths: finalSyncRepairDeltaPaths/);
-  assert.match(source, /attempt: "final-sync"/);
+  assert.match(source, /attempt: repairCodexAttempt\(1, "final_sync"\)/);
   assert.match(source, /finalizeExecutionReport\(\{/);
 });
 

@@ -7,6 +7,7 @@ import test from "node:test";
 import { ACTION_EVENT_TYPES } from "../../dist/action-ledger.js";
 import {
   deliverNotification,
+  deliverNotificationAttempt,
   type NotificationLedgerInput,
 } from "../../dist/repair/notification-action-ledger.js";
 import { flushRepairActionEvents } from "../../dist/repair/repair-action-ledger.js";
@@ -70,6 +71,77 @@ for (const scenario of [
     }
   });
 }
+
+test("hook and status dashboard deliveries keep separate exact attempt outcomes", async () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "notification-targets-")));
+  const outputRoot = path.join(root, "output");
+  fs.mkdirSync(outputRoot);
+  const previous = { ...process.env };
+  Object.assign(process.env, workflowEnv(root, outputRoot));
+  const input: NotificationLedgerInput = {
+    repository: "openclaw/clawsweeper",
+    key: "notification:test:dashboard",
+    number: 43,
+  };
+
+  try {
+    await deliverNotificationAttempt(input, {
+      kind: "notification_delivery",
+      destination: "openclaw_hook",
+      operation: async () => "hook-accepted",
+    });
+    await assert.rejects(
+      deliverNotificationAttempt(input, {
+        kind: "status_dashboard_delivery",
+        destination: "status_dashboard",
+        operation: async () => {
+          throw new Error("dashboard rejected request");
+        },
+        knownNoMutation: () => true,
+      }),
+      /dashboard rejected/,
+    );
+    await assert.rejects(
+      deliverNotificationAttempt(input, {
+        kind: "status_dashboard_delivery",
+        destination: "status_dashboard",
+        operation: async () => {
+          throw new Error("dashboard outcome unknown");
+        },
+      }),
+      /dashboard outcome unknown/,
+    );
+    await flushRepairActionEvents();
+
+    const events = readEvents(outputRoot);
+    assert.deepEqual(
+      events.map((event) => event.attributes?.state),
+      [
+        "mutation_attempted",
+        "mutation_accepted",
+        "mutation_attempted",
+        "mutation_rejected",
+        "mutation_attempted",
+        "mutation_unknown",
+      ],
+    );
+    assert.deepEqual(
+      events.map((event) => event.action.mutation),
+      [false, true, false, false, false, true],
+    );
+    const idempotencyKeys = events.map((event) => event.idempotency_key_sha256);
+    assert.equal(idempotencyKeys[0], idempotencyKeys[1]);
+    assert.equal(idempotencyKeys[2], idempotencyKeys[3]);
+    assert.equal(idempotencyKeys[2], idempotencyKeys[4]);
+    assert.equal(idempotencyKeys[4], idempotencyKeys[5]);
+    assert.notEqual(idempotencyKeys[0], idempotencyKeys[2]);
+    assert.notEqual(events[2]?.event_id, events[4]?.event_id);
+    assert.equal(events[5]?.action.retryable, true);
+  } finally {
+    restoreEnv(previous);
+    fs.rmSync(root, { force: true, recursive: true });
+  }
+});
 
 function workflowEnv(root: string, outputRoot: string) {
   return {

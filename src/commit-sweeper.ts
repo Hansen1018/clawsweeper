@@ -440,6 +440,7 @@ function reviewCommand(args: Args): void {
   );
   const sha = assertSha(argString(args, "commit_sha", ""));
   const lifecycle = commitLifecycle(targetRepo, sha);
+  const deferWorkflowCompletion = argBool(args, "defer_workflow_completion");
   recordCommitWorkflowEvent(lifecycle, "started");
   try {
     const metadata = commitMetadata(targetDir, targetRepo, sha);
@@ -478,12 +479,16 @@ function reviewCommand(args: Args): void {
       kind: "commit_review_report",
       type: ACTION_EVENT_TYPES.reviewPublished,
     });
-    recordCommitWorkflowEvent(lifecycle, "completed");
-    recordCommitWorkflowEvent(lifecycle, "finalized");
+    if (!deferWorkflowCompletion) {
+      recordCommitWorkflowEvent(lifecycle, "completed");
+      recordCommitWorkflowEvent(lifecycle, "finalized");
+    }
     console.log(outputPath);
   } catch (error) {
-    recordCommitWorkflowEvent(lifecycle, "failed", error);
-    recordCommitWorkflowEvent(lifecycle, "finalized");
+    if (!deferWorkflowCompletion) {
+      recordCommitWorkflowEvent(lifecycle, "failed", error);
+      recordCommitWorkflowEvent(lifecycle, "finalized");
+    }
     throw error;
   }
 }
@@ -681,7 +686,8 @@ function publishCheckCommand(args: Args): void {
   const reportRelativePath =
     argString(args, "report_relative_path", "") || commitReportRelativePath(targetRepo, sha);
   const lifecycle = commitLifecycle(targetRepo, sha);
-  recordCommitWorkflowEvent(lifecycle, "started");
+  const continueWorkflow = argBool(args, "continue_workflow");
+  if (!continueWorkflow) recordCommitWorkflowEvent(lifecycle, "started");
   try {
     runCommitMutation(lifecycle, {
       kind: "commit_check_publication",
@@ -703,13 +709,33 @@ function publishCheckCommand(args: Args): void {
           checkName: argString(args, "check_name", COMMIT_REVIEW_CHECK_NAME),
         }),
     });
-    recordCommitWorkflowEvent(lifecycle, "completed");
-    recordCommitWorkflowEvent(lifecycle, "finalized");
+    if (!continueWorkflow) {
+      recordCommitWorkflowEvent(lifecycle, "completed");
+      recordCommitWorkflowEvent(lifecycle, "finalized");
+    }
   } catch (error) {
-    recordCommitWorkflowEvent(lifecycle, "failed", error);
-    recordCommitWorkflowEvent(lifecycle, "finalized");
+    if (!continueWorkflow) {
+      recordCommitWorkflowEvent(lifecycle, "failed", error);
+      recordCommitWorkflowEvent(lifecycle, "finalized");
+    }
     throw error;
   }
+}
+
+function finishReviewCommand(args: Args): void {
+  const targetRepo = argString(args, "target_repo", DEFAULT_TARGET_REPO);
+  const sha = assertSha(argString(args, "commit_sha", ""));
+  const lifecycle = commitLifecycle(targetRepo, sha);
+  if (argBool(args, "succeeded")) {
+    recordCommitWorkflowEvent(lifecycle, "completed");
+  } else {
+    recordCommitWorkflowEvent(
+      lifecycle,
+      "failed",
+      new Error(argString(args, "error_kind", "commit review workflow failed")),
+    );
+  }
+  recordCommitWorkflowEvent(lifecycle, "finalized");
 }
 
 function collectMarkdownFiles(dir: string): string[] {
@@ -1064,6 +1090,7 @@ export function main(argv = process.argv.slice(2)): void {
   if (command === "review") reviewCommand(args);
   else if (command === "classify") classifyCommand(args);
   else if (command === "publish-check") publishCheckCommand(args);
+  else if (command === "finish-review") finishReviewCommand(args);
   else if (command === "reports") reportsCommand(args);
   else if (command === "copy-artifacts") copyArtifactsCommand(args);
   else if (command === "dispatch-findings") dispatchFindingsCommand(args);

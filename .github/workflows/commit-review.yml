@@ -362,6 +362,8 @@ jobs:
     permissions:
       actions: read
       contents: read
+    env:
+      CLAWSWEEPER_ACTION_LEDGER_INVOCATION: commit-${{ matrix.sha }}
     strategy:
       fail-fast: false
       matrix:
@@ -386,19 +388,6 @@ jobs:
           permission-contents: read
           permission-issues: read
           permission-pull-requests: read
-
-      - name: Create state token
-        id: state-token
-        uses: ./clawsweeper/.github/actions/create-state-token
-        with:
-          client-id: ${{ env.CLAWSWEEPER_APP_CLIENT_ID }}
-          private-key: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
-
-      - uses: ./clawsweeper/.github/actions/setup-state
-        with:
-          token: ${{ steps.state-token.outputs.token }}
-          worktree-path: clawsweeper
-          fetch-depth: 1
 
       - uses: ./clawsweeper/.github/actions/setup-action-ledger
         with:
@@ -441,6 +430,7 @@ jobs:
           echo "Commit under review: $(git -C "$TARGET_NAME" rev-parse --short "$COMMIT_SHA")"
 
       - name: Review commit
+        id: review-commit
         working-directory: clawsweeper
         env:
           GH_TOKEN: ${{ steps.target-read-token.outputs.token }}
@@ -457,7 +447,8 @@ jobs:
             --codex-model internal \
             --codex-reasoning-effort high \
             --codex-sandbox danger-full-access \
-            --codex-timeout-ms 1800000
+            --codex-timeout-ms 1800000 \
+            --defer-workflow-completion
 
       - name: Create target checks token
         id: target-checks-token
@@ -471,6 +462,7 @@ jobs:
           permission-checks: write
 
       - name: Publish commit check
+        id: publish-commit-check
         if: ${{ needs.plan.outputs.create_checks == 'true' }}
         working-directory: clawsweeper
         env:
@@ -489,7 +481,27 @@ jobs:
             --commit-sha "${{ matrix.sha }}" \
             --report-path "$report_path" \
             --report-relative-path "$relative_path" \
-            --report-repo "${{ github.repository }}"
+            --report-repo "${{ github.repository }}" \
+            --continue-workflow
+
+      - name: Finish commit review lifecycle
+        if: ${{ always() && steps.review-setup-pnpm.outcome == 'success' }}
+        working-directory: clawsweeper
+        env:
+          REVIEW_OUTCOME: ${{ steps.review-commit.outcome }}
+          CHECK_OUTCOME: ${{ steps.publish-commit-check.outcome }}
+        run: |
+          set -euo pipefail
+          succeeded=false
+          if [ "$REVIEW_OUTCOME" = "success" ] &&
+             { [ "$CHECK_OUTCOME" = "success" ] || [ "$CHECK_OUTCOME" = "skipped" ]; }; then
+            succeeded=true
+          fi
+          node dist/commit-sweeper.js finish-review \
+            --target-repo "${{ needs.plan.outputs.target_repo }}" \
+            --commit-sha "${{ matrix.sha }}" \
+            --succeeded "$succeeded" \
+            --error-kind "review=$REVIEW_OUTCOME,check=$CHECK_OUTCOME"
 
       - name: Finalize commit review action ledger
         if: ${{ always() && steps.review-setup-pnpm.outcome == 'success' }}

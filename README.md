@@ -127,9 +127,15 @@ Every repair write is recorded at the request boundary with stable business
 idempotency and a distinct wire-attempt identity. Branch, PR, comment, label,
 review-thread, continuation-dispatch, source-close compensation, and merge
 outcomes remain accepted or unknown even when a later verification step fails.
-Repair and commit-review Codex logs and reports are digest-bound in the
-immutable action ledger, as are commit-check publication and notification
-delivery.
+Every durable repair Codex action (write preflight, edit, base reconcile,
+validation fix, review, and review fix) and commit-review Codex run publishes a
+typed lifecycle plus digest-bound logs and reports to the immutable action
+ledger. A deliberately skipped write preflight launches no subprocess and
+therefore has no Codex artifacts to receipt. Commit-review matrix producers are
+isolated by commit SHA; the danger-full-access Codex step has no state-write
+credential, and check/state publication happens only after it. Commit-check,
+OpenClaw-hook, and status-dashboard deliveries each keep their own exact
+request-attempt outcome.
 
 Operators can create repair-only jobs for one author's blocked pull requests in
 one repository with `pnpm repair:pr-intake -- --repo owner/name --author login`,
