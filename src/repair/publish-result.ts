@@ -76,10 +76,10 @@ async function runPublishResult() {
     }
 
     writeAggregateApplyReport();
-    recordAggregatePublication("apply_report", "repair-apply-report.json");
+    recordAggregatePublication("apply_report");
     if (args["write-dashboard"]) {
       updateDashboard();
-      recordAggregatePublication("repair_dashboard", "docs/repair/README.md");
+      recordAggregatePublication("repair_dashboard");
     }
 
     console.log(JSON.stringify({ published: published.length, records: published }, null, 2));
@@ -485,8 +485,8 @@ function writeAggregateApplyReport() {
   );
 }
 
-function recordAggregatePublication(publicationKind: string, recordPath: string) {
-  recordRepairLifecycleEvent(aggregateLifecycle(publicationKind, recordPath), {
+function recordAggregatePublication(publicationKind: string) {
+  recordRepairLifecycleEvent(aggregateLifecycle(publicationKind), {
     type:
       publicationKind === "repair_dashboard"
         ? ACTION_EVENT_TYPES.dashboardLifecycle
