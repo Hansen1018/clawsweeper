@@ -530,6 +530,10 @@ test("repair execution and validation cannot mutate GitHub before trusted public
   const executeText = JSON.stringify(execute);
   const validateText = JSON.stringify(validate);
   const reportText = JSON.stringify(report);
+  const reportOnlyRequeue = report.steps?.find(
+    (step: { id?: string }) => step.id === "requeue_report_only",
+  );
+  assert.ok(reportOnlyRequeue);
   assert.doesNotMatch(executeText, /create-github-app-token|create-state-token|setup-state/);
   assert.doesNotMatch(validateText, /create-github-app-token|create-state-token|setup-state/);
   assert.doesNotMatch(
@@ -572,7 +576,11 @@ test("repair execution and validation cannot mutate GitHub before trusted public
   }
   assert.match(source, /Authorize exact job and run[\s\S]*--allow-execute[\s\S]*--allow-fix-pr/);
   assert.match(reportText, /repair:requeue[\s\S]*--allow-execute[\s\S]*--allow-fix-pr/);
-  assert.match(reportText, /--requeue-depth[\s\S]*--max-requeue-depth 1/);
+  assert.match(
+    String(reportOnlyRequeue.if ?? ""),
+    /fromJSON\(needs\.cluster\.outputs\.requeue_depth \|\| '0'\) < 1/,
+  );
+  assert.match(String(reportOnlyRequeue.run ?? ""), /--requeue-depth[\s\S]*--max-requeue-depth 1/);
   assert.match(reportText, /REQUEUE_OUTCOME/);
   assert.match(reportText, /bounded authorized retry could not be queued/);
   assert.match(reportText, /failed deterministic verification\. It was not requeued/);

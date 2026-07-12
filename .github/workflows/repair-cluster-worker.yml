@@ -1209,7 +1209,7 @@ jobs:
 
       - name: Create central requeue token
         id: requeue_token
-        if: ${{ steps.repair_requeue.outputs.count != '' && steps.repair_requeue.outputs.count != '0' || (steps.execution_artifact.outcome != 'success' || steps.download_execution.outcome != 'success') && fromJSON(needs.cluster.outputs.requeue_depth || '0') < 1 }}
+        if: ${{ (steps.repair_requeue.outputs.count != '' && steps.repair_requeue.outputs.count != '0' || steps.execution_artifact.outcome != 'success' || steps.download_execution.outcome != 'success') && fromJSON(needs.cluster.outputs.requeue_depth || '0') < 1 }}
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           client-id: ${{ env.CLAWSWEEPER_APP_CLIENT_ID }}
@@ -1221,7 +1221,7 @@ jobs:
 
       - name: Requeue retryable report-only outcomes
         id: requeue_report_only
-        if: ${{ steps.verify_execution.outcome == 'success' && steps.repair_requeue.outputs.count != '' && steps.repair_requeue.outputs.count != '0' }}
+        if: ${{ steps.verify_execution.outcome == 'success' && steps.repair_requeue.outputs.count != '' && steps.repair_requeue.outputs.count != '0' && fromJSON(needs.cluster.outputs.requeue_depth || '0') < 1 }}
         env:
           GH_TOKEN: ${{ steps.requeue_token.outputs.token }}
           CLAWSWEEPER_MUTATION_TOKEN_SOURCE: clawsweeper-app
