@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { parse as parseYaml } from "yaml";
 
+import { resolveSpawnCommand } from "../command.js";
 import { runCommand as run, type CommandRunOptions } from "./command-runner.js";
 import {
   ensureMergeBaseAvailable,
@@ -128,12 +129,21 @@ export type TargetValidationProofResult = StagedProofExecutionResult & {
   plan: StagedProofPlan;
 };
 
-type TargetValidationIsolation = {
+type LinuxTargetValidationIsolation = {
+  kind: "linux-user";
   gid: number;
   home: string;
   uid: number;
   user: string;
 };
+
+type MacosTargetValidationIsolation = {
+  kind: "macos-sandbox";
+  home: string;
+  user: string;
+};
+
+type TargetValidationIsolation = LinuxTargetValidationIsolation | MacosTargetValidationIsolation;
 
 type TargetControlledCommandOptions = CommandRunOptions & {
   cwd: string;
@@ -2143,6 +2153,8 @@ export function targetValidationEnv() {
       key.startsWith("CLAWSWEEPER_TARGET_VALIDATION_") ||
       key.startsWith("CLAWSWEEPER_ACTION_LEDGER_") ||
       key.startsWith("CLAWSWEEPER_CRABFLEET_") ||
+      /^(?:(?:HTTP|HTTPS|ALL|NO)_PROXY|GLOBAL_AGENT_(?:HTTP|HTTPS)_PROXY)$/i.test(key) ||
+      /^npm_config_(?:proxy|https_proxy|noproxy)$/i.test(key) ||
       /(?:^|_)(?:TOKEN|SECRET|PASSWORD|PRIVATE_KEY|API_KEY|CREDENTIALS?)$/i.test(key)
     ) {
       delete env[key];
@@ -2156,15 +2168,59 @@ export function targetValidationIsolationFromEnv(): TargetValidationIsolation | 
   if (requiredValue && !["0", "1"].includes(requiredValue)) {
     throw new Error("invalid CLAWSWEEPER_TARGET_VALIDATION_ISOLATION_REQUIRED value");
   }
+  const safeTestModeValue = process.env.CLAWSWEEPER_TARGET_VALIDATION_SAFE_TEST_MODE ?? "";
+  if (safeTestModeValue && !["0", "1"].includes(safeTestModeValue)) {
+    throw new Error("invalid CLAWSWEEPER_TARGET_VALIDATION_SAFE_TEST_MODE value");
+  }
   const required = requiredValue === "1";
+  const safeTestMode = safeTestModeValue === "1";
   const user = String(process.env.CLAWSWEEPER_TARGET_VALIDATION_USER ?? "").trim();
   const configuredHome = String(process.env.CLAWSWEEPER_TARGET_VALIDATION_HOME ?? "").trim();
+  if (process.platform !== "linux") {
+    if (!safeTestMode) {
+      if (!required && !user && !configuredHome) return null;
+      throw new Error("target validation user isolation is supported only on Linux");
+    }
+    if (process.platform !== "darwin") {
+      throw new Error("safe target validation test mode is supported only on macOS");
+    }
+    if (required || user) {
+      throw new Error("safe macOS target validation test mode cannot use Linux user isolation");
+    }
+    if (!configuredHome) {
+      throw new Error("safe macOS target validation test mode requires an isolated home");
+    }
+    if (!path.isAbsolute(configuredHome)) {
+      throw new Error("safe macOS target validation home must be absolute");
+    }
+    const home = fs.realpathSync(configuredHome);
+    const temporaryRoot = fs.realpathSync(os.tmpdir());
+    const hostHome = fs.realpathSync(os.homedir());
+    if (
+      !pathIsWithin(temporaryRoot, home) ||
+      pathIsWithin(home, hostHome) ||
+      pathIsWithin(hostHome, home)
+    ) {
+      throw new Error("safe macOS target validation home must be isolated temporary storage");
+    }
+    const homeStat = fs.lstatSync(configuredHome);
+    if (
+      !homeStat.isDirectory() ||
+      homeStat.isSymbolicLink() ||
+      (homeStat.mode & 0o077) !== 0 ||
+      homeStat.uid !== process.getuid?.()
+    ) {
+      throw new Error("safe macOS target validation home must be private and runner-owned");
+    }
+    return {
+      kind: "macos-sandbox",
+      home,
+      user: os.userInfo().username,
+    };
+  }
   if (!required && !user && !configuredHome) return null;
   if (!user || !configuredHome) {
     throw new Error("target validation isolation requires both a user and isolated home");
-  }
-  if (process.platform !== "linux") {
-    throw new Error("target validation isolation is supported only on Linux");
   }
   if (!/^[a-z_][a-z0-9_-]{0,31}$/i.test(user)) {
     throw new Error("invalid target validation isolation user");
@@ -2187,7 +2243,7 @@ export function targetValidationIsolationFromEnv(): TargetValidationIsolation | 
   if (runnerGid === undefined || gid !== runnerGid) {
     throw new Error("target validation isolation user must share only the checkout group");
   }
-  return { gid, home, uid, user };
+  return { kind: "linux-user", gid, home, uid, user };
 }
 
 export function runTargetControlledCommand(
@@ -2196,11 +2252,30 @@ export function runTargetControlledCommand(
   options: TargetControlledCommandOptions,
 ): string {
   const isolation = targetValidationIsolationFromEnv();
-  if (!isolation) return run(command, commandArgs, options);
+  if (!isolation) {
+    if (process.platform !== "linux") {
+      throw new Error(
+        "target-controlled commands require Linux user isolation or explicit safe macOS test mode",
+      );
+    }
+    return run(command, commandArgs, options);
+  }
 
   const startedAt = Date.now();
   const timeoutMs = options.timeoutMs ?? DEFAULT_TARGET_VALIDATION_TIMEOUT_MS;
   const cwd = fs.realpathSync(options.cwd);
+  if (isolation.kind === "macos-sandbox") {
+    if (pathIsWithin(cwd, isolation.home) || pathIsWithin(isolation.home, cwd)) {
+      throw new Error("safe macOS target validation checkout and isolated home must be disjoint");
+    }
+    return runMacosSandboxedTargetCommand(command, commandArgs, {
+      ...options,
+      cwd,
+      env: options.env ?? process.env,
+      isolation,
+      timeoutMs: remainingIsolationBudget(timeoutMs, startedAt),
+    });
+  }
   const root = targetValidationIsolationRoot(cwd);
   if (pathIsWithin(root, isolation.home) || pathIsWithin(isolation.home, root)) {
     throw new Error("target validation checkout and isolated home must be disjoint");
@@ -2239,6 +2314,217 @@ export function runTargetControlledCommand(
     cwd,
     timeoutMs: remainingIsolationBudget(timeoutMs, startedAt),
   });
+}
+
+function runMacosSandboxedTargetCommand(
+  command: string,
+  commandArgs: string[],
+  options: TargetControlledCommandOptions & {
+    env: NodeJS.ProcessEnv;
+    isolation: MacosTargetValidationIsolation;
+    timeoutMs: number;
+  },
+) {
+  if (!fs.existsSync("/usr/bin/sandbox-exec")) {
+    throw new Error("safe macOS target validation requires /usr/bin/sandbox-exec");
+  }
+  const env = Object.fromEntries(isolatedTargetValidationEnv(options.env, options.isolation));
+  const invocation = resolveSpawnCommand(command, commandArgs, {
+    cwd: options.cwd,
+    env,
+  });
+  const profile = macosTargetValidationSandboxProfile({
+    command: invocation.command,
+    cwd: options.cwd,
+    env,
+    home: options.isolation.home,
+  });
+  try {
+    return run("/usr/bin/sandbox-exec", ["-p", profile, invocation.command, ...invocation.args], {
+      cwd: options.cwd,
+      env,
+      timeoutMs: options.timeoutMs,
+    });
+  } catch (error) {
+    if (/^command timed out after \d+ms:/i.test(String((error as Error).message))) {
+      throw new Error(
+        `command timed out after ${options.timeoutMs}ms: ${[command, ...commandArgs].join(" ")}`,
+        { cause: error },
+      );
+    }
+    throw error;
+  }
+}
+
+function macosTargetValidationSandboxProfile({
+  command,
+  cwd,
+  env,
+  home,
+}: {
+  command: string;
+  cwd: string;
+  env: NodeJS.ProcessEnv;
+  home: string;
+}) {
+  const readableRoots = macosTargetValidationReadableRoots({ command, cwd, env, home });
+  const writableRoots = macosTargetValidationWritableRoots({ command, cwd, env, home });
+  const readRules = readableRoots.map((root) => `(subpath ${JSON.stringify(root)})`).join(" ");
+  const writeRules = writableRoots.map((root) => `(subpath ${JSON.stringify(root)})`).join(" ");
+  return [
+    "(version 1)",
+    "(deny default)",
+    '(import "system.sb")',
+    "(allow process*)",
+    "(allow file-read-metadata)",
+    `(allow file-read* ${readRules})`,
+    `(allow file-write* ${writeRules})`,
+    "(deny network*)",
+  ].join("\n");
+}
+
+function macosTargetValidationReadableRoots({
+  command,
+  cwd,
+  env,
+  home,
+}: {
+  command: string;
+  cwd: string;
+  env: NodeJS.ProcessEnv;
+  home: string;
+}) {
+  return uniqueExistingRealPaths([
+    "/Applications",
+    "/Library",
+    "/System",
+    "/bin",
+    "/dev",
+    "/opt/homebrew",
+    "/private/etc",
+    "/sbin",
+    "/usr",
+    cwd,
+    home,
+    ...macosTargetValidationGitObjectRoots(cwd),
+    ...targetValidationToolRoots(command, env),
+  ]);
+}
+
+function macosTargetValidationWritableRoots({
+  command,
+  cwd,
+  env,
+  home,
+}: {
+  command: string;
+  cwd: string;
+  env: NodeJS.ProcessEnv;
+  home: string;
+}) {
+  const temporaryRoot = fs.realpathSync(os.tmpdir());
+  return uniqueExistingRealPaths([
+    cwd,
+    home,
+    ...targetValidationToolRoots(command, env).filter((root) => pathIsWithin(temporaryRoot, root)),
+  ]);
+}
+
+function targetValidationToolRoots(command: string, env: NodeJS.ProcessEnv) {
+  const roots = String(env.PATH ?? "")
+    .split(path.delimiter)
+    .filter(Boolean);
+  if (path.isAbsolute(command)) roots.push(path.dirname(command));
+  for (const [key, value] of Object.entries(env)) {
+    if (key.endsWith("_BIN") && value && path.isAbsolute(value)) {
+      roots.push(path.dirname(value));
+      continue;
+    }
+    if (!key.endsWith("_BIN_ARGS") || !value || !env[key.slice(0, -5)]) continue;
+    try {
+      const args = JSON.parse(value);
+      if (!Array.isArray(args)) continue;
+      for (const arg of args) {
+        if (typeof arg !== "string" || !path.isAbsolute(arg)) continue;
+        try {
+          roots.push(fs.statSync(arg).isDirectory() ? arg : path.dirname(arg));
+        } catch {
+          // Missing override inputs fail when the command is launched.
+        }
+      }
+    } catch {
+      // Invalid override JSON fails in command resolution.
+    }
+  }
+  const resolved = uniqueExistingRealPaths(roots);
+  const hostHome = fs.realpathSync(os.homedir());
+  if (resolved.some((root) => pathIsWithin(root, hostHome) || pathIsWithin(hostHome, root))) {
+    throw new Error("safe macOS target validation tool roots must not expose the host home");
+  }
+  return resolved;
+}
+
+function macosTargetValidationGitObjectRoots(cwd: string) {
+  const gitDir = path.join(cwd, ".git");
+  let stat: fs.Stats;
+  try {
+    stat = fs.lstatSync(gitDir);
+  } catch {
+    return [];
+  }
+  if (!stat.isDirectory() || stat.isSymbolicLink()) return [];
+  const objectsDir = path.join(gitDir, "objects");
+  const alternatesPath = path.join(objectsDir, "info", "alternates");
+  let alternates: string;
+  try {
+    alternates = fs.readFileSync(alternatesPath, "utf8");
+  } catch {
+    return [];
+  }
+  return uniqueStrings(
+    alternates
+      .split(/\r?\n/)
+      .map((entry) => entry.trim())
+      .filter(Boolean)
+      .map((entry) =>
+        validatedMacosTemporaryReadRoot(
+          path.isAbsolute(entry) ? entry : path.resolve(objectsDir, entry),
+        ),
+      ),
+  );
+}
+
+function validatedMacosTemporaryReadRoot(candidate: string) {
+  const resolved = fs.realpathSync(candidate);
+  const temporaryRoot = fs.realpathSync(os.tmpdir());
+  const hostHome = fs.realpathSync(os.homedir());
+  const stat = fs.lstatSync(resolved);
+  if (
+    resolved === temporaryRoot ||
+    !pathIsWithin(temporaryRoot, resolved) ||
+    pathIsWithin(resolved, hostHome) ||
+    pathIsWithin(hostHome, resolved) ||
+    !stat.isDirectory() ||
+    stat.isSymbolicLink() ||
+    stat.uid !== process.getuid?.()
+  ) {
+    throw new Error("safe macOS target validation Git objects must be runner-owned temporary data");
+  }
+  return resolved;
+}
+
+function uniqueExistingRealPaths(values: string[]) {
+  return [
+    ...new Set(
+      values.flatMap((value) => {
+        try {
+          return [fs.realpathSync(value)];
+        } catch {
+          return [];
+        }
+      }),
+    ),
+  ].sort();
 }
 
 function parseIsolationIdentity(label: string, value: string) {
@@ -2296,16 +2582,22 @@ function isolatedTargetValidationEnv(
 ): [string, string][] {
   const env: NodeJS.ProcessEnv = { ...source };
   for (const key of Object.keys(env)) {
+    const normalized = key.toUpperCase();
     if (
-      key === "HOME" ||
-      key === "LOGNAME" ||
-      key === "SUDO_COMMAND" ||
-      key === "SUDO_GID" ||
-      key === "SUDO_UID" ||
-      key === "SUDO_USER" ||
-      key === "TMPDIR" ||
-      key === "USER" ||
-      key.startsWith("XDG_")
+      normalized === "HOME" ||
+      normalized === "LOGNAME" ||
+      normalized === "SUDO_COMMAND" ||
+      normalized === "SUDO_GID" ||
+      normalized === "SUDO_UID" ||
+      normalized === "SUDO_USER" ||
+      normalized === "TMPDIR" ||
+      normalized === "USER" ||
+      normalized === "NPM_CONFIG_CACHE" ||
+      normalized === "NPM_CONFIG_USERCONFIG" ||
+      normalized === "PNPM_STORE_PATH" ||
+      normalized.startsWith("XDG_") ||
+      /^(?:(?:HTTP|HTTPS|ALL|NO)_PROXY|GLOBAL_AGENT_(?:HTTP|HTTPS)_PROXY)$/.test(normalized) ||
+      /^NPM_CONFIG_(?:PROXY|HTTPS_PROXY|NOPROXY|STORE_DIR)$/.test(normalized)
     ) {
       delete env[key];
     }
@@ -2320,10 +2612,34 @@ function isolatedTargetValidationEnv(
   env.COREPACK_HOME = path.join(isolation.home, ".cache", "node", "corepack");
   env.PNPM_HOME = path.join(isolation.home, ".local", "share", "pnpm");
   env.npm_config_cache = path.join(isolation.home, ".cache", "npm");
-  env.PATH = `${path.join(isolation.home, ".local", "bin")}${path.delimiter}${source.PATH ?? ""}`;
+  env.npm_config_userconfig = path.join(isolation.home, ".npmrc");
+  env.npm_config_manage_package_manager_versions = "false";
+  env.npm_config_pm_on_fail = "ignore";
+  env.npm_config_verify_deps_before_run = "false";
+  env.PATH = isolatedTargetValidationPath(source.PATH, isolation.home);
   return Object.entries(env)
     .filter((entry): entry is [string, string] => entry[1] !== undefined)
     .sort(([left], [right]) => left.localeCompare(right));
+}
+
+function isolatedTargetValidationPath(sourcePath: string | undefined, isolatedHome: string) {
+  const hostHome = fs.realpathSync(os.homedir());
+  const entries = [
+    path.join(isolatedHome, ".local", "bin"),
+    ...(sourcePath ?? "").split(path.delimiter),
+  ];
+  return uniqueStrings(
+    entries.filter((entry) => {
+      if (!entry || !path.isAbsolute(entry)) return false;
+      if (pathIsWithin(hostHome, entry) || pathIsWithin(entry, hostHome)) return false;
+      try {
+        const resolved = fs.realpathSync(entry);
+        return !pathIsWithin(hostHome, resolved) && !pathIsWithin(resolved, hostHome);
+      } catch {
+        return pathIsWithin(isolatedHome, entry);
+      }
+    }),
+  ).join(path.delimiter);
 }
 
 function remainingIsolationBudget(timeoutMs: number, startedAt: number) {

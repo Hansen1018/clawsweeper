@@ -761,6 +761,8 @@ export function validationCommandForExecution(parts: readonly string[]): string[
     return [
       ...envPrefix,
       "pnpm",
+      "--config.verify-deps-before-run=false",
+      "--config.pm-on-fail=ignore",
       "--config.enable-pre-post-scripts=false",
       ...commandParts.slice(1),
     ];

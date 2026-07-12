@@ -42,6 +42,30 @@ import {
 import { mockCommandBinEnv } from "../helpers.ts";
 
 const FAKE_TOOLCHAIN_TIMEOUT_MS = 15_000;
+const macosSafeTestHome =
+  process.platform === "darwin"
+    ? fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-macos-validation-home-")))
+    : null;
+
+function targetValidationOutputPath(name) {
+  return path.join(
+    macosSafeTestHome ?? os.tmpdir(),
+    `${name}-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+  );
+}
+
+if (macosSafeTestHome) {
+  fs.chmodSync(macosSafeTestHome, 0o700);
+  process.env.CLAWSWEEPER_TARGET_VALIDATION_SAFE_TEST_MODE = "1";
+  process.env.CLAWSWEEPER_TARGET_VALIDATION_HOME = macosSafeTestHome;
+}
+
+test.after(() => {
+  if (!macosSafeTestHome) return;
+  delete process.env.CLAWSWEEPER_TARGET_VALIDATION_SAFE_TEST_MODE;
+  delete process.env.CLAWSWEEPER_TARGET_VALIDATION_HOME;
+  fs.rmSync(macosSafeTestHome, { recursive: true, force: true });
+});
 
 test("default staged proof entry budget covers a supported OpenClaw install", () => {
   assert.ok(DEFAULT_PROOF_INPUT_MAX_ENTRIES > 110_301);
@@ -2061,12 +2085,12 @@ test("bun-based target toolchain hides pnpm-injected npm_config_user_agent from 
     );
     assert.equal(
       env.npm_config_cache,
-      "/tmp/npm-cache",
+      macosSafeTestHome ? path.join(macosSafeTestHome, ".cache", "npm") : "/tmp/npm-cache",
       "npm-compatible cache config must pass through to bun children",
     );
     assert.equal(
       env.npm_config_userconfig,
-      "/tmp/npmrc",
+      macosSafeTestHome ? path.join(macosSafeTestHome, ".npmrc") : "/tmp/npmrc",
       "npm-compatible userconfig must pass through to bun children",
     );
     assert.equal(env.npm_execpath, undefined, "npm_execpath must not leak to bun children");
@@ -2081,7 +2105,11 @@ test("bun-based target toolchain hides pnpm-injected npm_config_user_agent from 
       "npm_lifecycle_event must not leak to bun children",
     );
     assert.equal(env.npm_package_name, undefined, "npm_package_* must not leak to bun children");
-    assert.equal(env.PNPM_HOME, undefined, "PNPM_HOME must not leak to bun children");
+    assert.equal(
+      env.PNPM_HOME,
+      macosSafeTestHome ? path.join(macosSafeTestHome, ".local", "share", "pnpm") : undefined,
+      "PNPM_HOME must stay within the isolated home",
+    );
     assert.equal(env.PNPM_STORE_PATH, undefined, "PNPM_* variables must not leak to bun children");
   }
 });
@@ -3692,6 +3720,8 @@ test("package validation execution injects lifecycle suppression without changin
   ]);
   assert.deepEqual(validationCommandForExecution(["pnpm", "--filter", "app", "check"]), [
     "pnpm",
+    "--config.verify-deps-before-run=false",
+    "--config.pm-on-fail=ignore",
     "--config.enable-pre-post-scripts=false",
     "--filter",
     "app",
@@ -3773,7 +3803,7 @@ test("staged target proof validates and digests resolved environment argv", () =
 
 test("staged target proof executes colliding rendered commands by structured argv", () => {
   const cwd = gitPackageFixture({});
-  const logPath = path.join(os.tmpdir(), `clawsweeper-argv-${process.pid}-${Date.now()}.log`);
+  const logPath = targetValidationOutputPath("clawsweeper-argv");
   fs.writeFileSync(
     path.join(cwd, "record-argv.cjs"),
     "require('node:fs').appendFileSync(process.argv[2], JSON.stringify(process.argv.slice(3)) + '\\n');\n",
@@ -3869,14 +3899,11 @@ test("stalled canonical changed gates fail instead of certifying fallback proof"
 });
 
 test("changed validation retries one transient check:changed failure", () => {
-  const marker = path.join(
-    os.tmpdir(),
-    `clawsweeper-validation-attempt-${process.pid}-${Date.now()}.txt`,
-  );
   const cwd = gitPackageFixture({
     "check:changed":
       "node -e \"const fs=require('fs'); const file=process.env.CLAWSWEEPER_TEST_ATTEMPT_FILE; const count=fs.existsSync(file)?Number(fs.readFileSync(file,'utf8')):0; fs.writeFileSync(file, String(count+1)); if (count===0) { console.error('transient changed gate failure'); process.exit(1); }\"",
   });
+  const marker = targetValidationOutputPath("clawsweeper-validation-attempt");
   git(cwd, "add", ".");
   git(cwd, "commit", "-m", "initial");
   attachOrigin(cwd);
@@ -3903,14 +3930,11 @@ test("changed validation retries one transient check:changed failure", () => {
 });
 
 test("changed validation does not retry after its command budget is exhausted", () => {
-  const marker = path.join(
-    os.tmpdir(),
-    `clawsweeper-validation-budget-attempt-${process.pid}-${Date.now()}.txt`,
-  );
   const cwd = gitPackageFixture({
     "check:changed":
       "node -e \"const fs=require('fs'); const file=process.env.CLAWSWEEPER_TEST_ATTEMPT_FILE; const count=fs.existsSync(file)?Number(fs.readFileSync(file,'utf8')):0; fs.writeFileSync(file, String(count+1)); setTimeout(() => {}, 5000)\"",
   });
+  const marker = targetValidationOutputPath("clawsweeper-validation-budget-attempt");
   git(cwd, "add", ".");
   git(cwd, "commit", "-m", "initial");
   attachOrigin(cwd);
@@ -4006,24 +4030,189 @@ test("target validation strips credentials and trusted workflow ledger identity"
 test("required target validation isolation fails closed without its account contract", () => {
   const previous = {
     required: process.env.CLAWSWEEPER_TARGET_VALIDATION_ISOLATION_REQUIRED,
+    safeTestMode: process.env.CLAWSWEEPER_TARGET_VALIDATION_SAFE_TEST_MODE,
     user: process.env.CLAWSWEEPER_TARGET_VALIDATION_USER,
     home: process.env.CLAWSWEEPER_TARGET_VALIDATION_HOME,
   };
+  delete process.env.CLAWSWEEPER_TARGET_VALIDATION_SAFE_TEST_MODE;
   process.env.CLAWSWEEPER_TARGET_VALIDATION_ISOLATION_REQUIRED = "1";
   delete process.env.CLAWSWEEPER_TARGET_VALIDATION_USER;
   delete process.env.CLAWSWEEPER_TARGET_VALIDATION_HOME;
   try {
     assert.throws(
       () => targetValidationIsolationFromEnv(),
-      /requires both a user and isolated home/,
+      process.platform === "linux"
+        ? /requires both a user and isolated home/
+        : /supported only on Linux/,
     );
     assert.equal(targetValidationEnv().CLAWSWEEPER_TARGET_VALIDATION_ISOLATION_REQUIRED, undefined);
   } finally {
     restoreEnv("CLAWSWEEPER_TARGET_VALIDATION_ISOLATION_REQUIRED", previous.required);
+    restoreEnv("CLAWSWEEPER_TARGET_VALIDATION_SAFE_TEST_MODE", previous.safeTestMode);
     restoreEnv("CLAWSWEEPER_TARGET_VALIDATION_USER", previous.user);
     restoreEnv("CLAWSWEEPER_TARGET_VALIDATION_HOME", previous.home);
   }
 });
+
+test(
+  "macOS target validation fails closed without safe sandbox mode",
+  { skip: process.platform !== "darwin" },
+  () => {
+    const previous = {
+      safeTestMode: process.env.CLAWSWEEPER_TARGET_VALIDATION_SAFE_TEST_MODE,
+      home: process.env.CLAWSWEEPER_TARGET_VALIDATION_HOME,
+    };
+    delete process.env.CLAWSWEEPER_TARGET_VALIDATION_SAFE_TEST_MODE;
+    delete process.env.CLAWSWEEPER_TARGET_VALIDATION_HOME;
+    try {
+      assert.throws(
+        () =>
+          runTargetControlledCommand(process.execPath, ["-e", "process.exit(0)"], {
+            cwd: os.tmpdir(),
+            env: targetValidationEnv(),
+            isolateNetwork: true,
+            timeoutMs: 5_000,
+          }),
+        /require Linux user isolation or explicit safe macOS test mode/,
+      );
+    } finally {
+      restoreEnv("CLAWSWEEPER_TARGET_VALIDATION_SAFE_TEST_MODE", previous.safeTestMode);
+      restoreEnv("CLAWSWEEPER_TARGET_VALIDATION_HOME", previous.home);
+    }
+  },
+);
+
+test(
+  "safe macOS target validation rejects the host home as its isolated home",
+  { skip: process.platform !== "darwin" },
+  () => {
+    const previous = process.env.CLAWSWEEPER_TARGET_VALIDATION_HOME;
+    process.env.CLAWSWEEPER_TARGET_VALIDATION_HOME = os.homedir();
+    try {
+      assert.throws(
+        () => targetValidationIsolationFromEnv(),
+        /home must be isolated temporary storage/,
+      );
+    } finally {
+      restoreEnv("CLAWSWEEPER_TARGET_VALIDATION_HOME", previous);
+    }
+  },
+);
+
+test(
+  "safe macOS target validation cannot read Codex config or reach a host Responses proxy",
+  { skip: process.platform !== "darwin" },
+  () => {
+    const secretRoot = path.join(
+      os.homedir(),
+      ".codex",
+      `clawsweeper-isolation-probe-${process.pid}-${Date.now()}`,
+    );
+    const targetRoot = fs.realpathSync(
+      fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-macos-target-")),
+    );
+    const proxyRoot = fs.realpathSync(
+      fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-macos-proxy-")),
+    );
+    const portFile = path.join(proxyRoot, "port");
+    const forwardedFile = path.join(proxyRoot, "forwarded");
+    const proxyScript = path.join(proxyRoot, "proxy.mjs");
+    const targetScript = path.join(targetRoot, "attack.mjs");
+    const proxyEnvKeys = [
+      "HTTP_PROXY",
+      "HTTPS_PROXY",
+      "ALL_PROXY",
+      "NO_PROXY",
+      "npm_config_proxy",
+      "npm_config_https_proxy",
+      "npm_config_noproxy",
+      "npm_config_userconfig",
+    ];
+    const previousProxyEnv = Object.fromEntries(proxyEnvKeys.map((key) => [key, process.env[key]]));
+    let proxy;
+
+    fs.mkdirSync(secretRoot, { recursive: true });
+    for (const [name, value] of [
+      ["config.toml", 'base_url = "http://127.0.0.1:1/v1"\n'],
+      ["auth.json", '{"OPENAI_API_KEY":"secret"}\n'],
+      ["responses-proxy.json", '{"port":1,"pid":1}\n'],
+      [".npmrc", "//registry.npmjs.org/:_authToken=secret\n"],
+    ]) {
+      fs.writeFileSync(path.join(secretRoot, name), value);
+      fs.chmodSync(path.join(secretRoot, name), 0o600);
+    }
+    fs.writeFileSync(
+      proxyScript,
+      `import fs from "node:fs";
+import http from "node:http";
+const server = http.createServer((_request, response) => {
+  fs.writeFileSync(${JSON.stringify(forwardedFile)}, "reached");
+  response.end("ok");
+});
+server.listen(0, "127.0.0.1", () => {
+  fs.writeFileSync(${JSON.stringify(portFile)}, String(server.address().port));
+});
+`,
+    );
+
+    try {
+      proxy = spawn(process.execPath, [proxyScript], { stdio: "ignore" });
+      waitForFile(portFile, 5_000);
+      const port = fs.readFileSync(portFile, "utf8").trim();
+      for (const key of proxyEnvKeys.slice(0, -1)) {
+        process.env[key] = `http://secret@127.0.0.1:${port}`;
+      }
+      process.env.npm_config_userconfig = path.join(secretRoot, ".npmrc");
+      fs.writeFileSync(
+        targetScript,
+        `import fs from "node:fs";
+if (process.env.npm_config_manage_package_manager_versions !== "false") process.exit(40);
+if (process.env.npm_config_pm_on_fail !== "ignore") process.exit(40);
+if (process.env.npm_config_verify_deps_before_run !== "false") process.exit(40);
+if (process.env.npm_config_userconfig !== process.env.HOME + "/.npmrc") process.exit(40);
+for (const key of ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "npm_config_proxy", "npm_config_https_proxy", "npm_config_noproxy"]) {
+  if (process.env[key]) process.exit(40);
+}
+for (const file of ${JSON.stringify([
+          path.join(secretRoot, "config.toml"),
+          path.join(secretRoot, "auth.json"),
+          path.join(secretRoot, "responses-proxy.json"),
+          path.join(secretRoot, ".npmrc"),
+        ])}) {
+  try {
+    fs.readFileSync(file);
+    process.exit(41);
+  } catch (error) {
+    if (!["EACCES", "EPERM"].includes(error?.code)) process.exit(42);
+  }
+}
+try {
+  await fetch("http://127.0.0.1:${port}/v1/responses", {
+    signal: AbortSignal.timeout(1000),
+  });
+  process.exit(43);
+} catch {}
+`,
+      );
+
+      for (const isolateNetwork of [true, false]) {
+        runTargetControlledCommand(process.execPath, [targetScript], {
+          cwd: targetRoot,
+          env: targetValidationEnv(),
+          isolateNetwork,
+          timeoutMs: 15_000,
+        });
+      }
+      assert.equal(fs.existsSync(forwardedFile), false);
+    } finally {
+      proxy?.kill("SIGTERM");
+      for (const [key, value] of Object.entries(previousProxyEnv)) restoreEnv(key, value);
+      fs.rmSync(secretRoot, { recursive: true, force: true });
+      fs.rmSync(targetRoot, { recursive: true, force: true });
+      fs.rmSync(proxyRoot, { recursive: true, force: true });
+    }
+  },
+);
 
 test(
   "isolated target validation cannot read Codex config or reach a host Responses proxy",

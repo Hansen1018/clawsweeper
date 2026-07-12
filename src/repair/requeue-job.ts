@@ -33,6 +33,7 @@ import {
   deterministicRequeueDispatchKey,
   normalizedRequeueSourceJobPath,
 } from "./requeue-job-key.js";
+import { runDeadlineBoundRequeueDispatch } from "./requeue-dispatch.js";
 
 const DEFAULT_REPO = currentProjectRepo();
 const DEFAULT_WORKFLOW = REPAIR_CLUSTER_WORKFLOW;
@@ -175,16 +176,23 @@ const requeueLifecycle: CommandLifecycleInput = {
 let commandError: unknown = null;
 
 try {
-  dispatchJob(sourceJobPath, mode, dispatchKey, requeueLifecycle, {
-    schema_version: 2,
-    authority: requeueAuthority,
-    depth: nextRequeueDepth,
-    allow_execute: forwardedGates.allowExecute,
-    allow_fix_pr: forwardedGates.allowFixPr,
-    dispatch_key: dispatchKey,
-    job_path: sourceJobPath,
-    job_sha256: authorizationSha256,
-  });
+  dispatchJob(
+    sourceJobPath,
+    mode,
+    dispatchKey,
+    requeueLifecycle,
+    {
+      schema_version: 2,
+      authority: requeueAuthority,
+      depth: nextRequeueDepth,
+      allow_execute: forwardedGates.allowExecute,
+      allow_fix_pr: forwardedGates.allowFixPr,
+      dispatch_key: dispatchKey,
+      job_path: sourceJobPath,
+      job_sha256: authorizationSha256,
+    },
+    deadlineAtMs,
+  );
   recordCommandRequeue(requeueLifecycle, {
     dispatchKey,
     sourceJobPath,
@@ -287,8 +295,9 @@ function dispatchJob(
     job_path: string;
     job_sha256: string;
   },
+  deadlineAtMs: number,
 ) {
-  const result = runCommandLifecycleMutation(lifecycle, {
+  runCommandLifecycleMutation(lifecycle, {
     kind: "requeue_dispatch",
     identity: {
       repository: repo,
@@ -301,9 +310,8 @@ function dispatchJob(
     },
     component: "repair_requeue",
     operation: () =>
-      spawnSync(
-        "gh",
-        [
+      runDeadlineBoundRequeueDispatch({
+        args: [
           "workflow",
           "run",
           workflow,
@@ -330,13 +338,10 @@ function dispatchJob(
           "-f",
           `requeue_context=${Buffer.from(JSON.stringify(requeueContext)).toString("base64url")}`,
         ],
-        { cwd: repoRoot(), encoding: "utf8", stdio: "pipe" },
-      ),
-    outcome: (dispatch) => (dispatch.status === 0 && !dispatch.error ? "accepted" : "unknown"),
+        cwd: repoRoot(),
+        deadlineAtMs,
+      }),
   });
-  if (result.status !== 0) {
-    throw new Error(`failed to dispatch ${jobPath}: ${result.stderr || result.stdout}`);
-  }
 }
 
 function waitForStartedRuns({

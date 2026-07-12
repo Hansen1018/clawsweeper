@@ -5,6 +5,10 @@ inputs:
     description: ClawSweeper checkout path relative to the workspace.
     required: false
     default: "."
+  storage:
+    description: Store ledger state in runner temp or beneath the selected worktree.
+    required: false
+    default: runner-temp
 runs:
   using: composite
   steps:
@@ -22,17 +26,29 @@ runs:
           echo "Unable to resolve immutable workflow run creation time." >&2
           exit 1
         fi
-        worktree_root="$GITHUB_WORKSPACE"
-        if [ "${{ inputs.worktree-path }}" != "." ]; then
-          worktree_root="$worktree_root/${{ inputs.worktree-path }}"
+        storage="${{ inputs.storage }}"
+        ledger_root=""
+        if [ "$storage" = "worktree" ]; then
+          worktree_root="$GITHUB_WORKSPACE"
+          if [ "${{ inputs.worktree-path }}" != "." ]; then
+            worktree_root="$worktree_root/${{ inputs.worktree-path }}"
+          fi
+          worktree_root="$(cd "$worktree_root" && pwd -P)"
+          output_root="$worktree_root/.clawsweeper-repair/action-ledger-state"
+          ledger_root="$worktree_root"
+        elif [ "$storage" = "runner-temp" ]; then
+          output_root="$RUNNER_TEMP/clawsweeper-action-ledger/${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT}/${GITHUB_JOB}"
+        else
+          echo "Invalid action ledger storage mode: $storage" >&2
+          exit 1
         fi
-        worktree_root="$(cd "$worktree_root" && pwd -P)"
-        output_root="$RUNNER_TEMP/clawsweeper-action-ledger/${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT}/${GITHUB_JOB}"
         mkdir -p "$output_root"
         output_root="$(cd "$output_root" && pwd -P)"
         {
           echo "CLAWSWEEPER_ACTION_LEDGER_FORCE=1"
-          echo "CLAWSWEEPER_ACTION_LEDGER_ROOT=$worktree_root"
+          if [ -n "$ledger_root" ]; then
+            echo "CLAWSWEEPER_ACTION_LEDGER_ROOT=$ledger_root"
+          fi
           echo "CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT=$output_root"
           echo "GITHUB_RUN_STARTED_AT=$run_started_at"
         } >> "$GITHUB_ENV"

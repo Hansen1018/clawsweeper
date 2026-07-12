@@ -51,7 +51,8 @@ test("ledger-producing jobs initialize immutable workflow context", () => {
     action,
     /RUNNER_TEMP\/clawsweeper-action-ledger\/\$\{GITHUB_RUN_ID\}\/\$\{GITHUB_RUN_ATTEMPT\}\/\$\{GITHUB_JOB\}/,
   );
-  assert.match(action, /CLAWSWEEPER_ACTION_LEDGER_ROOT=\$worktree_root/);
+  assert.match(action, /storage:[\s\S]*default: runner-temp/);
+  assert.match(action, /if \[ "\$storage" = "worktree" \]/);
   assert.match(action, /CLAWSWEEPER_ACTION_LEDGER_FORCE=1/);
   assert.match(action, /CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT=\$output_root/);
   assert.match(action, /GITHUB_RUN_STARTED_AT=\$run_started_at/);

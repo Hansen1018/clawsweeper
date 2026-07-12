@@ -854,6 +854,10 @@ Token flow:
   trusted Codex config. Validation commands additionally run in a separate
   network namespace, so target code cannot reach host-local credential
   proxies.
+- Non-Linux target-controlled commands fail closed by default. macOS tests may
+  explicitly set `CLAWSWEEPER_TARGET_VALIDATION_SAFE_TEST_MODE=1` with a private
+  `CLAWSWEEPER_TARGET_VALIDATION_HOME`; those commands run under Seatbelt with
+  host Codex config/key reads and all network access denied.
 - A separate no-credential runner reconstructs the prepared commit in a
   disposable checkout and replays the original normalized staged-proof plan,
   including provenance, prerequisites, subsumption, and changed-gate

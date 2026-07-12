@@ -2530,10 +2530,7 @@ test("exact comment fast path converges terminal acknowledgement before own reac
   assert.match(reactionCleanup, /isOwnCommentReaction\(reaction, content\)/);
   assert.match(reactionCleanup, /reactions\/\$\{reaction\.id\}/);
   assert.match(reactionCleanup, /"--method",\s*"DELETE"/);
-  assert.match(
-    reactionCleanup,
-    /runTextCommandMutation\(\s*command,[\s\S]*"--method",\s*"DELETE"[\s\S]*\{ attempts: 1 \}/,
-  );
+  assert.match(reactionCleanup, /runTextCommandMutation\(\s*command,[\s\S]*"--method",\s*"DELETE"/);
   assert.match(reactionCleanup, /return "source_drift"/);
   assert.doesNotMatch(reactionCleanup, /\bghText\(/);
   assert.match(reactionCleanup, /isAllowedMutationActor\(login, DEFAULT_TRUSTED_BOTS\)/);
@@ -2611,7 +2608,6 @@ test("every durable command mutation uses the final source authorization guard",
     source.indexOf("function ensureAutomergeLabel"),
   );
   assert.match(reactionCleanup, /runTextCommandMutation\(/);
-  assert.match(reactionCleanup, /\{ attempts: 1 \}/);
   assert.match(reactionCleanup, /return "source_drift"/);
   assert.doesNotMatch(reactionCleanup, /\bghText\(/);
   assert.match(

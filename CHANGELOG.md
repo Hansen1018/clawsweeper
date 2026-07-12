@@ -150,12 +150,16 @@ checkpoint, and status-only commits are intentionally omitted.
   deauthorized work without GitHub side effects; scoped durable queue drains to
   one exact replay attempt while reloading state between rows; and preserved
   monotonic synthetic attempt identities beyond bounded ledger-history
-  eviction. Terminal reaction cleanup now uses the same immediate guard with no
-  mutation retry.
+  eviction. Every guarded GitHub mutation, including terminal reaction cleanup,
+  is now one-shot after its immediate source revalidation.
 - Isolated target-controlled repair setup and validation from trusted Codex
   credentials by using a dedicated account and private home, removing stale
   Responses proxy state before login-authenticated Codex work, and placing
-  validation commands in a host-disconnected network namespace.
+  validation commands in a host-disconnected network namespace. Non-Linux
+  execution now fails closed by default; explicit macOS test execution uses a
+  private-home Seatbelt profile that denies trusted Codex files and all network
+  access. Proxy shutdown also verifies the recorded PID, executable, and
+  listening port before sending a request or removing live metadata.
 - Preserved distinct durable repair-loop sweep attempts across ledger merges and
   state publication, while terminalizing edited or deleted staged comment
   versions before dispatch so stale content cannot consume capacity or execute.
@@ -182,7 +186,12 @@ checkpoint, and status-only commits are intentionally omitted.
   deterministic dispatch identities across ambiguous retries.
 - Raised staged-proof entry capacity above supported OpenClaw installs while
   retaining byte, depth, and deadline traversal bounds.
-- Bounded missing repair handoff retries, terminated deterministic handoff verification failures, removed repository-wide gate mutation from requeue, scoped router comment IDs per item, and bounded post-command proof snapshot verification.
+- Bounded missing repair handoff retries and the underlying workflow-dispatch
+  subprocess by the same absolute deadline, conservatively treating dispatch
+  timeouts as potentially accepted; terminated deterministic handoff
+  verification failures, removed repository-wide gate mutation from requeue,
+  scoped router comment IDs per item, and bounded post-command proof snapshot
+  verification.
 - Bounded every repair git helper subprocess while retaining the shorter configurable network timeout, ordinary nonzero and signal status semantics, platform-aware command launching, and explicit spawn-error reporting. Thanks @hex-AI12.
 - Waited for the exact dashboard Worker commit to reach the live health endpoint before running post-deploy smoke checks, preventing Cloudflare rollout propagation from producing false CI failures.
 - Separated review publication from apply/comment-sync concurrency so long

@@ -1257,6 +1257,7 @@ jobs:
       - uses: ./.github/actions/setup-action-ledger
         with:
           worktree-path: .clawsweeper-repair/trusted-proof-ledger
+          storage: worktree
 
       - name: Create and validate exact staged proof events
         env:

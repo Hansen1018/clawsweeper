@@ -352,7 +352,9 @@ test("proof lifecycle is created in an isolated trusted job before state credent
   assert.match(cli, /publishProofActionLedgerArtifact/);
 
   const setupAction = readText(".github/actions/setup-action-ledger/action.yml");
-  assert.match(setupAction, /CLAWSWEEPER_ACTION_LEDGER_ROOT=\$worktree_root/);
+  assert.match(setupAction, /ledger_root="\$worktree_root"/);
+  assert.match(setupAction, /CLAWSWEEPER_ACTION_LEDGER_ROOT=\$ledger_root/);
+  assert.match(publishBlock, /storage: worktree/);
 
   const targetValidation = readText("src/repair/target-validation.ts");
   assert.match(targetValidation, /key\.startsWith\("GITHUB_"\)/);
