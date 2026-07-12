@@ -9,6 +9,13 @@ checkpoint, and status-only commits are intentionally omitted.
 
 ### Added
 
+- Added provider-neutral Gitcrawl evidence intake for repair jobs, with
+  immutable local SQLite snapshots and Cloudflare query support, repository and
+  archive binding, operation-scoped coverage, parity checks, bounded canonical
+  evidence graphs, atomic generated-job publication, snapshot-bound cursors,
+  migration preflight, and immutable snapshot, query, and packet-binding action
+  receipts that exclude SQL, raw rows, payloads, prompts, logs, and cloud error
+  bodies from durable state.
 - Added versioned staged repair proof plans with deterministic cheap-to-expensive validation, behavioral profile-command staging, concrete-argv environment resolution and revalidation, structured package-manager option parsing, checkout immutability checks, retention of every allowlisted required command, exact-command deduplication, explicit-only non-live subsumption with digest provenance, fail-closed canonical-gate stalls and runtime budgets, topology-stable retry traces, and bounded machine-readable proof bound to the exact validated head/base after final or fallback history compaction. Thanks @vincentkoc.
 - Required every repair merge owner to verify a non-bypass GitHub App credential and server-enforced strict base-branch status checks from repository rulesets or classic protection before merging, using a fresh trusted finalizer with exact-repository mutation and administration verifier tokens while keeping Codex credentials administration-free.
 - Added a maintainer-only two-runner workflow that builds a hash-bound

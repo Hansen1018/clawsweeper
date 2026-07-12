@@ -286,20 +286,23 @@ The shared taxonomy defines six families:
    and binding phases.
 
 Review, apply, command-router, repair-session, issue-status, result-publication,
-and dashboard-publication lanes now emit this taxonomy. Repair receipts keep the
-logical work key and sealed repaired-source revision stable across retries;
-ClawSweeper's workflow checkout SHA is not target provenance. Workflow run and
-run attempt define the repair execution attempt; job, step, and invocation
-remain producer identity. Each process reconstructs the latest parent and phase
-sequence from the canonical local spool plus prior-job shard artifacts accepted
-by the same bounded path, shard, packing, and topology validator used for state
-imports. Queue, plan, and post-flight events therefore remain one monotonic
-chain without reusing a finalized producer. Session writes record both the
-optional operator-facing CrabFleet transition and the corresponding repair
-phase. GitHub status comments are receipted only after the mutation returns,
-while dashboard delivery records sent, skipped, and failed outcomes. Local
-result, aggregate apply-report, and dashboard writes use `completed`; their
-later immutable shard import is the durable publication boundary.
+dashboard-publication, and Gitcrawl intake lanes now emit this taxonomy.
+Gitcrawl cluster and low-signal importers record a snapshot event, digest-only
+query events, and a packet-binding event only after atomic job publication and
+before durable scan-cursor advancement. Repair receipts keep the logical work
+key and sealed repaired-source revision stable across retries; ClawSweeper's
+workflow checkout SHA is not target provenance. Workflow run and run attempt
+define the repair execution attempt; job, step, and invocation remain producer
+identity. Each process reconstructs the latest parent and phase sequence from
+the canonical local spool plus prior-job shard artifacts accepted by the same
+bounded path, shard, packing, and topology validator used for state imports.
+Queue, plan, and post-flight events therefore remain one monotonic chain without
+reusing a finalized producer. Session writes record both the optional
+operator-facing CrabFleet transition and the corresponding repair phase. GitHub
+status comments are receipted only after the mutation returns, while dashboard
+delivery records sent, skipped, and failed outcomes. Local result, aggregate
+apply-report, and dashboard writes use `completed`; their later immutable shard
+import is the durable publication boundary.
 
 Credential-isolated repair jobs never receive state-repository credentials just
 to publish receipts. Cluster and mutation jobs finalize local immutable shards

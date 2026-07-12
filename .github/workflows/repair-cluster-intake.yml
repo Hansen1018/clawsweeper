@@ -97,6 +97,10 @@ jobs:
         with:
           build-script: build:repair
 
+      - name: Setup Gitcrawl evidence action ledger
+        id: gitcrawl-action-ledger
+        uses: ./.github/actions/setup-action-ledger
+
       - name: Create state token
         id: state-token
         uses: ./.github/actions/create-state-token
@@ -253,6 +257,44 @@ jobs:
           };
           fs.writeFileSync(process.env.LEDGER_PATH, `${JSON.stringify(ledger, null, 2)}\n`);
           NODE
+
+      - name: Finalize Gitcrawl evidence action ledger
+        if: ${{ always() && steps.gitcrawl-action-ledger.outcome == 'success' }}
+        run: pnpm run --silent repair:action-ledger -- finalize
+
+      - name: Publish immutable Gitcrawl evidence action ledger
+        if: ${{ always() && steps.gitcrawl-action-ledger.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          test -n "${CLAWSWEEPER_STATE_DIR:-}"
+          source_root=".clawsweeper-repair/action-ledger-state"
+          if [ ! -d "$source_root/ledger" ]; then
+            echo "No Gitcrawl evidence action event shards were finalized."
+            exit 0
+          fi
+          event_paths_file=".artifacts/cluster-repair-intake/action-ledger-paths.txt"
+          mkdir -p "$(dirname "$event_paths_file")"
+          pnpm run --silent repair:action-ledger -- publish \
+            --source-root "$source_root" \
+            --state-root "$CLAWSWEEPER_STATE_DIR" |
+            jq -r '.paths[]?' |
+            sort -u > "$event_paths_file"
+          if [ ! -s "$event_paths_file" ]; then
+            echo "Gitcrawl evidence action event shards existed but no paths were imported." >&2
+            exit 1
+          fi
+          action_ledger_args=()
+          while IFS= read -r event_path; do
+            durable_event_path="$CLAWSWEEPER_STATE_DIR/$event_path"
+            test -f "$durable_event_path"
+            mkdir -p "$(dirname "$event_path")"
+            cp "$durable_event_path" "$event_path"
+            action_ledger_args+=(--path "$event_path")
+          done < "$event_paths_file"
+          pnpm run repair:publish-main -- \
+            --message "chore: append Gitcrawl evidence action ledger" \
+            "${action_ledger_args[@]}" \
+            --rebase-strategy normal
 
       - name: Publish intake jobs and ledger
         if: ${{ steps.prepare.outputs.should_import == 'true' }}
