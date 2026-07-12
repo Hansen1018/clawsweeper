@@ -2716,6 +2716,56 @@ test(
   },
 );
 
+test("staged proof charges tracked path bytes against the checkout hashing budget", () => {
+  const cwd = gitPackageFixture({ check: "node check.js" });
+  const nested = path.join(cwd, "tracked", "nested");
+  fs.mkdirSync(nested, { recursive: true });
+  fs.writeFileSync(path.join(nested, "zero-byte-proof-input.txt"), "");
+  git(cwd, "add", ".");
+  git(cwd, "commit", "-m", "add zero-byte tracked input");
+  attachOrigin(cwd);
+
+  const trackedPaths = git(cwd, "ls-files").split("\n").filter(Boolean);
+  const trackedContentBytes = trackedPaths.reduce((total, relativePath) => {
+    const stat = fs.lstatSync(path.join(cwd, relativePath));
+    return stat.isFile() ? total + stat.size : total;
+  }, 0);
+  const trackedPathBytes = trackedPaths.reduce(
+    (total, relativePath) => total + Buffer.byteLength(relativePath),
+    0,
+  );
+  const options = {
+    toolchain: {
+      packageManager: "pnpm",
+      baseValidationCommands: [],
+      changedGate: null,
+    },
+  };
+
+  assert.doesNotThrow(() =>
+    runStagedValidationProof(
+      ["git diff --check"],
+      cwd,
+      validationOptions("steipete/example", {
+        ...options,
+        proofInputMaxBytes: trackedContentBytes + trackedPathBytes,
+      }),
+    ),
+  );
+  assert.throws(
+    () =>
+      runStagedValidationProof(
+        ["git diff --check"],
+        cwd,
+        validationOptions("steipete/example", {
+          ...options,
+          proofInputMaxBytes: trackedContentBytes + trackedPathBytes - 1,
+        }),
+      ),
+    /tracked checkout hashing exceeded the supported byte budget/,
+  );
+});
+
 test("staged proof accepts an uninitialized gitlink bound by the parent index", () => {
   const { cwd, gitlinkPath } = uninitializedGitlinkFixture();
   const instrumentation = instrumentProofDirectory(gitlinkPath);
@@ -2986,7 +3036,7 @@ for (const mode of ["initial", "replay"]) {
 
 test("staged proof charges absent snapshot candidates to every traversal budget", () => {
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-absent-proof-inputs-"));
-  fs.writeFileSync(path.join(cwd, "tracked.txt"), "");
+  fs.writeFileSync(path.join(cwd, "a"), "");
   git(cwd, "init", "-b", "main");
   git(cwd, "config", "user.email", "clawsweeper@example.invalid");
   git(cwd, "config", "user.name", "ClawSweeper Test");

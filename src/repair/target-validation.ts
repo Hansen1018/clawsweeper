@@ -51,6 +51,8 @@ const DEFAULT_TARGET_VALIDATION_TIMEOUT_MS = 12 * 60 * 1000;
 export const DEFAULT_PROOF_INPUT_MAX_ENTRIES = 250_000;
 const DEFAULT_PROOF_INPUT_MAX_DEPTH = 64;
 const DEFAULT_PROOF_INPUT_MAX_BYTES = 512 * 1024 * 1024;
+const MIN_TRACKED_INDEX_OUTPUT_BYTES = 4 * 1024;
+const MAX_TRACKED_INDEX_OUTPUT_BYTES = 64 * 1024 * 1024;
 const MIN_VALIDATION_RETRY_BUDGET_MS = 1_000;
 const ABSENT_PROOF_INPUT = "<absent>";
 const PROTECTED_PROOF_INPUT_DIRECTORIES = new Set([
@@ -1470,16 +1472,13 @@ function trackedWorktreeSha256(cwd: string, limits: ProofInputLimits): string {
   const root = fs.realpathSync(cwd);
   const digest = crypto.createHash("sha256");
   const state: ProofTraversalState = { bytes: 0, entries: 0 };
-  const entries = run("git", ["ls-files", "--stage", "-z"], {
+  const output = boundedTrackedIndexOutput(
     cwd,
-    timeoutMs: proofHashingTimeoutMs(limits, "tracked index"),
-  })
-    .split("\0")
-    .filter(Boolean);
-  if (entries.length > limits.maxEntries) {
-    throw new Error("tracked checkout hashing exceeded the supported entry budget");
-  }
-  for (const entry of entries) {
+    ["ls-files", "--stage", "-z"],
+    limits,
+    "tracked index",
+  );
+  for (const entry of nullDelimitedEntries(output)) {
     const match = entry.match(/^([0-7]{6}) ([a-f0-9]{40,64}) ([0-3])\t([\s\S]+)$/);
     if (!match || match[3] !== "0") {
       throw new Error("staged proof requires an unambiguous tracked index");
@@ -1487,6 +1486,7 @@ function trackedWorktreeSha256(cwd: string, limits: ProofInputLimits): string {
     const [, mode, indexObject, , relativePath] = match;
     const depth = relativePath!.split("/").filter(Boolean).length;
     consumeProofHashingEntry(relativePath!, depth, state, limits);
+    consumeProofHashingBytes(relativePath!, Buffer.byteLength(relativePath!), state, limits);
     const absolutePath = path.resolve(root, ...relativePath!.split("/"));
     if (!isPathWithin(root, absolutePath)) {
       throw new Error(`tracked proof input escapes validation checkout: ${relativePath}`);
@@ -1789,23 +1789,64 @@ function assertProofHashingDeadline(limits: ProofInputLimits, logicalPath: strin
 }
 
 function assertNoHiddenTrackedIndexFlags(cwd: string, limits: ProofInputLimits) {
-  const entries = run("git", ["ls-files", "-v", "-z"], {
+  const output = boundedTrackedIndexOutput(
     cwd,
-    timeoutMs: proofHashingTimeoutMs(limits, "tracked index flags"),
-  })
-    .split("\0")
-    .filter(Boolean);
-  if (entries.length > limits.maxEntries) {
-    throw new Error("tracked checkout hashing exceeded the supported entry budget");
-  }
+    ["ls-files", "-v", "-z"],
+    limits,
+    "tracked index flags",
+  );
+  let entryCount = 0;
   assertProofHashingDeadline(limits, "tracked index flags");
-  for (const entry of entries) {
+  for (const entry of nullDelimitedEntries(output)) {
+    if (entryCount >= limits.maxEntries) {
+      throw new Error("tracked checkout hashing exceeded the supported entry budget");
+    }
+    entryCount += 1;
+    assertProofHashingDeadline(limits, "tracked index flags");
     const tag = entry[0] ?? "";
     if (tag === "S" || (/[A-Za-z]/.test(tag) && tag === tag.toLowerCase())) {
       throw new Error(
         `staged proof rejects hidden tracked index flags: ${entry.slice(2) || "unknown"}`,
       );
     }
+  }
+}
+
+function boundedTrackedIndexOutput(
+  cwd: string,
+  args: string[],
+  limits: ProofInputLimits,
+  logicalPath: string,
+) {
+  const configuredBytes =
+    Number.isSafeInteger(limits.maxBytes) && limits.maxBytes > 0 ? limits.maxBytes : 1;
+  const maxBuffer = Math.min(
+    MAX_TRACKED_INDEX_OUTPUT_BYTES,
+    Math.max(MIN_TRACKED_INDEX_OUTPUT_BYTES, configuredBytes),
+  );
+  try {
+    return run("git", args, {
+      cwd,
+      timeoutMs: proofHashingTimeoutMs(limits, logicalPath),
+      maxBuffer,
+    });
+  } catch (error) {
+    if (/ENOBUFS|maxBuffer/i.test(String((error as Error).message))) {
+      throw new Error(
+        `tracked checkout hashing exceeded the supported byte budget at ${logicalPath}`,
+        { cause: error },
+      );
+    }
+    throw error;
+  }
+}
+
+function* nullDelimitedEntries(output: string) {
+  let start = 0;
+  for (let index = 0; index <= output.length; index += 1) {
+    if (index < output.length && output[index] !== "\0") continue;
+    if (index > start) yield output.slice(start, index);
+    start = index + 1;
   }
 }
 

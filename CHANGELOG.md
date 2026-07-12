@@ -139,7 +139,8 @@ checkpoint, and status-only commits are intentionally omitted.
   they can reset bounded per-target attempt sequences and their high-water
   identity; retained issue-author read-only re-review authorization; bound
   requeues to exact job bytes; and kept lockfile restoration plus reproducible
-  frozen dependency setup within one shared repair deadline.
+  frozen dependency setup within one shared repair deadline while capping
+  tracked-index output and charging tracked path bytes to the proof budget.
 - Revalidated exact command comments and scheduled repair-loop authorization
   immediately before mutation, terminalizing edited, deleted, withdrawn, or
   deauthorized work without GitHub side effects; scoped durable queue drains to
