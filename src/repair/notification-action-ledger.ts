@@ -69,6 +69,24 @@ export function recordNotificationPhase(
   });
 }
 
+export function recordNotificationPhaseSafely(
+  input: NotificationLedgerInput,
+  phase: "planned" | "skipped" | "sent" | "failed",
+  reason: string = phase,
+  failureOutcome: NotificationMutationOutcome = "mutation_outcome_unknown",
+  report: (message: string) => void = console.error,
+): void {
+  try {
+    recordNotificationPhase(input, phase, reason, failureOutcome);
+  } catch (receiptError) {
+    report(
+      `[action-ledger] failed to record notification ${phase} after the primary failure: ${
+        receiptError instanceof Error ? receiptError.message : String(receiptError)
+      }`,
+    );
+  }
+}
+
 export async function deliverNotificationAttempt<T>(
   input: NotificationLedgerInput,
   options: {
@@ -102,7 +120,11 @@ export async function deliverNotification<T>(
     recordNotificationPhase(input, "sent");
     return result;
   } catch (error) {
-    recordNotificationPhase(input, "failed", error instanceof Error ? error.name : typeof error);
+    recordNotificationPhaseSafely(
+      input,
+      "failed",
+      error instanceof Error ? error.name : typeof error,
+    );
     throw error;
   }
 }

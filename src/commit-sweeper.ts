@@ -30,6 +30,7 @@ import {
   repositoryProfileFor,
 } from "./repository-profiles.js";
 import {
+  commitReviewLifecycleSucceeded,
   recordCommitArtifact,
   recordCommitLifecycleEvent,
   recordCommitWorkflowEvent,
@@ -726,13 +727,22 @@ function finishReviewCommand(args: Args): void {
   const targetRepo = argString(args, "target_repo", DEFAULT_TARGET_REPO);
   const sha = assertSha(argString(args, "commit_sha", ""));
   const lifecycle = commitLifecycle(targetRepo, sha);
-  if (argBool(args, "succeeded")) {
+  const reviewOutcome = argString(args, "review_outcome", "unknown");
+  const checkOutcome = argString(args, "check_outcome", "unknown");
+  const checksRequested = argBool(args, "checks_requested");
+  if (commitReviewLifecycleSucceeded({ reviewOutcome, checkOutcome, checksRequested })) {
     recordCommitWorkflowEvent(lifecycle, "completed");
   } else {
     recordCommitWorkflowEvent(
       lifecycle,
       "failed",
-      new Error(argString(args, "error_kind", "commit review workflow failed")),
+      new Error(
+        argString(
+          args,
+          "error_kind",
+          `review=${reviewOutcome},checks_requested=${checksRequested},check=${checkOutcome}`,
+        ),
+      ),
     );
   }
   recordCommitWorkflowEvent(lifecycle, "finalized");

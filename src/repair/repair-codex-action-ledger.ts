@@ -67,22 +67,43 @@ export function beginRepairCodexAction(
   },
 ) {
   const report = options.report ?? console.error;
+  const lifecycle = repairCodexLifecycle(input, options);
   let settled = false;
-  recordLifecycleSafely(input, options, "started", undefined, report);
+  recordLifecycleSafely(lifecycle, options, "started", undefined, report);
 
   return {
     complete(): void {
       if (settled) return;
       settled = true;
-      publishArtifactsSafely(input, options, report);
-      recordLifecycleSafely(input, options, "completed", undefined, report);
+      publishArtifactsSafely(lifecycle, options, report);
+      recordLifecycleSafely(lifecycle, options, "completed", undefined, report);
     },
     fail(error: unknown): void {
       if (settled) return;
       settled = true;
-      publishArtifactsSafely(input, options, report);
-      recordLifecycleSafely(input, options, "failed", error, report);
+      publishArtifactsSafely(lifecycle, options, report);
+      recordLifecycleSafely(lifecycle, options, "failed", error, report);
     },
+  };
+}
+
+function repairCodexLifecycle(
+  input: RepairLifecycleInput,
+  options: {
+    action: RepairCodexAction;
+    mode: string;
+    attempt: RepairCodexAttemptIdentity;
+  },
+): RepairLifecycleInput {
+  return {
+    ...input,
+    workKey: [
+      input.workKey,
+      "codex",
+      options.action,
+      options.mode,
+      repairCodexAttemptLabel(options.attempt),
+    ].join(":"),
   };
 }
 
@@ -122,11 +143,17 @@ function recordLifecycleSafely(
       state: phase,
       reviewMode: options.action,
       eventIdentity: {
+        action: options.action,
         mode: options.mode,
         attempt: options.attempt,
         ...(error === undefined
           ? {}
           : { errorKind: error instanceof Error ? error.name : typeof error }),
+      },
+      idempotencyIdentity: {
+        action: options.action,
+        mode: options.mode,
+        attempt: options.attempt,
       },
     });
   } catch (receiptError) {

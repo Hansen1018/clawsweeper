@@ -328,6 +328,90 @@ test("runClawSweeperEventNotifier retries events after dashboard ingest failures
   assert.match(report.actions[0].reason, /dashboard ingest returned 401/);
 });
 
+test("dashboard receipt failures preserve the delivery error and continue notifications", async () => {
+  const root = fs.realpathSync(
+    fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-events-dashboard-receipt-")),
+  );
+  fs.writeFileSync(
+    path.join(root, "repair-apply-report.json"),
+    `${JSON.stringify([
+      {
+        repo: "openclaw/openclaw",
+        target: "#456",
+        action: "close_duplicate",
+        status: "executed",
+        run_id: "987",
+        published_at: "2026-05-02T10:00:00Z",
+      },
+      {
+        repo: "openclaw/openclaw",
+        target: "#457",
+        action: "close_duplicate",
+        status: "executed",
+        run_id: "987",
+        published_at: "2026-05-02T10:01:00Z",
+      },
+    ])}\n`,
+  );
+  const outputRoot = path.join(root, "action-ledger-output");
+  fs.mkdirSync(outputRoot);
+  const previous = { ...process.env };
+  const originalConsoleError = console.error;
+  Object.assign(process.env, notificationWorkflowEnv(root, outputRoot));
+  const receiptErrors: string[] = [];
+  let dashboardCalls = 0;
+
+  try {
+    console.error = (message?: unknown) => {
+      receiptErrors.push(String(message));
+      if (receiptErrors.length === 2) {
+        process.env.GITHUB_REPOSITORY = "openclaw/clawsweeper";
+      }
+    };
+    const summary = await runClawSweeperEventNotifier(["--run-id", "987", "--write-report"], {
+      root,
+      fetch: async (input) => {
+        if (String(input).startsWith("https://status.example/")) {
+          dashboardCalls += 1;
+          if (dashboardCalls === 1) {
+            process.env.GITHUB_REPOSITORY = "invalid";
+            return new Response("primary dashboard failure", { status: 500 });
+          }
+          return new Response(JSON.stringify({ ok: true }), { status: 200 });
+        }
+        return new Response(JSON.stringify({ ok: true, runId: `hook-${dashboardCalls + 1}` }), {
+          status: 200,
+        });
+      },
+      now: () => new Date("2026-05-02T11:00:00Z"),
+      log: () => undefined,
+      env: {
+        CLAWSWEEPER_OPENCLAW_HOOK_URL: "https://claw.example/hooks",
+        CLAWSWEEPER_OPENCLAW_HOOK_TOKEN: "secret",
+        CLAWSWEEPER_DISCORD_TARGET: "channel:123",
+        CLAWSWEEPER_STATUS_INGEST_URL: "https://status.example/api/events",
+        CLAWSWEEPER_STATUS_INGEST_TOKEN: "status-secret",
+      },
+    });
+
+    assert.equal(receiptErrors.length, 2);
+    assert.match(receiptErrors[1] ?? "", /after the primary failure/);
+    assert.equal(summary.sent, 1);
+    assert.equal(summary.failed, 1);
+    const report = JSON.parse(
+      fs.readFileSync(path.join(root, "notifications/clawsweeper-event-report.json"), "utf8"),
+    );
+    assert.equal(report.actions.length, 2);
+    assert.equal(report.actions[0].status, "failed");
+    assert.match(report.actions[0].reason, /primary dashboard failure/);
+    assert.equal(report.actions[1].status, "sent");
+  } finally {
+    console.error = originalConsoleError;
+    restoreEnv(previous);
+    fs.rmSync(root, { force: true, recursive: true });
+  }
+});
+
 test("runClawSweeperEventNotifier covers skip, config, dry-run, and strict failure paths", async () => {
   const missingRoot = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-events-missing-"));
   const missing = await runClawSweeperEventNotifier([], {
@@ -392,3 +476,29 @@ test("runClawSweeperEventNotifier covers skip, config, dry-run, and strict failu
   assert.equal(failed.failed, 1);
   assert.equal(failed.exitCode, 1);
 });
+
+function notificationWorkflowEnv(root: string, outputRoot: string) {
+  return {
+    CLAWSWEEPER_ACTION_LEDGER_FORCE: "1",
+    CLAWSWEEPER_ACTION_LEDGER_ROOT: root,
+    CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT: outputRoot,
+    CLAWSWEEPER_ACTION_LEDGER_INVOCATION: "notification-receipt-test",
+    CLAWSWEEPER_ACTION_LEDGER_PARTITION_DATE: "2026-07-12",
+    GITHUB_ACTION: "notify",
+    GITHUB_JOB: "notification",
+    GITHUB_REPOSITORY: "openclaw/clawsweeper",
+    GITHUB_RUN_ATTEMPT: "1",
+    GITHUB_RUN_ID: "5252",
+    GITHUB_SHA: "a".repeat(40),
+    GITHUB_WORKFLOW: "notification",
+    GITHUB_WORKFLOW_REF:
+      "openclaw/clawsweeper/.github/workflows/github-activity.yml@refs/heads/main",
+  };
+}
+
+function restoreEnv(previous: NodeJS.ProcessEnv) {
+  for (const key of Object.keys(process.env)) {
+    if (!(key in previous)) delete process.env[key];
+  }
+  Object.assign(process.env, previous);
+}

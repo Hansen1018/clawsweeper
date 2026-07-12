@@ -137,17 +137,23 @@ confidential-identifier checks as every other durable machine-text field.
 - Every repair Codex subprocess that persists output (write preflight, edit,
   base reconcile, validation fix, `/review`, and review-fix) records a typed
   attempt lifecycle plus SHA-256 evidence for JSONL, stderr, and report
-  artifacts. Final and final-sync attempts use explicit variants rather than
-  coercing display labels back into numbers. A configured preflight skip is the
+  artifacts. The action mode and typed attempt bind operation, event, and
+  idempotency identity, so same-numbered actions cannot replay or collide.
+  Final and final-sync attempts use explicit variants rather than coercing
+  display labels back into numbers. A configured preflight skip is the
   deliberate exception: it launches no subprocess and creates no Codex output.
 - Commit-review matrix shards bind their producer invocation to the matrix
   commit SHA, so multi-leg artifact downloads retain one importable shard per
   commit. Review and optional check publication share one causal workflow
-  lifecycle, which finalizes only after the check outcome is known.
+  lifecycle, which finalizes only after the check outcome is known. When checks
+  are requested, skipped, failed, or cancelled publication cannot produce a
+  completed lifecycle.
 - Commit-check publication, OpenClaw-hook delivery, and status-dashboard
   delivery use separate request-boundary attempts and outcomes. Their workflow
   shards are finalized and imported into the state repository; GitHub artifact
-  upload is retention, not the durable audit boundary.
+  upload is retention, not the durable audit boundary. Failure-receipt writes
+  are best-effort after a notification delivery error, preserving the primary
+  error and allowing later notifications to continue.
 - Repository, producer SHA, workflow, job, run, attempt, and component all bind
   shard identity. They do not define the logical operation.
 - Workflow, step, invocation, and component identifiers keep a readable prefix

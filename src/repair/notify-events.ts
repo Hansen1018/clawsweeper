@@ -16,6 +16,7 @@ import {
 import {
   deliverNotificationAttempt,
   recordNotificationPhase,
+  recordNotificationPhaseSafely,
 } from "./notification-action-ledger.js";
 
 type EventSeverity = "info" | "warning" | "error";
@@ -407,7 +408,7 @@ export async function runClawSweeperEventNotifier(
         reportRow(event, "sent", `sent to OpenClaw hook; ${dashboardStatus}`, result.runId),
       );
     } catch (error) {
-      recordNotificationPhase(
+      recordNotificationPhaseSafely(
         eventNotificationLedgerInput(event),
         "failed",
         error instanceof Error ? error.name : typeof error,

@@ -490,18 +490,16 @@ jobs:
         env:
           REVIEW_OUTCOME: ${{ steps.review-commit.outcome }}
           CHECK_OUTCOME: ${{ steps.publish-commit-check.outcome }}
+          CHECKS_REQUESTED: ${{ needs.plan.outputs.create_checks }}
         run: |
           set -euo pipefail
-          succeeded=false
-          if [ "$REVIEW_OUTCOME" = "success" ] &&
-             { [ "$CHECK_OUTCOME" = "success" ] || [ "$CHECK_OUTCOME" = "skipped" ]; }; then
-            succeeded=true
-          fi
           node dist/commit-sweeper.js finish-review \
             --target-repo "${{ needs.plan.outputs.target_repo }}" \
             --commit-sha "${{ matrix.sha }}" \
-            --succeeded "$succeeded" \
-            --error-kind "review=$REVIEW_OUTCOME,check=$CHECK_OUTCOME"
+            --review-outcome "$REVIEW_OUTCOME" \
+            --check-outcome "$CHECK_OUTCOME" \
+            --checks-requested "$CHECKS_REQUESTED" \
+            --error-kind "review=$REVIEW_OUTCOME,checks_requested=$CHECKS_REQUESTED,check=$CHECK_OUTCOME"
 
       - name: Finalize commit review action ledger
         if: ${{ always() && steps.review-setup-pnpm.outcome == 'success' }}

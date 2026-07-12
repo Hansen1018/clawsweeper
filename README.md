@@ -130,12 +130,16 @@ outcomes remain accepted or unknown even when a later verification step fails.
 Every durable repair Codex action (write preflight, edit, base reconcile,
 validation fix, review, and review fix) and commit-review Codex run publishes a
 typed lifecycle plus digest-bound logs and reports to the immutable action
-ledger. A deliberately skipped write preflight launches no subprocess and
-therefore has no Codex artifacts to receipt. Commit-review matrix producers are
-isolated by commit SHA; the danger-full-access Codex step has no state-write
-credential, and check/state publication happens only after it. Commit-check,
-OpenClaw-hook, and status-dashboard deliveries each keep their own exact
-request-attempt outcome.
+ledger. Repair Codex operation, event, and idempotency identities include the
+action mode and typed attempt, so same-numbered edit, review, fix, preflight,
+validation, and reconciliation passes cannot replay each other. A deliberately
+skipped write preflight launches no subprocess and therefore has no Codex
+artifacts to receipt. Commit-review matrix producers are isolated by commit SHA;
+the danger-full-access Codex step has no state-write credential, and check/state
+publication happens only after it. A requested commit check must publish before
+the review lifecycle completes. Commit-check, OpenClaw-hook, and
+status-dashboard deliveries each keep their own exact request-attempt outcome,
+while a failed dashboard receipt cannot replace the underlying delivery error.
 
 Operators can create repair-only jobs for one author's blocked pull requests in
 one repository with `pnpm repair:pr-intake -- --repo owner/name --author login`,

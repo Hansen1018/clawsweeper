@@ -9,7 +9,40 @@ import {
   flushWorkflowActionEvents,
   importActionEventShards,
 } from "../dist/action-ledger-runtime.js";
-import { recordCommitWorkflowEvent, runCommitMutation } from "../dist/commit-action-ledger.js";
+import {
+  commitReviewLifecycleSucceeded,
+  recordCommitWorkflowEvent,
+  runCommitMutation,
+} from "../dist/commit-action-ledger.js";
+
+test("commit review terminal success requires requested check publication", () => {
+  assert.equal(
+    commitReviewLifecycleSucceeded({
+      reviewOutcome: "success",
+      checkOutcome: "skipped",
+      checksRequested: false,
+    }),
+    true,
+  );
+  for (const checkOutcome of ["skipped", "failure", "cancelled"]) {
+    assert.equal(
+      commitReviewLifecycleSucceeded({
+        reviewOutcome: "success",
+        checkOutcome,
+        checksRequested: true,
+      }),
+      false,
+    );
+  }
+  assert.equal(
+    commitReviewLifecycleSucceeded({
+      reviewOutcome: "success",
+      checkOutcome: "success",
+      checksRequested: true,
+    }),
+    true,
+  );
+});
 
 test("commit publication uncertainty is preserved by terminal workflow receipts", async () => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "commit-action-ledger-")));

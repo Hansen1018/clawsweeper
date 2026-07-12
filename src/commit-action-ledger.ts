@@ -20,6 +20,16 @@ export type CommitLifecycleInput = {
   sha: string;
 };
 
+export function commitReviewLifecycleSucceeded(options: {
+  reviewOutcome: string;
+  checkOutcome: string;
+  checksRequested: boolean;
+}): boolean {
+  const reviewOutcome = options.reviewOutcome.trim().toLowerCase();
+  const checkOutcome = options.checkOutcome.trim().toLowerCase();
+  return reviewOutcome === "success" && (!options.checksRequested || checkOutcome === "success");
+}
+
 type CommitLifecycleEvent = {
   type: string;
   status: ActionEventStatus;

@@ -219,6 +219,10 @@ test("commit review and notification workflows publish their operation receipts"
   assert.match(review, /--defer-workflow-completion/);
   assert.match(review, /--continue-workflow/);
   assert.match(review, /node dist\/commit-sweeper\.js finish-review/);
+  assert.match(review, /--review-outcome "\$REVIEW_OUTCOME"/);
+  assert.match(review, /--check-outcome "\$CHECK_OUTCOME"/);
+  assert.match(review, /--checks-requested "\$CHECKS_REQUESTED"/);
+  assert.doesNotMatch(review, /CHECK_OUTCOME" = "skipped"/);
   assert.doesNotMatch(review, /create-state-token|setup-state|CLAWSWEEPER_STATE_DIR/);
   assert.ok(
     review.indexOf("- name: Review commit") < review.indexOf("- name: Create target checks token"),

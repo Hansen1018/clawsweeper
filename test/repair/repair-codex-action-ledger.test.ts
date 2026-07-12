@@ -73,6 +73,59 @@ test("repair Codex attempt identities reject lossy numeric values", () => {
   );
 });
 
+test("same-attempt repair Codex actions keep distinct operation and receipt identities", async () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "repair-codex-actions-")));
+  const outputRoot = path.join(root, "output");
+  fs.mkdirSync(outputRoot);
+  const previous = { ...process.env };
+  Object.assign(process.env, workflowEnv(root, outputRoot));
+  const input = {
+    repository: "openclaw/openclaw",
+    workKey: "execute-fix:test",
+    sourceRevision: "b".repeat(40),
+  };
+  const actions = [
+    "repair_edit",
+    "repair_write_preflight",
+    "repair_base_reconcile",
+    "repair_review",
+    "repair_review_fix",
+    "repair_validation_fix",
+  ] as const;
+  const receiptErrors: string[] = [];
+
+  try {
+    for (const action of actions) {
+      beginRepairCodexAction(input, {
+        action,
+        mode: "repair",
+        attempt: repairCodexAttempt(1),
+        paths: {},
+        report: (message) => receiptErrors.push(message),
+      }).complete();
+    }
+    await flushRepairActionEvents();
+
+    assert.deepEqual(receiptErrors, []);
+    const events = readEvents(outputRoot);
+    assert.equal(events.length, actions.length * 2);
+    for (const action of actions) {
+      const actionEvents = events.filter((event) => event.attributes?.review_mode === action);
+      assert.deepEqual(
+        actionEvents.map((event) => event.event_type),
+        [ACTION_EVENT_TYPES.reviewStarted, ACTION_EVENT_TYPES.reviewCompleted],
+      );
+      assert.equal(new Set(actionEvents.map((event) => event.operation_id)).size, 1);
+      assert.equal(new Set(actionEvents.map((event) => event.idempotency_key_sha256)).size, 1);
+    }
+    assert.equal(new Set(events.map((event) => event.operation_id)).size, actions.length);
+    assert.equal(new Set(events.map((event) => event.idempotency_key_sha256)).size, actions.length);
+  } finally {
+    restoreEnv(previous);
+    fs.rmSync(root, { force: true, recursive: true });
+  }
+});
+
 function workflowEnv(root: string, outputRoot: string) {
   return {
     CLAWSWEEPER_ACTION_LEDGER_FORCE: "1",
