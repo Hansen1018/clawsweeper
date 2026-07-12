@@ -131,6 +131,8 @@ jobs:
       job_exists: ${{ steps.check_job.outputs.job_exists }}
       worker_artifact_id: ${{ steps.upload_worker.outputs.artifact-id }}
       worker_artifact_digest: ${{ steps.upload_worker.outputs.artifact-digest }}
+      action_ledger_artifact_id: ${{ steps.upload_action_ledger.outputs.artifact-id }}
+      action_ledger_artifact_digest: ${{ steps.upload_action_ledger.outputs.artifact-digest }}
       producer_attempt: ${{ steps.producer_attempt.outputs.value }}
     env:
       CLAWSWEEPER_ALLOWED_OWNER: ${{ vars.CLAWSWEEPER_ALLOWED_OWNER || 'openclaw' }}
@@ -274,10 +276,11 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-clawsweeper-codex-thread-${{ steps.codex_session.outputs.key }}-
 
-      - name: Register steerable Action session
+      - name: Register repair lifecycle and optional steerable Action session
         id: crabfleet_session
-        if: ${{ steps.check_job.outputs.job_exists == '1' && env.CLAWSWEEPER_STEERABLE_CODEX == '1' && !inputs.dry_run }}
+        if: ${{ steps.check_job.outputs.job_exists == '1' }}
         env:
+          CLAWSWEEPER_ACTION_SESSION_REMOTE: ${{ env.CLAWSWEEPER_STEERABLE_CODEX == '1' && !inputs.dry_run && '1' || '0' }}
           CLAWSWEEPER_CRABFLEET_SERVICE_TOKEN: ${{ secrets.CLAWSWEEPER_CRABFLEET_SERVICE_TOKEN }}
           CLAWSWEEPER_CRABFLEET_OWNER: ${{ vars.CLAWSWEEPER_CRABFLEET_OWNER }}
         run: pnpm run repair:action-session -- register "${{ inputs.job }}"
@@ -408,13 +411,14 @@ jobs:
         run: pnpm run --silent repair:action-ledger -- finalize
 
       - name: Upload cluster repair action ledger
+        id: upload_action_ledger
         if: ${{ always() && steps.cluster-setup-pnpm.outcome == 'success' }}
         uses: actions/upload-artifact@v7
         with:
           name: clawsweeper-repair-action-ledger-cluster-${{ github.run_id }}-${{ github.run_attempt }}
           path: .clawsweeper-repair/action-ledger-state/**
           include-hidden-files: true
-          if-no-files-found: ignore
+          if-no-files-found: error
           retention-days: 90
 
   authorize:
@@ -1259,6 +1263,7 @@ jobs:
       CLAWSWEEPER_CLOSE_SUPERSEDED_SOURCE_PRS: ${{ vars.CLAWSWEEPER_CLOSE_SUPERSEDED_SOURCE_PRS || '1' }}
       CLAWSWEEPER_STEERABLE_CODEX: ${{ vars.CLAWSWEEPER_STEERABLE_CODEX || '0' }}
       CLAWSWEEPER_CRABFLEET_URL: ${{ vars.CLAWSWEEPER_CRABFLEET_URL || 'https://crabfleet.openclaw.ai' }}
+      CLAWSWEEPER_ACTION_LEDGER_CAUSAL_ROOTS: ${{ github.workspace }}/.clawsweeper-repair/action-ledger-context
       OPENCLAW_LOCAL_CHECK: "0"
     steps:
       - uses: actions/checkout@v7
@@ -1275,6 +1280,28 @@ jobs:
           npm_config_ignore_scripts: "true"
         with:
           build-script: build:repair
+
+      - name: Resolve planning action ledger context
+        id: planning_action_ledger
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          pnpm run repair:resolve-run-artifact -- \
+            --repository "${{ github.repository }}" \
+            --run-id "${{ github.run_id }}" \
+            --current-attempt "${{ github.run_attempt }}" \
+            --prefix clawsweeper-repair-action-ledger-cluster \
+            --expected-artifact-id "${{ needs.cluster.outputs.action_ledger_artifact_id }}" \
+            --expected-artifact-digest "${{ needs.cluster.outputs.action_ledger_artifact_digest }}"
+
+      - name: Download planning action ledger context
+        uses: actions/download-artifact@v8
+        with:
+          artifact-ids: ${{ steps.planning_action_ledger.outputs.artifact_id }}
+          path: .clawsweeper-repair/action-ledger-context
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
 
       - name: Resolve sealed execution handoff producer
         id: execution_artifact
@@ -1335,13 +1362,14 @@ jobs:
         id: check_job
         run: echo "job_exists=1" >> "$GITHUB_OUTPUT"
 
-      - name: Resume steerable Action session
+      - name: Resume repair lifecycle and optional steerable Action session
         id: crabfleet_session
-        if: ${{ steps.check_job.outputs.job_exists == '1' && env.CLAWSWEEPER_STEERABLE_CODEX == '1' }}
+        if: ${{ steps.check_job.outputs.job_exists == '1' }}
         env:
+          CLAWSWEEPER_ACTION_SESSION_REMOTE: ${{ env.CLAWSWEEPER_STEERABLE_CODEX == '1' && '1' || '0' }}
           CLAWSWEEPER_CRABFLEET_SERVICE_TOKEN: ${{ secrets.CLAWSWEEPER_CRABFLEET_SERVICE_TOKEN }}
           CLAWSWEEPER_CRABFLEET_OWNER: ${{ vars.CLAWSWEEPER_CRABFLEET_OWNER }}
-        run: pnpm run repair:action-session -- register .clawsweeper-repair/execution/job.md
+        run: pnpm run repair:action-session -- register .clawsweeper-repair/execution/job.md --skip-repair-receipt
 
       - name: Create exact-repository mutation token
         id: target_post_flight_token
@@ -1812,17 +1840,69 @@ jobs:
         with:
           build-script: build:repair
 
+      - name: Resolve repair action ledger shards
+        id: repair-action-ledger-artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          rows="$(
+            gh api --paginate \
+              "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts?per_page=100" \
+              --jq '.artifacts[] | [.id, .name, .expired] | @tsv'
+          )"
+          artifact_ids=()
+          while IFS=$'\t' read -r artifact_id artifact_name expired; do
+            if [ -z "$artifact_id" ]; then
+              continue
+            fi
+            case "$artifact_name" in
+              "clawsweeper-repair-action-ledger-cluster-${GITHUB_RUN_ID}-"* | \
+              "clawsweeper-repair-action-ledger-mutate-${GITHUB_RUN_ID}-"*) ;;
+              *) continue ;;
+            esac
+            if [ "$expired" = "true" ]; then
+              echo "Repair action ledger artifact expired before publication: $artifact_name" >&2
+              exit 1
+            fi
+            artifact_attempt="${artifact_name##*-}"
+            if ! [[ "$artifact_attempt" =~ ^[1-9][0-9]*$ ]]; then
+              echo "Invalid repair action ledger artifact name: $artifact_name" >&2
+              exit 1
+            fi
+            if ! [[ "$artifact_id" =~ ^[1-9][0-9]*$ ]]; then
+              echo "Invalid repair action ledger artifact id: $artifact_id" >&2
+              exit 1
+            fi
+            artifact_ids+=("$artifact_id")
+          done <<< "$rows"
+          if [ "${#artifact_ids[@]}" -eq 0 ]; then
+            echo "has_artifacts=0" >> "$GITHUB_OUTPUT"
+            echo "::notice title=No repair action ledger artifacts::No repair receipt shards were produced by this workflow run."
+            exit 0
+          fi
+          if [ "${#artifact_ids[@]}" -gt 64 ]; then
+            echo "Repair action ledger artifact count exceeds the bounded publication limit." >&2
+            exit 1
+          fi
+          mapfile -t artifact_ids < <(printf '%s\n' "${artifact_ids[@]}" | sort -n -u)
+          artifact_ids_csv="$(IFS=,; printf '%s' "${artifact_ids[*]}")"
+          echo "artifact_ids=$artifact_ids_csv" >> "$GITHUB_OUTPUT"
+          echo "has_artifacts=1" >> "$GITHUB_OUTPUT"
+
       - name: Download repair action ledger shards
-        id: download-repair-action-ledger
-        continue-on-error: true
+        if: ${{ steps.repair-action-ledger-artifacts.outputs.has_artifacts == '1' }}
         uses: actions/download-artifact@v8
         with:
-          pattern: clawsweeper-repair-action-ledger-*
+          artifact-ids: ${{ steps.repair-action-ledger-artifacts.outputs.artifact_ids }}
           path: .clawsweeper-repair/action-ledger-download
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
           merge-multiple: true
 
       - name: Publish immutable repair action ledger
-        if: ${{ steps.download-repair-action-ledger.outcome == 'success' }}
+        if: ${{ steps.repair-action-ledger-artifacts.outputs.has_artifacts == '1' }}
         run: |
           set -euo pipefail
           test -n "${CLAWSWEEPER_STATE_DIR:-}"

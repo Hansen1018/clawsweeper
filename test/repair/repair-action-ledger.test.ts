@@ -61,6 +61,113 @@ test("repair receipts preserve operation and mutation identity across workflow r
   }
 });
 
+test("repair receipts reconstruct one causal chain across workflow processes and retry safely", async () => {
+  const queueRoot = fs.realpathSync(
+    fs.mkdtempSync(path.join(os.tmpdir(), "repair-action-ledger-queue-")),
+  );
+  const planRoot = fs.realpathSync(
+    fs.mkdtempSync(path.join(os.tmpdir(), "repair-action-ledger-plan-")),
+  );
+  const retryRoot = fs.realpathSync(
+    fs.mkdtempSync(path.join(os.tmpdir(), "repair-action-ledger-retry-")),
+  );
+  const queueOutput = path.join(queueRoot, "output");
+  const planOutput = path.join(planRoot, "output");
+  const retryOutput = path.join(retryRoot, "output");
+  for (const output of [queueOutput, planOutput, retryOutput]) fs.mkdirSync(output);
+  const previous = { ...process.env };
+  const lifecycle = {
+    repository: "openclaw/openclaw",
+    workKey: "openclaw/openclaw:repair-pr-42",
+    clusterId: "repair-pr-42",
+    number: 42,
+    sourceRevision: "source-head-42",
+  };
+
+  try {
+    Object.assign(process.env, workflowEnv(queueRoot, queueOutput), {
+      GITHUB_ACTION: "register_lifecycle",
+      CLAWSWEEPER_ACTION_LEDGER_INVOCATION: "queue",
+    });
+    recordRepairLifecycleEvent(lifecycle, {
+      type: ACTION_EVENT_TYPES.repairQueue,
+      status: ACTION_EVENT_STATUSES.queued,
+      reasonCode: ACTION_EVENT_REASON_CODES.accepted,
+      mutation: false,
+      component: "action_session",
+      state: "queued",
+      phase: "queue",
+    });
+    await flushRepairActionEvents();
+    const queue = readEvents(queueOutput)[0]!;
+
+    Object.assign(process.env, workflowEnv(planRoot, planOutput), {
+      GITHUB_ACTION: "record_planning_completion",
+      CLAWSWEEPER_ACTION_LEDGER_CAUSAL_ROOTS: queueOutput,
+      CLAWSWEEPER_ACTION_LEDGER_INVOCATION: "plan",
+    });
+    recordRepairLifecycleEvent(lifecycle, {
+      type: ACTION_EVENT_TYPES.repairPlan,
+      status: ACTION_EVENT_STATUSES.completed,
+      reasonCode: ACTION_EVENT_REASON_CODES.completed,
+      mutation: false,
+      component: "action_session",
+      state: "planned",
+      phase: "planned",
+    });
+    await flushRepairActionEvents();
+    const plan = readEvents(planOutput)[0]!;
+
+    assert.equal(plan.operation_id, queue.operation_id);
+    assert.equal(plan.attempt_id, queue.attempt_id);
+    assert.equal(queue.phase_seq, 1);
+    assert.equal(plan.phase_seq, 2);
+    assert.equal(plan.parent_event_id, queue.event_id);
+
+    recordRepairLifecycleEvent(lifecycle, {
+      type: ACTION_EVENT_TYPES.repairPlan,
+      status: ACTION_EVENT_STATUSES.completed,
+      reasonCode: ACTION_EVENT_REASON_CODES.completed,
+      mutation: false,
+      component: "action_session",
+      state: "planned",
+      phase: "planned",
+    });
+    await flushRepairActionEvents();
+    assert.equal(readEvents(planOutput).length, 1);
+
+    Object.assign(process.env, workflowEnv(retryRoot, retryOutput), {
+      GITHUB_ACTION: "register_lifecycle_retry",
+      GITHUB_RUN_ATTEMPT: "2",
+      CLAWSWEEPER_ACTION_LEDGER_CAUSAL_ROOTS: [queueOutput, planOutput].join(path.delimiter),
+      CLAWSWEEPER_ACTION_LEDGER_INVOCATION: "retry",
+    });
+    recordRepairLifecycleEvent(lifecycle, {
+      type: ACTION_EVENT_TYPES.repairQueue,
+      status: ACTION_EVENT_STATUSES.queued,
+      reasonCode: ACTION_EVENT_REASON_CODES.accepted,
+      mutation: false,
+      component: "action_session",
+      state: "queued",
+      phase: "queue",
+    });
+    await flushRepairActionEvents();
+    const retry = readEvents(retryOutput)[0]!;
+    assert.equal(retry.operation_id, queue.operation_id);
+    assert.notEqual(retry.attempt_id, queue.attempt_id);
+    assert.equal(retry.phase_seq, 1);
+    assert.equal(retry.parent_event_id, null);
+  } finally {
+    for (const key of Object.keys(process.env)) {
+      if (!(key in previous)) delete process.env[key];
+    }
+    Object.assign(process.env, previous);
+    for (const root of [queueRoot, planRoot, retryRoot]) {
+      fs.rmSync(root, { force: true, recursive: true });
+    }
+  }
+});
+
 function recordRepairAttempt() {
   const lifecycle = {
     repository: "openclaw/openclaw",

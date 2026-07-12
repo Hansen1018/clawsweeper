@@ -303,18 +303,25 @@ The shared taxonomy defines six families:
 
 Review, apply, command-router, repair-session, issue-status, result-publication,
 and dashboard-publication lanes now emit this taxonomy. Repair receipts keep the
-logical work key and source revision stable across retries while workflow run,
-attempt, job, step, and invocation define the execution attempt. Session writes
-record both the operator-facing CrabFleet transition and the corresponding
-repair phase. GitHub status comments are receipted only after the mutation
-returns, while dashboard delivery records sent, skipped, and failed outcomes.
-Local result, aggregate apply-report, and dashboard writes use `completed`;
-their later immutable shard import is the durable publication boundary.
+logical work key and source revision stable across retries. Workflow run and run
+attempt define the repair execution attempt; job, step, and invocation remain
+producer identity. Each process reconstructs the latest parent and phase
+sequence from the canonical local spool plus any exact prior-job shard artifact,
+so queue, plan, and post-flight events remain one monotonic chain without
+reusing a finalized producer. Session writes record both the optional
+operator-facing CrabFleet transition and the corresponding repair phase. GitHub
+status comments are receipted only after the mutation returns, while dashboard
+delivery records sent, skipped, and failed outcomes. Local result, aggregate
+apply-report, and dashboard writes use `completed`; their later immutable shard
+import is the durable publication boundary.
 
 Credential-isolated repair jobs never receive state-repository credentials just
 to publish receipts. Cluster and mutation jobs finalize local immutable shards
 and upload them as workflow artifacts. A dedicated state-authorized collector
-imports the bounded shard set and commits only the canonical ledger paths.
+lists the bounded matching artifact set, fails on discovery or download errors,
+imports the shards, and commits only the canonical ledger paths. The mutation
+job downloads the cluster shard by its trusted artifact ID and digest only as
+causal context. It does not receive state-repository credentials.
 Result and open-PR finalizer workflows already own state credentials, so they
 import and publish their own finalized shards directly. Additional lanes can
 migrate independently without changing the v1 shard format.
