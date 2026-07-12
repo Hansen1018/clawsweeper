@@ -2530,6 +2530,12 @@ test("exact comment fast path converges terminal acknowledgement before own reac
   assert.match(reactionCleanup, /isOwnCommentReaction\(reaction, content\)/);
   assert.match(reactionCleanup, /reactions\/\$\{reaction\.id\}/);
   assert.match(reactionCleanup, /"--method",\s*"DELETE"/);
+  assert.match(
+    reactionCleanup,
+    /runTextCommandMutation\(\s*command,[\s\S]*"--method",\s*"DELETE"[\s\S]*\{ attempts: 1 \}/,
+  );
+  assert.match(reactionCleanup, /return "source_drift"/);
+  assert.doesNotMatch(reactionCleanup, /\bghText\(/);
   assert.match(reactionCleanup, /isAllowedMutationActor\(login, DEFAULT_TRUSTED_BOTS\)/);
   assert.doesNotMatch(reactionCleanup, /isAllowedMutationActor\(login, trustedBots\)/);
 });
@@ -2599,6 +2605,28 @@ test("every durable command mutation uses the final source authorization guard",
   assert.ok(finalReadiness >= 0);
   assert.ok(finalAuthorization > finalReadiness);
   assert.ok(returnReady > finalAuthorization);
+
+  const reactionCleanup = source.slice(
+    source.indexOf("function removeOwnCommentReaction"),
+    source.indexOf("function ensureAutomergeLabel"),
+  );
+  assert.match(reactionCleanup, /runTextCommandMutation\(/);
+  assert.match(reactionCleanup, /\{ attempts: 1 \}/);
+  assert.match(reactionCleanup, /return "source_drift"/);
+  assert.doesNotMatch(reactionCleanup, /\bghText\(/);
+  assert.match(
+    wrappers,
+    /if \(blockCommandImmediatelyBeforeSideEffect\(command\)\) return false;\s*runGitHubTextMutation\(command/,
+  );
+  assert.match(reactionCleanup, /"reaction_delete"/);
+  assert.match(reactionCleanup, /githubNotFoundNoMutation/);
+  const guard = source.slice(
+    source.indexOf("function revalidateCommandImmediatelyBeforeMutation"),
+    source.indexOf("function terminalizeWithdrawnCommand"),
+  );
+  assert.match(guard, /DELETED_DURABLE_COMMENT_VERSION_REASON/);
+  assert.match(guard, /EDITED_DURABLE_COMMENT_VERSION_REASON/);
+  assert.match(guard, /command authorization was withdrawn before execution/);
 });
 
 test("command receipt gates let the oldest same-key run proceed when a newer duplicate is pending", () => {

@@ -150,7 +150,12 @@ checkpoint, and status-only commits are intentionally omitted.
   deauthorized work without GitHub side effects; scoped durable queue drains to
   one exact replay attempt while reloading state between rows; and preserved
   monotonic synthetic attempt identities beyond bounded ledger-history
-  eviction.
+  eviction. Terminal reaction cleanup now uses the same immediate guard with no
+  mutation retry.
+- Isolated target-controlled repair setup and validation from trusted Codex
+  credentials by using a dedicated account and private home, removing stale
+  Responses proxy state before login-authenticated Codex work, and placing
+  validation commands in a host-disconnected network namespace.
 - Preserved distinct durable repair-loop sweep attempts across ledger merges and
   state publication, while terminalizing edited or deleted staged comment
   versions before dispatch so stale content cannot consume capacity or execute.

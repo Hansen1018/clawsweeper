@@ -5892,24 +5892,28 @@ function removeOwnCommentReaction(command: LooseRecord, content: string) {
     if (!isOwnCommentReaction(reaction, content)) continue;
     matched = true;
     try {
-      runGitHubTextMutation(
-        command,
-        "reaction_delete",
-        {
-          repository: command.repo,
-          commentId: command.comment_id,
-          reactionId: reaction.id,
-          content,
-        },
-        [
-          "api",
-          `repos/${command.repo}/issues/comments/${command.comment_id}/reactions/${reaction.id}`,
-          "--method",
-          "DELETE",
-        ],
-        { attempts: 1 },
-        githubNotFoundNoMutation,
-      );
+      if (
+        !runTextCommandMutation(
+          command,
+          "reaction_delete",
+          {
+            repository: command.repo,
+            commentId: command.comment_id,
+            reactionId: reaction.id,
+            content,
+          },
+          [
+            "api",
+            `repos/${command.repo}/issues/comments/${command.comment_id}/reactions/${reaction.id}`,
+            "--method",
+            "DELETE",
+          ],
+          { attempts: 1 },
+          githubNotFoundNoMutation,
+        )
+      ) {
+        return "source_drift";
+      }
       removed = true;
     } catch (error) {
       const message = compactText(ghErrorText(error), 220);
