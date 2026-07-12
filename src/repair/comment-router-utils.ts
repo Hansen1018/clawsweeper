@@ -821,20 +821,21 @@ export function readLedger(file: JsonValue) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
       return { updated_at: null, attempt_sequences: {}, commands: [] };
     }
-    throw error;
+    throw new Error(
+      `existing comment router ledger is unreadable or malformed: ${error instanceof Error ? error.message : String(error)}`,
+      { cause: error },
+    );
   }
   let data: LooseRecord;
   try {
     data = JSON.parse(contents);
   } catch (error) {
-    throw new Error(`failed to parse comment router ledger: ${String(file)}`, { cause: error });
+    throw new Error(
+      `failed to parse comment router ledger: existing comment router ledger is unreadable or malformed: ${String(file)}`,
+      { cause: error },
+    );
   }
-  if (!data || typeof data !== "object" || Array.isArray(data)) {
-    throw new Error("comment router ledger must be an object");
-  }
-  if (!Array.isArray(data.commands)) {
-    throw new Error("comment router ledger commands must be an array");
-  }
+  assertCommentRouterLedgerShape(data);
   const attemptHighWater = normalizedRepairLoopAttemptHighWater(data.attempt_high_water);
   return {
     updated_at: data.updated_at ?? null,
@@ -842,6 +843,44 @@ export function readLedger(file: JsonValue) {
     attempt_sequences: normalizedRepairLoopAttemptSequences(data.attempt_sequences),
     commands: data.commands.map((entry: JsonValue) => validatedLedgerCommand(entry)),
   };
+}
+
+function assertCommentRouterLedgerShape(data: JsonValue): asserts data is LooseRecord {
+  if (!data || typeof data !== "object" || Array.isArray(data)) {
+    throw new Error("existing comment router ledger must be an object");
+  }
+  if (!Array.isArray(data.commands)) {
+    throw new Error("existing comment router ledger commands must be an array");
+  }
+  if (
+    data.attempt_high_water !== undefined &&
+    (typeof data.attempt_high_water !== "number" ||
+      !Number.isSafeInteger(data.attempt_high_water) ||
+      data.attempt_high_water < 0)
+  ) {
+    throw new Error(
+      "existing comment router ledger attempt_high_water must be a non-negative integer",
+    );
+  }
+  if (data.attempt_sequences === undefined) return;
+  if (
+    !data.attempt_sequences ||
+    typeof data.attempt_sequences !== "object" ||
+    Array.isArray(data.attempt_sequences)
+  ) {
+    throw new Error("existing comment router ledger attempt_sequences must be an object");
+  }
+  for (const [key, sequence] of Object.entries(data.attempt_sequences)) {
+    if (
+      !key.startsWith("repair-loop-label-sweep:") ||
+      key.length > 512 ||
+      typeof sequence !== "number" ||
+      !Number.isSafeInteger(sequence) ||
+      sequence <= 0
+    ) {
+      throw new Error("existing comment router ledger contains an invalid attempt sequence");
+    }
+  }
 }
 
 export function appendLedger(current: LooseRecord, entries: LooseRecord[]) {

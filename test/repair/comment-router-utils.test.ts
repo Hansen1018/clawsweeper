@@ -47,6 +47,50 @@ import { forcedReplayCommandFields, readCommentRouterConfig } from "../../dist/r
 
 const COMMENT_ROUTER_LEDGER_ENTRY_LIMIT = COMMENT_ROUTER_ATTEMPT_SEQUENCE_LIMIT;
 
+test("existing malformed ledgers fail closed instead of resetting durable attempt state", (t) => {
+  const root = fs.mkdtempSync(path.join(tmpdir(), "clawsweeper-ledger-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const missing = path.join(root, "missing.json");
+  const malformed = path.join(root, "malformed.json");
+  const invalidShape = path.join(root, "invalid-shape.json");
+  const invalidHighWater = path.join(root, "invalid-high-water.json");
+  const invalidSequence = path.join(root, "invalid-sequence.json");
+  const unreadable = path.join(root, "ledger-directory");
+
+  assert.deepEqual(readLedger(missing), {
+    updated_at: null,
+    attempt_sequences: {},
+    commands: [],
+  });
+
+  fs.writeFileSync(malformed, "{");
+  assert.throws(() => readLedger(malformed), /ledger is unreadable or malformed/);
+
+  fs.writeFileSync(invalidShape, JSON.stringify({ commands: {} }));
+  assert.throws(() => readLedger(invalidShape), /ledger commands must be an array/);
+
+  fs.writeFileSync(
+    invalidHighWater,
+    JSON.stringify({ attempt_high_water: "4", attempt_sequences: {}, commands: [] }),
+  );
+  assert.throws(() => readLedger(invalidHighWater), /attempt_high_water/);
+
+  fs.writeFileSync(
+    invalidSequence,
+    JSON.stringify({
+      attempt_high_water: 4,
+      attempt_sequences: {
+        "repair-loop-label-sweep:openclaw/openclaw:automerge:1": "5",
+      },
+      commands: [],
+    }),
+  );
+  assert.throws(() => readLedger(invalidSequence), /invalid attempt sequence/);
+
+  fs.mkdirSync(unreadable);
+  assert.throws(() => readLedger(unreadable), /ledger is unreadable or malformed/);
+});
+
 function routerLedgerEntry(index: number, status: "waiting" | "claimed" | "executed") {
   const commentId = String(index + 1);
   return {

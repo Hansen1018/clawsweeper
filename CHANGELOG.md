@@ -135,9 +135,9 @@ checkpoint, and status-only commits are intentionally omitted.
   receipt, lease, ruleset, permission, and withdrawal lookups before the final
   exact command snapshot, then fetching full live automerge readiness as the
   last read before every automerge label mutation and merge; preserved executed
-  attempts over skipped snapshots; bounded per-target attempt sequences behind
-  a durable high-water identity; retained issue-author read-only re-review
-  authorization; bound
+  attempts over skipped snapshots; rejected malformed durable ledgers before
+  they can reset bounded per-target attempt sequences and their high-water
+  identity; retained issue-author read-only re-review authorization; bound
   requeues to exact job bytes; and kept lockfile restoration plus reproducible
   frozen dependency setup within one shared repair deadline.
 - Revalidated exact command comments and scheduled repair-loop authorization
