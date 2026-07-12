@@ -1,7 +1,12 @@
 import type { JsonValue, LooseRecord } from "./json-types.js";
 import { DEFAULT_ALLOWED_REPOSITORY_PERMISSIONS } from "./comment-router-core.js";
 import { currentProjectRepo, readMaxLiveWorkers } from "./lib.js";
-import { assertRepo, commaSet, positiveInteger } from "./comment-router-utils.js";
+import {
+  assertRepo,
+  commaSet,
+  parseRepairLoopSweepCommandId,
+  positiveInteger,
+} from "./comment-router-utils.js";
 import { AUTOMATION_LIMITS } from "./limits.js";
 import {
   DEFAULT_HEAD_PREFIX,
@@ -41,7 +46,7 @@ export type CommentRouterConfig = {
   lookbackMinutes: number;
   since: string;
   itemNumbers: Set<number>;
-  commentIds: Set<number>;
+  commentIds: Set<string>;
   statusCommentId: number | null;
   allowedAssociations: Set<string>;
   allowedRepositoryPermissions: Set<string>;
@@ -173,7 +178,7 @@ export function readCommentRouterConfig(args: LooseRecord): CommentRouterConfig 
         .join(","),
       "item-numbers",
     ),
-    commentIds: numberSet(
+    commentIds: commentIdSet(
       [args["comment-id"], args["comment-ids"], process.env.CLAWSWEEPER_COMMENT_IDS]
         .filter((value) => value !== undefined && value !== null)
         .join(","),
@@ -263,4 +268,19 @@ function numberSet(value: JsonValue, name: string): Set<number> {
     numbers.add(number);
   }
   return numbers;
+}
+
+function commentIdSet(value: JsonValue, name: string): Set<string> {
+  const ids = new Set<string>();
+  for (const item of String(value ?? "").split(",")) {
+    const trimmed = item.trim().toLowerCase();
+    if (!trimmed) continue;
+    if (!/^[1-9]\d*$/.test(trimmed) && !parseRepairLoopSweepCommandId(trimmed)) {
+      throw new Error(
+        `invalid ${name}: expected positive integer or repair-loop sweep id, got ${trimmed}`,
+      );
+    }
+    ids.add(trimmed);
+  }
+  return ids;
 }

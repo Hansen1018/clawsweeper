@@ -635,6 +635,10 @@ test("exact router dispatch concurrency is item-specific and cannot replace anot
   assert.match(fanout, /since="\$\{\{ github\.event\.client_payload\.since \|\| '' \}\}"/);
   assert.match(fanout, /group_by\(\.issue_number\)/);
   assert.match(fanout, /\.\[\]\.comment_id.*test\("\^\[0-9\]\+\$"\)/s);
+  assert.match(
+    fanout,
+    /test\("\^repair-loop-label-sweep:\(autofix\|automerge\):\[1-9\]\[0-9\]\*\$"\)/,
+  );
   assert.match(fanout, /read -r item_number item_comment_ids/);
   assert.match(fanout, /if \[ -n "\$item_comment_ids" \][\s\S]*comment_ids=\$item_comment_ids/);
   assert.doesNotMatch(fanout, /comment_ids="\$comment_ids"/);

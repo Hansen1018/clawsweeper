@@ -17,6 +17,7 @@ import {
   isGitHubAppIntegrationAuthError,
   isAllowedMutationActor,
   normalizeGitHubActor,
+  parseRepairLoopSweepCommandId,
   readLedger,
   routerDispatchReceiptKey,
   selectCommentsForRouting,
@@ -236,6 +237,28 @@ test("synthetic dispatch claims retain a stable idempotency lookup across router
     first.filter((key) => replay.includes(key)),
     [`idempotency:${idempotencyKey}`],
   );
+});
+
+test("synthetic repair-loop command ids parse only exact positive item targets", () => {
+  assert.deepEqual(parseRepairLoopSweepCommandId("repair-loop-label-sweep:AUTOMERGE:74499"), {
+    intent: "automerge",
+    number: 74499,
+    commentId: "repair-loop-label-sweep:automerge:74499",
+  });
+  assert.deepEqual(parseRepairLoopSweepCommandId("repair-loop-label-sweep:autofix:1"), {
+    intent: "autofix",
+    number: 1,
+    commentId: "repair-loop-label-sweep:autofix:1",
+  });
+  for (const invalid of [
+    "repair-loop-label-sweep:automerge:0",
+    "repair-loop-label-sweep:autofix:-1",
+    "repair-loop-label-sweep:review:74499",
+    "repair-loop-label-sweep:automerge:74499:extra",
+    "74499",
+  ]) {
+    assert.equal(parseRepairLoopSweepCommandId(invalid), null);
+  }
 });
 
 test("synthetic dispatch receipt material is stable within an attempt and changes next attempt", () => {

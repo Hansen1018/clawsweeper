@@ -99,6 +99,7 @@ import {
   issueNumberFromUrl,
   isAllowedMutationActor,
   isGitHubAppIntegrationAuthError,
+  parseRepairLoopSweepCommandId,
   readLedger,
   routerDispatchReceiptKey,
   selectCommentsForRouting,
@@ -4157,6 +4158,7 @@ function listCandidateComments() {
   if (commentIds.size > 0) {
     return selectCommentsForRouting({
       recentComments: [...commentIds]
+        .filter((commentId) => /^[1-9]\d*$/.test(commentId))
         .map((commentId) => fetchIssueComment(commentId))
         .filter((comment) => comment !== null),
       durableComments: [],
@@ -4205,7 +4207,10 @@ function listRepairLoopReviewComments() {
 }
 
 function listRepairLoopSweepCommands(existingCommands: LooseRecord[]) {
-  if (itemNumbers.size > 0 || commentIds.size > 0) return [];
+  const requestedSweeps = [...commentIds]
+    .map((commentId) => parseRepairLoopSweepCommandId(commentId))
+    .filter((command) => command !== null);
+  if ((itemNumbers.size > 0 || commentIds.size > 0) && requestedSweeps.length === 0) return [];
   const paused = new Set(
     existingCommands
       .filter(isReadyHumanReviewPause)
@@ -4218,6 +4223,16 @@ function listRepairLoopSweepCommands(existingCommands: LooseRecord[]) {
       .map((command) => `${command.intent}:${Number(command.issue_number)}`),
   );
   const commands: LooseRecord[] = [];
+  if (requestedSweeps.length > 0) {
+    for (const { intent, number } of requestedSweeps) {
+      if (itemNumbers.size > 0 && !itemNumbers.has(number)) continue;
+      const key = `${intent}:${number}`;
+      if (seen.has(key) || paused.has(number)) continue;
+      seen.add(key);
+      commands.push(repairLoopSweepCommand(intent, number));
+    }
+    return commands;
+  }
   for (const [intent, label] of [
     ["autofix", AUTOFIX_LABEL],
     ["automerge", AUTOMERGE_LABEL],
@@ -4226,31 +4241,35 @@ function listRepairLoopSweepCommands(existingCommands: LooseRecord[]) {
       const key = `${intent}:${number}`;
       if (seen.has(key) || paused.has(number)) continue;
       seen.add(key);
-      commands.push({
-        idempotency_key: `repair-loop-label-sweep:${targetRepo}:${intent}:${number}`,
-        comment_id: `repair-loop-label-sweep:${intent}:${number}`,
-        comment_version_key: null,
-        comment_url: `https://github.com/${targetRepo}/pull/${number}`,
-        repo: targetRepo,
-        issue_number: number,
-        author: "clawsweeper[bot]",
-        author_association: "NONE",
-        comment_created_at: new Date(startedAtMs).toISOString(),
-        comment_updated_at: new Date(startedAtMs).toISOString(),
-        trigger: "trusted_bot",
-        command: intent,
-        intent,
-        trusted_bot: true,
-        trusted_bot_author: "clawsweeper[bot]",
-        automation_source: "repair_loop_label_sweep",
-        repair_reason: "scheduled ClawSweeper repair-loop label sweep",
-        ...forcedReplayCommandFields({ forceReprocess, attemptId }),
-        status: "pending",
-        actions: [],
-      });
+      commands.push(repairLoopSweepCommand(intent, number));
     }
   }
   return commands;
+}
+
+function repairLoopSweepCommand(intent: "autofix" | "automerge", number: number): LooseRecord {
+  return {
+    idempotency_key: `repair-loop-label-sweep:${targetRepo}:${intent}:${number}`,
+    comment_id: `repair-loop-label-sweep:${intent}:${number}`,
+    comment_version_key: null,
+    comment_url: `https://github.com/${targetRepo}/pull/${number}`,
+    repo: targetRepo,
+    issue_number: number,
+    author: "clawsweeper[bot]",
+    author_association: "NONE",
+    comment_created_at: new Date(startedAtMs).toISOString(),
+    comment_updated_at: new Date(startedAtMs).toISOString(),
+    trigger: "trusted_bot",
+    command: intent,
+    intent,
+    trusted_bot: true,
+    trusted_bot_author: "clawsweeper[bot]",
+    automation_source: "repair_loop_label_sweep",
+    repair_reason: "scheduled ClawSweeper repair-loop label sweep",
+    ...forcedReplayCommandFields({ forceReprocess, attemptId }),
+    status: "pending",
+    actions: [],
+  };
 }
 
 function fetchIssueComment(commentId: JsonValue): LooseRecord | null {

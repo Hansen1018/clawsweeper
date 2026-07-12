@@ -1509,6 +1509,19 @@ test("router classifies fresh human-review pauses before label sweeps", () => {
   assert.match(source, /\.filter\(isReadyHumanReviewPause\)/);
 });
 
+test("exact synthetic label sweeps bypass GitHub comment lookup and recreate the command", () => {
+  const source = readFileSync("src/repair/comment-router.ts", "utf8");
+
+  assert.match(
+    source,
+    /\[\.\.\.commentIds\][\s\S]*filter\(\(commentId\) => \/\^\[1-9\]\\d\*\$\/\.test\(commentId\)\)[\s\S]*fetchIssueComment/,
+  );
+  assert.match(
+    source,
+    /requestedSweeps = \[\.\.\.commentIds\][\s\S]*parseRepairLoopSweepCommandId[\s\S]*repairLoopSweepCommand\(intent, number\)/,
+  );
+});
+
 test("label sweeps honor fresh trusted exact-head review start leases", () => {
   const headSha = "0123456789abcdef0123456789abcdef01234567";
   const comment = {

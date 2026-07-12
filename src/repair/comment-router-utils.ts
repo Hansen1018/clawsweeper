@@ -745,6 +745,23 @@ export function commaSet(value: JsonValue) {
   );
 }
 
+export function parseRepairLoopSweepCommandId(value: JsonValue) {
+  const match = /^repair-loop-label-sweep:(autofix|automerge):([1-9]\d*)$/.exec(
+    String(value ?? "")
+      .trim()
+      .toLowerCase(),
+  );
+  if (!match) return null;
+  const number = Number(match[2]);
+  if (!Number.isSafeInteger(number)) return null;
+  const intent = match[1] as "autofix" | "automerge";
+  return {
+    intent,
+    number,
+    commentId: `repair-loop-label-sweep:${intent}:${number}`,
+  };
+}
+
 export function stripAnsi(text: string) {
   return String(text ?? "").replace(
     new RegExp(`${String.fromCharCode(27)}\\[[0-?]*[ -/]*[@-~]`, "g"),

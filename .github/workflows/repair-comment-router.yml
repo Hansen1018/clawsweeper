@@ -51,7 +51,7 @@ on:
         default: ""
         type: string
       comment_ids:
-        description: "Optional comma-separated issue comment ids to route directly"
+        description: "Optional comma-separated issue comment or synthetic repair-loop ids to route directly"
         required: false
         default: ""
         type: string
@@ -389,7 +389,14 @@ jobs:
             | group_by(.issue_number)[]
             | [
                 .[0].issue_number,
-                ([.[].comment_id | strings | select(test("^[0-9]+$"))] | unique | join(","))
+                ([
+                  .[].comment_id
+                  | strings
+                  | select(
+                      test("^[0-9]+$") or
+                      test("^repair-loop-label-sweep:(autofix|automerge):[1-9][0-9]*$")
+                    )
+                ] | unique | join(","))
               ]
             | @tsv
           ' results/comment-router-latest.json | while IFS=$'\t' read -r item_number item_comment_ids; do

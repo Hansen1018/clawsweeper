@@ -92,3 +92,24 @@ test("comment router config rejects unscoped or invalid replay attempts", () => 
     /non-empty token/,
   );
 });
+
+test("comment router config accepts only numeric or exact repair-loop command ids", () => {
+  const config = readCommentRouterConfig({
+    repo: "openclaw/example",
+    "repair-repo": "openclaw/clawsweeper",
+    "review-repo": "openclaw/clawsweeper",
+    "comment-ids": "123,repair-loop-label-sweep:AUTOMERGE:74499",
+  });
+
+  assert.deepEqual(config.commentIds, new Set(["123", "repair-loop-label-sweep:automerge:74499"]));
+  assert.throws(
+    () =>
+      readCommentRouterConfig({
+        repo: "openclaw/example",
+        "repair-repo": "openclaw/clawsweeper",
+        "review-repo": "openclaw/clawsweeper",
+        "comment-ids": "repair-loop-label-sweep:review:74499",
+      }),
+    /expected positive integer or repair-loop sweep id/,
+  );
+});
