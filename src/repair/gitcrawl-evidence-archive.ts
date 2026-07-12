@@ -111,22 +111,22 @@ function createPinnedSourceAnchor(
     path.dirname(source),
     `.${path.basename(source)}.archive-${crypto.randomUUID()}`,
   );
-  archiveTestHooks.beforeSourceAnchorLink?.({ source, anchor });
-  fs.linkSync(source, anchor);
   let descriptor: number | undefined;
   try {
+    descriptor = fs.openSync(source, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+    const pinned = fs.fstatSync(descriptor);
+    if (!pinned.isFile() || !sameFileIdentity(sourceStat, pinned)) {
+      throw new Error(`Gitcrawl evidence ${mode} source changed before anchoring: ${source}`);
+    }
+    archiveTestHooks.beforeSourceAnchorLink?.({ source, anchor });
+    fs.linkSync(source, anchor);
     const anchorStat = fs.lstatSync(anchor);
     if (
       !anchorStat.isFile() ||
       anchorStat.isSymbolicLink() ||
-      !sameInodeIdentity(sourceStat, anchorStat)
+      !sameFileIdentity(pinned, anchorStat)
     ) {
       throw new Error(`Gitcrawl evidence ${mode} source changed before anchoring: ${source}`);
-    }
-    descriptor = fs.openSync(anchor, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
-    const pinned = fs.fstatSync(descriptor);
-    if (!sameInodeIdentity(anchorStat, pinned)) {
-      throw new Error(`Gitcrawl evidence ${mode} source anchor changed before transfer: ${source}`);
     }
     return { path: anchor, descriptor, stat: pinned };
   } catch (error) {
