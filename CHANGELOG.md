@@ -84,6 +84,10 @@ checkpoint, and status-only commits are intentionally omitted.
   the setup-provided action-ledger output root to the state repository. Each
   command lane binds publication to a canonical, run-scoped finalized-shard
   manifest and rejects any missing producer path before state import.
+- Published independent staged-proof creation and receipt binding as immutable
+  `proof.stage` and `proof.binding` action-ledger events, preserving command
+  dispatch, source, authorization, repair action, plan, proof, head/base, and
+  validation-receipt identities before token-bearing mutation can continue.
 - Short-circuited authenticated duplicate comment deliveries when their exact
   body version is already terminal in the durable router ledger, while edited,
   retryable, and state-drifted commands retain the full routing path.

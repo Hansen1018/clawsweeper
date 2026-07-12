@@ -1035,7 +1035,10 @@ jobs:
       artifact_id: ${{ needs.authorize.outputs.recovery_validation_artifact_id || steps.upload.outputs.artifact-id }}
       artifact_digest: ${{ needs.authorize.outputs.recovery_validation_artifact_digest || steps.upload.outputs.artifact-digest }}
       producer_attempt: ${{ needs.authorize.outputs.checkpoint_recovered == '1' && needs.authorize.outputs.producer_attempt || steps.producer_attempt.outputs.value }}
+      action_ledger_artifact_id: ${{ steps.upload_action_ledger.outputs.artifact-id }}
+      action_ledger_artifact_digest: ${{ steps.upload_action_ledger.outputs.artifact-digest }}
     env:
+      CLAWSWEEPER_ACTION_LEDGER_DISPATCH_KEY: ${{ inputs.dispatch_key }}
       OPENCLAW_LOCAL_CHECK: "0"
     steps:
       - name: Record producer attempt
@@ -1048,7 +1051,10 @@ jobs:
           filter: blob:none
           persist-credentials: false
 
+      - uses: ./.github/actions/setup-action-ledger
+
       - uses: ./.github/actions/setup-pnpm
+        id: validate_setup_pnpm
         env:
           npm_config_ignore_scripts: "true"
         with:
@@ -1139,6 +1145,111 @@ jobs:
           path: .clawsweeper-repair/validation/receipt.json
           if-no-files-found: error
           retention-days: 90
+
+      - name: Finalize independent staged proof action ledger
+        id: finalize_action_ledger
+        if: ${{ always() && steps.validate_setup_pnpm.outcome == 'success' }}
+        run: pnpm run --silent repair:action-ledger -- finalize
+
+      - name: Upload independent staged proof action ledger
+        id: upload_action_ledger
+        if: ${{ always() && needs.authorize.outputs.checkpoint_recovered != '1' && steps.finalize_action_ledger.outcome == 'success' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: clawsweeper-repair-proof-events-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .clawsweeper-repair/action-ledger-state/**
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+
+  publish-proof-action-ledger:
+    name: Publish immutable staged proof action ledger
+    needs:
+      - validate
+    if: ${{ always() && needs.validate.outputs.action_ledger_artifact_id != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          filter: blob:none
+          persist-credentials: false
+
+      - name: Create proof ledger state token
+        id: state-token
+        uses: ./.github/actions/create-state-token
+        with:
+          client-id: ${{ env.CLAWSWEEPER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
+
+      - uses: ./.github/actions/setup-state
+        with:
+          token: ${{ steps.state-token.outputs.token }}
+          fetch-depth: 1
+
+      - uses: ./.github/actions/setup-pnpm
+        with:
+          build-script: build:repair
+
+      - name: Resolve independent staged proof action ledger producer
+        id: proof_action_ledger_artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CLAWSWEEPER_ALLOW_PRIOR_ARTIFACT: ${{ needs.validate.outputs.producer_attempt != '' && needs.validate.outputs.producer_attempt != github.run_attempt && '1' || '0' }}
+        run: |
+          pnpm run repair:resolve-run-artifact -- \
+            --repository "${{ github.repository }}" \
+            --run-id "${{ github.run_id }}" \
+            --current-attempt "${{ github.run_attempt }}" \
+            --prefix clawsweeper-repair-proof-events \
+            --expected-artifact-id "${{ needs.validate.outputs.action_ledger_artifact_id }}" \
+            --expected-artifact-digest "${{ needs.validate.outputs.action_ledger_artifact_digest }}"
+
+      - name: Download independent staged proof action ledger
+        uses: actions/download-artifact@v8
+        with:
+          artifact-ids: ${{ steps.proof_action_ledger_artifact.outputs.artifact_id }}
+          path: .clawsweeper-repair/action-ledger-proof
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+
+      - name: Publish independent staged proof action events
+        run: |
+          set -euo pipefail
+          test -n "${CLAWSWEEPER_STATE_DIR:-}"
+          source_root=".clawsweeper-repair/action-ledger-proof"
+          if [ ! -d "$source_root/ledger" ]; then
+            echo "The uploaded staged proof artifact did not contain action event shards." >&2
+            exit 1
+          fi
+          event_paths_file=".artifacts/staged-proof-action-ledger-paths.txt"
+          mkdir -p .artifacts
+          pnpm run --silent repair:action-ledger -- publish \
+            --source-root "$source_root" \
+            --state-root "$CLAWSWEEPER_STATE_DIR" |
+            jq -r '.paths[]?' |
+            sort -u > "$event_paths_file"
+          if [ ! -s "$event_paths_file" ]; then
+            echo "Staged proof action event shards existed but no paths were imported." >&2
+            exit 1
+          fi
+          action_ledger_args=()
+          while IFS= read -r event_path; do
+            durable_event_path="$CLAWSWEEPER_STATE_DIR/$event_path"
+            test -f "$durable_event_path"
+            mkdir -p "$(dirname "$event_path")"
+            cp "$durable_event_path" "$event_path"
+            action_ledger_args+=(--path "$event_path")
+          done < "$event_paths_file"
+          pnpm run repair:publish-main -- \
+            --message "chore: append staged proof action ledger" \
+            "${action_ledger_args[@]}" \
+            --rebase-strategy normal
 
   report:
     name: Report and requeue without target credentials
@@ -1429,7 +1540,8 @@ jobs:
       - execute
       - validate
       - report
-    if: ${{ needs.execute.result == 'success' && needs.execute.outputs.execute_fix_outcome == 'success' && needs.execute.outputs.mutation_ready == 'true' && needs.validate.result == 'success' && needs.report.result == 'success' }}
+      - publish-proof-action-ledger
+    if: ${{ needs.execute.result == 'success' && needs.execute.outputs.execute_fix_outcome == 'success' && needs.execute.outputs.mutation_ready == 'true' && needs.validate.result == 'success' && needs.report.result == 'success' && (needs.publish-proof-action-ledger.result == 'success' || (needs.publish-proof-action-ledger.result == 'skipped' && needs.authorize.outputs.checkpoint_recovered == '1')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 25
     permissions:
