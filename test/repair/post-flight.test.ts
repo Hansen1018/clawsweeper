@@ -268,6 +268,7 @@ test("merge post-flight requires exact proof and server-enforced strict base bin
   const mergeFlagPath = path.join(tmp, "merged.txt");
   const viewCountPath = path.join(tmp, "view-count.txt");
   const commentsCountPath = path.join(tmp, "comments-count.txt");
+  const pullCountPath = path.join(tmp, "pull-count.txt");
 
   fs.mkdirSync(fakeBin, { recursive: true });
   fs.mkdirSync(runDir, { recursive: true });
@@ -279,9 +280,19 @@ test("merge post-flight requires exact proof and server-enforced strict base bin
       "const args = process.argv.slice(2);",
       "if (args[0] === 'api' && args[1] === 'repos/openclaw/openclaw/pulls/123') {",
       "  const merged = fs.existsSync(process.env.FAKE_GH_MERGED_FILE);",
+      "  const countPath = process.env.FAKE_GH_PULL_COUNT_FILE;",
+      "  const count = countPath && fs.existsSync(countPath) ? Number(fs.readFileSync(countPath, 'utf8')) : 0;",
+      "  if (countPath) fs.writeFileSync(countPath, String(count + 1));",
+      "  const replacementLabels = process.env.FAKE_GH_REPLACEMENT_LABEL_RACE === '1'",
+      "    ? count === 0",
+      "      ? [{ name: 'clawsweeper:automerge' }]",
+      "      : process.env.FAKE_GH_REPLACEMENT_PAUSED === '1'",
+      "        ? [{ name: 'clawsweeper:human-review' }]",
+      "        : []",
+      "    : [];",
       "  process.stdout.write(JSON.stringify({",
       "    number: 123, state: merged ? 'closed' : 'open', title: 'fix(ui): preserve source config',",
-      `    draft: false, labels: [], base: { ref: 'main', sha: '${MERGE_BASE_SHA}' },`,
+      `    draft: false, labels: replacementLabels, base: { ref: 'main', sha: '${MERGE_BASE_SHA}' },`,
       "    merged_at: merged ? '2026-05-24T00:42:00Z' : null,",
       "    merge_commit_sha: merged ? 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' : null,",
       `    head: { sha: '${MERGE_HEAD_SHA}' },`,
@@ -388,6 +399,7 @@ test("merge post-flight requires exact proof and server-enforced strict base bin
       FAKE_GH_MERGED_FILE: mergeFlagPath,
       FAKE_GH_VIEW_COUNT_FILE: viewCountPath,
       FAKE_GH_COMMENTS_COUNT_FILE: commentsCountPath,
+      FAKE_GH_PULL_COUNT_FILE: pullCountPath,
       ...mockGhBinEnv(path.join(fakeBin, "gh"), fakeBin),
     };
     writeMergeReports(runDir, resultPath);
@@ -456,10 +468,58 @@ test("merge post-flight requires exact proof and server-enforced strict base bin
     );
     assert.equal(fs.existsSync(mergeFlagPath), false);
 
+    writeAutomergeReplacementReports(runDir, resultPath);
+    fs.rmSync(reportPath, { force: true });
+    fs.rmSync(viewCountPath, { force: true });
+    fs.rmSync(commentsCountPath, { force: true });
+    fs.rmSync(pullCountPath, { force: true });
+    runPostFlight(
+      jobPath,
+      resultPath,
+      {
+        ...env,
+        FAKE_GH_STRICT_BASE: "1",
+        FAKE_GH_REPLACEMENT_LABEL_RACE: "1",
+      },
+      1,
+    );
+    const removedAuthorizationReport = JSON.parse(fs.readFileSync(reportPath, "utf8"));
+    assert.equal(removedAuthorizationReport.actions[0]?.status, "blocked");
+    assert.equal(
+      removedAuthorizationReport.actions[0]?.reason,
+      "pull request no longer has live clawsweeper:automerge authorization; refusing final replacement merge mutation",
+    );
+    assert.equal(fs.existsSync(mergeFlagPath), false);
+
+    writeAutomergeReplacementReports(runDir, resultPath);
+    fs.rmSync(reportPath, { force: true });
+    fs.rmSync(viewCountPath, { force: true });
+    fs.rmSync(commentsCountPath, { force: true });
+    fs.rmSync(pullCountPath, { force: true });
+    runPostFlight(
+      jobPath,
+      resultPath,
+      {
+        ...env,
+        FAKE_GH_STRICT_BASE: "1",
+        FAKE_GH_REPLACEMENT_LABEL_RACE: "1",
+        FAKE_GH_REPLACEMENT_PAUSED: "1",
+      },
+      1,
+    );
+    const pausedReplacementReport = JSON.parse(fs.readFileSync(reportPath, "utf8"));
+    assert.equal(pausedReplacementReport.actions[0]?.status, "blocked");
+    assert.equal(
+      pausedReplacementReport.actions[0]?.reason,
+      "pull request is paused by clawsweeper:human-review; refusing final merge mutation",
+    );
+    assert.equal(fs.existsSync(mergeFlagPath), false);
+
     writeMergeReports(runDir, resultPath);
     fs.rmSync(reportPath, { force: true });
     fs.rmSync(viewCountPath, { force: true });
     fs.rmSync(commentsCountPath, { force: true });
+    fs.rmSync(pullCountPath, { force: true });
     runPostFlight(
       jobPath,
       resultPath,
@@ -514,17 +574,14 @@ test("post-flight rechecks live security immediately before privileged mutations
   );
   assert.match(
     finalizeFixPr,
-    /liveSecurityBlockReason\([\s\S]*fetchPullRequest[\s\S]*runVerifiedPostFlightPullMutation\(parsed\.number, \(\) => \{[\s\S]*runtimeStrictBaseBindingBlock\(\{[\s\S]*freshPostFlightMergeMutationBlock\(parsed\.number\)[\s\S]*ghWithRetry\(mergeArgs\)/,
+    /freshPostFlightMergeMutationBlock\([\s\S]*runVerifiedPostFlightPullMutation\(parsed\.number, \(\) => \{[\s\S]*runtimeStrictBaseBindingBlock\(\{[\s\S]*freshPostFlightMergeMutationBlock\([\s\S]*ghWithRetry\(mergeArgs\)/,
   );
   const mergeMutation = finalizeFixPr.slice(
     finalizeFixPr.indexOf("runVerifiedPostFlightPullMutation(parsed.number, () => {"),
   );
   const finalView = mergeMutation.indexOf("fetchPullRequestView(result.repo, parsed.number)");
   const strictBase = mergeMutation.indexOf("runtimeStrictBaseBindingBlock(", finalView);
-  const finalSafety = mergeMutation.indexOf(
-    "freshPostFlightMergeMutationBlock(parsed.number)",
-    strictBase,
-  );
+  const finalSafety = mergeMutation.indexOf("freshPostFlightMergeMutationBlock(", strictBase);
   const merge = mergeMutation.indexOf("ghWithRetry(mergeArgs)", finalSafety);
   assert.ok(
     finalView >= 0 && strictBase > finalView && finalSafety > strictBase && merge > finalSafety,
@@ -535,6 +592,11 @@ test("post-flight rechecks live security immediately before privileged mutations
   );
   assert.match(finalSafetyHelper, /fetchPullRequest\(result\.repo, number\)/);
   assert.match(finalSafetyHelper, /repairPauseLabel\(pull\.labels\)/);
+  assert.match(
+    finalSafetyHelper,
+    /automergeReplacement && !hasLabel\(pull\.labels, AUTOMERGE_LABEL\)/,
+  );
+  assert.match(finalSafetyHelper, /no longer has live \$\{AUTOMERGE_LABEL\} authorization/);
   assert.match(finalSafetyHelper, /liveSecurityBlockReason\(number, pull\.labels \?\? \[\]\)/);
   assert.match(
     finalizeFixPr,
@@ -970,6 +1032,13 @@ function writeMergeReports(runDir: string, resultPath: string) {
       2,
     ),
   );
+}
+
+function writeAutomergeReplacementReports(runDir: string, resultPath: string) {
+  writeMergeReports(runDir, resultPath);
+  const result = JSON.parse(fs.readFileSync(resultPath, "utf8"));
+  result.fix_artifact = { repair_strategy: "replace_uneditable_branch" };
+  fs.writeFileSync(resultPath, `${JSON.stringify(result, null, 2)}\n`);
 }
 
 function passedValidationProof(headSha: string, baseSha: string) {

@@ -333,11 +333,9 @@ function finalizeFixPr(action: LooseRecord) {
     bodyFile,
   ];
   if (pull.head?.sha) mergeArgs.push("--match-head-commit", String(pull.head.sha));
-  const securityBlock = liveSecurityBlockReason(
-    parsed.number,
-    fetchPullRequest(result.repo, parsed.number).labels ?? [],
-  );
-  if (securityBlock) return { ...prBase, status: "blocked", reason: securityBlock };
+  const automergeReplacement = isAutomergeReplacement(action);
+  const finalMutationBlock = freshPostFlightMergeMutationBlock(parsed.number, automergeReplacement);
+  if (finalMutationBlock) return { ...prBase, status: "blocked", reason: finalMutationBlock };
   const mutationBlock = postFlightPullMutationBlock(parsed.number);
   if (mutationBlock) return { ...prBase, status: "blocked", reason: mutationBlock };
   try {
@@ -349,8 +347,11 @@ function finalizeFixPr(action: LooseRecord) {
         policyReadJson: rulesetPolicyReader(),
       });
       if (finalStrictBaseBindingBlock) return { policyBlock: finalStrictBaseBindingBlock };
-      const finalMutationBlock = freshPostFlightMergeMutationBlock(parsed.number);
-      if (finalMutationBlock) return { policyBlock: finalMutationBlock };
+      const immediateMutationBlock = freshPostFlightMergeMutationBlock(
+        parsed.number,
+        automergeReplacement,
+      );
+      if (immediateMutationBlock) return { policyBlock: immediateMutationBlock };
       ghWithRetry(mergeArgs);
       return { policyBlock: "" };
     });
@@ -672,11 +673,14 @@ function validateMergePolicy(action: LooseRecord, pull: LooseRecord) {
 }
 
 function isAutomergeReplacementMerge(action: LooseRecord, pull: LooseRecord) {
+  return isAutomergeReplacement(action) && hasLabel(pull.labels, AUTOMERGE_LABEL);
+}
+
+function isAutomergeReplacement(action: LooseRecord) {
   return (
     job.frontmatter.source === "pr_automerge" &&
     action.action === "open_fix_pr" &&
-    result.fix_artifact?.repair_strategy === "replace_uneditable_branch" &&
-    hasLabel(pull.labels, AUTOMERGE_LABEL)
+    result.fix_artifact?.repair_strategy === "replace_uneditable_branch"
   );
 }
 
@@ -729,11 +733,14 @@ function freshLiveSecurityBlockReason(number: JsonValue) {
   return liveSecurityBlockReason(number, issue.labels ?? []);
 }
 
-function freshPostFlightMergeMutationBlock(number: number) {
+function freshPostFlightMergeMutationBlock(number: number, automergeReplacement: boolean) {
   const pull = fetchPullRequest(result.repo, number);
   const pauseLabel = repairPauseLabel(pull.labels);
   if (pauseLabel) {
     return `pull request is paused by ${pauseLabel}; refusing final merge mutation`;
+  }
+  if (automergeReplacement && !hasLabel(pull.labels, AUTOMERGE_LABEL)) {
+    return `pull request no longer has live ${AUTOMERGE_LABEL} authorization; refusing final replacement merge mutation`;
   }
   return liveSecurityBlockReason(number, pull.labels ?? []);
 }
