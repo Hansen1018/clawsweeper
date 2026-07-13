@@ -18,7 +18,7 @@ import {
   recordCommitWorkflowEvent,
   runCommitMutation,
 } from "../dist/commit-action-ledger.js";
-import { mockGhBinEnv } from "./helpers.ts";
+import { mockGhBinEnv, readText } from "./helpers.ts";
 
 test("commit review terminal success requires requested check publication", () => {
   assert.equal(
@@ -439,6 +439,184 @@ test("commit review check publication completes before the workflow is finalized
       ["started", "completed", "finalized"],
     );
     assert.equal(events.at(-1)?.attributes?.state, "finalized");
+  } finally {
+    restoreEnv(previous);
+    fs.rmSync(root, { force: true, recursive: true });
+  }
+});
+
+test("commit check publisher skips accepted shard writes and installs verified causality", () => {
+  const workflow = readText(".github/workflows/commit-review.yml");
+  const publisher = workflow.slice(workflow.indexOf("\n  publish:"));
+
+  assert.match(publisher, /commit-review-action-ledger-causality\.json/);
+  assert.match(publisher, /CLAWSWEEPER_COMMIT_ACTION_LEDGER_PRIOR_CONTEXT=/);
+  assert.match(
+    publisher,
+    /publication_kind == "commit_check_publication"[\s\S]*completion_reason == "mutation_accepted"/,
+  );
+  assert.match(
+    publisher,
+    /grep -Fqx "\$sha" "\$accepted_checks_file"[\s\S]*skipping duplicate write[\s\S]*continue/,
+  );
+  assert.ok(
+    publisher.indexOf("repair:action-ledger -- verify") <
+      publisher.indexOf("CLAWSWEEPER_COMMIT_ACTION_LEDGER_PRIOR_CONTEXT="),
+  );
+});
+
+test("commit check retries continue authenticated shard causality", async () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "commit-check-causality-")));
+  const reviewRoot = path.join(root, "review-spool");
+  const reviewOutput = path.join(root, "review-output");
+  const publishRoot = path.join(root, "publish-spool");
+  const publishOutput = path.join(root, "publish-output");
+  const contextPath = path.join(root, "prior-context.json");
+  for (const directory of [reviewRoot, reviewOutput, publishRoot, publishOutput]) {
+    fs.mkdirSync(directory);
+  }
+  const previous = { ...process.env };
+  const lifecycle = { repository: "openclaw/openclaw", sha: "b".repeat(40) };
+  const identity = { sha: lifecycle.sha, reportSha256: "c".repeat(64) };
+
+  try {
+    Object.assign(process.env, workflowEnv(reviewRoot, reviewOutput));
+    runCommitMutation(lifecycle, {
+      kind: "commit_check_publication",
+      identity,
+      operation: () => "first",
+    });
+    const eventPaths = await flushCommitActionEvents();
+    const reviewEvents = readEvents(reviewOutput);
+    const priorAccepted = reviewEvents.at(-1);
+    assert.ok(priorAccepted);
+    const recordedProducer = reviewEvents[0]?.producer;
+    assert.ok(recordedProducer);
+    const producer = {
+      repository: recordedProducer.repository,
+      sha: recordedProducer.sha,
+      workflow: recordedProducer.workflow,
+      job: recordedProducer.job,
+      run_id: recordedProducer.run_id,
+      run_attempt: recordedProducer.run_attempt,
+    };
+    fs.writeFileSync(
+      contextPath,
+      `${JSON.stringify([
+        {
+          source_root: reviewOutput,
+          event_paths: eventPaths,
+          producer,
+          subject: lifecycle,
+        },
+      ])}\n`,
+    );
+
+    Object.assign(process.env, workflowEnv(publishRoot, publishOutput), {
+      CLAWSWEEPER_COMMIT_ACTION_LEDGER_PRIOR_CONTEXT: contextPath,
+      GITHUB_JOB: "publish",
+    });
+    assert.equal(
+      runCommitMutation(lifecycle, {
+        kind: "commit_check_publication",
+        identity,
+        operation: () => "second",
+      }),
+      "second",
+    );
+    await flushCommitActionEvents();
+
+    const publishEvents = readEvents(publishOutput);
+    assert.deepEqual(
+      reviewEvents.map((event) => event.attributes?.attempt),
+      [1, 1],
+    );
+    assert.deepEqual(
+      publishEvents.map((event) => event.attributes?.attempt),
+      [2, 2],
+    );
+    assert.deepEqual(
+      publishEvents.map((event) => event.phase_seq),
+      [3, 4],
+    );
+    assert.equal(publishEvents[0]?.parent_event_id, priorAccepted.event_id);
+    assert.equal(
+      new Set([...reviewEvents, ...publishEvents].map((event) => event.idempotency_key_sha256))
+        .size,
+      1,
+    );
+    assert.equal(
+      new Set([...reviewEvents, ...publishEvents].map((event) => event.attempt_id)).size,
+      1,
+    );
+  } finally {
+    restoreEnv(previous);
+    fs.rmSync(root, { force: true, recursive: true });
+  }
+});
+
+test("commit check causality rejects unauthenticated prior shards before the wire request", async () => {
+  const root = fs.realpathSync(
+    fs.mkdtempSync(path.join(os.tmpdir(), "commit-check-causality-auth-")),
+  );
+  const reviewRoot = path.join(root, "review-spool");
+  const reviewOutput = path.join(root, "review-output");
+  const publishRoot = path.join(root, "publish-spool");
+  const publishOutput = path.join(root, "publish-output");
+  const contextPath = path.join(root, "prior-context.json");
+  for (const directory of [reviewRoot, reviewOutput, publishRoot, publishOutput]) {
+    fs.mkdirSync(directory);
+  }
+  const previous = { ...process.env };
+  const lifecycle = { repository: "openclaw/openclaw", sha: "b".repeat(40) };
+  let wireRequests = 0;
+
+  try {
+    Object.assign(process.env, workflowEnv(reviewRoot, reviewOutput));
+    runCommitMutation(lifecycle, {
+      kind: "commit_check_publication",
+      identity: { sha: lifecycle.sha },
+      operation: () => undefined,
+    });
+    const eventPaths = await flushCommitActionEvents();
+    const recordedProducer = readEvents(reviewOutput)[0]?.producer;
+    assert.ok(recordedProducer);
+    const producer = {
+      repository: recordedProducer.repository,
+      sha: recordedProducer.sha,
+      workflow: recordedProducer.workflow,
+      job: "publish",
+      run_id: recordedProducer.run_id,
+      run_attempt: recordedProducer.run_attempt,
+    };
+    fs.writeFileSync(
+      contextPath,
+      `${JSON.stringify([
+        {
+          source_root: reviewOutput,
+          event_paths: eventPaths,
+          producer,
+          subject: lifecycle,
+        },
+      ])}\n`,
+    );
+
+    Object.assign(process.env, workflowEnv(publishRoot, publishOutput), {
+      CLAWSWEEPER_COMMIT_ACTION_LEDGER_PRIOR_CONTEXT: contextPath,
+      GITHUB_JOB: "publish",
+    });
+    assert.throws(
+      () =>
+        runCommitMutation(lifecycle, {
+          kind: "commit_check_publication",
+          identity: { sha: lifecycle.sha },
+          operation: () => {
+            wireRequests += 1;
+          },
+        }),
+      /prior context producer is not authenticated/,
+    );
+    assert.equal(wireRequests, 0);
   } finally {
     restoreEnv(previous);
     fs.rmSync(root, { force: true, recursive: true });

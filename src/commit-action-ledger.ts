@@ -16,7 +16,9 @@ import {
 import {
   flushWorkflowActionEvents,
   interruptOpenWorkflowActionEvents,
+  readValidatedActionEventShardBatch,
   recordWorkflowActionEvent,
+  workflowActionProducer,
   workflowActionEventsEnabled,
 } from "./action-ledger-runtime.js";
 import {
@@ -72,6 +74,7 @@ type CommitLifecycleEvent = {
   idempotencyIdentity?: unknown;
   retryable?: boolean;
   evidence?: Array<{ kind: string; sha256?: string }>;
+  requestAttempt?: number;
 };
 
 type CommitActionLedgerContext = {
@@ -89,13 +92,13 @@ export function recordCommitLifecycleEvent(
   if (!workflowActionEventsEnabled(env)) return null;
   const root = context?.root ?? commitActionLedgerRoot(env);
   const operationIdentity = commitOperationIdentity(input);
-  const operationId = actionOperationId(input.repository, "commit_review", operationIdentity);
   const attemptIdentity = workflowAttemptIdentity(env);
-  const attemptId = actionAttemptId(operationId, attemptIdentity);
   const previous = latestCommitEvent(
-    readSpooledActionEvents(root, input.repository).filter(
-      (candidate) => candidate.operation_id === operationId && candidate.attempt_id === attemptId,
-    ),
+    commitEvents(input, {
+      root,
+      recoveryRoot: context?.recoveryRoot ?? actionLedgerRecoveryRoot(env, root),
+      env,
+    }),
   );
   const phaseSeq = (previous?.phase_seq ?? 0) + 1;
   return recordWorkflowActionEvent(
@@ -145,6 +148,7 @@ export function recordCommitLifecycleEvent(
         ...(event.reviewMode ? { review_mode: event.reviewMode } : {}),
         ...(event.publicationKind ? { publication_kind: event.publicationKind } : {}),
         ...(event.logKind ? { log_kind: event.logKind } : {}),
+        ...(event.requestAttempt ? { attempt: event.requestAttempt } : {}),
       },
     },
     { env },
@@ -244,6 +248,7 @@ export function runCommitMutation<T>(
       publicationKind: options.kind,
       eventIdentity: { kind: options.kind, requestSha256, requestAttempt, outcome: "attempted" },
       idempotencyIdentity,
+      requestAttempt,
     },
     ledgerContext,
   );
@@ -335,6 +340,7 @@ function recordCommitMutationOutcome(
       publicationKind: kind,
       eventIdentity: { kind, requestSha256, requestAttempt, outcome },
       idempotencyIdentity,
+      requestAttempt,
     },
     context,
   );
@@ -582,9 +588,154 @@ function commitEvents(
     commitOperationIdentity(input),
   );
   const attemptId = actionAttemptId(operationId, workflowAttemptIdentity(context.env));
-  return readSpooledActionEvents(context.root, input.repository).filter(
-    (event) => event.operation_id === operationId && event.attempt_id === attemptId,
+  const events = [
+    ...readPriorCommitActionEvents(input, context.env),
+    ...readSpooledActionEvents(context.root, input.repository),
+  ].filter((event) => event.operation_id === operationId && event.attempt_id === attemptId);
+  return [...new Map(events.map((event) => [event.event_id, event])).values()].sort(
+    (left, right) => left.phase_seq - right.phase_seq,
   );
+}
+
+type PriorCommitActionLedgerSource = {
+  source_root: string;
+  event_paths: string[];
+  producer: {
+    repository: string;
+    sha: string;
+    workflow: string;
+    job: string;
+    run_id: string;
+    run_attempt: number;
+  };
+  subject: {
+    repository: string;
+    sha: string;
+  };
+};
+
+function readPriorCommitActionEvents(
+  input: CommitLifecycleInput,
+  env: NodeJS.ProcessEnv,
+): ActionEvent[] {
+  const contextPath = env.CLAWSWEEPER_COMMIT_ACTION_LEDGER_PRIOR_CONTEXT?.trim();
+  if (!contextPath) return [];
+  if (!existsSync(contextPath) || !statSync(contextPath).isFile()) {
+    throw new Error("commit action ledger prior context is missing");
+  }
+  if (statSync(contextPath).size > 256 * 1024) {
+    throw new Error("commit action ledger prior context is too large");
+  }
+  let value: unknown;
+  try {
+    value = JSON.parse(readFileSync(contextPath, "utf8"));
+  } catch {
+    throw new Error("commit action ledger prior context is invalid");
+  }
+  if (!Array.isArray(value) || value.length > 256) {
+    throw new Error("commit action ledger prior context is invalid");
+  }
+  const repository = input.repository.trim().toLowerCase();
+  const sha = input.sha.trim().toLowerCase();
+  return value.flatMap((candidate, index) => {
+    const source = parsePriorCommitActionLedgerSource(candidate, index);
+    if (source.subject.repository !== repository || source.subject.sha !== sha) return [];
+    assertPriorCommitActionLedgerProducer(source, env);
+    const batch = readValidatedActionEventShardBatch(source.source_root);
+    if (JSON.stringify(batch.eventPaths) !== JSON.stringify(source.event_paths)) {
+      throw new Error(`commit action ledger prior context shard set mismatch at index ${index}`);
+    }
+    for (const event of batch.events) {
+      const producer = event.producer;
+      if (
+        producer.repository !== source.producer.repository ||
+        producer.sha !== source.producer.sha ||
+        producer.workflow !== source.producer.workflow ||
+        producer.job !== source.producer.job ||
+        producer.run_id !== source.producer.run_id ||
+        producer.run_attempt !== source.producer.run_attempt
+      ) {
+        throw new Error(`commit action ledger prior context producer mismatch at index ${index}`);
+      }
+      if (
+        event.subject.repository !== repository ||
+        event.subject.kind !== "commit" ||
+        event.subject.source_revision !== sha
+      ) {
+        throw new Error(`commit action ledger prior context subject mismatch at index ${index}`);
+      }
+    }
+    return batch.events;
+  });
+}
+
+function parsePriorCommitActionLedgerSource(
+  value: unknown,
+  index: number,
+): PriorCommitActionLedgerSource {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`commit action ledger prior context entry ${index} is invalid`);
+  }
+  const source = value as Partial<PriorCommitActionLedgerSource>;
+  const producer = source.producer;
+  const subject = source.subject;
+  if (
+    Object.keys(source).sort().join(",") !== "event_paths,producer,source_root,subject" ||
+    typeof source.source_root !== "string" ||
+    !source.source_root.startsWith("/") ||
+    !Array.isArray(source.event_paths) ||
+    source.event_paths.some((entry) => typeof entry !== "string") ||
+    !producer ||
+    typeof producer !== "object" ||
+    Object.keys(producer).sort().join(",") !== "job,repository,run_attempt,run_id,sha,workflow" ||
+    typeof producer.repository !== "string" ||
+    typeof producer.sha !== "string" ||
+    typeof producer.workflow !== "string" ||
+    typeof producer.job !== "string" ||
+    typeof producer.run_id !== "string" ||
+    !Number.isSafeInteger(producer.run_attempt) ||
+    Number(producer.run_attempt) < 1 ||
+    !subject ||
+    typeof subject !== "object" ||
+    Object.keys(subject).sort().join(",") !== "repository,sha" ||
+    typeof subject.repository !== "string" ||
+    typeof subject.sha !== "string"
+  ) {
+    throw new Error(`commit action ledger prior context entry ${index} is invalid`);
+  }
+  return {
+    source_root: source.source_root,
+    event_paths: source.event_paths,
+    producer: {
+      repository: producer.repository.trim().toLowerCase(),
+      sha: producer.sha.trim().toLowerCase(),
+      workflow: producer.workflow.trim(),
+      job: producer.job.trim(),
+      run_id: producer.run_id.trim(),
+      run_attempt: producer.run_attempt,
+    },
+    subject: {
+      repository: subject.repository.trim().toLowerCase(),
+      sha: subject.sha.trim().toLowerCase(),
+    },
+  };
+}
+
+function assertPriorCommitActionLedgerProducer(
+  source: PriorCommitActionLedgerSource,
+  env: NodeJS.ProcessEnv,
+): void {
+  const current = workflowActionProducer("commit_prior_context", env);
+  if (
+    source.producer.repository !== current.repository ||
+    source.producer.sha !== current.sha ||
+    source.producer.workflow !== current.workflow ||
+    source.producer.job !== "review" ||
+    source.producer.run_id !== current.runId ||
+    source.producer.run_attempt > current.runAttempt
+  ) {
+    throw new Error("commit action ledger prior context producer is not authenticated");
+  }
 }
 
 function latestCommitEvent(events: readonly ActionEvent[]): ActionEvent | null {

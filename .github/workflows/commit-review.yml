@@ -670,8 +670,12 @@ jobs:
           cohort_file=".artifacts/commit-review-artifact-cohort.json"
           expected_shas_file=".artifacts/expected-commit-review-shas.txt"
           actual_shas_file=".artifacts/actual-commit-review-shas.txt"
+          accepted_checks_file=".artifacts/accepted-commit-review-check-shas.txt"
+          causality_file=".artifacts/commit-review-action-ledger-causality.json"
           test -s "$cohort_file"
           : > "$actual_shas_file"
+          : > "$accepted_checks_file"
+          printf '[]\n' > "$causality_file"
           if [ "$PLANNED_COUNT" = "1" ]; then
             IFS=$'\t' read -r commit_sha artifact_attempt ledger_name ledger_id report_name report_id \
               < <(jq -r '.[] | [.sha, (.producerAttempt | tostring), .ledger.name, (.ledger.id | tostring), .report.name, (.report.id | tostring)] | @tsv' "$cohort_file")
@@ -717,6 +721,50 @@ jobs:
               --expected-commit-repository "$EXPECTED_TARGET_REPO" \
               --expected-commit-sha "$commit_sha" \
               --source-root "$review_root" >/dev/null
+            source_root="$(cd "$review_root" && pwd -P)"
+            context_entry="$(
+              jq -c \
+                --arg source_root "$source_root" \
+                --arg subject_repository "$EXPECTED_TARGET_REPO" \
+                --arg subject_sha "$commit_sha" \
+                '{
+                  source_root: $source_root,
+                  event_paths: .event_paths,
+                  producer: {
+                    repository: .repository,
+                    sha: .sha,
+                    workflow: .workflow,
+                    job: .job,
+                    run_id: .run_id,
+                    run_attempt: .run_attempt
+                  },
+                  subject: {
+                    repository: $subject_repository,
+                    sha: $subject_sha
+                  }
+                }' \
+                "$review_root/repair-action-ledger-manifest.json"
+            )"
+            jq --argjson entry "$context_entry" '. + [$entry]' "$causality_file" \
+              > "${causality_file}.tmp"
+            mv "${causality_file}.tmp" "$causality_file"
+            mapfile -t event_paths \
+              < <(jq -r '.event_paths[]' "$review_root/repair-action-ledger-manifest.json")
+            event_files=()
+            for event_path in "${event_paths[@]}"; do
+              event_files+=("$review_root/$event_path")
+            done
+            if jq -s -e \
+              --arg repository "$EXPECTED_TARGET_REPO" \
+              --arg sha "$commit_sha" \
+              'any(.[]; .subject.repository == $repository and
+                        .subject.kind == "commit" and
+                        .subject.source_revision == $sha and
+                        .attributes.publication_kind == "commit_check_publication" and
+                        .attributes.completion_reason == "mutation_accepted")' \
+              "${event_files[@]}" >/dev/null; then
+              echo "$commit_sha" >> "$accepted_checks_file"
+            fi
             cp -R "$report_root"/. commit-artifacts/
             echo "$commit_sha" >> "$actual_shas_file"
           done < <(jq -r '.[] | [.sha, (.producerAttempt | tostring), .ledger.name, (.ledger.id | tostring), .report.name, (.report.id | tostring)] | @tsv' "$cohort_file")
@@ -726,6 +774,9 @@ jobs:
             diff -u "$expected_shas_file" "$actual_shas_file" >&2 || true
             exit 1
           fi
+          sort -u -o "$accepted_checks_file" "$accepted_checks_file"
+          echo "CLAWSWEEPER_COMMIT_ACTION_LEDGER_PRIOR_CONTEXT=$(pwd -P)/$causality_file" \
+            >> "$GITHUB_ENV"
 
       - uses: actions/download-artifact@v8
         if: ${{ needs.plan.outputs.skipped_count != '0' }}
@@ -798,8 +849,13 @@ jobs:
         run: |
           set -euo pipefail
           test -n "$GH_TOKEN"
+          accepted_checks_file=".artifacts/accepted-commit-review-check-shas.txt"
           find commit-artifacts -name '*.md' -print0 | while IFS= read -r -d '' report_path; do
             sha="$(basename "$report_path" .md)"
+            if [ -s "$accepted_checks_file" ] && grep -Fqx "$sha" "$accepted_checks_file"; then
+              echo "Commit check already accepted by review shard for $sha; skipping duplicate write."
+              continue
+            fi
             relative_path="records/${report_path#commit-artifacts/}"
             node dist/commit-sweeper.js publish-check \
               --target-repo "${{ needs.plan.outputs.target_repo }}" \
