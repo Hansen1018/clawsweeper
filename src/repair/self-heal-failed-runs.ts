@@ -265,6 +265,7 @@ function selectCandidates() {
     );
   }
   const generationsByJob = new Map<string, Map<string, RunGeneration>>();
+  const unresolvedProvenanceByJob = new Map<string, { record: JsonObject; skip: LooseRecord }>();
 
   for (const record of records) {
     const sourceJob = record.source_job;
@@ -281,12 +282,17 @@ function selectCandidates() {
     try {
       generationKey = runGenerationKey(record, sourceJob);
     } catch (error) {
-      skippedCandidates.push({
+      const skip = {
         reason: "immutable_provenance_unavailable",
         run_id: record.run_id ?? null,
         source_job: sourceJob,
         detail: error instanceof Error ? error.message : String(error),
-      });
+      };
+      skippedCandidates.push(skip);
+      const unresolved = unresolvedProvenanceByJob.get(sourceJob);
+      if (!unresolved || isNewerRunRecord(record, unresolved.record)) {
+        unresolvedProvenanceByJob.set(sourceJob, { record, skip });
+      }
       continue;
     }
     const generation = generations.get(generationKey);
@@ -299,12 +305,22 @@ function selectCandidates() {
   }
 
   const latestCandidates: JsonObject[] = [];
-  for (const generations of generationsByJob.values()) {
+  for (const [sourceJob, generations] of generationsByJob) {
     let latestGeneration: RunGeneration | null = null;
     for (const generation of generations.values()) {
       if (!latestGeneration || isNewerRunRecord(generation.latest, latestGeneration.latest)) {
         latestGeneration = generation;
       }
+    }
+    const provenanceBarrier = unresolvedProvenanceByJob.get(sourceJob);
+    if (
+      latestGeneration &&
+      provenanceBarrier &&
+      runSortKey(provenanceBarrier.record) > runSortKey(latestGeneration.latest)
+    ) {
+      provenanceBarrier.skip.blocks_older_generations = true;
+      provenanceBarrier.skip.blocked_run_id = latestGeneration.latest.run_id ?? null;
+      continue;
     }
     const candidate = latestGeneration ? selfHealCandidate(latestGeneration) : null;
     if (candidate) latestCandidates.push(candidate);

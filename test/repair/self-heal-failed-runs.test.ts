@@ -334,6 +334,34 @@ test("failed-run self-heal does not replay an older immutable generation after s
   }
 });
 
+test("failed-run self-heal blocks older generations behind unresolved newer provenance", () => {
+  const fixture = createSelfHealFixture("newer-unresolved");
+  const newerRunId = String(Number(fixture.runId) + 1);
+  try {
+    writeRunRecord(fixture.runsDir, fixture.runId, {
+      source_job: fixture.jobPath,
+      source_state_revision: fixture.originalRevision,
+      source_job_sha256: fixture.originalDigest,
+      mode: "plan",
+    });
+    writeRunRecord(fixture.runsDir, newerRunId, {
+      source_job: fixture.jobPath,
+      source_state_revision: fixture.replacementRevision,
+      source_job_sha256: fixture.replacementDigest,
+      mode: "unsafe",
+    });
+
+    const summary = runSelfHeal(fixture);
+    assert.equal(summary.candidates.length, 0);
+    const blocked = summary.skipped_candidates.find((candidate) => candidate.run_id === newerRunId);
+    assert.equal(blocked?.reason, "immutable_provenance_unavailable");
+    assert.equal(blocked?.blocks_older_generations, true);
+    assert.equal(blocked?.blocked_run_id, fixture.runId);
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
 test("failed-run self-heal honors a newer executed success in the same generation", () => {
   const fixture = createSelfHealFixture("same-generation-success");
   try {

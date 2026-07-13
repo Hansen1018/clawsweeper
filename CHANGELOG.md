@@ -137,7 +137,8 @@ checkpoint, and status-only commits are intentionally omitted.
   Workers verify the same immutable job again at execution authorization and
   seal its bytes into result artifacts, while active-run matching and dispatch
   receipts distinguish later job generations. Failed-run self-heal refuses
-  dispatch when active-generation discovery is unavailable. Pre-contract
+  dispatch when active-generation discovery is unavailable and blocks older
+  generations behind any newer run with unresolved provenance. Pre-contract
   workers that finish during rollout remain publishable only when their exact
   worker commit is verified on default-branch history before the immutable
   handoff contract, and those records carry explicit legacy provenance.
