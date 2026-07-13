@@ -316,7 +316,13 @@ test("commit finding dispatch records the concrete request before publication fi
     await flushWorkflowActionEvents(root);
 
     assert.match(fs.readFileSync(githubOutput, "utf8"), /^dispatch_count=1$/m);
-    assert.equal(fs.readFileSync(ghLog, "utf8").trim().split("\n").length, 1);
+    const ghInvocations = fs.readFileSync(ghLog, "utf8").trim().split("\n");
+    assert.equal(ghInvocations.length, 1);
+    const ghArgs = JSON.parse(ghInvocations[0]!) as string[];
+    assert.match(
+      ghArgs.find((arg) => arg.startsWith("dispatch_key=")) ?? "",
+      /^dispatch_key=commit-finding-[a-f0-9]{24}$/,
+    );
     const events = readEvents(outputRoot).filter(
       (event) => event.attributes?.publication_kind === "commit_finding_dispatch",
     );
@@ -327,6 +333,49 @@ test("commit finding dispatch records the concrete request before publication fi
     assert.ok(events.every((event) => event.subject?.source_revision === sha));
   } finally {
     restoreEnv(previous);
+    fs.rmSync(root, { force: true, recursive: true });
+  }
+});
+
+test("repository and workflow commit finding dispatches share one stable receipt key", () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "commit-dispatch-key-")));
+  const artifactDir = path.join(root, "commit-artifacts", "openclaw-openclaw", "commits");
+  const sha = "e".repeat(40);
+  fs.mkdirSync(artifactDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(artifactDir, `${sha}.md`),
+    `---\nresult: findings\nsha: ${sha}\nrepository: openclaw/openclaw\nhighest_severity: P1\ncheck_conclusion: failure\n---\n`,
+  );
+
+  try {
+    const common = [
+      path.join(process.cwd(), "dist", "commit-sweeper.js"),
+      "dispatch-findings",
+      "--artifact-dir",
+      path.join(root, "commit-artifacts"),
+      "--repair-repo",
+      "openclaw/clawsweeper",
+      "--repair-workflow",
+      "repair-commit-finding-intake.yml",
+      "--report-repo",
+      "openclaw/clawsweeper",
+      "--dry-run",
+    ];
+    const repositoryPayload = JSON.parse(
+      execFileSync(process.execPath, [...common, "--dispatch-mode", "repository_dispatch"], {
+        encoding: "utf8",
+      }),
+    );
+    const workflowCommand = execFileSync(
+      process.execPath,
+      [...common, "--dispatch-mode", "workflow_dispatch"],
+      { encoding: "utf8" },
+    );
+    const dispatchKey = String(repositoryPayload.client_payload.dispatch_key);
+
+    assert.match(dispatchKey, /^commit-finding-[a-f0-9]{24}$/);
+    assert.match(workflowCommand, new RegExp(`dispatch_key=${dispatchKey}`));
+  } finally {
     fs.rmSync(root, { force: true, recursive: true });
   }
 });

@@ -633,6 +633,15 @@ test("commit finding intake is merge-disabled and carries no verifier credential
   const workflow = readWorkflow(file);
 
   assert.equal(workflow.env?.CLAWSWEEPER_ALLOW_MERGE, "0");
+  assert.match(source, /run-name:.*Commit finding.*dispatch_key/);
+  assert.match(source, /dispatch_key:[\s\S]*Stable commit finding idempotency key/);
+  assert.match(source, /name: Deduplicate commit finding dispatch receipt/);
+  assert.match(
+    source,
+    /dispatch-receipt-owner\.sh \\\n\s+repair-commit-finding-intake\.yml "\$expected_title" "\$GITHUB_RUN_ID" "Intake commit finding"/,
+  );
+  assert.match(source, /name: Intake commit finding[\s\S]*needs: receipt/);
+  assert.match(source, /needs\.receipt\.outputs\.proceed == 'true'/);
   assert.match(source, /Create read-only intake token[\s\S]*permission-contents: read/);
   assert.doesNotMatch(
     source.slice(

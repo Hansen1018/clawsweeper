@@ -948,10 +948,24 @@ function githubRunUrl(): string {
   return repository && runId ? `${server}/${repository}/actions/runs/${runId}` : "";
 }
 
+function commitFindingDispatchKey(dispatch: CommitFindingDispatch): string {
+  const digest = createHash("sha256")
+    .update(
+      JSON.stringify({
+        targetRepo: dispatch.targetRepo,
+        sha: dispatch.sha,
+      }),
+    )
+    .digest("hex")
+    .slice(0, 24);
+  return `commit-finding-${digest}`;
+}
+
 function dispatchPayload(dispatch: CommitFindingDispatch, reportRepo: string): string {
   return `${JSON.stringify({
     event_type: "clawsweeper_commit_finding",
     client_payload: {
+      dispatch_key: commitFindingDispatchKey(dispatch),
       target_repo: dispatch.targetRepo,
       commit_sha: dispatch.sha,
       report_repo: reportRepo,
@@ -982,6 +996,8 @@ function workflowDispatchArgs(
     `target_repo=${dispatch.targetRepo}`,
     "-f",
     `commit_sha=${dispatch.sha}`,
+    "-f",
+    `dispatch_key=${commitFindingDispatchKey(dispatch)}`,
     "-f",
     `report_repo=${reportRepo}`,
     "-f",
@@ -1018,9 +1034,11 @@ function dispatchCommitFinding(options: {
           arg === "PLACEHOLDER" ? options.repairRepo : arg,
         );
   const lifecycle = commitLifecycle(options.dispatch.targetRepo, options.dispatch.sha);
+  const dispatchKey = commitFindingDispatchKey(options.dispatch);
   runCommitMutation(lifecycle, {
     kind: "commit_finding_dispatch",
     identity: {
+      dispatchKey,
       repairRepo: options.repairRepo,
       workflow: options.workflow,
       mode: options.mode,
