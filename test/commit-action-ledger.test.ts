@@ -807,7 +807,7 @@ test("commit check retries continue authenticated shard causality", async () => 
 
   try {
     Object.assign(process.env, workflowEnv(reviewRoot, reviewOutput), {
-      GITHUB_JOB: "attest",
+      GITHUB_JOB: "review",
     });
     runCommitMutation(lifecycle, {
       kind: "commit_check_publication",
@@ -820,6 +820,7 @@ test("commit check retries continue authenticated shard causality", async () => 
     assert.ok(priorAccepted);
     const recordedProducer = reviewEvents[0]?.producer;
     assert.ok(recordedProducer);
+    assert.equal(recordedProducer.job, "review");
     const producer = {
       repository: recordedProducer.repository,
       sha: recordedProducer.sha,
@@ -913,7 +914,7 @@ test("commit check causality rejects unauthenticated prior shards before the wir
       repository: recordedProducer.repository,
       sha: recordedProducer.sha,
       workflow: recordedProducer.workflow,
-      job: "review",
+      job: "attest",
       run_id: recordedProducer.run_id,
       run_attempt: recordedProducer.run_attempt,
     };
