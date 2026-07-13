@@ -86,6 +86,43 @@ test("Codex output redaction sizes stream overlap by UTF-8 bytes", () => {
   }
 });
 
+test("Codex output redaction spans chunks inside nested JSON-escaped secrets", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-output-redaction-json-"));
+  const outputPath = path.join(root, "codex.jsonl");
+  const secret = 'runtime\n"quoted"\\token-123456';
+  const structuredMessage = JSON.stringify({ summary: secret });
+  const event = `${JSON.stringify({
+    type: "item.completed",
+    item: { text: structuredMessage },
+  })}\n`;
+  const encodedSecret = JSON.stringify(JSON.stringify(secret).slice(1, -1)).slice(1, -1);
+  const secretOffset = event.indexOf(encodedSecret);
+  const capture = openCodexOutputCapture(outputPath, {
+    redactValues: [secret],
+    tailBytes: 4096,
+  });
+
+  try {
+    assert.notEqual(secretOffset, -1);
+    const firstSplit = secretOffset + encodedSecret.indexOf("\\\\n") + 1;
+    const secondSplit = secretOffset + encodedSecret.indexOf('\\\\\\"') + 2;
+    const thirdSplit = secretOffset + encodedSecret.indexOf("\\\\\\\\token") + 2;
+    appendCodexOutputCapture(capture, Buffer.from(event.slice(0, firstSplit)));
+    appendCodexOutputCapture(capture, Buffer.from(event.slice(firstSplit, secondSplit)));
+    appendCodexOutputCapture(capture, Buffer.from(event.slice(secondSplit, thirdSplit)));
+    appendCodexOutputCapture(capture, Buffer.from(event.slice(thirdSplit)));
+    closeCodexOutputCapture(capture);
+
+    const retained = fs.readFileSync(outputPath, "utf8");
+    const parsedEvent = JSON.parse(retained) as { item: { text: string } };
+    assert.deepEqual(JSON.parse(parsedEvent.item.text), { summary: "[REDACTED]" });
+    assert.doesNotMatch(retained, /runtime|quoted|token-123456/);
+    assert.equal(codexOutputTail(capture), retained);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("Codex text redaction spans independently delivered chunks", () => {
   const secret = "runtime-token-123456";
   const redactor = createCodexTextRedactor([secret]);
@@ -111,7 +148,7 @@ test("Codex text redaction preserves UTF-8 code points split by overlap retentio
 test("Codex last-message redaction atomically replaces structured output", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-last-message-redaction-"));
   const outputPath = path.join(root, "result.json");
-  const secret = "runtime-token-123456";
+  const secret = 'runtime\n"quoted"\\token-123456';
   fs.writeFileSync(outputPath, `${JSON.stringify({ summary: secret })}\n`);
 
   try {
@@ -120,6 +157,7 @@ test("Codex last-message redaction atomically replaces structured output", () =>
     assert.deepEqual(JSON.parse(fs.readFileSync(outputPath, "utf8")), {
       summary: "[REDACTED]",
     });
+    assert.doesNotMatch(fs.readFileSync(outputPath, "utf8"), /runtime|quoted|token-123456/);
     assert.deepEqual(fs.readdirSync(root), ["result.json"]);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });

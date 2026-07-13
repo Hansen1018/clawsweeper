@@ -22,6 +22,8 @@ const TRUNCATION_MARKER = Buffer.from(
   "utf8",
 );
 const REDACTION_MARKER = Buffer.from("[REDACTED]", "utf8");
+// Covers JSON values retained directly and structured JSON nested inside Codex JSONL.
+const MAX_JSON_REDACTION_DEPTH = 2;
 
 export interface CodexOutputCapture {
   file: number;
@@ -191,9 +193,20 @@ function normalizedRedactions(values: readonly string[] | undefined): Buffer[] {
 }
 
 function normalizedRedactionStrings(values: readonly string[] | undefined): string[] {
-  return [
-    ...new Set((values ?? []).map((value) => value.trim()).filter((value) => value.length >= 6)),
-  ].sort((left, right) => right.length - left.length);
+  const secrets = new Set(
+    (values ?? []).map((value) => value.trim()).filter((value) => value.length >= 6),
+  );
+  const variants = new Set<string>();
+  for (const secret of secrets) {
+    let variant = secret;
+    for (let depth = 0; depth <= MAX_JSON_REDACTION_DEPTH; depth += 1) {
+      variants.add(variant);
+      const encoded = JSON.stringify(variant).slice(1, -1);
+      if (encoded === variant) break;
+      variant = encoded;
+    }
+  }
+  return [...variants].sort((left, right) => right.length - left.length);
 }
 
 function redactAvailableBuffer(
