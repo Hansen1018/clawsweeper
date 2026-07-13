@@ -96,7 +96,15 @@ test("automerge reconciles command responses inside the merge receipt without ce
 
   assert.match(
     executeAutomerge,
-    /result = runGitHubSpawnMutation\([\s\S]*buildAutomergeMergeArgs\([\s\S]*onDispatchStart:[\s\S]*reconcile: \(\{ result: commandResult, error: commandError \}\) => \{[\s\S]*fetchAutomergeEffectSnapshot\(command\.issue_number\)[\s\S]*fetchAutomergeSquashCommitProof\([\s\S]*expectedSquashCommitMessage\(mergeMessage\.subject, mergeMessage\.body\)[\s\S]*confirmAutomergeEffectSnapshot\(snapshot, command\.expected_head_sha,[\s\S]*squashCommitProof[\s\S]*outcome: automergeAttemptReceiptOutcome/,
+    /result = runGitHubSpawnMutation\([\s\S]*buildAutomergeMergeArgs\([\s\S]*onDispatchStart:[\s\S]*reconcile:/,
+  );
+  assert.match(
+    executeAutomerge,
+    /reconcile: \(\{ result: commandResult, error: commandError \}\) => \{[\s\S]*fetchAutomergeEffectSnapshot\(command\.issue_number\)[\s\S]*fetchAutomergeSquashCommitProof\([\s\S]*expectedSquashCommitMessage\(mergeMessage\.subject, mergeMessage\.body\)/,
+  );
+  assert.match(
+    executeAutomerge,
+    /confirmAutomergeEffectSnapshot\([\s\S]*command\.expected_head_sha,[\s\S]*squashCommitProof \? \{ squashCommit: squashCommitProof \} : \{\}[\s\S]*outcome: automergeAttemptReceiptOutcome/,
   );
   assert.doesNotMatch(executeAutomerge, /"merge confirmed after ambiguous response"/);
   assert.match(

@@ -4041,9 +4041,11 @@ function executeAutomerge(command: LooseRecord): LooseRecord {
               command_error: commandError,
               snapshot,
               snapshot_error: "",
-              confirmation: confirmAutomergeEffectSnapshot(snapshot, command.expected_head_sha, {
-                ...(squashCommitProof ? { squashCommit: squashCommitProof } : {}),
-              }),
+              confirmation: confirmAutomergeEffectSnapshot(
+                snapshot,
+                command.expected_head_sha,
+                squashCommitProof ? { squashCommit: squashCommitProof } : {},
+              ),
             };
           } catch (error) {
             return {
