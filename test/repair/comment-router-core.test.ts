@@ -2078,7 +2078,7 @@ test("command receipt gates let the oldest same-key run proceed when a newer dup
   assert.match(receiptGate, /\.display_title == \$title and \.id < \(\$current \| tonumber\)/);
   assert.match(receiptGate, /\.status == "in_progress"/);
   assert.match(receiptGate, /\.status == "completed"/);
-  assert.match(receiptGate, /actions\/runs\/\$\{run_id\}\/jobs\?per_page=100/);
+  assert.match(receiptGate, /actions\/runs\/\$\{run_id\}\/jobs\?filter=all&per_page=100/);
   assert.match(receiptGate, /\.name == \$required_job and/);
   assert.match(
     receiptGate,

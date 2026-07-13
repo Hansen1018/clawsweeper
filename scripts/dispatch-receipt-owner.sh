@@ -37,7 +37,7 @@ while IFS= read -r run_id; do
     continue
   fi
   jobs_json="$(gh api --paginate --slurp --method GET \
-    "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/jobs?per_page=100")"
+    "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/jobs?filter=all&per_page=100")"
   if jq -e --arg required_job "$required_job_name" --arg required_step "$required_step_name" '
     any(
       .[] | .jobs[]?;

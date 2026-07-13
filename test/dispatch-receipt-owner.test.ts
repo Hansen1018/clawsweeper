@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import test from "node:test";
@@ -128,6 +128,36 @@ test("dispatch receipt gate retains ownership when later finalization fails", ()
               { name: "Dispatch sealed repair worker", conclusion: "success" },
               { name: "Finalize commit finding intake action ledger", conclusion: "failure" },
             ],
+          },
+        ],
+      },
+      "Intake commit finding",
+      "Dispatch sealed repair worker",
+    ),
+    "owner",
+  );
+});
+
+test("dispatch receipt gate retains ownership from an earlier successful job attempt", () => {
+  assert.match(readFileSync(SCRIPT, "utf8"), /jobs\?filter=all&per_page=100/);
+  assert.equal(
+    runGate(
+      {
+        runs: [
+          { id: 102, display_title: EXPECTED_TITLE, status: "completed", conclusion: "failure" },
+        ],
+        jobs102: [
+          {
+            name: "Intake commit finding",
+            run_attempt: 2,
+            conclusion: "failure",
+            steps: [{ name: "Dispatch sealed repair worker", conclusion: "skipped" }],
+          },
+          {
+            name: "Intake commit finding",
+            run_attempt: 1,
+            conclusion: "failure",
+            steps: [{ name: "Dispatch sealed repair worker", conclusion: "success" }],
           },
         ],
       },
