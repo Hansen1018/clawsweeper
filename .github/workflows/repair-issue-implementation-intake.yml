@@ -233,25 +233,34 @@ jobs:
 
       - name: Finalize issue implementation intake action ledger
         if: ${{ always() && steps.intake-action-ledger.outcome == 'success' }}
-        run: pnpm run --silent repair:action-ledger -- finalize
+        run: |
+          set -euo pipefail
+          : "${CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:?setup-action-ledger output root is required}"
+          mkdir -p .artifacts
+          pnpm run --silent repair:action-ledger -- finalize \
+            --repair-lane issue-implementation-intake \
+            > .artifacts/issue-implementation-intake-action-ledger-manifest.json
 
       - name: Publish immutable issue implementation intake action ledger
         if: ${{ always() && steps.intake-action-ledger.outcome == 'success' }}
         run: |
           set -euo pipefail
           test -n "${CLAWSWEEPER_STATE_DIR:-}"
-          source_root=".clawsweeper-repair/action-ledger-state"
-          if [ ! -d "$source_root/ledger" ]; then
-            echo "No issue implementation intake action event shards were finalized."
-            exit 0
-          fi
+          source_root="${CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:?setup-action-ledger output root is required}"
+          manifest_file=".artifacts/issue-implementation-intake-action-ledger-manifest.json"
           event_paths_file=".artifacts/issue-implementation-intake-action-ledger-paths.txt"
+          import_result_file=".artifacts/issue-implementation-intake-action-ledger-import.json"
           mkdir -p .artifacts
+          test -s "$manifest_file"
           pnpm run --silent repair:action-ledger -- publish \
+            --repair-lane issue-implementation-intake \
+            --manifest "$manifest_file" \
             --source-root "$source_root" \
-            --state-root "$CLAWSWEEPER_STATE_DIR" |
-            jq -r '.paths[]?' |
-            sort -u > "$event_paths_file"
+            --state-root "$CLAWSWEEPER_STATE_DIR" > "$import_result_file"
+          jq -e --slurpfile manifest "$manifest_file" \
+            '.eventPaths == $manifest[0].event_paths' \
+            "$import_result_file" >/dev/null
+          jq -r '.paths[]?' "$import_result_file" | sort -u > "$event_paths_file"
           if [ ! -s "$event_paths_file" ]; then
             echo "Issue implementation intake action event shards existed but no paths were imported." >&2
             exit 1

@@ -209,6 +209,7 @@ jobs:
           persist-credentials: "false"
 
       - uses: ./.github/actions/setup-action-ledger
+        id: cluster-action-ledger
 
       - name: Check job file
         id: check_job
@@ -411,7 +412,12 @@ jobs:
 
       - name: Finalize cluster repair action ledger
         if: ${{ always() && steps.cluster-setup-pnpm.outcome == 'success' }}
-        run: pnpm run --silent repair:action-ledger -- finalize
+        run: |
+          set -euo pipefail
+          output_root="${CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:?setup-action-ledger output root is required}"
+          pnpm run --silent repair:action-ledger -- finalize \
+            --repair-lane cluster \
+            > "$output_root/repair-action-ledger-manifest.json"
 
       - name: Upload cluster repair action ledger
         id: upload_action_ledger
@@ -419,7 +425,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: clawsweeper-repair-action-ledger-cluster-${{ github.run_id }}-${{ github.run_attempt }}
-          path: .clawsweeper-repair/action-ledger-state/**
+          path: ${{ steps.cluster-action-ledger.outputs.output-root }}/**
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 90
@@ -736,6 +742,9 @@ jobs:
       artifact_id: ${{ needs.authorize.outputs.recovery_execution_artifact_id || steps.upload_execution.outputs.artifact-id }}
       artifact_digest: ${{ needs.authorize.outputs.recovery_execution_artifact_digest || steps.upload_execution.outputs.artifact-digest }}
       producer_attempt: ${{ needs.authorize.outputs.checkpoint_recovered == '1' && needs.authorize.outputs.producer_attempt || steps.producer_attempt.outputs.value }}
+      action_ledger_artifact_id: ${{ steps.upload_action_ledger.outputs.artifact-id }}
+      action_ledger_artifact_digest: ${{ steps.upload_action_ledger.outputs.artifact-digest }}
+      action_ledger_producer_attempt: ${{ steps.producer_attempt.outputs.value }}
     env:
       CLAWSWEEPER_ALLOWED_OWNER: ${{ needs.authorize.outputs.target_owner }}
       CLAWSWEEPER_ALLOW_EXECUTE: ${{ needs.cluster.outputs.allow_execute == '1' && '1' || '0' }}
@@ -769,6 +778,7 @@ jobs:
           persist-credentials: false
 
       - uses: ./.github/actions/setup-action-ledger
+        id: execute-action-ledger
 
       - uses: ./.github/actions/setup-pnpm
         id: execute-setup-pnpm
@@ -974,16 +984,22 @@ jobs:
 
       - name: Finalize execution repair action ledger
         if: ${{ always() && steps.execute-setup-pnpm.outcome == 'success' }}
-        run: pnpm run --silent repair:action-ledger -- finalize
+        run: |
+          set -euo pipefail
+          output_root="${CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:?setup-action-ledger output root is required}"
+          pnpm run --silent repair:action-ledger -- finalize \
+            --repair-lane execute \
+            > "$output_root/repair-action-ledger-manifest.json"
 
       - name: Upload execution repair action ledger
+        id: upload_action_ledger
         if: ${{ always() && steps.execute-setup-pnpm.outcome == 'success' }}
         uses: actions/upload-artifact@v7
         with:
           name: clawsweeper-repair-action-ledger-execute-${{ github.run_id }}-${{ github.run_attempt }}
-          path: .clawsweeper-repair/action-ledger-state/**
+          path: ${{ steps.execute-action-ledger.outputs.output-root }}/**
           include-hidden-files: true
-          if-no-files-found: ignore
+          if-no-files-found: error
           retention-days: 90
 
   validate:
@@ -1296,6 +1312,10 @@ jobs:
     permissions:
       actions: read
       contents: read
+    outputs:
+      action_ledger_artifact_id: ${{ steps.upload_action_ledger.outputs.artifact-id }}
+      action_ledger_artifact_digest: ${{ steps.upload_action_ledger.outputs.artifact-digest }}
+      action_ledger_producer_attempt: ${{ steps.producer_attempt.outputs.value }}
     env:
       CLAWSWEEPER_ALLOWED_OWNER: ${{ needs.authorize.outputs.target_owner }}
       CLAWSWEEPER_ALLOW_EXECUTE: ${{ needs.cluster.outputs.allow_execute == '1' && '1' || '0' }}
@@ -1309,6 +1329,10 @@ jobs:
       CLAWSWEEPER_ACTION_LEDGER_CAUSAL_ROOTS: ${{ github.workspace }}/.clawsweeper-repair/action-ledger-context
       OPENCLAW_LOCAL_CHECK: "0"
     steps:
+      - name: Record producer attempt
+        id: producer_attempt
+        run: echo "value=$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+
       - uses: actions/checkout@v7
         with:
           ref: ${{ github.sha }}
@@ -1316,6 +1340,7 @@ jobs:
           persist-credentials: false
 
       - uses: ./.github/actions/setup-action-ledger
+        id: mutate-action-ledger
 
       - uses: ./.github/actions/setup-pnpm
         id: mutate-setup-pnpm
@@ -1828,16 +1853,22 @@ jobs:
 
       - name: Finalize mutation repair action ledger
         if: ${{ always() && steps.mutate-setup-pnpm.outcome == 'success' }}
-        run: pnpm run --silent repair:action-ledger -- finalize
+        run: |
+          set -euo pipefail
+          output_root="${CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:?setup-action-ledger output root is required}"
+          pnpm run --silent repair:action-ledger -- finalize \
+            --repair-lane mutate \
+            > "$output_root/repair-action-ledger-manifest.json"
 
       - name: Upload mutation repair action ledger
+        id: upload_action_ledger
         if: ${{ always() && steps.mutate-setup-pnpm.outcome == 'success' }}
         uses: actions/upload-artifact@v7
         with:
           name: clawsweeper-repair-action-ledger-mutate-${{ github.run_id }}-${{ github.run_attempt }}
-          path: .clawsweeper-repair/action-ledger-state/**
+          path: ${{ steps.mutate-action-ledger.outputs.output-root }}/**
           include-hidden-files: true
-          if-no-files-found: ignore
+          if-no-files-found: error
           retention-days: 90
 
       - name: Fail incomplete post-flight result
@@ -1884,83 +1915,123 @@ jobs:
         with:
           build-script: build:repair
 
-      - name: Resolve repair action ledger shards
-        id: repair-action-ledger-artifacts
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          rows="$(
-            gh api --paginate \
-              "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts?per_page=100" \
-              --jq '.artifacts[] | [.id, .name, .expired] | @tsv'
-          )"
-          artifact_ids=()
-          while IFS=$'\t' read -r artifact_id artifact_name expired; do
-            if [ -z "$artifact_id" ]; then
-              continue
-            fi
-            case "$artifact_name" in
-              "clawsweeper-repair-action-ledger-cluster-${GITHUB_RUN_ID}-"* | \
-              "clawsweeper-repair-action-ledger-execute-${GITHUB_RUN_ID}-"* | \
-              "clawsweeper-repair-action-ledger-mutate-${GITHUB_RUN_ID}-"*) ;;
-              *) continue ;;
-            esac
-            if [ "$expired" = "true" ]; then
-              echo "Repair action ledger artifact expired before publication: $artifact_name" >&2
-              exit 1
-            fi
-            artifact_attempt="${artifact_name##*-}"
-            if ! [[ "$artifact_attempt" =~ ^[1-9][0-9]*$ ]]; then
-              echo "Invalid repair action ledger artifact name: $artifact_name" >&2
-              exit 1
-            fi
-            if ! [[ "$artifact_id" =~ ^[1-9][0-9]*$ ]]; then
-              echo "Invalid repair action ledger artifact id: $artifact_id" >&2
-              exit 1
-            fi
-            artifact_ids+=("$artifact_id")
-          done <<< "$rows"
-          if [ "${#artifact_ids[@]}" -eq 0 ]; then
-            echo "has_artifacts=0" >> "$GITHUB_OUTPUT"
-            echo "::notice title=No repair action ledger artifacts::No repair receipt shards were produced by this workflow run."
-            exit 0
-          fi
-          if [ "${#artifact_ids[@]}" -gt 64 ]; then
-            echo "Repair action ledger artifact count exceeds the bounded publication limit." >&2
-            exit 1
-          fi
-          mapfile -t artifact_ids < <(printf '%s\n' "${artifact_ids[@]}" | sort -n -u)
-          artifact_ids_csv="$(IFS=,; printf '%s' "${artifact_ids[*]}")"
-          echo "artifact_ids=$artifact_ids_csv" >> "$GITHUB_OUTPUT"
-          echo "has_artifacts=1" >> "$GITHUB_OUTPUT"
-
-      - name: Download repair action ledger shards
-        if: ${{ steps.repair-action-ledger-artifacts.outputs.has_artifacts == '1' }}
+      - name: Download cluster repair action ledger
         uses: actions/download-artifact@v8
         with:
-          artifact-ids: ${{ steps.repair-action-ledger-artifacts.outputs.artifact_ids }}
-          path: .clawsweeper-repair/action-ledger-download
+          artifact-ids: ${{ needs.cluster.outputs.action_ledger_artifact_id }}
+          path: .clawsweeper-repair/action-ledger-download/cluster
           github-token: ${{ github.token }}
           repository: ${{ github.repository }}
           run-id: ${{ github.run_id }}
-          merge-multiple: true
+
+      - name: Download execution repair action ledger
+        if: ${{ needs.execute.outputs.action_ledger_artifact_id != '' }}
+        uses: actions/download-artifact@v8
+        with:
+          artifact-ids: ${{ needs.execute.outputs.action_ledger_artifact_id }}
+          path: .clawsweeper-repair/action-ledger-download/execute
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+
+      - name: Download mutation repair action ledger
+        if: ${{ needs.mutate.outputs.action_ledger_artifact_id != '' }}
+        uses: actions/download-artifact@v8
+        with:
+          artifact-ids: ${{ needs.mutate.outputs.action_ledger_artifact_id }}
+          path: .clawsweeper-repair/action-ledger-download/mutate
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
 
       - name: Publish immutable repair action ledger
-        if: ${{ steps.repair-action-ledger-artifacts.outputs.has_artifacts == '1' }}
+        env:
+          CLUSTER_LEDGER_ARTIFACT_ID: ${{ needs.cluster.outputs.action_ledger_artifact_id }}
+          CLUSTER_LEDGER_ATTEMPT: ${{ needs.cluster.outputs.producer_attempt }}
+          EXECUTE_LEDGER_ARTIFACT_ID: ${{ needs.execute.outputs.action_ledger_artifact_id }}
+          EXECUTE_LEDGER_ATTEMPT: ${{ needs.execute.outputs.action_ledger_producer_attempt }}
+          EXECUTE_JOB_RESULT: ${{ needs.execute.result }}
+          MUTATE_LEDGER_ARTIFACT_ID: ${{ needs.mutate.outputs.action_ledger_artifact_id }}
+          MUTATE_LEDGER_ATTEMPT: ${{ needs.mutate.outputs.action_ledger_producer_attempt }}
+          MUTATE_JOB_RESULT: ${{ needs.mutate.result }}
         run: |
           set -euo pipefail
           test -n "${CLAWSWEEPER_STATE_DIR:-}"
-          source_root=".clawsweeper-repair/action-ledger-download"
           event_paths_file=".artifacts/repair-action-ledger-paths.txt"
           mkdir -p .artifacts
-          pnpm run --silent repair:action-ledger -- publish \
-            --source-root "$source_root" \
-            --state-root "$CLAWSWEEPER_STATE_DIR" |
-            jq -r '.paths[]?' |
-            sort -u > "$event_paths_file"
+          : > "$event_paths_file"
+          publish_lane() {
+            local lane="$1"
+            local job="$2"
+            local run_attempt="$3"
+            local source_root=".clawsweeper-repair/action-ledger-download/$lane"
+            local manifest_file="$source_root/repair-action-ledger-manifest.json"
+            local import_result_file=".artifacts/$lane-action-ledger-import.json"
+            test -s "$manifest_file"
+            pnpm run --silent repair:action-ledger -- publish \
+              --repair-lane "$lane" \
+              --manifest "$manifest_file" \
+              --expected-job "$job" \
+              --expected-run-attempt "$run_attempt" \
+              --source-root "$source_root" \
+              --state-root "$CLAWSWEEPER_STATE_DIR" > "$import_result_file"
+            jq -e --slurpfile manifest "$manifest_file" \
+              '.eventPaths == $manifest[0].event_paths' \
+              "$import_result_file" >/dev/null
+            jq -r '.paths[]?' "$import_result_file" >> "$event_paths_file"
+          }
+          require_lane() {
+            local lane="$1"
+            local job_result="$2"
+            local artifact_id="$3"
+            local run_attempt="$4"
+            if [ "$job_result" = "skipped" ]; then
+              if [ -n "$artifact_id" ] || [ -n "$run_attempt" ]; then
+                echo "Skipped $lane job exposed unexpected action ledger outputs." >&2
+                exit 1
+              fi
+              return
+            fi
+            if ! [[ "$artifact_id" =~ ^[1-9][0-9]*$ ]] ||
+               ! [[ "$run_attempt" =~ ^[1-9][0-9]*$ ]]; then
+              echo "$lane job did not expose an exact action ledger artifact and attempt." >&2
+              exit 1
+            fi
+          }
+          verify_lane() {
+            local lane="$1"
+            local job="$2"
+            local run_attempt="$3"
+            local source_root=".clawsweeper-repair/action-ledger-download/$lane"
+            local manifest_file="$source_root/repair-action-ledger-manifest.json"
+            test -s "$manifest_file"
+            pnpm run --silent repair:action-ledger -- verify \
+              --repair-lane "$lane" \
+              --manifest "$manifest_file" \
+              --expected-job "$job" \
+              --expected-run-attempt "$run_attempt" \
+              --source-root "$source_root" >/dev/null
+          }
+          require_lane cluster "${{ needs.cluster.result }}" "$CLUSTER_LEDGER_ARTIFACT_ID" "$CLUSTER_LEDGER_ATTEMPT"
+          require_lane execute "$EXECUTE_JOB_RESULT" "$EXECUTE_LEDGER_ARTIFACT_ID" "$EXECUTE_LEDGER_ATTEMPT"
+          require_lane mutate "$MUTATE_JOB_RESULT" "$MUTATE_LEDGER_ARTIFACT_ID" "$MUTATE_LEDGER_ATTEMPT"
+          verify_lane cluster cluster "$CLUSTER_LEDGER_ATTEMPT"
+          if [ "$EXECUTE_JOB_RESULT" != "skipped" ]; then
+            verify_lane execute execute "$EXECUTE_LEDGER_ATTEMPT"
+          fi
+          if [ "$MUTATE_JOB_RESULT" != "skipped" ]; then
+            verify_lane mutate mutate "$MUTATE_LEDGER_ATTEMPT"
+          fi
+          publish_lane cluster cluster "$CLUSTER_LEDGER_ATTEMPT"
+          if [ "$EXECUTE_JOB_RESULT" != "skipped" ]; then
+            publish_lane execute execute "$EXECUTE_LEDGER_ATTEMPT"
+          fi
+          if [ "$MUTATE_JOB_RESULT" != "skipped" ]; then
+            publish_lane mutate mutate "$MUTATE_LEDGER_ATTEMPT"
+          fi
+          sort -u -o "$event_paths_file" "$event_paths_file"
           if [ ! -s "$event_paths_file" ]; then
-            echo "Repair action ledger artifacts were selected but no paths were imported." >&2
+            echo "Repair action ledger manifests imported no durable paths." >&2
             exit 1
           fi
           action_ledger_args=()

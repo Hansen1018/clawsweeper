@@ -266,19 +266,22 @@ test("repair workflow resolves producer artifacts by trusted id across rerun att
       /uses: actions\/download-artifact@v8\n\s+with:\n([\s\S]*?)(?=\n\s{6}- (?:name|uses):|\n\n)/g,
     ),
   ];
-  assert.equal(downloadBlocks.length, 17);
-  const collectorDownload = downloadBlocks.find((block) =>
-    block[1]!.includes("steps.repair-action-ledger-artifacts.outputs.artifact_ids"),
+  assert.equal(downloadBlocks.length, 19);
+  const collectorDownloads = downloadBlocks.filter((block) =>
+    block[1]!.includes("action_ledger_artifact_id"),
   );
-  assert.ok(collectorDownload);
-  assert.match(collectorDownload[1]!, /github-token: \$\{\{ github\.token \}\}/);
-  assert.match(collectorDownload[1]!, /run-id: \$\{\{ github\.run_id \}\}/);
-  assert.match(collectorDownload[1]!, /merge-multiple: true/);
-  const exactArtifactDownloads = downloadBlocks.filter(
-    (block) => block !== collectorDownload && block[1]!.includes("artifact-ids:"),
+  assert.equal(collectorDownloads.length, 3);
+  for (const collectorDownload of collectorDownloads) {
+    assert.match(collectorDownload[1]!, /github-token: \$\{\{ github\.token \}\}/);
+    assert.match(collectorDownload[1]!, /run-id: \$\{\{ github\.run_id \}\}/);
+    assert.doesNotMatch(collectorDownload[1]!, /merge-multiple: true/);
+  }
+  assert.equal(downloadBlocks.filter((block) => block[1]!.includes("artifact-ids:")).length, 19);
+  const resolvedArtifactDownloads = downloadBlocks.filter(
+    (block) => block[1]!.includes("steps.") && block[1]!.includes(".outputs.artifact_id"),
   );
-  assert.equal(exactArtifactDownloads.length, 16);
-  for (const block of exactArtifactDownloads) {
+  assert.equal(resolvedArtifactDownloads.length, 16);
+  for (const block of resolvedArtifactDownloads) {
     assert.match(block[1]!, /artifact-ids: \$\{\{ steps\.[^.]+\.outputs\.artifact_id \}\}/);
     assert.match(block[1]!, /github-token: \$\{\{ github\.token \}\}/);
     assert.match(block[1]!, /run-id: \$\{\{ github\.run_id \}\}/);
@@ -286,7 +289,7 @@ test("repair workflow resolves producer artifacts by trusted id across rerun att
   }
   assert.equal(
     [...workflow.matchAll(/pnpm run repair:resolve-run-artifact/g)].length,
-    exactArtifactDownloads.length,
+    resolvedArtifactDownloads.length,
   );
   assert.doesNotMatch(workflow, /pattern: clawsweeper-repair-action-ledger-\*/);
   assert.match(

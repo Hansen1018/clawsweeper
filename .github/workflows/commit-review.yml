@@ -390,6 +390,7 @@ jobs:
           permission-pull-requests: read
 
       - uses: ./clawsweeper/.github/actions/setup-action-ledger
+        id: review-action-ledger
         with:
           worktree-path: clawsweeper
 
@@ -504,14 +505,19 @@ jobs:
       - name: Finalize commit review action ledger
         if: ${{ always() && steps.review-setup-pnpm.outcome == 'success' }}
         working-directory: clawsweeper
-        run: pnpm run --silent repair:action-ledger -- finalize
+        run: |
+          set -euo pipefail
+          output_root="${CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:?setup-action-ledger output root is required}"
+          pnpm run --silent repair:action-ledger -- finalize \
+            --repair-lane "commit-review-${{ matrix.sha }}" \
+            > "$output_root/repair-action-ledger-manifest.json"
 
       - name: Upload commit review action ledger
         if: ${{ always() && steps.review-setup-pnpm.outcome == 'success' }}
         uses: actions/upload-artifact@v7
         with:
           name: action-ledger-commit-review-${{ matrix.sha }}-${{ github.run_attempt }}
-          path: clawsweeper/.clawsweeper-repair/action-ledger-state/**
+          path: ${{ steps.review-action-ledger.outputs.output-root }}/**
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 90
@@ -565,9 +571,9 @@ jobs:
       - uses: actions/download-artifact@v8
         if: ${{ needs.plan.outputs.planned_count != '0' }}
         with:
-          pattern: action-ledger-commit-review-*
+          pattern: action-ledger-commit-review-*-${{ github.run_attempt }}
           path: .clawsweeper-repair/action-ledger-download
-          merge-multiple: true
+          merge-multiple: false
 
       - uses: actions/download-artifact@v8
         if: ${{ needs.plan.outputs.planned_count != '0' }}
@@ -650,33 +656,117 @@ jobs:
 
       - name: Finalize commit publication action ledger
         if: ${{ always() && steps.publish-setup-pnpm.outcome == 'success' }}
-        run: pnpm run --silent repair:action-ledger -- finalize
+        run: |
+          set -euo pipefail
+          : "${CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:?setup-action-ledger output root is required}"
+          mkdir -p .artifacts
+          pnpm run --silent repair:action-ledger -- finalize \
+            --repair-lane commit-publication \
+            > .artifacts/commit-publication-action-ledger-manifest.json
 
       - name: Publish immutable commit review action ledger
         if: ${{ always() && steps.publish-setup-pnpm.outcome == 'success' }}
+        env:
+          EXPECTED_COMMIT_MATRIX: ${{ needs.plan.outputs.matrix }}
         run: |
           set -euo pipefail
           test -n "${CLAWSWEEPER_STATE_DIR:-}"
+          source_root="${CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:?setup-action-ledger output root is required}"
           mkdir -p .artifacts
-          if [ ! -d .clawsweeper-repair/action-ledger-download/ledger ] &&
-             [ ! -d .clawsweeper-repair/action-ledger-state/ledger ]; then
-            echo "No commit review action event shards were finalized."
-            exit 0
-          fi
           event_paths_file=".artifacts/commit-review-action-ledger-paths.txt"
           : > "$event_paths_file"
-          for source_root in \
-            .clawsweeper-repair/action-ledger-download \
-            .clawsweeper-repair/action-ledger-state
-          do
-            if [ ! -d "$source_root/ledger" ]; then
-              continue
+          shopt -s nullglob
+          review_roots=(.clawsweeper-repair/action-ledger-download/action-ledger-commit-review-*)
+          expected_shas_file=".artifacts/expected-commit-review-shas.txt"
+          actual_shas_file=".artifacts/actual-commit-review-shas.txt"
+          jq -er 'map(.sha) | if all(.[]; test("^[a-f0-9]{40}$")) then .[] else error("invalid commit review SHA") end' \
+            <<< "$EXPECTED_COMMIT_MATRIX" | sort -u > "$expected_shas_file"
+          if [ "$(wc -l < "$expected_shas_file" | tr -d ' ')" != "${{ needs.plan.outputs.planned_count }}" ]; then
+            echo "Commit review matrix count does not match planned_count." >&2
+            exit 1
+          fi
+          : > "$actual_shas_file"
+          for review_root in "${review_roots[@]}"; do
+            artifact_name="$(basename "$review_root")"
+            artifact_attempt="${artifact_name##*-}"
+            commit_sha="${artifact_name#action-ledger-commit-review-}"
+            commit_sha="${commit_sha%-$artifact_attempt}"
+            if ! [[ "$commit_sha" =~ ^[a-f0-9]{40}$ ]] ||
+               [ "$artifact_attempt" != "$GITHUB_RUN_ATTEMPT" ]; then
+              echo "Invalid commit review action ledger artifact identity: $artifact_name" >&2
+              exit 1
             fi
-            pnpm run --silent repair:action-ledger -- publish \
-              --source-root "$source_root" \
-              --state-root "$CLAWSWEEPER_STATE_DIR" |
-              jq -r '.paths[]?' >> "$event_paths_file"
+            echo "$commit_sha" >> "$actual_shas_file"
           done
+          sort -u -o "$actual_shas_file" "$actual_shas_file"
+          if ! cmp -s "$expected_shas_file" "$actual_shas_file"; then
+            echo "Commit review action ledger artifacts do not match the planned matrix." >&2
+            diff -u "$expected_shas_file" "$actual_shas_file" >&2 || true
+            exit 1
+          fi
+          verify_lane() {
+            local lane="$1"
+            local job="$2"
+            local run_attempt="$3"
+            local source_root="$4"
+            local manifest_file="$5"
+            test -s "$manifest_file"
+            pnpm run --silent repair:action-ledger -- verify \
+              --repair-lane "$lane" \
+              --manifest "$manifest_file" \
+              --expected-job "$job" \
+              --expected-run-attempt "$run_attempt" \
+              --source-root "$source_root" >/dev/null
+          }
+          for review_root in "${review_roots[@]}"; do
+            artifact_name="$(basename "$review_root")"
+            artifact_attempt="${artifact_name##*-}"
+            commit_sha="${artifact_name#action-ledger-commit-review-}"
+            commit_sha="${commit_sha%-$artifact_attempt}"
+            verify_lane \
+              "commit-review-$commit_sha" \
+              review \
+              "$artifact_attempt" \
+              "$review_root" \
+              "$review_root/repair-action-ledger-manifest.json"
+          done
+          verify_lane \
+            commit-publication \
+            publish \
+            "$GITHUB_RUN_ATTEMPT" \
+            "$source_root" \
+            .artifacts/commit-publication-action-ledger-manifest.json
+          for review_root in "${review_roots[@]}"; do
+            artifact_name="$(basename "$review_root")"
+            artifact_attempt="${artifact_name##*-}"
+            commit_sha="${artifact_name#action-ledger-commit-review-}"
+            commit_sha="${commit_sha%-$artifact_attempt}"
+            manifest_file="$review_root/repair-action-ledger-manifest.json"
+            import_result_file=".artifacts/commit-review-$commit_sha-action-ledger-import.json"
+            pnpm run --silent repair:action-ledger -- publish \
+              --repair-lane "commit-review-$commit_sha" \
+              --manifest "$manifest_file" \
+              --expected-job review \
+              --expected-run-attempt "$artifact_attempt" \
+              --source-root "$review_root" \
+              --state-root "$CLAWSWEEPER_STATE_DIR" > "$import_result_file"
+            jq -e --slurpfile manifest "$manifest_file" \
+              '.eventPaths == $manifest[0].event_paths' \
+              "$import_result_file" >/dev/null
+            jq -r '.paths[]?' "$import_result_file" >> "$event_paths_file"
+          done
+          manifest_file=".artifacts/commit-publication-action-ledger-manifest.json"
+          import_result_file=".artifacts/commit-publication-action-ledger-import.json"
+          test -s "$manifest_file"
+          pnpm run --silent repair:action-ledger -- publish \
+            --repair-lane commit-publication \
+            --manifest "$manifest_file" \
+            --source-root "$source_root" \
+            --state-root "$CLAWSWEEPER_STATE_DIR" > "$import_result_file"
+          jq -e --slurpfile manifest "$manifest_file" \
+            '.eventPaths == $manifest[0].event_paths' \
+            "$import_result_file" >/dev/null
+          jq -r '.paths[]?' "$import_result_file" >> "$event_paths_file"
           sort -u -o "$event_paths_file" "$event_paths_file"
           if [ ! -s "$event_paths_file" ]; then
             echo "Commit review action event shards existed but no paths were imported." >&2

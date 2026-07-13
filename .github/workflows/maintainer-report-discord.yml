@@ -93,23 +93,35 @@ jobs:
 
       - name: Finalize maintainer notification action ledger
         if: ${{ always() && steps.setup-pnpm.outcome == 'success' }}
-        run: pnpm run --silent repair:action-ledger -- finalize
+        run: |
+          set -euo pipefail
+          : "${CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:?setup-action-ledger output root is required}"
+          mkdir -p .artifacts
+          pnpm run --silent repair:action-ledger -- finalize \
+            --repair-lane maintainer-notification \
+            > .artifacts/maintainer-notification-action-ledger-manifest.json
 
       - name: Publish immutable maintainer notification action ledger
         if: ${{ always() && steps.setup-pnpm.outcome == 'success' }}
         run: |
           set -euo pipefail
-          source_root=".clawsweeper-repair/action-ledger-state"
-          if [ ! -d "$source_root/ledger" ]; then
-            exit 0
-          fi
+          test -n "${CLAWSWEEPER_STATE_DIR:-}"
+          source_root="${CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:?setup-action-ledger output root is required}"
+          manifest_file=".artifacts/maintainer-notification-action-ledger-manifest.json"
           paths_file=".artifacts/maintainer-notification-action-ledger-paths.txt"
+          import_result_file=".artifacts/maintainer-notification-action-ledger-import.json"
           mkdir -p .artifacts
+          test -s "$manifest_file"
           pnpm run --silent repair:action-ledger -- publish \
+            --repair-lane maintainer-notification \
+            --manifest "$manifest_file" \
             --source-root "$source_root" \
-            --state-root "$CLAWSWEEPER_STATE_DIR" |
-            jq -r '.paths[]?' |
-            sort -u > "$paths_file"
+            --state-root "$CLAWSWEEPER_STATE_DIR" > "$import_result_file"
+          jq -e --slurpfile manifest "$manifest_file" \
+            '.eventPaths == $manifest[0].event_paths' \
+            "$import_result_file" >/dev/null
+          jq -r '.paths[]?' "$import_result_file" | sort -u > "$paths_file"
+          test -s "$paths_file"
           action_ledger_args=()
           while IFS= read -r event_path; do
             durable_event_path="$CLAWSWEEPER_STATE_DIR/$event_path"

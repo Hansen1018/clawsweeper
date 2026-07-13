@@ -99,13 +99,20 @@ checkpoint, and status-only commits are intentionally omitted.
   receipts before dispatch, and local-only lifecycle steps do not receive the
   CrabFleet service token. Credential-isolated worker jobs upload finalized
   shards for one state-authorized collector, while existing state-authorized
-  publishers import their own shards directly.
+  publishers import their own shards directly. Repair and commit publishers
+  now use the setup-provided canonical output root, bind every artifact to an
+  exact lane, job, run, and attempt manifest, preflight the complete expected
+  producer set before state import, and reject missing, extra, or cross-run
+  shards instead of silently publishing an incomplete ledger.
 - Added exact repair request-boundary receipts for branch, pull request,
   comment, label, review-thread, continuation-dispatch, source-close
   compensation, closeout, and merge mutations, preserving accepted and unknown
-  outcomes through later failures. Added digest-bound repair and commit-review
-  Codex log/report lifecycles, request-bound commit-check and notification
-  delivery receipts, generic workflow attempt/finalization events, and
+  outcomes through later failures. Merge, close, comment, label, CrabFleet,
+  and dashboard requests now emit one receipt pair per actual one-shot request,
+  including unknown response-loss outcomes. Added digest-bound repair and
+  commit-review Codex log/report lifecycles, request-bound commit-check and
+  notification delivery receipts, generic workflow attempt/finalization
+  events, interruption recovery for unfinished generic Codex reviews, and
   immutable workflow publication of the resulting shards.
 - Short-circuited authenticated duplicate comment deliveries when their exact
   body version is already terminal in the durable router ledger, while edited,

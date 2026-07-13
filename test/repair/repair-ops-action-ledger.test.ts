@@ -122,21 +122,28 @@ test("repair worker jobs upload shards and one credentialed job publishes them",
   assert.match(publisher, /name: Publish immutable repair action ledger/);
   assert.match(publisher, /needs:\s+- cluster\s+- execute\s+- mutate/);
   assert.match(publisher, /create-state-token/);
-  assert.match(publisher, /name: Resolve repair action ledger shards/);
-  assert.match(publisher, /has_artifacts=0/);
   assert.match(
     publisher,
-    /artifact-ids: \$\{\{ steps\.repair-action-ledger-artifacts\.outputs\.artifact_ids \}\}/,
+    /artifact-ids: \$\{\{ needs\.cluster\.outputs\.action_ledger_artifact_id \}\}/,
   );
-  assert.doesNotMatch(
+  assert.match(
     publisher,
-    /continue-on-error: true[\s\S]*Download repair action ledger shards/,
+    /artifact-ids: \$\{\{ needs\.execute\.outputs\.action_ledger_artifact_id \}\}/,
+  );
+  assert.match(
+    publisher,
+    /artifact-ids: \$\{\{ needs\.mutate\.outputs\.action_ledger_artifact_id \}\}/,
   );
   assert.match(publisher, /repair:action-ledger -- publish/);
-  assert.match(publisher, /clawsweeper-repair-action-ledger-execute-/);
+  assert.match(publisher, /--repair-lane "\$lane"/);
+  assert.match(publisher, /--expected-job "\$job"/);
+  assert.match(publisher, /--expected-run-attempt "\$run_attempt"/);
+  assert.match(publisher, /publish_lane cluster cluster/);
+  assert.match(publisher, /publish_lane execute execute/);
+  assert.match(publisher, /publish_lane mutate mutate/);
   assert.match(
     publisher,
-    /Repair action ledger artifacts were selected but no paths were imported\." >&2\s+exit 1/,
+    /require_lane cluster[\s\S]*require_lane execute[\s\S]*require_lane mutate[\s\S]*verify_lane cluster[\s\S]*verify_lane execute[\s\S]*verify_lane mutate[\s\S]*publish_lane cluster/,
   );
   assert.match(publisher, /--message "chore: append repair action ledger"/);
 });
@@ -202,6 +209,11 @@ test("repair mutation and Codex boundaries emit exact immutable receipts", () =>
   assert.match(postFlight, /post_flight_merge/);
   assert.match(postFlight, /closeout_comment/);
   assert.match(postFlight, /source_pull_request_closeout/);
+  assert.match(postFlight, /\(\) => ghText\(mergeArgs\)/);
+  assert.match(postFlight, /\(\) => ghText\(\["pr", "close"/);
+  assert.doesNotMatch(postFlight, /\(\) => ghWithRetry\(mergeArgs\)/);
+  assert.doesNotMatch(postFlight, /\(\) => ghWithRetry\(\["pr", "close"/);
+  assert.doesNotMatch(postFlight, /ghBestEffort/);
   assert.match(postFlight, /recordPostFlightWorkflowEventSafely\("started"\)/);
   assert.match(postFlight, /recordPostFlightWorkflowEventSafely\("failed", error\)/);
   assert.match(postFlight, /recordPostFlightWorkflowEventSafely\("finalized"\)/);
@@ -293,4 +305,37 @@ test("the shared action ledger finalizer is operation-family agnostic", () => {
   assert.match(source, /flushRepairActionEvents\(\)/);
   assert.doesNotMatch(source, /flushWorkflowActionEvents/);
   assert.doesNotMatch(source, /flushCommandActionEvents/);
+});
+
+test("repair and commit publishers require canonical exact manifests", () => {
+  for (const workflowPath of [
+    ".github/workflows/commit-review.yml",
+    ".github/workflows/github-activity.yml",
+    ".github/workflows/maintainer-report-discord.yml",
+    ".github/workflows/repair-cluster-worker.yml",
+    ".github/workflows/repair-finalize-open-prs.yml",
+    ".github/workflows/repair-issue-implementation-intake.yml",
+    ".github/workflows/repair-publish-results.yml",
+  ]) {
+    const workflow = readText(workflowPath);
+    assert.match(workflow, /CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT/);
+    assert.match(workflow, /--repair-lane/);
+    assert.match(workflow, /action-ledger-manifest\.json/);
+    assert.match(workflow, /\.eventPaths == \$manifest\[0\]\.event_paths/);
+    assert.doesNotMatch(workflow, /\.clawsweeper-repair\/action-ledger-state/);
+  }
+  const collector = readText("src/repair/action-ledger-cli.ts");
+  assert.match(collector, /assertRepairActionLedgerManifestSource/);
+  assert.match(collector, /command === "verify"/);
+  assert.match(collector, /expectedProducer/);
+  assert.match(collector, /expectedEventPaths: manifest\.event_paths/);
+  assert.match(collector, /publication requires --repair-lane and --manifest/);
+  const commit = readText(".github/workflows/commit-review.yml");
+  assert.match(commit, /pattern: action-ledger-commit-review-\*-\$\{\{ github\.run_attempt \}\}/);
+  assert.match(commit, /EXPECTED_COMMIT_MATRIX:/);
+  assert.match(commit, /cmp -s "\$expected_shas_file" "\$actual_shas_file"/);
+  assert.match(
+    commit,
+    /repair:action-ledger -- verify[\s\S]*for review_root in "\$\{review_roots\[@\]\}"[\s\S]*repair:action-ledger -- publish/,
+  );
 });
