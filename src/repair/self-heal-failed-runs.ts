@@ -52,6 +52,15 @@ type RunGeneration = {
   records: JsonObject[];
 };
 
+type RunRecordProvenance = {
+  effectiveMode: string;
+  immutableJobKey: string;
+  jobSha256: string;
+  stateRevision: string;
+};
+
+const runRecordProvenanceCache = new WeakMap<JsonObject, RunRecordProvenance>();
+
 const args = parseArgs(process.argv.slice(2));
 const repo = String(args.repo ?? DEFAULT_REPO);
 const workflow = String(args.workflow ?? DEFAULT_WORKFLOW);
@@ -222,7 +231,7 @@ function selectCandidates() {
   }
   const generationsByJob = new Map<string, Map<string, RunGeneration>>();
 
-  for (const [recordIndex, record] of records.entries()) {
+  for (const record of records) {
     const sourceJob = record.source_job;
     if (typeof sourceJob !== "string" || !sourceJob) {
       skippedCandidates.push({ reason: "missing_source_job", run_id: record.run_id ?? null });
@@ -233,7 +242,18 @@ function selectCandidates() {
       generations = new Map();
       generationsByJob.set(sourceJob, generations);
     }
-    const generationKey = runGenerationKey(record, recordIndex);
+    let generationKey: string;
+    try {
+      generationKey = runGenerationKey(record, sourceJob);
+    } catch (error) {
+      skippedCandidates.push({
+        reason: "immutable_provenance_unavailable",
+        run_id: record.run_id ?? null,
+        source_job: sourceJob,
+        detail: error instanceof Error ? error.message : String(error),
+      });
+      continue;
+    }
     const generation = generations.get(generationKey);
     if (!generation) {
       generations.set(generationKey, { latest: record, records: [record] });
@@ -341,12 +361,9 @@ function selectCandidates() {
     .sort((left: JsonValue, right: JsonValue) => runSortKey(right) - runSortKey(left));
 }
 
-function runGenerationKey(record: JsonObject, recordIndex: number): string {
-  const jobSha256 = String(record.source_job_sha256 ?? "").trim();
-  if (JOB_SHA256.test(jobSha256)) return `digest:${jobSha256}`;
-  const runId = String(record.run_id ?? "").trim();
-  if (/^[1-9][0-9]*$/.test(runId)) return `run:${runId}`;
-  return `record:${recordIndex}`;
+function runGenerationKey(record: JsonObject, sourceJob: string): string {
+  const provenance = resolveRunRecordProvenance(record, sourceJob);
+  return JSON.stringify([provenance.immutableJobKey, provenance.effectiveMode]);
 }
 
 function isNewerRunRecord(candidate: JsonObject, current: JsonObject): boolean {
@@ -533,6 +550,20 @@ function readRunRecords() {
 }
 
 function resolveRunRecordJob(record: LooseRecord, sourceJob: string) {
+  const provenance = resolveRunRecordProvenance(record, sourceJob);
+  ensureHistoricalStateRevision(provenance.stateRevision);
+  const immutableJob = resolveStateJobIdentity({
+    jobPath: sourceJob,
+    stateRevision: provenance.stateRevision,
+    jobSha256: provenance.jobSha256,
+  });
+  return { immutableJob, effectiveMode: provenance.effectiveMode };
+}
+
+function resolveRunRecordProvenance(record: JsonObject, sourceJob: string): RunRecordProvenance {
+  const cached = runRecordProvenanceCache.get(record);
+  if (cached) return cached;
+
   let stateRevision = String(record.source_state_revision ?? "").trim();
   let jobSha256 = String(record.source_job_sha256 ?? "").trim();
   const recordMode = validatedRunRecordMode(record.mode);
@@ -559,13 +590,18 @@ function resolveRunRecordJob(record: LooseRecord, sourceJob: string) {
   if (effectiveMode === null) {
     throw new Error("run record is missing validated effective repair mode");
   }
-  ensureHistoricalStateRevision(stateRevision);
-  const immutableJob = resolveStateJobIdentity({
-    jobPath: sourceJob,
-    stateRevision,
+  const provenance = {
+    effectiveMode,
+    immutableJobKey: immutableJobIdentityKey({
+      jobPath: sourceJob,
+      stateRevision,
+      jobSha256,
+    }),
     jobSha256,
-  });
-  return { immutableJob, effectiveMode };
+    stateRevision,
+  };
+  runRecordProvenanceCache.set(record, provenance);
+  return provenance;
 }
 
 function validatedRunRecordMode(value: unknown): string | null {

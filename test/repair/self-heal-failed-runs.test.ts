@@ -166,6 +166,34 @@ test("failed-run self-heal preserves a durable gate-downgraded effective mode", 
   }
 });
 
+test("failed-run self-heal keeps a later autonomous failure after a successful plan downgrade", () => {
+  const fixture = createSelfHealFixture("cross-mode-generation", "autonomous");
+  const autonomousRunId = String(Number(fixture.runId) + 1);
+  try {
+    writeRunRecord(fixture.runsDir, fixture.runId, {
+      source_job: fixture.jobPath,
+      source_state_revision: fixture.originalRevision,
+      source_job_sha256: fixture.originalDigest,
+      mode: "plan",
+      workflow_conclusion: "success",
+    });
+    writeRunRecord(fixture.runsDir, autonomousRunId, {
+      source_job: fixture.jobPath,
+      source_state_revision: fixture.originalRevision,
+      source_job_sha256: fixture.originalDigest,
+      mode: "autonomous",
+    });
+
+    const summary = runSelfHeal(fixture);
+    assert.equal(summary.candidates.length, 1);
+    assert.equal(summary.candidates[0].source_run_id, autonomousRunId);
+    assert.equal(summary.candidates[0].source_job_sha256, fixture.originalDigest);
+    assert.equal(summary.candidates[0].mode, "autonomous");
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
 test("failed-run self-heal recovers an early gate downgrade before worker results exist", () => {
   const fixture = createSelfHealFixture("early-downgrade", "autonomous");
   try {
@@ -248,6 +276,13 @@ test("failed-run self-heal ignores a newer receipt-only duplicate success", () =
         url: `https://github.test/actions/runs/${Number(fixture.runId) + 1}`,
       },
     ]);
+    writeWorkflowInputs(fixture.artifactFixture, String(Number(fixture.runId) + 1), 1, {
+      sourceJob: fixture.jobPath,
+      stateRevision: fixture.originalRevision,
+      jobSha256: fixture.originalDigest,
+      requestedMode: "plan",
+      effectiveMode: "plan",
+    });
     writeRunJobs(fixture, [
       { name: "Deduplicate command dispatch receipt", conclusion: "success" },
       { name: "Plan and review cluster", conclusion: "skipped" },
@@ -275,7 +310,7 @@ test("failed-run self-heal does not replay an older immutable generation after s
       {
         databaseId: Number(fixture.runId) + 1,
         workflowName: "repair cluster worker",
-        displayTitle: `repair cluster ${fixture.jobPath} (${"f".repeat(64)})`,
+        displayTitle: `repair cluster ${fixture.jobPath} (${fixture.replacementDigest})`,
         status: "completed",
         conclusion: "success",
         createdAt: new Date().toISOString(),
@@ -283,6 +318,13 @@ test("failed-run self-heal does not replay an older immutable generation after s
         url: `https://github.test/actions/runs/${Number(fixture.runId) + 1}`,
       },
     ]);
+    writeWorkflowInputs(fixture.artifactFixture, String(Number(fixture.runId) + 1), 1, {
+      sourceJob: fixture.jobPath,
+      stateRevision: fixture.replacementRevision,
+      jobSha256: fixture.replacementDigest,
+      requestedMode: "autonomous",
+      effectiveMode: "autonomous",
+    });
     writeRunJobs(fixture, [{ name: "Plan and review cluster", conclusion: "success" }]);
 
     const summary = runSelfHeal(fixture);
@@ -313,6 +355,13 @@ test("failed-run self-heal honors a newer executed success in the same generatio
         url: `https://github.test/actions/runs/${Number(fixture.runId) + 1}`,
       },
     ]);
+    writeWorkflowInputs(fixture.artifactFixture, String(Number(fixture.runId) + 1), 1, {
+      sourceJob: fixture.jobPath,
+      stateRevision: fixture.originalRevision,
+      jobSha256: fixture.originalDigest,
+      requestedMode: "plan",
+      effectiveMode: "plan",
+    });
     writeRunJobs(fixture, [{ name: "Plan and review cluster", conclusion: "success" }]);
 
     const summary = runSelfHeal(fixture);
@@ -581,7 +630,9 @@ function createSelfHealFixture(label: string, originalMode: "plan" | "autonomous
   const original = repairJob(originalMode, `${label}-original`);
   const originalRevision = commitJob(stateRoot, jobPath, original, "original");
   const originalDigest = createHash("sha256").update(original).digest("hex");
-  commitJob(stateRoot, jobPath, repairJob("autonomous", `${label}-replacement`), "replacement");
+  const replacement = repairJob("autonomous", `${label}-replacement`);
+  const replacementRevision = commitJob(stateRoot, jobPath, replacement, "replacement");
+  const replacementDigest = createHash("sha256").update(replacement).digest("hex");
   writeFakeGh(binDir);
   return {
     root,
@@ -594,6 +645,8 @@ function createSelfHealFixture(label: string, originalMode: "plan" | "autonomous
     jobPath,
     originalRevision,
     originalDigest,
+    replacementRevision,
+    replacementDigest,
     runId: "910001",
   };
 }
