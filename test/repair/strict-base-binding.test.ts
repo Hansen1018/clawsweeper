@@ -326,7 +326,7 @@ test("all repair merge owners repeat the shared strict base guard immediately be
     [
       "src/repair/comment-router.ts",
       "function executeAutomerge(",
-      "const result = runGitHubSpawnMutation(",
+      "result = runGitHubSpawnMutation(",
     ],
     ["src/repair/post-flight.ts", "function finalizeFixPr(", "ghText(mergeArgs)"],
   ] as const) {
