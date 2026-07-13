@@ -50,6 +50,7 @@ writeOutputs({
 });
 
 function parseArgs(values: string[]): Map<string, string> {
+  if (values[0] === "--") values = values.slice(1);
   const parsed = new Map<string, string>();
   for (let index = 0; index < values.length; index += 2) {
     const name = values[index];

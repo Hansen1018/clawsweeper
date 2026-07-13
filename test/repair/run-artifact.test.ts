@@ -1,11 +1,58 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 
 import { resolveRunArtifact } from "../../dist/repair/run-artifact.js";
 
 const digest1 = "1".repeat(64);
 const digest2 = "2".repeat(64);
+
+test("artifact resolver accepts pnpm's forwarded argument separator", () => {
+  const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-artifact-cli-"));
+  const ghPath = path.join(binDir, "gh");
+  fs.writeFileSync(
+    ghPath,
+    `#!/usr/bin/env node
+process.stdout.write(JSON.stringify([{ artifacts: [{
+  id: 101,
+  name: "clawsweeper-repair-worker-9001-1",
+  digest: "sha256:${digest1}",
+  workflow_run: { id: 9001, run_attempt: 1 }
+}] }]));
+`,
+  );
+  fs.chmodSync(ghPath, 0o755);
+
+  try {
+    const output = execFileSync(
+      process.execPath,
+      [
+        "dist/repair/resolve-run-artifact.js",
+        "--",
+        "--repository",
+        "openclaw/clawsweeper",
+        "--run-id",
+        "9001",
+        "--current-attempt",
+        "1",
+        "--prefix",
+        "clawsweeper-repair-worker",
+      ],
+      {
+        encoding: "utf8",
+        env: { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}` },
+      },
+    );
+
+    assert.match(output, /artifact_id=101/);
+    assert.match(output, /producer_attempt=1/);
+  } finally {
+    fs.rmSync(binDir, { recursive: true, force: true });
+  }
+});
 
 test("reruns select the latest trusted producer attempt instead of the consumer attempt", () => {
   assert.deepEqual(
