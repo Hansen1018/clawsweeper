@@ -1139,6 +1139,7 @@ type ProofLaneActionLedger = {
     cursorEnabled: boolean;
   };
   batchStartEventId: string | null;
+  lastEventId: string | null;
   nextPhaseSeq: number;
   startedAtMs: number;
   mutationObserved: boolean;
@@ -27962,6 +27963,7 @@ function startProofLaneActionLedger(options: {
     lane: options.lane,
     operationIdentity,
     batchStartEventId: start?.event_id ?? null,
+    lastEventId: start?.event_id ?? null,
     nextPhaseSeq: 2,
     startedAtMs: Date.now(),
     mutationObserved: false,
@@ -28067,7 +28069,7 @@ function recordProofLaneResults(
 ): void {
   for (const [index, result] of results.entries()) {
     const disposition = proofLaneResultDisposition(result.action);
-    recordWorkflowPhaseEvent(ROOT, {
+    const event = recordWorkflowPhaseEvent(ROOT, {
       phase: ACTION_EVENT_TYPES.proofStage,
       status: disposition.status,
       reasonCode: disposition.reasonCode,
@@ -28081,7 +28083,7 @@ function recordProofLaneResults(
       },
       operation: "proof_handling",
       operationIdentity: ledger.operationIdentity,
-      parentEventId: ledger.batchStartEventId,
+      parentEventId: ledger.lastEventId,
       phaseSeq: nextProofLanePhase(ledger),
       idempotencyIdentity: {
         operationIdentity: ledger.operationIdentity,
@@ -28099,6 +28101,7 @@ function recordProofLaneResults(
       },
       privacy: actionLedgerPrivacy(),
     });
+    ledger.lastEventId = event?.event_id ?? ledger.lastEventId;
   }
 }
 
@@ -28114,7 +28117,7 @@ function recordProofLaneArtifact(
 ): void {
   const evidence = actionLedgerFileEvidence(options.evidenceKind, options.filePath);
   const recordPath = repoRelativePath(options.filePath);
-  recordWorkflowPhaseEvent(ROOT, {
+  const event = recordWorkflowPhaseEvent(ROOT, {
     phase: options.phase,
     status: evidence ? ACTION_EVENT_STATUSES.completed : ACTION_EVENT_STATUSES.skipped,
     reasonCode: evidence ? ACTION_EVENT_REASON_CODES.completed : ACTION_EVENT_REASON_CODES.notFound,
@@ -28123,7 +28126,7 @@ function recordProofLaneArtifact(
     identity: { slot: options.slot },
     operation: "proof_handling",
     operationIdentity: ledger.operationIdentity,
-    parentEventId: ledger.batchStartEventId,
+    parentEventId: ledger.lastEventId,
     phaseSeq: nextProofLanePhase(ledger),
     idempotencyIdentity: {
       operationIdentity: ledger.operationIdentity,
@@ -28145,6 +28148,7 @@ function recordProofLaneArtifact(
     },
     privacy: actionLedgerPrivacy(),
   });
+  ledger.lastEventId = event?.event_id ?? ledger.lastEventId;
 }
 
 function finishProofLaneActionLedger(
@@ -28159,7 +28163,7 @@ function finishProofLaneActionLedger(
   if (ledger.terminal) return;
   const failure =
     options.error === undefined ? null : actionLedgerFailureDisposition(options.error);
-  recordWorkflowPhaseEvent(ROOT, {
+  const event = recordWorkflowPhaseEvent(ROOT, {
     phase: ACTION_EVENT_TYPES.proofStage,
     status: failure?.status ?? ACTION_EVENT_STATUSES.completed,
     reasonCode: failure?.reasonCode ?? ACTION_EVENT_REASON_CODES.completed,
@@ -28171,7 +28175,7 @@ function finishProofLaneActionLedger(
     },
     operation: "proof_handling",
     operationIdentity: ledger.operationIdentity,
-    parentEventId: ledger.batchStartEventId,
+    parentEventId: ledger.lastEventId,
     phaseSeq: nextProofLanePhase(ledger),
     idempotencyIdentity: {
       operationIdentity: ledger.operationIdentity,
@@ -28193,6 +28197,7 @@ function finishProofLaneActionLedger(
     },
     privacy: actionLedgerPrivacy(),
   });
+  ledger.lastEventId = event?.event_id ?? ledger.lastEventId;
   ledger.terminal = true;
 }
 
@@ -28230,7 +28235,7 @@ function proofLaneMutationRunner(
       },
       operation: "proof_handling",
       operationIdentity: ledger.operationIdentity,
-      parentEventId: ledger.batchStartEventId,
+      parentEventId: ledger.lastEventId,
       phaseSeq: nextProofLanePhase(ledger),
       idempotencyIdentity: {
         operationIdentity: ledger.operationIdentity,
@@ -28247,9 +28252,10 @@ function proofLaneMutationRunner(
       },
       privacy: actionLedgerPrivacy(),
     });
+    ledger.lastEventId = attempt?.event_id ?? ledger.lastEventId;
     const finish = (outcome: "accepted" | "rejected" | "unknown"): void => {
       const mutation = outcome !== "rejected";
-      recordWorkflowPhaseEvent(ROOT, {
+      const result = recordWorkflowPhaseEvent(ROOT, {
         phase,
         status:
           outcome === "accepted"
@@ -28273,7 +28279,7 @@ function proofLaneMutationRunner(
         },
         operation: "proof_handling",
         operationIdentity: ledger.operationIdentity,
-        parentEventId: attempt?.event_id ?? ledger.batchStartEventId,
+        parentEventId: attempt?.event_id ?? ledger.lastEventId,
         phaseSeq: nextProofLanePhase(ledger),
         idempotencyIdentity: {
           operationIdentity: ledger.operationIdentity,
@@ -28291,6 +28297,7 @@ function proofLaneMutationRunner(
         },
         privacy: actionLedgerPrivacy(),
       });
+      ledger.lastEventId = result?.event_id ?? ledger.lastEventId;
       if (mutation) ledger.mutationObserved = true;
       if (outcome === "unknown") ledger.uncertainMutationObserved = true;
     };
