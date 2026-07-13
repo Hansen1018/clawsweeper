@@ -603,7 +603,7 @@ jobs:
       # codeql[actions/untrusted-checkout/critical]
       # lgtm[actions/untrusted-checkout/critical]
       - name: Commit notification receipts
-        if: ${{ steps.download.outputs.has_artifacts == '1' }}
+        if: ${{ always() && steps.download.outputs.has_artifacts == '1' && steps.app_token.outcome == 'success' }}
         env:
           GH_TOKEN: ${{ steps.app_token.outputs.token }}
         run: |

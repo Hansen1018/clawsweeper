@@ -180,6 +180,10 @@ test("repair event notifications publish durable claims before delivery and rece
   assert.match(notify, /CLAWSWEEPER_EVENT_NOTIFY_REQUIRE_DURABLE_CLAIM: "1"/);
   assert.match(receipt, /--path notifications/);
   assert.match(receipt, /CLAWSWEEPER_ACTION_LEDGER_INVOCATION=notification-receipts/);
+  assert.match(
+    receipt,
+    /if: \$\{\{ always\(\) && steps\.download\.outputs\.has_artifacts == '1' && steps\.app_token\.outcome == 'success' \}\}/,
+  );
   assert.doesNotMatch(receipt, /--best-effort-refresh/);
   assert.doesNotMatch(result, /--path notifications/);
   assert.doesNotMatch(result, /--best-effort-refresh/);

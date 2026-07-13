@@ -65,7 +65,8 @@ checkpoint, and status-only commits are intentionally omitted.
   last-message output, and collected debug artifacts before publication,
   including scheme-independent authorization and cookie headers.
 - Checkpointed accepted OpenClaw event hooks before status-dashboard delivery
-  so reruns retry only the unfinished destination instead of replaying Discord.
+  and publish those receipts after later delivery failures, so reruns retry only
+  the unfinished destination instead of replaying Discord.
 - Accepted package-manager argument separators in the action-ledger CLI and
   allowed proven zero-command router runs to finish without empty publication.
 - Made action-ledger publication include every transactional import binding,
