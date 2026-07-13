@@ -9,6 +9,7 @@ import {
 import {
   ensureExactHeadMergeClaim,
   exactHeadMergeClaimBody,
+  exactHeadMergeClaimRecoveryDecision,
   inspectExactHeadMergeClaim,
   releaseExactHeadMergeClaim,
 } from "../../dist/repair/exact-head-merge-claim.js";
@@ -227,6 +228,91 @@ test("released exact-head merge claims can be reacquired by a fresh workflow att
   const retry = ensureExactHeadMergeClaim(request(2), io);
   assert.equal(retry.status, "acquired");
   assert.equal(comments.length, 3);
+});
+
+test("terminal stale claims are retired before a fresh workflow may reacquire", () => {
+  const comments: Record<string, any>[] = [];
+  let nextId = 1501;
+  const request = (runId: number) => ({
+    repository: "openclaw/openclaw",
+    number: 42,
+    headSha,
+    method: "squash" as const,
+    owner: "comment_router",
+    claimant: `comment_router:${runId}:1`,
+    appId: 3306130,
+    appSlug: "clawsweeper",
+  });
+  const io = {
+    listComments: () => comments,
+    createComment: (body: string) => {
+      const comment = {
+        id: nextId++,
+        body,
+        created_at: "2026-07-13T08:00:00Z",
+        performed_via_github_app: { id: 3306130, slug: "clawsweeper" },
+        user: { login: "clawsweeper[bot]" },
+      };
+      comments.push(comment);
+      return comment;
+    },
+  };
+
+  assert.equal(ensureExactHeadMergeClaim(request(7001), io).status, "acquired");
+  const recovered = ensureExactHeadMergeClaim(request(7002), {
+    ...io,
+    recoverClaim: () => ({
+      status: "recoverable" as const,
+      reason: "prior workflow attempt is terminal",
+    }),
+  });
+  assert.equal(recovered.status, "recovered");
+  assert.match(comments[1].body, /clawsweeper-exact-head-merge-recovery:v1 claim=1501/);
+  assert.equal(inspectExactHeadMergeClaim(request(7002), io.listComments).status, "released");
+
+  const reacquired = ensureExactHeadMergeClaim(request(7002), io);
+  assert.equal(reacquired.status, "acquired");
+  assert.equal(reacquired.claimId, 1503);
+});
+
+test("claim recovery requires an aged claim and the exact workflow attempt to be terminal", () => {
+  const candidate = {
+    claimId: 1501,
+    claimant: "comment_router:7001:2",
+    createdAt: "2026-07-13T08:00:00Z",
+  };
+  const env = {
+    GITHUB_REPOSITORY: "openclaw/clawsweeper",
+    GITHUB_RUN_ID: "7002",
+    GITHUB_RUN_ATTEMPT: "1",
+  };
+  assert.equal(
+    exactHeadMergeClaimRecoveryDecision(
+      candidate,
+      () => ({ id: 7001, run_attempt: 2, status: "completed" }),
+      env,
+      Date.parse("2026-07-13T08:10:00Z"),
+    ).status,
+    "recoverable",
+  );
+  assert.equal(
+    exactHeadMergeClaimRecoveryDecision(
+      candidate,
+      () => ({ id: 7001, run_attempt: 2, status: "in_progress" }),
+      env,
+      Date.parse("2026-07-13T08:10:00Z"),
+    ).status,
+    "active",
+  );
+  assert.equal(
+    exactHeadMergeClaimRecoveryDecision(
+      candidate,
+      () => ({ id: 7001, run_attempt: 2, status: "completed" }),
+      env,
+      Date.parse("2026-07-13T08:01:00Z"),
+    ).status,
+    "active",
+  );
 });
 
 test("an active claim for an older head does not block the superseding head", () => {

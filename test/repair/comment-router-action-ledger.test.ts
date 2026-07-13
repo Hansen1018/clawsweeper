@@ -96,7 +96,7 @@ test("automerge reconciles an ambiguous command response inside the merge receip
 
   assert.match(
     executeAutomerge,
-    /const result = runGitHubSpawnMutation\([\s\S]*buildAutomergeMergeArgs\([\s\S]*reconcile: \(\{ result: commandResult, error: commandError \}\) => \{[\s\S]*fetchAutomergeEffectSnapshot\(command\.issue_number\)[\s\S]*confirmAutomergeEffectSnapshot\(snapshot, command\.expected_head_sha\)[\s\S]*outcome: automergeAttemptReceiptOutcome/,
+    /result = runGitHubSpawnMutation\([\s\S]*buildAutomergeMergeArgs\([\s\S]*onDispatchStart:[\s\S]*reconcile: \(\{ result: commandResult, error: commandError \}\) => \{[\s\S]*fetchAutomergeEffectSnapshot\(command\.issue_number\)[\s\S]*confirmAutomergeEffectSnapshot\(snapshot, command\.expected_head_sha\)[\s\S]*outcome: automergeAttemptReceiptOutcome/,
   );
   assert.match(
     executeAutomerge,
@@ -140,7 +140,7 @@ test("automerge observes exact-head queue state before issuing another merge", (
   const pendingCheck = executeAutomerge.indexOf("exactHeadAutomergePendingReason(command, view)");
   const readinessCheck = executeAutomerge.indexOf("validateAutomergeReadiness({");
   const gateAction = executeAutomerge.indexOf("if (gateBlock) {");
-  const mergeCall = executeAutomerge.indexOf("const result = runGitHubSpawnMutation(");
+  const mergeCall = executeAutomerge.indexOf("result = runGitHubSpawnMutation(");
 
   assert.ok(hardCheck >= 0);
   assert.ok(strictBaseCheck > hardCheck);
@@ -171,7 +171,7 @@ test("automerge fresh attempts reconcile a durable exact-head claim before merge
   );
   const claim = executeAutomerge.indexOf("claimAutomergeMergeRequest(command)");
   const reconciliation = executeAutomerge.indexOf("reconcileClaimedAutomergeRequest(");
-  const merge = executeAutomerge.indexOf("const result = runGitHubSpawnMutation(");
+  const merge = executeAutomerge.indexOf("result = runGitHubSpawnMutation(");
 
   assert.ok(claim >= 0);
   assert.ok(reconciliation > claim);

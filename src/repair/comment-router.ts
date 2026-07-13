@@ -26,8 +26,10 @@ import {
 import {
   ensureExactHeadMergeClaim,
   exactHeadMergeClaimIdentity,
+  exactHeadMergeClaimRecoveryDecision,
   exactHeadMergeClaimant,
   isTrustedExactHeadMergeClaimComment,
+  isTrustedExactHeadMergeClaimRecoveryComment,
   isTrustedExactHeadMergeClaimReleaseComment,
   releaseExactHeadMergeClaim,
   type ExactHeadMergeClaimRequest,
@@ -2399,6 +2401,7 @@ function runGitHubTextMutationOnce(
 type GitHubSpawnResult = ReturnType<typeof ghSpawn>;
 
 type GitHubSpawnMutationReceipt<T> = {
+  onDispatchStart?: () => void;
   reconcile: (response: { result: GitHubSpawnResult | null; error: unknown | null }) => T;
   outcome: (result: T) => "accepted" | "rejected" | "unknown";
 };
@@ -2434,6 +2437,7 @@ function runGitHubSpawnMutation<T>(
         let result: GitHubSpawnResult | null = null;
         let error: unknown | null = null;
         try {
+          receipt.onDispatchStart?.();
           result = ghSpawn(ghArgs, options);
         } catch (caught) {
           error = caught;
@@ -3982,47 +3986,77 @@ function executeAutomerge(command: LooseRecord): LooseRecord {
     );
   }
   // Keep the exact-head merge request one-shot; reconcile its effect before closing the receipt.
-  const result = runGitHubSpawnMutation(
-    command,
-    "pull_request_merge",
-    {
-      repository: command.repo,
-      number: command.issue_number,
-      expectedHeadSha: command.expected_head_sha,
-      method: "squash",
-    },
-    buildAutomergeMergeArgs({
-      issueNumber: command.issue_number,
-      repo: command.repo,
-      expectedHeadSha: command.expected_head_sha,
-      subject: mergeMessage.subject,
-      bodyFile,
-    }),
-    {},
-    {
-      reconcile: ({ result: commandResult, error: commandError }) => {
-        try {
-          const snapshot = fetchAutomergeEffectSnapshot(command.issue_number);
-          return {
-            command_result: commandResult,
-            command_error: commandError,
-            snapshot,
-            snapshot_error: "",
-            confirmation: confirmAutomergeEffectSnapshot(snapshot, command.expected_head_sha),
-          };
-        } catch (error) {
-          return {
-            command_result: commandResult,
-            command_error: commandError,
-            snapshot: null,
-            snapshot_error: compactGhError(error),
-            confirmation: null,
-          };
-        }
+  let mergeRequestStarted = false;
+  let result;
+  try {
+    result = runGitHubSpawnMutation(
+      command,
+      "pull_request_merge",
+      {
+        repository: command.repo,
+        number: command.issue_number,
+        expectedHeadSha: command.expected_head_sha,
+        method: "squash",
       },
-      outcome: automergeAttemptReceiptOutcome,
-    },
-  );
+      buildAutomergeMergeArgs({
+        issueNumber: command.issue_number,
+        repo: command.repo,
+        expectedHeadSha: command.expected_head_sha,
+        subject: mergeMessage.subject,
+        bodyFile,
+      }),
+      {},
+      {
+        onDispatchStart: () => {
+          mergeRequestStarted = true;
+        },
+        reconcile: ({ result: commandResult, error: commandError }) => {
+          try {
+            const snapshot = fetchAutomergeEffectSnapshot(command.issue_number);
+            return {
+              command_result: commandResult,
+              command_error: commandError,
+              snapshot,
+              snapshot_error: "",
+              confirmation: confirmAutomergeEffectSnapshot(snapshot, command.expected_head_sha),
+            };
+          } catch (error) {
+            return {
+              command_result: commandResult,
+              command_error: commandError,
+              snapshot: null,
+              snapshot_error: compactGhError(error),
+              confirmation: null,
+            };
+          }
+        },
+        outcome: automergeAttemptReceiptOutcome,
+      },
+    );
+  } catch (error) {
+    if (!mergeRequestStarted) {
+      return releaseBeforeDispatch({
+        action: "merge",
+        status: "waiting",
+        reason: `merge ledger failed before dispatch: ${compactGhError(error)}`,
+        merge_method: "squash",
+        transient_wait_ms: waitedMs,
+        transient_observations: transientObservations,
+      });
+    }
+    return reconcileClaimedAutomergeRequest(
+      command,
+      {
+        status: "existing",
+        reason: `merge dispatch started but receipt finalization failed: ${compactGhError(error)}`,
+        claimId: mergeClaim.claimId,
+        claimant: automergeMergeClaimRequest(command).claimant,
+        createdAt: null,
+      },
+      waitedMs,
+      transientObservations,
+    );
+  }
   if (result.confirmation?.mergedAt) {
     return {
       action: "merge",
@@ -4252,10 +4286,20 @@ function claimAutomergeMergeRequest(command: LooseRecord): ExactHeadMergeClaimRe
       ghPaged<LooseRecord>(
         `repos/${request.repository}/issues/${request.number}/comments?per_page=100`,
       ),
-    createComment: (body) =>
+    createComment: (body, context) =>
       runCommandMutation(command, {
-        kind: "pull_request_merge_claim",
-        identity: exactHeadMergeClaimIdentity(request),
+        kind:
+          context.kind === "claim"
+            ? "pull_request_merge_claim"
+            : "pull_request_merge_claim_recovery",
+        identity:
+          context.kind === "claim"
+            ? exactHeadMergeClaimIdentity(request)
+            : {
+                ...exactHeadMergeClaimIdentity(request),
+                claimId: context.claimId,
+                claimant: context.claimant,
+              },
         operation: () =>
           ghJson(
             [
@@ -4266,9 +4310,23 @@ function claimAutomergeMergeRequest(command: LooseRecord): ExactHeadMergeClaimRe
             ],
             { attempts: 1 },
           ),
-        outcome: (comment) =>
-          isTrustedExactHeadMergeClaimComment(comment, request) ? "accepted" : "unknown",
+        outcome: (comment) => {
+          const trusted =
+            context.kind === "claim"
+              ? isTrustedExactHeadMergeClaimComment(comment, request)
+              : isTrustedExactHeadMergeClaimRecoveryComment(
+                  comment,
+                  request,
+                  context.claimId,
+                  context.claimant,
+                );
+          return trusted ? "accepted" : "unknown";
+        },
       }),
+    recoverClaim: (candidate) =>
+      exactHeadMergeClaimRecoveryDecision(candidate, (path) =>
+        ghJson(["api", path], { attempts: 1 }),
+      ),
   });
 }
 
@@ -4347,6 +4405,16 @@ function reconcileClaimedAutomergeRequest(
     return { action: "merge", status: "blocked", reason: claim.reason, merge_method: "squash" };
   }
   if (claim.status === "unknown") {
+    return {
+      action: "merge",
+      status: "waiting",
+      reason: claim.reason,
+      merge_method: "squash",
+      transient_wait_ms: waitedMs,
+      transient_observations: transientObservations,
+    };
+  }
+  if (claim.status === "recovered") {
     return {
       action: "merge",
       status: "waiting",

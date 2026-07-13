@@ -39,9 +39,11 @@ import { squashAutomergeMethodBlock } from "./automerge-effect.js";
 import {
   ensureExactHeadMergeClaim,
   exactHeadMergeClaimIdentity,
+  exactHeadMergeClaimRecoveryDecision,
   exactHeadMergeClaimant,
   inspectExactHeadMergeClaim,
   isTrustedExactHeadMergeClaimComment,
+  isTrustedExactHeadMergeClaimRecoveryComment,
   isTrustedExactHeadMergeClaimReleaseComment,
   releaseExactHeadMergeClaim,
   type ExactHeadMergeClaimInspection,
@@ -605,8 +607,7 @@ function applyMergeAction({
       ...(preliminaryClaim.status === "unknown" ? { requeue_required: true } : {}),
     };
   }
-  const trustedClaimHistory =
-    preliminaryClaim.status === "existing" || preliminaryClaim.status === "released";
+  const trustedClaimHistory = preliminaryClaim.status === "existing";
   const expectedUpdatedAt = action.target_updated_at ?? action.live_updated_at;
   if (!expectedUpdatedAt && !allowMissingUpdatedAt) {
     return {
@@ -845,6 +846,17 @@ function applyMergeAction({
     };
   }
   const mergeClaim = claimApplyMergeRequest(result.repo, target, authorizedHeadSha);
+  if (mergeClaim.status === "recovered") {
+    return {
+      ...base,
+      status: "blocked",
+      reason: mergeClaim.reason,
+      live_state: finalLive.state,
+      live_updated_at: finalLive.updated_at,
+      merge_method: "squash",
+      requeue_required: true,
+    };
+  }
   if (mergeClaim.status === "blocked" || mergeClaim.status === "unknown") {
     return {
       ...base,
@@ -1019,15 +1031,30 @@ function applyMergeAction({
         merge_method: "squash",
       });
     }
+    let mergeRequestStarted = false;
     try {
       runRepairMutation(applyResultLifecycle(target), {
         kind: "apply_result_merge",
         identity: applyMergeMutationIdentity(target, authorizedHeadSha),
         component: "apply_result",
-        operation: () => ghText(mergeArgs),
+        operation: () => {
+          mergeRequestStarted = true;
+          return ghText(mergeArgs);
+        },
         outcome: () => "unknown",
       });
     } catch (error) {
+      if (!mergeRequestStarted) {
+        return releaseBeforeDispatch({
+          ...base,
+          status: "blocked",
+          reason: `merge ledger failed before dispatch: ${ghErrorText(error)}`,
+          live_state: claimedLive.state,
+          live_updated_at: claimedLive.updated_at,
+          merge_method: "squash",
+          requeue_required: true,
+        });
+      }
       commandError = error;
     }
   }
@@ -1229,10 +1256,20 @@ function claimApplyMergeRequest(repository: string, number: number, headSha: str
   const request = applyMergeClaimRequest(repository, number, headSha);
   return ensureExactHeadMergeClaim(request, {
     listComments: () => listApplyMergeClaimComments(request),
-    createComment: (body) =>
+    createComment: (body, context) =>
       runRepairMutation(applyResultLifecycle(number), {
-        kind: "apply_result_merge_claim",
-        identity: exactHeadMergeClaimIdentity(request),
+        kind:
+          context.kind === "claim"
+            ? "apply_result_merge_claim"
+            : "apply_result_merge_claim_recovery",
+        identity:
+          context.kind === "claim"
+            ? exactHeadMergeClaimIdentity(request)
+            : {
+                ...exactHeadMergeClaimIdentity(request),
+                claimId: context.claimId,
+                claimant: context.claimant,
+              },
         component: "merge_claim",
         operation: () =>
           ghJsonOnce([
@@ -1241,9 +1278,21 @@ function claimApplyMergeRequest(repository: string, number: number, headSha: str
             "-f",
             `body=${body}`,
           ]),
-        outcome: (comment) =>
-          isTrustedExactHeadMergeClaimComment(comment, request) ? "accepted" : "unknown",
+        outcome: (comment) => {
+          const trusted =
+            context.kind === "claim"
+              ? isTrustedExactHeadMergeClaimComment(comment, request)
+              : isTrustedExactHeadMergeClaimRecoveryComment(
+                  comment,
+                  request,
+                  context.claimId,
+                  context.claimant,
+                );
+          return trusted ? "accepted" : "unknown";
+        },
       }),
+    recoverClaim: (candidate) =>
+      exactHeadMergeClaimRecoveryDecision(candidate, (path) => ghJsonOnce(["api", path])),
   });
 }
 

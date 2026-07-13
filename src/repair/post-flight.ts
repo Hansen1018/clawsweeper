@@ -53,8 +53,10 @@ import {
 import {
   ensureExactHeadMergeClaim,
   exactHeadMergeClaimIdentity,
+  exactHeadMergeClaimRecoveryDecision,
   exactHeadMergeClaimant,
   isTrustedExactHeadMergeClaimComment,
+  isTrustedExactHeadMergeClaimRecoveryComment,
   isTrustedExactHeadMergeClaimReleaseComment,
   releaseExactHeadMergeClaim,
   type ExactHeadMergeClaimRequest,
@@ -386,7 +388,11 @@ function finalizeFixPr(action: LooseRecord) {
           };
         }
         const claim = claimPostFlightMergeRequest(parsed.number, action.commit);
-        if (claim.status === "blocked" || claim.status === "unknown") {
+        if (
+          claim.status === "blocked" ||
+          claim.status === "unknown" ||
+          claim.status === "recovered"
+        ) {
           return {
             policyBlock: "",
             claim,
@@ -659,13 +665,19 @@ function finalizeFixPr(action: LooseRecord) {
         waited_ms: waitedMs,
       };
     }
-    if (mergeAttempt.claim?.status === "blocked" || mergeAttempt.claim?.status === "unknown") {
+    if (
+      mergeAttempt.claim?.status === "blocked" ||
+      mergeAttempt.claim?.status === "unknown" ||
+      mergeAttempt.claim?.status === "recovered"
+    ) {
       return {
         ...prBase,
         status: "blocked",
         reason: mergeAttempt.claim.reason,
         merge_method: "squash",
-        ...(mergeAttempt.claim.status === "unknown" ? { retry_recommended: true } : {}),
+        ...(mergeAttempt.claim.status === "unknown" || mergeAttempt.claim.status === "recovered"
+          ? { retry_recommended: true }
+          : {}),
         merge_attempts: mergeAttempts,
         waited_ms: waitedMs,
       };
@@ -816,10 +828,20 @@ function claimPostFlightMergeRequest(
         ghPaged<LooseRecord>(
           `repos/${request.repository}/issues/${request.number}/comments?per_page=100`,
         ),
-      createComment: (body) =>
+      createComment: (body, context) =>
         runRepairMutation(postFlightLifecycle(null), {
-          kind: "post_flight_merge_claim",
-          identity: exactHeadMergeClaimIdentity(request),
+          kind:
+            context.kind === "claim"
+              ? "post_flight_merge_claim"
+              : "post_flight_merge_claim_recovery",
+          identity:
+            context.kind === "claim"
+              ? exactHeadMergeClaimIdentity(request)
+              : {
+                  ...exactHeadMergeClaimIdentity(request),
+                  claimId: context.claimId,
+                  claimant: context.claimant,
+                },
           component: "merge_claim",
           operation: () =>
             ghJson(
@@ -831,9 +853,23 @@ function claimPostFlightMergeRequest(
               ],
               { attempts: 1 },
             ),
-          outcome: (comment) =>
-            isTrustedExactHeadMergeClaimComment(comment, request) ? "accepted" : "unknown",
+          outcome: (comment) => {
+            const trusted =
+              context.kind === "claim"
+                ? isTrustedExactHeadMergeClaimComment(comment, request)
+                : isTrustedExactHeadMergeClaimRecoveryComment(
+                    comment,
+                    request,
+                    context.claimId,
+                    context.claimant,
+                  );
+            return trusted ? "accepted" : "unknown";
+          },
         }),
+      recoverClaim: (candidate) =>
+        exactHeadMergeClaimRecoveryDecision(candidate, (path) =>
+          ghJson(["api", path], { attempts: 1 }),
+        ),
     });
   } catch (error) {
     return {

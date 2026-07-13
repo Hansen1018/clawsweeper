@@ -1360,7 +1360,7 @@ test("repair apply blocks final security drift before the merge request", () => 
   }
 });
 
-test("repair apply releases a post-claim abort and lets the same head merge on retry", () => {
+test("repair apply requires a fresh reviewed timestamp after releasing a post-claim abort", () => {
   const fixture = writeMergeApplyFixture({ securityOnPostClaimIssueFetchOnce: true });
   try {
     runMergeApplyResult(fixture, { runAttempt: 1 });
@@ -1377,6 +1377,17 @@ test("repair apply releases a post-claim abort and lets the same head merge on r
     assert.match(comments[1].body, /clawsweeper-exact-head-merge-release:v1 claim=1001/);
 
     runMergeApplyResult(fixture, { runAttempt: 2 });
+    report = readApplyReport(fixture.reportPath);
+    assert.equal(report.actions[0].status, "blocked");
+    assert.equal(report.actions[0].reason, "target changed since worker review");
+    assert.equal(mergeCallCount(fixture.ghLogPath), 0);
+    comments = JSON.parse(fs.readFileSync(fixture.mergeClaimPath, "utf8"));
+    assert.equal(comments.length, 2);
+
+    const refreshedResult = JSON.parse(fs.readFileSync(fixture.resultPath, "utf8"));
+    refreshedResult.actions[0].target_updated_at = "2026-07-13T07:01:00Z";
+    fs.writeFileSync(fixture.resultPath, JSON.stringify(refreshedResult, null, 2));
+    runMergeApplyResult(fixture, { runAttempt: 3 });
     report = readApplyReport(fixture.reportPath);
     assert.equal(report.actions[0].status, "executed");
     assert.equal(mergeCallCount(fixture.ghLogPath), 1);
