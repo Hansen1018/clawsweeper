@@ -18,7 +18,7 @@ test("commit review ledger attestation runs outside the Codex review job", () =>
 
   assert.doesNotMatch(review, /setup-action-ledger|CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT/);
   assert.doesNotMatch(review, /permission-checks: write|publish-check|finish-review/);
-  assert.doesNotMatch(review, /COMMIT_SWEEPER_TARGET_GH_TOKEN|^\s+GH_TOKEN:/m);
+  assert.doesNotMatch(review, /COMMIT_SWEEPER_TARGET_GH_TOKEN/);
   assert.match(review, /--codex-sandbox read-only/);
   assert.match(review, /--require-publishable-report/);
   assert.match(review, /uses: actions\/upload-artifact@v7[\s\S]*if: always\(\)/);
@@ -30,6 +30,29 @@ test("commit review ledger attestation runs outside the Codex review job", () =>
   assert.match(attestor, /Resolve raw commit review artifact/);
   assert.match(attestor, /Upload attested commit review report/);
   assert.match(attestor, /Finalize commit review action ledger/);
+});
+
+test("commit review materializes private clone data before removing review credentials", () => {
+  const workflow = fs.readFileSync(".github/workflows/commit-review.yml", "utf8");
+  const review = workflow.slice(workflow.indexOf("\n  review:"), workflow.indexOf("\n  attest:"));
+  const checkout = review.slice(
+    review.indexOf("      - name: Check out target main"),
+    review.indexOf("      - name: Review commit"),
+  );
+  const reviewCommit = review.slice(
+    review.indexOf("      - name: Review commit"),
+    review.indexOf("      - name: Upload commit review Codex logs"),
+  );
+  const materializeCommit =
+    'git -C "$TARGET_NAME" diff --no-ext-diff --binary "$COMMIT_SHA^" "$COMMIT_SHA" >/dev/null';
+  const removePromisorCredential =
+    'git -C "$TARGET_NAME" remote set-url origin "https://github.com/${TARGET_REPO}.git"';
+
+  assert.match(checkout, /TARGET_TOKEN: \$\{\{ steps\.target-read-token\.outputs\.token \}\}/);
+  assert.ok(checkout.includes(materializeCommit));
+  assert.ok(checkout.indexOf(materializeCommit) < checkout.indexOf(removePromisorCredential));
+  assert.match(reviewCommit, /GH_TOKEN: \$\{\{ steps\.target-read-token\.outputs\.token \}\}/);
+  assert.doesNotMatch(reviewCommit, /COMMIT_SWEEPER_TARGET_GH_TOKEN/);
 });
 
 test("commit review captures the complete structured Codex stream", () => {
@@ -92,9 +115,17 @@ for (const entry of fs.readdirSync(os.tmpdir())) {
   }
 }
 const prompt = fs.readFileSync(0, "utf8");
-if (prompt.includes("private-model-name") || prompt.includes("ghs_review-secret-token-123456")) {
+if (
+  prompt.includes("private-model-name") ||
+  prompt.includes("ghs_review-read-token-123456") ||
+  prompt.includes("ghs_review-secret-token-123456")
+) {
   process.stderr.write("redaction secret forwarded to Codex stdin");
   process.exit(6);
+}
+if (!prompt.includes("- GitHub author: hydrated-author")) {
+  process.stderr.write("GitHub author was not hydrated");
+  process.exit(7);
 }
 const outputIndex = args.indexOf("--output-last-message");
 const outputPath = args[outputIndex + 1];
@@ -128,7 +159,11 @@ fs.writeFileSync(outputPath, [
       { mode: 0o755 },
     );
     const ghPath = path.join(binDir, "gh");
-    fs.writeFileSync(ghPath, "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+    fs.writeFileSync(
+      ghPath,
+      '#!/bin/sh\n[ "$GH_TOKEN" = "ghs_review-read-token-123456" ] || exit 1\nprintf "hydrated-author\\n"\n',
+      { mode: 0o755 },
+    );
 
     const result = spawnSync(
       process.execPath,
@@ -159,6 +194,7 @@ fs.writeFileSync(outputPath, [
         env: {
           ...process.env,
           CODEX_HOME: codexHome,
+          GH_TOKEN: "ghs_review-read-token-123456",
           COMMIT_SWEEPER_TARGET_GH_TOKEN: "ghs_review-secret-token-123456",
           CODEX_BIN: codexPath,
           PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}`,
@@ -172,6 +208,7 @@ fs.writeFileSync(outputPath, [
     assert.doesNotMatch(invocation.join(" "), /private-model-name/);
 
     const jsonl = fs.readFileSync(path.join(workDir, `${sha}.jsonl`), "utf8");
+    assert.doesNotMatch(jsonl, /ghs_review-read-token-123456/);
     assert.doesNotMatch(jsonl, /ghs_review-secret-token-123456/);
     assert.doesNotMatch(jsonl, /private-model-name/);
     assert.match(jsonl, /\[REDACTED\]/);
@@ -185,6 +222,7 @@ fs.writeFileSync(outputPath, [
     assert.equal(events.length, 1602);
 
     const stderr = fs.readFileSync(path.join(workDir, `${sha}.stderr.log`), "utf8");
+    assert.doesNotMatch(stderr, /ghs_review-read-token-123456/);
     assert.doesNotMatch(stderr, /ghs_review-secret-token-123456/);
     assert.doesNotMatch(stderr, /private-model-name/);
     assert.match(stderr, /\[REDACTED\]/);
@@ -194,6 +232,7 @@ fs.writeFileSync(outputPath, [
     const reportPath = path.join(reportDir, "openclaw-clawsweeper", "commits", `${sha}.md`);
     assert.ok(fs.existsSync(reportPath));
     const report = fs.readFileSync(reportPath, "utf8");
+    assert.doesNotMatch(report, /ghs_review-read-token-123456/);
     assert.doesNotMatch(report, /ghs_review-secret-token-123456/);
     assert.doesNotMatch(report, /private-model-name/);
     assert.match(report, /\[REDACTED\]/);
