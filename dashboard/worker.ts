@@ -390,7 +390,8 @@ export class StatusStore {
           ? current.value
           : null;
       const parsed = currentValue ? JSON.parse(currentValue) : [];
-      const events = [body.event, ...(Array.isArray(parsed) ? parsed : [])].slice(
+      const priorEvents = Array.isArray(parsed) ? parsed : [];
+      const events = [body.event, ...withoutMatchingIdempotency(priorEvents, body.event)].slice(
         0,
         numberFrom(body.limit, EVENT_LIMIT),
       );
@@ -1729,7 +1730,12 @@ async function ingestEvent(request, env) {
   if (!env.INGEST_TOKEN || token !== env.INGEST_TOKEN) return json({ error: "unauthorized" }, 401);
   const body = await request.json().catch(() => null);
   if (!body || typeof body !== "object") return json({ error: "invalid_json" }, 400);
-  const event = normalizeEvent(body);
+  const idempotencyKey =
+    nullableString(request.headers.get("idempotency-key")) ?? nullableString(body.idempotency_key);
+  if (idempotencyKey && idempotencyKey.length > 256) {
+    return json({ error: "idempotency_key_too_long" }, 400);
+  }
+  const event = normalizeEvent(body, idempotencyKey);
   const writes = [
     prependStoredEvent(env, event),
     writeStoredJson(env, "latest-event", event, EVENT_STORE_TTL_SECONDS),
@@ -6316,9 +6322,15 @@ async function prependStoredEvent(env, event) {
   await writeStoredJson(
     env,
     "events",
-    [event, ...current].slice(0, EVENT_LIMIT),
+    [event, ...withoutMatchingIdempotency(current, event)].slice(0, EVENT_LIMIT),
     EVENT_STORE_TTL_SECONDS,
   );
+}
+
+function withoutMatchingIdempotency(events, event) {
+  const key = nullableString(event?.idempotency_key);
+  if (!key) return events;
+  return events.filter((candidate) => nullableString(candidate?.idempotency_key) !== key);
 }
 
 async function readStatusStoreText(store, key) {
@@ -6639,11 +6651,12 @@ async function withTimeout(promise, timeoutMs, label) {
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timeoutId));
 }
 
-function normalizeEvent(body) {
+function normalizeEvent(body, idempotencyKey = null) {
   const itemNumber = numberOrNull(body.item_number);
   const sourceItemNumber = numberOrNull(body.source_item_number);
   return {
-    id: crypto.randomUUID(),
+    id: idempotencyKey || crypto.randomUUID(),
+    idempotency_key: idempotencyKey,
     received_at: new Date().toISOString(),
     event_type: stringField(body.event_type, "status.event"),
     mode: stringField(body.mode, "unknown"),

@@ -819,6 +819,29 @@ test("dashboard durable status store persists, expires, and prepends events", as
     [{ id: "second" }, { id: "first" }],
   );
 
+  for (const title of ["old", "new"]) {
+    await store.fetch(
+      new Request("https://clawsweeper-status-store/events", {
+        method: "POST",
+        body: JSON.stringify({
+          event: { id: "stable", idempotency_key: "stable-key", title },
+          limit: 10,
+          ttl_seconds: 60,
+        }),
+      }),
+    );
+  }
+  const deduplicated = JSON.parse(
+    await (await store.fetch(new Request("https://clawsweeper-status-store/events"))).text(),
+  );
+  assert.equal(
+    deduplicated.filter(
+      (event: { idempotency_key?: string }) => event.idempotency_key === "stable-key",
+    ).length,
+    1,
+  );
+  assert.equal(deduplicated[0].title, "new");
+
   const bayStoreUrl = `https://clawsweeper-status-store/${encodeURIComponent(
     "openclaw-bay:terminal-state:v1",
   )}`;
@@ -5131,6 +5154,19 @@ test("dashboard preserves repeated untargeted activity events", async () => {
       );
       assert.equal(ingest.status, 200);
     }
+    const oversized = await worker.fetch(
+      new Request("https://clawsweeper.openclaw.ai/api/events", {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer test-token",
+          "Content-Type": "application/json",
+          "Idempotency-Key": "x".repeat(257),
+        },
+        body: JSON.stringify({ event_type: "status.test" }),
+      }),
+      env,
+    );
+    assert.equal(oversized.status, 400);
 
     const response = await worker.fetch(
       new Request("https://clawsweeper.openclaw.ai/api/status"),
@@ -5147,6 +5183,69 @@ test("dashboard preserves repeated untargeted activity events", async () => {
         .sort(),
       ["Probe one", "Probe two"],
     );
+  } finally {
+    globalThis.fetch = originalFetch;
+    Object.defineProperty(globalThis, "caches", { configurable: true, value: originalCaches });
+  }
+});
+
+test("dashboard deduplicates retried events by idempotency key", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalCaches = globalThis.caches;
+  Object.defineProperty(globalThis, "caches", {
+    configurable: true,
+    value: {
+      default: {
+        match: async () => undefined,
+        put: async () => undefined,
+      },
+    },
+  });
+  globalThis.fetch = activePrFetch;
+
+  try {
+    const env = {
+      INGEST_TOKEN: "test-token",
+      STATUS_STORE: new MemoryKv(),
+      CLAWSWEEPER_REPO: "openclaw/clawsweeper",
+      TARGET_REPOS: "openclaw/openclaw",
+      CACHE_TTL_SECONDS: "0",
+    };
+    for (const title of ["First delivery", "Retried delivery"]) {
+      const ingest = await worker.fetch(
+        new Request("https://clawsweeper.openclaw.ai/api/events", {
+          method: "POST",
+          headers: {
+            Authorization: "Bearer test-token",
+            "Content-Type": "application/json",
+            "Idempotency-Key": "stable-event-key",
+          },
+          body: JSON.stringify({
+            event_type: "status.test",
+            mode: "test",
+            stage: "probe",
+            status: "ok",
+            title,
+          }),
+        }),
+        env,
+      );
+      assert.equal(ingest.status, 200);
+    }
+
+    const response = await worker.fetch(
+      new Request("https://clawsweeper.openclaw.ai/api/status"),
+      env,
+      {
+        waitUntil: () => undefined,
+      },
+    );
+    const status = await response.json();
+    const events = status.recent.events.filter(
+      (event: { idempotency_key?: string }) => event.idempotency_key === "stable-event-key",
+    );
+    assert.equal(events.length, 1);
+    assert.equal(events[0].title, "Retried delivery");
   } finally {
     globalThis.fetch = originalFetch;
     Object.defineProperty(globalThis, "caches", { configurable: true, value: originalCaches });
