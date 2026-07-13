@@ -200,6 +200,18 @@ test("automerge fresh attempts reconcile a durable exact-head claim before merge
     source,
     /function reconcileClaimedAutomergeRequest[\s\S]*fetchAutomergeEffectSnapshot[\s\S]*status: "waiting"/,
   );
+  assert.match(
+    source,
+    /function observeExistingAutomergeEffect[\s\S]*inspectAutomergeMergeClaim[\s\S]*claim\.expectedSquashMessage[\s\S]*fetchAutomergeSquashCommitProof/,
+  );
+  assert.match(
+    source,
+    /function reconcileClaimedAutomergeRequest[\s\S]*claim\.expectedSquashMessage[\s\S]*fetchAutomergeSquashCommitProof/,
+  );
+  assert.match(
+    source,
+    /markAutomergeMergeClaimDispatched\([\s\S]*expectedSquashCommitMessage\(mergeMessage\.subject, mergeMessage\.body\)/,
+  );
 });
 
 test("all exact-head merge owners release unused claims and require squash auto-merge", () => {

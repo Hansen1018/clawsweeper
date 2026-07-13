@@ -48,6 +48,8 @@ import {
   exactHeadMergeClaimRecoveryDecision,
   exactHeadMergeClaimWorkflowRunEnv,
   exactHeadMergeClaimant,
+  exactHeadMergeClaimOwnsUpdatedAt,
+  exactHeadMergeUpdatedAtMatches,
   inspectExactHeadMergeClaim,
   isTrustedExactHeadMergeClaimComment,
   isTrustedExactHeadMergeClaimDispatchComment,
@@ -616,7 +618,6 @@ function applyMergeAction({
       ...(preliminaryClaim.status === "unknown" ? { requeue_required: true } : {}),
     };
   }
-  const trustedClaimHistory = preliminaryClaim.status === "existing";
   const expectedUpdatedAt = action.target_updated_at ?? action.live_updated_at;
   if (!expectedUpdatedAt && !allowMissingUpdatedAt) {
     return {
@@ -627,7 +628,14 @@ function applyMergeAction({
       live_updated_at: live.updated_at,
     };
   }
-  if (expectedUpdatedAt && expectedUpdatedAt !== live.updated_at && !trustedClaimHistory) {
+  if (
+    expectedUpdatedAt &&
+    !exactHeadMergeUpdatedAtMatches(expectedUpdatedAt, live.updated_at) &&
+    !(
+      preliminaryClaim.status === "existing" &&
+      exactHeadMergeClaimOwnsUpdatedAt(preliminaryClaim, live.updated_at)
+    )
+  ) {
     return {
       ...base,
       status: "blocked",
@@ -637,10 +645,37 @@ function applyMergeAction({
       live_state: live.state,
     };
   }
-  // The trusted write-ahead claim is itself an issue comment. It may advance
-  // updated_at, so exact claimed heads rely on the live hard gates below.
-
-  const existingMerge = confirmExactMergeSnapshot(pullRequest, authorizedHeadSha);
+  let existingSquashCommitProof: SquashMergeCommitProof | undefined;
+  if (
+    preliminaryClaim.status === "existing" &&
+    preliminaryClaim.dispatched &&
+    preliminaryClaim.expectedSquashMessage &&
+    pullRequest.merged_at
+  ) {
+    try {
+      existingSquashCommitProof = fetchSquashMergeCommitProof(
+        result.repo,
+        pullRequest,
+        preliminaryClaim.expectedSquashMessage,
+      );
+    } catch (error) {
+      return {
+        ...base,
+        status: "blocked",
+        reason: `durably claimed merge proof could not be read: ${ghErrorText(error)}`,
+        live_state: live.state,
+        live_updated_at: live.updated_at,
+        merge_method: "squash",
+        requeue_required: true,
+      };
+    }
+  }
+  const existingMerge = confirmExactMergeSnapshot(pullRequest, authorizedHeadSha, {
+    ...(preliminaryClaim.status === "existing" && preliminaryClaim.dispatched
+      ? { requireSquashMethod: true }
+      : {}),
+    ...(existingSquashCommitProof ? { squashCommit: existingSquashCommitProof } : {}),
+  });
   if (existingMerge.block) {
     return {
       ...base,
@@ -815,7 +850,14 @@ function applyMergeAction({
       merge_method: "squash",
     };
   }
-  if (expectedUpdatedAt && finalLive.updated_at !== expectedUpdatedAt && !trustedClaimHistory) {
+  if (
+    expectedUpdatedAt &&
+    !exactHeadMergeUpdatedAtMatches(expectedUpdatedAt, finalLive.updated_at) &&
+    !(
+      preliminaryClaim.status === "existing" &&
+      exactHeadMergeClaimOwnsUpdatedAt(preliminaryClaim, finalLive.updated_at)
+    )
+  ) {
     return {
       ...base,
       status: "blocked",
@@ -880,6 +922,9 @@ function applyMergeAction({
     };
   }
   const reconciliationOnly = mergeClaim.status === "existing";
+  if (mergeClaim.status === "existing" && mergeClaim.dispatched) {
+    dispatchedSquashCommitMessage = mergeClaim.expectedSquashMessage ?? "";
+  }
   if (mergeClaim.status === "acquired") {
     const releaseBeforeDispatch = (actionResult: LooseRecord) =>
       releaseApplyMergeClaimBeforeDispatch({
@@ -1000,6 +1045,21 @@ function applyMergeAction({
         merge_method: "squash",
       });
     }
+    if (
+      expectedUpdatedAt &&
+      !exactHeadMergeUpdatedAtMatches(expectedUpdatedAt, claimedLive.updated_at) &&
+      !exactHeadMergeClaimOwnsUpdatedAt(mergeClaim, claimedLive.updated_at)
+    ) {
+      return releaseBeforeDispatch({
+        ...base,
+        status: "blocked",
+        reason: "target changed after exact-head merge claim",
+        expected_updated_at: expectedUpdatedAt,
+        live_state: claimedLive.state,
+        live_updated_at: claimedLive.updated_at,
+        merge_method: "squash",
+      });
+    }
     let claimedStrictBaseBindingBlock = "";
     try {
       claimedStrictBaseBindingBlock = runtimeStrictBaseBindingBlock({
@@ -1056,13 +1116,14 @@ function applyMergeAction({
             target,
             authorizedHeadSha,
             mergeClaim.claimId,
+            squashCommitMessage,
           );
           if (dispatchBoundary.status !== "dispatched") {
             throw new Error(dispatchBoundary.reason);
           }
+          dispatchedSquashCommitMessage = dispatchBoundary.expectedSquashMessage;
           mergeRequestStarted = true;
           const output = ghText(mergeArgs);
-          dispatchedSquashCommitMessage = squashCommitMessage;
           return output;
         },
         outcome: () => "unknown",
@@ -1351,9 +1412,10 @@ function markApplyMergeClaimDispatched(
   number: number,
   headSha: string,
   claimId: number,
+  expectedSquashMessage: string,
 ) {
   const request = applyMergeClaimRequest(repository, number, headSha);
-  return markExactHeadMergeClaimDispatched(request, claimId, {
+  return markExactHeadMergeClaimDispatched(request, claimId, expectedSquashMessage, {
     listComments: () => listApplyMergeClaimComments(request),
     createComment: (body) =>
       runRepairMutation(applyResultLifecycle(number), {
@@ -1368,7 +1430,12 @@ function markApplyMergeClaimDispatched(
             `body=${body}`,
           ]),
         outcome: (comment) =>
-          isTrustedExactHeadMergeClaimDispatchComment(comment, request, claimId)
+          isTrustedExactHeadMergeClaimDispatchComment(
+            comment,
+            request,
+            claimId,
+            expectedSquashMessage,
+          )
             ? "accepted"
             : "unknown",
       }),

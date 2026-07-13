@@ -62,6 +62,7 @@ import {
   exactHeadMergeClaimRecoveryDecision,
   exactHeadMergeClaimWorkflowRunEnv,
   exactHeadMergeClaimant,
+  inspectExactHeadMergeClaim,
   isTrustedExactHeadMergeClaimComment,
   isTrustedExactHeadMergeClaimDispatchComment,
   isTrustedExactHeadMergeClaimRecoveryComment,
@@ -259,7 +260,51 @@ function finalizeFixPr(action: LooseRecord) {
     const policyBlock = validateMergePolicy(action, pull);
     if (policyBlock) return { ...prBase, status: "blocked", reason: policyBlock };
 
-    const existingMerge = confirmMergedPullSnapshot(pull, action.commit);
+    const existingClaim =
+      pull.merged_at &&
+      /^[1-9][0-9]*$/.test(String(process.env.GITHUB_RUN_ID ?? "")) &&
+      /^[1-9][0-9]*$/.test(String(process.env.GITHUB_RUN_ATTEMPT ?? ""))
+        ? inspectPostFlightMergeClaim(parsed.number, action.commit)
+        : ({ status: "absent", reason: "", claimId: null } as const);
+    if (existingClaim.status === "blocked" || existingClaim.status === "unknown") {
+      return {
+        ...prBase,
+        status: "blocked",
+        reason: existingClaim.reason,
+        ...(existingClaim.status === "unknown" ? { retry_recommended: true } : {}),
+      };
+    }
+    let existingSquashCommitProof: SquashMergeCommitProof | undefined;
+    if (
+      existingClaim.status === "existing" &&
+      existingClaim.dispatched &&
+      existingClaim.expectedSquashMessage &&
+      pull.merged_at
+    ) {
+      try {
+        existingSquashCommitProof = fetchSquashMergeCommitProof(
+          result.repo,
+          pull,
+          existingClaim.expectedSquashMessage,
+        );
+      } catch (error) {
+        return {
+          ...prBase,
+          status: "blocked",
+          reason: `durably claimed merge proof could not be read: ${compactText(ghErrorText(error), 500)}`,
+          retry_recommended: true,
+        };
+      }
+    }
+    const existingMerge =
+      existingClaim.status === "existing" && existingClaim.dispatched
+        ? confirmPostFlightMergeSnapshot(
+            pull,
+            view,
+            action.commit,
+            existingSquashCommitProof ? { squashCommit: existingSquashCommitProof } : {},
+          )
+        : { ...confirmMergedPullSnapshot(pull, action.commit), pendingReason: "" };
     if (existingMerge.block) {
       return { ...prBase, status: "blocked", reason: existingMerge.block };
     }
@@ -417,7 +462,13 @@ function finalizeFixPr(action: LooseRecord) {
         }
         if (claim.status === "existing") {
           try {
-            const confirmation = reconcileMergeState(parsed.number, action.commit);
+            const confirmation = reconcileMergeState(
+              parsed.number,
+              action.commit,
+              claim.expectedSquashMessage
+                ? { expectedSquashMessage: claim.expectedSquashMessage }
+                : {},
+            );
             return {
               policyBlock: "",
               claim,
@@ -499,16 +550,17 @@ function finalizeFixPr(action: LooseRecord) {
               parsed.number,
               action.commit,
               claim.claimId,
+              squashCommitMessage,
             );
             if (dispatchBoundary.status !== "dispatched") {
               throw new Error(dispatchBoundary.reason);
             }
             mergeAttempts += 1;
             let commandError: unknown = null;
+            dispatchedSquashCommitMessage = dispatchBoundary.expectedSquashMessage;
             mergeRequestStarted = true;
             try {
               ghText(mergeArgs);
-              dispatchedSquashCommitMessage = squashCommitMessage;
             } catch (error) {
               commandError = error;
             }
@@ -943,9 +995,23 @@ function claimPostFlightMergeRequest(
   }
 }
 
-function markPostFlightMergeClaimDispatched(number: number, headSha: JsonValue, claimId: number) {
+function inspectPostFlightMergeClaim(number: number, headSha: JsonValue) {
   const request = postFlightMergeClaimRequest(number, headSha);
-  return markExactHeadMergeClaimDispatched(request, claimId, {
+  return inspectExactHeadMergeClaim(request, () =>
+    ghPaged<LooseRecord>(
+      `repos/${request.repository}/issues/${request.number}/comments?per_page=100`,
+    ),
+  );
+}
+
+function markPostFlightMergeClaimDispatched(
+  number: number,
+  headSha: JsonValue,
+  claimId: number,
+  expectedSquashMessage: string,
+) {
+  const request = postFlightMergeClaimRequest(number, headSha);
+  return markExactHeadMergeClaimDispatched(request, claimId, expectedSquashMessage, {
     listComments: () =>
       ghPaged<LooseRecord>(
         `repos/${request.repository}/issues/${request.number}/comments?per_page=100`,
@@ -966,7 +1032,12 @@ function markPostFlightMergeClaimDispatched(number: number, headSha: JsonValue, 
             { attempts: 1 },
           ),
         outcome: (comment) =>
-          isTrustedExactHeadMergeClaimDispatchComment(comment, request, claimId)
+          isTrustedExactHeadMergeClaimDispatchComment(
+            comment,
+            request,
+            claimId,
+            expectedSquashMessage,
+          )
             ? "accepted"
             : "unknown",
       }),

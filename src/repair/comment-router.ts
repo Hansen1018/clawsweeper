@@ -32,6 +32,7 @@ import {
   exactHeadMergeClaimRecoveryDecision,
   exactHeadMergeClaimWorkflowRunEnv,
   exactHeadMergeClaimant,
+  inspectExactHeadMergeClaim,
   isTrustedExactHeadMergeClaimComment,
   isTrustedExactHeadMergeClaimDispatchComment,
   isTrustedExactHeadMergeClaimRecoveryComment,
@@ -4017,7 +4018,11 @@ function executeAutomerge(command: LooseRecord): LooseRecord {
       {},
       {
         beforeDispatch: () => {
-          const dispatchBoundary = markAutomergeMergeClaimDispatched(command, mergeClaim.claimId);
+          const dispatchBoundary = markAutomergeMergeClaimDispatched(
+            command,
+            mergeClaim.claimId,
+            expectedSquashCommitMessage(mergeMessage.subject, mergeMessage.body),
+          );
           if (dispatchBoundary.status !== "dispatched") {
             throw new Error(dispatchBoundary.reason);
           }
@@ -4028,14 +4033,10 @@ function executeAutomerge(command: LooseRecord): LooseRecord {
         reconcile: ({ result: commandResult, error: commandError }) => {
           try {
             const snapshot = fetchAutomergeEffectSnapshot(command.issue_number);
-            const squashDispatchSucceeded =
-              commandError === null && commandResult?.status === 0 && !commandResult.error;
-            squashCommitProof = squashDispatchSucceeded
-              ? fetchAutomergeSquashCommitProof(
-                  snapshot,
-                  expectedSquashCommitMessage(mergeMessage.subject, mergeMessage.body),
-                )
-              : undefined;
+            squashCommitProof = fetchAutomergeSquashCommitProof(
+              snapshot,
+              expectedSquashCommitMessage(mergeMessage.subject, mergeMessage.body),
+            );
             return {
               command_result: commandResult,
               command_error: commandError,
@@ -4080,6 +4081,9 @@ function executeAutomerge(command: LooseRecord): LooseRecord {
         owner: automergeMergeClaimRequest(command).owner,
         claimant: automergeMergeClaimRequest(command).claimant,
         createdAt: null,
+        dispatched: true,
+        expectedSquashMessage: expectedSquashCommitMessage(mergeMessage.subject, mergeMessage.body),
+        lastClaimMutationAt: null,
       },
       waitedMs,
       transientObservations,
@@ -4234,8 +4238,10 @@ function automergePendingAction(
 function observeExistingAutomergeEffect(command: LooseRecord, view: LooseRecord) {
   if (!view.mergedAt && String(view.state ?? "").toUpperCase() !== "MERGED") return null;
   let snapshot: LooseRecord;
+  let claim: ReturnType<typeof inspectAutomergeMergeClaim>;
   try {
     snapshot = fetchAutomergeEffectSnapshot(command.issue_number);
+    claim = inspectAutomergeMergeClaim(command);
   } catch (error) {
     return {
       action: "merge",
@@ -4244,9 +4250,28 @@ function observeExistingAutomergeEffect(command: LooseRecord, view: LooseRecord)
       merge_method: "squash",
     };
   }
-  const confirmation = confirmAutomergeEffectSnapshot(snapshot, command.expected_head_sha, {
-    requireSquashMethod: false,
-  });
+  if (claim.status === "blocked" || claim.status === "unknown") {
+    return {
+      action: "merge",
+      status: claim.status === "blocked" ? "blocked" : "waiting",
+      reason: claim.reason,
+      merge_method: "squash",
+    };
+  }
+  const durableExpectedMessage =
+    claim.status === "existing" && claim.dispatched ? claim.expectedSquashMessage : null;
+  const squashCommitProof = durableExpectedMessage
+    ? fetchAutomergeSquashCommitProof(snapshot, durableExpectedMessage)
+    : undefined;
+  const confirmation = confirmAutomergeEffectSnapshot(
+    snapshot,
+    command.expected_head_sha,
+    claim.status === "existing" && claim.dispatched
+      ? squashCommitProof
+        ? { squashCommit: squashCommitProof }
+        : {}
+      : { requireSquashMethod: false },
+  );
   if (confirmation.block) {
     return {
       action: "merge",
@@ -4383,9 +4408,22 @@ function claimAutomergeMergeRequest(command: LooseRecord): ExactHeadMergeClaimRe
   });
 }
 
-function markAutomergeMergeClaimDispatched(command: LooseRecord, claimId: number) {
+function inspectAutomergeMergeClaim(command: LooseRecord) {
   const request = automergeMergeClaimRequest(command);
-  return markExactHeadMergeClaimDispatched(request, claimId, {
+  return inspectExactHeadMergeClaim(request, () =>
+    ghPaged<LooseRecord>(
+      `repos/${request.repository}/issues/${request.number}/comments?per_page=100`,
+    ),
+  );
+}
+
+function markAutomergeMergeClaimDispatched(
+  command: LooseRecord,
+  claimId: number,
+  expectedSquashMessage: string,
+) {
+  const request = automergeMergeClaimRequest(command);
+  return markExactHeadMergeClaimDispatched(request, claimId, expectedSquashMessage, {
     listComments: () =>
       ghPaged<LooseRecord>(
         `repos/${request.repository}/issues/${request.number}/comments?per_page=100`,
@@ -4405,7 +4443,12 @@ function markAutomergeMergeClaimDispatched(command: LooseRecord, claimId: number
             { attempts: 1 },
           ),
         outcome: (comment) =>
-          isTrustedExactHeadMergeClaimDispatchComment(comment, request, claimId)
+          isTrustedExactHeadMergeClaimDispatchComment(
+            comment,
+            request,
+            claimId,
+            expectedSquashMessage,
+          )
             ? "accepted"
             : "unknown",
       }),
@@ -4507,11 +4550,27 @@ function reconcileClaimedAutomergeRequest(
       transient_observations: transientObservations,
     };
   }
+  if (claim.status !== "existing") {
+    return {
+      action: "merge",
+      status: "waiting",
+      reason: claim.reason,
+      merge_method: "squash",
+      transient_wait_ms: waitedMs,
+      transient_observations: transientObservations,
+    };
+  }
   try {
+    const snapshot = fetchAutomergeEffectSnapshot(command.issue_number);
+    const durableSquashCommitProof =
+      squashCommitProof ??
+      (claim.expectedSquashMessage
+        ? fetchAutomergeSquashCommitProof(snapshot, claim.expectedSquashMessage)
+        : undefined);
     const confirmation = confirmAutomergeEffectSnapshot(
-      fetchAutomergeEffectSnapshot(command.issue_number),
+      snapshot,
       command.expected_head_sha,
-      squashCommitProof ? { squashCommit: squashCommitProof } : {},
+      durableSquashCommitProof ? { squashCommit: durableSquashCommitProof } : {},
     );
     if (confirmation.block) {
       return {

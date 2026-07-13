@@ -1160,18 +1160,15 @@ for (const mergeCommitMode of ["message_mismatch", "two_parents"] as const) {
   });
 }
 
-test("repair apply does not certify the merge method after an ambiguous command response", () => {
+test("repair apply certifies an ambiguous squash response from the durable dispatch payload", () => {
   const fixture = writeMergeApplyFixture({ mergeMode: "ambiguous_exact" });
   try {
     runMergeApplyResult(fixture, { retryAttempts: 4 });
 
     const report = readApplyReport(fixture.reportPath);
-    assert.equal(report.actions[0].status, "blocked");
-    assert.equal(
-      report.actions[0].reason,
-      "merged pull request method could not be proven as SQUASH",
-    );
-    assert.equal(report.actions[0].merged_at, undefined);
+    assert.equal(report.actions[0].status, "executed");
+    assert.equal(report.actions[0].reason, "merge confirmed after ambiguous response");
+    assert.equal(report.actions[0].merged_at, "2026-07-13T08:00:00Z");
     assert.equal(mergeCallCount(fixture.ghLogPath), 1);
     assert.equal(restPullCallCount(fixture.ghLogPath), 3);
     const mergeCall = ghCalls(fixture.ghLogPath).find(
@@ -1360,6 +1357,40 @@ test("repair apply fresh attempts reconcile an unknown claimed merge without rei
     );
     assert.equal(report.actions[0].requeue_required, true);
     assert.equal(mergeCallCount(fixture.ghLogPath), 1);
+
+    fs.writeFileSync(fixture.unrelatedDriftPath, "1");
+    runMergeApplyResult(fixture, { runAttempt: 3 });
+    report = readApplyReport(fixture.reportPath);
+    assert.equal(report.actions[0].status, "blocked");
+    assert.equal(report.actions[0].reason, "target changed since worker review");
+    assert.equal(report.actions[0].live_updated_at, "2026-07-13T07:30:00Z");
+    assert.equal(mergeCallCount(fixture.ghLogPath), 1);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("repair apply reconstructs durable squash proof in a fresh process", () => {
+  const fixture = writeMergeApplyFixture();
+  try {
+    runMergeApplyResult(fixture, { runAttempt: 1 });
+    let report = readApplyReport(fixture.reportPath);
+    assert.equal(report.actions[0].status, "executed");
+    assert.equal(mergeCallCount(fixture.ghLogPath), 1);
+
+    runMergeApplyResult(fixture, { runAttempt: 2 });
+    report = readApplyReport(fixture.reportPath);
+    assert.equal(report.actions[0].status, "executed");
+    assert.equal(report.actions[0].reason, "already merged");
+    assert.equal(report.actions[0].merge_commit_sha, "c".repeat(40));
+    assert.equal(mergeCallCount(fixture.ghLogPath), 1);
+    assert.ok(
+      ghCalls(fixture.ghLogPath).filter(
+        (call) =>
+          call.args[0] === "api" &&
+          call.args[1] === `repos/openclaw/openclaw/commits/${"c".repeat(40)}`,
+      ).length >= 2,
+    );
   } finally {
     fixture.cleanup();
   }
@@ -1427,7 +1458,7 @@ test("repair apply requires a fresh reviewed timestamp after releasing a post-cl
     assert.equal(comments.length, 2);
 
     const refreshedResult = JSON.parse(fs.readFileSync(fixture.resultPath, "utf8"));
-    refreshedResult.actions[0].target_updated_at = "2026-07-13T07:01:00Z";
+    refreshedResult.actions[0].target_updated_at = "2026-07-13T07:02:00Z";
     fs.writeFileSync(fixture.resultPath, JSON.stringify(refreshedResult, null, 2));
     runMergeApplyResult(fixture, { runAttempt: 3 });
     report = readApplyReport(fixture.reportPath);
@@ -1436,7 +1467,7 @@ test("repair apply requires a fresh reviewed timestamp after releasing a post-cl
     comments = JSON.parse(fs.readFileSync(fixture.mergeClaimPath, "utf8"));
     assert.equal(comments.length, 4);
     assert.match(comments[2].body, /clawsweeper-exact-head-merge-claim:v1/);
-    assert.match(comments[3].body, /clawsweeper-exact-head-merge-dispatch:v1 claim=1003/);
+    assert.match(comments[3].body, /clawsweeper-exact-head-merge-dispatch:v2 claim=1003/);
   } finally {
     fixture.cleanup();
   }
@@ -1465,7 +1496,7 @@ test("repair apply dry-run does not require workflow claim identity", () => {
   }
 });
 
-test("repair apply records an unknown exact-head merge outcome without method proof", () => {
+test("repair apply records a durable observed receipt after ambiguous exact merge", () => {
   const fixture = writeMergeApplyFixture({ mergeMode: "ambiguous_exact" });
   try {
     runMergeApplyResult(fixture, {
@@ -1485,6 +1516,7 @@ test("repair apply records an unknown exact-head merge outcome without method pr
       [
         ["started", "mutation_attempted"],
         ["failed", "mutation_outcome_unknown"],
+        ["executed", "mutation_observed"],
       ],
     );
     assert.deepEqual(
@@ -1927,6 +1959,7 @@ type MergeFixture = {
   ghLogPath: string;
   mergeCountPath: string;
   mergeClaimPath: string;
+  unrelatedDriftPath: string;
   ledgerRoot: string;
   ledgerOutputRoot: string;
   headSha: string;
@@ -1964,6 +1997,7 @@ function writeMergeApplyFixture(
   const ghLogPath = path.join(root, "gh.log");
   const mergeCountPath = path.join(root, "merge-count");
   const mergeClaimPath = path.join(root, "merge-claim");
+  const unrelatedDriftPath = path.join(root, "unrelated-drift");
   const mergeMessagePath = path.join(root, "merge-message");
   const issueCountPath = path.join(root, "issue-count");
   const ledgerRoot = path.join(root, "ledger");
@@ -2039,6 +2073,7 @@ function writeMergeApplyFixture(
     ghLogPath,
     mergeCountPath,
     mergeClaimPath,
+    unrelatedDriftPath,
     mergeMessagePath,
     headSha,
     wrongHeadSha: "b".repeat(40),
@@ -2089,12 +2124,17 @@ if (args[0] === "api") {
     const comment = {
       id: 1001 + comments.length,
       body,
+      created_at: new Date(Date.parse("2026-07-13T07:00:00Z") + (comments.length + 1) * 60_000).toISOString(),
       performed_via_github_app: { id: 3306130, slug: "openclaw-clawsweeper" },
       user: { login: "openclaw-clawsweeper[bot]" },
     };
     comments.push(comment);
     fs.writeFileSync(data.mergeClaimPath, JSON.stringify(comments));
     write(comment);
+    process.exit(0);
+  }
+  if (apiPath === "repos/openclaw/clawsweeper/actions/runs/9001/attempts/1") {
+    write({ id: 9001, run_attempt: 1, status: "in_progress", conclusion: null });
     process.exit(0);
   }
   if (apiPath.includes("/issues/101/comments")) {
@@ -2107,14 +2147,18 @@ if (args[0] === "api") {
   if (apiPath === "repos/openclaw/openclaw/issues/101") {
     const count = issueCount() + 1;
     fs.writeFileSync(data.issueCountPath, String(count));
+    const comments = fs.existsSync(data.mergeClaimPath)
+      ? JSON.parse(fs.readFileSync(data.mergeClaimPath, "utf8"))
+      : [];
+    const latestClaimMutation = comments.at(-1)?.created_at || "2026-07-13T07:00:00Z";
     write({
       number: 101,
       title: "Exact merge candidate",
       html_url: "https://github.com/openclaw/openclaw/pull/101",
       state: "open",
-      updated_at: fs.existsSync(data.mergeClaimPath)
-        ? "2026-07-13T07:01:00Z"
-        : "2026-07-13T07:00:00Z",
+      updated_at: fs.existsSync(data.unrelatedDriftPath)
+        ? "2026-07-13T07:30:00Z"
+        : latestClaimMutation,
       author_association: "CONTRIBUTOR",
       user: { login: "contributor" },
       labels:
@@ -2264,6 +2308,7 @@ process.exit(1);
     ghLogPath,
     mergeCountPath,
     mergeClaimPath,
+    unrelatedDriftPath,
     ledgerRoot,
     ledgerOutputRoot,
     headSha,
@@ -2307,8 +2352,10 @@ function runMergeApplyResult(
         CLAWSWEEPER_RULESET_GH_TOKEN: "ruleset-token",
         CLAWSWEEPER_RULESET_INSTALLATION_ID: "7001",
         CLAWSWEEPER_GH_RETRY_ATTEMPTS: String(options.retryAttempts ?? 1),
+        CLAWSWEEPER_WORKFLOW_GH_TOKEN: "workflow-read-token",
         GITHUB_RUN_ATTEMPT: String(options.runAttempt ?? 1),
         GITHUB_RUN_ID: "9001",
+        GITHUB_REPOSITORY: "openclaw/clawsweeper",
         ...(options.actionLedgerInvocation
           ? {
               CLAWSWEEPER_ACTION_LEDGER_FORCE: "1",
@@ -2318,7 +2365,6 @@ function runMergeApplyResult(
               CLAWSWEEPER_ACTION_LEDGER_INVOCATION: options.actionLedgerInvocation,
               GITHUB_ACTION: "apply_result",
               GITHUB_JOB: "mutate",
-              GITHUB_REPOSITORY: "openclaw/clawsweeper",
               GITHUB_SHA: "f".repeat(40),
               GITHUB_WORKFLOW: "repair cluster worker",
               GITHUB_WORKFLOW_REF:

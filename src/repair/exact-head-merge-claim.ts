@@ -3,15 +3,18 @@ import type { LooseRecord } from "./json-types.js";
 const CLAIM_PREFIX = "clawsweeper-exact-head-merge-claim:v1";
 const RELEASE_PREFIX = "clawsweeper-exact-head-merge-release:v1";
 const RECOVERY_PREFIX = "clawsweeper-exact-head-merge-recovery:v1";
-const DISPATCH_PREFIX = "clawsweeper-exact-head-merge-dispatch:v1";
+const LEGACY_DISPATCH_PREFIX = "clawsweeper-exact-head-merge-dispatch:v1";
+const DISPATCH_PREFIX = "clawsweeper-exact-head-merge-dispatch:v2";
 const CLAIM_PATTERN =
   /<!-- clawsweeper-exact-head-merge-claim:v1 repo=([^ ]+) pr=([1-9][0-9]*) head=([a-fA-F0-9]{40}) method=([a-z]+) owner=([a-z0-9_-]+) claimant=([^ ]+) -->/g;
 const RELEASE_PATTERN =
   /<!-- clawsweeper-exact-head-merge-release:v1 claim=([1-9][0-9]*) repo=([^ ]+) pr=([1-9][0-9]*) head=([a-fA-F0-9]{40}) method=([a-z]+) owner=([a-z0-9_-]+) claimant=([^ ]+) -->/g;
 const RECOVERY_PATTERN =
   /<!-- clawsweeper-exact-head-merge-recovery:v1 claim=([1-9][0-9]*) repo=([^ ]+) pr=([1-9][0-9]*) head=([a-fA-F0-9]{40}) method=([a-z]+) owner=([a-z0-9_-]+) claimant=([^ ]+) recoverer=([^ ]+) -->/g;
-const DISPATCH_PATTERN =
+const LEGACY_DISPATCH_PATTERN =
   /<!-- clawsweeper-exact-head-merge-dispatch:v1 claim=([1-9][0-9]*) repo=([^ ]+) pr=([1-9][0-9]*) head=([a-fA-F0-9]{40}) method=([a-z]+) owner=([a-z0-9_-]+) claimant=([^ ]+) -->/g;
+const DISPATCH_PATTERN =
+  /<!-- clawsweeper-exact-head-merge-dispatch:v2 claim=([1-9][0-9]*) repo=([^ ]+) pr=([1-9][0-9]*) head=([a-fA-F0-9]{40}) method=([a-z]+) owner=([a-z0-9_-]+) claimant=([^ ]+) expected=([^ ]+) -->/g;
 const DEFAULT_RECOVERY_GRACE_MS = 5 * 60 * 1000;
 
 export type ExactHeadMergeClaimIdentity = {
@@ -29,7 +32,12 @@ export type ExactHeadMergeClaimRequest = ExactHeadMergeClaimIdentity & {
 };
 
 export type ExactHeadMergeClaimResult =
-  | { status: "acquired"; reason: ""; claimId: number }
+  | {
+      status: "acquired";
+      reason: "";
+      claimId: number;
+      lastClaimMutationAt: string | null;
+    }
   | {
       status: "existing";
       reason: string;
@@ -38,6 +46,8 @@ export type ExactHeadMergeClaimResult =
       claimant: string;
       createdAt: string | null;
       dispatched?: boolean;
+      expectedSquashMessage: string | null;
+      lastClaimMutationAt: string | null;
     }
   | { status: "recovered"; reason: string; claimId: null }
   | { status: "blocked" | "unknown"; reason: string; claimId: null };
@@ -56,7 +66,13 @@ export type ExactHeadMergeClaimReleaseResult =
   | { status: "blocked" | "unknown"; reason: string; claimId: number };
 
 export type ExactHeadMergeClaimDispatchResult =
-  | { status: "dispatched"; reason: ""; claimId: number }
+  | {
+      status: "dispatched";
+      reason: "";
+      claimId: number;
+      expectedSquashMessage: string;
+      lastClaimMutationAt: string | null;
+    }
   | { status: "blocked" | "unknown"; reason: string; claimId: number };
 
 export type ExactHeadMergeClaimRecoveryCandidate = {
@@ -89,7 +105,9 @@ type ParsedRecovery = ParsedRelease & {
   recoverer: string;
 };
 
-type ParsedDispatch = ParsedRelease;
+type ParsedDispatch = ParsedRelease & {
+  expectedSquashMessage: string | null;
+};
 
 type TrustedClaim = {
   comment: LooseRecord;
@@ -114,6 +132,7 @@ type TrustedDispatch = {
   comment: LooseRecord;
   id: number;
   dispatch: ParsedDispatch;
+  createdAt: string | null;
 };
 
 type InspectedClaims = {
@@ -188,11 +207,13 @@ export function exactHeadMergeClaimRecoveryBody(
 export function exactHeadMergeClaimDispatchBody(
   request: ExactHeadMergeClaimRequest,
   claimId: number,
+  expectedSquashMessage: string,
 ): string {
   const normalized = normalizeRequest(request);
   const normalizedClaimId = normalizeCommentId(claimId, "claim");
+  const normalizedExpectedSquashMessage = normalizeExpectedSquashMessage(expectedSquashMessage);
   return [
-    exactHeadMergeDispatchMarker(normalized, normalizedClaimId),
+    exactHeadMergeDispatchMarker(normalized, normalizedClaimId, normalizedExpectedSquashMessage),
     `ClawSweeper crossed the exact-head squash merge dispatch boundary for \`${normalized.headSha.slice(0, 12)}\` under claim ${normalizedClaimId}. Later workflow attempts must reconcile GitHub state and must not replay the merge request.`,
   ].join("\n");
 }
@@ -209,7 +230,7 @@ export function isTrustedExactHeadMergeClaimComment(
     markerCount(body, CLAIM_PREFIX) === 1 &&
     markerCount(body, RELEASE_PREFIX) === 0 &&
     markerCount(body, RECOVERY_PREFIX) === 0 &&
-    markerCount(body, DISPATCH_PREFIX) === 0 &&
+    dispatchMarkerCount(body) === 0 &&
     claims.length === 1 &&
     sameClaim(claims[0]!, normalized) &&
     claims[0]!.owner === normalized.owner &&
@@ -231,7 +252,7 @@ export function isTrustedExactHeadMergeClaimReleaseComment(
     markerCount(body, CLAIM_PREFIX) === 0 &&
     markerCount(body, RELEASE_PREFIX) === 1 &&
     markerCount(body, RECOVERY_PREFIX) === 0 &&
-    markerCount(body, DISPATCH_PREFIX) === 0 &&
+    dispatchMarkerCount(body) === 0 &&
     releases.length === 1 &&
     releases[0]!.claimId === normalizedClaimId &&
     sameClaim(releases[0]!, normalized) &&
@@ -258,7 +279,7 @@ export function isTrustedExactHeadMergeClaimRecoveryComment(
     markerCount(body, CLAIM_PREFIX) === 0 &&
     markerCount(body, RELEASE_PREFIX) === 0 &&
     markerCount(body, RECOVERY_PREFIX) === 1 &&
-    markerCount(body, DISPATCH_PREFIX) === 0 &&
+    dispatchMarkerCount(body) === 0 &&
     recoveries.length === 1 &&
     recoveries[0]!.claimId === normalizedClaimId &&
     sameClaim(recoveries[0]!, normalized) &&
@@ -272,9 +293,14 @@ export function isTrustedExactHeadMergeClaimDispatchComment(
   comment: LooseRecord,
   request: ExactHeadMergeClaimRequest,
   claimId: number,
+  expectedSquashMessage?: string,
 ): boolean {
   const normalized = normalizeRequest(request);
   const normalizedClaimId = normalizeCommentId(claimId, "claim");
+  const normalizedExpectedSquashMessage =
+    expectedSquashMessage === undefined
+      ? undefined
+      : normalizeExpectedSquashMessage(expectedSquashMessage);
   if (!trustedClaimAuthor(comment, normalized)) return false;
   const body = String(comment.body ?? "");
   const dispatches = parseDispatchMarkers(body);
@@ -282,12 +308,14 @@ export function isTrustedExactHeadMergeClaimDispatchComment(
     markerCount(body, CLAIM_PREFIX) === 0 &&
     markerCount(body, RELEASE_PREFIX) === 0 &&
     markerCount(body, RECOVERY_PREFIX) === 0 &&
-    markerCount(body, DISPATCH_PREFIX) === 1 &&
+    dispatchMarkerCount(body) === 1 &&
     dispatches.length === 1 &&
     dispatches[0]!.claimId === normalizedClaimId &&
     sameClaim(dispatches[0]!, normalized) &&
     dispatches[0]!.owner === normalized.owner &&
-    dispatches[0]!.claimant === normalized.claimant
+    dispatches[0]!.claimant === normalized.claimant &&
+    (normalizedExpectedSquashMessage === undefined ||
+      dispatches[0]!.expectedSquashMessage === normalizedExpectedSquashMessage)
   );
 }
 
@@ -414,8 +442,14 @@ export function ensureExactHeadMergeClaim(
   );
   const winningClaim = confirmed.value.exact[0]!;
   if (ownClaims.some((claim) => claim.id === winningClaim.id)) {
-    return { status: "acquired", reason: "", claimId: winningClaim.id };
+    return {
+      status: "acquired",
+      reason: "",
+      claimId: winningClaim.id,
+      lastClaimMutationAt: winningClaim.createdAt,
+    };
   }
+  const dispatch = matchingDispatch(confirmed.value, winningClaim.claim, winningClaim.id);
   return {
     status: "existing",
     reason: "another verified workflow owns the exact-head merge claim; reconciliation only",
@@ -423,13 +457,16 @@ export function ensureExactHeadMergeClaim(
     owner: winningClaim.claim.owner,
     claimant: winningClaim.claim.claimant,
     createdAt: winningClaim.createdAt,
-    dispatched: hasMatchingDispatch(confirmed.value, winningClaim.claim, winningClaim.id),
+    dispatched: Boolean(dispatch),
+    expectedSquashMessage: dispatch?.dispatch.expectedSquashMessage ?? null,
+    lastClaimMutationAt: dispatch?.createdAt ?? winningClaim.createdAt,
   };
 }
 
 export function markExactHeadMergeClaimDispatched(
   request: ExactHeadMergeClaimRequest,
   claimId: number,
+  expectedSquashMessage: string,
   io: {
     listComments: () => LooseRecord[];
     createComment: (body: string) => LooseRecord;
@@ -437,6 +474,7 @@ export function markExactHeadMergeClaimDispatched(
 ): ExactHeadMergeClaimDispatchResult {
   const normalized = normalizeRequest(request);
   const normalizedClaimId = normalizeCommentId(claimId, "claim");
+  const normalizedExpectedSquashMessage = normalizeExpectedSquashMessage(expectedSquashMessage);
   const initial = inspectClaims(normalized, io.listComments);
   if ("failure" in initial) {
     return {
@@ -445,8 +483,22 @@ export function markExactHeadMergeClaimDispatched(
       claimId: normalizedClaimId,
     };
   }
-  if (hasMatchingDispatch(initial.value, normalized, normalizedClaimId)) {
-    return { status: "dispatched", reason: "", claimId: normalizedClaimId };
+  const initialDispatch = matchingDispatch(initial.value, normalized, normalizedClaimId);
+  if (initialDispatch) {
+    if (initialDispatch.dispatch.expectedSquashMessage !== normalizedExpectedSquashMessage) {
+      return {
+        status: "blocked",
+        reason: "exact-head merge dispatch payload differs from the durable claim",
+        claimId: normalizedClaimId,
+      };
+    }
+    return {
+      status: "dispatched",
+      reason: "",
+      claimId: normalizedClaimId,
+      expectedSquashMessage: normalizedExpectedSquashMessage,
+      lastClaimMutationAt: initialDispatch.createdAt,
+    };
   }
   const active = initial.value.exact[0];
   if (
@@ -464,7 +516,13 @@ export function markExactHeadMergeClaimDispatched(
 
   let createError = "";
   try {
-    io.createComment(exactHeadMergeClaimDispatchBody(normalized, normalizedClaimId));
+    io.createComment(
+      exactHeadMergeClaimDispatchBody(
+        normalized,
+        normalizedClaimId,
+        normalizedExpectedSquashMessage,
+      ),
+    );
   } catch (error) {
     createError = errorText(error);
   }
@@ -476,8 +534,22 @@ export function markExactHeadMergeClaimDispatched(
       claimId: normalizedClaimId,
     };
   }
-  if (hasMatchingDispatch(confirmed.value, normalized, normalizedClaimId)) {
-    return { status: "dispatched", reason: "", claimId: normalizedClaimId };
+  const confirmedDispatch = matchingDispatch(confirmed.value, normalized, normalizedClaimId);
+  if (confirmedDispatch?.dispatch.expectedSquashMessage === normalizedExpectedSquashMessage) {
+    return {
+      status: "dispatched",
+      reason: "",
+      claimId: normalizedClaimId,
+      expectedSquashMessage: normalizedExpectedSquashMessage,
+      lastClaimMutationAt: confirmedDispatch.createdAt,
+    };
+  }
+  if (confirmedDispatch) {
+    return {
+      status: "blocked",
+      reason: "exact-head merge dispatch payload differs from the durable claim",
+      claimId: normalizedClaimId,
+    };
   }
   return {
     status: "unknown",
@@ -586,6 +658,7 @@ export function inspectExactHeadMergeClaim(
   if ("failure" in inspected) return inspected.failure;
   if (inspected.value.exact.length > 0) {
     const active = inspected.value.exact[0]!;
+    const dispatch = matchingDispatch(inspected.value, active.claim, active.id);
     return {
       status: "existing",
       reason: "exact-head merge request is durably claimed; reconciliation only",
@@ -593,7 +666,9 @@ export function inspectExactHeadMergeClaim(
       owner: active.claim.owner,
       claimant: active.claim.claimant,
       createdAt: active.createdAt,
-      dispatched: hasMatchingDispatch(inspected.value, active.claim, active.id),
+      dispatched: Boolean(dispatch),
+      expectedSquashMessage: dispatch?.dispatch.expectedSquashMessage ?? null,
+      lastClaimMutationAt: dispatch?.createdAt ?? active.createdAt,
     };
   }
   if (inspected.value.exactHistory) {
@@ -644,7 +719,7 @@ function inspectClaims(
     const claimCount = markerCount(body, CLAIM_PREFIX);
     const releaseCount = markerCount(body, RELEASE_PREFIX);
     const recoveryCount = markerCount(body, RECOVERY_PREFIX);
-    const dispatchCount = markerCount(body, DISPATCH_PREFIX);
+    const dispatchCount = dispatchMarkerCount(body);
     if (claimCount === 0 && releaseCount === 0 && recoveryCount === 0 && dispatchCount === 0)
       continue;
     if (
@@ -687,7 +762,7 @@ function inspectClaims(
       if (markers.length !== 1) return malformedMarkerFailure();
       const dispatch = markers[0]!;
       if (!sameClaimScope(dispatch, request)) return conflictingScopeFailure(dispatch);
-      dispatches.push({ comment, id, dispatch });
+      dispatches.push({ comment, id, dispatch, createdAt: commentTimestamp(comment) });
       continue;
     }
     const markers = parseRecoveryMarkers(body);
@@ -840,8 +915,23 @@ function exactHeadMergeRecoveryMarker(
 function exactHeadMergeDispatchMarker(
   request: ExactHeadMergeClaimRequest,
   claimId: number,
+  expectedSquashMessage: string,
 ): string {
-  return `<!-- ${DISPATCH_PREFIX} claim=${claimId} repo=${encodeURIComponent(request.repository)} pr=${request.number} head=${request.headSha} method=${request.method} owner=${request.owner} claimant=${encodeURIComponent(request.claimant)} -->`;
+  return `<!-- ${DISPATCH_PREFIX} claim=${claimId} repo=${encodeURIComponent(request.repository)} pr=${request.number} head=${request.headSha} method=${request.method} owner=${request.owner} claimant=${encodeURIComponent(request.claimant)} expected=${encodeURIComponent(expectedSquashMessage)} -->`;
+}
+
+function matchingDispatch(
+  inspected: InspectedClaims,
+  request: ParsedClaim,
+  claimId: number,
+): TrustedDispatch | undefined {
+  return inspected.dispatches.find(
+    (candidate) =>
+      candidate.dispatch.claimId === claimId &&
+      sameClaim(candidate.dispatch, request) &&
+      candidate.dispatch.owner === request.owner &&
+      candidate.dispatch.claimant === request.claimant,
+  );
 }
 
 function hasMatchingDispatch(
@@ -849,13 +939,7 @@ function hasMatchingDispatch(
   request: ParsedClaim,
   claimId: number,
 ): boolean {
-  return inspected.dispatches.some(
-    (candidate) =>
-      candidate.dispatch.claimId === claimId &&
-      sameClaim(candidate.dispatch, request) &&
-      candidate.dispatch.owner === request.owner &&
-      candidate.dispatch.claimant === request.claimant,
-  );
+  return Boolean(matchingDispatch(inspected, request, claimId));
 }
 
 export function exactHeadMergeClaimWorkflowRunEnv(
@@ -940,6 +1024,23 @@ function parseDispatchMarkers(body: string): ParsedDispatch[] {
         method: normalizeMethod(match[5]!),
         owner: normalizeOwner(match[6]!),
         claimant: normalizeClaimant(decodeURIComponent(match[7]!)),
+        expectedSquashMessage: normalizeExpectedSquashMessage(decodeURIComponent(match[8]!)),
+      });
+    } catch {
+      return [];
+    }
+  }
+  for (const match of body.matchAll(LEGACY_DISPATCH_PATTERN)) {
+    try {
+      dispatches.push({
+        claimId: normalizeCommentId(Number(match[1]), "claim"),
+        repository: normalizeRepository(decodeURIComponent(match[2]!)),
+        number: normalizeNumber(Number(match[3])),
+        headSha: normalizeHeadSha(match[4]!),
+        method: normalizeMethod(match[5]!),
+        owner: normalizeOwner(match[6]!),
+        claimant: normalizeClaimant(decodeURIComponent(match[7]!)),
+        expectedSquashMessage: null,
       });
     } catch {
       return [];
@@ -952,6 +1053,10 @@ function markerCount(body: string, marker: string): number {
   return body.split(marker).length - 1;
 }
 
+function dispatchMarkerCount(body: string): number {
+  return markerCount(body, DISPATCH_PREFIX) + markerCount(body, LEGACY_DISPATCH_PREFIX);
+}
+
 function commentTimestamp(comment: LooseRecord): string | null {
   for (const value of [comment.created_at, comment.updated_at]) {
     const text = String(value ?? "").trim();
@@ -960,6 +1065,19 @@ function commentTimestamp(comment: LooseRecord): string | null {
     if (Number.isFinite(parsed)) return new Date(parsed).toISOString();
   }
   return null;
+}
+
+export function exactHeadMergeClaimOwnsUpdatedAt(
+  claim: { lastClaimMutationAt?: string | null },
+  updatedAt: unknown,
+): boolean {
+  return exactHeadMergeUpdatedAtMatches(claim.lastClaimMutationAt, updatedAt);
+}
+
+export function exactHeadMergeUpdatedAtMatches(left: unknown, right: unknown): boolean {
+  const normalizedLeft = normalizeTimestamp(left);
+  const normalizedRight = normalizeTimestamp(right);
+  return Boolean(normalizedLeft && normalizedRight && normalizedLeft === normalizedRight);
 }
 
 export function exactHeadMergeClaimRecoveryDecision(
@@ -1150,6 +1268,24 @@ function normalizeClaimant(value: string): string {
     throw new Error("claimant is invalid for the exact-head merge claim");
   }
   return claimant;
+}
+
+function normalizeExpectedSquashMessage(value: string): string {
+  const expectedSquashMessage = String(value ?? "").trimEnd();
+  if (!expectedSquashMessage) {
+    throw new Error("expected squash message is invalid for the exact-head merge claim");
+  }
+  if (encodeURIComponent(expectedSquashMessage).length > 50_000) {
+    throw new Error("expected squash message is too large for the exact-head merge claim");
+  }
+  return expectedSquashMessage;
+}
+
+function normalizeTimestamp(value: unknown): string | null {
+  const text = String(value ?? "").trim();
+  if (!text) return null;
+  const parsed = Date.parse(text);
+  return Number.isFinite(parsed) ? new Date(parsed).toISOString() : null;
 }
 
 function trustedClaimAuthor(comment: LooseRecord, request: ExactHeadMergeClaimRequest): boolean {
