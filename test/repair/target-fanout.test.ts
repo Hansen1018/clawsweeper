@@ -422,11 +422,11 @@ test("target fanout records queue, exact dispatch, and cursor publication lifecy
     const publications = events.filter((event) => event.event_type === "publication.lifecycle");
     assert.deepEqual(
       publications.map((event) => event.action.status),
-      ["started", "published"],
+      ["started", "completed"],
     );
     assert.equal(publications[1]?.parent_event_id, publications[0]?.event_id);
     assert.equal(publications[1]?.idempotency_key_sha256, publications[0]?.idempotency_key_sha256);
-    assert.equal(publications[1]?.attributes?.publication_kind, "target_fanout_cursor");
+    assert.equal(publications[1]?.attributes?.publication_kind, "local_artifact");
     assert.match(publications[1]?.evidence?.[0]?.sha256 ?? "", /^[a-f0-9]{64}$/);
 
     const terminal = events.at(-1);
@@ -512,7 +512,7 @@ test("target fanout closes a failed request attempt without advancing the cursor
   }
 });
 
-test("target fanout publishes the cursor and current-workflow shards together", () => {
+test("target fanout publishes its cursor before finalizing and publishing exact shards", () => {
   const workflow = readFileSync(".github/workflows/sweep.yml", "utf8");
   const start = workflow.indexOf("\n  target-fanout:");
   const end = workflow.indexOf("\n  plan:", start);
@@ -524,22 +524,25 @@ test("target fanout publishes the cursor and current-workflow shards together", 
   assert.match(fanout, /id: action-ledger/);
   assert.match(fanout, /id: setup-state/);
   assert.match(fanout, /id: setup-pnpm/);
-  assert.match(
-    fanout,
-    /if: \$\{\{ always\(\) && steps\.setup-state\.outcome == 'success' && steps\.action-ledger\.outcome == 'success' && steps\.setup-pnpm\.outcome == 'success' \}\}/,
-  );
+  assert.match(fanout, /--receipt-kind target_fanout_cursor_publication/);
+  assert.match(fanout, /repair:action-ledger -- finalize/);
   assert.match(
     fanout,
     /repair:action-ledger -- publish-workflow \\\n\s+--expected-producer-job target-fanout/,
   );
-  assert.match(
-    fanout,
-    /cp -R results\/target-fanout-cursors\/\. \\\n\s+"\$CLAWSWEEPER_STATE_DIR\/results\/target-fanout-cursors\/"/,
+  assert.match(fanout, /publish-action-event-paths/);
+  assert.ok(
+    fanout.indexOf("--receipt-kind target_fanout_cursor_publication") <
+      fanout.indexOf("repair:action-ledger -- finalize"),
   );
-  assert.match(fanout, /if \[ -d results\/target-fanout-cursors \]; then/);
-  assert.match(fanout, /publish_args\+=\(--path results\/target-fanout-cursors\)/);
-  assert.match(fanout, /publish_args\+=\(--path "\$event_path"\)/);
-  assert.match(fanout, /--message "chore: publish target fanout state"/);
+  assert.ok(
+    fanout.indexOf("repair:action-ledger -- finalize") <
+      fanout.indexOf("repair:action-ledger -- publish-workflow"),
+  );
+  assert.doesNotMatch(
+    fanout.slice(fanout.indexOf("Import immutable target fanout action ledger")),
+    /--rebase-strategy theirs/,
+  );
 });
 
 function repo(nameWithOwner: string, overrides: Partial<ListedRepository> = {}): ListedRepository {

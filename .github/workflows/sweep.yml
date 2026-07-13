@@ -1407,19 +1407,38 @@ jobs:
             --workflow sweep.yml \
             --ref main
 
-      - name: Publish fanout cursor and action ledger
+      - name: Publish fanout cursor
         if: ${{ always() && steps.setup-state.outcome == 'success' && steps.action-ledger.outcome == 'success' && steps.setup-pnpm.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          if [ ! -d results/target-fanout-cursors ]; then
+            echo "No target fanout cursor to publish."
+            exit 0
+          fi
+          pnpm run repair:publish-main -- \
+            --message "chore: update target fanout cursor" \
+            --path results/target-fanout-cursors \
+            --receipt-kind target_fanout_cursor_publication \
+            --rebase-strategy theirs
+
+      - name: Finalize target fanout action ledger
+        id: finalize-action-ledger
+        if: ${{ always() && steps.action-ledger.outcome == 'success' && steps.setup-pnpm.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          mkdir -p .artifacts
+          pnpm run --silent repair:action-ledger -- finalize \
+            > .artifacts/target-fanout-action-ledger-finalize.json
+
+      - name: Import immutable target fanout action ledger
+        id: import-action-ledger
+        if: ${{ always() && steps.setup-state.outcome == 'success' && steps.finalize-action-ledger.outcome == 'success' }}
         run: |
           set -euo pipefail
           test -n "${CLAWSWEEPER_STATE_DIR:-}"
           source_root="${CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:?setup-action-ledger output root is required}"
-          if [ ! -d "$source_root/ledger" ]; then
-            echo "Target fanout completed without immutable action ledger shards." >&2
-            exit 1
-          fi
           import_result_file=".artifacts/target-fanout-action-ledger-import.json"
           event_paths_file=".artifacts/target-fanout-action-ledger-paths.txt"
-          mkdir -p .artifacts
           pnpm run --silent repair:action-ledger -- publish-workflow \
             --expected-producer-job target-fanout \
             --source-root "$source_root" \
@@ -1429,24 +1448,20 @@ jobs:
             echo "Target fanout action shards existed but no paths were imported." >&2
             exit 1
           fi
-          publish_args=()
-          if [ -d results/target-fanout-cursors ]; then
-            mkdir -p "$CLAWSWEEPER_STATE_DIR/results/target-fanout-cursors"
-            cp -R results/target-fanout-cursors/. \
-              "$CLAWSWEEPER_STATE_DIR/results/target-fanout-cursors/"
-            publish_args+=(--path results/target-fanout-cursors)
-          fi
           while IFS= read -r event_path; do
             durable_event_path="$CLAWSWEEPER_STATE_DIR/$event_path"
             test -f "$durable_event_path"
             mkdir -p "$(dirname "$event_path")"
             cp "$durable_event_path" "$event_path"
-            publish_args+=(--path "$event_path")
           done < "$event_paths_file"
-          pnpm run repair:publish-main -- \
-            --message "chore: publish target fanout state" \
-            "${publish_args[@]}" \
-            --rebase-strategy theirs
+
+      - name: Publish immutable target fanout action ledger
+        if: ${{ always() && steps.import-action-ledger.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          node dist/clawsweeper.js publish-action-event-paths \
+            --paths-file .artifacts/target-fanout-action-ledger-paths.txt \
+            --message "chore: append target fanout action ledger"
 
   plan:
     name: Plan review candidates

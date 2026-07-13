@@ -65,6 +65,7 @@ interface FanoutActionLedger {
     repository: string;
     mode: FanoutMode;
     limit: number;
+    cycleStartedAt: string;
   };
   subject: ActionEventSubject;
   queueStartEventId: string | null;
@@ -194,6 +195,7 @@ function startFanoutActionLedger(options: FanoutOptions): FanoutActionLedger {
     repository,
     mode: options.mode,
     limit: options.limit,
+    cycleStartedAt: fanoutCycleStartedAt(),
   };
   const subject: ActionEventSubject = {
     repository,
@@ -495,8 +497,8 @@ function recordFanoutCursorPublication(
   }
   const completed = recordWorkflowPhaseEvent(repoRoot(), {
     phase: ACTION_EVENT_TYPES.publicationLifecycle,
-    status: ACTION_EVENT_STATUSES.published,
-    reasonCode: ACTION_EVENT_REASON_CODES.published,
+    status: ACTION_EVENT_STATUSES.completed,
+    reasonCode: ACTION_EVENT_REASON_CODES.completed,
     retryable: false,
     mutation: true,
     identity: { slot: "fanout_cursor_publication_outcome", outcome: "accepted" },
@@ -510,7 +512,7 @@ function recordFanoutCursorPublication(
     evidence: [{ kind: "fanout_cursor_state", sha256: cursorSha256 }],
     attributes: {
       completion_reason: "mutation_accepted",
-      publication_kind: "target_fanout_cursor",
+      publication_kind: "local_artifact",
       work_kind: options.mode,
     },
     privacy: fanoutActionLedgerPrivacy(),
@@ -613,6 +615,11 @@ function fanoutActionLedgerPrivacy() {
       "token",
     ],
   };
+}
+
+function fanoutCycleStartedAt(): string {
+  const value = String(process.env.GITHUB_RUN_STARTED_AT ?? "").trim();
+  return value || "1970-01-01T00:00:00Z";
 }
 
 function cursorContent(cursor: number): string {
