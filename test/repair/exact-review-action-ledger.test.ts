@@ -394,6 +394,11 @@ test("exact-review workflows isolate state credentials and publish exact manifes
   assert.match(event, /exact-review-action-ledger-cli\.js claim/);
   assert.match(event, /exact-review-action-ledger-cli\.js complete/);
   assert.match(reconcileProducer, /exact-review-action-ledger-cli\.js reconcile/);
+  assert.match(reconcileProducer, /actions\/checkout@v7\s+with:\s+ref: \$\{\{ github\.sha \}\}/);
+  assert.match(
+    reconcileProducer,
+    /Verify reconciler source revision[\s\S]*test "\$\(git rev-parse HEAD\)" = "\$GITHUB_SHA"/,
+  );
   for (const producer of [legacy, event, reconcileProducer]) {
     assert.match(producer, /--repair-lane exact-review-queue/);
     assert.match(producer, /actions\/upload-artifact@v7/);
