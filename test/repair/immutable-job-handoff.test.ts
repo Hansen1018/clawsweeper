@@ -117,6 +117,7 @@ test("worker concurrency serializes logical jobs while preserving dedicated requ
     "${{ inputs.requeue && format('clawsweeper-repair-requeue-{0}-{1}-{2}', inputs.job, inputs.job_sha256, github.run_id) || format('clawsweeper-repair-{0}', inputs.job) }}",
   );
   assert.equal(workflow.concurrency["cancel-in-progress"], false);
+  assert.equal(workflow.concurrency.queue, "max");
 });
 
 test("repair dispatch binds dedupe to immutable state and job bytes", () => {

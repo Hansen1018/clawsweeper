@@ -503,9 +503,9 @@ appropriate repair job.
   review and merge.
 - `automerge` merges only after review verdict, checks, mergeability,
   security, maintainer stop/approve state, and repository policy gates pass.
-- Repair workers coalesce pending runs for the same durable job while allowing
-  an active execute run to finish its gate cleanup. Stale-head retries use a
-  dedicated run-scoped lane so they can start during that temporary gate
+- Repair workers queue immutable generations for the same durable job while
+  allowing an active execute run to finish its gate cleanup. Stale-head retries
+  use a dedicated run-scoped lane so they can start during that temporary gate
   window. Before a contributor branch push, ClawSweeper waits 90 seconds by
   default, fetches the live PR head again, and requeues instead of pushing when
   that head changed. It also refuses to push when the PR closed during the
