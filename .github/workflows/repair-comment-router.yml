@@ -606,6 +606,7 @@ jobs:
           fetch-depth: 1
 
       - uses: ./.github/actions/setup-pnpm
+        id: setup-pnpm
         with:
           build-script: build:repair
 
@@ -646,6 +647,7 @@ jobs:
           echo "app_id=$app_id" >> "$GITHUB_OUTPUT"
 
       - name: Drain durable waiting commands under the serialized capacity gate
+        id: drain-waiting-commands
         env:
           GH_TOKEN: ${{ steps.dispatch-app-token.outputs.token }}
           CLAWSWEEPER_AUTHENTICATED_APP_ID: ${{ steps.dispatch-mutation-app.outputs.app_id }}
@@ -811,7 +813,7 @@ jobs:
           mkdir -p .artifacts
           allow_empty_args=()
           # Empty is valid only when this run's report proves no command lifecycle started.
-          if [ "${{ steps.route-comments.outcome }}" = "success" ] &&
+          if [ "${{ steps.drain-waiting-commands.outcome }}" = "success" ] &&
              jq -e '.commands_seen == 0' results/comment-router-latest.json >/dev/null 2>&1; then
             allow_empty_args+=(--allow-empty)
           fi
