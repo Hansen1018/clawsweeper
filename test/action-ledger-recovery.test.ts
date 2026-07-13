@@ -9,6 +9,59 @@ import { pathToFileURL } from "node:url";
 import { actionLedgerJson } from "../dist/action-ledger.js";
 import { readMutationRecoveries } from "../dist/action-ledger-recovery.js";
 
+test("mutation recovery writers sync content and its directory around the atomic rename", async () => {
+  const result = await runInstrumentedWriter("success");
+
+  assert.equal(result.outcome, "success");
+  assert.equal(result.targetExists, true);
+  assert.deepEqual(result.temporaryEntries, []);
+  assert.deepEqual(result.events, [
+    "open:temporary",
+    "write:temporary",
+    "fsync:temporary",
+    "close:temporary",
+    "rename",
+    "open:directory",
+    "fsync:directory",
+    "close:directory",
+    "cleanup:temporary",
+  ]);
+});
+
+test("mutation recovery writers do not rename when syncing staged content fails", async () => {
+  const result = await runInstrumentedWriter("fail-temporary-fsync");
+
+  assert.equal(result.outcome, "EIO: temporary fsync failed");
+  assert.equal(result.targetExists, false);
+  assert.deepEqual(result.temporaryEntries, []);
+  assert.deepEqual(result.events, [
+    "open:temporary",
+    "write:temporary",
+    "fsync:temporary",
+    "close:temporary",
+    "cleanup:temporary",
+  ]);
+});
+
+test("mutation recovery writers retain the renamed WAL but fail closed when directory sync fails", async () => {
+  const result = await runInstrumentedWriter("fail-directory-fsync");
+
+  assert.equal(result.outcome, "EIO: directory fsync failed");
+  assert.equal(result.targetExists, true);
+  assert.deepEqual(result.temporaryEntries, []);
+  assert.deepEqual(result.events, [
+    "open:temporary",
+    "write:temporary",
+    "fsync:temporary",
+    "close:temporary",
+    "rename",
+    "open:directory",
+    "fsync:directory",
+    "close:directory",
+    "cleanup:temporary",
+  ]);
+});
+
 test("mutation recovery readers preserve a live writer staging file", async () => {
   const root = fs.realpathSync(
     fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-recovery-concurrency-")),
@@ -152,6 +205,122 @@ process.stdout.write(JSON.stringify({ first, second }));
     fs.rmSync(root, { force: true, recursive: true });
   }
 });
+
+type InstrumentedWriterMode = "success" | "fail-temporary-fsync" | "fail-directory-fsync";
+
+type InstrumentedWriterResult = {
+  outcome: string;
+  events: string[];
+  targetExists: boolean;
+  temporaryEntries: string[];
+};
+
+async function runInstrumentedWriter(
+  mode: InstrumentedWriterMode,
+): Promise<InstrumentedWriterResult> {
+  const root = fs.realpathSync(
+    fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-recovery-durability-")),
+  );
+  const key = "d".repeat(64);
+  const moduleUrl = pathToFileURL(
+    path.join(process.cwd(), "dist", "action-ledger-recovery.js"),
+  ).href;
+  const script = `
+import fs from "node:fs";
+import path from "node:path";
+import { syncBuiltinESMExports } from "node:module";
+
+const [root, key, moduleUrl, mode] = process.argv.slice(1);
+const directory = path.join(root, ".mutation-recovery", "repair");
+const target = path.join(directory, \`\${key}.json\`);
+const surrogate = path.join(root, "directory-sync-surrogate");
+const events = [];
+const descriptorKinds = new Map();
+const originalOpenSync = fs.openSync;
+const originalWriteFileSync = fs.writeFileSync;
+const originalFsyncSync = fs.fsyncSync;
+const originalCloseSync = fs.closeSync;
+const originalRenameSync = fs.renameSync;
+const originalRmSync = fs.rmSync;
+
+originalWriteFileSync(surrogate, "sync\\n");
+fs.openSync = (filePath, flags, permissions) => {
+  if (String(filePath) === directory) {
+    const descriptor = originalOpenSync(surrogate, "r+");
+    descriptorKinds.set(descriptor, "directory");
+    events.push("open:directory");
+    return descriptor;
+  }
+  const descriptor = originalOpenSync(filePath, flags, permissions);
+  if (String(filePath).endsWith(".tmp")) {
+    descriptorKinds.set(descriptor, "temporary");
+    events.push("open:temporary");
+  }
+  return descriptor;
+};
+fs.writeFileSync = (target, ...args) => {
+  if (typeof target === "number" && descriptorKinds.get(target) === "temporary") {
+    events.push("write:temporary");
+  }
+  return originalWriteFileSync(target, ...args);
+};
+fs.fsyncSync = (descriptor) => {
+  const kind = descriptorKinds.get(descriptor);
+  if (kind) events.push(\`fsync:\${kind}\`);
+  if (mode === \`fail-\${kind}-fsync\`) {
+    const error = new Error(\`\${kind} fsync failed\`);
+    error.code = "EIO";
+    throw error;
+  }
+  return originalFsyncSync(descriptor);
+};
+fs.closeSync = (descriptor) => {
+  const kind = descriptorKinds.get(descriptor);
+  if (kind) events.push(\`close:\${kind}\`);
+  descriptorKinds.delete(descriptor);
+  return originalCloseSync(descriptor);
+};
+fs.renameSync = (source, destination) => {
+  events.push("rename");
+  return originalRenameSync(source, destination);
+};
+fs.rmSync = (filePath, options) => {
+  if (String(filePath).endsWith(".tmp")) events.push("cleanup:temporary");
+  return originalRmSync(filePath, options);
+};
+syncBuiltinESMExports();
+
+const { writeMutationRecovery } = await import(moduleUrl);
+let outcome = "success";
+try {
+  writeMutationRecovery(root, "repair", key, { state: "pending" });
+} catch (error) {
+  outcome = \`\${error.code ?? "ERROR"}: \${error.message}\`;
+}
+const temporaryEntries = fs.existsSync(directory)
+  ? fs.readdirSync(directory).filter((entry) => entry.endsWith(".tmp"))
+  : [];
+process.stdout.write(JSON.stringify({
+  outcome,
+  events,
+  targetExists: fs.existsSync(target),
+  temporaryEntries,
+}));
+`;
+
+  try {
+    const child = spawn(
+      process.execPath,
+      ["--input-type=module", "-e", script, root, key, moduleUrl, mode],
+      { stdio: ["ignore", "pipe", "pipe"] },
+    );
+    const result = await childResult(child);
+    assert.equal(result.code, 0, result.stderr || result.stdout);
+    return JSON.parse(result.stdout) as InstrumentedWriterResult;
+  } finally {
+    fs.rmSync(root, { force: true, recursive: true });
+  }
+}
 
 async function waitForPath(filePath: string, timeoutMs = 2_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;

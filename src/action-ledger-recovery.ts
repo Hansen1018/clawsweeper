@@ -1,7 +1,10 @@
 import {
+  closeSync,
   existsSync,
+  fsyncSync,
   lstatSync,
   mkdirSync,
+  openSync,
   readFileSync,
   readdirSync,
   renameSync,
@@ -98,13 +101,18 @@ export function writeMutationRecovery<T>(
     key,
     payload,
   };
-  writeFileSync(temporary, `${actionLedgerJson(envelope)}\n`, {
-    encoding: "utf8",
-    flag: "wx",
-    mode: 0o600,
-  });
   try {
+    const temporaryDescriptor = openSync(temporary, "wx", 0o600);
+    try {
+      writeFileSync(temporaryDescriptor, `${actionLedgerJson(envelope)}\n`, {
+        encoding: "utf8",
+      });
+      fsyncSync(temporaryDescriptor);
+    } finally {
+      closeSync(temporaryDescriptor);
+    }
     renameSync(temporary, target);
+    synchronizeDirectory(directory);
   } finally {
     rmSync(temporary, { force: true });
   }
@@ -206,6 +214,15 @@ function prepareMutationRecoveryDirectory(recoveryRoot: string, family: string):
   if (!existsSync(directory)) mkdirSync(directory, { mode: 0o700 });
   assertDirectory(directory);
   return directory;
+}
+
+function synchronizeDirectory(directory: string): void {
+  const descriptor = openSync(directory, "r");
+  try {
+    fsyncSync(descriptor);
+  } finally {
+    closeSync(descriptor);
+  }
 }
 
 function assertMutationRecoveryIdentity(family: string, key: string): void {
