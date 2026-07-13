@@ -142,7 +142,7 @@ test("prior result publication resolves only one complete final provenance cohor
   );
 });
 
-test("prior result provenance verifies one exact source cohort", () => {
+test("prior result provenance verifies independently restored source attempts", () => {
   const fixture = priorResultCohortFixture();
   assert.doesNotThrow(() => verifyPriorResultArtifactCohort(fixture));
 
@@ -154,7 +154,21 @@ test("prior result provenance verifies one exact source cohort", () => {
     digest: `sha256:${digest2}`,
     producer_attempt: "2",
   };
-  assert.throws(() => verifyPriorResultArtifactCohort(mixed), /mixes producer attempts/);
+  assert.doesNotThrow(() => verifyPriorResultArtifactCohort(mixed));
+
+  const future = priorResultCohortFixture();
+  future.currentAttempt = 4;
+  future.artifacts.push(artifact(105, 3, digest2, "clawsweeper-repair-validation"));
+  future.provenance.artifacts.validation = {
+    name: "clawsweeper-repair-validation-9001-3",
+    id: "105",
+    digest: `sha256:${digest2}`,
+    producer_attempt: "3",
+  };
+  assert.throws(
+    () => verifyPriorResultArtifactCohort(future),
+    /source artifact attempt exceeds its publisher attempt/,
+  );
 });
 
 test("commit review reruns select one complete report and ledger pair per SHA", () => {

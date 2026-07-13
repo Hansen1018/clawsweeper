@@ -212,8 +212,8 @@ export function verifyPriorResultArtifactCohort({
     verifyClaim("execution", "clawsweeper-repair-execution"),
     verifyClaim("validation", "clawsweeper-repair-validation"),
   ];
-  if (new Set(sourceAttempts).size !== 1 || sourceAttempts[0]! > producerAttempt) {
-    throw new Error("prior result source artifact cohort mixes producer attempts");
+  if (sourceAttempts.some((attempt) => attempt > producerAttempt)) {
+    throw new Error("prior result source artifact attempt exceeds its publisher attempt");
   }
   verifyClaim("pre_close", "clawsweeper-repair-publication-close", producerAttempt);
   verifyClaim("publication", "clawsweeper-repair-publication", producerAttempt);
