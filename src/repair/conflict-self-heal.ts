@@ -417,6 +417,22 @@ function postSelfHealStatus(candidate: LooseRecord, { status }: { status: string
     runUrl: currentActionsRunUrl(),
     status,
   });
+  const existing = findSelfHealStatusComment(candidate.number);
+  const payload = writePayload(
+    repoRoot(),
+    `conflict-self-heal-status-${candidate.number}-${candidate.head_sha}`,
+    { body },
+  );
+  const commandArgs = existing?.id
+    ? [
+        "api",
+        `repos/${repo}/issues/comments/${existing.id}`,
+        "--method",
+        "PATCH",
+        "--input",
+        payload,
+      ]
+    : ["api", `repos/${repo}/issues/${candidate.number}/comments`, "--input", payload];
   runRepairMutation(conflictCandidateLifecycle(candidate, `status:${status}`), {
     kind: "conflict_self_heal_status",
     operationName: "conflict_self_heal",
@@ -428,31 +444,10 @@ function postSelfHealStatus(candidate: LooseRecord, { status }: { status: string
       jobPath: candidate.job_path,
       status,
       body,
+      method: existing?.id ? "PATCH" : "POST",
+      commentId: existing?.id ?? null,
     },
-    operation: () => {
-      const existing = findSelfHealStatusComment(candidate.number);
-      const payload = writePayload(
-        repoRoot(),
-        `conflict-self-heal-status-${candidate.number}-${candidate.head_sha}`,
-        { body },
-      );
-      if (existing?.id) {
-        return ghText([
-          "api",
-          `repos/${repo}/issues/comments/${existing.id}`,
-          "--method",
-          "PATCH",
-          "--input",
-          payload,
-        ]);
-      }
-      return ghText([
-        "api",
-        `repos/${repo}/issues/${candidate.number}/comments`,
-        "--input",
-        payload,
-      ]);
-    },
+    operation: () => ghText(commandArgs),
   });
 }
 

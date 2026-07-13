@@ -42,6 +42,14 @@ test("self-heal mutations emit durable action receipts", () => {
     conflicts,
     /runRepairMutation\(conflictCandidateLifecycle\(candidate, `status:\$\{status\}`\),[\s\S]*kind: "conflict_self_heal_status"/,
   );
+  assert.ok(
+    conflicts.indexOf("const existing = findSelfHealStatusComment(candidate.number)") <
+      conflicts.indexOf(
+        "runRepairMutation(conflictCandidateLifecycle(candidate, `status:${status}`)",
+      ),
+  );
+  assert.match(conflicts, /method: existing\?\.id \? "PATCH" : "POST"/);
+  assert.match(conflicts, /operation: \(\) => ghText\(commandArgs\)/);
   assert.match(
     conflicts,
     /runRepairMutation\(conflictCandidateLifecycle\(candidate, "dispatch"\),[\s\S]*kind: "repair_dispatch"/,
