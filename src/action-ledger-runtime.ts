@@ -435,6 +435,7 @@ function workflowActionEventIsRecoverableStart(event: ActionEvent): boolean {
   return (
     workflowActionEventIsUncertainMutationStart(event) ||
     ((event.event_type === ACTION_EVENT_TYPES.reviewStarted ||
+      event.event_type === ACTION_EVENT_TYPES.workflowAttempt ||
       event.event_type === ACTION_EVENT_TYPES.reviewBatch ||
       event.event_type === ACTION_EVENT_TYPES.reviewItem ||
       event.event_type === ACTION_EVENT_TYPES.reviewRetry ||

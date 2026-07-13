@@ -1718,6 +1718,142 @@ test("interruption recovery preserves cancellation instead of rewriting it as ti
   assert.equal(terminal?.attributes?.completion_reason, "cancelled");
 });
 
+test("interruption recovery terminalizes dangling repair workflow attempts", () => {
+  const root = tempRoot();
+  const env = workflowEnv({ CLAWSWEEPER_ACTION_LEDGER_INVOCATION: "repair-attempt" });
+  const started = recordWorkflowPhaseEvent(
+    root,
+    {
+      phase: ACTION_EVENT_TYPES.workflowAttempt,
+      status: ACTION_EVENT_STATUSES.started,
+      reasonCode: ACTION_EVENT_REASON_CODES.selected,
+      retryable: false,
+      mutation: false,
+      identity: { state: "started" },
+      operation: "repair",
+      operationIdentity: { workKey: "openclaw/openclaw:42" },
+      attemptIdentity: { workKey: "openclaw/openclaw:42", attempt: 1 },
+      phaseSeq: 1,
+      component: "repair_worker",
+      subject: {
+        repository: "openclaw/openclaw",
+        kind: "queue_item",
+        subjectId: "openclaw/openclaw:42",
+      },
+      attributes: { state: "started", completion_reason: "workflow_started" },
+    },
+    { env },
+  );
+  assert.ok(started);
+
+  assert.equal(interruptOpenWorkflowActionEvents(root, { env }), 1);
+  const events = readAllSpooledActionEvents(root);
+  const terminal = events.find(
+    (event) =>
+      event.event_type === ACTION_EVENT_TYPES.workflowAttempt &&
+      event.action.status === ACTION_EVENT_STATUSES.failed,
+  );
+  assert.ok(terminal);
+  assert.equal(terminal.operation_id, started.operation_id);
+  assert.equal(terminal.attempt_id, started.attempt_id);
+  assert.equal(terminal.parent_event_id, started.event_id);
+  assert.equal(terminal.action.reason_code, ACTION_EVENT_REASON_CODES.timeout);
+  assert.equal(terminal.attributes?.completion_reason, "timeout");
+  assert.equal(interruptOpenWorkflowActionEvents(root, { env }), 0);
+});
+
+test("workflow attempt completion closes only its exact commit attempt", () => {
+  const root = tempRoot();
+  const env = workflowEnv({ CLAWSWEEPER_ACTION_LEDGER_INVOCATION: "commit-attempt" });
+  const subject = {
+    repository: "openclaw/openclaw",
+    kind: "commit" as const,
+    subjectId: `commit-${"c".repeat(40)}`,
+    sourceRevision: "c".repeat(40),
+  };
+  const operationIdentity = { repository: "openclaw/openclaw", sha: "c".repeat(40) };
+  const completedStart = recordWorkflowPhaseEvent(
+    root,
+    {
+      phase: ACTION_EVENT_TYPES.workflowAttempt,
+      status: ACTION_EVENT_STATUSES.started,
+      reasonCode: ACTION_EVENT_REASON_CODES.selected,
+      retryable: false,
+      mutation: false,
+      identity: { state: "started" },
+      operation: "commit_review",
+      operationIdentity,
+      attemptIdentity: { runAttempt: 1 },
+      phaseSeq: 1,
+      component: "commit_review",
+      subject,
+      attributes: { state: "started", completion_reason: "workflow_started" },
+    },
+    { env },
+  );
+  assert.ok(completedStart);
+  const completed = recordWorkflowPhaseEvent(
+    root,
+    {
+      phase: ACTION_EVENT_TYPES.workflowAttempt,
+      status: ACTION_EVENT_STATUSES.completed,
+      reasonCode: ACTION_EVENT_REASON_CODES.completed,
+      retryable: false,
+      mutation: false,
+      identity: { state: "completed" },
+      operation: "commit_review",
+      operationIdentity,
+      attemptIdentity: { runAttempt: 1 },
+      parentEventId: completedStart.event_id,
+      phaseSeq: 2,
+      component: "commit_review",
+      subject,
+      attributes: { state: "completed", completion_reason: "workflow_completed" },
+    },
+    { env },
+  );
+  assert.ok(completed);
+  const dangling = recordWorkflowPhaseEvent(
+    root,
+    {
+      phase: ACTION_EVENT_TYPES.workflowAttempt,
+      status: ACTION_EVENT_STATUSES.started,
+      reasonCode: ACTION_EVENT_REASON_CODES.selected,
+      retryable: false,
+      mutation: false,
+      identity: { state: "started" },
+      operation: "commit_review",
+      operationIdentity,
+      attemptIdentity: { runAttempt: 2 },
+      phaseSeq: 1,
+      component: "commit_review",
+      subject,
+      attributes: { state: "started", completion_reason: "workflow_started" },
+    },
+    { env },
+  );
+  assert.ok(dangling);
+  const completedAttemptBefore = readAllSpooledActionEvents(root).filter(
+    (event) => event.attempt_id === completedStart.attempt_id,
+  );
+
+  assert.equal(interruptOpenWorkflowActionEvents(root, { env }), 1);
+  const events = readAllSpooledActionEvents(root);
+  assert.deepEqual(
+    events.filter((event) => event.attempt_id === completedStart.attempt_id),
+    completedAttemptBefore,
+  );
+  const interrupted = events.find(
+    (event) =>
+      event.attempt_id === dangling.attempt_id &&
+      event.event_type === ACTION_EVENT_TYPES.workflowAttempt &&
+      event.action.status === ACTION_EVENT_STATUSES.failed,
+  );
+  assert.ok(interrupted);
+  assert.equal(interrupted.parent_event_id, dangling.event_id);
+  assert.equal(interrupted.action.reason_code, ACTION_EVENT_REASON_CODES.timeout);
+});
+
 test("interruption recovery terminalizes generic repair and commit review starts", () => {
   const root = tempRoot();
   const env = workflowEnv({ CLAWSWEEPER_ACTION_LEDGER_INVOCATION: "generic-review" });
