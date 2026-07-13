@@ -399,7 +399,12 @@ export class StatusStore {
         expires_at: expiresAt,
       });
       await this.scheduleCleanup(expiresAt);
-      return json({ ok: true, event: upserted.event, is_latest: upserted.isLatest });
+      return json({
+        ok: true,
+        event: upserted.event,
+        is_latest: upserted.isLatest,
+        is_latest_for_item: upserted.isLatestForItem,
+      });
     }
 
     return new Response("method not allowed", { status: 405 });
@@ -1733,14 +1738,14 @@ async function ingestEvent(request, env) {
   if (idempotencyKey && idempotencyKey.length > 256) {
     return json({ error: "idempotency_key_too_long" }, 400);
   }
-  const event = normalizeEvent(body, idempotencyKey);
+  const ci = normalizeCiStatus(body);
+  const event = normalizeEvent(body, idempotencyKey, ci);
   const stored = await prependStoredEvent(env, event);
   const writes = [];
   if (stored.isLatest) {
     writes.push(writeStoredJson(env, "latest-event", stored.event, EVENT_STORE_TTL_SECONDS));
   }
-  const ci = normalizeCiStatus(body);
-  if (ci) writes.push(writeCiStatus(env, ci));
+  if (ci && stored.isLatestForItem) writes.push(writeCiStatus(env, ci));
   await Promise.all(writes);
   return json({ ok: true, event: stored.event });
 }
@@ -6316,7 +6321,11 @@ async function prependStoredEvent(env, event) {
     );
     if (!response.ok) throw new Error(`status store event write failed: ${response.status}`);
     const stored = await response.json();
-    return { event: stored.event, isLatest: stored.is_latest === true };
+    return {
+      event: stored.event,
+      isLatest: stored.is_latest === true,
+      isLatestForItem: stored.is_latest_for_item === true,
+    };
   }
   const current = await readEvents(env);
   const upserted = upsertStoredEvent(current, event);
@@ -6326,14 +6335,18 @@ async function prependStoredEvent(env, event) {
     upserted.events.slice(0, EVENT_LIMIT),
     EVENT_STORE_TTL_SECONDS,
   );
-  return { event: upserted.event, isLatest: upserted.isLatest };
+  return {
+    event: upserted.event,
+    isLatest: upserted.isLatest,
+    isLatestForItem: upserted.isLatestForItem,
+  };
 }
 
 function upsertStoredEvent(events, event) {
   const key = nullableString(event?.idempotency_key);
-  if (!key) return { events: [event, ...events], event, isLatest: true };
+  if (!key) return storedEventResult([event, ...events], event, 0);
   const index = events.findIndex((candidate) => nullableString(candidate?.idempotency_key) === key);
-  if (index < 0) return { events: [event, ...events], event, isLatest: true };
+  if (index < 0) return storedEventResult([event, ...events], event, 0);
 
   const storedEvent = {
     ...event,
@@ -6341,7 +6354,25 @@ function upsertStoredEvent(events, event) {
   };
   const next = [...events];
   next[index] = storedEvent;
-  return { events: next, event: storedEvent, isLatest: index === 0 };
+  return storedEventResult(next, storedEvent, index);
+}
+
+function storedEventResult(events, event, index) {
+  const itemKey = storedEventItemKey(event);
+  return {
+    events,
+    event,
+    isLatest: index === 0,
+    isLatestForItem:
+      itemKey !== null &&
+      events.findIndex((candidate) => storedEventItemKey(candidate) === itemKey) === index,
+  };
+}
+
+function storedEventItemKey(event) {
+  const repository = nullableString(event?.repository);
+  const itemNumber = numberOrNull(event?.item_number);
+  return repository && itemNumber ? `${repository}#${itemNumber}` : null;
 }
 
 async function readStatusStoreText(store, key) {
@@ -6662,8 +6693,8 @@ async function withTimeout(promise, timeoutMs, label) {
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timeoutId));
 }
 
-function normalizeEvent(body, idempotencyKey = null) {
-  const itemNumber = numberOrNull(body.item_number);
+function normalizeEvent(body, idempotencyKey = null, ci = null) {
+  const itemNumber = numberOrNull(ci?.item_number ?? body.item_number);
   const sourceItemNumber = numberOrNull(body.source_item_number);
   return {
     id: idempotencyKey || crypto.randomUUID(),
@@ -6673,7 +6704,7 @@ function normalizeEvent(body, idempotencyKey = null) {
     mode: stringField(body.mode, "unknown"),
     stage: stringField(body.stage, "unknown"),
     status: stringField(body.status, "unknown"),
-    repository: nullableString(body.repository),
+    repository: nullableString(ci?.repository ?? body.repository),
     item_url: nullableString(body.item_url),
     run_url: nullableString(body.run_url),
     title: nullableString(body.title),

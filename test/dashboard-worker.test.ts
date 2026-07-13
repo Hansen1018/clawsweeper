@@ -5295,6 +5295,124 @@ test("dashboard preserves event chronology when an earlier idempotency key is re
   }
 });
 
+test("dashboard CI projection preserves per-item chronology across retried events", async () => {
+  const storage = new MemoryDurableStorage();
+  const store = new StatusStore({ storage });
+  const statusStoreStub = {
+    fetch: (request: Request, init?: RequestInit) =>
+      store.fetch(init ? new Request(request, init) : request),
+  };
+  const env = {
+    INGEST_TOKEN: "test-token",
+    STATUS_STORE: new MemoryDurableNamespace(statusStoreStub),
+  };
+  const ingest = async ({
+    idempotencyKey,
+    itemNumber,
+    state,
+    title,
+    updatedAt,
+  }: {
+    idempotencyKey: string;
+    itemNumber: number;
+    state: string;
+    title: string;
+    updatedAt: string;
+  }) => {
+    const response = await worker.fetch(
+      new Request("https://clawsweeper.openclaw.ai/api/events", {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer test-token",
+          "Content-Type": "application/json",
+          "Idempotency-Key": idempotencyKey,
+        },
+        body: JSON.stringify({
+          event_type: "ci.status",
+          repository: "openclaw/openclaw",
+          item_number: itemNumber,
+          status: state,
+          title,
+          ci: {
+            repository: "openclaw/openclaw",
+            item_number: itemNumber,
+            state,
+            source: "github-checks",
+            head_sha: `${idempotencyKey}-${state}`,
+            updated_at: updatedAt,
+          },
+        }),
+      }),
+      env,
+    );
+    assert.equal(response.status, 200);
+  };
+
+  await ingest({
+    idempotencyKey: "ci-a",
+    itemNumber: 80609,
+    state: "red",
+    title: "Older item CI",
+    updatedAt: "2026-07-13T10:00:00.000Z",
+  });
+  await ingest({
+    idempotencyKey: "ci-b",
+    itemNumber: 80609,
+    state: "green",
+    title: "Newer item CI",
+    updatedAt: "2026-07-13T10:01:00.000Z",
+  });
+  await ingest({
+    idempotencyKey: "ci-c",
+    itemNumber: 80610,
+    state: "green",
+    title: "Other item CI",
+    updatedAt: "2026-07-13T10:02:00.000Z",
+  });
+  await ingest({
+    idempotencyKey: "ci-b",
+    itemNumber: 80609,
+    state: "pending",
+    title: "Newer item CI retry",
+    updatedAt: "2026-07-13T10:03:00.000Z",
+  });
+  await ingest({
+    idempotencyKey: "ci-a",
+    itemNumber: 80609,
+    state: "red",
+    title: "Older item CI retry",
+    updatedAt: "2026-07-13T10:00:00.000Z",
+  });
+
+  const itemCiResponse = await store.fetch(
+    new Request(
+      `https://clawsweeper-status-store/${encodeURIComponent("ci:openclaw/openclaw#80609")}`,
+    ),
+  );
+  assert.equal(itemCiResponse.status, 200);
+  const itemCi = await itemCiResponse.json();
+  assert.deepEqual(
+    {
+      state: itemCi.state,
+      head_sha: itemCi.head_sha,
+      updated_at: itemCi.updated_at,
+    },
+    {
+      state: "pending",
+      head_sha: "ci-b-pending",
+      updated_at: "2026-07-13T10:03:00.000Z",
+    },
+  );
+
+  const events = JSON.parse(
+    await (await store.fetch(new Request("https://clawsweeper-status-store/events"))).text(),
+  );
+  assert.deepEqual(
+    events.slice(0, 3).map((event: { title: string }) => event.title),
+    ["Other item CI", "Newer item CI retry", "Older item CI retry"],
+  );
+});
+
 test("dashboard counts cluster-fixer operation events", async () => {
   const originalFetch = globalThis.fetch;
   const originalCaches = globalThis.caches;
