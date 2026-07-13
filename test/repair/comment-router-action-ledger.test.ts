@@ -125,6 +125,14 @@ test("automerge reconciles command responses inside the merge receipt without ce
     /automergeUnconfirmedFailureDisposition\(result\) === "waiting"[\s\S]*status: "waiting"/,
   );
   assert.match(
+    executeAutomerge,
+    /rejectAutomergeMergeClaim\(command, mergeClaim\.claimId\)[\s\S]*status !== "rejected"[\s\S]*ensureMergeReadyLabel\(command\)/,
+  );
+  assert.match(
+    source,
+    /function rejectAutomergeMergeClaim[\s\S]*rejectExactHeadMergeClaim[\s\S]*isTrustedExactHeadMergeClaimRejectionComment/,
+  );
+  assert.match(
     source,
     /const merge = executeAutomerge\(command\);[\s\S]*if \(applyAutomergeResultToCommand\(command, merge\)\) return;/,
   );

@@ -3,6 +3,7 @@ import type { LooseRecord } from "./json-types.js";
 const CLAIM_PREFIX = "clawsweeper-exact-head-merge-claim:v1";
 const RELEASE_PREFIX = "clawsweeper-exact-head-merge-release:v1";
 const RECOVERY_PREFIX = "clawsweeper-exact-head-merge-recovery:v1";
+const REJECTION_PREFIX = "clawsweeper-exact-head-merge-rejection:v1";
 const LEGACY_DISPATCH_PREFIX = "clawsweeper-exact-head-merge-dispatch:v1";
 const DISPATCH_PREFIX = "clawsweeper-exact-head-merge-dispatch:v2";
 const CLAIM_PATTERN =
@@ -11,11 +12,14 @@ const RELEASE_PATTERN =
   /<!-- clawsweeper-exact-head-merge-release:v1 claim=([1-9][0-9]*) repo=([^ ]+) pr=([1-9][0-9]*) head=([a-fA-F0-9]{40}) method=([a-z]+) owner=([a-z0-9_-]+) claimant=([^ ]+) -->/g;
 const RECOVERY_PATTERN =
   /<!-- clawsweeper-exact-head-merge-recovery:v1 claim=([1-9][0-9]*) repo=([^ ]+) pr=([1-9][0-9]*) head=([a-fA-F0-9]{40}) method=([a-z]+) owner=([a-z0-9_-]+) claimant=([^ ]+) recoverer=([^ ]+) -->/g;
+const REJECTION_PATTERN =
+  /<!-- clawsweeper-exact-head-merge-rejection:v1 claim=([1-9][0-9]*) repo=([^ ]+) pr=([1-9][0-9]*) head=([a-fA-F0-9]{40}) method=([a-z]+) owner=([a-z0-9_-]+) claimant=([^ ]+) -->/g;
 const LEGACY_DISPATCH_PATTERN =
   /<!-- clawsweeper-exact-head-merge-dispatch:v1 claim=([1-9][0-9]*) repo=([^ ]+) pr=([1-9][0-9]*) head=([a-fA-F0-9]{40}) method=([a-z]+) owner=([a-z0-9_-]+) claimant=([^ ]+) -->/g;
 const DISPATCH_PATTERN =
   /<!-- clawsweeper-exact-head-merge-dispatch:v2 claim=([1-9][0-9]*) repo=([^ ]+) pr=([1-9][0-9]*) head=([a-fA-F0-9]{40}) method=([a-z]+) owner=([a-z0-9_-]+) claimant=([^ ]+) expected=([^ ]+) -->/g;
 const DEFAULT_RECOVERY_GRACE_MS = 5 * 60 * 1000;
+const CLAIM_ACTIVITY_PROPAGATION_MS = 10_000;
 
 export type ExactHeadMergeClaimIdentity = {
   repository: string;
@@ -36,6 +40,7 @@ export type ExactHeadMergeClaimResult =
       status: "acquired";
       reason: "";
       claimId: number;
+      lastClaimMutationId: number;
       lastClaimMutationAt: string | null;
     }
   | {
@@ -47,6 +52,7 @@ export type ExactHeadMergeClaimResult =
       createdAt: string | null;
       dispatched?: boolean;
       expectedSquashMessage: string | null;
+      lastClaimMutationId: number;
       lastClaimMutationAt: string | null;
     }
   | { status: "recovered"; reason: string; claimId: null }
@@ -71,8 +77,13 @@ export type ExactHeadMergeClaimDispatchResult =
       reason: "";
       claimId: number;
       expectedSquashMessage: string;
+      lastClaimMutationId: number;
       lastClaimMutationAt: string | null;
     }
+  | { status: "blocked" | "unknown"; reason: string; claimId: number };
+
+export type ExactHeadMergeClaimRejectionResult =
+  | { status: "rejected"; reason: ""; claimId: number }
   | { status: "blocked" | "unknown"; reason: string; claimId: number };
 
 export type ExactHeadMergeClaimRecoveryCandidate = {
@@ -105,6 +116,8 @@ type ParsedRecovery = ParsedRelease & {
   recoverer: string;
 };
 
+type ParsedRejection = ParsedRelease;
+
 type ParsedDispatch = ParsedRelease & {
   expectedSquashMessage: string | null;
 };
@@ -128,6 +141,12 @@ type TrustedRecovery = {
   recovery: ParsedRecovery;
 };
 
+type TrustedRejection = {
+  comment: LooseRecord;
+  id: number;
+  rejection: ParsedRejection;
+};
+
 type TrustedDispatch = {
   comment: LooseRecord;
   id: number;
@@ -140,6 +159,7 @@ type InspectedClaims = {
   exact: TrustedClaim[];
   exactHistory: boolean;
   dispatches: TrustedDispatch[];
+  rejections: TrustedRejection[];
   recoveries: TrustedRecovery[];
   releases: TrustedRelease[];
 };
@@ -204,6 +224,18 @@ export function exactHeadMergeClaimRecoveryBody(
   ].join("\n");
 }
 
+export function exactHeadMergeClaimRejectionBody(
+  request: ExactHeadMergeClaimRequest,
+  claimId: number,
+): string {
+  const normalized = normalizeRequest(request);
+  const normalizedClaimId = normalizeCommentId(claimId, "claim");
+  return [
+    exactHeadMergeRejectionMarker(normalized, normalizedClaimId),
+    `ClawSweeper retired exact-head squash merge reservation ${normalizedClaimId} for \`${normalized.headSha.slice(0, 12)}\` after GitHub definitively rejected the dispatch without applying a merge effect.`,
+  ].join("\n");
+}
+
 export function exactHeadMergeClaimDispatchBody(
   request: ExactHeadMergeClaimRequest,
   claimId: number,
@@ -227,9 +259,11 @@ export function isTrustedExactHeadMergeClaimComment(
   const body = String(comment.body ?? "");
   const claims = parseClaimMarkers(body);
   return (
+    body === exactHeadMergeClaimBody(normalized) &&
     markerCount(body, CLAIM_PREFIX) === 1 &&
     markerCount(body, RELEASE_PREFIX) === 0 &&
     markerCount(body, RECOVERY_PREFIX) === 0 &&
+    markerCount(body, REJECTION_PREFIX) === 0 &&
     dispatchMarkerCount(body) === 0 &&
     claims.length === 1 &&
     sameClaim(claims[0]!, normalized) &&
@@ -249,9 +283,11 @@ export function isTrustedExactHeadMergeClaimReleaseComment(
   const body = String(comment.body ?? "");
   const releases = parseReleaseMarkers(body);
   return (
+    body === exactHeadMergeClaimReleaseBody(normalized, normalizedClaimId) &&
     markerCount(body, CLAIM_PREFIX) === 0 &&
     markerCount(body, RELEASE_PREFIX) === 1 &&
     markerCount(body, RECOVERY_PREFIX) === 0 &&
+    markerCount(body, REJECTION_PREFIX) === 0 &&
     dispatchMarkerCount(body) === 0 &&
     releases.length === 1 &&
     releases[0]!.claimId === normalizedClaimId &&
@@ -276,9 +312,17 @@ export function isTrustedExactHeadMergeClaimRecoveryComment(
   const body = String(comment.body ?? "");
   const recoveries = parseRecoveryMarkers(body);
   return (
+    body ===
+      exactHeadMergeClaimRecoveryBody(
+        { ...normalized, claimant: recoveries[0]?.recoverer ?? normalized.claimant },
+        normalizedClaimId,
+        normalizedOwner,
+        normalizedClaimant,
+      ) &&
     markerCount(body, CLAIM_PREFIX) === 0 &&
     markerCount(body, RELEASE_PREFIX) === 0 &&
     markerCount(body, RECOVERY_PREFIX) === 1 &&
+    markerCount(body, REJECTION_PREFIX) === 0 &&
     dispatchMarkerCount(body) === 0 &&
     recoveries.length === 1 &&
     recoveries[0]!.claimId === normalizedClaimId &&
@@ -286,6 +330,31 @@ export function isTrustedExactHeadMergeClaimRecoveryComment(
     recoveries[0]!.owner === normalizedOwner &&
     recoveries[0]!.claimant === normalizedClaimant &&
     recoveries[0]!.recoverer === normalized.claimant
+  );
+}
+
+export function isTrustedExactHeadMergeClaimRejectionComment(
+  comment: LooseRecord,
+  request: ExactHeadMergeClaimRequest,
+  claimId: number,
+): boolean {
+  const normalized = normalizeRequest(request);
+  const normalizedClaimId = normalizeCommentId(claimId, "claim");
+  if (!trustedClaimAuthor(comment, normalized)) return false;
+  const body = String(comment.body ?? "");
+  const rejections = parseRejectionMarkers(body);
+  return (
+    body === exactHeadMergeClaimRejectionBody(normalized, normalizedClaimId) &&
+    markerCount(body, CLAIM_PREFIX) === 0 &&
+    markerCount(body, RELEASE_PREFIX) === 0 &&
+    markerCount(body, RECOVERY_PREFIX) === 0 &&
+    markerCount(body, REJECTION_PREFIX) === 1 &&
+    dispatchMarkerCount(body) === 0 &&
+    rejections.length === 1 &&
+    rejections[0]!.claimId === normalizedClaimId &&
+    sameClaim(rejections[0]!, normalized) &&
+    rejections[0]!.owner === normalized.owner &&
+    rejections[0]!.claimant === normalized.claimant
   );
 }
 
@@ -304,10 +373,23 @@ export function isTrustedExactHeadMergeClaimDispatchComment(
   if (!trustedClaimAuthor(comment, normalized)) return false;
   const body = String(comment.body ?? "");
   const dispatches = parseDispatchMarkers(body);
+  const dispatch = dispatches[0];
+  const canonicalBody =
+    dispatch?.expectedSquashMessage === null
+      ? legacyExactHeadMergeClaimDispatchBody(normalized, normalizedClaimId)
+      : dispatch
+        ? exactHeadMergeClaimDispatchBody(
+            normalized,
+            normalizedClaimId,
+            dispatch.expectedSquashMessage,
+          )
+        : "";
   return (
+    body === canonicalBody &&
     markerCount(body, CLAIM_PREFIX) === 0 &&
     markerCount(body, RELEASE_PREFIX) === 0 &&
     markerCount(body, RECOVERY_PREFIX) === 0 &&
+    markerCount(body, REJECTION_PREFIX) === 0 &&
     dispatchMarkerCount(body) === 1 &&
     dispatches.length === 1 &&
     dispatches[0]!.claimId === normalizedClaimId &&
@@ -446,6 +528,7 @@ export function ensureExactHeadMergeClaim(
       status: "acquired",
       reason: "",
       claimId: winningClaim.id,
+      lastClaimMutationId: winningClaim.id,
       lastClaimMutationAt: winningClaim.createdAt,
     };
   }
@@ -459,6 +542,7 @@ export function ensureExactHeadMergeClaim(
     createdAt: winningClaim.createdAt,
     dispatched: Boolean(dispatch),
     expectedSquashMessage: dispatch?.dispatch.expectedSquashMessage ?? null,
+    lastClaimMutationId: dispatch?.id ?? winningClaim.id,
     lastClaimMutationAt: dispatch?.createdAt ?? winningClaim.createdAt,
   };
 }
@@ -497,6 +581,7 @@ export function markExactHeadMergeClaimDispatched(
       reason: "",
       claimId: normalizedClaimId,
       expectedSquashMessage: normalizedExpectedSquashMessage,
+      lastClaimMutationId: initialDispatch.id,
       lastClaimMutationAt: initialDispatch.createdAt,
     };
   }
@@ -541,6 +626,7 @@ export function markExactHeadMergeClaimDispatched(
       reason: "",
       claimId: normalizedClaimId,
       expectedSquashMessage: normalizedExpectedSquashMessage,
+      lastClaimMutationId: confirmedDispatch.id,
       lastClaimMutationAt: confirmedDispatch.createdAt,
     };
   }
@@ -554,6 +640,60 @@ export function markExactHeadMergeClaimDispatched(
   return {
     status: "unknown",
     reason: `exact-head merge dispatch boundary could not be confirmed${createError ? `: ${createError}` : ""}`,
+    claimId: normalizedClaimId,
+  };
+}
+
+export function rejectExactHeadMergeClaim(
+  request: ExactHeadMergeClaimRequest,
+  claimId: number,
+  io: {
+    listComments: () => LooseRecord[];
+    createComment: (body: string) => LooseRecord;
+  },
+): ExactHeadMergeClaimRejectionResult {
+  const normalized = normalizeRequest(request);
+  const normalizedClaimId = normalizeCommentId(claimId, "claim");
+  const initial = inspectClaims(normalized, io.listComments);
+  if ("failure" in initial) {
+    return {
+      status: initial.failure.status,
+      reason: initial.failure.reason,
+      claimId: normalizedClaimId,
+    };
+  }
+  const dispatch = matchingDispatch(initial.value, normalized, normalizedClaimId);
+  if (!dispatch) {
+    return {
+      status: "blocked",
+      reason: "exact-head merge claim has no durable dispatch to reject",
+      claimId: normalizedClaimId,
+    };
+  }
+  if (hasMatchingRejection(initial.value, normalized, normalizedClaimId)) {
+    return { status: "rejected", reason: "", claimId: normalizedClaimId };
+  }
+
+  let createError = "";
+  try {
+    io.createComment(exactHeadMergeClaimRejectionBody(normalized, normalizedClaimId));
+  } catch (error) {
+    createError = errorText(error);
+  }
+  const confirmed = inspectClaims(normalized, io.listComments);
+  if ("failure" in confirmed) {
+    return {
+      status: confirmed.failure.status,
+      reason: confirmed.failure.reason,
+      claimId: normalizedClaimId,
+    };
+  }
+  if (hasMatchingRejection(confirmed.value, normalized, normalizedClaimId)) {
+    return { status: "rejected", reason: "", claimId: normalizedClaimId };
+  }
+  return {
+    status: "unknown",
+    reason: `exact-head merge rejection could not be confirmed${createError ? `: ${createError}` : ""}`,
     claimId: normalizedClaimId,
   };
 }
@@ -668,6 +808,7 @@ export function inspectExactHeadMergeClaim(
       createdAt: active.createdAt,
       dispatched: Boolean(dispatch),
       expectedSquashMessage: dispatch?.dispatch.expectedSquashMessage ?? null,
+      lastClaimMutationId: dispatch?.id ?? active.id,
       lastClaimMutationAt: dispatch?.createdAt ?? active.createdAt,
     };
   }
@@ -711,6 +852,7 @@ function inspectClaims(
 
   const claims: TrustedClaim[] = [];
   const dispatches: TrustedDispatch[] = [];
+  const rejections: TrustedRejection[] = [];
   const recoveries: TrustedRecovery[] = [];
   const releases: TrustedRelease[] = [];
   for (const comment of comments) {
@@ -719,15 +861,23 @@ function inspectClaims(
     const claimCount = markerCount(body, CLAIM_PREFIX);
     const releaseCount = markerCount(body, RELEASE_PREFIX);
     const recoveryCount = markerCount(body, RECOVERY_PREFIX);
+    const rejectionCount = markerCount(body, REJECTION_PREFIX);
     const dispatchCount = dispatchMarkerCount(body);
-    if (claimCount === 0 && releaseCount === 0 && recoveryCount === 0 && dispatchCount === 0)
+    if (
+      claimCount === 0 &&
+      releaseCount === 0 &&
+      recoveryCount === 0 &&
+      rejectionCount === 0 &&
+      dispatchCount === 0
+    )
       continue;
     if (
       claimCount > 1 ||
       releaseCount > 1 ||
       recoveryCount > 1 ||
+      rejectionCount > 1 ||
       dispatchCount > 1 ||
-      claimCount + releaseCount + recoveryCount + dispatchCount !== 1
+      claimCount + releaseCount + recoveryCount + rejectionCount + dispatchCount !== 1
     ) {
       return malformedMarkerFailure();
     }
@@ -745,6 +895,20 @@ function inspectClaims(
       const markers = parseClaimMarkers(body);
       if (markers.length !== 1) return malformedMarkerFailure();
       const claim = markers[0]!;
+      if (
+        body !==
+        exactHeadMergeClaimBody({
+          ...request,
+          repository: claim.repository,
+          number: claim.number,
+          headSha: claim.headSha,
+          method: claim.method,
+          owner: claim.owner,
+          claimant: claim.claimant,
+        })
+      ) {
+        return malformedMarkerFailure();
+      }
       if (!sameClaimScope(claim, request)) return conflictingScopeFailure(claim);
       claims.push({ comment, id, claim, createdAt: commentTimestamp(comment) });
       continue;
@@ -753,6 +917,23 @@ function inspectClaims(
       const markers = parseReleaseMarkers(body);
       if (markers.length !== 1) return malformedMarkerFailure();
       const release = markers[0]!;
+      if (
+        body !==
+        exactHeadMergeClaimReleaseBody(
+          {
+            ...request,
+            repository: release.repository,
+            number: release.number,
+            headSha: release.headSha,
+            method: release.method,
+            owner: release.owner,
+            claimant: release.claimant,
+          },
+          release.claimId,
+        )
+      ) {
+        return malformedMarkerFailure();
+      }
       if (!sameClaimScope(release, request)) return conflictingScopeFailure(release);
       releases.push({ comment, id, release });
       continue;
@@ -761,19 +942,82 @@ function inspectClaims(
       const markers = parseDispatchMarkers(body);
       if (markers.length !== 1) return malformedMarkerFailure();
       const dispatch = markers[0]!;
+      const dispatchRequest = {
+        ...request,
+        repository: dispatch.repository,
+        number: dispatch.number,
+        headSha: dispatch.headSha,
+        method: dispatch.method,
+        owner: dispatch.owner,
+        claimant: dispatch.claimant,
+      };
+      const expectedBody =
+        dispatch.expectedSquashMessage === null
+          ? legacyExactHeadMergeClaimDispatchBody(dispatchRequest, dispatch.claimId)
+          : exactHeadMergeClaimDispatchBody(
+              dispatchRequest,
+              dispatch.claimId,
+              dispatch.expectedSquashMessage,
+            );
+      if (body !== expectedBody) return malformedMarkerFailure();
       if (!sameClaimScope(dispatch, request)) return conflictingScopeFailure(dispatch);
       dispatches.push({ comment, id, dispatch, createdAt: commentTimestamp(comment) });
+      continue;
+    }
+    if (rejectionCount === 1) {
+      const markers = parseRejectionMarkers(body);
+      if (markers.length !== 1) return malformedMarkerFailure();
+      const rejection = markers[0]!;
+      if (
+        body !==
+        exactHeadMergeClaimRejectionBody(
+          {
+            ...request,
+            repository: rejection.repository,
+            number: rejection.number,
+            headSha: rejection.headSha,
+            method: rejection.method,
+            owner: rejection.owner,
+            claimant: rejection.claimant,
+          },
+          rejection.claimId,
+        )
+      ) {
+        return malformedMarkerFailure();
+      }
+      if (!sameClaimScope(rejection, request)) return conflictingScopeFailure(rejection);
+      rejections.push({ comment, id, rejection });
       continue;
     }
     const markers = parseRecoveryMarkers(body);
     if (markers.length !== 1) return malformedMarkerFailure();
     const recovery = markers[0]!;
+    if (
+      body !==
+      exactHeadMergeClaimRecoveryBody(
+        {
+          ...request,
+          repository: recovery.repository,
+          number: recovery.number,
+          headSha: recovery.headSha,
+          method: recovery.method,
+          owner: request.owner,
+          claimant: recovery.recoverer,
+        },
+        recovery.claimId,
+        recovery.owner,
+        recovery.claimant,
+      )
+    ) {
+      return malformedMarkerFailure();
+    }
     if (!sameClaimScope(recovery, request)) return conflictingScopeFailure(recovery);
     recoveries.push({ comment, id, recovery });
   }
 
   claims.sort((left, right) => left.id - right.id);
   dispatches.sort((left, right) => left.id - right.id);
+  rejections.sort((left, right) => left.id - right.id);
   recoveries.sort((left, right) => left.id - right.id);
   releases.sort((left, right) => left.id - right.id);
   for (const release of releases) {
@@ -829,6 +1073,66 @@ function inspectClaims(
         },
       };
     }
+    const conflictingDispatch = dispatches.find(
+      (candidate) =>
+        candidate.id !== dispatch.id &&
+        candidate.dispatch.claimId === dispatch.dispatch.claimId &&
+        sameClaim(candidate.dispatch, dispatch.dispatch) &&
+        candidate.dispatch.owner === dispatch.dispatch.owner &&
+        candidate.dispatch.claimant === dispatch.dispatch.claimant &&
+        candidate.dispatch.expectedSquashMessage !== dispatch.dispatch.expectedSquashMessage,
+    );
+    if (conflictingDispatch) {
+      return {
+        failure: {
+          status: "blocked",
+          reason: "trusted exact-head merge dispatch payloads conflict",
+          claimId: null,
+        },
+      };
+    }
+  }
+  for (const rejection of rejections) {
+    const referenced = claims.find(
+      (claim) =>
+        claim.id === rejection.rejection.claimId &&
+        sameClaim(claim.claim, rejection.rejection) &&
+        claim.claim.owner === rejection.rejection.owner &&
+        claim.claim.claimant === rejection.rejection.claimant,
+    );
+    const dispatched = dispatches.some(
+      (dispatch) =>
+        dispatch.dispatch.claimId === rejection.rejection.claimId &&
+        sameClaim(dispatch.dispatch, rejection.rejection) &&
+        dispatch.dispatch.owner === rejection.rejection.owner &&
+        dispatch.dispatch.claimant === rejection.rejection.claimant &&
+        dispatch.id < rejection.id,
+    );
+    if (!referenced || rejection.id <= referenced.id || !dispatched) {
+      return {
+        failure: {
+          status: "blocked",
+          reason: "trusted exact-head merge rejection does not match a prior dispatch",
+          claimId: null,
+        },
+      };
+    }
+    if (
+      dispatches.some(
+        (dispatch) =>
+          dispatch.dispatch.claimId === rejection.rejection.claimId &&
+          sameClaim(dispatch.dispatch, rejection.rejection) &&
+          dispatch.id > rejection.id,
+      )
+    ) {
+      return {
+        failure: {
+          status: "blocked",
+          reason: "trusted exact-head merge dispatch follows a terminal rejection",
+          claimId: null,
+        },
+      };
+    }
   }
   for (const release of releases) {
     if (
@@ -857,6 +1161,9 @@ function inspectClaims(
       ) &&
       !recoveries.some(
         (recovery) => sameClaim(recovery.recovery, claim.claim) && recovery.id > claim.id,
+      ) &&
+      !rejections.some(
+        (rejection) => sameClaim(rejection.rejection, claim.claim) && rejection.id > claim.id,
       ),
   );
   return {
@@ -866,6 +1173,7 @@ function inspectClaims(
       exact,
       exactHistory: exactClaims.length > 0,
       recoveries,
+      rejections,
       releases,
     },
   };
@@ -912,6 +1220,13 @@ function exactHeadMergeRecoveryMarker(
   return `<!-- ${RECOVERY_PREFIX} claim=${claimId} repo=${encodeURIComponent(request.repository)} pr=${request.number} head=${request.headSha} method=${request.method} owner=${owner} claimant=${encodeURIComponent(claimant)} recoverer=${encodeURIComponent(request.claimant)} -->`;
 }
 
+function exactHeadMergeRejectionMarker(
+  request: ExactHeadMergeClaimRequest,
+  claimId: number,
+): string {
+  return `<!-- ${REJECTION_PREFIX} claim=${claimId} repo=${encodeURIComponent(request.repository)} pr=${request.number} head=${request.headSha} method=${request.method} owner=${request.owner} claimant=${encodeURIComponent(request.claimant)} -->`;
+}
+
 function exactHeadMergeDispatchMarker(
   request: ExactHeadMergeClaimRequest,
   claimId: number,
@@ -920,18 +1235,33 @@ function exactHeadMergeDispatchMarker(
   return `<!-- ${DISPATCH_PREFIX} claim=${claimId} repo=${encodeURIComponent(request.repository)} pr=${request.number} head=${request.headSha} method=${request.method} owner=${request.owner} claimant=${encodeURIComponent(request.claimant)} expected=${encodeURIComponent(expectedSquashMessage)} -->`;
 }
 
+function legacyExactHeadMergeClaimDispatchBody(
+  request: ExactHeadMergeClaimRequest,
+  claimId: number,
+): string {
+  return [
+    `<!-- ${LEGACY_DISPATCH_PREFIX} claim=${claimId} repo=${encodeURIComponent(request.repository)} pr=${request.number} head=${request.headSha} method=${request.method} owner=${request.owner} claimant=${encodeURIComponent(request.claimant)} -->`,
+    `ClawSweeper crossed the exact-head squash merge dispatch boundary for \`${request.headSha.slice(0, 12)}\` under claim ${claimId}. Later workflow attempts must reconcile GitHub state and must not replay the merge request.`,
+  ].join("\n");
+}
+
 function matchingDispatch(
   inspected: InspectedClaims,
   request: ParsedClaim,
   claimId: number,
 ): TrustedDispatch | undefined {
-  return inspected.dispatches.find(
-    (candidate) =>
+  for (let index = inspected.dispatches.length - 1; index >= 0; index -= 1) {
+    const candidate = inspected.dispatches[index]!;
+    if (
       candidate.dispatch.claimId === claimId &&
       sameClaim(candidate.dispatch, request) &&
       candidate.dispatch.owner === request.owner &&
-      candidate.dispatch.claimant === request.claimant,
-  );
+      candidate.dispatch.claimant === request.claimant
+    ) {
+      return candidate;
+    }
+  }
+  return undefined;
 }
 
 function hasMatchingDispatch(
@@ -940,6 +1270,20 @@ function hasMatchingDispatch(
   claimId: number,
 ): boolean {
   return Boolean(matchingDispatch(inspected, request, claimId));
+}
+
+function hasMatchingRejection(
+  inspected: InspectedClaims,
+  request: ParsedClaim,
+  claimId: number,
+): boolean {
+  return inspected.rejections.some(
+    (candidate) =>
+      candidate.rejection.claimId === claimId &&
+      sameClaim(candidate.rejection, request) &&
+      candidate.rejection.owner === request.owner &&
+      candidate.rejection.claimant === request.claimant,
+  );
 }
 
 export function exactHeadMergeClaimWorkflowRunEnv(
@@ -1012,6 +1356,26 @@ function parseRecoveryMarkers(body: string): ParsedRecovery[] {
   return recoveries;
 }
 
+function parseRejectionMarkers(body: string): ParsedRejection[] {
+  const rejections: ParsedRejection[] = [];
+  for (const match of body.matchAll(REJECTION_PATTERN)) {
+    try {
+      rejections.push({
+        claimId: normalizeCommentId(Number(match[1]), "claim"),
+        repository: normalizeRepository(decodeURIComponent(match[2]!)),
+        number: normalizeNumber(Number(match[3])),
+        headSha: normalizeHeadSha(match[4]!),
+        method: normalizeMethod(match[5]!),
+        owner: normalizeOwner(match[6]!),
+        claimant: normalizeClaimant(decodeURIComponent(match[7]!)),
+      });
+    } catch {
+      return [];
+    }
+  }
+  return rejections;
+}
+
 function parseDispatchMarkers(body: string): ParsedDispatch[] {
   const dispatches: ParsedDispatch[] = [];
   for (const match of body.matchAll(DISPATCH_PATTERN)) {
@@ -1068,10 +1432,47 @@ function commentTimestamp(comment: LooseRecord): string | null {
 }
 
 export function exactHeadMergeClaimOwnsUpdatedAt(
-  claim: { lastClaimMutationAt?: string | null },
+  claim: {
+    lastClaimMutationId?: number | null;
+    lastClaimMutationAt?: string | null;
+  },
   updatedAt: unknown,
+  timeline: LooseRecord[],
 ): boolean {
-  return exactHeadMergeUpdatedAtMatches(claim.lastClaimMutationAt, updatedAt);
+  const mutationId = Number(claim.lastClaimMutationId);
+  const mutationAt = normalizeTimestamp(claim.lastClaimMutationAt);
+  const liveUpdatedAt = normalizeTimestamp(updatedAt);
+  if (
+    !Number.isSafeInteger(mutationId) ||
+    mutationId < 1 ||
+    !mutationAt ||
+    !liveUpdatedAt ||
+    !Array.isArray(timeline)
+  ) {
+    return false;
+  }
+  const mutationMs = Date.parse(mutationAt);
+  const liveUpdatedAtMs = Date.parse(liveUpdatedAt);
+  if (
+    liveUpdatedAtMs < mutationMs ||
+    liveUpdatedAtMs - mutationMs > CLAIM_ACTIVITY_PROPAGATION_MS
+  ) {
+    return false;
+  }
+  let matchedMutation = false;
+  for (const activity of timeline) {
+    const activityAt = normalizeTimestamp(activity.updated_at ?? activity.created_at);
+    if (!activityAt || Date.parse(activityAt) < mutationMs) continue;
+    if (
+      Number(activity.id) !== mutationId ||
+      !exactHeadMergeUpdatedAtMatches(activityAt, mutationAt) ||
+      (activity.event !== undefined && String(activity.event) !== "commented")
+    ) {
+      return false;
+    }
+    matchedMutation = true;
+  }
+  return matchedMutation;
 }
 
 export function exactHeadMergeUpdatedAtMatches(left: unknown, right: unknown): boolean {

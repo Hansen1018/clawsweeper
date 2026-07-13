@@ -14,6 +14,7 @@ import {
   exactHeadMergeClaimWorkflowRunEnv,
   inspectExactHeadMergeClaim,
   markExactHeadMergeClaimDispatched,
+  rejectExactHeadMergeClaim,
   releaseExactHeadMergeClaim,
 } from "../../dist/repair/exact-head-merge-claim.js";
 
@@ -411,9 +412,25 @@ test("durable dispatch records distinguish claim-owned timestamp drift", () => {
   assert.equal(inspected.status, "existing");
   if (inspected.status !== "existing") return;
   assert.equal(inspected.expectedSquashMessage, squashCommitMessage);
+  assert.equal(inspected.lastClaimMutationId, 1452);
   assert.equal(inspected.lastClaimMutationAt, "2026-07-13T08:02:00.000Z");
-  assert.equal(exactHeadMergeClaimOwnsUpdatedAt(inspected, "2026-07-13T08:02:00Z"), true);
-  assert.equal(exactHeadMergeClaimOwnsUpdatedAt(inspected, "2026-07-13T08:03:00Z"), false);
+  const timeline = [{ ...comments[1], event: "commented" }];
+  assert.equal(exactHeadMergeClaimOwnsUpdatedAt(inspected, "2026-07-13T08:02:02Z", timeline), true);
+  assert.equal(
+    exactHeadMergeClaimOwnsUpdatedAt(inspected, "2026-07-13T08:02:02Z", [
+      ...timeline,
+      {
+        id: 9999,
+        event: "labeled",
+        created_at: "2026-07-13T08:02:00Z",
+      },
+    ]),
+    false,
+  );
+  assert.equal(
+    exactHeadMergeClaimOwnsUpdatedAt(inspected, "2026-07-13T08:03:00Z", timeline),
+    false,
+  );
 });
 
 test("legacy v1 dispatch markers remain fail-closed for squash certification", () => {
@@ -439,7 +456,10 @@ test("legacy v1 dispatch markers remain fail-closed for squash certification", (
     trustedComment(1461, exactHeadMergeClaimBody(request), "2026-07-13T08:01:00Z"),
     trustedComment(
       1462,
-      `<!-- clawsweeper-exact-head-merge-dispatch:v1 claim=1461 repo=openclaw%2Fopenclaw pr=42 head=${headSha} method=squash owner=comment_router claimant=comment_router%3A6992%3A1 -->`,
+      [
+        `<!-- clawsweeper-exact-head-merge-dispatch:v1 claim=1461 repo=openclaw%2Fopenclaw pr=42 head=${headSha} method=squash owner=comment_router claimant=comment_router%3A6992%3A1 -->`,
+        "ClawSweeper crossed the exact-head squash merge dispatch boundary for `aaaaaaaaaaaa` under claim 1461. Later workflow attempts must reconcile GitHub state and must not replay the merge request.",
+      ].join("\n"),
       "2026-07-13T08:02:00Z",
     ),
   );
@@ -509,6 +529,123 @@ test("malformed and oversized v2 dispatch payloads cannot become trusted state",
     /too large/,
   );
   assert.equal(comments.length, 1);
+});
+
+test("exact-head claim state rejects embedded and conflicting trusted markers", () => {
+  const request = {
+    repository: "openclaw/openclaw",
+    number: 42,
+    headSha,
+    method: "squash" as const,
+    owner: "apply_result",
+    claimant: "apply_result:6994:1",
+    appId: 3306130,
+    appSlug: "clawsweeper",
+  };
+  const trustedComment = (id: number, body: string, createdAt: string) => ({
+    id,
+    body,
+    created_at: createdAt,
+    performed_via_github_app: { id: 3306130, slug: "clawsweeper" },
+    user: { login: "clawsweeper[bot]" },
+  });
+  const embedded = trustedComment(
+    1481,
+    `quoted state follows\n${exactHeadMergeClaimBody(request)}`,
+    "2026-07-13T08:01:00Z",
+  );
+  const embeddedInspection = inspectExactHeadMergeClaim(request, () => [embedded]);
+  assert.equal(embeddedInspection.status, "blocked");
+  assert.match(embeddedInspection.reason, /malformed, mixed, or duplicated/);
+
+  const comments: Record<string, any>[] = [];
+  const io = {
+    listComments: () => comments,
+    createComment: (body: string) => {
+      const comment = trustedComment(
+        1482 + comments.length,
+        body,
+        `2026-07-13T08:0${comments.length + 1}:00Z`,
+      );
+      comments.push(comment);
+      return comment;
+    },
+  };
+  const claim = ensureExactHeadMergeClaim(request, io);
+  assert.equal(claim.status, "acquired");
+  if (claim.status !== "acquired") return;
+  assert.equal(
+    markExactHeadMergeClaimDispatched(request, claim.claimId, squashCommitMessage, io).status,
+    "dispatched",
+  );
+  const firstDispatch = comments[1]!;
+  comments.push({
+    ...firstDispatch,
+    id: firstDispatch.id + 1,
+    created_at: "2026-07-13T08:03:00Z",
+  });
+  let inspected = inspectExactHeadMergeClaim(request, io.listComments);
+  assert.equal(inspected.status, "existing");
+  if (inspected.status !== "existing") return;
+  assert.equal(inspected.lastClaimMutationId, firstDispatch.id + 1);
+  assert.equal(inspected.lastClaimMutationAt, "2026-07-13T08:03:00.000Z");
+
+  comments.push({
+    ...firstDispatch,
+    id: firstDispatch.id + 2,
+    body: firstDispatch.body.replace(
+      encodeURIComponent(squashCommitMessage),
+      encodeURIComponent(`${squashCommitMessage}\nconflict`),
+    ),
+    created_at: "2026-07-13T08:04:00Z",
+  });
+  inspected = inspectExactHeadMergeClaim(request, io.listComments);
+  assert.equal(inspected.status, "blocked");
+  assert.match(inspected.reason, /dispatch payloads conflict/);
+});
+
+test("definitive dispatch rejection durably retires the exact-head claim", () => {
+  const comments: Record<string, any>[] = [];
+  let nextId = 1491;
+  const request = (runId: number) => ({
+    repository: "openclaw/openclaw",
+    number: 42,
+    headSha,
+    method: "squash" as const,
+    owner: "comment_router",
+    claimant: `comment_router:${runId}:1`,
+    appId: 3306130,
+    appSlug: "clawsweeper",
+  });
+  const io = {
+    listComments: () => comments,
+    createComment: (body: string) => {
+      const comment = {
+        id: nextId++,
+        body,
+        created_at: `2026-07-13T08:0${comments.length + 1}:00Z`,
+        performed_via_github_app: { id: 3306130, slug: "clawsweeper" },
+        user: { login: "clawsweeper[bot]" },
+      };
+      comments.push(comment);
+      return comment;
+    },
+  };
+
+  const claim = ensureExactHeadMergeClaim(request(6995), io);
+  assert.equal(claim.status, "acquired");
+  if (claim.status !== "acquired") return;
+  assert.equal(
+    markExactHeadMergeClaimDispatched(request(6995), claim.claimId, squashCommitMessage, io).status,
+    "dispatched",
+  );
+  assert.equal(rejectExactHeadMergeClaim(request(6995), claim.claimId, io).status, "rejected");
+  assert.match(comments[2].body, /clawsweeper-exact-head-merge-rejection:v1/);
+  assert.equal(inspectExactHeadMergeClaim(request(6995), io.listComments).status, "released");
+
+  const reacquired = ensureExactHeadMergeClaim(request(6996), io);
+  assert.equal(reacquired.status, "acquired");
+  assert.equal(reacquired.claimId, 1494);
 });
 
 test("terminal stale claims are retired before a fresh workflow may reacquire", () => {

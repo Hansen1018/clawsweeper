@@ -1358,12 +1358,12 @@ test("repair apply fresh attempts reconcile an unknown claimed merge without rei
     assert.equal(report.actions[0].requeue_required, true);
     assert.equal(mergeCallCount(fixture.ghLogPath), 1);
 
-    fs.writeFileSync(fixture.unrelatedDriftPath, "1");
+    fs.writeFileSync(fixture.unrelatedDriftPath, "same_timestamp");
     runMergeApplyResult(fixture, { runAttempt: 3 });
     report = readApplyReport(fixture.reportPath);
     assert.equal(report.actions[0].status, "blocked");
     assert.equal(report.actions[0].reason, "target changed since worker review");
-    assert.equal(report.actions[0].live_updated_at, "2026-07-13T07:30:00Z");
+    assert.equal(report.actions[0].live_updated_at, "2026-07-13T07:02:02.000Z");
     assert.equal(mergeCallCount(fixture.ghLogPath), 1);
   } finally {
     fixture.cleanup();
@@ -1458,7 +1458,7 @@ test("repair apply requires a fresh reviewed timestamp after releasing a post-cl
     assert.equal(comments.length, 2);
 
     const refreshedResult = JSON.parse(fs.readFileSync(fixture.resultPath, "utf8"));
-    refreshedResult.actions[0].target_updated_at = "2026-07-13T07:02:00Z";
+    refreshedResult.actions[0].target_updated_at = "2026-07-13T07:02:02.000Z";
     fs.writeFileSync(fixture.resultPath, JSON.stringify(refreshedResult, null, 2));
     runMergeApplyResult(fixture, { runAttempt: 3 });
     report = readApplyReport(fixture.reportPath);
@@ -2144,6 +2144,25 @@ if (args[0] === "api") {
     write(args.includes("--slurp") ? [comments] : comments);
     process.exit(0);
   }
+  if (apiPath.includes("/issues/101/timeline")) {
+    const comments = fs.existsSync(data.mergeClaimPath)
+      ? JSON.parse(fs.readFileSync(data.mergeClaimPath, "utf8"))
+      : [];
+    const timeline = comments.map((comment) => ({ ...comment, event: "commented" }));
+    const driftMode = fs.existsSync(data.unrelatedDriftPath)
+      ? fs.readFileSync(data.unrelatedDriftPath, "utf8").trim()
+      : "";
+    if (driftMode === "same_timestamp" && comments.length > 0) {
+      timeline.push({
+        id: 90001,
+        event: "labeled",
+        created_at: comments.at(-1).created_at,
+        actor: { login: "maintainer" },
+      });
+    }
+    write(args.includes("--slurp") ? [timeline] : timeline);
+    process.exit(0);
+  }
   if (apiPath === "repos/openclaw/openclaw/issues/101") {
     const count = issueCount() + 1;
     fs.writeFileSync(data.issueCountPath, String(count));
@@ -2151,14 +2170,28 @@ if (args[0] === "api") {
       ? JSON.parse(fs.readFileSync(data.mergeClaimPath, "utf8"))
       : [];
     const latestClaimMutation = comments.at(-1)?.created_at || "2026-07-13T07:00:00Z";
+    const driftMode = fs.existsSync(data.unrelatedDriftPath)
+      ? fs.readFileSync(data.unrelatedDriftPath, "utf8").trim()
+      : "";
+    const mergeCompleted =
+      mergeCount() > 0 && ["success_exact", "ambiguous_exact"].includes(data.mergeMode);
+    const claimUpdatedAt =
+      comments.length > 0
+        ? new Date(Date.parse(latestClaimMutation) + 2_000).toISOString()
+        : latestClaimMutation;
     write({
       number: 101,
       title: "Exact merge candidate",
       html_url: "https://github.com/openclaw/openclaw/pull/101",
-      state: "open",
-      updated_at: fs.existsSync(data.unrelatedDriftPath)
-        ? "2026-07-13T07:30:00Z"
-        : latestClaimMutation,
+      state: mergeCompleted ? "closed" : "open",
+      updated_at:
+        driftMode === "same_timestamp"
+          ? claimUpdatedAt
+          : driftMode
+            ? "2026-07-13T07:30:00Z"
+            : mergeCompleted
+              ? "2026-07-13T08:00:03Z"
+              : claimUpdatedAt,
       author_association: "CONTRIBUTOR",
       user: { login: "contributor" },
       labels:

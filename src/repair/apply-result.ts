@@ -628,23 +628,6 @@ function applyMergeAction({
       live_updated_at: live.updated_at,
     };
   }
-  if (
-    expectedUpdatedAt &&
-    !exactHeadMergeUpdatedAtMatches(expectedUpdatedAt, live.updated_at) &&
-    !(
-      preliminaryClaim.status === "existing" &&
-      exactHeadMergeClaimOwnsUpdatedAt(preliminaryClaim, live.updated_at)
-    )
-  ) {
-    return {
-      ...base,
-      status: "blocked",
-      reason: "target changed since worker review",
-      expected_updated_at: expectedUpdatedAt,
-      live_updated_at: live.updated_at,
-      live_state: live.state,
-    };
-  }
   let existingSquashCommitProof: SquashMergeCommitProof | undefined;
   if (
     preliminaryClaim.status === "existing" &&
@@ -694,6 +677,26 @@ function applyMergeAction({
       live_updated_at: live.updated_at,
       merged_at: existingMerge.mergedAt,
       merge_commit_sha: pullRequest.merge_commit_sha ?? null,
+    };
+  }
+  if (
+    expectedUpdatedAt &&
+    !applyMergeUpdatedAtMatches(
+      result.repo,
+      target,
+      authorizedHeadSha,
+      expectedUpdatedAt,
+      live.updated_at,
+      preliminaryClaim,
+    )
+  ) {
+    return {
+      ...base,
+      status: "blocked",
+      reason: "target changed since worker review",
+      expected_updated_at: expectedUpdatedAt,
+      live_updated_at: live.updated_at,
+      live_state: live.state,
     };
   }
   const lockedSkip = lockedConversationSkipIfLocked(base, live);
@@ -852,10 +855,13 @@ function applyMergeAction({
   }
   if (
     expectedUpdatedAt &&
-    !exactHeadMergeUpdatedAtMatches(expectedUpdatedAt, finalLive.updated_at) &&
-    !(
-      preliminaryClaim.status === "existing" &&
-      exactHeadMergeClaimOwnsUpdatedAt(preliminaryClaim, finalLive.updated_at)
+    !applyMergeUpdatedAtMatches(
+      result.repo,
+      target,
+      authorizedHeadSha,
+      expectedUpdatedAt,
+      finalLive.updated_at,
+      preliminaryClaim,
     )
   ) {
     return {
@@ -1047,8 +1053,14 @@ function applyMergeAction({
     }
     if (
       expectedUpdatedAt &&
-      !exactHeadMergeUpdatedAtMatches(expectedUpdatedAt, claimedLive.updated_at) &&
-      !exactHeadMergeClaimOwnsUpdatedAt(mergeClaim, claimedLive.updated_at)
+      !applyMergeUpdatedAtMatches(
+        result.repo,
+        target,
+        authorizedHeadSha,
+        expectedUpdatedAt,
+        claimedLive.updated_at,
+        mergeClaim,
+      )
     ) {
       return releaseBeforeDispatch({
         ...base,
@@ -1529,6 +1541,31 @@ function listApplyMergeClaimComments(request: ExactHeadMergeClaimRequest) {
   return ghPaged<LooseRecord>(
     `repos/${request.repository}/issues/${request.number}/comments?per_page=100`,
   );
+}
+
+function applyMergeUpdatedAtMatches(
+  repository: string,
+  number: number,
+  headSha: string,
+  expectedUpdatedAt: JsonValue,
+  liveUpdatedAt: JsonValue,
+  claim: {
+    status: string;
+    lastClaimMutationId?: number | null;
+    lastClaimMutationAt?: string | null;
+  },
+) {
+  if (exactHeadMergeUpdatedAtMatches(expectedUpdatedAt, liveUpdatedAt)) return true;
+  if (claim.status !== "existing" && claim.status !== "acquired") return false;
+  try {
+    const request = applyMergeClaimRequest(repository, number, headSha);
+    const timeline = ghPaged<LooseRecord>(
+      `repos/${request.repository}/issues/${request.number}/timeline?per_page=100`,
+    );
+    return exactHeadMergeClaimOwnsUpdatedAt(claim, liveUpdatedAt, timeline);
+  } catch {
+    return false;
+  }
 }
 
 function applyMergeMutationIdentity(number: number, headSha: string) {

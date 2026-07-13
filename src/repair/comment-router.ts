@@ -35,9 +35,11 @@ import {
   inspectExactHeadMergeClaim,
   isTrustedExactHeadMergeClaimComment,
   isTrustedExactHeadMergeClaimDispatchComment,
+  isTrustedExactHeadMergeClaimRejectionComment,
   isTrustedExactHeadMergeClaimRecoveryComment,
   isTrustedExactHeadMergeClaimReleaseComment,
   markExactHeadMergeClaimDispatched,
+  rejectExactHeadMergeClaim,
   releaseExactHeadMergeClaim,
   type ExactHeadMergeClaimRequest,
   type ExactHeadMergeClaimResult,
@@ -3996,6 +3998,8 @@ function executeAutomerge(command: LooseRecord): LooseRecord {
   }
   // Keep the exact-head merge request one-shot; reconcile its effect before closing the receipt.
   let mergeRequestStarted = false;
+  let dispatchedClaimMutationId = mergeClaim.lastClaimMutationId;
+  let dispatchedClaimMutationAt = mergeClaim.lastClaimMutationAt;
   let squashCommitProof: SquashMergeCommitProof | undefined;
   let result;
   try {
@@ -4026,6 +4030,8 @@ function executeAutomerge(command: LooseRecord): LooseRecord {
           if (dispatchBoundary.status !== "dispatched") {
             throw new Error(dispatchBoundary.reason);
           }
+          dispatchedClaimMutationId = dispatchBoundary.lastClaimMutationId;
+          dispatchedClaimMutationAt = dispatchBoundary.lastClaimMutationAt;
         },
         onDispatchStart: () => {
           mergeRequestStarted = true;
@@ -4083,7 +4089,8 @@ function executeAutomerge(command: LooseRecord): LooseRecord {
         createdAt: null,
         dispatched: true,
         expectedSquashMessage: expectedSquashCommitMessage(mergeMessage.subject, mergeMessage.body),
-        lastClaimMutationAt: null,
+        lastClaimMutationId: dispatchedClaimMutationId,
+        lastClaimMutationAt: dispatchedClaimMutationAt,
       },
       waitedMs,
       transientObservations,
@@ -4152,6 +4159,12 @@ function executeAutomerge(command: LooseRecord): LooseRecord {
         transient_wait_ms: waitedMs,
         transient_observations: transientObservations,
       };
+    }
+    const rejectedClaim = rejectAutomergeMergeClaim(command, mergeClaim.claimId);
+    if (rejectedClaim.status !== "rejected") {
+      throw new Error(
+        `definitive merge rejection could not retire the exact-head claim: ${rejectedClaim.reason}`,
+      );
     }
     ensureMergeReadyLabel(command);
     runGitHubBestEffortMutation(
@@ -4449,6 +4462,35 @@ function markAutomergeMergeClaimDispatched(
             claimId,
             expectedSquashMessage,
           )
+            ? "accepted"
+            : "unknown",
+      }),
+  });
+}
+
+function rejectAutomergeMergeClaim(command: LooseRecord, claimId: number) {
+  const request = automergeMergeClaimRequest(command);
+  return rejectExactHeadMergeClaim(request, claimId, {
+    listComments: () =>
+      ghPaged<LooseRecord>(
+        `repos/${request.repository}/issues/${request.number}/comments?per_page=100`,
+      ),
+    createComment: (body) =>
+      runCommandMutation(command, {
+        kind: "pull_request_merge_claim_rejection",
+        identity: { ...exactHeadMergeClaimIdentity(request), claimId },
+        operation: () =>
+          ghJson(
+            [
+              "api",
+              `repos/${request.repository}/issues/${request.number}/comments`,
+              "-f",
+              `body=${body}`,
+            ],
+            { attempts: 1 },
+          ),
+        outcome: (comment) =>
+          isTrustedExactHeadMergeClaimRejectionComment(comment, request, claimId)
             ? "accepted"
             : "unknown",
       }),
