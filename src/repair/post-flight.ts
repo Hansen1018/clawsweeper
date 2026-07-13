@@ -559,14 +559,23 @@ function finalizeFixPr(action: LooseRecord) {
             }
             let commandError: unknown = null;
             dispatchedSquashCommitMessage = dispatchBoundary.expectedSquashMessage;
-            const dispatchPull = fetchPullRequest(result.repo, parsed.number);
-            const dispatchView = fetchPullRequestView(result.repo, parsed.number);
-            const dispatchPolicyBlock = postFlightMergeRetryBlock({
-              action,
-              number: parsed.number,
-              pull: dispatchPull,
-              view: dispatchView,
-            });
+            let dispatchPull = finalPull;
+            let dispatchView = finalView;
+            let dispatchPolicyBlock = "";
+            let dispatchPolicyRetry = false;
+            try {
+              dispatchPull = fetchPullRequest(result.repo, parsed.number);
+              dispatchView = fetchPullRequestView(result.repo, parsed.number);
+              dispatchPolicyBlock = postFlightMergeRetryBlock({
+                action,
+                number: parsed.number,
+                pull: dispatchPull,
+                view: dispatchView,
+              });
+            } catch (error) {
+              dispatchPolicyBlock = `post-dispatch merge preflight could not be refreshed: ${compactText(ghErrorText(error), 500)}`;
+              dispatchPolicyRetry = true;
+            }
             if (dispatchPolicyBlock) {
               let rejection;
               try {
@@ -583,7 +592,7 @@ function finalizeFixPr(action: LooseRecord) {
                   rejection.status === "rejected"
                     ? dispatchPolicyBlock
                     : `${dispatchPolicyBlock}; ${rejection.reason}`,
-                claimRejectionRetry: rejection.status === "unknown",
+                claimRejectionRetry: dispatchPolicyRetry || rejection.status === "unknown",
                 pull: dispatchPull,
                 view: dispatchView,
                 confirmation: null,

@@ -780,6 +780,31 @@ test("post-flight reconciles one exact-head merge effect across retries and queu
       ["skipped", "mutation_rejected"],
     ]);
 
+    fixture.reset();
+    runVerifiedPostFlight(
+      fixture,
+      {
+        ...commonEnv,
+        CLAWSWEEPER_ACTION_LEDGER_INVOCATION: "post-flight-post-dispatch-read-failure",
+        FAKE_GH_POST_DISPATCH_PREFLIGHT_FAILURE: "1",
+      },
+      1,
+    );
+    report = JSON.parse(fs.readFileSync(fixture.reportPath, "utf8"));
+    assert.equal(report.actions[0]?.status, "blocked");
+    assert.match(
+      report.actions[0]?.reason,
+      /^post-dispatch merge preflight could not be refreshed:/,
+    );
+    assert.equal(report.actions[0]?.retry_recommended, true);
+    assert.equal(report.actions[0]?.merge_attempts, 0);
+    assert.equal(fs.existsSync(fixture.mergeCountPath), false);
+    claimComments = JSON.parse(fs.readFileSync(fixture.mergeClaimPath, "utf8"));
+    assert.equal(claimComments.length, 3);
+    assert.match(claimComments[0].body, /clawsweeper-exact-head-merge-claim:v1/);
+    assert.match(claimComments[1].body, /clawsweeper-exact-head-merge-dispatch:v2 claim=1001/);
+    assert.match(claimComments[2].body, /clawsweeper-exact-head-merge-rejection:v1 claim=1001/);
+
     for (const proofFailure of [
       {
         env: { FAKE_GH_COMMIT_MESSAGE_MISMATCH: "1" },
@@ -1741,7 +1766,7 @@ function createVerifiedMergeFixture() {
       "const mergeCount = () => fs.existsSync(process.env.FAKE_GH_MERGE_COUNT_FILE) ? Number(fs.readFileSync(process.env.FAKE_GH_MERGE_COUNT_FILE, 'utf8')) : 0;",
       "if (merged) { pull.state = 'closed'; pull.merged_at = '2026-07-13T08:00:00Z'; pull.merge_commit_sha = 'b'.repeat(40); }",
       "if (process.env.FAKE_GH_HEAD_DRIFT === '1') pull.head.sha = 'c'.repeat(40);",
-      "if (args[0] === 'api' && args[1] === 'repos/openclaw/openclaw/pulls/123') { const commentsCount = fs.existsSync(process.env.FAKE_GH_COMMENTS_COUNT_FILE) ? Number(fs.readFileSync(process.env.FAKE_GH_COMMENTS_COUNT_FILE, 'utf8')) : 0; if (process.env.FAKE_GH_PENDING_BEFORE_MUTATION === '1' && mergeCount() === 0 && commentsCount > 0) fs.writeFileSync(process.env.FAKE_GH_GATE_DRIFT_FILE, '1'); if (process.env.FAKE_GH_CONFIRMATION_FAILURE_AFTER_ATTEMPT === '1' && mergeCount() > 0) { process.stderr.write('gh: HTTP 502: confirmation unavailable\\n'); process.exit(1); } if (process.env.FAKE_GH_CONFIRMATION_FAILURE_ON_POST_MERGE_READ === String(confirmationCount)) { process.stderr.write('gh: HTTP 502: reconciliation unavailable\\n'); process.exit(1); } process.stdout.write(JSON.stringify(pull)); process.exit(0); }",
+      "if (args[0] === 'api' && args[1] === 'repos/openclaw/openclaw/pulls/123') { const commentsCount = fs.existsSync(process.env.FAKE_GH_COMMENTS_COUNT_FILE) ? Number(fs.readFileSync(process.env.FAKE_GH_COMMENTS_COUNT_FILE, 'utf8')) : 0; const claimComments = fs.existsSync(process.env.FAKE_GH_MERGE_CLAIM_FILE) ? JSON.parse(fs.readFileSync(process.env.FAKE_GH_MERGE_CLAIM_FILE, 'utf8')) : []; const dispatchedClaim = claimComments.some((comment) => String(comment.body || '').includes('clawsweeper-exact-head-merge-dispatch:v2')); if (process.env.FAKE_GH_POST_DISPATCH_PREFLIGHT_FAILURE === '1' && dispatchedClaim && mergeCount() === 0) { process.stderr.write('gh: HTTP 502: post-dispatch preflight unavailable\\n'); process.exit(1); } if (process.env.FAKE_GH_PENDING_BEFORE_MUTATION === '1' && mergeCount() === 0 && commentsCount > 0) fs.writeFileSync(process.env.FAKE_GH_GATE_DRIFT_FILE, '1'); if (process.env.FAKE_GH_CONFIRMATION_FAILURE_AFTER_ATTEMPT === '1' && mergeCount() > 0) { process.stderr.write('gh: HTTP 502: confirmation unavailable\\n'); process.exit(1); } if (process.env.FAKE_GH_CONFIRMATION_FAILURE_ON_POST_MERGE_READ === String(confirmationCount)) { process.stderr.write('gh: HTTP 502: reconciliation unavailable\\n'); process.exit(1); } process.stdout.write(JSON.stringify(pull)); process.exit(0); }",
       "if (args[0] === 'api' && args[1] === 'repos/openclaw/openclaw/commits/' + 'b'.repeat(40)) { const message = fs.existsSync(process.env.FAKE_GH_MERGE_MESSAGE_FILE) ? fs.readFileSync(process.env.FAKE_GH_MERGE_MESSAGE_FILE, 'utf8') : ''; process.stdout.write(JSON.stringify({ sha: 'b'.repeat(40), commit: { message: process.env.FAKE_GH_COMMIT_MESSAGE_MISMATCH === '1' ? 'fix: raced merge\\n\\nwrong payload' : message }, parents: process.env.FAKE_GH_COMMIT_TWO_PARENTS === '1' ? [{ sha: 'd'.repeat(40) }, { sha: 'e'.repeat(40) }] : [{ sha: 'd'.repeat(40) }] })); process.exit(0); }",
       "if (args[0] === 'api' && args[1] === 'repos/openclaw/openclaw/pulls/122') { process.stdout.write(JSON.stringify(sourcePull)); process.exit(0); }",
       "if (args[0] === 'api' && args[1] === 'repos/openclaw/clawsweeper/actions/runs/521123/attempts/1') { process.stdout.write(JSON.stringify({ id: 521123, run_attempt: 1, status: 'in_progress', conclusion: null })); process.exit(0); }",
