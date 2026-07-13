@@ -351,6 +351,11 @@ The current implementation instruments these production surfaces:
 - Review and apply workflows record review batches, selected items, retries,
   Codex log publication, durable review-comment publication, apply actions,
   apply batches, apply reports, and interrupted or failed terminals.
+- Exact-review queue admission records enqueue, claim, completion, and
+  reconciliation request boundaries with stable business idempotency across
+  wire retries. Queue URLs, credentials, lease identifiers, and prompts are
+  excluded from receipts. Untrusted queue producers upload exact finalized
+  manifests; a separate state-authorized job verifies and imports those shards.
 - The comment router records command receipt, classification, durable claims
   and refreshes, progress, request-bound mutation attempts and outcomes,
   dispatch, wait, requeue, recovery, completion, skip, and failure.
@@ -360,11 +365,18 @@ The current implementation instruments these production surfaces:
   their persisted logs and reports, while post-flight merge, closeout comment,
   source close, and compensation requests use pre-request receipts with
   accepted, rejected-before-write, or unknown outcomes.
-- Spam audit records review batches, review items, and bounded audit-log
-  publication. Assist records generation, local review output, validated
-  artifact publication, and the request-bound comment mutation. Proof handling
-  records stage results, comment and label mutations, report publication, and
-  proof cursor bindings.
+- Spam intake records candidate classification, dispatch attempts and outcomes,
+  report publication, and terminal uncertainty before a separate trusted job
+  imports its producer shards. Spam audit then records review batches, review
+  items, and bounded audit-log publication. Assist records generation, local
+  review output, validated artifact publication, and the request-bound comment
+  mutation. Proof handling records stage results, comment and label mutations,
+  report publication, and proof cursor bindings.
+- Label housekeeping records repository-label creation, target-label addition,
+  and replacement-label removal as request-bound mutations. Each retry gets its
+  own attempt/outcome pair while the target, label, and source revision retain
+  one stable business identity; receipt evidence excludes item titles and label
+  prose.
 - Target fanout records queue selection, each repository dispatch attempt and
   outcome, and cursor publication. The generic `publish-workflow` path imports
   shards only from the authenticated workflow producer job, which lets spam,

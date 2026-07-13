@@ -83,11 +83,21 @@ checkpoint, and status-only commits are intentionally omitted.
   progress, mutation outcomes, dispatch, wait, requeue, recovery, and terminal
   state.
 - Instrumented the spam audit, assist, proof, and target-fanout surfaces. Spam
-  records review batches, items, and audit logs; assist records generation,
-  local output, artifact validation, and comment publication; proof records
-  stage results, comment and label mutations, reports, and cursors; and fanout
-  records queue selection, per-target dispatch attempts and outcomes, and cursor
+  intake records classification, dispatch attempts, outcomes, report
+  publication, and uncertain terminals before trusted shard import; the audit
+  records review batches, items, and logs. Assist records generation, local
+  output, artifact validation, and comment publication; proof records stage
+  results, comment and label mutations, reports, and cursors; and fanout records
+  queue selection, per-target dispatch attempts and outcomes, and cursor
   publication.
+- Added exact-review queue receipts for enqueue, claim, completion, and
+  reconciliation with per-wire attempts, stable business idempotency, bounded
+  redaction, credential-isolated producers, and exact-manifest publication by a
+  separate trusted job.
+- Added request-bound receipts for repository-label creation, target-label
+  addition, and replacement-label cleanup. Definite pre-write rejection remains
+  non-mutating, while transport and server uncertainty remains retryable and
+  cannot be rewritten as a clean failure.
 - Completed repair receipts across intake, queue, plan, executor, validation,
   review, publication, post-flight, requeue, recovery, self-heal, status,
   dashboard, notification, session, result, and finalizer lifecycles. Persisted
