@@ -5,7 +5,7 @@ import path from "node:path";
 import test from "node:test";
 
 import { ACTION_EVENT_TYPES } from "../../dist/action-ledger.js";
-import { postOpenClawAgentHook } from "../../dist/repair/openclaw-hook.js";
+import { OpenClawHookHttpError, postOpenClawAgentHook } from "../../dist/repair/openclaw-hook.js";
 import {
   deliverNotification,
   deliverNotificationAttempt,
@@ -22,11 +22,27 @@ for (const scenario of [
     terminalType: ACTION_EVENT_TYPES.notificationSent,
   },
   {
+    name: "rejected",
+    operation: async () => {
+      throw new OpenClawHookHttpError(422, "invalid request");
+    },
+    error: /OpenClaw hook returned 422/,
+    completionReason: "mutation_rejected",
+    requestState: "mutation_rejected",
+    retryable: false,
+    mutation: false,
+    terminalType: ACTION_EVENT_TYPES.notificationFailed,
+  },
+  {
     name: "unknown",
     operation: async () => {
       throw new Error("connection reset after delivery");
     },
+    error: /connection reset/,
     completionReason: "mutation_outcome_unknown",
+    requestState: "mutation_unknown",
+    retryable: true,
+    mutation: true,
     terminalType: ACTION_EVENT_TYPES.notificationFailed,
   },
 ] as const) {
@@ -46,7 +62,7 @@ for (const scenario of [
       if (scenario.name === "accepted") {
         assert.equal(await deliverNotification(input, scenario.operation), "sent");
       } else {
-        await assert.rejects(deliverNotification(input, scenario.operation), /connection reset/);
+        await assert.rejects(deliverNotification(input, scenario.operation), scenario.error);
       }
       await flushRepairActionEvents();
 
@@ -66,7 +82,11 @@ for (const scenario of [
         [1, 2, 3, 4],
       );
       assert.equal(events.at(-1)?.attributes?.completion_reason, scenario.completionReason);
-      assert.equal(events.at(-1)?.action.mutation, true);
+      assert.equal(events.at(-1)?.action.mutation, scenario.mutation ?? true);
+      assert.equal(events.at(-1)?.action.retryable, scenario.retryable ?? false);
+      if (scenario.requestState) {
+        assert.equal(events[2]?.attributes?.state, scenario.requestState);
+      }
     } finally {
       restoreEnv(previous);
       fs.rmSync(root, { force: true, recursive: true });

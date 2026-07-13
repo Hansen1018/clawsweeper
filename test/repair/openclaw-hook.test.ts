@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  isRejectedOpenClawHookError,
   isTransientOpenClawHookError,
   OpenClawHookHttpError,
   postOpenClawAgentHook,
@@ -85,4 +86,17 @@ test("isTransientOpenClawHookError classifies retryable HTTP statuses and socket
   assert.equal(isTransientOpenClawHookError(new OpenClawHookHttpError(502, "bad")), true);
   assert.equal(isTransientOpenClawHookError(new OpenClawHookHttpError(401, "bad")), false);
   assert.equal(isTransientOpenClawHookError(new Error("read ECONNRESET")), true);
+});
+
+test("isRejectedOpenClawHookError only classifies permanent 4xx responses as no-mutation", () => {
+  for (const status of [400, 401, 403, 404, 409, 422]) {
+    assert.equal(isRejectedOpenClawHookError(new OpenClawHookHttpError(status, "rejected")), true);
+  }
+  for (const status of [408, 425, 429, 500, 501, 502, 503, 504]) {
+    assert.equal(
+      isRejectedOpenClawHookError(new OpenClawHookHttpError(status, "ambiguous")),
+      false,
+    );
+  }
+  assert.equal(isRejectedOpenClawHookError(new Error("read ECONNRESET")), false);
 });

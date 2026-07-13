@@ -10,6 +10,7 @@ import {
   runRepairMutationAsync,
   type RepairLifecycleInput,
 } from "./repair-action-ledger.js";
+import { isRejectedOpenClawHookError } from "./openclaw-hook.js";
 
 export type NotificationLedgerInput = {
   repository: string;
@@ -18,7 +19,10 @@ export type NotificationLedgerInput = {
   sourceRevision?: string | null;
 };
 
-export type NotificationMutationOutcome = "mutation_observed" | "mutation_outcome_unknown";
+export type NotificationMutationOutcome =
+  | "mutation_observed"
+  | "mutation_rejected"
+  | "mutation_outcome_unknown";
 export type NotificationAttemptRunner = <T>(operation: () => Promise<T>) => Promise<T>;
 
 export function recordNotificationPhase(
@@ -53,7 +57,7 @@ export function recordNotificationPhase(
           : phase === "sent"
             ? ACTION_EVENT_REASON_CODES.completed
             : ACTION_EVENT_REASON_CODES.exception,
-    mutation: phase === "sent" || phase === "failed",
+    mutation: phase === "sent" || (phase === "failed" && failureOutcome !== "mutation_rejected"),
     retryable: phase === "failed" && failureOutcome === "mutation_outcome_unknown",
     component: "notification",
     operation: "notification",
@@ -127,13 +131,16 @@ export async function deliverNotificationAttempt<T>(
     knownNoMutation?: (error: unknown) => boolean;
   },
 ): Promise<T> {
+  const knownNoMutation =
+    options.knownNoMutation ??
+    (options.destination === "openclaw_hook" ? isRejectedOpenClawHookError : undefined);
   return runRepairMutationAsync(notificationLifecycle(input), {
     kind: options.kind,
     identity: { key: input.key, destination: options.destination },
     component: "notification",
     operationName: "notification",
     operation: options.operation,
-    ...(options.knownNoMutation ? { knownNoMutation: options.knownNoMutation } : {}),
+    ...(knownNoMutation ? { knownNoMutation } : {}),
   });
 }
 
@@ -155,6 +162,7 @@ export async function deliverNotification<T>(
       input,
       "failed",
       error instanceof Error ? error.name : typeof error,
+      isRejectedOpenClawHookError(error) ? "mutation_rejected" : "mutation_outcome_unknown",
     );
     throw error;
   }
@@ -180,6 +188,7 @@ export async function deliverRetriedNotification<T>(
       input,
       "failed",
       error instanceof Error ? error.name : typeof error,
+      isRejectedOpenClawHookError(error) ? "mutation_rejected" : "mutation_outcome_unknown",
     );
     throw error;
   }

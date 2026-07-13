@@ -160,6 +160,15 @@ export function isTransientOpenClawHookError(error: unknown): boolean {
   );
 }
 
+export function isRejectedOpenClawHookError(error: unknown): boolean {
+  return (
+    error instanceof OpenClawHookHttpError &&
+    error.status >= 400 &&
+    error.status < 500 &&
+    !isTransientOpenClawHookError(error)
+  );
+}
+
 export function readHookRunId(body: string): string | null {
   try {
     const parsed = JSON.parse(body);
