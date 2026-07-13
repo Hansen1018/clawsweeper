@@ -417,6 +417,7 @@ export function recordCommandRequeue(
   options: {
     dispatchKey: string;
     sourceJobPath: string;
+    sourceStateRevision: string;
     sourceJobSha256: string;
     depth: number;
   },
@@ -430,6 +431,7 @@ export function recordCommandRequeue(
     eventIdentity: {
       dispatchKey: options.dispatchKey,
       sourceJobPath: options.sourceJobPath,
+      sourceStateRevision: options.sourceStateRevision,
       sourceJobSha256: options.sourceJobSha256,
       depth: options.depth,
     },
@@ -438,6 +440,7 @@ export function recordCommandRequeue(
       mutation: "requeue_dispatch",
       dispatchKey: options.dispatchKey,
       sourceJobPath: options.sourceJobPath,
+      sourceStateRevision: options.sourceStateRevision,
       sourceJobSha256: options.sourceJobSha256,
       depth: options.depth,
     },

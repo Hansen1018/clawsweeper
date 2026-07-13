@@ -7,16 +7,19 @@ import {
   assertLiveWorkerCapacity,
   currentProjectRepo,
   parseArgs,
-  parseJob,
+  parseRepairRunTitle,
   readMaxLiveWorkers,
   repoRoot,
-  validateJob,
   waitForLiveWorkerCapacity,
 } from "./lib.js";
 import { ghErrorText, ghJson, ghText } from "./github-cli.js";
 import { sleepMs } from "./timing.js";
 import { REPAIR_CLUSTER_WORKFLOW } from "./constants.js";
 import { shouldSelfHealRunRecord } from "./self-heal-policy.js";
+import {
+  immutableJobIdentityKey,
+  resolveCurrentStateJobIdentity,
+} from "./immutable-job-handoff.js";
 
 const DEFAULT_REPO = currentProjectRepo();
 const DEFAULT_WORKFLOW = REPAIR_CLUSTER_WORKFLOW;
@@ -97,6 +100,9 @@ const attempts: LooseRecord[] = candidates.map((candidate: JsonValue) => ({
   source_run_id: candidate.run_id,
   cluster_id: candidate.cluster_id,
   source_job: candidate.source_job,
+  source_state_revision: candidate.source_state_revision,
+  source_job_sha256: candidate.source_job_sha256,
+  immutable_job_key: candidate.immutable_job_key,
   mode: candidate.mode,
   runner,
   execution_runner: executionRunner,
@@ -160,15 +166,16 @@ try {
 function selectCandidates() {
   const records = readRunRecords();
   const attempts = readSelfHealLedger().attempts ?? [];
-  const activeSourceJobs = execute ? activeRepairSourceJobs() : new Map<string, string[]>();
+  const activeJobGenerations = execute ? activeRepairJobGenerations() : new Map<string, string[]>();
   const cutoffMs = Date.now() - maxAgeHours * 60 * 60 * 1000;
-  const attemptedRunIds = new Set(
-    attempts.map((attempt: JsonValue) => String(attempt.source_run_id ?? "")).filter(Boolean),
-  );
-  const attemptCountsByJob = new Map<string, number>();
+  const attemptedIdentities = new Set<string>();
+  const attemptCountsByIdentity = new Map<string, number>();
   for (const attempt of attempts) {
-    const sourceJob = String(attempt.source_job ?? "");
-    if (sourceJob) attemptCountsByJob.set(sourceJob, (attemptCountsByJob.get(sourceJob) ?? 0) + 1);
+    const immutableKey = attemptImmutableJobKey(attempt);
+    if (!immutableKey) continue;
+    const sourceRunId = String(attempt.source_run_id ?? "");
+    if (sourceRunId) attemptedIdentities.add(`${sourceRunId}:${immutableKey}`);
+    attemptCountsByIdentity.set(immutableKey, (attemptCountsByIdentity.get(immutableKey) ?? 0) + 1);
   }
   const latestByJob = new Map();
 
@@ -199,62 +206,54 @@ function selectCandidates() {
       });
       return false;
     })
-    .filter((record: JsonValue) => {
+    .map((record: JsonValue) => {
       const sourceJob = String(record.source_job ?? "");
-      const activeRunIds = activeSourceJobs.get(sourceJob) ?? [];
+      const immutableJob = resolveCurrentStateJobIdentity(sourceJob);
+      return {
+        ...record,
+        source_job: immutableJob.jobPath,
+        source_state_revision: immutableJob.stateRevision,
+        source_job_sha256: immutableJob.jobSha256,
+        immutable_job_key: immutableJob.identityKey,
+        mode: requestedMode ?? immutableJob.job.frontmatter.mode,
+      };
+    })
+    .filter((record: JsonValue) => {
+      const activeRunIds =
+        activeJobGenerations.get(
+          activeJobGenerationKey(record.source_job, record.source_job_sha256),
+        ) ?? [];
       if (activeRunIds.length === 0) return true;
       skippedCandidates.push({
         reason: "active_repair_run",
         run_id: record.run_id ?? null,
-        source_job: sourceJob,
+        source_job: record.source_job,
+        source_state_revision: record.source_state_revision,
+        source_job_sha256: record.source_job_sha256,
         active_run_ids: activeRunIds,
       });
       return false;
     })
     .filter((record: JsonValue) => {
       if (allowRepeat) return true;
-      const sourceJob = String(record.source_job ?? "");
       const runId = String(record.run_id ?? "");
-      if (runId && attemptedRunIds.has(runId)) return false;
-      if ((attemptCountsByJob.get(sourceJob) ?? 0) < maxAttemptsPerJob) return true;
+      const immutableKey = String(record.immutable_job_key ?? "");
+      if (runId && attemptedIdentities.has(`${runId}:${immutableKey}`)) return false;
+      if ((attemptCountsByIdentity.get(immutableKey) ?? 0) < maxAttemptsPerJob) return true;
       skippedCandidates.push({
         reason: "retry_limit_reached",
         run_id: runId || null,
-        source_job: sourceJob,
-        attempts: attemptCountsByJob.get(sourceJob) ?? 0,
+        source_job: record.source_job,
+        source_state_revision: record.source_state_revision,
+        source_job_sha256: record.source_job_sha256,
+        attempts: attemptCountsByIdentity.get(immutableKey) ?? 0,
       });
       return false;
     })
-    .map((record: JsonValue) => {
-      const sourceJob = String(record.source_job ?? "");
-      const jobPath = sourceJobPath(sourceJob);
-      if (!fs.existsSync(jobPath)) {
-        skippedCandidates.push({
-          reason: "missing_job_file",
-          run_id: record.run_id ?? null,
-          source_job: sourceJob,
-        });
-        return null;
-      }
-      const job = parseJob(jobPath);
-      const errors = validateJob(job);
-      if (errors.length > 0) {
-        throw new Error(`invalid job ${record.source_job}: ${errors.join("; ")}`);
-      }
-      return {
-        ...record,
-        mode: requestedMode ?? record.mode ?? job.frontmatter.mode,
-      };
-    })
-    .filter(Boolean)
     .sort((left: JsonValue, right: JsonValue) => runSortKey(right) - runSortKey(left));
 }
 
-function sourceJobPath(sourceJob: string) {
-  return path.isAbsolute(sourceJob) ? sourceJob : path.join(repoRoot(), sourceJob);
-}
-
-function activeRepairSourceJobs() {
+function activeRepairJobGenerations() {
   const jobs = new Map<string, string[]>();
   let runs: LooseRecord[] = [];
   try {
@@ -266,18 +265,13 @@ function activeRepairSourceJobs() {
 
   for (const run of runs) {
     if (!ACTIVE_STATUSES.has(String(run.status ?? ""))) continue;
-    const sourceJob = sourceJobFromRunTitle(String(run.displayTitle ?? ""));
-    if (!sourceJob) continue;
+    const parsed = parseRepairRunTitle(run.displayTitle);
+    if (!parsed?.jobSha256) continue;
     const runId = String(run.databaseId ?? "");
-    jobs.set(sourceJob, [...(jobs.get(sourceJob) ?? []), runId].filter(Boolean));
+    const key = activeJobGenerationKey(parsed.jobPath, parsed.jobSha256);
+    jobs.set(key, [...(jobs.get(key) ?? []), runId].filter(Boolean));
   }
   return jobs;
-}
-
-function sourceJobFromRunTitle(title: string) {
-  const index = title.indexOf("jobs/");
-  if (index < 0) return null;
-  return title.slice(index).trim();
 }
 
 function dispatchCandidate(candidate: LooseRecord) {
@@ -291,6 +285,10 @@ function dispatchCandidate(candidate: LooseRecord) {
       repo,
       "-f",
       `job=${candidate.source_job}`,
+      "-f",
+      `state_revision=${candidate.source_state_revision}`,
+      "-f",
+      `job_sha256=${candidate.source_job_sha256}`,
       "-f",
       `mode=${candidate.mode}`,
       "-f",
@@ -366,11 +364,12 @@ function liveRunRecords() {
   try {
     return listClusterRuns()
       .map((run: LooseRecord) => {
-        const sourceJob = sourceJobFromRunTitle(String(run.displayTitle ?? ""));
-        if (!sourceJob) return null;
+        const parsed = parseRepairRunTitle(run.displayTitle);
+        if (!parsed) return null;
         return {
           run_id: String(run.databaseId ?? ""),
-          source_job: sourceJob,
+          source_job: parsed.jobPath,
+          source_job_sha256: parsed.jobSha256,
           workflow_conclusion: run.conclusion ?? null,
           workflow_created_at: run.createdAt ?? null,
           workflow_updated_at: run.updatedAt ?? null,
@@ -496,8 +495,33 @@ function summarizeCandidate(candidate: LooseRecord) {
     source_run_id: candidate.run_id,
     cluster_id: candidate.cluster_id,
     source_job: candidate.source_job,
+    source_state_revision: candidate.source_state_revision,
+    source_job_sha256: candidate.source_job_sha256,
     mode: candidate.mode,
     result_status: candidate.result_status,
     run_url: candidate.run_url,
   };
+}
+
+function attemptImmutableJobKey(attempt: LooseRecord): string | null {
+  const stateRevision = attempt.source_state_revision;
+  const jobSha256 = attempt.source_job_sha256;
+  if (!stateRevision && !jobSha256) return null;
+  return immutableJobIdentityKey({
+    jobPath: attempt.source_job,
+    stateRevision,
+    jobSha256,
+  });
+}
+
+function activeJobGenerationKey(jobPath: JsonValue, jobSha256: JsonValue): string {
+  const pathText = String(jobPath ?? "").trim();
+  const digest = String(jobSha256 ?? "").trim();
+  if (!/^jobs\/[A-Za-z0-9_.-]+\/inbox\/[A-Za-z0-9_.-]+\.md$/.test(pathText)) {
+    throw new Error("active repair run contains a malformed job path");
+  }
+  if (!/^[a-f0-9]{64}$/.test(digest)) {
+    throw new Error("active repair run contains a malformed job SHA-256");
+  }
+  return `${pathText}:${digest}`;
 }

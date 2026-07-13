@@ -36,13 +36,15 @@ test("report-only repair requeues forward a stable dispatch receipt and publish 
   assert.ok(receiptIndex > dispatchIndex);
   assert.match(source, /deterministicRequeueDispatchKey\(\{/);
   assert.match(source, /authorizationSha256/);
+  assert.match(source, /sourceStateRevision: immutableJob\.stateRevision/);
   assert.match(source, /depth: nextRequeueDepth/);
   assert.match(source, /boundedNextRequeueDepth\(requeueDepth, maxRequeueDepth\)/);
   assert.match(source, /`dispatch_key=\$\{dispatchKey\}`/);
   assert.match(source, /`job=\$\{jobPath\}`/);
+  assert.match(source, /immutableJobDispatchArgs\(immutableJob\)/);
   assert.match(source, /`requeue_depth=\$\{nextRequeueDepth\}`/);
   assert.match(source, /operationKey: `repair-requeue:/);
-  assert.match(source, /sourceRevision: authorizationSha256/);
+  assert.match(source, /sourceRevision: immutableJob\.stateRevision/);
   assert.match(source, /runCommandLifecycleMutation\(lifecycle,/);
   assert.match(source, /await flushCommandActionEvents\(\)/);
   assert.match(setupAction, /CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT=\$output_root/);
@@ -82,6 +84,9 @@ test("report-only repair requeues forward a stable dispatch receipt and publish 
     /--source-job-path "\$\{\{ needs\.authorize\.outputs\.source_job_path \}\}"/,
   );
   assert.match(workflow, /--requeue-depth "\$\{\{ inputs\.requeue_depth \}\}"/);
+  assert.match(workflow, /--state-revision "\$\{\{ inputs\.state_revision \}\}"/);
+  assert.match(workflow, /--job-sha256 "\$\{\{ inputs\.job_sha256 \}\}"/);
+  assert.match(workflow, /fetch-depth: 0/);
   assert.match(workflow, /--max-requeue-depth 1/);
 });
 

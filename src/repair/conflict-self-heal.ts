@@ -27,6 +27,10 @@ import {
   selfHealJobPath,
   selfHealStatusMarkerPrefix,
 } from "./conflict-self-heal-core.js";
+import {
+  immutableJobDispatchArgs,
+  resolveCurrentStateJobIdentity,
+} from "./immutable-job-handoff.js";
 
 const args = parseArgs(process.argv.slice(2));
 
@@ -203,22 +207,6 @@ function classifyCandidate(
   });
   if (capBlock) return { ...base, status: "skipped", reason: capBlock };
 
-  const active = activeRepairWorkflowRunForJobAfterDispatchRecheck({
-    repo: repairRepo,
-    workflow,
-    jobPath,
-    activeRunsByPrefix: activeRepairRunsByPrefix,
-  });
-  if (active) {
-    return {
-      ...base,
-      status: "waiting",
-      reason: "repair worker already active for this self-heal job",
-      active_run_url: active.url ?? null,
-      active_run_id: active.databaseId ?? active.id ?? null,
-    };
-  }
-
   const headKey = `${repo}#${pull.number}:${headSha}`;
   plannedHeads.add(headKey);
   return { ...base, status: "candidate", reason: eligibility.reason };
@@ -273,20 +261,6 @@ function executeDispatches(
   if (process.env.CLAWSWEEPER_ALLOW_FIX_PR !== "1") {
     throw new Error("refusing conflict self-heal dispatch: CLAWSWEEPER_ALLOW_FIX_PR must be 1");
   }
-  summary.live_worker_capacity_before_dispatch = waitForCapacity
-    ? waitForLiveWorkerCapacity({
-        repo: repairRepo,
-        workflow,
-        requested: candidates.length,
-        maxLiveWorkers,
-      })
-    : assertLiveWorkerCapacity({
-        repo: repairRepo,
-        workflow,
-        requested: candidates.length,
-        maxLiveWorkers,
-      });
-
   const batchId = `conflict-self-heal-${new Date().toISOString().replace(/[:.]/g, "-")}`;
   const prepared: Array<{ candidate: LooseRecord; attempt: LooseRecord }> = [];
   for (const candidate of candidates) {
@@ -321,8 +295,16 @@ function executeDispatches(
     currentLedger.attempts = [...(currentLedger.attempts ?? []), attempt];
   }
   if (prepared.length > 0) publishSelfHealJobs();
+  const ready: Array<{ candidate: LooseRecord; attempt: LooseRecord }> = [];
   for (const item of prepared) {
     const { candidate, attempt } = item;
+    const immutableJob = resolveCurrentStateJobIdentity(candidate.job_path);
+    candidate.state_revision = immutableJob.stateRevision;
+    candidate.job_sha256 = immutableJob.jobSha256;
+    candidate.immutable_job_key = immutableJob.identityKey;
+    attempt.state_revision = immutableJob.stateRevision;
+    attempt.job_sha256 = immutableJob.jobSha256;
+    attempt.immutable_job_key = immutableJob.identityKey;
     const latest = fetchPullHead(repo, candidate.number);
     attempt.latest_head_sha_after_publish = latest.head_sha;
     if (latest.head_sha !== candidate.head_sha) {
@@ -330,6 +312,39 @@ function executeDispatches(
       attempt.reason = "head SHA changed after state publish";
       continue;
     }
+    const active = activeRepairWorkflowRunForJobAfterDispatchRecheck({
+      repo: repairRepo,
+      workflow,
+      jobPath: immutableJob.jobPath,
+      jobSha256: immutableJob.jobSha256,
+      activeRunsByPrefix: activeRepairRunsByPrefix,
+    });
+    if (active) {
+      attempt.status = "waiting";
+      attempt.reason = "repair worker already active for this immutable self-heal job";
+      attempt.run_url = active.url ?? null;
+      attempt.run_id = active.databaseId ?? active.id ?? null;
+      continue;
+    }
+    ready.push(item);
+  }
+  if (ready.length > 0) {
+    summary.live_worker_capacity_before_dispatch = waitForCapacity
+      ? waitForLiveWorkerCapacity({
+          repo: repairRepo,
+          workflow,
+          requested: ready.length,
+          maxLiveWorkers,
+        })
+      : assertLiveWorkerCapacity({
+          repo: repairRepo,
+          workflow,
+          requested: ready.length,
+          maxLiveWorkers,
+        });
+  }
+  for (const item of ready) {
+    const { candidate, attempt } = item;
     postSelfHealStatus(candidate, { status: "dispatching" });
     dispatchRepair(candidate);
     attempt.status = "dispatched";
@@ -425,6 +440,10 @@ function dispatchRepair(candidate: LooseRecord) {
       repairRepo,
       "-f",
       `job=${candidate.job_path}`,
+      ...immutableJobDispatchArgs({
+        stateRevision: candidate.state_revision,
+        jobSha256: candidate.job_sha256,
+      }),
       "-f",
       "mode=autonomous",
       "-f",

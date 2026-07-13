@@ -1,6 +1,5 @@
 #!/usr/bin/env node
 import type { JsonValue, LooseRecord } from "./json-types.js";
-import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -9,10 +8,8 @@ import {
   assertLiveWorkerCapacity,
   currentProjectRepo,
   parseArgs,
-  parseJob,
   readMaxLiveWorkers,
   repoRoot,
-  validateJob,
   waitForLiveWorkerCapacity,
 } from "./lib.js";
 import { ghJson, ghText } from "./github-cli.js";
@@ -31,6 +28,7 @@ import {
   deterministicRequeueDispatchKey,
   normalizedRequeueSourceJobPath,
 } from "./requeue-job-key.js";
+import { immutableJobDispatchArgs, resolveStateJobIdentity } from "./immutable-job-handoff.js";
 
 const DEFAULT_REPO = currentProjectRepo();
 const DEFAULT_WORKFLOW = REPAIR_CLUSTER_WORKFLOW;
@@ -61,24 +59,31 @@ const maxRequeueDepth = nonNegativeIntegerArg(args["max-requeue-depth"], "max-re
 
 const resolved = requestedRunId
   ? resolveFromRunId(String(requestedRunId))
-  : { source_job: args._[0], mode: requestedMode };
+  : {
+      source_job: args._[0],
+      mode: requestedMode,
+      state_revision: null,
+      job_sha256: null,
+    };
 
 if (!resolved.source_job) {
   console.error(
-    `usage: node scripts/requeue-job.ts <job.md|run-id> [--mode plan|execute|autonomous] [--execute] [--open-execute-window] [--source-run-id id] [--source-job-path path] [--requeue-depth n] [--max-requeue-depth n] [--runner label] [--execution-runner label] [--model model] [--max-live-workers ${AUTOMATION_LIMITS.repair_live_runs.default}] [--wait-for-capacity]`,
+    `usage: node scripts/requeue-job.ts <job.md|run-id> [--state-revision sha] [--job-sha256 digest] [--mode plan|execute|autonomous] [--execute] [--open-execute-window] [--source-run-id id] [--source-job-path path] [--requeue-depth n] [--max-requeue-depth n] [--runner label] [--execution-runner label] [--model model] [--max-live-workers ${AUTOMATION_LIMITS.repair_live_runs.default}] [--wait-for-capacity]`,
   );
   process.exit(2);
 }
 
-const job = parseJob(resolved.source_job);
-const sourceJobPath = normalizedRequeueSourceJobPath(args["source-job-path"], job.relativePath);
-const authorizationSha256 = createHash("sha256").update(job.raw).digest("hex");
-const errors = validateJob(job);
-if (errors.length > 0) {
-  console.error(`invalid job: ${job.relativePath}`);
-  for (const error of errors) console.error(`- ${error}`);
-  process.exit(1);
-}
+const sourceJobPath = normalizedRequeueSourceJobPath(
+  args["source-job-path"],
+  String(resolved.source_job),
+);
+const immutableJob = resolveStateJobIdentity({
+  jobPath: sourceJobPath,
+  stateRevision: args["state-revision"] ?? args.state_revision ?? resolved.state_revision,
+  jobSha256: args["job-sha256"] ?? args.job_sha256 ?? resolved.job_sha256,
+});
+const job = immutableJob.job;
+const authorizationSha256 = immutableJob.jobSha256;
 
 const mode = requestedMode ?? resolved.mode ?? job.frontmatter.mode;
 if (!["plan", "execute", "autonomous"].includes(mode)) {
@@ -91,6 +96,8 @@ const summary: LooseRecord = {
   workflow,
   source_run_id: sourceRunId || null,
   source_job: sourceJobPath,
+  source_state_revision: immutableJob.stateRevision,
+  source_job_sha256: immutableJob.jobSha256,
   source_authorization_sha256: authorizationSha256,
   requeue_depth: requeueDepth,
   max_requeue_depth: maxRequeueDepth,
@@ -115,13 +122,14 @@ const dispatchKey = deterministicRequeueDispatchKey({
   workflow,
   sourceRunId: sourceRunId || null,
   sourceJobPath,
+  stateRevision: immutableJob.stateRevision,
   authorizationSha256,
   depth: nextRequeueDepth,
 });
 const requeueLifecycle: CommandLifecycleInput = {
   repository: repo,
-  operationKey: `repair-requeue:${repo}:${sourceJobPath}:${authorizationSha256}:depth:${nextRequeueDepth}`,
-  sourceRevision: authorizationSha256,
+  operationKey: `repair-requeue:${repo}:${immutableJob.identityKey}:depth:${nextRequeueDepth}`,
+  sourceRevision: immutableJob.stateRevision,
   attemptId: dispatchKey,
 };
 let commandError: unknown = null;
@@ -143,6 +151,7 @@ try {
     dispatchKey,
     sourceJobPath,
     sourceJobSha256: authorizationSha256,
+    sourceStateRevision: immutableJob.stateRevision,
     depth: nextRequeueDepth,
   });
   const observedRuns = waitForStartedRuns({ headSha, since: dispatchStartedAt, expectedCount: 1 });
@@ -198,7 +207,12 @@ if (commandError) throw commandError;
 function resolveFromRunId(runId: string) {
   const fromLedger = readPublishedRunRecord(runId);
   if (fromLedger?.source_job) {
-    return { source_job: fromLedger.source_job, mode: fromLedger.mode };
+    return {
+      source_job: fromLedger.source_job,
+      mode: fromLedger.mode,
+      state_revision: fromLedger.source_state_revision,
+      job_sha256: fromLedger.source_job_sha256,
+    };
   }
 
   const artifactDir = fs.mkdtempSync(
@@ -214,10 +228,19 @@ function resolveFromRunId(runId: string) {
   }
   const planPath = findFirstFile(artifactDir, "cluster-plan.json");
   const resultPath = findFirstFile(artifactDir, "result.json");
+  const sourceIdentityPath = findFirstFile(artifactDir, "source-job.json");
   if (!planPath) throw new Error(`run ${runId} artifact did not include cluster-plan.json`);
   const plan = JSON.parse(fs.readFileSync(planPath, "utf8"));
   const result = resultPath ? JSON.parse(fs.readFileSync(resultPath, "utf8")) : null;
-  return { source_job: plan.source_job, mode: result?.mode ?? plan.mode };
+  const sourceIdentity = sourceIdentityPath
+    ? JSON.parse(fs.readFileSync(sourceIdentityPath, "utf8"))
+    : null;
+  return {
+    source_job: sourceIdentity?.source_job ?? plan.source_job,
+    mode: result?.mode ?? plan.mode,
+    state_revision: sourceIdentity?.state_revision ?? null,
+    job_sha256: sourceIdentity?.job_sha256 ?? null,
+  };
 }
 
 function readPublishedRunRecord(runId: string) {
@@ -247,6 +270,7 @@ function dispatchJob(
       workflow,
       sourceJobPath,
       sourceJobSha256: authorizationSha256,
+      sourceStateRevision: immutableJob.stateRevision,
       depth: nextRequeueDepth,
       dispatchKey,
     },
@@ -264,6 +288,7 @@ function dispatchJob(
           `job=${jobPath}`,
           "-f",
           `dispatch_key=${dispatchKey}`,
+          ...immutableJobDispatchArgs(immutableJob),
           "-f",
           `mode=${mode}`,
           "-f",

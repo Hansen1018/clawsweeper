@@ -32,6 +32,7 @@ export {
   activeRepairWorkflowRunForJobAfterDispatchRecheck,
   listActiveWorkflowRuns,
   liveWorkerCapacity,
+  parseRepairRunTitle,
   readMaxLiveWorkers,
   repairRunNameForJob,
   repairRunNamePrefixForJob,

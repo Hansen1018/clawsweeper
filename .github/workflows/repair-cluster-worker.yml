@@ -1310,7 +1310,9 @@ jobs:
       - uses: ./.github/actions/setup-state
         with:
           token: ${{ steps.report-state-token.outputs.token }}
-          fetch-depth: 1
+          # Report-only requeue validates the original worker revision, which
+          # may no longer be the state branch tip.
+          fetch-depth: 0
 
       - uses: ./.github/actions/setup-action-ledger
 
@@ -1377,6 +1379,8 @@ jobs:
             --source-job-path "${{ needs.authorize.outputs.source_job_path }}" \
             --source-run-id "${{ github.run_id }}" \
             --mode "${{ inputs.mode }}" \
+            --state-revision "${{ inputs.state_revision }}" \
+            --job-sha256 "${{ inputs.job_sha256 }}" \
             --execute \
             --open-execute-window \
             --requeue-depth "${{ inputs.requeue_depth }}" \

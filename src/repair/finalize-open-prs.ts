@@ -8,7 +8,6 @@ import {
   currentProjectRepo,
   hasDeterministicSecuritySignal,
   parseArgs,
-  parseJob,
   readMaxLiveWorkers,
   repoRoot,
   waitForLiveWorkerCapacity,
@@ -18,11 +17,11 @@ import { sleepMs } from "./timing.js";
 import { DEFAULT_TARGET_REPO, REPAIR_CLUSTER_WORKFLOW, REVIEW_BOTS } from "./constants.js";
 import { numberEnv } from "./env-utils.js";
 import { compactText, escapeRegExp } from "./text-utils.js";
+import { runRepairMutation, type RepairLifecycleInput } from "./repair-action-ledger.js";
 import {
-  repairSourceRevision,
-  runRepairMutation,
-  type RepairLifecycleInput,
-} from "./repair-action-ledger.js";
+  immutableJobDispatchArgs,
+  resolveCurrentStateJobIdentity,
+} from "./immutable-job-handoff.js";
 
 const DEFAULT_HEAD_PREFIX = "clawsweeper/";
 const PASSING_CHECK_CONCLUSIONS = new Set(["SUCCESS", "SKIPPED", "NEUTRAL"]);
@@ -542,7 +541,8 @@ function isDispatchableFinalizerPr(pr: JsonValue) {
 }
 
 function dispatchCandidateFromPr(pr: JsonValue) {
-  const mode = resolveDispatchMode(pr.job_path);
+  const immutableJob = resolveCurrentStateJobIdentity(pr.job_path);
+  const mode = resolveDispatchMode(immutableJob);
   return {
     pr: pr.number,
     url: pr.url,
@@ -550,18 +550,20 @@ function dispatchCandidateFromPr(pr: JsonValue) {
     branch: pr.branch,
     head_sha: pr.head_sha,
     cluster_id: pr.cluster_id,
-    job_path: pr.job_path,
+    job_path: immutableJob.jobPath,
+    state_revision: immutableJob.stateRevision,
+    job_sha256: immutableJob.jobSha256,
+    immutable_job_key: immutableJob.identityKey,
     mode,
     blockers: pr.blockers,
     recommended_next_action: pr.recommended_next_action,
-    idempotency_key: `finalize-open-prs:${repo}#${pr.number}:${pr.head_sha || pr.branch || "unknown"}`,
+    idempotency_key: `finalize-open-prs:${repo}#${pr.number}:${pr.head_sha || pr.branch || "unknown"}:${immutableJob.identityKey}`,
   };
 }
 
-function resolveDispatchMode(jobPath: string) {
+function resolveDispatchMode(immutableJob: ReturnType<typeof resolveCurrentStateJobIdentity>) {
   if (requestedMode) return requestedMode;
-  const job = parseJob(jobPath);
-  const mode = String(job.frontmatter.mode ?? "");
+  const mode = String(immutableJob.job.frontmatter.mode ?? "");
   return ["execute", "autonomous"].includes(mode) ? mode : "autonomous";
 }
 
@@ -571,6 +573,8 @@ function summarizeDispatchCandidate(candidate: LooseRecord) {
     url: candidate.url,
     cluster_id: candidate.cluster_id,
     job_path: candidate.job_path,
+    state_revision: candidate.state_revision,
+    job_sha256: candidate.job_sha256,
     branch: candidate.branch,
     head_sha: candidate.head_sha,
     mode: candidate.mode,
@@ -600,6 +604,7 @@ function executeDispatches(candidates: LooseRecord[], dispatchSummary: JsonValue
       repo: repairRepo,
       workflow,
       jobPath: candidate.job_path,
+      jobSha256: candidate.job_sha256,
       activeRunsByPrefix: activeRepairRunsByPrefix,
     });
     if (activeRun) activeRunsByJobPath.set(String(candidate.job_path), activeRun);
@@ -634,6 +639,9 @@ function executeDispatches(candidates: LooseRecord[], dispatchSummary: JsonValue
       url: candidate.url,
       cluster_id: candidate.cluster_id,
       job_path: candidate.job_path,
+      state_revision: candidate.state_revision,
+      job_sha256: candidate.job_sha256,
+      immutable_job_key: candidate.immutable_job_key,
       branch: candidate.branch,
       head_sha: candidate.head_sha,
       mode: candidate.mode,
@@ -673,6 +681,10 @@ function dispatchRepair(candidate: LooseRecord) {
     repairRepo,
     "-f",
     `job=${candidate.job_path}`,
+    ...immutableJobDispatchArgs({
+      stateRevision: candidate.state_revision,
+      jobSha256: candidate.job_sha256,
+    }),
     "-f",
     `mode=${candidate.mode}`,
     "-f",
@@ -690,6 +702,8 @@ function dispatchRepair(candidate: LooseRecord) {
       repository: repairRepo,
       workflow,
       jobPath: candidate.job_path,
+      stateRevision: candidate.state_revision,
+      jobSha256: candidate.job_sha256,
       mode: candidate.mode,
       runner,
       executionRunner,
@@ -701,15 +715,13 @@ function dispatchRepair(candidate: LooseRecord) {
 }
 
 function finalizerDispatchLifecycle(candidate: LooseRecord): RepairLifecycleInput {
-  const job = parseJob(String(candidate.job_path));
   const pr = Number(candidate.pr);
   return {
     repository: repo,
-    workKey: `open-pr-finalizer:${repo}#${pr}:${job.relativePath}`,
+    workKey: `open-pr-finalizer:${repo}#${pr}:${candidate.immutable_job_key}`,
     number: pr,
-    sourceRevision:
-      String(candidate.head_sha ?? "").trim() || repairSourceRevision(job.frontmatter),
-    recordPath: job.relativePath,
+    sourceRevision: String(candidate.state_revision),
+    recordPath: String(candidate.job_path),
     subjectKind: "pull_request",
     subjectId: `pull-request-${pr}`,
   };

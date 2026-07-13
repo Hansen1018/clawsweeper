@@ -271,6 +271,38 @@ test("all production dispatch callers require exact published job revisions", ()
   assert.doesNotMatch(worker, /scripts\/restore-repair-job\.sh "\$JOB_PATH"/);
 });
 
+test("repair operational callers resolve immutable state before dedupe and dispatch", () => {
+  const requeue = fs.readFileSync("src/repair/requeue-job.ts", "utf8");
+  const selfHeal = fs.readFileSync("src/repair/self-heal-failed-runs.ts", "utf8");
+  const finalizer = fs.readFileSync("src/repair/finalize-open-prs.ts", "utf8");
+  const conflict = fs.readFileSync("src/repair/conflict-self-heal.ts", "utf8");
+
+  assert.match(selfHeal, /state_revision=/);
+  assert.match(selfHeal, /job_sha256=/);
+  for (const source of [requeue, finalizer, conflict]) {
+    assert.match(source, /immutableJobDispatchArgs/);
+  }
+  assert.match(requeue, /resolveStateJobIdentity\(\{/);
+  assert.match(requeue, /sourceStateRevision: immutableJob\.stateRevision/);
+  assert.match(selfHeal, /resolveCurrentStateJobIdentity\(sourceJob\)/);
+  assert.match(selfHeal, /activeJobGenerationKey\(record\.source_job, record\.source_job_sha256\)/);
+  assert.match(finalizer, /const immutableJob = resolveCurrentStateJobIdentity\(pr\.job_path\)/);
+  assert.ok(
+    finalizer.indexOf("resolveCurrentStateJobIdentity(pr.job_path)") <
+      finalizer.indexOf("resolveDispatchMode(immutableJob)"),
+  );
+  assert.match(finalizer, /jobSha256: candidate\.job_sha256/);
+  assert.match(conflict, /if \(prepared\.length > 0\) publishSelfHealJobs\(\)/);
+  assert.ok(
+    conflict.indexOf("publishSelfHealJobs()") <
+      conflict.indexOf("resolveCurrentStateJobIdentity(candidate.job_path)"),
+  );
+  assert.ok(
+    conflict.indexOf("resolveCurrentStateJobIdentity(candidate.job_path)") <
+      conflict.indexOf("dispatchRepair(candidate)"),
+  );
+});
+
 test("create-job refuses dispatch before a published immutable identity exists", () => {
   const clusterId = `immutable-create-job-${randomUUID()}`;
   const jobPath = path.resolve(`jobs/openclaw/inbox/${clusterId}.md`);

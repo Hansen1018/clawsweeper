@@ -8,6 +8,7 @@ import {
   fetchRecentWorkflowRuns,
   listActiveWorkflowRuns,
   normalizeWorkflowRun,
+  parseRepairRunTitle,
   readMaxLiveWorkers,
   repairRunNameForJob,
   repairRunNamePrefixForJob,
@@ -52,6 +53,14 @@ test("repair run names match workflow dispatch titles", () => {
     repairRunNameForJob("jobs/openclaw/inbox/automerge-openclaw-openclaw-75363.md", "auto "),
     "auto jobs/openclaw/inbox/automerge-openclaw-openclaw-75363.md",
   );
+  assert.deepEqual(
+    parseRepairRunTitle("auto jobs/openclaw/inbox/automerge-openclaw-openclaw-75363.md", "auto "),
+    {
+      jobPath: "jobs/openclaw/inbox/automerge-openclaw-openclaw-75363.md",
+      dispatchKey: null,
+      jobSha256: null,
+    },
+  );
   assert.equal(
     repairRunNameForJob(
       "jobs/openclaw/inbox/automerge-openclaw-openclaw-75363.md",
@@ -78,6 +87,54 @@ test("repair run names include command receipt keys without hiding active jobs",
       ]),
     })?.status,
     "in_progress",
+  );
+});
+
+test("repair run titles preserve immutable job generations", () => {
+  const job = "jobs/openclaw/inbox/cluster-001.md";
+  const oldDigest = "a".repeat(64);
+  const newDigest = "b".repeat(64);
+  const keyedTitle = repairRunNameForJob(job, "automerge repair ", "router-abc123", newDigest);
+  assert.equal(keyedTitle, `repair cluster ${job} [router-abc123] (${newDigest})`);
+  assert.deepEqual(parseRepairRunTitle(keyedTitle), {
+    jobPath: job,
+    dispatchKey: "router-abc123",
+    jobSha256: newDigest,
+  });
+  assert.deepEqual(parseRepairRunTitle(`repair cluster ${job} (${newDigest})`), {
+    jobPath: job,
+    dispatchKey: null,
+    jobSha256: newDigest,
+  });
+  assert.equal(parseRepairRunTitle(`repair cluster ${job} (not-a-digest)`), null);
+
+  const activeRunsByPrefix = new Map([
+    [
+      "repair cluster ",
+      [
+        {
+          databaseId: 1,
+          displayTitle: `repair cluster ${job} (${oldDigest})`,
+          status: "in_progress",
+        },
+      ],
+    ],
+  ]);
+  assert.equal(
+    activeRepairWorkflowRunForJob({
+      jobPath: job,
+      jobSha256: newDigest,
+      activeRunsByPrefix,
+    }),
+    null,
+  );
+  assert.equal(
+    activeRepairWorkflowRunForJob({
+      jobPath: job,
+      jobSha256: oldDigest,
+      activeRunsByPrefix,
+    })?.databaseId,
+    1,
   );
 });
 
