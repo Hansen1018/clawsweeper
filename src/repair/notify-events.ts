@@ -407,7 +407,7 @@ export async function runClawSweeperEventNotifier(
         });
         dashboardStatus = "sent to status dashboard";
       }
-      recordNotificationPhase(ledgerInput, "sent");
+      recordNotificationPhaseSafely(ledgerInput, "sent");
       const notifiedAt = now().toISOString();
       nextLedger = addEventLedgerEntry(nextLedger, event, {
         notifiedAt,

@@ -11,6 +11,7 @@ import {
   deliverNotificationAttempt,
   deliverRetriedNotification,
   recordNotificationPhase,
+  recordNotificationPhaseSafely,
   type NotificationLedgerInput,
 } from "../../dist/repair/notification-action-ledger.js";
 import { flushRepairActionEvents } from "../../dist/repair/repair-action-ledger.js";
@@ -294,6 +295,47 @@ test("all shared OpenClaw notification callers use per-wire attempt runners", ()
   ]) {
     const source = fs.readFileSync(file, "utf8");
     assert.match(source, /postOpenClawAgentHook\(\{[\s\S]*?attemptRunner[\s\S]*?\}\)/);
+  }
+});
+
+test("accepted notification delivery is not reversed by a terminal receipt failure", () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "notification-receipt-")));
+  const invalidLedgerRoot = path.join(root, "not-a-directory");
+  fs.writeFileSync(invalidLedgerRoot, "occupied");
+  const previous = { ...process.env };
+  Object.assign(process.env, workflowEnv(invalidLedgerRoot, path.join(root, "output")));
+  const reports: string[] = [];
+
+  try {
+    assert.doesNotThrow(() =>
+      recordNotificationPhaseSafely(
+        {
+          repository: "openclaw/clawsweeper",
+          key: "notification:test:receipt-failure",
+          number: 46,
+        },
+        "sent",
+        "sent",
+        "mutation_outcome_unknown",
+        { kind: "notification_delivery", destination: "openclaw_hook" },
+        (message) => reports.push(message),
+      ),
+    );
+    assert.equal(reports.length, 1);
+    assert.match(reports[0], /failed to record notification sent/);
+
+    const ledgerSource = fs.readFileSync("src/repair/notification-action-ledger.ts", "utf8");
+    const notifierSource = fs.readFileSync("src/repair/notify-events.ts", "utf8");
+    assert.doesNotMatch(ledgerSource, /recordNotificationPhase\(input, "sent"\)/);
+    assert.doesNotMatch(notifierSource, /recordNotificationPhase\(ledgerInput, "sent"\)/);
+    assert.equal(
+      (ledgerSource.match(/recordNotificationPhaseSafely\(input, "sent"\)/g) ?? []).length,
+      2,
+    );
+    assert.match(notifierSource, /recordNotificationPhaseSafely\(ledgerInput, "sent"\)/);
+  } finally {
+    restoreEnv(previous);
+    fs.rmSync(root, { force: true, recursive: true });
   }
 });
 

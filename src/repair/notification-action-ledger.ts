@@ -100,8 +100,9 @@ export function recordNotificationPhaseSafely(
   try {
     recordNotificationPhase(input, phase, reason, failureOutcome, delivery);
   } catch (receiptError) {
+    const context = phase === "failed" ? " after the primary failure" : "";
     report(
-      `[action-ledger] failed to record notification ${phase} after the primary failure: ${
+      `[action-ledger] failed to record notification ${phase}${context}: ${
         receiptError instanceof Error ? receiptError.message : String(receiptError)
       }`,
     );
@@ -165,14 +166,13 @@ export async function deliverNotification<T>(
   operation: () => Promise<T>,
 ): Promise<T> {
   recordNotificationPhase(input, "planned");
+  let result: T;
   try {
-    const result = await deliverNotificationAttempt(input, {
+    result = await deliverNotificationAttempt(input, {
       kind: "notification_delivery",
       destination: "openclaw_hook",
       operation,
     });
-    recordNotificationPhase(input, "sent");
-    return result;
   } catch (error) {
     recordNotificationPhaseSafely(
       input,
@@ -182,6 +182,8 @@ export async function deliverNotification<T>(
     );
     throw error;
   }
+  recordNotificationPhaseSafely(input, "sent");
+  return result;
 }
 
 export async function deliverRetriedNotification<T>(
@@ -189,16 +191,15 @@ export async function deliverRetriedNotification<T>(
   operation: (attemptRunner: NotificationAttemptRunner) => Promise<T>,
 ): Promise<T> {
   recordNotificationPhase(input, "planned");
+  let result: T;
   try {
-    const result = await operation((attempt) =>
+    result = await operation((attempt) =>
       deliverNotificationAttempt(input, {
         kind: "notification_delivery",
         destination: "openclaw_hook",
         operation: attempt,
       }),
     );
-    recordNotificationPhase(input, "sent");
-    return result;
   } catch (error) {
     recordNotificationPhaseSafely(
       input,
@@ -208,6 +209,8 @@ export async function deliverRetriedNotification<T>(
     );
     throw error;
   }
+  recordNotificationPhaseSafely(input, "sent");
+  return result;
 }
 
 function notificationLifecycle(input: NotificationLedgerInput): RepairLifecycleInput {
