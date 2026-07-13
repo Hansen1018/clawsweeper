@@ -253,8 +253,8 @@ jobs:
 
       - name: Enqueue legacy event through the durable control plane
         env:
-          CLAWSWEEPER_ACTION_LEDGER_ROOT: ${{ steps.exact-review-action-ledger.outputs.output-root }}/exact-review-queue-spool
-          CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT: ${{ steps.exact-review-action-ledger.outputs.output-root }}/exact-review-queue-output
+          CLAWSWEEPER_ACTION_LEDGER_ROOT: ${{ steps.exact-review-action-ledger.outputs.output-root || runner.temp }}/exact-review-queue-spool
+          CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT: ${{ steps.exact-review-action-ledger.outputs.output-root || runner.temp }}/exact-review-queue-output
           CLIENT_PAYLOAD: ${{ toJson(github.event.client_payload) }}
           QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
           CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
@@ -319,8 +319,8 @@ jobs:
       - name: Claim exact-review queue lease
         id: claim-exact-review-queue
         env:
-          CLAWSWEEPER_ACTION_LEDGER_ROOT: ${{ steps.exact-review-action-ledger.outputs.output-root }}/exact-review-queue-spool
-          CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT: ${{ steps.exact-review-action-ledger.outputs.output-root }}/exact-review-queue-output
+          CLAWSWEEPER_ACTION_LEDGER_ROOT: ${{ steps.exact-review-action-ledger.outputs.output-root || runner.temp }}/exact-review-queue-spool
+          CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT: ${{ steps.exact-review-action-ledger.outputs.output-root || runner.temp }}/exact-review-queue-output
           DISPATCH_PAYLOAD: ${{ toJSON(github.event.client_payload) }}
           ITEM_KEY: ${{ github.event.client_payload.queue_claim.item_key || github.event.client_payload.item_key }}
           QUEUE_LEASE_ID: ${{ github.event.client_payload.queue_lease_id }}
@@ -1066,8 +1066,8 @@ jobs:
         if: ${{ always() && steps.finalize-exact-event-action-ledger.outcome == 'success' && steps.publish-exact-event-action-ledger.outcome == 'success' }}
         continue-on-error: true
         env:
-          CLAWSWEEPER_ACTION_LEDGER_ROOT: ${{ steps.exact-review-action-ledger.outputs.output-root }}/exact-review-queue-spool
-          CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT: ${{ steps.exact-review-action-ledger.outputs.output-root }}/exact-review-queue-output
+          CLAWSWEEPER_ACTION_LEDGER_ROOT: ${{ steps.exact-review-action-ledger.outputs.output-root || runner.temp }}/exact-review-queue-spool
+          CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT: ${{ steps.exact-review-action-ledger.outputs.output-root || runner.temp }}/exact-review-queue-output
           PRIMARY_OUTCOME: ${{ steps.exact-review-primary-result.outputs.outcome || 'failure' }}
           CLAIM_GENERATION: ${{ steps.claim-exact-review-queue.outputs.claim_generation }}
           ITEM_KEY: ${{ steps.claim-exact-review-queue.outputs.item_key }}

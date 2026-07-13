@@ -421,11 +421,11 @@ test("exact-review workflows isolate state credentials and publish exact manifes
   for (const queueProducer of [legacy, event, reconcileProducer]) {
     assert.match(
       queueProducer,
-      /CLAWSWEEPER_ACTION_LEDGER_ROOT: \$\{\{ steps\.exact-review-action-ledger\.outputs\.output-root \}\}\/exact-review-queue-spool/,
+      /CLAWSWEEPER_ACTION_LEDGER_ROOT: \$\{\{ steps\.exact-review-action-ledger\.outputs\.output-root \|\| runner\.temp \}\}\/exact-review-queue-spool/,
     );
     assert.match(
       queueProducer,
-      /CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT: \$\{\{ steps\.exact-review-action-ledger\.outputs\.output-root \}\}\/exact-review-queue-output/,
+      /CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT: \$\{\{ steps\.exact-review-action-ledger\.outputs\.output-root \|\| runner\.temp \}\}\/exact-review-queue-output/,
     );
     assert.match(
       queueProducer,

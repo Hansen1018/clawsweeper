@@ -47,8 +47,8 @@ jobs:
 
       - name: Reconcile terminal run
         env:
-          CLAWSWEEPER_ACTION_LEDGER_ROOT: ${{ steps.exact-review-action-ledger.outputs.output-root }}/exact-review-queue-spool
-          CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT: ${{ steps.exact-review-action-ledger.outputs.output-root }}/exact-review-queue-output
+          CLAWSWEEPER_ACTION_LEDGER_ROOT: ${{ steps.exact-review-action-ledger.outputs.output-root || runner.temp }}/exact-review-queue-spool
+          CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT: ${{ steps.exact-review-action-ledger.outputs.output-root || runner.temp }}/exact-review-queue-output
           CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
           SOURCE_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
