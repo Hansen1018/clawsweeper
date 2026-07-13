@@ -61,9 +61,13 @@ test("repair sessions, statuses, and result publication flush immutable receipts
   assert.match(publisher, /resultPublicationSourceRevision\([\s\S]*sourceContext[\s\S]*resultPath/);
   assert.match(
     publisher,
-    /eventIdentity:\s*\{\s*publicationKind: "cluster_result",\s*runId: runId \|\| clusterId,\s*state: "prepared"/,
+    /eventIdentity:\s*\{\s*publicationKind: "cluster_result",\s*runId: runId \|\| clusterId,\s*state: canonicalDecision\.publish \? "prepared" : "stale_noop"/,
   );
-  assert.match(publisher, /state: "prepared"/);
+  assert.equal(
+    [...publisher.matchAll(/state: canonicalDecision\.publish \? "prepared" : "stale_noop"/g)]
+      .length,
+    2,
+  );
   assert.doesNotMatch(publisher, /state: "published"/);
   assert.doesNotMatch(publisher, /recordAggregatePreparation\([^)]*,/);
 });
