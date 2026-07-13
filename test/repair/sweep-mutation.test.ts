@@ -24,7 +24,7 @@ test("sweep workflow dispatch records accepted receipts without persisting raw i
       repository: "openclaw/clawsweeper",
       workflow: "sweep.yml",
       ref: "main",
-      businessKey: "test-dispatch-7130",
+      businessKey: "test-dispatch:7130",
       targetRepository: "openclaw/openclaw",
       itemNumber: 42,
       fields: {
@@ -184,7 +184,7 @@ test("workflow dispatch identity is stable across field order after a definite r
   });
 });
 
-test("durable action history blocks duplicate dispatch on a later workflow attempt", async () => {
+test("indexed durable action history blocks duplicate dispatch without scanning history", async () => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "sweep-durable-")));
   const firstRoot = path.join(root, "first-spool");
   const firstOutput = path.join(root, "first-output");
@@ -209,6 +209,7 @@ test("durable action history blocks duplicate dispatch on a later workflow attem
     );
     await flushRepairActionEvents();
     importActionEventShards(firstOutput, stateRoot);
+    poisonLegacyScan(stateRoot);
 
     Object.assign(process.env, workflowEnv(secondRoot, secondOutput, stateRoot), {
       GITHUB_RUN_ATTEMPT: "2",
@@ -232,6 +233,174 @@ test("durable action history blocks duplicate dispatch on a later workflow attem
   }
 });
 
+test("indexed rejected history permits a later workflow attempt without scanning history", async () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "sweep-index-miss-")));
+  const firstRoot = path.join(root, "first-spool");
+  const firstOutput = path.join(root, "first-output");
+  const secondRoot = path.join(root, "second-spool");
+  const secondOutput = path.join(root, "second-output");
+  const stateRoot = path.join(root, "state");
+  for (const directory of [firstRoot, firstOutput, secondRoot, secondOutput, stateRoot]) {
+    fs.mkdirSync(directory);
+  }
+  const previous = { ...process.env };
+  Object.assign(process.env, workflowEnv(firstRoot, firstOutput, stateRoot));
+  let calls = 0;
+
+  try {
+    assert.throws(
+      () =>
+        executeSweepMutation(workflowDispatch(), {
+          runWire: () => {
+            calls += 1;
+            return failure("gh: Validation Failed (HTTP 422)");
+          },
+        }),
+      /HTTP 422/,
+    );
+    await flushRepairActionEvents();
+    importActionEventShards(firstOutput, stateRoot);
+    poisonLegacyScan(stateRoot);
+
+    Object.assign(process.env, workflowEnv(secondRoot, secondOutput, stateRoot), {
+      GITHUB_RUN_ATTEMPT: "2",
+      CLAWSWEEPER_ACTION_LEDGER_INVOCATION: "sweep-mutation-test-rerun",
+    });
+    assert.deepEqual(
+      executeSweepMutation(workflowDispatch(), {
+        runWire: () => {
+          calls += 1;
+          return success();
+        },
+      }),
+      { outcome: "accepted", attempts: 1 },
+    );
+    assert.equal(calls, 2);
+  } finally {
+    restoreEnv(previous);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("first workflow attempts check only the local spool", () => {
+  withLedger((root) => {
+    poisonLegacyScan(path.join(root, "state"));
+    assert.deepEqual(executeSweepMutation(workflowDispatch(), { runWire: () => success() }), {
+      outcome: "accepted",
+      attempts: 1,
+    });
+  });
+});
+
+test("reruns fall back to bounded legacy history when the key has no index", async () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "sweep-legacy-")));
+  const firstRoot = path.join(root, "first-spool");
+  const firstOutput = path.join(root, "first-output");
+  const secondRoot = path.join(root, "second-spool");
+  const secondOutput = path.join(root, "second-output");
+  const stateRoot = path.join(root, "state");
+  for (const directory of [firstRoot, firstOutput, secondRoot, secondOutput, stateRoot]) {
+    fs.mkdirSync(directory);
+  }
+  const previous = { ...process.env };
+  Object.assign(process.env, workflowEnv(firstRoot, firstOutput, stateRoot));
+  let calls = 0;
+
+  try {
+    assert.throws(() =>
+      executeSweepMutation(workflowDispatch(), {
+        runWire: () => {
+          calls += 1;
+          return failure("gh: Bad Gateway (HTTP 502)");
+        },
+      }),
+    );
+    await flushRepairActionEvents();
+    importActionEventShards(firstOutput, stateRoot);
+    for (const directory of [
+      "repair-mutation-idempotency",
+      "repair-mutation-idempotency-reservations",
+    ]) {
+      fs.rmSync(path.join(stateRoot, "ledger", "v1", "import-bindings", directory), {
+        recursive: true,
+      });
+    }
+
+    Object.assign(process.env, workflowEnv(secondRoot, secondOutput, stateRoot), {
+      GITHUB_RUN_ATTEMPT: "2",
+      CLAWSWEEPER_ACTION_LEDGER_INVOCATION: "sweep-mutation-test-rerun",
+    });
+    assert.throws(
+      () => executeSweepMutation(workflowDispatch(), { runWire: () => success() }),
+      /refusing duplicate non-idempotent sweep dispatch/,
+    );
+    assert.equal(calls, 1);
+  } finally {
+    restoreEnv(previous);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("reruns fail closed when the key index is malformed", async () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "sweep-index-invalid-")));
+  const firstRoot = path.join(root, "first-spool");
+  const firstOutput = path.join(root, "first-output");
+  const secondRoot = path.join(root, "second-spool");
+  const secondOutput = path.join(root, "second-output");
+  const stateRoot = path.join(root, "state");
+  for (const directory of [firstRoot, firstOutput, secondRoot, secondOutput, stateRoot]) {
+    fs.mkdirSync(directory);
+  }
+  const previous = { ...process.env };
+  Object.assign(process.env, workflowEnv(firstRoot, firstOutput, stateRoot));
+  let calls = 0;
+
+  try {
+    assert.throws(() =>
+      executeSweepMutation(workflowDispatch(), {
+        runWire: () => {
+          calls += 1;
+          return failure("gh: Bad Gateway (HTTP 502)");
+        },
+      }),
+    );
+    await flushRepairActionEvents();
+    const imported = importActionEventShards(firstOutput, stateRoot);
+    const indexPaths = imported.completionPaths.filter((relativePath) =>
+      relativePath.includes("repair-mutation-idempotency"),
+    );
+    assert.equal(indexPaths.length, 1);
+    fs.writeFileSync(path.join(stateRoot, indexPaths[0]!), "{}\n", "utf8");
+    poisonLegacyScan(stateRoot);
+
+    Object.assign(process.env, workflowEnv(secondRoot, secondOutput, stateRoot), {
+      GITHUB_RUN_ATTEMPT: "2",
+      CLAWSWEEPER_ACTION_LEDGER_INVOCATION: "sweep-mutation-test-rerun",
+    });
+    assert.throws(
+      () => executeSweepMutation(workflowDispatch(), { runWire: () => success() }),
+      /invalid repair mutation idempotency index/,
+    );
+    assert.equal(calls, 1);
+  } finally {
+    restoreEnv(previous);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("non-idempotent business keys require the current run id as a colon segment", () => {
+  withLedger(() => {
+    assert.throws(
+      () =>
+        executeSweepMutation(
+          { ...workflowDispatch(), businessKey: "test-dispatch-7130" },
+          { runWire: () => success() },
+        ),
+      /colon-delimited segment/,
+    );
+  });
+});
+
 test("sweep mutation CLI rejects unknown options and duplicate workflow fields", () => {
   for (const args of [
     [
@@ -244,7 +413,7 @@ test("sweep mutation CLI rejects unknown options and duplicate workflow fields",
       "--ref",
       "main",
       "--business-key",
-      "test-dispatch-7130",
+      "test-dispatch:7130",
       "--unknown",
       "value",
     ],
@@ -258,7 +427,7 @@ test("sweep mutation CLI rejects unknown options and duplicate workflow fields",
       "--ref",
       "main",
       "--business-key",
-      "test-dispatch-7130",
+      "test-dispatch:7130",
       "--field",
       "target_repo=openclaw/openclaw",
       "--field",
@@ -292,7 +461,7 @@ test("repository dispatch payloads are bounded, no-follow, and event-type matche
             payloadPath: symlink,
             targetRepository: "openclaw/openclaw",
             itemNumber: 42,
-            businessKey: "repository-dispatch-7130",
+            businessKey: "repository-dispatch:7130",
           },
           { runWire: () => success() },
         ),
@@ -309,7 +478,7 @@ test("repository dispatch payloads are bounded, no-follow, and event-type matche
             payloadPath: payload,
             targetRepository: "openclaw/openclaw",
             itemNumber: 42,
-            businessKey: "repository-dispatch-7130",
+            businessKey: "repository-dispatch:7130",
           },
           { runWire: () => success() },
         ),
@@ -329,7 +498,7 @@ function workflowDispatch(
     repository: "openclaw/clawsweeper",
     workflow: "sweep.yml",
     ref: "main",
-    businessKey: "test-dispatch-7130",
+    businessKey: "test-dispatch:7130",
     targetRepository: "openclaw/openclaw",
     itemNumber: 42,
     fields,
@@ -387,6 +556,14 @@ function success() {
 
 function failure(stderr: string) {
   return { status: 1, stdout: "", stderr: "" + stderr };
+}
+
+function poisonLegacyScan(stateRoot: string): void {
+  const eventRoot = path.join(stateRoot, "ledger", "v1", "events");
+  fs.mkdirSync(eventRoot, { recursive: true });
+  for (let index = 0; index < 513; index += 1) {
+    fs.writeFileSync(path.join(eventRoot, `unrelated-${String(index).padStart(3, "0")}`), "");
+  }
 }
 
 function restoreEnv(previous: NodeJS.ProcessEnv): void {

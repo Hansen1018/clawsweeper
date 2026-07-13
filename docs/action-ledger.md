@@ -275,12 +275,32 @@ confidential-identifier checks as every other durable machine-text field.
   first numbered part cannot expose a partial run. Sequential imports therefore
   cannot move a run, replace a reserved numbered set with a different part
   count, or advertise completion before payload publication finishes.
+- Completion also publishes create-only `repair.mutation` secondary indexes
+  under
+  `ledger/v1/import-bindings/repair-mutation-idempotency/<producer-repository-sha256>/<idempotency-key-sha256>/<shard-sha256>.json`.
+  A matching create-only reservation is published before shard payloads under
+  `repair-mutation-idempotency-reservations/`, binding the completion digest so
+  interrupted imports remain visibly incomplete. Each canonical completion
+  manifest binds the exact shard path and replay digest plus every matching
+  event ID and semantic digest. Indexed readers cap directory entries and
+  manifest bytes, require exact reservation/completion filename sets, reject
+  links and malformed or empty directories, reopen the referenced completed
+  shard, and require the replay and matching event set to agree exactly before
+  returning history.
+- Non-idempotent sweep dispatch business keys must contain the current
+  `GITHUB_RUN_ID` as an exact colon-delimited segment. Attempt 1 checks only its
+  local spool. Later workflow attempts use the secondary index; a missing key
+  directory falls back to the bounded legacy history scan for pre-index rollout
+  compatibility, while an existing malformed or incomplete directory fails
+  closed. Run-scoped keys make a global index coverage marker or historical
+  backfill unnecessary.
 - Import results expose `eventPaths`, `reservationPaths`, and `completionPaths`
   separately. Their sorted, bounded `paths` union is the publication contract,
-  containing every event shard plus its producer-run, event, shard-set, and
-  completion binding. Workflow publishers stage and commit every returned path
-  so replay identity, crash recovery, completion visibility, cross-import
-  conflict detection, and causal protections survive in a fresh state checkout.
+  containing every event shard plus its producer-run, event, shard-set,
+  completion, and repair-mutation index reservation/completion bindings.
+  Workflow publishers stage and commit every returned path so replay identity,
+  crash recovery, completion visibility, cross-import conflict detection, and
+  causal protections survive in a fresh state checkout.
 
 ## Privacy Boundary
 

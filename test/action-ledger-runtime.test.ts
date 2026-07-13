@@ -16,6 +16,7 @@ import {
   importActionEventShards,
   interruptOpenWorkflowActionEvents,
   postActionEventToCrabFleet,
+  readImportedRepairMutationEvents,
   readValidatedActionEventShardBatch,
   recordWorkflowActionEvent,
   recordWorkflowPhaseEvent,
@@ -4239,6 +4240,108 @@ test("state shard imports are validated, create-only, and conflict detecting", a
   assert.throws(
     () => importActionEventShards(source, destination),
     /action event shard content is not canonical/,
+  );
+});
+
+test("state shard imports create replayable repair mutation idempotency indexes", async () => {
+  const root = tempRoot();
+  const source = trustedChildRoot(root, "source");
+  const destination = trustedChildRoot(root, "destination");
+  const env = workflowEnv();
+  const { mutationOutcome } = recordWorkflowAttemptMutationOutcome(root, env, "unknown");
+  await flushWorkflowActionEvents(root, { env, outputRoot: source });
+
+  const imported = importActionEventShards(source, destination);
+  const indexPaths = imported.completionPaths.filter((relativePath) =>
+    relativePath.includes("repair-mutation-idempotency"),
+  );
+  const reservationPaths = imported.reservationPaths.filter((relativePath) =>
+    relativePath.includes("repair-mutation-idempotency-reservations"),
+  );
+  assert.equal(indexPaths.length, 1);
+  assert.equal(reservationPaths.length, 1);
+  const index = JSON.parse(fs.readFileSync(path.join(destination, indexPaths[0]!), "utf8"));
+  assert.equal(index.schema, "clawsweeper.action-ledger-import-repair-mutation-idempotency");
+  assert.equal(index.idempotency_key_sha256, mutationOutcome.idempotency_key_sha256);
+  assert.equal(index.shard.path, imported.eventPaths[0]);
+  assert.deepEqual(
+    index.events.map((event: { event_id: string }) => event.event_id),
+    readActionEventShardAt(destination, imported.eventPaths[0]!)
+      .filter((event) => event.event_type === ACTION_EVENT_TYPES.repairMutation)
+      .map((event) => event.event_id),
+  );
+
+  const indexed = readImportedRepairMutationEvents(
+    destination,
+    mutationOutcome.producer.repository,
+    mutationOutcome.idempotency_key_sha256,
+  );
+  assert.deepEqual(
+    indexed?.map((event) => event.event_id),
+    index.events.map((event: { event_id: string }) => event.event_id),
+  );
+
+  const replayed = importActionEventShards(source, destination);
+  assert.equal(replayed.unchanged, 1);
+  assert.deepEqual(replayed.completionPaths, imported.completionPaths);
+
+  fs.writeFileSync(path.join(destination, indexPaths[0]!), "{}\n", "utf8");
+  assert.throws(
+    () => importActionEventShards(source, destination),
+    /repair mutation idempotency index binding conflict/,
+  );
+});
+
+test("repair mutation idempotency index reads reject links and oversized manifests", async () => {
+  const root = tempRoot();
+  const source = trustedChildRoot(root, "source");
+  const destination = trustedChildRoot(root, "destination");
+  const env = workflowEnv();
+  const { mutationOutcome } = recordWorkflowAttemptMutationOutcome(root, env, "observed");
+  await flushWorkflowActionEvents(root, { env, outputRoot: source });
+  const imported = importActionEventShards(source, destination);
+  const relativePath = imported.completionPaths.find((entry) =>
+    entry.includes("repair-mutation-idempotency"),
+  );
+  assert.ok(relativePath);
+  const indexPath = path.join(destination, relativePath);
+
+  if (process.platform !== "win32") {
+    const outside = path.join(root, "outside-index.json");
+    fs.writeFileSync(outside, fs.readFileSync(indexPath, "utf8"), "utf8");
+    fs.rmSync(indexPath);
+    fs.symlinkSync(outside, indexPath);
+    assert.throws(
+      () =>
+        readImportedRepairMutationEvents(
+          destination,
+          mutationOutcome.producer.repository,
+          mutationOutcome.idempotency_key_sha256,
+        ),
+      /unsafe repair mutation idempotency index entry/,
+    );
+    fs.rmSync(indexPath);
+  }
+
+  fs.writeFileSync(indexPath, "x".repeat(1024 * 1024 + 1), "utf8");
+  assert.throws(
+    () =>
+      readImportedRepairMutationEvents(
+        destination,
+        mutationOutcome.producer.repository,
+        mutationOutcome.idempotency_key_sha256,
+      ),
+    /byte limit/,
+  );
+  fs.rmSync(indexPath);
+  assert.throws(
+    () =>
+      readImportedRepairMutationEvents(
+        destination,
+        mutationOutcome.producer.repository,
+        mutationOutcome.idempotency_key_sha256,
+      ),
+    /repair mutation idempotency index is incomplete/,
   );
 });
 

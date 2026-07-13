@@ -31231,7 +31231,7 @@ function publishActionEventsCommand(args: Args): void {
 }
 
 const ACTION_EVENT_PUBLISH_PATH_PATTERN =
-  /^ledger\/v1\/(?:events\/\d{4}\/\d{2}\/\d{2}\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\.jsonl|import-bindings\/(?:producer-runs|events|shard-sets|completed-shard-sets)\/[a-f0-9]{64}\.json)$/;
+  /^ledger\/v1\/(?:events\/\d{4}\/\d{2}\/\d{2}\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\.jsonl|import-bindings\/(?:(?:producer-runs|events|shard-sets|completed-shard-sets)\/[a-f0-9]{64}\.json|repair-mutation-idempotency(?:-reservations)?\/[a-f0-9]{64}\/[a-f0-9]{64}\/[a-f0-9]{64}\.json))$/;
 const ACTION_EVENT_PUBLISH_PATH_FILE_MAX_BYTES = ACTION_EVENT_SHARD_IMPORT_MAX_PUBLISH_PATHS * 512;
 
 export function actionEventPublishPathsForTest(content: string): string[] {

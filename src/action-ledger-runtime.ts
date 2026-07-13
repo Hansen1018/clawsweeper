@@ -37,6 +37,7 @@ import {
   isActionEventStatus,
   parseActionEventShardContent,
   readAllSpooledActionEvents,
+  readActionEventShardAt,
   sortActionEventsCausally,
   validateActionEvent,
   writeActionEvent,
@@ -104,8 +105,11 @@ export const ACTION_EVENT_SHARD_IMPORT_LIMITS = {
   maxCausalBindings: 256 * ACTION_EVENT_SHARD_FILE_LIMITS.maxEvents,
 } as const;
 
+const REPAIR_MUTATION_IDEMPOTENCY_INDEX_MAX_ENTRIES = ACTION_EVENT_SHARD_IMPORT_LIMITS.maxFiles;
+
 export const ACTION_EVENT_SHARD_IMPORT_MAX_PUBLISH_PATHS =
-  ACTION_EVENT_SHARD_IMPORT_LIMITS.maxTotalEvents + ACTION_EVENT_SHARD_IMPORT_LIMITS.maxFiles * 4;
+  ACTION_EVENT_SHARD_IMPORT_LIMITS.maxTotalEvents * 3 +
+  ACTION_EVENT_SHARD_IMPORT_LIMITS.maxFiles * 4;
 
 export type WorkflowActionEventInput = {
   scope: string;
@@ -196,6 +200,31 @@ type ImportedActionEventIdentityBinding = {
   event_id: string;
   semantic_sha256: string;
   parent_event_id: string | null;
+};
+
+type RepairMutationIdempotencyIndex = {
+  schema: "clawsweeper.action-ledger-import-repair-mutation-idempotency";
+  schema_version: 1;
+  producer_repository_sha256: string;
+  idempotency_key_sha256: string;
+  shard_sha256: string;
+  shard: {
+    path: string;
+    replay_sha256: string;
+  };
+  events: Array<{
+    event_id: string;
+    semantic_sha256: string;
+  }>;
+};
+
+type RepairMutationIdempotencyIndexReservation = {
+  schema: "clawsweeper.action-ledger-import-repair-mutation-idempotency-reservation";
+  schema_version: 1;
+  producer_repository_sha256: string;
+  idempotency_key_sha256: string;
+  shard_sha256: string;
+  completion_sha256: string;
 };
 
 type CrabFleetProjectionRequest = {
@@ -1171,6 +1200,155 @@ export function importActionEventShards(
   );
 }
 
+export function readImportedRepairMutationEvents(
+  destinationRoot: string,
+  producerRepository: string,
+  idempotencyKeySha256: string,
+): ActionEvent[] | null {
+  const normalizedRepository = normalizeRepo(producerRepository);
+  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(normalizedRepository)) {
+    throw new Error("invalid repair mutation index producer repository");
+  }
+  if (!/^[a-f0-9]{64}$/.test(idempotencyKeySha256)) {
+    throw new Error("invalid repair mutation index idempotency key");
+  }
+  const root = prepareSafeReadRoot(destinationRoot, "repair mutation idempotency index");
+  const completionDirectory = repairMutationIdempotencyIndexDirectory(
+    normalizedRepository,
+    idempotencyKeySha256,
+  );
+  const reservationDirectory = repairMutationIdempotencyIndexReservationDirectory(
+    normalizedRepository,
+    idempotencyKeySha256,
+  );
+  const completionEntries = readRepairMutationIdempotencyIndexDirectory(
+    root,
+    completionDirectory,
+    "repair mutation idempotency index",
+  );
+  const reservationEntries = readRepairMutationIdempotencyIndexDirectory(
+    root,
+    reservationDirectory,
+    "repair mutation idempotency index reservation",
+  );
+  if (completionEntries === null && reservationEntries === null) return null;
+  if (
+    completionEntries === null ||
+    reservationEntries === null ||
+    completionEntries.length === 0 ||
+    reservationEntries.length === 0 ||
+    actionLedgerJson(completionEntries.map((entry) => entry.name)) !==
+      actionLedgerJson(reservationEntries.map((entry) => entry.name))
+  ) {
+    throw new Error("repair mutation idempotency index is incomplete");
+  }
+
+  const events: ActionEvent[] = [];
+  const shardPaths = new Set<string>();
+  const eventIds = new Set<string>();
+  for (const entry of completionEntries) {
+    const shardSha256 = entry.name.slice(0, -".json".length);
+    const completionPath = path.posix.join(
+      completionDirectory.replaceAll(path.sep, "/"),
+      entry.name,
+    );
+    const completionContent = readUtf8FileNoFollow(
+      prepareSafeReadTarget(root, completionPath, "repair mutation idempotency index"),
+      ACTION_EVENT_IMPORT_BINDING_MAX_BYTES,
+    );
+    const reservationPath = path.posix.join(
+      reservationDirectory.replaceAll(path.sep, "/"),
+      entry.name,
+    );
+    const reservationContent = readUtf8FileNoFollow(
+      prepareSafeReadTarget(root, reservationPath, "repair mutation idempotency index reservation"),
+      ACTION_EVENT_IMPORT_BINDING_MAX_BYTES,
+    );
+    parseRepairMutationIdempotencyIndexReservation(
+      reservationContent,
+      normalizedRepository,
+      idempotencyKeySha256,
+      shardSha256,
+      createHash("sha256").update(completionContent).digest("hex"),
+    );
+    const index = parseRepairMutationIdempotencyIndex(
+      completionContent,
+      normalizedRepository,
+      idempotencyKeySha256,
+      shardSha256,
+    );
+    if (shardPaths.has(index.shard.path)) {
+      throw new Error("repair mutation idempotency index contains a duplicate shard");
+    }
+    shardPaths.add(index.shard.path);
+
+    const shardEvents = readActionEventShardAt(root, index.shard.path);
+    const replaySha256 = actionEventShardReplaySha256(shardEvents);
+    const repositorySha256 = repairMutationProducerRepositorySha256(
+      shardEvents[0]?.producer.repository ?? "",
+    );
+    const matching = shardEvents
+      .filter(
+        (event) =>
+          event.event_type === ACTION_EVENT_TYPES.repairMutation &&
+          event.idempotency_key_sha256 === idempotencyKeySha256,
+      )
+      .map((event) => ({
+        event_id: event.event_id,
+        semantic_sha256: event.semantic_sha256,
+      }));
+    if (
+      repositorySha256 !== index.producer_repository_sha256 ||
+      replaySha256 !== index.shard.replay_sha256 ||
+      actionLedgerJson(matching) !== actionLedgerJson(index.events)
+    ) {
+      throw new Error("repair mutation idempotency index does not match its referenced shard");
+    }
+    for (const event of shardEvents) {
+      if (
+        event.event_type !== ACTION_EVENT_TYPES.repairMutation ||
+        event.idempotency_key_sha256 !== idempotencyKeySha256
+      ) {
+        continue;
+      }
+      if (eventIds.has(event.event_id)) {
+        throw new Error("repair mutation idempotency index contains a duplicate event");
+      }
+      eventIds.add(event.event_id);
+      events.push(event);
+    }
+  }
+  return events;
+}
+
+function readRepairMutationIdempotencyIndexDirectory(
+  root: SafeReadRoot,
+  relativeDirectory: string,
+  label: string,
+): ReturnType<typeof readDirectoryEntriesNoFollow> | null {
+  let entries: ReturnType<typeof readDirectoryEntriesNoFollow>;
+  try {
+    entries = readDirectoryEntriesNoFollow(
+      root,
+      relativeDirectory,
+      label,
+      REPAIR_MUTATION_IDEMPOTENCY_INDEX_MAX_ENTRIES,
+    );
+  } catch (error) {
+    if (isNotFoundError(error)) return null;
+    throw error;
+  }
+  for (const entry of entries) {
+    if (entry.isSymbolicLink() || !entry.isFile()) {
+      throw new Error(`refusing unsafe ${label} entry: ${entry.name}`);
+    }
+    if (!/^[a-f0-9]{64}\.json$/.test(entry.name)) {
+      throw new Error(`invalid ${label} entry: ${entry.name}`);
+    }
+  }
+  return entries;
+}
+
 function validateImportedActionEventProducer(
   shards: readonly ImportedActionEventShard[],
   expected: ExpectedActionEventProducer,
@@ -1307,6 +1485,7 @@ function actionEventShardImportBindings(
   const producerRuns = new Map<string, ActionEventShardImportBinding>();
   const eventIdentities = new Map<string, ActionEventShardImportBinding>();
   const shardSets = new Map<string, ImportedActionEventShard[]>();
+  const repairMutationIndexes: ActionEventShardImportBinding[] = [];
   for (const shard of shards) {
     const { partitionDate, ...producerIdentity } = shard.identity;
     const producerKey = actionLedgerJson(producerIdentity);
@@ -1347,6 +1526,7 @@ function actionEventShardImportBindings(
         kind: "reservation",
       });
     }
+    repairMutationIndexes.push(...repairMutationIdempotencyIndexBindings(shard));
 
     const shardSetKey = actionLedgerJson(shard.identity);
     const group = shardSets.get(shardSetKey) ?? [];
@@ -1354,7 +1534,11 @@ function actionEventShardImportBindings(
     shardSets.set(shardSetKey, group);
   }
 
-  const bindings = [...producerRuns.values(), ...eventIdentities.values()];
+  const bindings = [
+    ...producerRuns.values(),
+    ...eventIdentities.values(),
+    ...repairMutationIndexes,
+  ];
   for (const group of shardSets.values()) {
     const ordered = [...group].sort((left, right) =>
       left.relativePath < right.relativePath ? -1 : left.relativePath > right.relativePath ? 1 : 0,
@@ -1398,6 +1582,216 @@ function actionEventShardImportBindings(
         ? 1
         : 0;
   });
+}
+
+function repairMutationIdempotencyIndexBindings(
+  shard: ImportedActionEventShard,
+): ActionEventShardImportBinding[] {
+  const matchingByKey = new Map<string, ActionEvent[]>();
+  for (const event of shard.events) {
+    if (event.event_type !== ACTION_EVENT_TYPES.repairMutation) continue;
+    const matching = matchingByKey.get(event.idempotency_key_sha256) ?? [];
+    matching.push(event);
+    matchingByKey.set(event.idempotency_key_sha256, matching);
+  }
+  if (matchingByKey.size === 0) return [];
+
+  const producerRepositorySha256 = repairMutationProducerRepositorySha256(
+    shard.identity.repository,
+  );
+  const replaySha256 = actionEventShardReplaySha256(shard.events);
+  const shardSha256 = repairMutationIndexShardSha256(shard.relativePath, replaySha256);
+  return [...matchingByKey.entries()].flatMap(([idempotencyKeySha256, events]) => {
+    const index: RepairMutationIdempotencyIndex = {
+      schema: "clawsweeper.action-ledger-import-repair-mutation-idempotency",
+      schema_version: 1,
+      producer_repository_sha256: producerRepositorySha256,
+      idempotency_key_sha256: idempotencyKeySha256,
+      shard_sha256: shardSha256,
+      shard: {
+        path: shard.relativePath,
+        replay_sha256: replaySha256,
+      },
+      events: events.map((event) => ({
+        event_id: event.event_id,
+        semantic_sha256: event.semantic_sha256,
+      })),
+    };
+    const completionContent = `${actionLedgerJson(index)}\n`;
+    const filename = `${shardSha256}.json`;
+    const reservation: RepairMutationIdempotencyIndexReservation = {
+      schema: "clawsweeper.action-ledger-import-repair-mutation-idempotency-reservation",
+      schema_version: 1,
+      producer_repository_sha256: producerRepositorySha256,
+      idempotency_key_sha256: idempotencyKeySha256,
+      shard_sha256: shardSha256,
+      completion_sha256: createHash("sha256").update(completionContent).digest("hex"),
+    };
+    return [
+      {
+        relativePath: path.join(
+          repairMutationIdempotencyIndexReservationDirectory(
+            shard.identity.repository,
+            idempotencyKeySha256,
+          ),
+          filename,
+        ),
+        content: `${actionLedgerJson(reservation)}\n`,
+        label: "repair mutation idempotency index reservation binding",
+        kind: "reservation" as const,
+      },
+      {
+        relativePath: path.join(
+          repairMutationIdempotencyIndexDirectory(shard.identity.repository, idempotencyKeySha256),
+          filename,
+        ),
+        content: completionContent,
+        label: "repair mutation idempotency index binding",
+        kind: "completion" as const,
+      },
+    ];
+  });
+}
+
+function repairMutationIdempotencyIndexDirectory(
+  producerRepository: string,
+  idempotencyKeySha256: string,
+): string {
+  return path.join(
+    "ledger",
+    "v1",
+    "import-bindings",
+    "repair-mutation-idempotency",
+    repairMutationProducerRepositorySha256(producerRepository),
+    idempotencyKeySha256,
+  );
+}
+
+function repairMutationIdempotencyIndexReservationDirectory(
+  producerRepository: string,
+  idempotencyKeySha256: string,
+): string {
+  return path.join(
+    "ledger",
+    "v1",
+    "import-bindings",
+    "repair-mutation-idempotency-reservations",
+    repairMutationProducerRepositorySha256(producerRepository),
+    idempotencyKeySha256,
+  );
+}
+
+function repairMutationProducerRepositorySha256(repository: string): string {
+  return createHash("sha256").update(normalizeRepo(repository)).digest("hex");
+}
+
+function repairMutationIndexShardSha256(relativePath: string, replaySha256: string): string {
+  return createHash("sha256")
+    .update(
+      actionLedgerJson({
+        path: relativePath,
+        replay_sha256: replaySha256,
+      }),
+    )
+    .digest("hex");
+}
+
+function actionEventShardReplaySha256(events: readonly ActionEvent[]): string {
+  return createHash("sha256")
+    .update(`${events.map((event) => actionEventReplayJson(event)).join("\n")}\n`)
+    .digest("hex");
+}
+
+function parseRepairMutationIdempotencyIndex(
+  content: string,
+  producerRepository: string,
+  idempotencyKeySha256: string,
+  shardSha256: string,
+): RepairMutationIdempotencyIndex {
+  let value: unknown;
+  try {
+    value = JSON.parse(content);
+  } catch {
+    throw new Error("invalid repair mutation idempotency index");
+  }
+  const candidate = value as Partial<RepairMutationIdempotencyIndex>;
+  const shard =
+    candidate.shard && typeof candidate.shard === "object" && !Array.isArray(candidate.shard)
+      ? {
+          path: String(candidate.shard.path ?? ""),
+          replay_sha256: String(candidate.shard.replay_sha256 ?? ""),
+        }
+      : { path: "", replay_sha256: "" };
+  const events = Array.isArray(candidate.events)
+    ? candidate.events.map((event) => {
+        const entry = event as { event_id?: unknown; semantic_sha256?: unknown };
+        return {
+          event_id: typeof entry.event_id === "string" ? entry.event_id : "",
+          semantic_sha256: typeof entry.semantic_sha256 === "string" ? entry.semantic_sha256 : "",
+        };
+      })
+    : [];
+  const expected: RepairMutationIdempotencyIndex = {
+    schema: "clawsweeper.action-ledger-import-repair-mutation-idempotency",
+    schema_version: 1,
+    producer_repository_sha256: repairMutationProducerRepositorySha256(producerRepository),
+    idempotency_key_sha256: idempotencyKeySha256,
+    shard_sha256: shardSha256,
+    shard,
+    events,
+  };
+  if (
+    candidate.schema !== expected.schema ||
+    candidate.schema_version !== expected.schema_version ||
+    candidate.producer_repository_sha256 !== expected.producer_repository_sha256 ||
+    candidate.idempotency_key_sha256 !== expected.idempotency_key_sha256 ||
+    candidate.shard_sha256 !== expected.shard_sha256 ||
+    !ACTION_EVENT_SHARD_PATH_PATTERN.test(shard.path) ||
+    !/^[a-f0-9]{64}$/.test(shard.replay_sha256) ||
+    repairMutationIndexShardSha256(shard.path, shard.replay_sha256) !== shardSha256 ||
+    events.length === 0 ||
+    events.length > ACTION_EVENT_SHARD_IMPORT_LIMITS.maxFileEvents ||
+    events.some(
+      (event) =>
+        !/^[a-f0-9]{64}$/.test(event.event_id) || !/^[a-f0-9]{64}$/.test(event.semantic_sha256),
+    ) ||
+    new Set(events.map((event) => event.event_id)).size !== events.length ||
+    `${actionLedgerJson(value)}\n` !== content ||
+    actionLedgerJson(value) !== actionLedgerJson(expected)
+  ) {
+    throw new Error("invalid repair mutation idempotency index");
+  }
+  return expected;
+}
+
+function parseRepairMutationIdempotencyIndexReservation(
+  content: string,
+  producerRepository: string,
+  idempotencyKeySha256: string,
+  shardSha256: string,
+  completionSha256: string,
+): RepairMutationIdempotencyIndexReservation {
+  let value: unknown;
+  try {
+    value = JSON.parse(content);
+  } catch {
+    throw new Error("invalid repair mutation idempotency index reservation");
+  }
+  const expected: RepairMutationIdempotencyIndexReservation = {
+    schema: "clawsweeper.action-ledger-import-repair-mutation-idempotency-reservation",
+    schema_version: 1,
+    producer_repository_sha256: repairMutationProducerRepositorySha256(producerRepository),
+    idempotency_key_sha256: idempotencyKeySha256,
+    shard_sha256: shardSha256,
+    completion_sha256: completionSha256,
+  };
+  if (
+    `${actionLedgerJson(value)}\n` !== content ||
+    actionLedgerJson(value) !== actionLedgerJson(expected)
+  ) {
+    throw new Error("invalid repair mutation idempotency index reservation");
+  }
+  return expected;
 }
 
 function publishActionEventShardImportBinding(

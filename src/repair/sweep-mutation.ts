@@ -11,6 +11,7 @@ import {
   readSpooledActionEvents,
   type ActionEvent,
 } from "../action-ledger.js";
+import { readImportedRepairMutationEvents } from "../action-ledger-runtime.js";
 import {
   prepareSafeReadRoot,
   prepareSafeReadTarget,
@@ -311,21 +312,26 @@ function assertDispatchCanStart(
   lifecycle: RepairLifecycleInput,
   options: { kind: string; identity: unknown; operationName: string },
 ): void {
-  // Published receipts block normal reruns. A hard runner loss before receipt publication
-  // remains at-least-once delivery, so callers must target downstream-safe workflows.
   const idempotencyKey = actionIdempotencyKey(
     repairMutationIdempotencyIdentity(lifecycle, options),
   );
-  const stateRoot = String(process.env.CLAWSWEEPER_STATE_DIR ?? "").trim();
-  if (!stateRoot) {
-    throw new Error("non-idempotent sweep dispatch requires hydrated durable action ledger state");
+  const localEvents = readSpooledActionEvents(repairActionLedgerRoot(), lifecycle.repository);
+  const runAttempt = githubRunAttempt();
+  let durableEvents: ActionEvent[] = [];
+  if (runAttempt > 1) {
+    const stateRoot = String(process.env.CLAWSWEEPER_STATE_DIR ?? "").trim();
+    if (!stateRoot) {
+      throw new Error(
+        "non-idempotent sweep dispatch rerun requires hydrated durable action ledger state",
+      );
+    }
+    const producerRepository = String(process.env.GITHUB_REPOSITORY ?? "").trim();
+    requiredRepository(producerRepository);
+    durableEvents =
+      readImportedRepairMutationEvents(stateRoot, producerRepository, idempotencyKey) ??
+      readDurableDispatchEvents(stateRoot, producerRepository, idempotencyKey);
   }
-  const producerRepository = String(process.env.GITHUB_REPOSITORY ?? "").trim();
-  requiredRepository(producerRepository);
-  const events = [
-    ...readSpooledActionEvents(repairActionLedgerRoot(), lifecycle.repository),
-    ...readDurableDispatchEvents(stateRoot, producerRepository, idempotencyKey),
-  ].filter(
+  const events = [...localEvents, ...durableEvents].filter(
     (event) =>
       event.event_type === ACTION_EVENT_TYPES.repairMutation &&
       event.idempotency_key_sha256 === idempotencyKey,
@@ -586,7 +592,27 @@ function validateRequest(request: SweepMutationRequest): void {
     if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(request.businessKey)) {
       throw new Error("business key must be a bounded machine identifier");
     }
+    const runId = githubRunId();
+    if (!request.businessKey.split(":").includes(runId)) {
+      throw new Error("business key must contain GITHUB_RUN_ID as a colon-delimited segment");
+    }
   }
+}
+
+function githubRunId(): string {
+  const value = String(process.env.GITHUB_RUN_ID ?? "").trim();
+  if (!/^[1-9]\d*$/.test(value)) {
+    throw new Error("GITHUB_RUN_ID must be a positive integer");
+  }
+  return value;
+}
+
+function githubRunAttempt(): number {
+  const value = Number(String(process.env.GITHUB_RUN_ATTEMPT ?? "").trim());
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new Error("GITHUB_RUN_ATTEMPT must be a positive integer");
+  }
+  return value;
 }
 
 function requiredRepository(value: string): void {

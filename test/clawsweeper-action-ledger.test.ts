@@ -249,6 +249,8 @@ test("action event publication accepts only sorted canonical event and binding p
     `ledger/v1/import-bindings/completed-shard-sets/${"a".repeat(64)}.json`,
     `ledger/v1/import-bindings/events/${"b".repeat(64)}.json`,
     `ledger/v1/import-bindings/producer-runs/${"c".repeat(64)}.json`,
+    `ledger/v1/import-bindings/repair-mutation-idempotency/${"e".repeat(64)}/${"f".repeat(64)}/${"0".repeat(64)}.json`,
+    `ledger/v1/import-bindings/repair-mutation-idempotency-reservations/${"1".repeat(64)}/${"2".repeat(64)}/${"3".repeat(64)}.json`,
     `ledger/v1/import-bindings/shard-sets/${"d".repeat(64)}.json`,
   ].sort();
   assert.deepEqual(actionEventPublishPathsForTest(`${paths.join("\n")}\n`), paths);
