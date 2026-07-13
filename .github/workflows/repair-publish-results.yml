@@ -161,109 +161,76 @@ jobs:
           RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
           WORKER_LEDGERS_REQUIRED: ${{ steps.worker-contract.outputs.worker_ledgers_required }}
           ARTIFACT_INVENTORY: ${{ runner.temp }}/clawsweeper-repair-artifacts.json
-          JOB_INVENTORY: ${{ runner.temp }}/clawsweeper-repair-jobs.json
+          JOB_INVENTORY_DIR: ${{ runner.temp }}/clawsweeper-repair-job-attempts
         run: |
           set -euo pipefail
-          rm -rf artifacts
-          mkdir -p artifacts
+          case "$RUN_ATTEMPT" in
+            "" | *[!0-9]* | 0)
+              echo "Invalid workflow run attempt: $RUN_ATTEMPT" >&2
+              exit 1
+              ;;
+          esac
+          rm -rf artifacts "$JOB_INVENTORY_DIR"
+          mkdir -p artifacts "$JOB_INVENTORY_DIR"
           gh api --paginate --slurp \
             "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/artifacts?per_page=100" \
             > "$ARTIFACT_INVENTORY"
-          gh api --paginate --slurp \
-            "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/attempts/${RUN_ATTEMPT}/jobs?per_page=100" \
-            > "$JOB_INVENTORY"
+          for ((attempt = 1; attempt <= RUN_ATTEMPT; attempt += 1)); do
+            gh api --paginate --slurp \
+              "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/attempts/${attempt}/jobs?per_page=100" \
+              > "$JOB_INVENTORY_DIR/${attempt}.json"
+          done
           node --input-type=module <<'NODE'
           import fs from "node:fs";
+          import path from "node:path";
+          import { resolveWorkerPublicationCohort } from "./dist/repair/workflow-attempt-cohort.js";
 
-          const runId = requiredDigits(process.env.RUN_ID, "run id");
-          const runAttempt = requiredDigits(process.env.RUN_ATTEMPT, "run attempt");
-          const pages = JSON.parse(fs.readFileSync(process.env.ARTIFACT_INVENTORY, "utf8"));
-          if (!Array.isArray(pages)) throw new Error("workflow artifact response is invalid");
-          const artifacts = pages.flatMap((page) => {
-            if (!Array.isArray(page?.artifacts)) {
-              throw new Error("workflow artifact page is invalid");
-            }
-            return page.artifacts;
-          });
-          const finalName = `clawsweeper-repair-${runId}-${runAttempt}`;
-          const workerName = `clawsweeper-repair-worker-${runId}-${runAttempt}`;
-          const clusterLedgerName =
-            `clawsweeper-repair-worker-action-ledger-cluster-${runId}-${runAttempt}`;
-          const executeLedgerName =
-            `clawsweeper-repair-worker-action-ledger-execute-${runId}-${runAttempt}`;
-          const select = (name) =>
-            artifacts.filter(
-              (artifact) =>
-                artifact?.name === name &&
-                artifact.expired !== true &&
-                Number.isSafeInteger(Number(artifact.id)),
-            );
-          const finalArtifacts = select(finalName);
-          const workerArtifacts = select(workerName);
-          const clusterLedgers = select(clusterLedgerName);
-          const executeLedgers = select(executeLedgerName);
-          if (
-            finalArtifacts.length > 1 ||
-            workerArtifacts.length > 1 ||
-            clusterLedgers.length > 1 ||
-            executeLedgers.length > 1
-          ) {
-            throw new Error("current worker result artifact is ambiguous");
-          }
-          const jobPages = JSON.parse(fs.readFileSync(process.env.JOB_INVENTORY, "utf8"));
-          if (!Array.isArray(jobPages)) throw new Error("workflow job response is invalid");
-          const jobs = jobPages.flatMap((page) => {
-            if (!Array.isArray(page?.jobs)) throw new Error("workflow job page is invalid");
-            return page.jobs;
-          });
+          const runId = process.env.RUN_ID;
+          const runAttempt = process.env.RUN_ATTEMPT;
+          const artifactPages = JSON.parse(
+            fs.readFileSync(process.env.ARTIFACT_INVENTORY, "utf8"),
+          );
+          const jobInventories = fs
+            .readdirSync(process.env.JOB_INVENTORY_DIR, { withFileTypes: true })
+            .filter((entry) => entry.isFile() && /^[1-9][0-9]*\.json$/.test(entry.name))
+            .map((entry) => ({
+              attempt: Number(entry.name.slice(0, -".json".length)),
+              pages: JSON.parse(
+                fs.readFileSync(path.join(process.env.JOB_INVENTORY_DIR, entry.name), "utf8"),
+              ),
+            }));
           const workerLedgersRequired = process.env.WORKER_LEDGERS_REQUIRED === "1";
-          const clusterJobResult = workerLedgersRequired
-            ? exactJobResult(jobs, "Plan and review cluster")
-            : "legacy";
-          const executeJobResult = workerLedgersRequired
-            ? exactJobResult(jobs, "Execute and apply cluster actions")
-            : "legacy";
-          const artifact = finalArtifacts[0] ?? workerArtifacts[0];
-          if (!artifact) {
-            writeOutputs({
-              artifact_found: "0",
-              cluster_job_result: clusterJobResult,
-              execute_job_result: executeJobResult,
-              cluster_ledger_found: clusterLedgers[0] ? "1" : "0",
-              cluster_ledger_id: clusterLedgers[0] ? String(clusterLedgers[0].id) : "",
-              execute_ledger_found: executeLedgers[0] ? "1" : "0",
-              execute_ledger_id: executeLedgers[0] ? String(executeLedgers[0].id) : "",
-            });
-            process.exit(0);
-          }
-          writeOutputs({
-            artifact_found: "1",
-            artifact_id: String(artifact.id),
-            artifact_name: artifact.name,
-            producer_attempt: runAttempt,
-            cluster_job_result: clusterJobResult,
-            execute_job_result: executeJobResult,
-            cluster_ledger_found: clusterLedgers[0] ? "1" : "0",
-            cluster_ledger_id: clusterLedgers[0] ? String(clusterLedgers[0].id) : "",
-            execute_ledger_found: executeLedgers[0] ? "1" : "0",
-            execute_ledger_id: executeLedgers[0] ? String(executeLedgers[0].id) : "",
+          const cohort = resolveWorkerPublicationCohort({
+            artifactPages,
+            jobInventories,
+            runId,
+            currentAttempt: runAttempt,
+            workerLedgersRequired,
           });
-
-          function requiredDigits(value, label) {
-            const text = String(value ?? "");
-            if (!/^[1-9][0-9]*$/.test(text)) throw new Error(`${label} is invalid`);
-            return text;
-          }
-
-          function exactJobResult(jobs, name) {
-            const matches = jobs.filter((job) => job?.name === name);
-            if (matches.length !== 1) {
-              throw new Error(`workflow job inventory has ${matches.length} ${name} jobs`);
-            }
-            const result = String(matches[0].conclusion ?? matches[0].status ?? "").trim();
-            if (!result) throw new Error(`workflow job ${name} has no terminal result`);
-            return result;
-          }
+          const clusterJob = cohort.clusterJob ?? { attempt: Number(runAttempt), result: "legacy" };
+          const executeJob = cohort.executeJob ?? { attempt: Number(runAttempt), result: "legacy" };
+          writeOutputs({
+            artifact_found: cohort.resultArtifact ? "1" : "0",
+            artifact_id: cohort.resultArtifact ? String(cohort.resultArtifact.id) : "",
+            artifact_name: cohort.resultArtifact?.name ?? "",
+            producer_attempt: cohort.resultArtifact
+              ? String(cohort.resultArtifact.attempt)
+              : "",
+            cluster_job_result: clusterJob.result,
+            cluster_job_attempt: String(clusterJob.attempt),
+            execute_job_result: executeJob.result,
+            execute_job_attempt: String(executeJob.attempt),
+            cluster_ledger_found: cohort.clusterLedger ? "1" : "0",
+            cluster_ledger_id: cohort.clusterLedger ? String(cohort.clusterLedger.id) : "",
+            cluster_ledger_attempt: cohort.clusterLedger
+              ? String(cohort.clusterLedger.attempt)
+              : "",
+            execute_ledger_found: cohort.executeLedger ? "1" : "0",
+            execute_ledger_id: cohort.executeLedger ? String(cohort.executeLedger.id) : "",
+            execute_ledger_attempt: cohort.executeLedger
+              ? String(cohort.executeLedger.attempt)
+              : "",
+          });
 
           function writeOutputs(outputs) {
             fs.appendFileSync(
@@ -311,10 +278,11 @@ jobs:
         env:
           WORKER_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
           WORKER_RUN_ID: ${{ github.event.workflow_run.id }}
-          WORKER_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
           CLUSTER_JOB_RESULT: ${{ steps.result-artifact.outputs.cluster_job_result }}
+          CLUSTER_JOB_ATTEMPT: ${{ steps.result-artifact.outputs.cluster_job_attempt }}
           CLUSTER_LEDGER_FOUND: ${{ steps.result-artifact.outputs.cluster_ledger_found }}
           EXECUTE_JOB_RESULT: ${{ steps.result-artifact.outputs.execute_job_result }}
+          EXECUTE_JOB_ATTEMPT: ${{ steps.result-artifact.outputs.execute_job_attempt }}
           EXECUTE_LEDGER_FOUND: ${{ steps.result-artifact.outputs.execute_ledger_found }}
         run: |
           set -euo pipefail
@@ -323,7 +291,8 @@ jobs:
             local job="$2"
             local job_result="$3"
             local artifact_found="$4"
-            local allow_empty="${5:-false}"
+            local producer_attempt="$5"
+            local allow_empty="${6:-false}"
             if [ "$job_result" = "skipped" ]; then
               if [ "$artifact_found" = "1" ]; then
                 echo "$lane job was skipped but exposed an action ledger artifact." >&2
@@ -332,7 +301,7 @@ jobs:
               return
             fi
             if [ "$artifact_found" != "1" ]; then
-              echo "$lane job ($job_result) did not expose its current-attempt action ledger." >&2
+              echo "$lane job ($job_result) did not expose its producer-attempt action ledger." >&2
               return 1
             fi
             local source_root=".clawsweeper-repair/action-ledger-download/$lane"
@@ -350,12 +319,12 @@ jobs:
               --expected-workflow repair-cluster-worker.yml \
               --expected-job "$job" \
               --expected-run-id "$WORKER_RUN_ID" \
-              --expected-run-attempt "$WORKER_RUN_ATTEMPT" \
+              --expected-run-attempt "$producer_attempt" \
               "${allow_empty_args[@]}" \
               --source-root "$source_root" >/dev/null
           }
-          verify_lane cluster cluster "$CLUSTER_JOB_RESULT" "$CLUSTER_LEDGER_FOUND" true
-          verify_lane execute execute "$EXECUTE_JOB_RESULT" "$EXECUTE_LEDGER_FOUND" true
+          verify_lane cluster cluster "$CLUSTER_JOB_RESULT" "$CLUSTER_LEDGER_FOUND" "$CLUSTER_JOB_ATTEMPT" true
+          verify_lane execute execute "$EXECUTE_JOB_RESULT" "$EXECUTE_LEDGER_FOUND" "$EXECUTE_JOB_ATTEMPT" true
 
       - name: Verify current worker result artifact
         id: download
@@ -574,9 +543,10 @@ jobs:
           WORKER_LEDGER_OUTCOME: ${{ steps.worker-ledgers.outcome }}
           WORKER_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
           WORKER_RUN_ID: ${{ github.event.workflow_run.id }}
-          WORKER_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
           CLUSTER_JOB_RESULT: ${{ steps.result-artifact.outputs.cluster_job_result }}
+          CLUSTER_JOB_ATTEMPT: ${{ steps.result-artifact.outputs.cluster_job_attempt }}
           EXECUTE_JOB_RESULT: ${{ steps.result-artifact.outputs.execute_job_result }}
+          EXECUTE_JOB_ATTEMPT: ${{ steps.result-artifact.outputs.execute_job_attempt }}
         run: |
           set -euo pipefail
           test -n "${CLAWSWEEPER_STATE_DIR:-}"
@@ -590,7 +560,8 @@ jobs:
             local lane="$1"
             local job="$2"
             local job_result="$3"
-            local allow_empty="${4:-false}"
+            local producer_attempt="$4"
+            local allow_empty="${5:-false}"
             if [ "$job_result" = "skipped" ]; then
               return
             fi
@@ -609,7 +580,7 @@ jobs:
               --expected-workflow repair-cluster-worker.yml \
               --expected-job "$job" \
               --expected-run-id "$WORKER_RUN_ID" \
-              --expected-run-attempt "$WORKER_RUN_ATTEMPT" \
+              --expected-run-attempt "$producer_attempt" \
               "${allow_empty_args[@]}" \
               --source-root "$worker_root" \
               --state-root "$CLAWSWEEPER_STATE_DIR" > "$worker_import"
@@ -619,8 +590,8 @@ jobs:
             jq -r '.paths[]?' "$worker_import" >> "$event_paths_file"
           }
           if [ "$WORKER_LEDGER_OUTCOME" = "success" ]; then
-            import_worker_lane cluster cluster "$CLUSTER_JOB_RESULT" true
-            import_worker_lane execute execute "$EXECUTE_JOB_RESULT" true
+            import_worker_lane cluster cluster "$CLUSTER_JOB_RESULT" "$CLUSTER_JOB_ATTEMPT" true
+            import_worker_lane execute execute "$EXECUTE_JOB_RESULT" "$EXECUTE_JOB_ATTEMPT" true
           fi
           allow_empty_args=()
           if [ "$ALLOW_EMPTY" = "true" ]; then

@@ -31,7 +31,8 @@ test("repair result publication binds canonical replacement to immutable produce
   assert.equal((publish.match(/--producer-attempt "\$PRODUCER_ATTEMPT"/g) ?? []).length, 2);
 });
 
-test("repair result publication treats a missing current artifact as an explicit empty outcome", () => {
+test("repair result publication keeps results current while resolving prior producer attempts", () => {
+  const worker = readText(".github/workflows/repair-cluster-worker.yml");
   const workflow = readText(".github/workflows/repair-publish-results.yml");
   const current = workflow.slice(
     workflow.indexOf("- name: Resolve current worker result artifact"),
@@ -42,19 +43,27 @@ test("repair result publication treats a missing current artifact as an explicit
     workflow.indexOf("- name: Publish result ledger"),
   );
 
-  assert.match(current, /finalName = `clawsweeper-repair-\$\{runId\}-\$\{runAttempt\}`/);
-  assert.match(current, /workerName = `clawsweeper-repair-worker-\$\{runId\}-\$\{runAttempt\}`/);
-  assert.match(current, /current worker result artifact is ambiguous/);
-  assert.match(current, /artifact_found: "0"/);
+  assert.match(current, /for \(\(attempt = 1; attempt <= RUN_ATTEMPT; attempt \+= 1\)\)/);
+  assert.match(current, /resolveWorkerPublicationCohort/);
+  assert.match(current, /currentAttempt: runAttempt/);
+  assert.match(current, /artifact_found: cohort\.resultArtifact \? "1" : "0"/);
+  assert.match(current, /cluster_job_attempt: String\(clusterJob\.attempt\)/);
+  assert.match(current, /execute_job_attempt: String\(executeJob\.attempt\)/);
   assert.match(verify, /if \[ "\$ARTIFACT_FOUND" != "1" \]; then/);
   assert.match(verify, /echo "has_artifacts=0" >> "\$GITHUB_OUTPUT"/);
   assert.match(verify, /exit 0/);
   assert.match(workflow, /artifact-ids: \$\{\{ steps\.result-artifact\.outputs\.artifact_id \}\}/);
   assert.match(verify, /findResultPaths\("artifacts"\)/);
   assert.match(verify, /pnpm run repair:review-results -- "\$\{result_paths\[@\]\}"/);
+  assert.match(worker, /Resolve latest worker transfer artifact/);
+  assert.match(worker, /selectLatestAttemptArtifact/);
+  assert.match(
+    worker,
+    /artifact-ids: \$\{\{ steps\.worker-transfer-artifact\.outputs\.artifact_id \}\}/,
+  );
   assert.doesNotMatch(
     workflow,
-    /run-artifact\.js|Resolve verified prior worker result cohort|allowPriorAttempts|prior-attempt/,
+    /run-artifact\.js|Resolve verified prior worker result cohort|allowPriorAttempts/,
   );
 });
 

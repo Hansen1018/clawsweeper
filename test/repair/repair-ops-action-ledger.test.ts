@@ -111,15 +111,22 @@ test("repair worker jobs upload current-attempt ledgers for the trusted publishe
     execute,
     /clawsweeper-repair-worker-action-ledger-execute-\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}/,
   );
-  assert.match(publisher, /attempts\/\$\{RUN_ATTEMPT\}\/jobs\?per_page=100/);
-  assert.match(publisher, /exactJobResult\(jobs, "Plan and review cluster"\)/);
-  assert.match(publisher, /exactJobResult\(jobs, "Execute and apply cluster actions"\)/);
+  assert.match(execute, /Resolve latest worker transfer artifact/);
+  assert.match(execute, /selectLatestAttemptArtifact/);
+  assert.match(
+    execute,
+    /artifact-ids: \$\{\{ steps\.worker-transfer-artifact\.outputs\.artifact_id \}\}/,
+  );
+  assert.match(publisher, /attempts\/\$\{attempt\}\/jobs\?per_page=100/);
+  assert.match(publisher, /resolveWorkerPublicationCohort/);
+  assert.match(publisher, /cluster_job_attempt: String\(clusterJob\.attempt\)/);
+  assert.match(publisher, /execute_job_attempt: String\(executeJob\.attempt\)/);
   assert.match(publisher, /Download cluster action ledger/);
   assert.match(publisher, /Download execution action ledger/);
   assert.match(publisher, /Verify current worker action ledgers/);
   assert.match(
     publisher,
-    /\$lane job \(\$job_result\) did not expose its current-attempt action ledger/,
+    /\$lane job \(\$job_result\) did not expose its producer-attempt action ledger/,
   );
   assert.match(publisher, /--expected-repository "\$GITHUB_REPOSITORY"/);
   assert.match(publisher, /--expected-sha "\$WORKER_HEAD_SHA"/);
@@ -127,14 +134,20 @@ test("repair worker jobs upload current-attempt ledgers for the trusted publishe
   assert.match(publisher, /--expected-run-id "\$WORKER_RUN_ID"/);
   assert.match(
     publisher,
-    /verify_lane cluster cluster "\$CLUSTER_JOB_RESULT" "\$CLUSTER_LEDGER_FOUND" true/,
+    /verify_lane cluster cluster "\$CLUSTER_JOB_RESULT" "\$CLUSTER_LEDGER_FOUND" "\$CLUSTER_JOB_ATTEMPT" true/,
   );
   assert.match(
     publisher,
-    /verify_lane execute execute "\$EXECUTE_JOB_RESULT" "\$EXECUTE_LEDGER_FOUND" true/,
+    /verify_lane execute execute "\$EXECUTE_JOB_RESULT" "\$EXECUTE_LEDGER_FOUND" "\$EXECUTE_JOB_ATTEMPT" true/,
   );
-  assert.match(publisher, /import_worker_lane cluster cluster "\$CLUSTER_JOB_RESULT" true/);
-  assert.match(publisher, /import_worker_lane execute execute "\$EXECUTE_JOB_RESULT" true/);
+  assert.match(
+    publisher,
+    /import_worker_lane cluster cluster "\$CLUSTER_JOB_RESULT" "\$CLUSTER_JOB_ATTEMPT" true/,
+  );
+  assert.match(
+    publisher,
+    /import_worker_lane execute execute "\$EXECUTE_JOB_RESULT" "\$EXECUTE_JOB_ATTEMPT" true/,
+  );
   assert.match(
     publisher,
     /worker_ledgers_required=0[\s\S]*clawsweeper-repair-worker-action-ledger-cluster-\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}[\s\S]*clawsweeper-repair-worker-action-ledger-execute-\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}[\s\S]*name: Execute and apply cluster actions[\s\S]*worker_ledgers_required=1/,
@@ -147,7 +160,7 @@ test("repair worker jobs upload current-attempt ledgers for the trusted publishe
     worker,
     /\n  (authorize|report|mutate|validate|publish-repair-action-ledger):/,
   );
-  assert.doesNotMatch(publisher, /resolve-run-artifact|prior-attempt|allowPriorAttempts/);
+  assert.doesNotMatch(publisher, /resolve-run-artifact|allowPriorAttempts/);
 });
 
 test("repair mutation and Codex boundaries emit exact immutable receipts", () => {
