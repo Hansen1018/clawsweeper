@@ -81,6 +81,11 @@ test("repair worker jobs upload current-attempt ledgers for the trusted publishe
   assert.match(worker, /concurrency:[\s\S]*cancel-in-progress: false[\s\S]*queue: max/);
   assert.match(cluster, /permissions:\s+actions: read\s+contents: read/);
   assert.match(cluster, /uses: \.\/\.github\/actions\/setup-action-ledger/);
+  assert.equal(
+    (cluster.match(/uses: \.\/\.github\/actions\/setup-action-ledger/g) ?? []).length,
+    1,
+  );
+  assert.match(cluster, /id: cluster-setup-pnpm\n\s+with:/);
   assert.match(cluster, /Finalize cluster repair action ledger/);
   assert.match(
     cluster,
@@ -96,6 +101,11 @@ test("repair worker jobs upload current-attempt ledgers for the trusted publishe
       cluster.indexOf("- name: Finalize cluster repair action ledger"),
   );
   assert.match(execute, /uses: \.\/\.github\/actions\/setup-action-ledger/);
+  assert.equal(
+    (execute.match(/uses: \.\/\.github\/actions\/setup-action-ledger/g) ?? []).length,
+    1,
+  );
+  assert.match(execute, /id: execute-setup-pnpm\n\s+with:/);
   assert.match(execute, /Finalize execution repair action ledger/);
   assert.match(
     execute,
@@ -117,14 +127,18 @@ test("repair worker jobs upload current-attempt ledgers for the trusted publishe
   assert.match(publisher, /--expected-run-id "\$WORKER_RUN_ID"/);
   assert.match(
     publisher,
-    /verify_lane cluster cluster "\$CLUSTER_JOB_RESULT" "\$CLUSTER_LEDGER_FOUND"/,
+    /verify_lane cluster cluster "\$CLUSTER_JOB_RESULT" "\$CLUSTER_LEDGER_FOUND" true/,
   );
   assert.match(
     publisher,
     /verify_lane execute execute "\$EXECUTE_JOB_RESULT" "\$EXECUTE_LEDGER_FOUND" true/,
   );
-  assert.match(publisher, /import_worker_lane cluster cluster "\$CLUSTER_JOB_RESULT"/);
+  assert.match(publisher, /import_worker_lane cluster cluster "\$CLUSTER_JOB_RESULT" true/);
   assert.match(publisher, /import_worker_lane execute execute "\$EXECUTE_JOB_RESULT" true/);
+  assert.match(
+    publisher,
+    /worker_ledgers_required=0[\s\S]*clawsweeper-repair-worker-action-ledger-cluster-\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}[\s\S]*clawsweeper-repair-worker-action-ledger-execute-\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}[\s\S]*name: Execute and apply cluster actions[\s\S]*worker_ledgers_required=1/,
+  );
   assert.ok(
     publisher.indexOf("- name: Verify current worker action ledgers") <
       publisher.indexOf("- name: Publish result ledger"),
@@ -437,7 +451,7 @@ test("issue implementation intake finalizes and publishes source-bound status re
   assert.match(dispatcher, /repairSourceRevision\(job\.frontmatter\)/);
 });
 
-test("commit finding and cluster intake publish their dispatch receipts", () => {
+test("commit finding and cluster intake publish their operation receipts", () => {
   const commitFinding = readText(".github/workflows/repair-commit-finding-intake.yml");
   const cluster = readText(".github/workflows/repair-cluster-intake.yml");
 
@@ -489,9 +503,11 @@ test("result and finalizer workflows publish their repair operation receipts", (
   assert.match(results, /CLAWSWEEPER_ACTION_LEDGER_INVOCATION=cluster-results/);
   assert.match(results, /CLAWSWEEPER_ACTION_LEDGER_INVOCATION=open-pr-finalizer/);
   assert.match(results, /CLAWSWEEPER_ACTION_LEDGER_INVOCATION=finalizer-results/);
-  assert.match(results, /Classify trusted worker artifact contract/);
+  assert.match(results, /Classify trusted worker capabilities/);
   assert.match(results, /git merge-base --is-ancestor "\$WORKER_HEAD_SHA"/);
   assert.match(results, /-S'Seal immutable source job provenance'/);
+  assert.match(results, /worker_ledgers_required=0/);
+  assert.match(results, /worker_ledgers_required=1/);
   assert.match(results, /--trusted-legacy-worker-head "\$TRUSTED_LEGACY_WORKER_HEAD"/);
   assert.match(finalizer, /append repair finalizer action ledger/);
   assert.match(finalizer, /--receipt-kind open_pr_finalizer_state/);

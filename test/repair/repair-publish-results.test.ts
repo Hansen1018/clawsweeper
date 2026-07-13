@@ -61,13 +61,13 @@ test("repair result publication treats a missing current artifact as an explicit
 test("repair result publication rejects untrusted worker heads before minting write credentials", () => {
   const workflow = readText(".github/workflows/repair-publish-results.yml");
   const classification = workflow.slice(
-    workflow.indexOf("- name: Classify trusted worker artifact contract"),
+    workflow.indexOf("- name: Classify trusted worker capabilities"),
     workflow.indexOf("- name: Create GitHub App token"),
   );
 
   assert.match(workflow, /permissions:\n  contents: read/);
   assert.ok(
-    workflow.indexOf("- name: Classify trusted worker artifact contract") <
+    workflow.indexOf("- name: Classify trusted worker capabilities") <
       workflow.indexOf("- name: Create GitHub App token"),
   );
   assert.match(
@@ -85,6 +85,13 @@ test("repair result publication rejects untrusted worker heads before minting wr
     /if \[\[ ! "\$WORKER_HEAD_SHA" =~ \^\[a-f0-9\]\{40\}\$ \]\]; then[\s\S]*exit 1/,
   );
   assert.match(classification, /! git merge-base --is-ancestor "\$WORKER_HEAD_SHA"[\s\S]*exit 1/);
+  assert.match(
+    classification,
+    /git show "\$WORKER_HEAD_SHA:\.github\/workflows\/repair-cluster-worker\.yml"/,
+  );
+  assert.match(classification, /worker_ledgers_required=0/);
+  assert.match(classification, /name: Execute and apply cluster actions/);
+  assert.match(classification, /worker_ledgers_required=1/);
 });
 
 test("repair event notifications publish durable claims before delivery and receipts", () => {

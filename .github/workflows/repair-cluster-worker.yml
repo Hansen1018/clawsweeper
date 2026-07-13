@@ -240,7 +240,6 @@ jobs:
 
       - uses: ./.github/actions/setup-pnpm
         id: cluster-setup-pnpm
-        if: ${{ steps.check_job.outputs.job_exists == '1' }}
         with:
           build-script: build:repair
 
@@ -405,13 +404,23 @@ jobs:
         run: pnpm run repair:action-session -- update --state blocked --phase planning_failed --summary "Planning Action failed" --completion-reason action_failed
 
       - name: Finalize cluster repair action ledger
+        id: finalize-cluster-action-ledger
         if: ${{ always() && steps.cluster-action-ledger.outcome == 'success' && steps.cluster-setup-pnpm.outcome == 'success' }}
         run: |
           set -euo pipefail
           output_root="${CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:?setup-action-ledger output root is required}"
+          allow_empty_args=()
+          allow_empty=false
+          if [ "${{ steps.check_job.outputs.job_exists }}" != "1" ] ||
+             [ "${{ steps.self_heal_head.outputs.matched }}" = "false" ]; then
+            allow_empty=true
+            allow_empty_args+=(--allow-empty)
+          fi
           pnpm run --silent repair:action-ledger -- finalize \
             --repair-lane cluster \
+            "${allow_empty_args[@]}" \
             > "$output_root/repair-action-ledger-manifest.json"
+          echo "allow_empty=$allow_empty" >> "$GITHUB_OUTPUT"
 
       - name: Upload cluster repair action ledger
         if: ${{ always() && steps.cluster-action-ledger.outcome == 'success' && steps.cluster-setup-pnpm.outcome == 'success' }}
@@ -541,7 +550,6 @@ jobs:
 
       - uses: ./.github/actions/setup-pnpm
         id: execute-setup-pnpm
-        if: ${{ steps.check_job.outputs.job_exists == '1' }}
         with:
           build-script: build:repair
 
@@ -780,13 +788,9 @@ jobs:
           count="$(pnpm run --silent workflow -- count-requeue-required --dir .clawsweeper-repair/runs)"
           echo "count=$count" >> "$GITHUB_OUTPUT"
 
-      - uses: ./.github/actions/setup-action-ledger
-        id: repair-requeue-ledger
-        if: ${{ always() && steps.repair_requeue.outputs.count != '' && steps.repair_requeue.outputs.count != '0' }}
-
       - name: Requeue source-head repair races
         id: requeue_dispatch
-        if: ${{ always() && steps.repair-requeue-ledger.outcome == 'success' && steps.repair_requeue.outputs.count != '' && steps.repair_requeue.outputs.count != '0' }}
+        if: ${{ always() && steps.execute-action-ledger.outcome == 'success' && steps.repair_requeue.outputs.count != '' && steps.repair_requeue.outputs.count != '0' }}
         env:
           GH_TOKEN: ${{ steps.requeue-token.outputs.token }}
           CLAWSWEEPER_MUTATION_TOKEN_SOURCE: clawsweeper-app
@@ -806,7 +810,7 @@ jobs:
             --model "${{ inputs.model }}"
 
       - name: Finalize repair requeue action ledger
-        if: ${{ always() && steps.execute-setup-pnpm.outcome == 'success' && steps.repair-requeue-ledger.outcome == 'success' && steps.repair_requeue.outputs.count != '' && steps.repair_requeue.outputs.count != '0' }}
+        if: ${{ always() && steps.execute-setup-pnpm.outcome == 'success' && steps.execute-action-ledger.outcome == 'success' && steps.repair_requeue.outputs.count != '' && steps.repair_requeue.outputs.count != '0' }}
         run: |
           set -euo pipefail
           : "${CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:?setup-action-ledger output root is required}"
@@ -816,7 +820,7 @@ jobs:
             > .artifacts/repair-requeue-action-ledger-manifest.json
 
       - name: Publish immutable repair requeue action ledger
-        if: ${{ always() && steps.execute-setup-pnpm.outcome == 'success' && steps.repair-requeue-ledger.outcome == 'success' && steps.repair_requeue.outputs.count != '' && steps.repair_requeue.outputs.count != '0' }}
+        if: ${{ always() && steps.execute-setup-pnpm.outcome == 'success' && steps.execute-action-ledger.outcome == 'success' && steps.repair_requeue.outputs.count != '' && steps.repair_requeue.outputs.count != '0' }}
         run: |
           set -euo pipefail
           test -n "${CLAWSWEEPER_STATE_DIR:-}"

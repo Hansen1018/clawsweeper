@@ -33,7 +33,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Classify trusted worker artifact contract
+      - name: Classify trusted worker capabilities
         id: worker-contract
         env:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
@@ -42,6 +42,7 @@ jobs:
         run: |
           set -euo pipefail
           echo "trusted_legacy_worker_head=" >> "$GITHUB_OUTPUT"
+          echo "worker_ledgers_required=0" >> "$GITHUB_OUTPUT"
           if [[ ! "$WORKER_HEAD_SHA" =~ ^[a-f0-9]{40}$ ]]; then
             echo "::error title=Untrusted worker::Worker head is not an exact commit."
             exit 1
@@ -64,6 +65,13 @@ jobs:
           fi
           if git merge-base --is-ancestor "$WORKER_HEAD_SHA" "${contract_commit}^"; then
             echo "trusted_legacy_worker_head=$WORKER_HEAD_SHA" >> "$GITHUB_OUTPUT"
+          fi
+          worker_workflow="$RUNNER_TEMP/repair-cluster-worker-$WORKER_HEAD_SHA.yml"
+          git show "$WORKER_HEAD_SHA:.github/workflows/repair-cluster-worker.yml" > "$worker_workflow"
+          if grep -Fq 'clawsweeper-repair-worker-action-ledger-cluster-${{ github.run_id }}-${{ github.run_attempt }}' "$worker_workflow" &&
+             grep -Fq 'clawsweeper-repair-worker-action-ledger-execute-${{ github.run_id }}-${{ github.run_attempt }}' "$worker_workflow" &&
+             grep -Fq 'name: Execute and apply cluster actions' "$worker_workflow"; then
+            echo "worker_ledgers_required=1" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Create GitHub App token
@@ -151,6 +159,7 @@ jobs:
           GH_TOKEN: ${{ steps.app_token.outputs.token }}
           RUN_ID: ${{ github.event.workflow_run.id }}
           RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          WORKER_LEDGERS_REQUIRED: ${{ steps.worker-contract.outputs.worker_ledgers_required }}
           ARTIFACT_INVENTORY: ${{ runner.temp }}/clawsweeper-repair-artifacts.json
           JOB_INVENTORY: ${{ runner.temp }}/clawsweeper-repair-jobs.json
         run: |
@@ -207,8 +216,13 @@ jobs:
             if (!Array.isArray(page?.jobs)) throw new Error("workflow job page is invalid");
             return page.jobs;
           });
-          const clusterJobResult = exactJobResult(jobs, "Plan and review cluster");
-          const executeJobResult = exactJobResult(jobs, "Execute and apply cluster actions");
+          const workerLedgersRequired = process.env.WORKER_LEDGERS_REQUIRED === "1";
+          const clusterJobResult = workerLedgersRequired
+            ? exactJobResult(jobs, "Plan and review cluster")
+            : "legacy";
+          const executeJobResult = workerLedgersRequired
+            ? exactJobResult(jobs, "Execute and apply cluster actions")
+            : "legacy";
           const artifact = finalArtifacts[0] ?? workerArtifacts[0];
           if (!artifact) {
             writeOutputs({
@@ -272,7 +286,7 @@ jobs:
           run-id: ${{ github.event.workflow_run.id }}
 
       - name: Download cluster action ledger
-        if: ${{ steps.result-artifact.outputs.cluster_ledger_found == '1' }}
+        if: ${{ steps.worker-contract.outputs.worker_ledgers_required == '1' && steps.result-artifact.outputs.cluster_ledger_found == '1' }}
         uses: actions/download-artifact@v8
         with:
           artifact-ids: ${{ steps.result-artifact.outputs.cluster_ledger_id }}
@@ -282,7 +296,7 @@ jobs:
           run-id: ${{ github.event.workflow_run.id }}
 
       - name: Download execution action ledger
-        if: ${{ steps.result-artifact.outputs.execute_ledger_found == '1' }}
+        if: ${{ steps.worker-contract.outputs.worker_ledgers_required == '1' && steps.result-artifact.outputs.execute_ledger_found == '1' }}
         uses: actions/download-artifact@v8
         with:
           artifact-ids: ${{ steps.result-artifact.outputs.execute_ledger_id }}
@@ -293,6 +307,7 @@ jobs:
 
       - name: Verify current worker action ledgers
         id: worker-ledgers
+        if: ${{ steps.worker-contract.outputs.worker_ledgers_required == '1' }}
         env:
           WORKER_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
           WORKER_RUN_ID: ${{ github.event.workflow_run.id }}
@@ -339,7 +354,7 @@ jobs:
               "${allow_empty_args[@]}" \
               --source-root "$source_root" >/dev/null
           }
-          verify_lane cluster cluster "$CLUSTER_JOB_RESULT" "$CLUSTER_LEDGER_FOUND"
+          verify_lane cluster cluster "$CLUSTER_JOB_RESULT" "$CLUSTER_LEDGER_FOUND" true
           verify_lane execute execute "$EXECUTE_JOB_RESULT" "$EXECUTE_LEDGER_FOUND" true
 
       - name: Verify current worker result artifact
@@ -604,7 +619,7 @@ jobs:
             jq -r '.paths[]?' "$worker_import" >> "$event_paths_file"
           }
           if [ "$WORKER_LEDGER_OUTCOME" = "success" ]; then
-            import_worker_lane cluster cluster "$CLUSTER_JOB_RESULT"
+            import_worker_lane cluster cluster "$CLUSTER_JOB_RESULT" true
             import_worker_lane execute execute "$EXECUTE_JOB_RESULT" true
           fi
           allow_empty_args=()

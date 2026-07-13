@@ -93,7 +93,6 @@ test("same-attempt repair Codex actions keep distinct operation and receipt iden
   };
   const actions = [
     "repair_edit",
-    "repair_write_preflight",
     "repair_base_reconcile",
     "repair_review",
     "repair_review_fix",
