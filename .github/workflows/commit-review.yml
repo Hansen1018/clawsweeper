@@ -456,6 +456,7 @@ jobs:
           git -C "$TARGET_NAME" fetch --no-tags origin main --depth=1000
           git -C "$TARGET_NAME" checkout -B main refs/remotes/origin/main
           git -C "$TARGET_NAME" fetch --no-tags origin "$COMMIT_SHA" --depth=200
+          git -C "$TARGET_NAME" remote set-url origin "https://github.com/${TARGET_REPO}.git"
           if ! git -C "$TARGET_NAME" merge-base --is-ancestor "$COMMIT_SHA" HEAD; then
             echo "Commit $COMMIT_SHA is not reachable from the checked-out origin/main history." >&2
             exit 1
@@ -470,8 +471,6 @@ jobs:
         id: review-commit
         working-directory: clawsweeper
         env:
-          GH_TOKEN: ${{ steps.target-read-token.outputs.token }}
-          COMMIT_SWEEPER_TARGET_GH_TOKEN: ${{ steps.target-read-token.outputs.token }}
           COMMIT_SWEEPER_ADDITIONAL_PROMPT: ${{ github.event.inputs.additional_prompt || github.event.client_payload.additional_prompt || '' }}
         run: |
           node dist/commit-sweeper.js review \
@@ -483,7 +482,7 @@ jobs:
             --work-dir ../commit-work \
             --codex-model internal \
             --codex-reasoning-effort high \
-            --codex-sandbox danger-full-access \
+            --codex-sandbox read-only \
             --codex-timeout-ms 1800000 \
             --defer-workflow-completion
 
@@ -492,7 +491,11 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: codex-logs-commit-review-${{ matrix.sha }}-${{ github.run_attempt }}
-          path: commit-work/**
+          path: |
+            commit-work/${{ matrix.sha }}.prompt.md
+            commit-work/${{ matrix.sha }}.jsonl
+            commit-work/${{ matrix.sha }}.stderr.log
+            commit-work/${{ matrix.sha }}.md
           if-no-files-found: warn
           retention-days: 30
 

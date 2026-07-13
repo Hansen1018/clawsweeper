@@ -10,6 +10,17 @@ export type CodexEnvOptions = {
 export type CodexLoginMethod = "api" | "chatgpt";
 
 export const PUBLIC_CODEX_MODEL = "internal";
+const CODEX_SENSITIVE_ENV_NAME = /(?:^|_)(?:TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL|PRIVATE)(?:_|$)/i;
+const CODEX_ACTIONS_CREDENTIAL_ENV = [
+  "ACTIONS_CACHE_URL",
+  "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
+  "ACTIONS_ID_TOKEN_REQUEST_URL",
+  "ACTIONS_RESULTS_URL",
+  "ACTIONS_RUNTIME_TOKEN",
+  "ACTIONS_RUNTIME_URL",
+  "GITHUB_ACTIONS_RUNTIME_TOKEN",
+] as const;
+const CODEX_AUTH_ENV = new Set(["OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN"]);
 
 export function codexLoginMethod(
   value = process.env.CLAWSWEEPER_CODEX_LOGIN_METHOD,
@@ -77,8 +88,14 @@ export function codexEnv(options: CodexEnvOptions = {}): NodeJS.ProcessEnv {
   delete env.CLAWSWEEPER_CRABFLEET_SERVICE_TOKEN;
   delete env.CLAWSWEEPER_CRABFLEET_RUNNER_PTY_URL;
   delete env.CLAWSWEEPER_CRABFLEET_WORK_STATE_URL;
+  for (const key of CODEX_ACTIONS_CREDENTIAL_ENV) delete env[key];
   for (const key of Object.keys(env)) {
-    if (/^CLAWSWEEPER_.*GH_TOKEN$/.test(key)) delete env[key];
+    if (
+      (/^CLAWSWEEPER_.*GH_TOKEN$/.test(key) || CODEX_SENSITIVE_ENV_NAME.test(key)) &&
+      !(options.preserveCodexAuth && CODEX_AUTH_ENV.has(key))
+    ) {
+      delete env[key];
+    }
   }
   if (!options.preserveCodexAuth) {
     delete env.OPENAI_API_KEY;
@@ -89,4 +106,15 @@ export function codexEnv(options: CodexEnvOptions = {}): NodeJS.ProcessEnv {
   if (ghToken) env.GH_TOKEN = ghToken;
   env.GIT_OPTIONAL_LOCKS = "0";
   return env;
+}
+
+export function codexSensitiveEnvValues(env: NodeJS.ProcessEnv = process.env): string[] {
+  return [
+    ...new Set(
+      Object.entries(env)
+        .filter(([name]) => CODEX_SENSITIVE_ENV_NAME.test(name))
+        .map(([, value]) => String(value ?? "").trim())
+        .filter((value) => value.length >= 6),
+    ),
+  ].sort((left, right) => right.length - left.length);
 }

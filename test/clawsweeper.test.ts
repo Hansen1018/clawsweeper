@@ -2765,6 +2765,12 @@ test("codex subprocess env strips GitHub and App credentials", () => {
     process.env.CLAWSWEEPER_CRABFLEET_SERVICE_TOKEN = "service";
     process.env.CLAWSWEEPER_CRABFLEET_RUNNER_PTY_URL = "wss://example.invalid/secret";
     process.env.CLAWSWEEPER_CRABFLEET_WORK_STATE_URL = "https://example.invalid/secret";
+    process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN = "oidc-token";
+    process.env.ACTIONS_ID_TOKEN_REQUEST_URL = "https://example.invalid/oidc";
+    process.env.ACTIONS_RESULTS_URL = "https://example.invalid/results";
+    process.env.ACTIONS_RUNTIME_TOKEN = "runtime-token";
+    process.env.ACTIONS_RUNTIME_URL = "https://example.invalid/runtime";
+    process.env.TEST_SECRET = "ambient-secret";
     process.env.OPENAI_API_KEY = "openai";
     process.env.CODEX_API_KEY = "codex";
 
@@ -2781,6 +2787,12 @@ test("codex subprocess env strips GitHub and App credentials", () => {
     assert.equal(env.CLAWSWEEPER_CRABFLEET_SERVICE_TOKEN, undefined);
     assert.equal(env.CLAWSWEEPER_CRABFLEET_RUNNER_PTY_URL, undefined);
     assert.equal(env.CLAWSWEEPER_CRABFLEET_WORK_STATE_URL, undefined);
+    assert.equal(env.ACTIONS_ID_TOKEN_REQUEST_TOKEN, undefined);
+    assert.equal(env.ACTIONS_ID_TOKEN_REQUEST_URL, undefined);
+    assert.equal(env.ACTIONS_RESULTS_URL, undefined);
+    assert.equal(env.ACTIONS_RUNTIME_TOKEN, undefined);
+    assert.equal(env.ACTIONS_RUNTIME_URL, undefined);
+    assert.equal(env.TEST_SECRET, undefined);
     assert.equal(env.OPENAI_API_KEY, undefined);
     assert.equal(env.CODEX_API_KEY, undefined);
     assert.equal(env.GIT_OPTIONAL_LOCKS, "0");
@@ -2804,6 +2816,29 @@ test("codex subprocess env can expose an explicit read-only GitHub token", () =>
     assert.equal(env.COMMIT_SWEEPER_TARGET_GH_TOKEN, undefined);
     assert.equal(env.CLAWSWEEPER_PROOF_INSPECTION_TOKEN, undefined);
     assert.equal(env.GIT_OPTIONAL_LOCKS, "0");
+  } finally {
+    process.env = originalEnv;
+  }
+});
+
+test("codex subprocess env preserves only explicit local Codex auth", () => {
+  const originalEnv = { ...process.env };
+  try {
+    process.env.OPENAI_API_KEY = "openai-local";
+    process.env.CODEX_API_KEY = "codex-local";
+    process.env.CODEX_ACCESS_TOKEN = "codex-access-local";
+    process.env.GH_TOKEN = "github-secret";
+    process.env.ACTIONS_RUNTIME_TOKEN = "actions-secret";
+    process.env.TEST_SECRET = "ambient-secret";
+
+    const env = codexEnv({ preserveCodexAuth: true });
+
+    assert.equal(env.OPENAI_API_KEY, "openai-local");
+    assert.equal(env.CODEX_API_KEY, "codex-local");
+    assert.equal(env.CODEX_ACCESS_TOKEN, "codex-access-local");
+    assert.equal(env.GH_TOKEN, undefined);
+    assert.equal(env.ACTIONS_RUNTIME_TOKEN, undefined);
+    assert.equal(env.TEST_SECRET, undefined);
   } finally {
     process.env = originalEnv;
   }

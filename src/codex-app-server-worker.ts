@@ -61,14 +61,17 @@ interface RpcMessage {
 
 const options = JSON.parse(readFileSync(process.argv[2] ?? "", "utf8")) as WorkerOptions;
 const execOptions = parseExecOptions(options.args, process.cwd());
-const prompt = await readStdin();
+const input = readWorkerInput(await readStdin());
+const prompt = input.prompt;
 const stdout = openCodexOutputCapture(options.stdoutPath, {
   maxFileBytes: options.maxOutputFileBytes,
   tailBytes: options.tailBytes,
+  redactValues: input.redactValues,
 });
 const stderr = openCodexOutputCapture(options.stderrPath, {
   maxFileBytes: options.maxOutputFileBytes,
   tailBytes: options.tailBytes,
+  redactValues: input.redactValues,
 });
 process.env.CODEX_BIN = options.command;
 const child = spawnCodex(
@@ -548,6 +551,16 @@ function readStdin(): Promise<string> {
     process.stdin.once("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
     process.stdin.once("error", reject);
   });
+}
+
+function readWorkerInput(raw: string): { prompt: string; redactValues: string[] } {
+  const value = JSON.parse(raw) as { input?: unknown; redactValues?: unknown };
+  return {
+    prompt: typeof value.input === "string" ? value.input : "",
+    redactValues: Array.isArray(value.redactValues)
+      ? value.redactValues.filter((entry): entry is string => typeof entry === "string")
+      : [],
+  };
 }
 
 function errorMessage(error: unknown): string {

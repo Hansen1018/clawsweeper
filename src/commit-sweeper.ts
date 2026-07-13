@@ -8,6 +8,7 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  rmSync,
   writeFileSync,
 } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
@@ -21,7 +22,13 @@ import {
 import { publishCheckFromReport, splitFrontMatter } from "./commit-checks.js";
 import { argBool, argNumber, argString, parseArgs, type Args } from "./clawsweeper-args.js";
 import { safeOutputTail } from "./clawsweeper-text.js";
-import { codexEnv, codexLoginConfig, codexModelArgs, PUBLIC_CODEX_MODEL } from "./codex-env.js";
+import {
+  codexEnv,
+  codexLoginConfig,
+  codexModelArgs,
+  codexSensitiveEnvValues,
+  PUBLIC_CODEX_MODEL,
+} from "./codex-env.js";
 import {
   codexProcessErrorCode,
   runCodexProcess,
@@ -337,6 +344,8 @@ function runCodex(options: {
   const outputPath = join(options.workDir, `${options.sha}.md`);
   const stdoutPath = join(options.workDir, `${options.sha}.jsonl`);
   const stderrPath = join(options.workDir, `${options.sha}.stderr.log`);
+  const rawOutputDir = mkdtempSync(join(tmpdir(), "clawsweeper-commit-review-output-"));
+  const rawOutputPath = join(rawOutputDir, `${options.sha}.md`);
   writeFileSync(
     promptPath,
     promptForCommit({
@@ -366,29 +375,47 @@ function runCodex(options: {
     eventIdentity: { sha: options.sha },
   });
   if (options.serviceTier) codexConfig.splice(1, 0, `service_tier="${options.serviceTier}"`);
-  const processEnv = codexEnv({ ghToken: process.env.COMMIT_SWEEPER_TARGET_GH_TOKEN });
-  const redactionSecrets = commitReviewRedactionSecrets(processEnv);
-  const rawResult = runCodexProcess({
-    args: [
-      "exec",
-      ...codexModelArgs(options.model),
-      ...codexConfig.flatMap((config) => ["-c", config]),
-      "-C",
-      options.targetDir,
-      "--output-last-message",
-      outputPath,
-      "--json",
-      "--sandbox",
-      options.sandboxMode,
-      "-",
-    ],
-    cwd: options.targetDir,
-    env: processEnv,
-    input: readFileSync(promptPath, "utf8"),
-    stdoutPath,
-    stderrPath,
-    timeoutMs: options.timeoutMs,
-  });
+  const processEnv = codexEnv();
+  const redactionSecrets = [
+    ...new Set([
+      ...codexSensitiveEnvValues(process.env),
+      String(process.env.CLAWSWEEPER_INTERNAL_MODEL ?? "").trim(),
+    ]),
+  ].filter((value) => value.length >= 6);
+  let rawResult: CodexProcessResult;
+  try {
+    rawResult = runCodexProcess({
+      args: [
+        "exec",
+        ...codexModelArgs(options.model),
+        ...codexConfig.flatMap((config) => ["-c", config]),
+        "-C",
+        options.targetDir,
+        "--output-last-message",
+        rawOutputPath,
+        "--json",
+        "--sandbox",
+        options.sandboxMode,
+        "-",
+      ],
+      cwd: options.targetDir,
+      env: processEnv,
+      input: readFileSync(promptPath, "utf8"),
+      stdoutPath,
+      stderrPath,
+      timeoutMs: options.timeoutMs,
+      redactValues: redactionSecrets,
+    });
+    if (existsSync(rawOutputPath)) {
+      writeFileSync(
+        outputPath,
+        redactCommitReviewText(readFileSync(rawOutputPath, "utf8"), redactionSecrets),
+        "utf8",
+      );
+    }
+  } finally {
+    rmSync(rawOutputDir, { recursive: true, force: true });
+  }
   for (const artifactPath of [promptPath, outputPath, stdoutPath, stderrPath]) {
     redactCommitReviewFile(artifactPath, redactionSecrets);
   }
@@ -448,24 +475,6 @@ function runCodex(options: {
     eventIdentity: { sha: options.sha },
   });
   return stripMarkdownFence(readFileSync(outputPath, "utf8"));
-}
-
-const COMMIT_REVIEW_SECRET_ENV = [
-  "COMMIT_SWEEPER_TARGET_GH_TOKEN",
-  "GH_TOKEN",
-  "GITHUB_TOKEN",
-  "GH_ENTERPRISE_TOKEN",
-  "GITHUB_ENTERPRISE_TOKEN",
-] as const;
-
-function commitReviewRedactionSecrets(env: NodeJS.ProcessEnv): string[] {
-  return [
-    ...new Set(
-      COMMIT_REVIEW_SECRET_ENV.map((name) => String(env[name] ?? "").trim()).filter(
-        (value) => value.length >= 6,
-      ),
-    ),
-  ].sort((left, right) => right.length - left.length);
 }
 
 function redactCommitReviewText(value: string, secrets: readonly string[]): string {
