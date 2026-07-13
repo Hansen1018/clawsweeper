@@ -237,6 +237,69 @@ test("failed-run self-heal restores both gates after receipt failure and dispatc
   }
 });
 
+test("failed-run self-heal restores absent and empty gate state exactly", () => {
+  const fixture = createSelfHealFixture("cleanup-exact-state", "autonomous");
+  try {
+    writeRunRecord(fixture.runsDir, fixture.runId, {
+      source_job: fixture.jobPath,
+      source_state_revision: fixture.originalRevision,
+      source_job_sha256: fixture.originalDigest,
+      mode: "autonomous",
+    });
+    fs.writeFileSync(
+      fixture.variablesFixture,
+      `${JSON.stringify([{ name: "CLAWSWEEPER_ALLOW_FIX_PR", value: "" }])}\n`,
+    );
+    const headSha = execFileSync("git", ["rev-parse", "origin/main"], {
+      encoding: "utf8",
+    }).trim();
+    fs.writeFileSync(
+      fixture.postDispatchRunListFixture,
+      `${JSON.stringify([
+        {
+          databaseId: 920101,
+          workflowName: "repair cluster worker",
+          displayTitle: `repair cluster ${fixture.jobPath} (${fixture.originalDigest})`,
+          headSha,
+          status: "in_progress",
+          conclusion: null,
+          createdAt: new Date(Date.now() + 60_000).toISOString(),
+          updatedAt: new Date(Date.now() + 60_000).toISOString(),
+          url: "https://github.test/actions/runs/920101",
+        },
+      ])}\n`,
+    );
+
+    const result = runSelfHealProcess(fixture, {
+      args: ["--execute", "--open-execute-window"],
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    const gateMutations = fs
+      .readFileSync(fixture.commandLogPath, "utf8")
+      .split("\n")
+      .filter(
+        (command) => command.startsWith("variable set ") || command.startsWith("variable delete "),
+      );
+    assert.deepEqual(
+      gateMutations.map((command) => command.trimEnd()),
+      [
+        "variable set CLAWSWEEPER_ALLOW_EXECUTE --repo openclaw/clawsweeper --body 1",
+        "variable set CLAWSWEEPER_ALLOW_FIX_PR --repo openclaw/clawsweeper --body 1",
+        "variable set CLAWSWEEPER_ALLOW_FIX_PR --repo openclaw/clawsweeper --body",
+        "variable delete CLAWSWEEPER_ALLOW_EXECUTE --repo openclaw/clawsweeper",
+      ],
+    );
+    assert.equal(fs.existsSync(fixture.selfHealLedgerPath), true);
+    assert.doesNotMatch(
+      fs.readFileSync("src/repair/self-heal-failed-runs.ts", "utf8"),
+      /ledger[-_]path/,
+    );
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
 test("failed-run self-heal preserves a durable gate-downgraded effective mode", () => {
   const fixture = createSelfHealFixture("downgraded", "autonomous");
   try {
@@ -713,7 +776,7 @@ function createSelfHealFixture(label: string, originalMode: "plan" | "autonomous
   const runJobsFixture = path.join(root, "run-jobs.json");
   const variablesFixture = path.join(root, "variables.json");
   const commandLogPath = path.join(root, "gh-commands.log");
-  const selfHealLedgerPath = path.join(root, "self-heal-ledger.json");
+  const selfHealLedgerPath = path.join(root, "self-heal.json");
   fs.writeFileSync(runListFixture, "[]\n");
   fs.writeFileSync(postDispatchRunListFixture, "[]\n");
   fs.writeFileSync(runJobsFixture, '{"jobs":[]}\n');
@@ -773,8 +836,6 @@ function runSelfHealProcess(
       path.resolve("dist/repair/self-heal-failed-runs.js"),
       "--runs-dir",
       fixture.runsDir,
-      "--ledger-path",
-      fixture.selfHealLedgerPath,
       "--max-age-hours",
       "24",
       ...(options.args ?? []),
@@ -960,6 +1021,9 @@ if [ "$1" = "variable" ] && [ "$2" = "list" ]; then
   exit 0
 fi
 if [ "$1" = "variable" ] && [ "$2" = "set" ]; then
+  exit 0
+fi
+if [ "$1" = "variable" ] && [ "$2" = "delete" ]; then
   exit 0
 fi
 if [ "$1" = "workflow" ] && [ "$2" = "run" ]; then

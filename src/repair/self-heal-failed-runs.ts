@@ -60,9 +60,14 @@ type RunRecordProvenance = {
   stateRevision: string;
 };
 
+type GateState = {
+  exists: boolean;
+  value: string;
+};
+
 type GateRestore = {
   name: string;
-  previous: JsonValue;
+  previous: GateState;
 };
 
 type GateCleanupFailure = {
@@ -96,11 +101,6 @@ const allowRepeat = Boolean(args["allow-repeat"]);
 const requestedMode = typeof args.mode === "string" ? args.mode : null;
 const runRecordsDir = path.resolve(
   String(args["runs-dir"] ?? args.runs_dir ?? path.join(repoRoot(), "results", "runs")),
-);
-const selfHealLedgerFile = path.resolve(
-  String(
-    args["ledger-path"] ?? args.ledger_path ?? path.join(repoRoot(), "results", "self-heal.json"),
-  ),
 );
 const skippedCandidates: LooseRecord[] = [];
 
@@ -971,7 +971,7 @@ function writeSelfHealLedger(ledger: LooseRecord) {
 }
 
 function selfHealLedgerPath() {
-  return selfHealLedgerFile;
+  return path.join(path.dirname(runRecordsDir), "self-heal.json");
 }
 
 function listClusterRuns() {
@@ -1002,13 +1002,17 @@ function readFixGate() {
 }
 
 function openGate(name: string) {
-  const previous = readGate(name);
+  const previous = readMutableGateState(name);
   gateRestores.push({ name, previous });
-  if (previous !== "1") setGate(name, "1");
+  if (!previous.exists || previous.value !== "1") setGate(name, "1");
 }
 
-function readGate(name: string) {
-  return readGateValue(name, { preferEnv: false });
+function readMutableGateState(name: string): GateState {
+  const variables = readRepoVariables({ required: true });
+  const variable = variables.find((candidate: JsonValue) => candidate.name === name);
+  return variable
+    ? { exists: true, value: String(variable.value ?? "") }
+    : { exists: false, value: "" };
 }
 
 function readGateValue(name: string, { preferEnv }: { preferEnv: boolean }) {
@@ -1018,12 +1022,17 @@ function readGateValue(name: string, { preferEnv }: { preferEnv: boolean }) {
   return variables.find((variable: JsonValue) => variable.name === name)?.value ?? envValue ?? "";
 }
 
-function readRepoVariables() {
+function readRepoVariables({ required = false }: { required?: boolean } = {}) {
   try {
     return ghJson<LooseRecord[]>(["variable", "list", "--repo", repo, "--json", "name,value"]);
   } catch (error) {
     const detail = ghErrorText(error);
     if (/HTTP 403|Resource not accessible by integration/i.test(detail)) {
+      if (required) {
+        throw new Error(
+          `cannot read repository variables before opening temporary execution gates: ${detail}`,
+        );
+      }
       console.warn("self-heal: cannot read repo variables; falling back to workflow env");
       return [];
     }
@@ -1049,7 +1058,7 @@ function restoreOpenedGates(): {
   const receiptFailures: GateCleanupFailure[] = [];
   const restoreFailures: GateCleanupFailure[] = [];
   for (const gate of [...gateRestores].reverse()) {
-    const result = restoreGate(gate.name, gate.previous || "1");
+    const result = restoreGate(gate.name, gate.previous);
     if (result.receiptError !== null) {
       receiptFailures.push({ name: gate.name, error: result.receiptError });
     }
@@ -1062,20 +1071,26 @@ function restoreOpenedGates(): {
 
 function restoreGate(
   name: string,
-  value: JsonValue,
+  state: GateState,
 ): { receiptError: unknown | null; restoreError: unknown | null } {
-  const normalizedValue = String(value ?? "");
+  const receiptState = state.exists ? `set:${state.value}` : "delete";
   let restoreStarted = false;
   let restoreCompleted = false;
   try {
-    runRepairMutation(selfHealGateLifecycle(name, normalizedValue), {
+    runRepairMutation(selfHealGateLifecycle(name, receiptState), {
       kind: "repository_variable_update",
       operationName: "failed_run_self_heal",
       component: "failed_run_self_heal_gate",
-      identity: { repository: repo, name, value: normalizedValue, batchId },
+      identity: {
+        repository: repo,
+        name,
+        exists: state.exists,
+        value: state.value,
+        batchId,
+      },
       operation: () => {
         restoreStarted = true;
-        const result = writeGateValue(name, normalizedValue);
+        const result = writeGateState(name, state);
         restoreCompleted = true;
         return result;
       },
@@ -1085,12 +1100,19 @@ function restoreGate(
     if (restoreCompleted) return { receiptError: error, restoreError: null };
     if (restoreStarted) return { receiptError: null, restoreError: error };
     try {
-      writeGateValue(name, normalizedValue);
+      writeGateState(name, state);
       return { receiptError: error, restoreError: null };
     } catch (restoreError) {
       return { receiptError: error, restoreError };
     }
   }
+}
+
+function writeGateState(name: string, state: GateState): string {
+  if (state.exists) return writeGateValue(name, state.value);
+  const result = ghText(["variable", "delete", name, "--repo", repo]);
+  console.log(`${name}=<absent>`);
+  return result;
 }
 
 function writeGateValue(name: string, value: string): string {
