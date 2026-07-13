@@ -424,8 +424,9 @@ test("exact event publish and routing require a successful fresh review artifact
   );
   assert.match(releaseUnsuccessfulStep, /clawsweeper-review-lease item=\$ITEM_NUMBER/);
   assert.match(releaseUnsuccessfulStep, /owner=\$LEASE_OWNER/);
-  assert.match(releaseUnsuccessfulStep, /issues\/comments\/\$lease_id/);
-  assert.match(releaseUnsuccessfulStep, /--method DELETE/);
+  assert.match(releaseUnsuccessfulStep, /sweep-mutation-cli\.js comment delete/);
+  assert.match(releaseUnsuccessfulStep, /--comment-id "\$lease_id"/);
+  assert.doesNotMatch(releaseUnsuccessfulStep, /gh api -X DELETE|--method DELETE/);
   assert.match(publisher, /"--event-apply-proof"/);
   assert.match(publisher, /exactEventApplyProof\(/);
   assert.match(publisher, /const requeueLatestExpected = applyDisposition === "source_drift"/);
@@ -479,11 +480,16 @@ test("exact event publish and routing require a successful fresh review artifact
     deferredRouteStep,
     /steps\.publish-event-result\.outputs\.routing_deferred == 'true'/,
   );
-  assert.match(deferredRouteStep, /gh workflow run repair-comment-router\.yml/);
-  assert.match(deferredRouteStep, /-f execute=true/);
-  assert.match(deferredRouteStep, /-f target_repo="\$TARGET_REPO"/);
-  assert.match(deferredRouteStep, /-f target_branch="\$TARGET_BRANCH"/);
-  assert.doesNotMatch(deferredRouteStep, /-f item_numbers=/);
+  assert.match(deferredRouteStep, /sweep-mutation-cli\.js workflow dispatch/);
+  assert.match(deferredRouteStep, /--workflow repair-comment-router\.yml/);
+  assert.match(
+    deferredRouteStep,
+    /--business-key "exact-verdict-router:\$GITHUB_RUN_ID:\$ITEM_NUMBER"/,
+  );
+  assert.match(deferredRouteStep, /--field execute=true/);
+  assert.match(deferredRouteStep, /--field target_repo="\$TARGET_REPO"/);
+  assert.match(deferredRouteStep, /--field target_branch="\$TARGET_BRANCH"/);
+  assert.doesNotMatch(deferredRouteStep, /--field item_numbers=/);
   assert.match(
     routerWorkflow,
     /format\('repair-comment-router-\{0\}', github\.event\.inputs\.target_repo \|\| github\.event\.client_payload\.target_repo \|\| 'openclaw\/openclaw'\)/,
@@ -553,8 +559,12 @@ test("exact event publish and routing require a successful fresh review artifact
   assert.doesNotMatch(releaseLeaseStep, /terminal_missing/);
   assert.doesNotMatch(releaseLeaseStep, /steps\.live-item\.outputs\.proceed == 'false'/);
   assert.match(releaseLeaseStep, /clawsweeper-review-lease item=\$ITEM_NUMBER/);
-  assert.match(releaseLeaseStep, /--method DELETE/);
+  assert.match(releaseLeaseStep, /sweep-mutation-cli\.js comment delete/);
+  assert.match(releaseLeaseStep, /--comment-id "\$lease_id"/);
   assert.match(releaseLeaseStep, /reactions\?content=eyes/);
+  assert.match(releaseLeaseStep, /sweep-mutation-cli\.js reaction delete/);
+  assert.match(releaseLeaseStep, /--reaction-id "\$reaction_id"/);
+  assert.doesNotMatch(releaseLeaseStep, /gh api -X DELETE|--method DELETE/);
   assert.match(releaseLeaseStep, /Removed terminal eyes reaction/);
   assert.ok(releaseLeaseStep.indexOf("lease_ids=") < releaseLeaseStep.indexOf('test "$(gh api'));
   assert.match(confirmTerminalStep, /steps\.release-terminal-review-leases\.outcome == 'success'/);
@@ -791,9 +801,10 @@ test("publish workflow dispatches immediate apply through the isolated lane", ()
   assert.doesNotMatch(dispatchCondition, /sync-selected-review-comments\.outcome/);
   assert.doesNotMatch(dispatchCondition, /finalize-selected-review-comment-action-ledger/);
   assert.doesNotMatch(dispatchCondition, /publish-selected-review-comment-action-ledger/);
-  assert.match(dispatchStep, /gh workflow run sweep\.yml/);
-  assert.match(dispatchStep, /-f apply_existing=true/);
-  assert.match(dispatchStep, /-f apply_item_numbers="\$item_numbers"/);
+  assert.match(dispatchStep, /sweep-mutation-cli\.js workflow dispatch/);
+  assert.match(dispatchStep, /--business-key "isolated-apply:\$GITHUB_RUN_ID"/);
+  assert.match(dispatchStep, /--field apply_existing=true/);
+  assert.match(dispatchStep, /--field apply_item_numbers="\$item_numbers"/);
   assert.match(
     publishJob,
     /group: clawsweeper-target-review-publish-\$\{\{ needs\.plan\.outputs\.target_repo \}\}/,
@@ -802,18 +813,18 @@ test("publish workflow dispatches immediate apply through the isolated lane", ()
   assert.match(publishJob, /queue: max/);
 });
 
-test("selected comment sync finalizes interrupted receipts before publication", () => {
+test("sweep caller mutations finalize interrupted receipts before publication", () => {
   const workflow = readText(".github/workflows/sweep.yml");
   const publishJobStart = workflow.indexOf("\n  publish:");
   const recoverJobStart = workflow.indexOf("\n  recover-review-failures:", publishJobStart);
   const publishJob = workflow.slice(publishJobStart, recoverJobStart);
   const syncStart = publishJob.indexOf("- name: Sync selected review comments");
-  const finalizerStart = publishJob.indexOf(
-    "- name: Finalize selected review comment action ledger",
+  const dispatchStart = publishJob.indexOf(
+    "- name: Dispatch selected safe close proposals to isolated apply",
   );
-  const publicationStart = publishJob.indexOf(
-    "- name: Publish selected review comment action ledger",
-  );
+  const continueStart = publishJob.indexOf("- name: Continue sweep");
+  const finalizerStart = publishJob.indexOf("- name: Finalize sweep caller action ledger");
+  const publicationStart = publishJob.indexOf("- name: Publish sweep caller action ledger");
   const primarySyncSuccess = publishJob.indexOf(
     'echo "sync_succeeded=true" >> "$GITHUB_OUTPUT"',
     syncStart,
@@ -823,7 +834,9 @@ test("selected comment sync finalizes interrupted receipts before publication", 
   assert.ok(syncStart >= 0);
   assert.ok(primarySyncSuccess > syncStart);
   assert.ok(statusPublishStart > primarySyncSuccess);
-  assert.ok(finalizerStart > syncStart);
+  assert.ok(dispatchStart > syncStart);
+  assert.ok(continueStart > dispatchStart);
+  assert.ok(finalizerStart > continueStart);
   assert.ok(publicationStart > finalizerStart);
   assert.match(
     publishJob.slice(syncStart, finalizerStart),
@@ -835,7 +848,7 @@ test("selected comment sync finalizes interrupted receipts before publication", 
   );
   assert.match(
     publishJob.slice(publicationStart, publicationStart + 400),
-    /steps\.finalize-selected-review-comment-action-ledger\.outcome == 'success'/,
+    /steps\.finalize-sweep-caller-action-ledger\.outcome == 'success'/,
   );
 });
 
@@ -1384,8 +1397,10 @@ test("apply workflow bounds checkpoints and requeues with a fresh token", () => 
   assert.match(continueStep, /APPLY_CONTINUATION_BLOCKED/);
   assert.match(continueStep, /existing default cursor run will continue the lane/);
   assert.match(continueStep, /already covered by \$/);
-  assert.match(continueStep, /-f apply_item_numbers="\$APPLY_ITEM_NUMBERS"/);
-  assert.doesNotMatch(continueStep, /-f item_numbers=/);
+  assert.match(continueStep, /sweep-mutation-cli\.js workflow dispatch/);
+  assert.match(continueStep, /--business-key "apply-continuation:\$GITHUB_RUN_ID"/);
+  assert.match(continueStep, /--field apply_item_numbers="\$APPLY_ITEM_NUMBERS"/);
+  assert.doesNotMatch(continueStep, /--field item_numbers=/);
   assert.doesNotMatch(continueStep, /APPLY_CLOSED_TOTAL:-0.*APPLY_LIMIT:-0/);
 });
 
@@ -1396,15 +1411,18 @@ test("apply workflow finalization retries only target status after checkpointed 
     "- name: Apply unchanged proposed decisions with checkpoints",
   );
   const finalStatusStart = applyJob.indexOf("- name: Retry final apply status publication");
-  const actionLedgerStart = applyJob.indexOf("- name: Publish apply action events");
   const continueStart = applyJob.indexOf("- name: Continue apply sweep");
+  const finalizerStart = applyJob.indexOf("- name: Finalize apply action ledger");
+  const actionLedgerStart = applyJob.indexOf("- name: Publish apply action events");
   assert.ok(applyStart !== -1);
   assert.ok(finalStatusStart > applyStart);
-  assert.ok(actionLedgerStart > finalStatusStart);
-  assert.ok(continueStart > actionLedgerStart);
+  assert.ok(continueStart > finalStatusStart);
+  assert.ok(finalizerStart > continueStart);
+  assert.ok(actionLedgerStart > finalizerStart);
   const applyStep = applyJob.slice(applyStart, finalStatusStart);
-  const finalStatusStep = applyJob.slice(finalStatusStart, actionLedgerStart);
-  const actionLedgerStep = applyJob.slice(actionLedgerStart, continueStart);
+  const finalStatusStep = applyJob.slice(finalStatusStart, continueStart);
+  const finalizerStep = applyJob.slice(finalizerStart, actionLedgerStart);
+  const actionLedgerStep = applyJob.slice(actionLedgerStart);
 
   const commentCheckpoint = applyStep.indexOf(
     'publish_changes "chore: sync sweep review comments checkpoint $checkpoint" records apply-report.json results/comment-sync-cursors',
@@ -1438,6 +1456,7 @@ test("apply workflow finalization retries only target status after checkpointed 
   assert.doesNotMatch(finalStatusStep, /--path\s+"?records(?:\/|\s)/);
   assert.doesNotMatch(finalStatusStep, /apply-report\.json/);
   assert.doesNotMatch(finalStatusStep, /results\/(?:apply|comment-sync)-cursors/);
+  assert.match(finalizerStep, /finalize-action-events/);
   assert.match(actionLedgerStep, /publish-action-events/);
   assert.doesNotMatch(actionLedgerStep, /action-ledger-proof/);
   assert.match(actionLedgerStep, /CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT/);
@@ -1752,11 +1771,14 @@ test("event review completion removes ClawSweeper eyes reaction", () => {
     workflow.indexOf("\n\n  plan:"),
   );
 
-  assert.match(block, /-f content="\+1"/);
+  assert.match(block, /sweep-mutation-cli\.js reaction add/);
+  assert.match(block, /--content \+1/);
   assert.match(block, /-f content="eyes"/);
-  assert.match(block, /repos\/\$TARGET_REPO\/issues\/\$ITEM_NUMBER\/reactions\/\$reaction_id/);
+  assert.match(block, /sweep-mutation-cli\.js reaction delete/);
+  assert.match(block, /--reaction-id "\$reaction_id"/);
   assert.match(block, /"openclaw-clawsweeper\[bot\]"/);
   assert.doesNotMatch(block, /issues\/comments\/\$ITEM_NUMBER\/reactions/);
+  assert.doesNotMatch(block, /gh api -X DELETE/);
 });
 
 test("event re-review status lets the durable queue reconcile interruptions", () => {
@@ -1989,17 +2011,22 @@ test("sweep review continuations stay workflow-dispatch compatible", () => {
   const workflow = readText(".github/workflows/sweep.yml");
   const continueBlock = workflow.slice(
     workflow.indexOf("- name: Continue sweep"),
-    workflow.indexOf("\n\n  recover-review-failures:"),
+    workflow.indexOf("- name: Finalize sweep caller action ledger"),
   );
   const recoveryBlock = workflow.slice(
-    workflow.indexOf("args=(\n            workflow run sweep.yml"),
-    workflow.indexOf("\n\n  audit-dashboard:"),
+    workflow.indexOf("- name: Requeue planned review items once"),
+    workflow.indexOf("- name: Finalize review recovery action ledger"),
   );
 
   for (const block of [continueBlock, recoveryBlock]) {
-    assert.match(block, /-f target_repo="\$\{\{ needs\.plan\.outputs\.target_repo \}\}"/);
-    assert.match(block, /-f target_branch="\$\{\{ needs\.plan\.outputs\.target_branch \}\}"/);
+    assert.match(block, /sweep-mutation-cli\.js workflow dispatch/);
+    assert.match(block, /--workflow sweep\.yml/);
+    assert.match(block, /--target-repo "\$\{\{ needs\.plan\.outputs\.target_repo \}\}"/);
+    assert.match(block, /--field target_repo="\$\{\{ needs\.plan\.outputs\.target_repo \}\}"/);
+    assert.match(block, /--field target_branch="\$\{\{ needs\.plan\.outputs\.target_branch \}\}"/);
   }
+  assert.match(continueBlock, /--business-key "sweep-continuation:\$GITHUB_RUN_ID"/);
+  assert.match(recoveryBlock, /--business-key "review-recovery:\$GITHUB_RUN_ID"/);
 });
 
 test("target sweep dispatches preserve disabled ClawHub guard", () => {
