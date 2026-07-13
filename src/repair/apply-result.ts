@@ -839,7 +839,64 @@ function applyMergeAction({
     };
   }
   if (!confirmation.mergedAt) {
-    const pendingReason = exactHeadRestPendingMergeReason(merged, authorizedHeadSha);
+    const restHeadBindingBlock = validatePullRequestHeadBinding({
+      authorizedHeadSha,
+      pullRequest: merged,
+    });
+    if (restHeadBindingBlock) {
+      return {
+        ...base,
+        status: "blocked",
+        reason: restHeadBindingBlock,
+        live_state: merged.state ?? live.state,
+        live_updated_at: merged.updated_at ?? live.updated_at,
+        merge_method: "squash",
+      };
+    }
+
+    let reconciledView;
+    try {
+      reconciledView = fetchPullRequestViewOnce(result.repo, target);
+    } catch (error) {
+      return {
+        ...base,
+        status: "blocked",
+        reason: `merge outcome could not be reconciled from GitHub GraphQL: ${ghErrorText(error)}`,
+        live_state: merged.state ?? live.state,
+        live_updated_at: merged.updated_at ?? live.updated_at,
+        merge_method: "squash",
+        requeue_required: true,
+      };
+    }
+    const reconciledHeadBindingBlock = validateMergeHeadBinding({
+      authorizedHeadSha,
+      view: reconciledView,
+    });
+    if (reconciledHeadBindingBlock) {
+      return {
+        ...base,
+        status: "blocked",
+        reason: reconciledHeadBindingBlock,
+        live_state: merged.state ?? live.state,
+        live_updated_at: merged.updated_at ?? live.updated_at,
+        merge_method: "squash",
+      };
+    }
+    const reconciledHardMergeBlock = validateMergeablePullRequestHard({
+      pullRequest: merged,
+      view: reconciledView,
+    });
+    if (reconciledHardMergeBlock) {
+      return {
+        ...base,
+        status: "blocked",
+        reason: reconciledHardMergeBlock,
+        live_state: merged.state ?? live.state,
+        live_updated_at: merged.updated_at ?? live.updated_at,
+        merge_method: "squash",
+      };
+    }
+    const pendingReason = exactHeadPendingMerge(reconciledView, authorizedHeadSha);
     if (pendingReason) {
       return pendingMergeAction({
         base,
@@ -903,6 +960,26 @@ function validateMergeHeadBinding({
   return "";
 }
 
+function validatePullRequestHeadBinding({
+  authorizedHeadSha,
+  pullRequest,
+}: {
+  authorizedHeadSha: string;
+  pullRequest: LooseRecord;
+}): string {
+  if (!isFullCommitSha(authorizedHeadSha)) {
+    return "pull request head is missing or malformed for exact merge binding";
+  }
+  const pullRequestHeadSha = String(pullRequest.head?.sha ?? "");
+  if (!isFullCommitSha(pullRequestHeadSha)) {
+    return "pull request REST head is missing or malformed for exact merge binding";
+  }
+  if (pullRequestHeadSha !== authorizedHeadSha) {
+    return "pull request REST head changed during merge reconciliation";
+  }
+  return "";
+}
+
 function confirmExactMergeSnapshot(
   pullRequest: LooseRecord,
   authorizedHeadSha: string,
@@ -930,20 +1007,6 @@ function exactHeadPendingMerge(view: LooseRecord, authorizedHeadSha: string): st
   }
   if (view.autoMergeRequest) {
     return "auto-merge is pending for the authorized pull request head";
-  }
-  return "";
-}
-
-function exactHeadRestPendingMergeReason(
-  pullRequest: LooseRecord,
-  authorizedHeadSha: string,
-): string {
-  if (String(pullRequest.head?.sha ?? "") !== authorizedHeadSha) return "";
-  if (pullRequest.auto_merge) {
-    return "auto-merge is pending for the authorized pull request head";
-  }
-  if (String(pullRequest.mergeable_state ?? "").toLowerCase() === "queued") {
-    return "merge is pending in GitHub's merge queue for the authorized pull request head";
   }
   return "";
 }
@@ -1777,6 +1840,8 @@ function validateMergeablePullRequestHard({ pullRequest, view }: LooseRecord) {
   if (["CHANGES_REQUESTED", "REVIEW_REQUIRED"].includes(String(view.reviewDecision ?? ""))) {
     return `review decision is ${view.reviewDecision}`;
   }
+  const terminalCheckBlock = validateTerminalStatusChecks(view.statusCheckRollup ?? []);
+  if (terminalCheckBlock) return terminalCheckBlock;
   return "";
 }
 
@@ -1795,6 +1860,8 @@ function validateMergeablePullRequestReadiness({
 
 function validateStatusChecks(checks: LooseRecord[]) {
   if (!Array.isArray(checks) || checks.length === 0) return "no PR checks found";
+  const terminalBlock = validateTerminalStatusChecks(checks);
+  if (terminalBlock) return terminalBlock;
   const blockers: LooseRecord[] = [];
   for (const check of checks) {
     const name = check.name ?? check.context ?? "unknown check";
@@ -1809,6 +1876,34 @@ function validateStatusChecks(checks: LooseRecord[]) {
     }
   }
   if (blockers.length > 0) return `checks are not clean: ${blockers.slice(0, 5).join(", ")}`;
+  return "";
+}
+
+function validateTerminalStatusChecks(checks: LooseRecord[]) {
+  if (!Array.isArray(checks)) return "";
+  const blockers: string[] = [];
+  for (const check of checks) {
+    const name = check.name ?? check.context ?? "unknown check";
+    const status = String(check.status ?? "").toUpperCase();
+    const state = String(check.state ?? "").toUpperCase();
+    const conclusion = String(check.conclusion ?? "").toUpperCase();
+    if (conclusion && !PASSING_CHECK_CONCLUSIONS.has(conclusion)) {
+      blockers.push(`${name}: ${conclusion}`);
+      continue;
+    }
+    const terminalState = status || state;
+    if (
+      terminalState &&
+      ["ACTION_REQUIRED", "CANCELLED", "ERROR", "FAILURE", "STALE", "TIMED_OUT"].includes(
+        terminalState,
+      )
+    ) {
+      blockers.push(`${name}: ${terminalState}`);
+    }
+  }
+  if (blockers.length > 0) {
+    return `checks are not clean: ${blockers.slice(0, 5).join(", ")}`;
+  }
   return "";
 }
 
@@ -1962,8 +2057,8 @@ function fetchPullRequestOnce(repo: string, number: JsonValue) {
   return ghJsonOnce(["api", `repos/${repo}/pulls/${number}`]);
 }
 
-function fetchPullRequestView(repo: string, number: JsonValue) {
-  return ghJson([
+function pullRequestViewArgs(repo: string, number: JsonValue) {
+  return [
     "pr",
     "view",
     String(number),
@@ -1987,7 +2082,15 @@ function fetchPullRequestView(repo: string, number: JsonValue) {
       "updatedAt",
       "url",
     ].join(","),
-  ]);
+  ];
+}
+
+function fetchPullRequestView(repo: string, number: JsonValue) {
+  return ghJson(pullRequestViewArgs(repo, number));
+}
+
+function fetchPullRequestViewOnce(repo: string, number: JsonValue) {
+  return ghJsonOnce(pullRequestViewArgs(repo, number));
 }
 
 function findExistingComment(repo: string, number: JsonValue, marker: LooseRecord, body: string) {
