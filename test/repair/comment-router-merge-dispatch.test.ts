@@ -25,6 +25,10 @@ test("review activity arriving after dispatch marking retires the claim without 
         retryable: false,
       };
     },
+    strictBaseBindingBlock: () => {
+      calls.push("policy");
+      return null;
+    },
     rejectDispatched: () => {
       calls.push("reject");
       return { status: "rejected", reason: "", claimId: 1201 };
@@ -66,6 +70,7 @@ test("review activity refresh failure waits after retiring the dispatched claim"
       reason: "pull request review activity could not be refreshed: HTTP 503",
       retryable: true,
     }),
+    strictBaseBindingBlock: () => null,
     rejectDispatched: () => ({ status: "rejected", reason: "", claimId: 1301 }),
   });
 
@@ -75,4 +80,110 @@ test("review activity refresh failure waits after retiring the dispatched claim"
     status: "waiting",
     reason: "pull request review activity could not be refreshed: HTTP 503",
   });
+});
+
+test("strict-base drift after activity validation retires the claim without merging", () => {
+  const calls: string[] = [];
+  let mergeCalls = 0;
+  const result = guardAutomergeMergeDispatch({
+    markDispatched: () => {
+      calls.push("mark");
+      return {
+        status: "dispatched",
+        reason: "",
+        claimId: 1401,
+        expectedSquashMessage: "fix: guarded merge",
+        lastClaimMutationId: 1402,
+        lastClaimMutationAt: "2026-07-13T20:00:00.000Z",
+      };
+    },
+    reviewActivityBlock: () => {
+      calls.push("activity");
+      return null;
+    },
+    strictBaseBindingBlock: () => {
+      calls.push("policy");
+      return {
+        reason: "automerge disabled: main lacks server-enforced strict base binding",
+        retryable: false,
+      };
+    },
+    rejectDispatched: () => {
+      calls.push("reject");
+      return { status: "rejected", reason: "", claimId: 1401 };
+    },
+  });
+
+  if (result.status === "ready") mergeCalls += 1;
+
+  assert.deepEqual(calls, ["mark", "activity", "policy", "reject"]);
+  assert.equal(mergeCalls, 0);
+  assert.equal(result.status, "aborted");
+  if (result.status !== "aborted") return;
+  assert.deepEqual(result.action, {
+    status: "blocked",
+    reason: "automerge disabled: main lacks server-enforced strict base binding",
+  });
+});
+
+test("strict-base refresh failure retires the claim as a retryable no-op", () => {
+  let mergeCalls = 0;
+  const result = guardAutomergeMergeDispatch({
+    markDispatched: () => ({
+      status: "dispatched",
+      reason: "",
+      claimId: 1501,
+      expectedSquashMessage: "fix: guarded merge",
+      lastClaimMutationId: 1502,
+      lastClaimMutationAt: null,
+    }),
+    reviewActivityBlock: () => null,
+    strictBaseBindingBlock: () => ({
+      reason: "pre-dispatch strict-base policy could not be refreshed: HTTP 503",
+      retryable: true,
+    }),
+    rejectDispatched: () => ({ status: "rejected", reason: "", claimId: 1501 }),
+  });
+
+  if (result.status === "ready") mergeCalls += 1;
+
+  assert.equal(mergeCalls, 0);
+  assert.equal(result.status, "aborted");
+  if (result.status !== "aborted") return;
+  assert.deepEqual(result.action, {
+    status: "waiting",
+    reason: "pre-dispatch strict-base policy could not be refreshed: HTTP 503",
+  });
+});
+
+test("merge becomes ready only after activity and strict-base checks pass", () => {
+  const calls: string[] = [];
+  const result = guardAutomergeMergeDispatch({
+    markDispatched: () => {
+      calls.push("mark");
+      return {
+        status: "dispatched",
+        reason: "",
+        claimId: 1601,
+        expectedSquashMessage: "fix: guarded merge",
+        lastClaimMutationId: 1602,
+        lastClaimMutationAt: null,
+      };
+    },
+    reviewActivityBlock: () => {
+      calls.push("activity");
+      return null;
+    },
+    strictBaseBindingBlock: () => {
+      calls.push("policy");
+      return null;
+    },
+    rejectDispatched: () => {
+      calls.push("reject");
+      return { status: "rejected", reason: "", claimId: 1601 };
+    },
+  });
+
+  assert.deepEqual(calls, ["mark", "activity", "policy"]);
+  assert.equal(result.status, "ready");
 });

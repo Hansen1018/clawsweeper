@@ -376,6 +376,23 @@ test("all repair merge owners repeat the shared strict base guard immediately be
       continue;
     }
     assert.ok(guards.length >= 2, `${file} must check strict base binding at least twice`);
+    if (file === "src/repair/comment-router.ts") {
+      const dispatchStart = owner.indexOf("beforeDispatch: () => {");
+      const dispatchEnd = owner.indexOf("onDispatchStart: () => {", dispatchStart);
+      const dispatchBoundary = owner.slice(dispatchStart, dispatchEnd);
+      const marker = dispatchBoundary.indexOf("markDispatched: () =>");
+      const activity = dispatchBoundary.indexOf("reviewActivityBlock: () =>");
+      const strictBase = dispatchBoundary.indexOf("strictBaseBindingBlock: () => {");
+      const policyRead = dispatchBoundary.indexOf("policyReadJson: rulesetPolicyReader()");
+
+      assert.ok(dispatchStart >= 0, `${file} lacks a pre-dispatch boundary`);
+      assert.ok(marker >= 0, `${file} lacks durable dispatch marking`);
+      assert.ok(activity > marker, `${file} must refresh review activity after dispatch marking`);
+      assert.ok(strictBase > activity, `${file} must refresh strict-base policy after activity`);
+      assert.ok(policyRead > strictBase, `${file} final strict-base check lacks the policy reader`);
+      assert.match(owner, /knownNoMutation: \(\) => !mergeRequestStarted/);
+      continue;
+    }
     const finalGuardOffset = guards.at(-1)!;
     assert.ok(merge > finalGuardOffset, `${file} does not guard the final merge call`);
     const finalGuard = owner.slice(finalGuardOffset, merge);

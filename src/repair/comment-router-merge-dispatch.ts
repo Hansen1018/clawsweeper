@@ -8,6 +8,8 @@ export type AutomergeReviewActivityBlock = {
   retryable: boolean;
 };
 
+type AutomergeDispatchBlock = AutomergeReviewActivityBlock;
+
 type DispatchedClaim = Extract<ExactHeadMergeClaimDispatchResult, { status: "dispatched" }>;
 type FailedDispatchClaim = Exclude<ExactHeadMergeClaimDispatchResult, { status: "dispatched" }>;
 
@@ -23,6 +25,7 @@ export type AutomergeMergeDispatchGuardResult =
 export function guardAutomergeMergeDispatch(options: {
   markDispatched: () => ExactHeadMergeClaimDispatchResult;
   reviewActivityBlock: () => AutomergeReviewActivityBlock | null;
+  strictBaseBindingBlock: () => AutomergeDispatchBlock | null;
   rejectDispatched: () => ExactHeadMergeClaimRejectionResult;
 }): AutomergeMergeDispatchGuardResult {
   const dispatch = options.markDispatched();
@@ -31,18 +34,33 @@ export function guardAutomergeMergeDispatch(options: {
   }
 
   const activityBlock = options.reviewActivityBlock();
-  if (!activityBlock) return { status: "ready", dispatch };
+  if (activityBlock) {
+    return rejectDispatchedClaim(dispatch, activityBlock, options.rejectDispatched);
+  }
 
+  const strictBaseBindingBlock = options.strictBaseBindingBlock();
+  if (strictBaseBindingBlock) {
+    return rejectDispatchedClaim(dispatch, strictBaseBindingBlock, options.rejectDispatched);
+  }
+
+  return { status: "ready", dispatch };
+}
+
+function rejectDispatchedClaim(
+  dispatch: DispatchedClaim,
+  block: AutomergeDispatchBlock,
+  rejectDispatched: () => ExactHeadMergeClaimRejectionResult,
+): AutomergeMergeDispatchGuardResult {
   let rejection: ExactHeadMergeClaimRejectionResult;
   try {
-    rejection = options.rejectDispatched();
+    rejection = rejectDispatched();
   } catch (error) {
     return {
       status: "aborted",
       dispatch,
       action: {
         status: "waiting",
-        reason: `${activityBlock.reason}; exact-head merge claim rejection failed: ${errorText(error)}`,
+        reason: `${block.reason}; exact-head merge claim rejection failed: ${errorText(error)}`,
       },
     };
   }
@@ -51,8 +69,8 @@ export function guardAutomergeMergeDispatch(options: {
       status: "aborted",
       dispatch,
       action: {
-        status: activityBlock.retryable ? "waiting" : "blocked",
-        reason: activityBlock.reason,
+        status: block.retryable ? "waiting" : "blocked",
+        reason: block.reason,
       },
     };
   }
@@ -61,7 +79,7 @@ export function guardAutomergeMergeDispatch(options: {
     dispatch,
     action: {
       status: rejection.status === "unknown" ? "waiting" : "blocked",
-      reason: `${activityBlock.reason}; ${rejection.reason}`,
+      reason: `${block.reason}; ${rejection.reason}`,
     },
   };
 }

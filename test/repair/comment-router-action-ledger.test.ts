@@ -253,7 +253,7 @@ test("trusted verdict automerge rechecks reviewed PR activity around the merge c
   assert.match(executeAutomerge, /claimedReviewActivityBlock[\s\S]*releaseBeforeDispatch/);
 });
 
-test("trusted verdict activity is checked on both sides of durable dispatch marking", () => {
+test("activity and strict-base policy are checked after durable dispatch marking", () => {
   const source = readText("src/repair/comment-router.ts");
   const executeAutomerge = source.slice(
     source.indexOf("function executeAutomerge("),
@@ -277,13 +277,18 @@ test("trusted verdict activity is checked on both sides of durable dispatch mark
   const postMarkerActivityCheck = dispatchBoundary.indexOf(
     "reviewActivityBlock: () => trustedAutomergeReviewActivityBlockReason(command)",
   );
+  const postMarkerStrictBaseCheck = dispatchBoundary.indexOf("strictBaseBindingBlock: () => {");
+  const policyRead = dispatchBoundary.indexOf("policyReadJson: rulesetPolicyReader()");
   const reject = dispatchBoundary.indexOf("rejectAutomergeMergeClaim(command, mergeClaim.claimId)");
 
   assert.ok(preMarkerActivityCheck >= 0);
   assert.ok(guard > preMarkerActivityCheck);
   assert.ok(claimDispatch > guard);
   assert.ok(postMarkerActivityCheck > claimDispatch);
-  assert.ok(reject > postMarkerActivityCheck);
+  assert.ok(postMarkerStrictBaseCheck > postMarkerActivityCheck);
+  assert.ok(policyRead > postMarkerStrictBaseCheck);
+  assert.ok(reject > policyRead);
+  assert.match(executeAutomerge, /knownNoMutation: \(\) => !mergeRequestStarted/);
   assert.match(
     executeAutomerge,
     /const dispatchBoundaryState: \{[\s\S]*preMarkerReviewActivityBlock:[\s\S]*dispatchedAbortAction: LooseRecord \| null;[\s\S]*\}/,

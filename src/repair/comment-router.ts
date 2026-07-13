@@ -4073,6 +4073,23 @@ function executeAutomerge(command: LooseRecord): LooseRecord {
                 expectedSquashCommitMessage(mergeMessage.subject, mergeMessage.body),
               ),
             reviewActivityBlock: () => trustedAutomergeReviewActivityBlockReason(command),
+            strictBaseBindingBlock: () => {
+              try {
+                const block = runtimeStrictBaseBindingBlock({
+                  repo: command.repo,
+                  baseBranch: String(
+                    claimedView.baseRefName ?? claimedTarget.base_ref ?? targetBranch ?? "main",
+                  ),
+                  policyReadJson: rulesetPolicyReader(),
+                });
+                return block ? { reason: block, retryable: false } : null;
+              } catch (error) {
+                return {
+                  reason: `pre-dispatch strict-base policy could not be refreshed: ${compactGhError(error)}`,
+                  retryable: true,
+                };
+              }
+            },
             rejectDispatched: () => rejectAutomergeMergeClaim(command, mergeClaim.claimId),
           });
           if (dispatchGuard.status === "marker_failed") {
