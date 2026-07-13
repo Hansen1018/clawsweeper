@@ -170,11 +170,12 @@ export function repairRunNamePrefixForJob(
   automergeRunNamePrefix: JsonValue = DEFAULT_AUTOMERGE_REPAIR_RUN_NAME_PREFIX,
 ) {
   const job = String(jobPath ?? "");
-  if (job.includes("/inbox/issue-")) return DEFAULT_ISSUE_IMPLEMENTATION_RUN_NAME_PREFIX;
-  if (job.includes("/inbox/automerge-")) {
-    return String(automergeRunNamePrefix ?? DEFAULT_AUTOMERGE_REPAIR_RUN_NAME_PREFIX);
-  }
-  return DEFAULT_REPAIR_RUN_NAME_PREFIX;
+  const prefix = job.includes("/inbox/issue-")
+    ? DEFAULT_ISSUE_IMPLEMENTATION_RUN_NAME_PREFIX
+    : job.includes("/inbox/automerge-")
+      ? (automergeRunNamePrefix ?? DEFAULT_AUTOMERGE_REPAIR_RUN_NAME_PREFIX)
+      : DEFAULT_REPAIR_RUN_NAME_PREFIX;
+  return normalizeRepairRunNamePrefix(prefix);
 }
 
 export function repairRunNameForJob(
@@ -183,10 +184,8 @@ export function repairRunNameForJob(
   dispatchKey: JsonValue = null,
   jobSha256: JsonValue = null,
 ) {
-  const title = joinRepairRunNamePrefix(
-    repairRunNamePrefixForJob(jobPath, automergeRunNamePrefix),
-    String(jobPath ?? ""),
-  );
+  const job = String(jobPath ?? "");
+  const title = `${repairRunNamePrefixForJob(job, automergeRunNamePrefix)}${job}`;
   const key = String(dispatchKey ?? "").trim();
   const digest = String(jobSha256 ?? "").trim();
   const keyedTitle = key ? `${title} [${key}]` : title;
@@ -219,7 +218,9 @@ export function parseRepairRunTitle(
 
   const prefixes = [
     DEFAULT_ISSUE_IMPLEMENTATION_RUN_NAME_PREFIX,
-    String(automergeRunNamePrefix ?? DEFAULT_AUTOMERGE_REPAIR_RUN_NAME_PREFIX),
+    normalizeRepairRunNamePrefix(
+      automergeRunNamePrefix ?? DEFAULT_AUTOMERGE_REPAIR_RUN_NAME_PREFIX,
+    ),
     DEFAULT_AUTOMERGE_REPAIR_RUN_NAME_PREFIX,
     DEFAULT_REPAIR_RUN_NAME_PREFIX,
   ];
@@ -348,10 +349,9 @@ function isActiveWorkflowRun(run: LooseRecord, nowMs: number, staleQueuedMs: num
   return Math.max(0, nowMs - lastChangedAt) <= staleQueuedMs;
 }
 
-function joinRepairRunNamePrefix(prefix: JsonValue, jobPath: string) {
+function normalizeRepairRunNamePrefix(prefix: JsonValue) {
   const text = String(prefix ?? "");
-  if (!text || !jobPath) return `${text}${jobPath}`;
-  return /\s$/.test(text) ? `${text}${jobPath}` : `${text} ${jobPath}`;
+  return text && !/\s$/.test(text) ? `${text} ` : text;
 }
 
 function readPositiveInteger(value: JsonValue, name: string) {

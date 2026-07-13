@@ -90,6 +90,39 @@ test("repair run names include command receipt keys without hiding active jobs",
   );
 });
 
+test("custom repair run prefixes normalize for formatting, parsing, and active lookup", () => {
+  const job = "jobs/openclaw/inbox/automerge-openclaw-clawsweeper-521.md";
+  const digest = "a".repeat(64);
+  const title = repairRunNameForJob(job, "custom repair", "router-pr521", digest);
+  const activeRunsByPrefix = new Map();
+
+  assert.equal(title, `custom repair ${job} [router-pr521] (${digest})`);
+  assert.deepEqual(parseRepairRunTitle(title, "custom repair"), {
+    jobPath: job,
+    dispatchKey: "router-pr521",
+    jobSha256: digest,
+  });
+  assert.equal(parseRepairRunTitle(`custom repair${job}`, "custom repair"), null);
+  assert.equal(parseRepairRunTitle(`custom repair  ${job}`, "custom repair"), null);
+  assert.equal(
+    activeRepairWorkflowRunForJob({
+      jobPath: job,
+      jobSha256: digest,
+      automergeRunNamePrefix: "custom repair",
+      activeRunsByPrefix,
+      fetchWorkflowRuns: () => [
+        {
+          id: 521,
+          status: "in_progress",
+          display_title: title,
+        },
+      ],
+    })?.databaseId,
+    521,
+  );
+  assert.deepEqual([...activeRunsByPrefix.keys()], ["custom repair "]);
+});
+
 test("repair run titles preserve immutable job generations", () => {
   const job = "jobs/openclaw/inbox/cluster-001.md";
   const oldDigest = "a".repeat(64);
