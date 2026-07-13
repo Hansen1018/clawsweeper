@@ -328,65 +328,81 @@ dropped. The checked-in JSON schema is
 
 The shared taxonomy defines six families:
 
-1. **Review**: batch, item, retry, log publication, and comment publication.
+1. **Review**: review lifecycle, batch, item, retry, log publication, and
+   comment publication.
 2. **Command**: receive, classify, claim refresh, mutation attempt/outcome,
    progress, wait, requeue, and recovery.
 3. **Repair**: intake, dispatch, plan, execute, validate, review, publish,
    post-flight, requeue, recovery, and queue phases. Blocked and failed summary
    types remain available for coarse emitters.
-4. **Apply**: individual action, batch, and publication phases.
+4. **Apply**: planning and execution compatibility events plus individual
+   action, batch, and publication phases.
 5. **Operations**: workflow attempts; dispatch, retry, and queue lifecycles;
    notification delivery; publication, status, dashboard, and session
    lifecycles; cancellation and projection failures.
-6. **Evidence**: Gitcrawl snapshot, query, and binding phases plus proof stage
-   and binding phases.
+6. **Evidence**: Gitcrawl snapshot, query, and binding phases; provider-neutral
+   evidence-service request, deploy, and rollback phases; and proof stage and
+   binding phases.
 
-The Evidence family is the shared ledger contract. Production Gitcrawl snapshot,
-query, binding, and Cloudflare-service emitters are delivered by the Gitcrawl
-integration lane; defining the family alone does not claim that evidence was
-captured.
+### Implemented Coverage
 
-Review, apply, command-router, commit-review, notification, repair-session,
-self-heal, issue-status, result-publication, and dashboard-publication lanes now
-emit this taxonomy. Repair receipts keep the logical work key and sealed
-repaired-source revision stable across retries;
-ClawSweeper's workflow checkout SHA is not target provenance. Workflow run and
-run attempt define the repair execution attempt; job, step, and invocation
-remain producer identity. Each process maintains its own monotonic chain from
-the canonical local spool. Cross-job continuity comes from the stable operation
-and source identities plus separately authenticated producer manifests; jobs do
-not splice downloaded shards into a synthetic shared phase sequence. Session
-writes record both the optional operator-facing CrabFleet transition and the
-corresponding repair phase. GitHub status comments are receipted only after the
-mutation returns, while dashboard delivery records sent, skipped, and failed
-outcomes. Local result, aggregate apply-report, review report, Codex log, and
-dashboard writes use `completed`; their later immutable shard import is the
-durable publication boundary.
+The current implementation instruments these production surfaces:
 
-Credential-isolated repair jobs never receive state-repository credentials just
-to publish receipts. The current cluster and execute jobs finalize local
-immutable shards and upload exact current-run, current-attempt artifacts. The
-trusted `repair-publish-results` workflow inspects the worker SHA to detect this
-capability, verifies the exact job inventory and every manifest's repository,
-SHA, workflow, job, run, and attempt, then imports the cluster and execute lanes
-with its own publication lane before mutating durable result state. A current
-worker job that started must advertise exactly one valid lane; a skipped job
-must advertise none. Missing, malformed, incomplete, extra, or forged current
-lanes fail publication before result mutation. Legacy in-flight worker heads
-that predate this topology remain publishable without pretending that they
-emitted current-format ledgers.
+- Review and apply workflows record review batches, selected items, retries,
+  Codex log publication, durable review-comment publication, apply actions,
+  apply batches, apply reports, and interrupted or failed terminals.
+- The comment router records command receipt, classification, durable claims
+  and refreshes, progress, request-bound mutation attempts and outcomes,
+  dispatch, wait, requeue, recovery, completion, skip, and failure.
+- Repair workflows record intake, queue, plan, execution, validation, review,
+  publication, post-flight, requeue, recovery, status, dashboard, notification,
+  session, self-heal, and finalizer lifecycles. Executor Codex attempts bind
+  their persisted logs and reports, while post-flight merge, closeout comment,
+  source close, and compensation requests use pre-request receipts with
+  accepted, rejected-before-write, or unknown outcomes.
+- Spam audit records review batches, review items, and bounded audit-log
+  publication. Assist records generation, local review output, validated
+  artifact publication, and the request-bound comment mutation. Proof handling
+  records stage results, comment and label mutations, report publication, and
+  proof cursor bindings.
+- Target fanout records queue selection, each repository dispatch attempt and
+  outcome, and cursor publication. The generic `publish-workflow` path imports
+  shards only from the authenticated workflow producer job, which lets spam,
+  proof, fanout, and similar workflows publish without a lane-specific
+  manifest format.
+- State hydration excludes `ledger/` by default. Workflows that need historical
+  ledger data must opt in through the approved `hydrate-paths` input; the
+  hydration helper rejects unknown, nested, or unsafe roots.
 
-Commit review follows the same credential boundary. Each danger-full-access
-Codex matrix job has no state token and uploads one exact current-attempt bundle
-containing its report and local ledger; the ledger binds the Codex review-log
-digests. The trusted publication job verifies the matrix commit, producer SHA,
-job, run, attempt, and report digest, attests the report, and only then imports
-the review lane and performs state or check publication. Optional check-write
-credentials are minted only after Codex exits.
+Each process owns a monotonic local chain. Cross-job continuity comes from
+stable operation and source identities plus authenticated producer manifests,
+not synthetic parent links across downloaded shards. Repair identity binds the
+sealed target source revision; the ClawSweeper checkout SHA is producer
+provenance, not target provenance.
 
-Result and open-PR finalizer workflows already own state credentials, so they
-import and publish their own finalized shards directly. Additional lanes can
-migrate independently without changing the v1 shard format.
+Credential-isolated repair jobs finalize and upload their own producer-attempt
+shards without state-repository credentials. On a workflow rerun, the trusted
+`repair-publish-results` job resolves a workflow-attempt cohort: the result
+artifact comes from the coordinating attempt, while cluster and execute jobs
+are selected independently from the latest attempt in which each job actually
+ran. The publisher then requires the matching producer-attempt ledger for each
+selected job, verifies repository, SHA, workflow, job, run, and attempt, and
+imports the cohort before mutating durable result state. Missing, ambiguous,
+expired, incomplete, extra, or forged required lanes fail publication. Legacy
+worker heads predating the contract remain explicitly marked as legacy.
+
+Commit review uses the same credential separation. Each Codex matrix invocation
+uploads one producer-attempt bundle containing its report and local ledger. The
+trusted publication job verifies the matrix commit, producer identity, workflow
+attempt, report digest, and bound review-log digests before state or check
+publication. State-authorized result and open-PR finalizers import their own
+finalized shards directly.
+
+The provider-neutral evidence-service request, deploy, and rollback phases are
+taxonomy and schema contracts only. The intended follow-up direction is a
+Gitcrawl-backed evidence service deployed through Cloudflare. The replacement
+service, its deployment, and production emitters for those three phases are not
+implemented.
 
 New writers should prefer phase-oriented types from
 `ACTION_EVENT_PHASE_TYPES`, statuses from `ACTION_EVENT_STATUSES`, and optional
