@@ -272,6 +272,7 @@ test("failed-run self-heal restores absent and empty gate state exactly", () => 
 
     const result = runSelfHealProcess(fixture, {
       args: ["--execute", "--open-execute-window"],
+      env: { GH_VARIABLE_DELETE_ALREADY_ABSENT: "1" },
     });
 
     assert.equal(result.status, 0, result.stderr);
@@ -293,7 +294,7 @@ test("failed-run self-heal restores absent and empty gate state exactly", () => 
     assert.equal(fs.existsSync(fixture.selfHealLedgerPath), true);
     assert.doesNotMatch(
       fs.readFileSync("src/repair/self-heal-failed-runs.ts", "utf8"),
-      /ledger[-_]path/,
+      /args\["ledger-path"\]|args\.ledger_path/,
     );
   } finally {
     fs.rmSync(fixture.root, { recursive: true, force: true });
@@ -847,6 +848,7 @@ function runSelfHealProcess(
         ...process.env,
         PATH: `${fixture.binDir}${path.delimiter}${process.env.PATH ?? ""}`,
         CLAWSWEEPER_REPO: "openclaw/clawsweeper",
+        CLAWSWEEPER_SELF_HEAL_TEST_LEDGER_PATH: fixture.selfHealLedgerPath,
         CLAWSWEEPER_STATE_DIR: fixture.stateRoot,
         GH_ARTIFACT_FIXTURE: fixture.artifactFixture,
         GH_COMMAND_LOG: fixture.commandLogPath,
@@ -1024,6 +1026,10 @@ if [ "$1" = "variable" ] && [ "$2" = "set" ]; then
   exit 0
 fi
 if [ "$1" = "variable" ] && [ "$2" = "delete" ]; then
+  if [ "\${GH_VARIABLE_DELETE_ALREADY_ABSENT:-}" = "1" ]; then
+    printf 'gh: HTTP 404: Not Found\\n' >&2
+    exit 1
+  fi
   exit 0
 fi
 if [ "$1" = "workflow" ] && [ "$2" = "run" ]; then

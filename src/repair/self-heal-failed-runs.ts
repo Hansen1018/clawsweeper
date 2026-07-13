@@ -971,7 +971,14 @@ function writeSelfHealLedger(ledger: LooseRecord) {
 }
 
 function selfHealLedgerPath() {
-  return path.join(path.dirname(runRecordsDir), "self-heal.json");
+  const testPath = String(process.env.CLAWSWEEPER_SELF_HEAL_TEST_LEDGER_PATH ?? "").trim();
+  if (testPath) {
+    if (!process.env.NODE_TEST_CONTEXT) {
+      throw new Error("CLAWSWEEPER_SELF_HEAL_TEST_LEDGER_PATH is only available under node:test");
+    }
+    return path.resolve(testPath);
+  }
+  return path.join(repoRoot(), "results", "self-heal.json");
 }
 
 function listClusterRuns() {
@@ -1110,7 +1117,12 @@ function restoreGate(
 
 function writeGateState(name: string, state: GateState): string {
   if (state.exists) return writeGateValue(name, state.value);
-  const result = ghText(["variable", "delete", name, "--repo", repo]);
+  let result = "";
+  try {
+    result = ghText(["variable", "delete", name, "--repo", repo]);
+  } catch (error) {
+    if (!/\bHTTP 404\b|not found/i.test(ghErrorText(error))) throw error;
+  }
   console.log(`${name}=<absent>`);
   return result;
 }
