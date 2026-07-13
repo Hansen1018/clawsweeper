@@ -1015,9 +1015,59 @@ jobs:
         if: ${{ always() && steps.target.outputs.target_enabled != 'false' && steps.live-item.outputs.proceed != 'false' && steps.publish-event-result.outputs.terminal_noop != 'true' && steps.publish-event-result.outputs.policy_noop != 'true' && steps.publish-event-result.outputs.requeue_latest != 'true' && (steps.review-exact-event-item.outcome != 'success' || steps.publish-event-result.outcome != 'success' || (steps.publish-event-result.outputs.terminal_missing != 'true' && steps.publish-event-result.outputs.terminal_closed != 'true' && steps.publish-event-result.outputs.guarded_open != 'true' && steps.route-synced-verdict.outcome != 'success' && steps.queue-deferred-verdict-router.outcome != 'success')) }}
         run: exit 1
 
+      - name: Finalize exact event action ledger
+        id: finalize-exact-event-action-ledger
+        if: ${{ always() && steps.exact-review-action-ledger.outcome == 'success' && steps.setup-pnpm.outcome == 'success' }}
+        continue-on-error: true
+        env:
+          REVIEW_EXIT_CODE: ${{ steps.review-exact-event-item.outputs.exit_code || '' }}
+          REVIEW_OUTCOME: ${{ steps.review-exact-event-item.outcome || 'not_started' }}
+        run: |
+          args=()
+          if [ "$REVIEW_OUTCOME" = "cancelled" ] || [ "$REVIEW_EXIT_CODE" = "130" ] || [ "$REVIEW_EXIT_CODE" = "143" ]; then
+            args=(--interrupt-open-attempts --reason cancelled)
+          elif [ "$REVIEW_EXIT_CODE" = "124" ] || [ "$REVIEW_EXIT_CODE" = "137" ]; then
+            args=(--interrupt-open-attempts --reason timeout)
+          elif [ "$REVIEW_OUTCOME" != "success" ]; then
+            args=(--interrupt-open-attempts --reason workflow_failed)
+          fi
+          pnpm run --silent finalize-action-events -- "${args[@]}"
+
+      - name: Publish exact event action ledger
+        id: publish-exact-event-action-ledger
+        if: ${{ always() && steps.finalize-exact-event-action-ledger.outcome == 'success' && steps.setup-state.outcome == 'success' && steps.setup-pnpm.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          test -n "${CLAWSWEEPER_STATE_DIR:-}"
+          if [ ! -d "$CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT/ledger" ]; then
+            echo "No exact event action shards were finalized."
+            exit 0
+          fi
+          event_paths_file=".artifacts/exact-event-action-ledger-paths.txt"
+          mkdir -p .artifacts
+          pnpm run --silent publish-action-events -- \
+            --source-root "$CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT" \
+            --state-root "$CLAWSWEEPER_STATE_DIR" \
+            --expected-producer-job "$GITHUB_JOB" |
+            jq -r '.paths[]?' |
+            sort -u > "$event_paths_file"
+          if [ ! -s "$event_paths_file" ]; then
+            echo "Exact event action shards existed but no paths were imported." >&2
+            exit 1
+          fi
+          while IFS= read -r event_path; do
+            durable_event_path="$CLAWSWEEPER_STATE_DIR/$event_path"
+            test -f "$durable_event_path"
+            mkdir -p "$(dirname "$event_path")"
+            cp "$durable_event_path" "$event_path"
+          done < "$event_paths_file"
+          node dist/clawsweeper.js publish-action-event-paths \
+            --paths-file "$event_paths_file" \
+            --message "chore: append exact event action ledger"
+
       - name: Complete exact-review queue lease
         id: complete-exact-review-queue
-        if: ${{ always() }}
+        if: ${{ always() && steps.finalize-exact-event-action-ledger.outcome == 'success' && steps.publish-exact-event-action-ledger.outcome == 'success' }}
         continue-on-error: true
         env:
           CLAWSWEEPER_ACTION_LEDGER_ROOT: ${{ steps.exact-review-action-ledger.outputs.output-root }}/exact-review-queue-spool
@@ -1130,54 +1180,6 @@ jobs:
             --message "chore: append command status action ledger" \
             "${action_ledger_args[@]}" \
             --rebase-strategy normal
-
-      - name: Finalize exact event action ledger
-        if: ${{ always() && steps.exact-review-action-ledger.outcome == 'success' && steps.setup-pnpm.outcome == 'success' }}
-        continue-on-error: true
-        env:
-          REVIEW_EXIT_CODE: ${{ steps.review-exact-event-item.outputs.exit_code || '' }}
-          REVIEW_OUTCOME: ${{ steps.review-exact-event-item.outcome || 'not_started' }}
-        run: |
-          args=()
-          if [ "$REVIEW_OUTCOME" = "cancelled" ] || [ "$REVIEW_EXIT_CODE" = "130" ] || [ "$REVIEW_EXIT_CODE" = "143" ]; then
-            args=(--interrupt-open-attempts --reason cancelled)
-          elif [ "$REVIEW_EXIT_CODE" = "124" ] || [ "$REVIEW_EXIT_CODE" = "137" ]; then
-            args=(--interrupt-open-attempts --reason timeout)
-          elif [ "$REVIEW_OUTCOME" != "success" ]; then
-            args=(--interrupt-open-attempts --reason workflow_failed)
-          fi
-          pnpm run --silent finalize-action-events -- "${args[@]}"
-
-      - name: Publish exact event action ledger
-        if: ${{ always() && steps.setup-state.outcome == 'success' && steps.setup-pnpm.outcome == 'success' }}
-        run: |
-          set -euo pipefail
-          test -n "${CLAWSWEEPER_STATE_DIR:-}"
-          if [ ! -d "$CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT/ledger" ]; then
-            echo "No exact event action shards were finalized."
-            exit 0
-          fi
-          event_paths_file=".artifacts/exact-event-action-ledger-paths.txt"
-          mkdir -p .artifacts
-          pnpm run --silent publish-action-events -- \
-            --source-root "$CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT" \
-            --state-root "$CLAWSWEEPER_STATE_DIR" \
-            --expected-producer-job "$GITHUB_JOB" |
-            jq -r '.paths[]?' |
-            sort -u > "$event_paths_file"
-          if [ ! -s "$event_paths_file" ]; then
-            echo "Exact event action shards existed but no paths were imported." >&2
-            exit 1
-          fi
-          while IFS= read -r event_path; do
-            durable_event_path="$CLAWSWEEPER_STATE_DIR/$event_path"
-            test -f "$durable_event_path"
-            mkdir -p "$(dirname "$event_path")"
-            cp "$durable_event_path" "$event_path"
-          done < "$event_paths_file"
-          node dist/clawsweeper.js publish-action-event-paths \
-            --paths-file "$event_paths_file" \
-            --message "chore: append exact event action ledger"
 
   publish-exact-review-action-ledger:
     name: Publish immutable exact-review queue action ledger
