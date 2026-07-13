@@ -1654,7 +1654,7 @@ test("interruption recovery preserves unknowns across accepted retries and resol
     return terminal;
   };
 
-  const unknown = recordAttempt("a".repeat(64), "unknown", 11);
+  recordAttempt("a".repeat(64), "unknown", 11);
   recordAttempt("b".repeat(64), "accepted", 21);
   const observedIdentity = {
     operation: "apply",
@@ -1695,6 +1695,7 @@ test("interruption recovery preserves unknowns across accepted retries and resol
     { env },
   );
   assert.ok(observed);
+  const reopenedUnknown = recordAttempt("c".repeat(64), "unknown", 35);
   recordAttempt("a".repeat(64), "accepted", 41);
 
   assert.equal(interruptOpenWorkflowActionEvents(root, { env }), 2);
@@ -1709,8 +1710,8 @@ test("interruption recovery preserves unknowns across accepted retries and resol
   assert.ok(recovered.every((event) => event.action.retryable === false));
   const itemTerminal = recovered.find((event) => event.subject.number === 54);
   assert.ok(itemTerminal);
-  assert.equal(itemTerminal?.parent_event_id, unknown.event_id);
-  assert.ok(unknown.phase_seq < itemTerminal.phase_seq);
+  assert.equal(itemTerminal?.parent_event_id, reopenedUnknown.event_id);
+  assert.ok(reopenedUnknown.phase_seq < itemTerminal.phase_seq);
   const batchTerminal = recovered.find((event) => event.subject.kind === "workflow");
   assert.ok(batchTerminal);
   assert.equal(batchTerminal.parent_event_id, itemTerminal.event_id);

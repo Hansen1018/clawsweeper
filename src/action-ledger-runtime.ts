@@ -480,7 +480,6 @@ function workflowActionEventIsMutationOutcome(event: ActionEvent): boolean {
 function workflowActionUnresolvedUnknownMutation(
   events: readonly ActionEvent[],
 ): ActionEvent | undefined {
-  const observed = new Set<string>();
   const unresolved = new Map<string, ActionEvent>();
   let dispatchUnknown: ActionEvent | undefined;
   for (const event of [...events].sort(
@@ -490,9 +489,8 @@ function workflowActionUnresolvedUnknownMutation(
     const completionReason = event.attributes?.completion_reason;
     const key = event.idempotency_key_sha256;
     if (completionReason === "mutation_observed") {
-      observed.add(key);
       unresolved.delete(key);
-    } else if (completionReason === "mutation_outcome_unknown" && !observed.has(key)) {
+    } else if (completionReason === "mutation_outcome_unknown") {
       unresolved.set(key, event);
     } else if (completionReason === "dispatch_outcome_unknown") {
       dispatchUnknown = event;
