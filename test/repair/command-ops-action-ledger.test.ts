@@ -82,22 +82,31 @@ test("direct repair requeues forward a stable dispatch receipt and publish it", 
   assert.match(workflow, /--max-requeue-depth 1/);
 });
 
-test("exact review publishes status receipts created after its first ledger publication", () => {
+test("exact review publishes post-ack status receipts in a second ledger", () => {
   const setupAction = readText(".github/actions/setup-action-ledger/action.yml");
   const source = readText("src/repair/update-command-status.ts");
   const workflow = readText(".github/workflows/sweep.yml");
+  const exactEventFinalize = workflow.indexOf("- name: Finalize exact event action ledger");
+  const exactEventPublish = workflow.indexOf("- name: Publish exact event action ledger");
+  const completeLease = workflow.indexOf("- name: Complete exact-review queue lease");
   const sourceDriftStatus = workflow.indexOf("- name: Mark source-drift re-review queued");
   const lateFinalize = workflow.indexOf("- name: Finalize late command status action ledger");
   const latePublish = workflow.indexOf("- name: Publish late command status action ledger");
-  const exactEventFinalize = workflow.indexOf("- name: Finalize exact event action ledger");
+  const exactReviewQueuePublisher = workflow.indexOf(
+    "\n  publish-exact-review-action-ledger:",
+    latePublish,
+  );
   const targetFanout = workflow.indexOf("\n  target-fanout:", latePublish);
   const finalizeStep = workflow.slice(lateFinalize, latePublish);
-  const publishStep = workflow.slice(latePublish, exactEventFinalize);
+  const publishStep = workflow.slice(latePublish, exactReviewQueuePublisher);
 
-  assert.ok(sourceDriftStatus >= 0);
+  assert.ok(exactEventFinalize >= 0);
+  assert.ok(exactEventPublish > exactEventFinalize);
+  assert.ok(completeLease > exactEventPublish);
+  assert.ok(sourceDriftStatus > completeLease);
   assert.ok(lateFinalize > sourceDriftStatus);
   assert.ok(latePublish > lateFinalize);
-  assert.ok(exactEventFinalize > latePublish);
+  assert.ok(exactReviewQueuePublisher > latePublish);
   assert.ok(targetFanout > latePublish);
   assert.match(setupAction, /CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT=\$output_root/);
   assert.match(source, /await flushCommandActionEvents\(\)/);
