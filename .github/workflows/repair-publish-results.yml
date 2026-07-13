@@ -144,41 +144,68 @@ jobs:
           done
           pnpm run build:repair
 
-      - name: Download worker artifacts
-        id: download
+      - name: Resolve exact worker result artifact
+        id: result-artifact
         env:
           GH_TOKEN: ${{ steps.app_token.outputs.token }}
           RUN_ID: ${{ github.event.workflow_run.id }}
           RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          CLAWSWEEPER_ALLOW_PRIOR_ARTIFACT: "0"
         run: |
           set -euo pipefail
           rm -rf artifacts
           mkdir -p artifacts
-          final_artifact="clawsweeper-repair-${RUN_ID}-${RUN_ATTEMPT:-1}"
-          if gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" --name "$final_artifact" --dir artifacts; then
-            echo "has_artifacts=1" >> "$GITHUB_OUTPUT"
-            exit 0
+          pnpm run --silent repair:resolve-run-artifact -- \
+            --repository "$GITHUB_REPOSITORY" \
+            --run-id "$RUN_ID" \
+            --current-attempt "$RUN_ATTEMPT" \
+            --prefix clawsweeper-repair \
+            --fallback-prefix clawsweeper-repair-worker
+
+      - name: Download exact worker result artifact
+        uses: actions/download-artifact@v8
+        with:
+          artifact-ids: ${{ steps.result-artifact.outputs.artifact_id }}
+          path: artifacts
+          github-token: ${{ steps.app_token.outputs.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.event.workflow_run.id }}
+
+      - name: Verify exact worker result artifact
+        id: download
+        env:
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          ARTIFACT_NAME: ${{ steps.result-artifact.outputs.artifact_name }}
+          PRODUCER_ATTEMPT: ${{ steps.result-artifact.outputs.producer_attempt }}
+        run: |
+          set -euo pipefail
+          if [ "$PRODUCER_ATTEMPT" != "$RUN_ATTEMPT" ]; then
+            echo "::error::Resolved worker result producer attempt $PRODUCER_ATTEMPT does not match workflow attempt $RUN_ATTEMPT."
+            exit 1
           fi
-          if gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" --dir artifacts; then
-            result_paths_file="$RUNNER_TEMP/clawsweeper-repair-result-paths.txt"
-            node --input-type=module > "$result_paths_file" <<'NODE'
+          case "$ARTIFACT_NAME" in
+            "clawsweeper-repair-${RUN_ID}-${RUN_ATTEMPT}" | \
+            "clawsweeper-repair-worker-${RUN_ID}-${RUN_ATTEMPT}") ;;
+            *)
+              echo "::error::Resolved worker result artifact does not belong to the current attempt."
+              exit 1
+              ;;
+          esac
+          result_paths_file="$RUNNER_TEMP/clawsweeper-repair-result-paths.txt"
+          node --input-type=module > "$result_paths_file" <<'NODE'
           import { findResultPaths } from "./dist/repair/publish-files.js";
           for (const resultPath of findResultPaths("artifacts")) {
             process.stdout.write(`${resultPath}\n`);
           }
           NODE
-            if [ ! -s "$result_paths_file" ]; then
-              echo "has_artifacts=0" >> "$GITHUB_OUTPUT"
-              echo "::notice title=No repair artifacts::No verified result payload for worker run $RUN_ID."
-              exit 0
-            fi
-            mapfile -t result_paths < "$result_paths_file"
-            pnpm run repair:review-results -- "${result_paths[@]}"
-            echo "has_artifacts=1" >> "$GITHUB_OUTPUT"
-            exit 0
+          if [ ! -s "$result_paths_file" ]; then
+            echo "::error::Exact worker artifact $ARTIFACT_NAME has no verified result payload."
+            exit 1
           fi
-          echo "has_artifacts=0" >> "$GITHUB_OUTPUT"
-          echo "::notice title=No repair artifacts::No downloadable artifacts for worker run $RUN_ID."
+          mapfile -t result_paths < "$result_paths_file"
+          pnpm run repair:review-results -- "${result_paths[@]}"
+          echo "has_artifacts=1" >> "$GITHUB_OUTPUT"
 
       # This workflow_run job executes trusted main-branch code only; artifacts
       # from worker runs are downloaded as data and handled by repair publishers.
