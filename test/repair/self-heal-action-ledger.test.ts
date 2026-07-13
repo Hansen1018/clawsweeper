@@ -1,0 +1,86 @@
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import test from "node:test";
+
+function readText(path: string): string {
+  return fs.readFileSync(path, "utf8");
+}
+
+test("failed-run self-heal preserves legacy retry budgets and skips removed jobs", () => {
+  const source = readText("src/repair/self-heal-failed-runs.ts");
+
+  assert.match(source, /legacyAttemptCountsByJob/);
+  assert.match(source, /legacyAttemptedRunsByJob/);
+  assert.match(
+    source,
+    /\(attemptCountsByIdentity\.get\(immutableKey\) \?\? 0\) \+\s+\(legacyAttemptCountsByJob\.get\(sourceJob\) \?\? 0\)/,
+  );
+  assert.match(source, /reason: "missing_job_file"/);
+  assert.match(source, /if \(!isMissingCurrentStateJob\(error\)\) throw error/);
+  assert.ok(
+    source.indexOf('reason: "missing_job_file"') < source.indexOf("activeJobGenerations.get("),
+  );
+});
+
+test("self-heal mutations emit durable action receipts", () => {
+  const failedRuns = readText("src/repair/self-heal-failed-runs.ts");
+  const conflicts = readText("src/repair/conflict-self-heal.ts");
+
+  assert.match(
+    failedRuns,
+    /runRepairMutation\(selfHealDispatchLifecycle\(candidate\),[\s\S]*kind: "repair_dispatch"/,
+  );
+  assert.match(
+    failedRuns,
+    /runRepairMutation\(selfHealGateLifecycle\(name, normalizedValue\),[\s\S]*kind: "repository_variable_update"/,
+  );
+  assert.match(
+    conflicts,
+    /runRepairMutation\(conflictPublicationLifecycle\(publicationContentSha256\),[\s\S]*kind: "conflict_self_heal_job_state"/,
+  );
+  assert.match(
+    conflicts,
+    /runRepairMutation\(conflictCandidateLifecycle\(candidate, `status:\$\{status\}`\),[\s\S]*kind: "conflict_self_heal_status"/,
+  );
+  assert.match(
+    conflicts,
+    /runRepairMutation\(conflictCandidateLifecycle\(candidate, "dispatch"\),[\s\S]*kind: "repair_dispatch"/,
+  );
+});
+
+test("self-heal workflows publish immutable action-ledger shards", () => {
+  const workflows = [
+    {
+      path: ".github/workflows/repair-self-heal.yml",
+      setup: "Setup failed-run self-heal action ledger",
+      finalize: "Finalize failed-run self-heal action ledger",
+      publish: "Publish immutable failed-run self-heal action ledger",
+      lane: "failed-run-self-heal",
+      receipt: "failed_run_self_heal_state",
+    },
+    {
+      path: ".github/workflows/repair-conflict-self-heal.yml",
+      setup: "Setup conflict self-heal action ledger",
+      finalize: "Finalize conflict self-heal action ledger",
+      publish: "Publish immutable conflict self-heal action ledger",
+      lane: "conflict-self-heal",
+      receipt: "conflict_self_heal_state",
+    },
+  ] as const;
+
+  for (const expected of workflows) {
+    const workflow = readText(expected.path);
+    assert.match(workflow, /uses: \.\/\.github\/actions\/setup-action-ledger/);
+    assert.match(workflow, new RegExp(expected.setup));
+    assert.match(workflow, new RegExp(expected.finalize));
+    assert.match(workflow, new RegExp(expected.publish));
+    assert.match(workflow, new RegExp(`--repair-lane ${expected.lane}`));
+    assert.match(workflow, new RegExp(`--receipt-kind ${expected.receipt}`));
+    assert.match(workflow, /repair:action-ledger -- finalize/);
+    assert.match(workflow, /repair:action-ledger -- publish/);
+    assert.match(workflow, /\.eventPaths == \$manifest\[0\]\.event_paths/);
+    assert.match(workflow, /jq -r '\.paths\[\]\?'/);
+    assert.ok(workflow.indexOf(expected.setup) < workflow.indexOf(expected.finalize));
+    assert.ok(workflow.indexOf(expected.finalize) < workflow.indexOf(expected.publish));
+  }
+});

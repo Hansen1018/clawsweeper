@@ -106,10 +106,12 @@ checkpoint, and status-only commits are intentionally omitted.
   shards instead of silently publishing an incomplete ledger.
 - Added exact repair request-boundary receipts for branch, pull request,
   comment, label, review-thread, continuation-dispatch, source-close
-  compensation, closeout, and merge mutations, preserving accepted and unknown
-  outcomes through later failures. Merge, close, comment, label, CrabFleet,
-  and dashboard requests now emit one receipt pair per actual one-shot request,
-  including unknown response-loss outcomes. Added digest-bound repair and
+  compensation, closeout, merge, self-heal gate, self-heal status-comment,
+  immutable self-heal job publication, and self-heal dispatch mutations,
+  preserving accepted and unknown outcomes through later failures. Merge,
+  close, comment, label, CrabFleet, and dashboard requests now emit one receipt
+  pair per actual one-shot request, including unknown response-loss outcomes.
+  Added digest-bound repair planning, structured-result repair, execution, and
   commit-review Codex log/report lifecycles, request-bound commit-check and
   notification delivery receipts, generic workflow attempt/finalization
   events, interruption recovery for unfinished generic Codex reviews, and
@@ -126,6 +128,8 @@ checkpoint, and status-only commits are intentionally omitted.
   workers that finish during rollout remain publishable only when their exact
   worker commit is verified on default-branch history before the immutable
   handoff contract, and those records carry explicit legacy provenance.
+  Pre-contract self-heal attempts continue to consume the source job's retry
+  budget, and missing historical job paths skip only the affected candidate.
   Commit-finding intake also verifies canonical report paths, exact report
   bytes, and embedded source identity. Deterministic no-op intake and paginated
   commit-review continuations retain receipt ownership across workflow reruns,

@@ -21,6 +21,7 @@ import {
   resolveCurrentStateJobIdentity,
 } from "./immutable-job-handoff.js";
 import { activeRepairJobGenerations as listActiveRepairJobGenerations } from "./live-worker-capacity.js";
+import { runRepairMutation, type RepairLifecycleInput } from "./repair-action-ledger.js";
 
 const DEFAULT_REPO = currentProjectRepo();
 const DEFAULT_WORKFLOW = REPAIR_CLUSTER_WORKFLOW;
@@ -170,12 +171,26 @@ function selectCandidates() {
   const cutoffMs = Date.now() - maxAgeHours * 60 * 60 * 1000;
   const attemptedIdentities = new Set<string>();
   const attemptCountsByIdentity = new Map<string, number>();
+  const legacyAttemptedRunsByJob = new Set<string>();
+  const legacyAttemptCountsByJob = new Map<string, number>();
   for (const attempt of attempts) {
     const immutableKey = attemptImmutableJobKey(attempt);
-    if (!immutableKey) continue;
     const sourceRunId = String(attempt.source_run_id ?? "");
-    if (sourceRunId) attemptedIdentities.add(`${sourceRunId}:${immutableKey}`);
-    attemptCountsByIdentity.set(immutableKey, (attemptCountsByIdentity.get(immutableKey) ?? 0) + 1);
+    if (immutableKey) {
+      if (sourceRunId) attemptedIdentities.add(`${sourceRunId}:${immutableKey}`);
+      attemptCountsByIdentity.set(
+        immutableKey,
+        (attemptCountsByIdentity.get(immutableKey) ?? 0) + 1,
+      );
+      continue;
+    }
+    const legacyJobPath = legacyAttemptJobPath(attempt);
+    if (!legacyJobPath) continue;
+    if (sourceRunId) legacyAttemptedRunsByJob.add(`${sourceRunId}:${legacyJobPath}`);
+    legacyAttemptCountsByJob.set(
+      legacyJobPath,
+      (legacyAttemptCountsByJob.get(legacyJobPath) ?? 0) + 1,
+    );
   }
   const latestByJob = new Map();
 
@@ -208,7 +223,18 @@ function selectCandidates() {
     })
     .map((record: JsonValue) => {
       const sourceJob = String(record.source_job ?? "");
-      const immutableJob = resolveCurrentStateJobIdentity(sourceJob);
+      let immutableJob;
+      try {
+        immutableJob = resolveCurrentStateJobIdentity(sourceJob);
+      } catch (error) {
+        if (!isMissingCurrentStateJob(error)) throw error;
+        skippedCandidates.push({
+          reason: "missing_job_file",
+          run_id: record.run_id ?? null,
+          source_job: sourceJob,
+        });
+        return null;
+      }
       return {
         ...record,
         source_job: immutableJob.jobPath,
@@ -218,6 +244,7 @@ function selectCandidates() {
         mode: requestedMode ?? immutableJob.job.frontmatter.mode,
       };
     })
+    .filter((record: JsonValue) => record !== null)
     .filter((record: JsonValue) => {
       const activeRunIds =
         activeJobGenerations.get(
@@ -238,15 +265,25 @@ function selectCandidates() {
       if (allowRepeat) return true;
       const runId = String(record.run_id ?? "");
       const immutableKey = String(record.immutable_job_key ?? "");
-      if (runId && attemptedIdentities.has(`${runId}:${immutableKey}`)) return false;
-      if ((attemptCountsByIdentity.get(immutableKey) ?? 0) < maxAttemptsPerJob) return true;
+      const sourceJob = String(record.source_job ?? "");
+      if (
+        runId &&
+        (attemptedIdentities.has(`${runId}:${immutableKey}`) ||
+          legacyAttemptedRunsByJob.has(`${runId}:${sourceJob}`))
+      ) {
+        return false;
+      }
+      const attemptsForJob =
+        (attemptCountsByIdentity.get(immutableKey) ?? 0) +
+        (legacyAttemptCountsByJob.get(sourceJob) ?? 0);
+      if (attemptsForJob < maxAttemptsPerJob) return true;
       skippedCandidates.push({
         reason: "retry_limit_reached",
         run_id: runId || null,
         source_job: record.source_job,
         source_state_revision: record.source_state_revision,
         source_job_sha256: record.source_job_sha256,
-        attempts: attemptCountsByIdentity.get(immutableKey) ?? 0,
+        attempts: attemptsForJob,
       });
       return false;
     })
@@ -264,36 +301,57 @@ function activeRepairJobGenerations() {
 }
 
 function dispatchCandidate(candidate: LooseRecord) {
-  const result = spawnSync(
-    "gh",
-    [
-      "workflow",
-      "run",
+  const commandArgs = [
+    "workflow",
+    "run",
+    workflow,
+    "--repo",
+    repo,
+    "-f",
+    `job=${candidate.source_job}`,
+    "-f",
+    `state_revision=${candidate.source_state_revision}`,
+    "-f",
+    `job_sha256=${candidate.source_job_sha256}`,
+    "-f",
+    `mode=${candidate.mode}`,
+    "-f",
+    `runner=${runner}`,
+    "-f",
+    `execution_runner=${executionRunner}`,
+    "-f",
+    `model=${model}`,
+  ];
+  runRepairMutation(selfHealDispatchLifecycle(candidate), {
+    kind: "repair_dispatch",
+    operationName: "failed_run_self_heal",
+    component: "failed_run_self_heal",
+    identity: {
+      repository: repo,
       workflow,
-      "--repo",
-      repo,
-      "-f",
-      `job=${candidate.source_job}`,
-      "-f",
-      `state_revision=${candidate.source_state_revision}`,
-      "-f",
-      `job_sha256=${candidate.source_job_sha256}`,
-      "-f",
-      `mode=${candidate.mode}`,
-      "-f",
-      `runner=${runner}`,
-      "-f",
-      `execution_runner=${executionRunner}`,
-      "-f",
-      `model=${model}`,
-    ],
-    { cwd: repoRoot(), encoding: "utf8", stdio: "pipe" },
-  );
-  if (result.status !== 0) {
-    throw new Error(
-      `failed to dispatch ${candidate.source_job}: ${result.stderr || result.stdout}`,
-    );
-  }
+      sourceRunId: candidate.run_id,
+      jobPath: candidate.source_job,
+      stateRevision: candidate.source_state_revision,
+      jobSha256: candidate.source_job_sha256,
+      mode: candidate.mode,
+      runner,
+      executionRunner,
+      model,
+    },
+    operation: () => {
+      const result = spawnSync("gh", commandArgs, {
+        cwd: repoRoot(),
+        encoding: "utf8",
+        stdio: "pipe",
+      });
+      if (result.status !== 0) {
+        throw new Error(
+          `failed to dispatch ${candidate.source_job}: ${result.stderr || result.stdout}`,
+        );
+      }
+      return result;
+    },
+  });
   console.log(`dispatched ${candidate.source_job} from failed run ${candidate.run_id}`);
 }
 
@@ -453,7 +511,14 @@ function readRepoVariables() {
 }
 
 function setGate(name: string, value: JsonValue) {
-  ghText(["variable", "set", name, "--repo", repo, "--body", String(value ?? "")]);
+  const normalizedValue = String(value ?? "");
+  runRepairMutation(selfHealGateLifecycle(name, normalizedValue), {
+    kind: "repository_variable_update",
+    operationName: "failed_run_self_heal",
+    component: "failed_run_self_heal_gate",
+    identity: { repository: repo, name, value: normalizedValue, batchId },
+    operation: () => ghText(["variable", "set", name, "--repo", repo, "--body", normalizedValue]),
+  });
   console.log(`${name}=${value}`);
 }
 
@@ -501,6 +566,38 @@ function attemptImmutableJobKey(attempt: LooseRecord): string | null {
     stateRevision,
     jobSha256,
   });
+}
+
+function legacyAttemptJobPath(attempt: LooseRecord): string | null {
+  const jobPath = String(attempt.source_job ?? "").trim();
+  return /^jobs\/[A-Za-z0-9_.-]+\/inbox\/[A-Za-z0-9_.-]+\.md$/.test(jobPath) ? jobPath : null;
+}
+
+function isMissingCurrentStateJob(error: unknown): boolean {
+  const detail = error instanceof Error ? error.message : String(error);
+  return /immutable job is missing at [^:]+:jobs\/[^/]+\/inbox\/[^/]+\.md$/.test(detail);
+}
+
+function selfHealDispatchLifecycle(candidate: LooseRecord): RepairLifecycleInput {
+  return {
+    repository: repo,
+    workKey: `failed-run-self-heal:${candidate.run_id}:${candidate.immutable_job_key}`,
+    clusterId: String(candidate.cluster_id ?? ""),
+    sourceRevision: String(candidate.source_state_revision ?? ""),
+    recordPath: String(candidate.source_job ?? ""),
+    subjectKind: "workflow",
+    subjectId: `failed-run-${candidate.run_id}`,
+  };
+}
+
+function selfHealGateLifecycle(name: string, value: string): RepairLifecycleInput {
+  return {
+    repository: repo,
+    workKey: `failed-run-self-heal:${batchId}:gate:${name}:${value}`,
+    sourceRevision: headSha,
+    subjectKind: "workflow",
+    subjectId: `self-heal-gate-${name.toLowerCase()}`,
+  };
 }
 
 function activeJobGenerationKey(jobPath: JsonValue, jobSha256: JsonValue): string {

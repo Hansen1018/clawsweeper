@@ -31,6 +31,11 @@ import {
   immutableJobDispatchArgs,
   resolveCurrentStateJobIdentity,
 } from "./immutable-job-handoff.js";
+import {
+  repairPublicationContentDigest,
+  runRepairMutation,
+  type RepairLifecycleInput,
+} from "./repair-action-ledger.js";
 
 const args = parseArgs(process.argv.slice(2));
 
@@ -359,11 +364,24 @@ function publishSelfHealJobs() {
   if (!publishRoot()) {
     throw new Error("refusing conflict self-heal dispatch: CLAWSWEEPER_STATE_DIR is required");
   }
-  const result = publishMainCommit({
-    message: "chore: publish conflict self-heal jobs",
-    paths: ["jobs"],
-    maxAttempts: 12,
-    pushAttempts: 4,
+  const publicationContentSha256 = repairPublicationContentDigest(["jobs"], repoRoot());
+  const result = runRepairMutation(conflictPublicationLifecycle(publicationContentSha256), {
+    kind: "conflict_self_heal_job_state",
+    operationName: "conflict_self_heal",
+    component: "conflict_self_heal",
+    identity: {
+      repository: repairRepo,
+      paths: ["jobs"],
+      publicationContentSha256,
+    },
+    operation: () =>
+      publishMainCommit({
+        message: "chore: publish conflict self-heal jobs",
+        paths: ["jobs"],
+        maxAttempts: 12,
+        pushAttempts: 4,
+      }),
+    outcome: (publication) => (publication === "committed" ? "accepted" : "rejected"),
   });
   console.log(`Published conflict self-heal jobs before dispatch: ${result}`);
 }
@@ -399,24 +417,43 @@ function postSelfHealStatus(candidate: LooseRecord, { status }: { status: string
     runUrl: currentActionsRunUrl(),
     status,
   });
-  const existing = findSelfHealStatusComment(candidate.number);
-  const payload = writePayload(
-    repoRoot(),
-    `conflict-self-heal-status-${candidate.number}-${candidate.head_sha}`,
-    { body },
-  );
-  if (existing?.id) {
-    ghText([
-      "api",
-      `repos/${repo}/issues/comments/${existing.id}`,
-      "--method",
-      "PATCH",
-      "--input",
-      payload,
-    ]);
-  } else {
-    ghText(["api", `repos/${repo}/issues/${candidate.number}/comments`, "--input", payload]);
-  }
+  runRepairMutation(conflictCandidateLifecycle(candidate, `status:${status}`), {
+    kind: "conflict_self_heal_status",
+    operationName: "conflict_self_heal",
+    component: "conflict_self_heal",
+    identity: {
+      repository: repo,
+      number: candidate.number,
+      headSha: candidate.head_sha,
+      jobPath: candidate.job_path,
+      status,
+      body,
+    },
+    operation: () => {
+      const existing = findSelfHealStatusComment(candidate.number);
+      const payload = writePayload(
+        repoRoot(),
+        `conflict-self-heal-status-${candidate.number}-${candidate.head_sha}`,
+        { body },
+      );
+      if (existing?.id) {
+        return ghText([
+          "api",
+          `repos/${repo}/issues/comments/${existing.id}`,
+          "--method",
+          "PATCH",
+          "--input",
+          payload,
+        ]);
+      }
+      return ghText([
+        "api",
+        `repos/${repo}/issues/${candidate.number}/comments`,
+        "--input",
+        payload,
+      ]);
+    },
+  });
 }
 
 function findSelfHealStatusComment(number: JsonValue) {
@@ -430,34 +467,84 @@ function findSelfHealStatusComment(number: JsonValue) {
 }
 
 function dispatchRepair(candidate: LooseRecord) {
-  const result = spawnSync(
-    "gh",
-    [
-      "workflow",
-      "run",
+  const commandArgs = [
+    "workflow",
+    "run",
+    workflow,
+    "--repo",
+    repairRepo,
+    "-f",
+    `job=${candidate.job_path}`,
+    ...immutableJobDispatchArgs({
+      stateRevision: candidate.state_revision,
+      jobSha256: candidate.job_sha256,
+    }),
+    "-f",
+    "mode=autonomous",
+    "-f",
+    `runner=${runner}`,
+    "-f",
+    `execution_runner=${executionRunner}`,
+    "-f",
+    `model=${model}`,
+  ];
+  runRepairMutation(conflictCandidateLifecycle(candidate, "dispatch"), {
+    kind: "repair_dispatch",
+    operationName: "conflict_self_heal",
+    component: "conflict_self_heal",
+    identity: {
+      repository: repairRepo,
       workflow,
-      "--repo",
-      repairRepo,
-      "-f",
-      `job=${candidate.job_path}`,
-      ...immutableJobDispatchArgs({
-        stateRevision: candidate.state_revision,
-        jobSha256: candidate.job_sha256,
-      }),
-      "-f",
-      "mode=autonomous",
-      "-f",
-      `runner=${runner}`,
-      "-f",
-      `execution_runner=${executionRunner}`,
-      "-f",
-      `model=${model}`,
-    ],
-    { cwd: repoRoot(), encoding: "utf8", stdio: "pipe" },
-  );
-  if (result.status !== 0) {
-    throw new Error(`failed to dispatch ${candidate.job_path}: ${result.stderr || result.stdout}`);
-  }
+      jobPath: candidate.job_path,
+      stateRevision: candidate.state_revision,
+      jobSha256: candidate.job_sha256,
+      mode: "autonomous",
+      runner,
+      executionRunner,
+      model,
+      headSha: candidate.head_sha,
+    },
+    operation: () => {
+      const result = spawnSync("gh", commandArgs, {
+        cwd: repoRoot(),
+        encoding: "utf8",
+        stdio: "pipe",
+      });
+      if (result.status !== 0) {
+        throw new Error(
+          `failed to dispatch ${candidate.job_path}: ${result.stderr || result.stdout}`,
+        );
+      }
+      return result;
+    },
+  });
+}
+
+function conflictCandidateLifecycle(
+  candidate: LooseRecord,
+  operation: string,
+): RepairLifecycleInput {
+  const number = Number(candidate.number);
+  return {
+    repository: repo,
+    workKey: `conflict-self-heal:${repo}#${number}:${candidate.immutable_job_key}:${operation}`,
+    number,
+    sourceRevision: String(candidate.state_revision ?? candidate.head_sha ?? ""),
+    recordPath: String(candidate.job_path ?? ""),
+    subjectKind: "pull_request",
+    subjectId: `pull-request-${number}`,
+  };
+}
+
+function conflictPublicationLifecycle(contentSha256: string): RepairLifecycleInput {
+  return {
+    repository: repairRepo,
+    workKey: `conflict-self-heal:job-publication:${contentSha256}`,
+    sourceRevision: String(process.env.GITHUB_SHA ?? ""),
+    recordPath: "jobs",
+    subjectKind: "workflow",
+    subjectId: "conflict-self-heal-job-publication",
+  };
 }
 
 function verifyJobHead(jobPath: string) {

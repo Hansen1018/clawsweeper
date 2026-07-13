@@ -138,14 +138,20 @@ confidential-identifier checks as every other durable machine-text field.
   selected path, entry type, executable bit, symlink target, and file-content
   digest. Distinct generated state from the same workflow revision cannot reuse
   a publication receipt, while replaying the same selected bytes remains stable.
-- Every repair Codex subprocess that persists output (write preflight, edit,
-  base reconcile, validation fix, `/review`, and review-fix) records a typed
-  attempt lifecycle plus SHA-256 evidence for JSONL, stderr, and report
-  artifacts. The action mode and typed attempt bind operation, event, and
-  idempotency identity, so same-numbered actions cannot replay or collide.
-  Final and final-sync attempts use explicit variants rather than coercing
-  display labels back into numbers. A configured preflight skip is the
-  deliberate exception: it launches no subprocess and creates no Codex output.
+- Every repair Codex subprocess that persists output (initial repair planning,
+  structured-result repair, write preflight, edit, base reconcile, validation
+  fix, `/review`, and review-fix) records a typed attempt lifecycle plus SHA-256
+  evidence for JSONL, stderr, and report artifacts. The action mode and typed
+  attempt bind operation, event, and idempotency identity, so same-numbered
+  actions cannot replay or collide. Final and final-sync attempts use explicit
+  variants rather than coercing display labels back into numbers. A configured
+  preflight skip is the deliberate exception: it launches no subprocess and
+  creates no Codex output.
+- Failed-run and conflict self-heal record request-bound receipts for temporary
+  repository-gate updates, status-comment upserts, immutable job publication,
+  and exact-generation worker dispatch. Legacy pre-contract attempts still
+  consume the retry budget for their source job path, while removed source jobs
+  are skipped independently instead of aborting the remaining batch.
 - Commit-review matrix shards bind their producer invocation to the matrix
   commit SHA, so multi-leg artifact downloads retain one importable shard per
   commit. Review and optional check publication share one causal workflow
@@ -337,9 +343,15 @@ The shared taxonomy defines six families:
 6. **Evidence**: Gitcrawl snapshot, query, and binding phases plus proof stage
    and binding phases.
 
-Review, apply, command-router, repair-session, issue-status, result-publication,
-and dashboard-publication lanes now emit this taxonomy. Repair receipts keep the
-logical work key and sealed repaired-source revision stable across retries;
+The Evidence family is the shared ledger contract. Production Gitcrawl snapshot,
+query, binding, and Cloudflare-service emitters are delivered by the Gitcrawl
+integration lane; defining the family alone does not claim that evidence was
+captured.
+
+Review, apply, command-router, commit-review, notification, repair-session,
+self-heal, issue-status, result-publication, and dashboard-publication lanes now
+emit this taxonomy. Repair receipts keep the logical work key and sealed
+repaired-source revision stable across retries;
 ClawSweeper's workflow checkout SHA is not target provenance. Workflow run and
 run attempt define the repair execution attempt; job, step, and invocation
 remain producer identity. Each process reconstructs the latest parent and phase
