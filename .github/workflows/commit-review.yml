@@ -536,11 +536,78 @@ jobs:
         with:
           build-script: build
 
+      - name: Authorize prior raw commit review artifact
+        id: raw-review-provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          EXPECTED_REVIEW_JOB: Review commit ${{ matrix.sha }}
+          EXPECTED_ATTEST_JOB: Attest commit ${{ matrix.sha }}
+          CURRENT_ATTEMPT_JOBS: ${{ runner.temp }}/commit-review-current-attempt-jobs-${{ matrix.sha }}.json
+        run: |
+          set -euo pipefail
+          if ! [[ "$RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]; then
+            echo "Invalid workflow run attempt: $RUN_ATTEMPT" >&2
+            exit 1
+          fi
+          if [ "$RUN_ATTEMPT" = "1" ]; then
+            echo "allow_prior=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          gh api --paginate --slurp \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/attempts/${RUN_ATTEMPT}/jobs?per_page=100" \
+            > "$CURRENT_ATTEMPT_JOBS"
+          node --input-type=module <<'NODE'
+          import fs from "node:fs";
+
+          const currentAttempt = Number(process.env.RUN_ATTEMPT);
+          const pages = JSON.parse(fs.readFileSync(process.env.CURRENT_ATTEMPT_JOBS, "utf8"));
+          if (!Array.isArray(pages)) {
+            throw new Error("current workflow attempt job response is invalid");
+          }
+          const jobs = pages.flatMap((page) => {
+            if (!page || !Array.isArray(page.jobs)) {
+              throw new Error("current workflow attempt job page is invalid");
+            }
+            return page.jobs;
+          });
+          if (jobs.length === 0) {
+            throw new Error("current workflow attempt has no jobs");
+          }
+          for (const job of jobs) {
+            if (
+              !job ||
+              typeof job.name !== "string" ||
+              Number(job.run_attempt) !== currentAttempt
+            ) {
+              throw new Error("current workflow attempt job provenance is invalid");
+            }
+          }
+
+          const attestJobs = jobs.filter(
+            (job) => job.name === process.env.EXPECTED_ATTEST_JOB,
+          );
+          if (attestJobs.length !== 1) {
+            throw new Error("current commit review attestation job provenance is ambiguous");
+          }
+          const reviewJobs = jobs.filter(
+            (job) => job.name === process.env.EXPECTED_REVIEW_JOB,
+          );
+          if (reviewJobs.length > 1) {
+            throw new Error("current commit review producer job provenance is ambiguous");
+          }
+          fs.appendFileSync(
+            process.env.GITHUB_OUTPUT,
+            `allow_prior=${reviewJobs.length === 0 ? "1" : "0"}\n`,
+          );
+          NODE
+
       - name: Resolve raw commit review artifact
         id: raw-review-artifact
         env:
           GH_TOKEN: ${{ github.token }}
-          CLAWSWEEPER_ALLOW_PRIOR_ARTIFACT: "1"
+          CLAWSWEEPER_ALLOW_PRIOR_ARTIFACT: ${{ steps.raw-review-provenance.outputs.allow_prior }}
         run: |
           pnpm run --silent repair:resolve-run-artifact -- \
             --repository "${{ github.repository }}" \

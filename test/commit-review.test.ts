@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { parse } from "yaml";
 
 const CLI = fileURLToPath(new URL("../dist/commit-sweeper.js", import.meta.url));
 
@@ -35,6 +36,93 @@ test("commit review ledger attestation runs outside the Codex review job", () =>
   assert.match(attestor, /Resolve raw commit review artifact/);
   assert.match(attestor, /Upload attested commit review report/);
   assert.match(attestor, /Finalize commit review action ledger/);
+});
+
+test("commit review attestation reuses prior reports only when the producer was not rerun", () => {
+  const workflow = parse(fs.readFileSync(".github/workflows/commit-review.yml", "utf8")) as {
+    jobs: {
+      attest: {
+        steps: Array<{
+          env?: Record<string, string>;
+          id?: string;
+          name?: string;
+          run?: string;
+        }>;
+      };
+    };
+  };
+  const steps = workflow.jobs.attest.steps;
+  const policyIndex = steps.findIndex(
+    (step) => step.name === "Authorize prior raw commit review artifact",
+  );
+  const resolveIndex = steps.findIndex(
+    (step) => step.name === "Resolve raw commit review artifact",
+  );
+  const policy = steps[policyIndex];
+  const resolve = steps[resolveIndex];
+
+  assert.ok(policyIndex >= 0);
+  assert.ok(resolveIndex > policyIndex);
+  assert.equal(policy?.id, "raw-review-provenance");
+  assert.equal(policy?.env?.RUN_ATTEMPT, "${{ github.run_attempt }}");
+  assert.equal(policy?.env?.EXPECTED_REVIEW_JOB, "Review commit ${{ matrix.sha }}");
+  assert.equal(policy?.env?.EXPECTED_ATTEST_JOB, "Attest commit ${{ matrix.sha }}");
+  assert.match(
+    policy?.run ?? "",
+    /actions\/runs\/\$\{RUN_ID\}\/attempts\/\$\{RUN_ATTEMPT\}\/jobs\?per_page=100/,
+  );
+  assert.equal(
+    resolve?.env?.CLAWSWEEPER_ALLOW_PRIOR_ARTIFACT,
+    "${{ steps.raw-review-provenance.outputs.allow_prior }}",
+  );
+
+  const firstAttempt = runPriorArtifactPolicy(policy?.run ?? "", 1, []);
+  assert.equal(firstAttempt.status, 0, firstAttempt.stderr);
+  assert.equal(firstAttempt.outputs.allow_prior, "0");
+  assert.equal(firstAttempt.ghCalled, false);
+
+  const failedProducerRerun = runPriorArtifactPolicy(policy?.run ?? "", 2, [
+    {
+      name: "Attest commit fixture-sha",
+      run_attempt: 2,
+      status: "in_progress",
+      conclusion: null,
+    },
+    {
+      name: "Review commit fixture-sha",
+      run_attempt: 2,
+      status: "completed",
+      conclusion: "failure",
+    },
+  ]);
+  assert.equal(failedProducerRerun.status, 0, failedProducerRerun.stderr);
+  assert.equal(failedProducerRerun.outputs.allow_prior, "0");
+  assert.match(failedProducerRerun.ghArgs, /actions\/runs\/4242\/attempts\/2\/jobs\?per_page=100/);
+
+  const attestationOnlyRetry = runPriorArtifactPolicy(policy?.run ?? "", 2, [
+    {
+      name: "Attest commit fixture-sha",
+      run_attempt: 2,
+      status: "in_progress",
+      conclusion: null,
+    },
+  ]);
+  assert.equal(attestationOnlyRetry.status, 0, attestationOnlyRetry.stderr);
+  assert.equal(attestationOnlyRetry.outputs.allow_prior, "1");
+
+  const missingAttestor = runPriorArtifactPolicy(policy?.run ?? "", 2, [
+    {
+      name: "Review commit fixture-sha",
+      run_attempt: 2,
+      status: "completed",
+      conclusion: "failure",
+    },
+  ]);
+  assert.notEqual(missingAttestor.status, 0);
+  assert.match(
+    missingAttestor.stderr,
+    /current commit review attestation job provenance is ambiguous/,
+  );
 });
 
 test("commit review materializes private clone data before removing review credentials", () => {
@@ -344,4 +432,66 @@ test("commit review publishability failure retains a diagnostic report and fails
 
 function git(cwd: string, ...args: string[]): string {
   return execFileSync(process.env.GIT_BIN ?? "git", args, { cwd, encoding: "utf8" }).trim();
+}
+
+function runPriorArtifactPolicy(
+  script: string,
+  runAttempt: number,
+  jobs: Array<Record<string, unknown>>,
+): {
+  ghArgs: string;
+  ghCalled: boolean;
+  outputs: Record<string, string>;
+  status: number | null;
+  stderr: string;
+} {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "commit-review-policy-")));
+  const binDir = path.join(root, "bin");
+  const fixturePath = path.join(root, "jobs.json");
+  const ghLogPath = path.join(root, "gh.log");
+  const outputPath = path.join(root, "github-output");
+  const currentJobsPath = path.join(root, "current-attempt-jobs.json");
+  fs.mkdirSync(binDir);
+  fs.writeFileSync(fixturePath, `${JSON.stringify([{ total_count: jobs.length, jobs }])}\n`);
+  fs.writeFileSync(
+    path.join(binDir, "gh"),
+    '#!/bin/sh\nprintf "%s\\n" "$*" > "$GH_LOG"\ncat "$GH_FIXTURE"\n',
+    { mode: 0o755 },
+  );
+
+  try {
+    const result = spawnSync("bash", ["-c", script], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        CURRENT_ATTEMPT_JOBS: currentJobsPath,
+        EXPECTED_ATTEST_JOB: "Attest commit fixture-sha",
+        EXPECTED_REVIEW_JOB: "Review commit fixture-sha",
+        GH_FIXTURE: fixturePath,
+        GH_LOG: ghLogPath,
+        GH_TOKEN: "fixture-token",
+        GITHUB_OUTPUT: outputPath,
+        GITHUB_REPOSITORY: "openclaw/clawsweeper",
+        PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}`,
+        RUN_ATTEMPT: String(runAttempt),
+        RUN_ID: "4242",
+      },
+    });
+    const outputText = fs.existsSync(outputPath) ? fs.readFileSync(outputPath, "utf8") : "";
+    return {
+      ghArgs: fs.existsSync(ghLogPath) ? fs.readFileSync(ghLogPath, "utf8").trim() : "",
+      ghCalled: fs.existsSync(ghLogPath),
+      outputs: Object.fromEntries(
+        outputText
+          .trim()
+          .split("\n")
+          .filter(Boolean)
+          .map((line) => line.split("=", 2) as [string, string]),
+      ),
+      status: result.status,
+      stderr: result.stderr,
+    };
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 }
