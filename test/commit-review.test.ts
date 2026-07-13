@@ -20,6 +20,8 @@ test("commit review ledger attestation runs outside the Codex review job", () =>
   assert.doesNotMatch(review, /permission-checks: write|publish-check|finish-review/);
   assert.doesNotMatch(review, /COMMIT_SWEEPER_TARGET_GH_TOKEN|^\s+GH_TOKEN:/m);
   assert.match(review, /--codex-sandbox read-only/);
+  assert.match(review, /--require-publishable-report/);
+  assert.match(review, /uses: actions\/upload-artifact@v7[\s\S]*if: always\(\)/);
   assert.match(review, /remote set-url origin "https:\/\/github\.com\/\$\{TARGET_REPO\}\.git"/);
   assert.doesNotMatch(review, /path: commit-work\/\*\*/);
   assert.match(attestor, /setup-action-ledger/);
@@ -150,6 +152,7 @@ fs.writeFileSync(outputPath, [
         "internal",
         "--codex-timeout-ms",
         "10000",
+        "--require-publishable-report",
       ],
       {
         encoding: "utf8",
@@ -194,6 +197,79 @@ fs.writeFileSync(outputPath, [
     assert.doesNotMatch(report, /ghs_review-secret-token-123456/);
     assert.doesNotMatch(report, /private-model-name/);
     assert.match(report, /\[REDACTED\]/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("commit review publishability failure retains a diagnostic report and fails the producer", () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "commit-review-failure-")));
+  const targetDir = path.join(root, "target");
+  const reportDir = path.join(root, "reports");
+  const workDir = path.join(root, "work");
+  const binDir = path.join(root, "bin");
+  fs.mkdirSync(targetDir);
+  fs.mkdirSync(binDir);
+
+  try {
+    git(targetDir, "init", "-q");
+    git(targetDir, "config", "user.name", "Test Author");
+    git(targetDir, "config", "user.email", "test@example.com");
+    git(targetDir, "config", "commit.gpgsign", "false");
+    fs.writeFileSync(path.join(targetDir, "review.txt"), "base\n");
+    git(targetDir, "add", "review.txt");
+    git(targetDir, "commit", "-q", "-m", "base");
+    const baseSha = git(targetDir, "rev-parse", "HEAD");
+    fs.writeFileSync(path.join(targetDir, "review.txt"), "changed\n");
+    git(targetDir, "commit", "-qam", "review target");
+    const sha = git(targetDir, "rev-parse", "HEAD");
+    const codexPath = path.join(binDir, "codex");
+    fs.writeFileSync(
+      codexPath,
+      "#!/usr/bin/env node\nprocess.stderr.write('synthetic Codex failure\\n');\nprocess.exit(9);\n",
+      { mode: 0o755 },
+    );
+
+    const result = spawnSync(
+      process.execPath,
+      [
+        CLI,
+        "review",
+        "--target-repo",
+        "openclaw/clawsweeper",
+        "--target-dir",
+        targetDir,
+        "--commit-sha",
+        sha,
+        "--base-sha",
+        baseSha,
+        "--report-dir",
+        reportDir,
+        "--artifact-mode",
+        "--work-dir",
+        workDir,
+        "--codex-model",
+        "internal",
+        "--codex-timeout-ms",
+        "10000",
+        "--require-publishable-report",
+      ],
+      {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          CODEX_BIN: codexPath,
+          PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}`,
+        },
+      },
+    );
+
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /commit review report result is not publishable: failed/);
+    const reportPath = path.join(reportDir, "openclaw-clawsweeper", "commits", `${sha}.md`);
+    assert.equal(fs.existsSync(reportPath), true);
+    assert.match(fs.readFileSync(reportPath, "utf8"), /^result: failed$/m);
+    assert.match(fs.readFileSync(reportPath, "utf8"), /synthetic Codex failure/);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

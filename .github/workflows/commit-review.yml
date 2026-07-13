@@ -484,6 +484,7 @@ jobs:
             --codex-reasoning-effort high \
             --codex-sandbox read-only \
             --codex-timeout-ms 1800000 \
+            --require-publishable-report \
             --defer-workflow-completion
 
       - name: Upload commit review Codex logs

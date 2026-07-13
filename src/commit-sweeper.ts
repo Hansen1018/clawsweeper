@@ -551,6 +551,13 @@ function reviewCommand(args: Args): void {
       path: outputPath,
       kind: "commit_review_report",
     });
+    const reportResult = commitReviewReportResult(outputPath);
+    if (
+      argBool(args, "require_publishable_report") &&
+      !COMMIT_REVIEW_SUCCESS_RESULTS.has(reportResult)
+    ) {
+      throw new Error(`commit review report result is not publishable: ${reportResult}`);
+    }
     if (!deferWorkflowCompletion) {
       recordCommitWorkflowEvent(lifecycle, "completed");
       recordCommitWorkflowEvent(lifecycle, "finalized");
