@@ -421,13 +421,22 @@ test("durable dispatch records distinguish claim-owned timestamp drift", () => {
     exactHeadMergeClaimOwnsUpdatedAt(
       inspected,
       reviewedTimelineCursor,
-      "2026-07-13T08:02:02Z",
+      "2026-07-13T08:02:00Z",
       timeline,
     ),
     true,
   );
   assert.equal(
-    exactHeadMergeClaimOwnsUpdatedAt(inspected, reviewedTimelineCursor, "2026-07-13T08:02:02Z", [
+    exactHeadMergeClaimOwnsUpdatedAt(
+      inspected,
+      reviewedTimelineCursor,
+      "2026-07-13T08:02:02Z",
+      timeline,
+    ),
+    false,
+  );
+  assert.equal(
+    exactHeadMergeClaimOwnsUpdatedAt(inspected, reviewedTimelineCursor, "2026-07-13T08:02:00Z", [
       {
         id: 9998,
         event: "commented",
@@ -438,7 +447,7 @@ test("durable dispatch records distinguish claim-owned timestamp drift", () => {
     false,
   );
   assert.equal(
-    exactHeadMergeClaimOwnsUpdatedAt(inspected, reviewedTimelineCursor, "2026-07-13T08:02:02Z", [
+    exactHeadMergeClaimOwnsUpdatedAt(inspected, reviewedTimelineCursor, "2026-07-13T08:02:00Z", [
       ...timeline,
       {
         id: 9999,
