@@ -539,11 +539,15 @@ test("post-flight rechecks live security immediately before privileged mutations
   );
   assert.match(
     finalizeFixPr,
-    /kind: "post_flight_merge"[\s\S]*ghText\(mergeArgs\)[\s\S]*reconcileMergeState\(parsed\.number, action\.commit\)[\s\S]*outcome:[\s\S]*confirmation\.mergedAt[\s\S]*"accepted"[\s\S]*"unknown"/,
+    /kind: "post_flight_merge"[\s\S]*ghText\(mergeArgs\)[\s\S]*reconcileMergeState\(parsed\.number, action\.commit\)[\s\S]*outcome:[\s\S]*confirmation\?\.mergedAt[\s\S]*"accepted"[\s\S]*"unknown"/,
   );
   assert.match(
     finalizeFixPr,
-    /mergeAttempt\.policyBlock[\s\S]*const confirmation = mergeAttempt\.confirmation[\s\S]*!confirmation\.mergedAt[\s\S]*retry_recommended: true/,
+    /mergeAttempt\.policyBlock[\s\S]*retryRecommended[\s\S]*const confirmation = mergeAttempt\.confirmation[\s\S]*!confirmation[\s\S]*retry_recommended: true[\s\S]*!confirmation\.mergedAt[\s\S]*retry_recommended: true/,
+  );
+  assert.match(
+    finalizeFixPr,
+    /catch \(error\)[\s\S]*confirmationError: ghErrorText\(error\)[\s\S]*ambiguous: commandError !== null/,
   );
   assert.match(
     finalizeFixPr,
@@ -599,6 +603,8 @@ test("post-flight reconciles ambiguous merges and retries only after fresh safet
       CLAWSWEEPER_RULESET_APP_SLUG: "openclaw-clawsweeper",
       CLAWSWEEPER_RULESET_INSTALLATION_ID: "987654",
       CLAWSWEEPER_RULESET_GH_TOKEN: "ruleset-verifier",
+      CLAWSWEEPER_GH_RETRY_ATTEMPTS: "1",
+      CLAWSWEEPER_POST_FLIGHT_WAIT_MS: "0",
       CLAWSWEEPER_POST_FLIGHT_MERGE_ATTEMPTS: "3",
       CLAWSWEEPER_POST_FLIGHT_MERGE_RETRY_MAX_WAIT_MS: "0",
       CLAWSWEEPER_ACTION_LEDGER_FORCE: "1",
@@ -613,6 +619,7 @@ test("post-flight reconciles ambiguous merges and retries only after fresh safet
       FAKE_GH_FAILURE_COMMENTS_FILE: fixture.failureCommentsPath,
       FAKE_GH_DELAYED_MERGE_FILE: fixture.delayedMergePath,
       FAKE_GH_CONFIRMATION_COUNT_FILE: fixture.confirmationCountPath,
+      FAKE_GH_GATE_DRIFT_FILE: fixture.gateDriftPath,
       GITHUB_ACTION: "post_flight",
       GITHUB_JOB: "mutate",
       GITHUB_REPOSITORY: "openclaw/clawsweeper",
@@ -737,6 +744,54 @@ test("post-flight reconciles ambiguous merges and retries only after fresh safet
       ["started", "mutation_attempted"],
       ["failed", "mutation_outcome_unknown"],
     ]);
+
+    fixture.reset();
+    runVerifiedPostFlight(
+      fixture,
+      { ...commonEnv, FAKE_GH_CONFIRMATION_FAILURE_AFTER_ATTEMPT: "1" },
+      1,
+    );
+    report = JSON.parse(fs.readFileSync(fixture.reportPath, "utf8"));
+    assert.equal(report.outcome, "requeue");
+    assert.equal(report.actions[0]?.status, "blocked");
+    assert.match(report.actions[0]?.reason, /^merge outcome could not be confirmed:/);
+    assert.equal(report.actions[0]?.retry_recommended, true);
+    assert.equal(report.actions[0]?.merge_attempts, 1);
+    assert.equal(fs.readFileSync(fixture.mergeCountPath, "utf8"), "1");
+    assert.equal(fs.existsSync(fixture.mergedPath), true);
+    assert.deepEqual(mutationReceiptStates(finalizeVerifiedActionLedger(fixture, commonEnv)), [
+      ["started", "mutation_attempted"],
+      ["failed", "mutation_outcome_unknown"],
+    ]);
+
+    fixture.reset();
+    runVerifiedPostFlight(
+      fixture,
+      {
+        ...commonEnv,
+        FAKE_GH_MERGE_MODE: "transient",
+        FAKE_GH_PENDING_AFTER_ATTEMPT: "1",
+      },
+      1,
+    );
+    report = JSON.parse(fs.readFileSync(fixture.reportPath, "utf8"));
+    assert.equal(report.outcome, "requeue");
+    assert.match(report.actions[0]?.reason, /mergeable state is unknown/i);
+    assert.equal(report.actions[0]?.retry_recommended, true);
+    assert.equal(fs.readFileSync(fixture.mergeCountPath, "utf8"), "1");
+    assert.deepEqual(mutationReceiptStates(finalizeVerifiedActionLedger(fixture, commonEnv)), [
+      ["started", "mutation_attempted"],
+      ["failed", "mutation_outcome_unknown"],
+    ]);
+
+    fixture.reset();
+    runVerifiedPostFlight(fixture, { ...commonEnv, FAKE_GH_PENDING_BEFORE_MUTATION: "1" }, 1);
+    report = JSON.parse(fs.readFileSync(fixture.reportPath, "utf8"));
+    assert.equal(report.outcome, "requeue");
+    assert.match(report.actions[0]?.reason, /mergeable state is unknown/i);
+    assert.equal(report.actions[0]?.retry_recommended, true);
+    assert.equal(fs.existsSync(fixture.mergeCountPath), false);
+    assert.deepEqual(mutationReceiptStates(finalizeVerifiedActionLedger(fixture, commonEnv)), []);
 
     fixture.reset();
     runVerifiedPostFlight(
@@ -1142,6 +1197,7 @@ function createVerifiedMergeFixture() {
   const failureCommentsPath = path.join(root, "failure-comments.txt");
   const delayedMergePath = path.join(root, "delayed-merge.txt");
   const confirmationCountPath = path.join(root, "confirmation-count.txt");
+  const gateDriftPath = path.join(root, "gate-drift.txt");
   const ledgerRoot = path.join(root, "ledger");
   const ledgerOutputRoot = path.join(root, "ledger-output");
   const clusterId = "automerge-openclaw-openclaw-123";
@@ -1397,7 +1453,7 @@ function createVerifiedMergeFixture() {
       "const merged = fs.existsSync(process.env.FAKE_GH_MERGED_FILE) || (delayedMerge && confirmationCount >= 2);",
       "const mergeCount = () => fs.existsSync(process.env.FAKE_GH_MERGE_COUNT_FILE) ? Number(fs.readFileSync(process.env.FAKE_GH_MERGE_COUNT_FILE, 'utf8')) : 0;",
       "if (merged) { pull.state = 'closed'; pull.merged_at = '2026-07-13T08:00:00Z'; pull.merge_commit_sha = 'b'.repeat(40); }",
-      "if (args[0] === 'api' && args[1] === 'repos/openclaw/openclaw/pulls/123') { process.stdout.write(JSON.stringify(pull)); process.exit(0); }",
+      "if (args[0] === 'api' && args[1] === 'repos/openclaw/openclaw/pulls/123') { const commentsCount = fs.existsSync(process.env.FAKE_GH_COMMENTS_COUNT_FILE) ? Number(fs.readFileSync(process.env.FAKE_GH_COMMENTS_COUNT_FILE, 'utf8')) : 0; if (process.env.FAKE_GH_PENDING_BEFORE_MUTATION === '1' && mergeCount() === 0 && commentsCount > 0) fs.writeFileSync(process.env.FAKE_GH_GATE_DRIFT_FILE, '1'); if (process.env.FAKE_GH_CONFIRMATION_FAILURE_AFTER_ATTEMPT === '1' && mergeCount() > 0) { process.stderr.write('gh: HTTP 502: confirmation unavailable\\n'); process.exit(1); } process.stdout.write(JSON.stringify(pull)); process.exit(0); }",
       "if (args[0] === 'api' && args[1] === 'repos/openclaw/openclaw/pulls/122') { process.stdout.write(JSON.stringify(sourcePull)); process.exit(0); }",
       "if (args[0] === 'api' && args[1] === 'repos/openclaw/openclaw/issues/123') { process.stdout.write(JSON.stringify({ labels: pull.labels })); process.exit(0); }",
       "if (args[0] === 'api' && args[1] === 'repos/openclaw/openclaw/issues/122') { process.stdout.write(JSON.stringify({ labels: sourcePull.labels })); process.exit(0); }",
@@ -1417,7 +1473,7 @@ function createVerifiedMergeFixture() {
       "if (args[0] === 'api' && args[1] === 'repos/openclaw/openclaw/rulesets/18588237') { process.stdout.write(JSON.stringify({ enforcement: 'active', bypass_actors: [], rules: [{ type: 'required_status_checks', parameters: { strict_required_status_checks_policy: true, required_status_checks: [{ context: 'required-ci/exact-merge' }] } }] })); process.exit(0); }",
       "if (args[0] === 'api' && args[1] === 'repos/openclaw/openclaw/branches/main/protection') { process.stdout.write(JSON.stringify({ required_status_checks: null })); process.exit(0); }",
       "if (args[0] === 'api' && args[1] === 'graphql') { process.stdout.write(JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: { pageInfo: { hasNextPage: false }, nodes: [] } } } } })); process.exit(0); }",
-      "if (args[0] === 'pr' && args[1] === 'view') { const viewMerged = merged || (process.env.FAKE_GH_VIEW_MERGED_ONLY_AFTER_ATTEMPT === '1' && mergeCount() > 0); process.stdout.write(JSON.stringify({ baseRefName: 'main', isDraft: false, mergeable: 'MERGEABLE', mergeCommit: viewMerged ? { oid: 'b'.repeat(40) } : null, mergeStateStatus: 'CLEAN', mergedAt: viewMerged ? '2026-07-13T08:00:00Z' : null, reviewDecision: null, state: viewMerged ? 'MERGED' : 'OPEN', statusCheckRollup: [], title: pull.title, url: 'https://github.com/openclaw/openclaw/pull/123' })); process.exit(0); }",
+      "if (args[0] === 'pr' && args[1] === 'view') { const viewMerged = merged || (process.env.FAKE_GH_VIEW_MERGED_ONLY_AFTER_ATTEMPT === '1' && mergeCount() > 0); const pending = (process.env.FAKE_GH_PENDING_AFTER_ATTEMPT === '1' && mergeCount() > 0) || fs.existsSync(process.env.FAKE_GH_GATE_DRIFT_FILE); process.stdout.write(JSON.stringify({ baseRefName: 'main', isDraft: false, mergeable: pending ? 'UNKNOWN' : 'MERGEABLE', mergeCommit: viewMerged ? { oid: 'b'.repeat(40) } : null, mergeStateStatus: 'CLEAN', mergedAt: viewMerged ? '2026-07-13T08:00:00Z' : null, reviewDecision: null, state: viewMerged ? 'MERGED' : 'OPEN', statusCheckRollup: [], title: pull.title, url: 'https://github.com/openclaw/openclaw/pull/123' })); process.exit(0); }",
       "if (args[0] === 'pr' && args[1] === 'merge') {",
       "  const count = mergeCount() + 1;",
       "  fs.writeFileSync(process.env.FAKE_GH_MERGE_COUNT_FILE, String(count));",
@@ -1453,6 +1509,7 @@ function createVerifiedMergeFixture() {
     failureCommentsPath,
     delayedMergePath,
     confirmationCountPath,
+    gateDriftPath,
     ledgerRoot,
     ledgerOutputRoot,
     reset() {
@@ -1462,6 +1519,7 @@ function createVerifiedMergeFixture() {
       fs.rmSync(failureCommentsPath, { force: true });
       fs.rmSync(delayedMergePath, { force: true });
       fs.rmSync(confirmationCountPath, { force: true });
+      fs.rmSync(gateDriftPath, { force: true });
       fs.rmSync(ledgerRoot, { recursive: true, force: true });
       fs.rmSync(ledgerOutputRoot, { recursive: true, force: true });
       fs.mkdirSync(ledgerRoot);

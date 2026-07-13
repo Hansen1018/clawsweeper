@@ -368,6 +368,7 @@ function finalizeFixPr(action: LooseRecord) {
       pull: LooseRecord;
       view: LooseRecord;
       confirmation: ReturnType<typeof reconcileMergeState> | null;
+      confirmationError: string;
       ambiguous: boolean;
     };
     try {
@@ -386,6 +387,7 @@ function finalizeFixPr(action: LooseRecord) {
             pull: finalPull,
             view: finalView,
             confirmation: null,
+            confirmationError: "",
             ambiguous: false,
           };
         }
@@ -394,28 +396,39 @@ function finalizeFixPr(action: LooseRecord) {
           identity: postFlightMergeMutationIdentity(parsed.number, action.commit),
           component: "post_flight",
           operation: () => {
+            let commandError: unknown = null;
             try {
               ghText(mergeArgs);
             } catch (error) {
-              const confirmation = reconcileMergeState(parsed.number, action.commit);
-              if (confirmation.mergedAt && !confirmation.block) {
-                return { confirmation, ambiguous: true };
-              }
-              throw error;
+              commandError = error;
             }
-            return {
-              confirmation: reconcileMergeState(parsed.number, action.commit),
-              ambiguous: false,
-            };
+            let confirmation: ReturnType<typeof reconcileMergeState>;
+            try {
+              confirmation = reconcileMergeState(parsed.number, action.commit);
+            } catch (error) {
+              return {
+                confirmation: null,
+                confirmationError: ghErrorText(error),
+                ambiguous: commandError !== null,
+              };
+            }
+            if (commandError !== null) {
+              if (confirmation.mergedAt && !confirmation.block) {
+                return { confirmation, confirmationError: "", ambiguous: true };
+              }
+              throw commandError;
+            }
+            return { confirmation, confirmationError: "", ambiguous: false };
           },
           outcome: ({ confirmation }) =>
-            confirmation.mergedAt && !confirmation.block ? "accepted" : "unknown",
+            confirmation?.mergedAt && !confirmation.block ? "accepted" : "unknown",
         });
         return {
           policyBlock: "",
-          pull: mutation.confirmation.pull,
-          view: mutation.confirmation.view,
+          pull: mutation.confirmation?.pull ?? finalPull,
+          view: mutation.confirmation?.view ?? finalView,
           confirmation: mutation.confirmation,
+          confirmationError: mutation.confirmationError,
           ambiguous: mutation.ambiguous,
         };
       });
@@ -458,11 +471,13 @@ function finalizeFixPr(action: LooseRecord) {
         view,
       });
       if (retryBlock) {
+        const retryRecommended = shouldWaitForMergeReadiness({ mergeBlock: retryBlock, view });
         return {
           ...prBase,
           status: "blocked",
           reason: retryBlock,
           merge_method: "squash",
+          ...(retryRecommended ? { retry_recommended: true } : {}),
           merge_attempts: mergeAttempts,
           waited_ms: waitedMs,
         };
@@ -508,18 +523,33 @@ function finalizeFixPr(action: LooseRecord) {
     view = mergeAttempt.view;
     prBase = { ...base, pr: `#${parsed.number}`, title: view.title ?? pull.title ?? null };
     if (mergeAttempt.policyBlock) {
+      const retryRecommended = shouldWaitForMergeReadiness({
+        mergeBlock: mergeAttempt.policyBlock,
+        view,
+      });
       return {
         ...prBase,
         status: "blocked",
         reason: mergeAttempt.policyBlock,
         merge_method: "squash",
+        ...(retryRecommended ? { retry_recommended: true } : {}),
         merge_attempts: mergeAttempts,
         waited_ms: waitedMs,
       };
     }
 
     const confirmation = mergeAttempt.confirmation;
-    if (!confirmation) throw new Error("merge confirmation is missing after an unblocked attempt");
+    if (!confirmation) {
+      return {
+        ...prBase,
+        status: "blocked",
+        reason: `merge outcome could not be confirmed: ${compactText(mergeAttempt.confirmationError, 500)}`,
+        merge_method: "squash",
+        retry_recommended: true,
+        merge_attempts: mergeAttempts,
+        waited_ms: waitedMs,
+      };
+    }
     pull = confirmation.pull;
     view = confirmation.view;
     prBase = { ...base, pr: `#${parsed.number}`, title: view.title ?? pull.title ?? null };
