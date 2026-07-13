@@ -272,7 +272,10 @@ test("commit finding and worker workflows bind immutable review inputs", () => {
 
   assert.match(intake, /Resolve commit finding report handoff/);
   assert.match(intake, /payload version 2 requires report_revision and report_sha256/);
-  assert.match(intake, /REPORT_REVISION: \$\{\{ steps\.report-handoff\.outputs\.report_revision \}\}/);
+  assert.match(
+    intake,
+    /REPORT_REVISION: \$\{\{ steps\.report-handoff\.outputs\.report_revision \}\}/,
+  );
   assert.match(intake, /REPORT_SHA256: \$\{\{ steps\.report-handoff\.outputs\.report_sha256 \}\}/);
   assert.doesNotMatch(intake, /repair:dispatch/);
   assert.match(worker, /ref: \$\{\{ steps\.immutable-job\.outputs\.state_revision \}\}/);
@@ -345,7 +348,16 @@ test("repair operational callers resolve immutable state before dedupe and dispa
     selfHeal,
     /resolveStateJobIdentity\(\{[\s\S]*jobPath: sourceJob,[\s\S]*stateRevision,[\s\S]*jobSha256/,
   );
-  assert.doesNotMatch(selfHeal, /resolveCurrentStateJobIdentity\(sourceJob\)/);
+  const resolveRunRecord = selfHeal.slice(
+    selfHeal.indexOf("function resolveRunRecordJob"),
+    selfHeal.indexOf("function resolveRunRecoveryInputs"),
+  );
+  assert.match(
+    resolveRunRecord,
+    /return \{[\s\S]*resolveCurrentStateJobIdentity\(sourceJob\),[\s\S]*legacyUnsealed: true/,
+  );
+  assert.equal(resolveRunRecord.match(/resolveCurrentStateJobIdentity\(sourceJob\)/g)?.length, 1);
+  assert.match(selfHeal, /mode: immutableJob\.legacyUnsealed[\s\S]*\? "plan"/);
   assert.match(selfHeal, /activeJobGenerationKey\(record\.source_job, record\.source_job_sha256\)/);
   assert.match(finalizer, /const jobPath = normalizedFinalizerDispatchJobPath\(pr\.job_path\)/);
   assert.match(finalizer, /const immutableJob = resolveCurrentStateJobIdentity\(jobPath\)/);

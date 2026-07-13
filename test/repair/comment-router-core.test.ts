@@ -1940,6 +1940,7 @@ test("label-sweep classification checks the exact-head review lease before dispa
 test("comment router durably claims dispatch commands and recovers exact workflow receipts", () => {
   const source = readFileSync("src/repair/comment-router.ts", "utf8");
   const sweepWorkflow = readFileSync(".github/workflows/sweep.yml", "utf8");
+  const exactReviewQueue = readFileSync("src/repair/exact-review-action-ledger.ts", "utf8");
   const assistWorkflow = readFileSync(".github/workflows/assist.yml", "utf8");
   const repairWorkflow = readFileSync(".github/workflows/repair-cluster-worker.yml", "utf8");
   const executeBlock = source.slice(
@@ -1983,8 +1984,10 @@ test("comment router durably claims dispatch commands and recovers exact workflo
     /ITEM_NUMBERS:.*startsWith\(github\.event\.inputs\.item_numbers, 'router-'\)/,
   );
   assert.match(assistWorkflow, /Assist \{0\}#\{1\} \[\{2\}\]/);
-  assert.match(sweepWorkflow, /delivery_id: dispatchKey/);
-  assert.match(sweepWorkflow, /`router:\$\{dispatchKey\}`/);
+  assert.match(exactReviewQueue, /const dispatchKey = stringValue\(dispatch\.dispatch_key\)/);
+  assert.match(exactReviewQueue, /const deliveryId = dispatchKey/);
+  assert.match(exactReviewQueue, /`router:\$\{dispatchKey\}`/);
+  assert.match(exactReviewQueue, /const payload = \{ delivery_id: deliveryId, decision \}/);
   assert.match(assistWorkflow, /dispatch-receipt-owner\.sh/);
   assert.match(assistWorkflow, /assist\.yml.*assist/s);
   assert.match(repairWorkflow, /dispatch-receipt-owner\.sh/);

@@ -405,6 +405,10 @@ test("exact-review workflows isolate state credentials and publish exact manifes
     event.indexOf("Publish exact event action ledger") <
       event.indexOf("Complete exact-review queue lease"),
   );
+  assert.match(
+    event,
+    /Complete exact-review queue lease[\s\S]*if: \$\{\{ always\(\) && steps\.finalize-exact-event-action-ledger\.outcome == 'success' && steps\.publish-exact-event-action-ledger\.outcome == 'success' \}\}/,
+  );
   assert.ok(
     event.indexOf("Complete exact-review queue lease") <
       event.indexOf("Finalize exact-review queue action ledger"),
