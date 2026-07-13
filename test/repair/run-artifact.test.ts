@@ -13,6 +13,7 @@ const digest2 = "2".repeat(64);
 test("artifact resolver accepts pnpm's forwarded argument separator", () => {
   const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-artifact-cli-"));
   const ghPath = path.join(binDir, "gh");
+  const outputPath = path.join(binDir, "github-output");
   fs.writeFileSync(
     ghPath,
     `#!/usr/bin/env node
@@ -27,7 +28,7 @@ process.stdout.write(JSON.stringify([{ artifacts: [{
   fs.chmodSync(ghPath, 0o755);
 
   try {
-    const output = execFileSync(
+    execFileSync(
       process.execPath,
       [
         "dist/repair/resolve-run-artifact.js",
@@ -43,9 +44,14 @@ process.stdout.write(JSON.stringify([{ artifacts: [{
       ],
       {
         encoding: "utf8",
-        env: { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}` },
+        env: {
+          ...process.env,
+          GITHUB_OUTPUT: outputPath,
+          PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}`,
+        },
       },
     );
+    const output = fs.readFileSync(outputPath, "utf8");
 
     assert.match(output, /artifact_id=101/);
     assert.match(output, /producer_attempt=1/);
