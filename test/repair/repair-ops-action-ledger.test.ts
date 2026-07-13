@@ -170,6 +170,7 @@ test("repair mutation and Codex boundaries emit exact immutable receipts", () =>
   const executor = readText("src/repair/execute-fix-artifact.ts");
   const github = readText("src/repair/execute-fix-github.ts");
   const postFlight = readText("src/repair/post-flight.ts");
+  const applyResult = readText("src/repair/apply-result.ts");
 
   assert.match(ledger, /ACTION_EVENT_TYPES\.repairMutation/);
   assert.match(ledger, /requestAttempt/);
@@ -255,6 +256,17 @@ test("repair mutation and Codex boundaries emit exact immutable receipts", () =>
     postFlight,
     /if \(!mergeOwned\) \{[\s\S]*status: "skipped"[\s\S]*already merged without a dispatched ClawSweeper claim/,
   );
+  for (const boundary of [
+    "apply_result_closeout_comment",
+    "apply_result_target_close",
+    "apply_result_blocked_merge_label_create",
+    "apply_result_blocked_merge_label_add",
+  ]) {
+    assert.match(applyResult, new RegExp(`"${boundary}"`));
+  }
+  assert.match(applyResult, /runApplyResultMutationWithRetry/);
+  assert.match(applyResult, /knownNoMutation: githubMutationRejectedBeforeWrite/);
+  assert.doesNotMatch(applyResult, /ghBestEffort\(\["issue", "edit"/);
 });
 
 test("commit review and notification workflows publish their operation receipts", () => {

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -1093,6 +1093,182 @@ test("repair apply leaves issue duplicate close behavior unchanged", () => {
   }
 });
 
+test("repair apply records distinct accepted receipts for closeout comment and PR close", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-apply-result-"));
+  try {
+    const paths = writeCloseReceiptFixture(tmp, { privateEvidence: true });
+
+    runApplyResult(paths, {
+      proofDecision: "covered",
+      actionLedgerInvocation: "apply-close-success",
+    });
+
+    const events = applyResultMutationEvents(paths);
+    assert.deepEqual(
+      events.map((event) => event.attributes?.completion_reason),
+      ["mutation_attempted", "mutation_accepted", "mutation_attempted", "mutation_accepted"],
+    );
+    assert.equal(new Set(events.map((event) => event.idempotency_key_sha256)).size, 2);
+    assert.equal(events[0].idempotency_key_sha256, events[1].idempotency_key_sha256);
+    assert.equal(events[2].idempotency_key_sha256, events[3].idempotency_key_sha256);
+    assert.notEqual(events[0].idempotency_key_sha256, events[2].idempotency_key_sha256);
+    const serialized = JSON.stringify(events);
+    assert.equal(serialized.includes("Private source title"), false);
+    assert.equal(serialized.includes("Thanks for the work here"), false);
+    assert.equal(serialized.includes("write-token"), false);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("repair apply preserves an accepted closeout receipt when PR close is definitely rejected", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-apply-result-"));
+  try {
+    const paths = writeCloseReceiptFixture(tmp, {
+      mutationFailures: {
+        target_close: { attempts: 1, message: "gh: Validation Failed (HTTP 422)" },
+      },
+    });
+
+    const applied = runApplyResultProcess(paths, {
+      proofDecision: "covered",
+      actionLedgerInvocation: "apply-close-rejected",
+      retryAttempts: 3,
+    });
+    assert.notEqual(
+      applied.status,
+      0,
+      `${applied.stderr}\n${fs.readFileSync(paths.ghLogPath, "utf8")}`,
+    );
+
+    const events = applyResultMutationEvents(paths);
+    assert.deepEqual(
+      events.map((event) => event.attributes?.completion_reason),
+      ["mutation_attempted", "mutation_accepted", "mutation_attempted", "mutation_rejected"],
+    );
+    assert.equal(events[0].idempotency_key_sha256, events[1].idempotency_key_sha256);
+    assert.notEqual(events[1].idempotency_key_sha256, events[2].idempotency_key_sha256);
+    assert.equal(events[2].idempotency_key_sha256, events[3].idempotency_key_sha256);
+    assert.equal(prCloseCallCount(paths.ghLogPath), 1);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+for (const [name, message] of [
+  ["5xx", "gh: Bad Gateway (HTTP 502)"],
+  ["transport", "gh: ETIMEDOUT while waiting for api.github.com"],
+] as const) {
+  test(`repair apply records ambiguous ${name} PR close outcomes without erasing comment acceptance`, () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-apply-result-"));
+    try {
+      const paths = writeCloseReceiptFixture(tmp, {
+        mutationFailures: {
+          target_close: { attempts: 1, message },
+        },
+      });
+
+      const applied = runApplyResultProcess(paths, {
+        proofDecision: "covered",
+        actionLedgerInvocation: `apply-close-${name}`,
+        retryAttempts: 1,
+      });
+      assert.notEqual(
+        applied.status,
+        0,
+        `${applied.stderr}\n${fs.readFileSync(paths.ghLogPath, "utf8")}`,
+      );
+
+      const events = applyResultMutationEvents(paths);
+      assert.deepEqual(
+        events.map((event) => event.attributes?.completion_reason),
+        [
+          "mutation_attempted",
+          "mutation_accepted",
+          "mutation_attempted",
+          "mutation_outcome_unknown",
+        ],
+      );
+      assert.equal(events[0].idempotency_key_sha256, events[1].idempotency_key_sha256);
+      assert.notEqual(events[1].idempotency_key_sha256, events[2].idempotency_key_sha256);
+      assert.equal(events[2].idempotency_key_sha256, events[3].idempotency_key_sha256);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+}
+
+for (const [name, message] of [
+  ["5xx", "gh: Bad Gateway (HTTP 502)"],
+  ["transport", "gh: ETIMEDOUT while waiting for api.github.com"],
+] as const) {
+  test(`repair apply does not retry an outcome-unknown ${name} closeout comment POST`, () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-apply-result-"));
+    try {
+      const paths = writeCloseReceiptFixture(tmp, {
+        mutationFailures: {
+          comment_create: { attempts: 1, message },
+        },
+      });
+
+      const applied = runApplyResultProcess(paths, {
+        proofDecision: "covered",
+        actionLedgerInvocation: `apply-comment-${name}`,
+        retryAttempts: 3,
+      });
+      assert.notEqual(applied.status, 0);
+
+      const events = applyResultMutationEvents(paths);
+      assert.deepEqual(
+        events.map((event) => event.attributes?.completion_reason),
+        ["mutation_attempted", "mutation_outcome_unknown"],
+      );
+      assert.equal(events[0].idempotency_key_sha256, events[1].idempotency_key_sha256);
+      assert.equal(commentCreateCallCount(paths.ghLogPath), 1);
+      assert.equal(prCloseCallCount(paths.ghLogPath), 0);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+}
+
+test("repair apply retries idempotent PR close with stable business identity", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-apply-result-"));
+  try {
+    const paths = writeCloseReceiptFixture(tmp, {
+      mutationFailures: {
+        target_close: { attempts: 1, message: "gh: Bad Gateway (HTTP 502)" },
+      },
+    });
+
+    runApplyResult(paths, {
+      proofDecision: "covered",
+      actionLedgerInvocation: "apply-close-retry",
+      retryAttempts: 2,
+    });
+
+    const events = applyResultMutationEvents(paths);
+    assert.deepEqual(
+      events.map((event) => event.attributes?.completion_reason),
+      [
+        "mutation_attempted",
+        "mutation_accepted",
+        "mutation_attempted",
+        "mutation_outcome_unknown",
+        "mutation_attempted",
+        "mutation_accepted",
+      ],
+    );
+    assert.equal(new Set(events.slice(2).map((event) => event.idempotency_key_sha256)).size, 1);
+    assert.equal(new Set(events.slice(2).map((event) => event.event_key)).size, 4);
+    assert.equal(new Set(events.map((event) => event.idempotency_key_sha256)).size, 2);
+    assert.equal(commentCreateCallCount(paths.ghLogPath), 1);
+    assert.equal(prCloseCallCount(paths.ghLogPath), 2);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
 test("repair apply leaves current-main fixed closeout outside coverage proof", () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-apply-result-"));
   try {
@@ -1690,6 +1866,30 @@ test("repair apply dry-run does not require workflow claim identity", () => {
   }
 });
 
+test("repair apply receipts blocked-merge label creation and addition", () => {
+  const fixture = writeMergeApplyFixture();
+  try {
+    runMergeApplyResult(fixture, {
+      allowMerge: false,
+      actionLedgerInvocation: "apply-blocked-merge-label",
+    });
+
+    const report = readApplyReport(fixture.reportPath);
+    assert.equal(report.actions[0].status, "blocked");
+    assert.match(report.actions[0].reason, /labeled clawsweeper/);
+    const events = applyResultMutationEvents(fixture);
+    assert.deepEqual(
+      events.map((event) => event.attributes?.completion_reason),
+      ["mutation_attempted", "mutation_accepted", "mutation_attempted", "mutation_accepted"],
+    );
+    assert.equal(new Set(events.map((event) => event.idempotency_key_sha256)).size, 2);
+    assert.equal(JSON.stringify(events).includes("Exact merge candidate"), false);
+    assert.equal(JSON.stringify(events).includes("write-token"), false);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
 test("repair apply records a durable observed receipt after ambiguous exact merge", () => {
   const fixture = writeMergeApplyFixture({ mergeMode: "ambiguous_exact" });
   try {
@@ -1740,6 +1940,9 @@ type ApplyFixturePaths = {
   resultPath: string;
   reportPath: string;
   ghLogPath: string;
+  ledgerRoot: string;
+  ledgerOutputRoot: string;
+  mutationStatePath: string;
 };
 
 type ApplyFixtureAction = {
@@ -1765,18 +1968,28 @@ type FakeGhData = {
   postProofIssueUpdates?: Record<number, string>;
   postProofPulls?: Record<number, Record<string, unknown>>;
   postProofPrViewFailure?: { number: number; message: string };
+  mutationStatePath?: string;
+  mutationFailures?: Partial<
+    Record<"comment_create" | "target_close", { attempts: number; message: string }>
+  >;
   logPath: string;
 };
 
 function writeApplyFixture(tmp: string, action: ApplyFixtureAction): ApplyFixturePaths {
+  const canonicalTmp = fs.realpathSync(tmp);
   const binDir = path.join(tmp, "bin");
   const runDir = path.join(tmp, "run");
   const jobPath = path.join(tmp, "job.md");
   const resultPath = path.join(runDir, "result.json");
   const reportPath = path.join(runDir, "apply-report.json");
   const ghLogPath = path.join(tmp, "gh.log");
+  const ledgerRoot = path.join(canonicalTmp, "ledger");
+  const ledgerOutputRoot = path.join(canonicalTmp, "ledger-output");
+  const mutationStatePath = path.join(canonicalTmp, "mutation-state.json");
   fs.mkdirSync(binDir, { recursive: true });
   fs.mkdirSync(runDir, { recursive: true });
+  fs.mkdirSync(ledgerRoot);
+  fs.mkdirSync(ledgerOutputRoot);
   fs.writeFileSync(
     jobPath,
     [
@@ -1834,7 +2047,66 @@ function writeApplyFixture(tmp: string, action: ApplyFixtureAction): ApplyFixtur
       2,
     ),
   );
-  return { binDir, jobPath, resultPath, reportPath, ghLogPath };
+  return {
+    binDir,
+    jobPath,
+    resultPath,
+    reportPath,
+    ghLogPath,
+    ledgerRoot,
+    ledgerOutputRoot,
+    mutationStatePath,
+  };
+}
+
+function writeCloseReceiptFixture(
+  tmp: string,
+  options: {
+    privateEvidence?: boolean;
+    mutationFailures?: FakeGhData["mutationFailures"];
+  } = {},
+): ApplyFixturePaths {
+  const paths = writeApplyFixture(tmp, {
+    action: "close_duplicate",
+    classification: "duplicate",
+    canonical: "#202",
+  });
+  const sourceTitle = options.privateEvidence ? "Private source title" : "Source";
+  const canonicalTitle = options.privateEvidence ? "Private canonical title" : "Canonical";
+  writeFakeGh(paths.binDir, {
+    issues: {
+      101: issue({ number: 101, title: sourceTitle, pullRequest: true }),
+      202: issue({
+        number: 202,
+        title: canonicalTitle,
+        pullRequest: true,
+        labels: ["proof: sufficient"],
+      }),
+    },
+    pulls: {
+      101: pull({ number: 101, title: sourceTitle }),
+      202: pull({ number: 202, title: canonicalTitle }),
+    },
+    comments: {
+      101: [
+        comment(
+          "alice",
+          options.privateEvidence ? "Private source discussion." : "Source discussion.",
+        ),
+      ],
+      202: [
+        comment(
+          "bob",
+          options.privateEvidence ? "Private canonical discussion." : "Canonical discussion.",
+        ),
+      ],
+    },
+    logPath: paths.ghLogPath,
+    mutationStatePath: paths.mutationStatePath,
+    ...(options.mutationFailures ? { mutationFailures: options.mutationFailures } : {}),
+  });
+  writeFakeCodex(paths.binDir);
+  return paths;
 }
 
 function runApplyResult(
@@ -1847,17 +2119,35 @@ function runApplyResult(
     proofFailureMessage?: string;
     afterProofPath?: string;
     allowMissingUpdatedAt?: boolean;
+    actionLedgerInvocation?: string;
+    retryAttempts?: number;
   },
 ) {
   const args = ["dist/repair/apply-result.js", paths.jobPath, paths.resultPath];
   if (options.allowMissingUpdatedAt) args.push("--allow-missing-updated-at");
-  execFileSync(process.execPath, args, {
+  execFileSync(process.execPath, args, applyResultProcessOptions(paths, options));
+}
+
+function runApplyResultProcess(
+  paths: ApplyFixturePaths,
+  options: Parameters<typeof runApplyResult>[1],
+) {
+  const args = ["dist/repair/apply-result.js", paths.jobPath, paths.resultPath];
+  if (options.allowMissingUpdatedAt) args.push("--allow-missing-updated-at");
+  return spawnSync(process.execPath, args, applyResultProcessOptions(paths, options));
+}
+
+function applyResultProcessOptions(
+  paths: ApplyFixturePaths,
+  options: Parameters<typeof runApplyResult>[1],
+) {
+  return {
     cwd: repoRoot,
     env: {
       ...process.env,
       CLAWSWEEPER_ALLOW_EXECUTE: "1",
       CLAWSWEEPER_ALLOWED_OWNER: "openclaw",
-      CLAWSWEEPER_GH_RETRY_ATTEMPTS: "1",
+      CLAWSWEEPER_GH_RETRY_ATTEMPTS: String(options.retryAttempts ?? 1),
       CLAWSWEEPER_MODEL: "model-test",
       // Coverage instrumentation plus the parallel repair suite can delay this child process.
       // Keep the bound short for a fake binary without making CI depend on a 10-second scheduler window.
@@ -1871,9 +2161,28 @@ function runApplyResult(
       PR_CLOSE_COVERAGE_PROOF_FAIL_IF_INVOKED: options.failIfProofRuns ? "1" : "",
       PR_CLOSE_COVERAGE_PROOF_FAILURE_MESSAGE: options.proofFailureMessage ?? "",
       PR_CLOSE_COVERAGE_PROOF_AFTER_PROOF_PATH: options.afterProofPath ?? "",
+      ...(options.actionLedgerInvocation
+        ? {
+            CLAWSWEEPER_ACTION_LEDGER_FORCE: "1",
+            CLAWSWEEPER_ACTION_LEDGER_ROOT: paths.ledgerRoot,
+            CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT: paths.ledgerOutputRoot,
+            CLAWSWEEPER_ACTION_LEDGER_PARTITION_DATE: "2026-07-13",
+            CLAWSWEEPER_ACTION_LEDGER_INVOCATION: options.actionLedgerInvocation,
+            GITHUB_ACTION: "apply_result",
+            GITHUB_JOB: "mutate",
+            GITHUB_REPOSITORY: "openclaw/clawsweeper",
+            GITHUB_RUN_ATTEMPT: "1",
+            GITHUB_RUN_ID: "9002",
+            GITHUB_SHA: "e".repeat(40),
+            GITHUB_WORKFLOW: "repair cluster worker",
+            GITHUB_WORKFLOW_REF:
+              "openclaw/clawsweeper/.github/workflows/repair-cluster-worker.yml@refs/heads/main",
+          }
+        : {}),
     },
     stdio: "pipe",
-  });
+    encoding: "utf8",
+  } as const;
 }
 
 function writeFakeGh(binDir: string, data: FakeGhData) {
@@ -1895,6 +2204,22 @@ function writeWithHeaders(value, headers = []) {
   process.stdout.write(["HTTP/2 200", ...headers, "", JSON.stringify(value)].join("\\r\\n"));
 }
 
+function maybeFailMutation(operation) {
+  const failure = data.mutationFailures && data.mutationFailures[operation];
+  if (!failure) return;
+  const state =
+    data.mutationStatePath && fs.existsSync(data.mutationStatePath)
+      ? JSON.parse(fs.readFileSync(data.mutationStatePath, "utf8"))
+      : {};
+  const attempts = Number(state[operation] || 0) + 1;
+  state[operation] = attempts;
+  if (data.mutationStatePath) fs.writeFileSync(data.mutationStatePath, JSON.stringify(state));
+  if (attempts <= failure.attempts) {
+    process.stderr.write(failure.message + "\\n");
+    process.exit(1);
+  }
+}
+
 if (args[0] === "api") {
   const apiPath = includeHeaders ? args[2] || "" : args[1] || "";
   const url = new URL(apiPath, "https://api.github.test/");
@@ -1902,6 +2227,7 @@ if (args[0] === "api") {
   if (match) {
     const number = Number(match[1]);
     if (args.includes("--method") && args.includes("POST")) {
+      maybeFailMutation("comment_create");
       const input = args[args.indexOf("--input") + 1];
       const body = JSON.parse(fs.readFileSync(input, "utf8")).body;
       fs.appendFileSync(data.logPath, JSON.stringify({ args: ["comment-body", String(body)] }) + "\\n");
@@ -1942,6 +2268,11 @@ if (args[0] === "api") {
 	    process.stderr.write("issue not found: #" + match[1] + "\\n");
 	    process.exit(1);
 	  }
+		  if (args.includes("--method") && args.includes("PATCH")) {
+		    maybeFailMutation("target_close");
+		    write({ ...issue, state: "closed" });
+		    process.exit(0);
+		  }
 		  const postProofUpdatedAt =
 		    data.afterProofPath &&
 		    fs.existsSync(data.afterProofPath) &&
@@ -1988,6 +2319,7 @@ if (args[0] === "api") {
 }
 
 if (args[0] === "pr" && args[1] === "close") {
+  maybeFailMutation("target_close");
   write({ closed: Number(args[2]) });
   process.exit(0);
 }
@@ -2140,8 +2472,32 @@ function ghCalls(logPath: string): { args: string[] }[] {
     .map((line) => JSON.parse(line) as { args: string[] });
 }
 
+function applyResultMutationEvents(paths: { ledgerRoot: string }) {
+  return readSpooledActionEvents(paths.ledgerRoot, "openclaw/openclaw")
+    .filter(
+      (event) =>
+        event.event_type === "repair.mutation" &&
+        String(event.producer.component).startsWith("apply_result."),
+    )
+    .sort((left, right) => left.phase_seq - right.phase_seq);
+}
+
+function commentCreateCallCount(logPath: string): number {
+  return ghCalls(logPath).filter(
+    (call) =>
+      call.args[0] === "api" &&
+      call.args[1] === "repos/openclaw/openclaw/issues/101/comments" &&
+      call.args.includes("POST"),
+  ).length;
+}
+
+function prCloseCallCount(logPath: string): number {
+  return ghCalls(logPath).filter((call) => call.args[0] === "pr" && call.args[1] === "close")
+    .length;
+}
+
 function hasPrCloseCall(logPath: string): boolean {
-  return ghCalls(logPath).some((call) => call.args[0] === "pr" && call.args[1] === "close");
+  return prCloseCallCount(logPath) > 0;
 }
 
 type MergeFixture = {
@@ -2364,6 +2720,16 @@ function pullViewReadCount() {
     (callArgs) =>
       callArgs[0] === "pr" && callArgs[1] === "view" && callArgs[2] === "101",
   );
+}
+
+if (args[0] === "label" && args[1] === "create") {
+  write({ name: args[2] });
+  process.exit(0);
+}
+
+if (args[0] === "issue" && args[1] === "edit" && args.includes("--add-label")) {
+  write({ number: Number(args[2]) });
+  process.exit(0);
 }
 
 if (args[0] === "api") {
@@ -2656,6 +3022,7 @@ function runMergeApplyResult(
     dryRun?: boolean;
     omitClaimIdentity?: boolean;
     actionLedgerInvocation?: string;
+    allowMerge?: boolean;
   } = {},
 ) {
   execFileSync(
@@ -2671,7 +3038,7 @@ function runMergeApplyResult(
       env: {
         ...process.env,
         CLAWSWEEPER_ALLOW_EXECUTE: "1",
-        CLAWSWEEPER_ALLOW_MERGE: "1",
+        CLAWSWEEPER_ALLOW_MERGE: options.allowMerge === false ? "" : "1",
         CLAWSWEEPER_ALLOWED_OWNER: "openclaw",
         CLAWSWEEPER_APP_SLUG: "openclaw-clawsweeper",
         CLAWSWEEPER_AUTHENTICATED_APP_ID: options.omitClaimIdentity ? "" : "3306130",

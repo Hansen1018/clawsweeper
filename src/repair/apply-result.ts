@@ -14,7 +14,6 @@ import {
 } from "./lib.js";
 import { defaultCloseComment, externalMessageProvenance } from "./external-messages.js";
 import {
-  ghBestEffortWithRetry as ghBestEffort,
   ghErrorText,
   githubLimitedPagePath,
   ghJson as ghJsonOnce,
@@ -25,7 +24,7 @@ import {
   ghTextWithRetry as ghWithRetry,
 } from "./github-cli.js";
 import { issueNumberFromRef } from "./github-ref.js";
-import { isLockedConversationCommentError } from "../github-retry.js";
+import { ghRetryKind, ghRetryWaitMs, isLockedConversationCommentError } from "../github-retry.js";
 import { lockedConversationSkip, lockedConversationSkipIfLocked } from "./apply-locks.js";
 import {
   CLAWSWEEPER_LABEL,
@@ -71,7 +70,9 @@ import {
   repairSourceRevision,
   runRepairMutation,
   type RepairLifecycleInput,
+  type RepairMutationOptions,
 } from "./repair-action-ledger.js";
+import { sleepMs } from "./timing.js";
 import {
   compactPrCloseCoverageProofComment,
   compactPrCloseCoverageProofText,
@@ -541,9 +542,9 @@ function applyCloseAction({
 
   try {
     if (!existingComment) {
-      postIssueComment(result.repo, target, body);
+      postIssueComment(result.repo, target, kind, idempotencyKey, body);
     }
-    closeIssueOrPullRequest(result.repo, target, kind, classification);
+    closeIssueOrPullRequest(result.repo, target, kind, classification, idempotencyKey);
   } catch (error) {
     if (isLockedConversationCommentError(error)) {
       return lockedConversationSkip(base, live, { terminalWriteError: true });
@@ -2096,7 +2097,10 @@ function recordApplyMergeObserved(number: number, headSha: string) {
   });
 }
 
-function applyResultLifecycle(number: number | null): RepairLifecycleInput {
+function applyResultLifecycle(
+  number: number | null,
+  subjectKind: RepairLifecycleInput["subjectKind"] = "pull_request",
+): RepairLifecycleInput {
   return {
     repository: result.repo,
     workKey: `apply-result:${result.cluster_id ?? result.run_id ?? result.reviewed_sha ?? "unknown"}`,
@@ -2104,7 +2108,7 @@ function applyResultLifecycle(number: number | null): RepairLifecycleInput {
     sourceRevision:
       repairSourceRevision(job.frontmatter) ??
       repairSourceRevision({ reviewed_sha: result.reviewed_sha ?? result.head_sha }),
-    subjectKind: number && number > 0 ? "pull_request" : "workflow",
+    subjectKind: number && number > 0 ? subjectKind : "workflow",
   };
 }
 
@@ -2207,13 +2211,53 @@ function validateMergePolicy({ job, action }: LooseRecord) {
 }
 
 function labelForClawSweeperReview(repo: string, target: LooseRecord) {
-  ensureLabel(repo, CLAWSWEEPER_LABEL, CLAWSWEEPER_LABEL_COLOR, CLAWSWEEPER_LABEL_DESCRIPTION);
-  ghBestEffort(["issue", "edit", String(target), "--repo", repo, "--add-label", CLAWSWEEPER_LABEL]);
+  const number = Number(target);
+  ensureLabel(
+    repo,
+    number,
+    CLAWSWEEPER_LABEL,
+    CLAWSWEEPER_LABEL_COLOR,
+    CLAWSWEEPER_LABEL_DESCRIPTION,
+  );
+  try {
+    runApplyResultMutationWithRetry(
+      applyResultLifecycle(number),
+      {
+        kind: "apply_result_blocked_merge_label_add",
+        identity: {
+          repository: repo,
+          number,
+          label: CLAWSWEEPER_LABEL,
+          operation: "blocked_merge_label_add",
+        },
+        component: "apply_result",
+      },
+      ["issue", "edit", String(target), "--repo", repo, "--add-label", CLAWSWEEPER_LABEL],
+    );
+  } catch {
+    // Helpful metadata should not block the primary command path.
+  }
 }
 
-function ensureLabel(repo: string, name: string, color: JsonValue, description: JsonValue) {
+function ensureLabel(
+  repo: string,
+  number: number,
+  name: string,
+  color: JsonValue,
+  description: JsonValue,
+) {
   try {
-    ghWithRetry(
+    runApplyResultMutationWithRetry(
+      applyResultLifecycle(number),
+      {
+        kind: "apply_result_blocked_merge_label_create",
+        identity: {
+          repository: repo,
+          label: name,
+          operation: "blocked_merge_label_create",
+        },
+        component: "apply_result",
+      },
       ["label", "create", name, "--repo", repo, "--color", color, "--description", description],
       2,
     );
@@ -3223,16 +3267,31 @@ function findExistingComment(repo: string, number: JsonValue, marker: LooseRecor
   );
 }
 
-function postIssueComment(repo: string, number: JsonValue, body: string) {
+function postIssueComment(
+  repo: string,
+  number: JsonValue,
+  subjectKind: RepairLifecycleInput["subjectKind"],
+  actionIdempotencyKey: string,
+  body: string,
+) {
   const payloadPath = writePayload(`comment-${number}`, { body });
-  ghWithRetry([
-    "api",
-    `repos/${repo}/issues/${number}/comments`,
-    "--method",
-    "POST",
-    "--input",
-    payloadPath,
-  ]);
+  // A workflow rerun reconciles the marker; retrying this POST could create a duplicate comment.
+  runApplyResultMutationWithRetry(
+    applyResultLifecycle(Number(number), subjectKind),
+    {
+      kind: "apply_result_closeout_comment",
+      identity: {
+        repository: repo,
+        number: Number(number),
+        clusterId: String(result.cluster_id ?? ""),
+        actionIdempotencyKey,
+        operation: "closeout_comment_create",
+      },
+      component: "apply_result",
+    },
+    ["api", `repos/${repo}/issues/${number}/comments`, "--method", "POST", "--input", payloadPath],
+    1,
+  );
 }
 
 function closeIssueOrPullRequest(
@@ -3240,9 +3299,33 @@ function closeIssueOrPullRequest(
   number: JsonValue,
   kind: string,
   classification: JsonValue,
+  actionIdempotencyKey: string,
 ) {
+  const lifecycle = applyResultLifecycle(
+    Number(number),
+    kind === "pull_request" ? "pull_request" : "issue",
+  );
+  const mutation = {
+    kind: "apply_result_target_close",
+    identity: {
+      repository: repo,
+      number: Number(number),
+      clusterId: String(result.cluster_id ?? ""),
+      actionIdempotencyKey,
+      targetKind: kind,
+      classification: String(classification ?? ""),
+      operation: "target_close",
+    },
+    component: "apply_result",
+  } satisfies Omit<RepairMutationOptions<string>, "operation" | "knownNoMutation">;
   if (kind === "pull_request") {
-    ghWithRetry(["pr", "close", String(number), "--repo", repo]);
+    runApplyResultMutationWithRetry(lifecycle, mutation, [
+      "pr",
+      "close",
+      String(number),
+      "--repo",
+      repo,
+    ]);
     return;
   }
   const stateReason = classification === "fixed_by_candidate" ? "completed" : "not_planned";
@@ -3250,7 +3333,7 @@ function closeIssueOrPullRequest(
     state: "closed",
     state_reason: stateReason,
   });
-  ghWithRetry([
+  runApplyResultMutationWithRetry(lifecycle, mutation, [
     "api",
     `repos/${repo}/issues/${number}`,
     "--method",
@@ -3258,6 +3341,58 @@ function closeIssueOrPullRequest(
     "--input",
     payloadPath,
   ]);
+}
+
+function runApplyResultMutationWithRetry(
+  lifecycle: RepairLifecycleInput,
+  options: Omit<RepairMutationOptions<string>, "operation" | "knownNoMutation">,
+  ghArgs: string[],
+  retryAttempts = githubMutationRetryAttempts(),
+): string {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= retryAttempts; attempt += 1) {
+    try {
+      return runRepairMutation(lifecycle, {
+        ...options,
+        knownNoMutation: githubMutationRejectedBeforeWrite,
+        operation: () => ghText(ghArgs),
+      });
+    } catch (error) {
+      lastError = error;
+      const retryKind = ghRetryKind(error);
+      if (
+        attempt >= retryAttempts ||
+        retryKind === "none" ||
+        githubMutationRejectedBeforeWrite(error)
+      ) {
+        throw error;
+      }
+      sleepMs(ghRetryWaitMs(retryKind, attempt - 1));
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
+}
+
+function githubMutationRetryAttempts(): number {
+  const configured = process.env.CLAWSWEEPER_GH_RETRY_ATTEMPTS;
+  if (configured == null || configured.trim() === "") return 6;
+  const attempts = Number(configured);
+  return Number.isFinite(attempts) ? Math.max(1, Math.floor(attempts)) : 6;
+}
+
+function githubMutationRejectedBeforeWrite(error: unknown): boolean {
+  const code =
+    error && typeof error === "object" && "code" in error
+      ? String((error as NodeJS.ErrnoException).code ?? "")
+      : "";
+  if (code === "ENOENT" || code === "EACCES") return true;
+  const detail = ghErrorText(error);
+  return (
+    /already exists/i.test(detail) ||
+    /\b(?:HTTP|status(?: code)?)\s*:?\s*(?:400|401|403|404|405|406|407|410|411|413|414|415|416|417|421|422|426|428|431|451)\b/i.test(
+      detail,
+    )
+  );
 }
 
 function writePayload(name: string, value: JsonValue) {
