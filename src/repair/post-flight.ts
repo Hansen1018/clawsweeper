@@ -244,23 +244,18 @@ function finalizeFixPr(action: LooseRecord) {
     const policyBlock = validateMergePolicy(action, pull);
     if (policyBlock) return { ...prBase, status: "blocked", reason: policyBlock };
 
-    const mergedAt = pull.merged_at ?? view.mergedAt ?? null;
-    if (mergedAt) {
-      const mergedHead = String(pull.head?.sha ?? view.headRefOid ?? "");
-      if (!action.commit || mergedHead !== action.commit) {
-        return {
-          ...prBase,
-          status: "blocked",
-          reason: "merged pull request head does not match the authorized repair commit",
-        };
-      }
+    const existingMerge = confirmMergedPullSnapshot(pull, action.commit);
+    if (existingMerge.block) {
+      return { ...prBase, status: "blocked", reason: existingMerge.block };
+    }
+    if (existingMerge.mergedAt) {
       recordPostFlightMergeObserved(parsed.number, action.commit);
       return {
         ...prBase,
         status: "executed",
         reason: "already merged",
-        merged_at: mergedAt,
-        merge_commit_sha: pull.merge_commit_sha ?? view.mergeCommit?.oid ?? null,
+        merged_at: existingMerge.mergedAt,
+        merge_commit_sha: pull.merge_commit_sha ?? null,
         waited_ms: waitedMs,
       };
     }
@@ -437,7 +432,7 @@ function finalizeFixPr(action: LooseRecord) {
           status: "executed",
           reason: "merge confirmed after ambiguous response",
           merged_at: reconciliation.mergedAt,
-          merge_commit_sha: pull.merge_commit_sha ?? view.mergeCommit?.oid ?? null,
+          merge_commit_sha: pull.merge_commit_sha ?? null,
           merge_method: "squash",
           commit_subject: mergeMessage.subject,
           summary_lines: mergeMessage.summaryLines,
@@ -559,7 +554,7 @@ function finalizeFixPr(action: LooseRecord) {
         ? "merge confirmed after ambiguous response"
         : "merged by ClawSweeper Repair post-flight",
       merged_at: confirmation.mergedAt,
-      merge_commit_sha: pull.merge_commit_sha ?? view.mergeCommit?.oid ?? null,
+      merge_commit_sha: pull.merge_commit_sha ?? null,
       merge_method: "squash",
       commit_subject: mergeMessage.subject,
       summary_lines: mergeMessage.summaryLines,
@@ -573,18 +568,21 @@ function finalizeFixPr(action: LooseRecord) {
 function reconcileMergeState(number: number, expectedHeadSha: JsonValue) {
   const pull = fetchPullRequest(result.repo, number);
   const view = fetchPullRequestView(result.repo, number);
-  const mergedAt = pull.merged_at ?? view.mergedAt ?? null;
-  if (!mergedAt) return { pull, view, mergedAt: null, block: "" };
-  const mergedHead = String(pull.head?.sha ?? view.headRefOid ?? "");
+  return { pull, view, ...confirmMergedPullSnapshot(pull, expectedHeadSha) };
+}
+
+function confirmMergedPullSnapshot(pull: LooseRecord, expectedHeadSha: JsonValue) {
+  // Keep the merge timestamp and authorized head bound to one GitHub response.
+  const mergedAt = pull.merged_at ?? null;
+  if (!mergedAt) return { mergedAt: null, block: "" };
+  const mergedHead = String(pull.head?.sha ?? "");
   if (!isFullCommitSha(expectedHeadSha) || mergedHead !== expectedHeadSha) {
     return {
-      pull,
-      view,
       mergedAt: null,
       block: "merged pull request head does not match the authorized repair commit",
     };
   }
-  return { pull, view, mergedAt, block: "" };
+  return { mergedAt, block: "" };
 }
 
 function postFlightMergeMutationIdentity(number: number, headSha: JsonValue) {

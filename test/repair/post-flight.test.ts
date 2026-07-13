@@ -547,12 +547,18 @@ test("post-flight rechecks live security immediately before privileged mutations
   );
   assert.match(
     finalizeFixPr,
-    /if \(mergedAt\)[\s\S]*recordPostFlightMergeObserved\(parsed\.number, action\.commit\)[\s\S]*if \(reconciliation\.mergedAt\)[\s\S]*recordPostFlightMergeObserved\(parsed\.number, action\.commit\)/,
+    /if \(existingMerge\.mergedAt\)[\s\S]*recordPostFlightMergeObserved\(parsed\.number, action\.commit\)[\s\S]*if \(reconciliation\.mergedAt\)[\s\S]*recordPostFlightMergeObserved\(parsed\.number, action\.commit\)/,
   );
   assert.match(
     source,
-    /function reconcileMergeState[\s\S]*fetchPullRequest\([\s\S]*fetchPullRequestView\([\s\S]*mergedHead !== expectedHeadSha/,
+    /function reconcileMergeState[\s\S]*fetchPullRequest\([\s\S]*fetchPullRequestView\([\s\S]*confirmMergedPullSnapshot\(/,
   );
+  const mergeSnapshotConfirmation = source.slice(
+    source.indexOf("function confirmMergedPullSnapshot"),
+    source.indexOf("function postFlightMergeMutationIdentity"),
+  );
+  assert.match(mergeSnapshotConfirmation, /pull\.merged_at[\s\S]*pull\.head\?\.sha/);
+  assert.doesNotMatch(mergeSnapshotConfirmation, /view\.(?:mergedAt|headRefOid)/);
   assert.match(
     source,
     /function postFlightMergeRetryBlock[\s\S]*liveSecurityBlockReason\([\s\S]*validateMergePolicy\([\s\S]*validateMergeableFixPr\([\s\S]*runtimeStrictBaseBindingBlock\(/,
@@ -708,6 +714,29 @@ test("post-flight reconciles ambiguous merges and retries only after fresh safet
           event.attributes?.completion_reason === "mutation_observed",
       ),
     );
+
+    fixture.reset();
+    runVerifiedPostFlight(
+      fixture,
+      {
+        ...commonEnv,
+        FAKE_GH_MERGE_MODE: "queue",
+        FAKE_GH_VIEW_MERGED_ONLY_AFTER_ATTEMPT: "1",
+      },
+      1,
+    );
+    report = JSON.parse(fs.readFileSync(fixture.reportPath, "utf8"));
+    assert.equal(report.outcome, "requeue");
+    assert.equal(report.actions[0]?.status, "blocked");
+    assert.equal(
+      report.actions[0]?.reason,
+      "merge command completed but GitHub has not confirmed the pull request as merged",
+    );
+    assert.equal(report.actions[0]?.retry_recommended, true);
+    assert.deepEqual(mutationReceiptStates(finalizeVerifiedActionLedger(fixture, commonEnv)), [
+      ["started", "mutation_attempted"],
+      ["failed", "mutation_outcome_unknown"],
+    ]);
 
     fixture.reset();
     runVerifiedPostFlight(
@@ -1388,7 +1417,7 @@ function createVerifiedMergeFixture() {
       "if (args[0] === 'api' && args[1] === 'repos/openclaw/openclaw/rulesets/18588237') { process.stdout.write(JSON.stringify({ enforcement: 'active', bypass_actors: [], rules: [{ type: 'required_status_checks', parameters: { strict_required_status_checks_policy: true, required_status_checks: [{ context: 'required-ci/exact-merge' }] } }] })); process.exit(0); }",
       "if (args[0] === 'api' && args[1] === 'repos/openclaw/openclaw/branches/main/protection') { process.stdout.write(JSON.stringify({ required_status_checks: null })); process.exit(0); }",
       "if (args[0] === 'api' && args[1] === 'graphql') { process.stdout.write(JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: { pageInfo: { hasNextPage: false }, nodes: [] } } } } })); process.exit(0); }",
-      "if (args[0] === 'pr' && args[1] === 'view') { process.stdout.write(JSON.stringify({ baseRefName: 'main', isDraft: false, mergeable: 'MERGEABLE', mergeCommit: merged ? { oid: 'b'.repeat(40) } : null, mergeStateStatus: 'CLEAN', mergedAt: merged ? '2026-07-13T08:00:00Z' : null, reviewDecision: null, state: merged ? 'MERGED' : 'OPEN', statusCheckRollup: [], title: pull.title, url: 'https://github.com/openclaw/openclaw/pull/123' })); process.exit(0); }",
+      "if (args[0] === 'pr' && args[1] === 'view') { const viewMerged = merged || (process.env.FAKE_GH_VIEW_MERGED_ONLY_AFTER_ATTEMPT === '1' && mergeCount() > 0); process.stdout.write(JSON.stringify({ baseRefName: 'main', isDraft: false, mergeable: 'MERGEABLE', mergeCommit: viewMerged ? { oid: 'b'.repeat(40) } : null, mergeStateStatus: 'CLEAN', mergedAt: viewMerged ? '2026-07-13T08:00:00Z' : null, reviewDecision: null, state: viewMerged ? 'MERGED' : 'OPEN', statusCheckRollup: [], title: pull.title, url: 'https://github.com/openclaw/openclaw/pull/123' })); process.exit(0); }",
       "if (args[0] === 'pr' && args[1] === 'merge') {",
       "  const count = mergeCount() + 1;",
       "  fs.writeFileSync(process.env.FAKE_GH_MERGE_COUNT_FILE, String(count));",
