@@ -157,11 +157,10 @@ test("commit finding intake rejects mismatched fetched bytes before writing stat
 });
 
 test("commit finding intake accepts only the canonical report repository and path", () => {
-  const unique = randomUUID().replaceAll("-", "").slice(0, 12);
-  const targetRepo = `fixture-${unique}/repo`;
+  const targetRepo = "openclaw/foo.bar_baz";
   const sha = "a".repeat(40);
   const revision = "b".repeat(40);
-  const expectedPath = `records/fixture-${unique}-repo/commits/${sha}.md`;
+  const expectedPath = `records/openclaw-foo.bar_baz/commits/${sha}.md`;
   const baseArgs = [
     path.resolve("dist/repair/commit-finding-intake.js"),
     "prepare",
@@ -183,6 +182,23 @@ test("commit finding intake accepts only the canonical report repository and pat
   assert.equal(wrongRepo.status, 2);
   assert.match(wrongRepo.stderr, /report repository must be openclaw\/clawsweeper-state/);
 
+  const canonicalPath = spawnSync(
+    process.execPath,
+    [
+      ...baseArgs,
+      "--report-repo",
+      "openclaw/clawsweeper-state",
+      "--report-path",
+      expectedPath,
+      "--report-url",
+      "https://example.invalid/report",
+    ],
+    { cwd: process.cwd(), encoding: "utf8" },
+  );
+  assert.equal(canonicalPath.status, 2);
+  assert.match(canonicalPath.stderr, /report URL must match immutable report identity/);
+  assert.doesNotMatch(canonicalPath.stderr, /report path must be/);
+
   const wrongPath = spawnSync(
     process.execPath,
     [
@@ -190,7 +206,7 @@ test("commit finding intake accepts only the canonical report repository and pat
       "--report-repo",
       "openclaw/clawsweeper-state",
       "--report-path",
-      `records/other-repo/commits/${sha}.md`,
+      `records/openclaw-foo-bar-baz/commits/${sha}.md`,
     ],
     { cwd: process.cwd(), encoding: "utf8" },
   );

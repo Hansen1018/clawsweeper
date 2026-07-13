@@ -2,6 +2,7 @@
 import type { JsonValue, LooseRecord } from "./json-types.js";
 import fs from "node:fs";
 import path from "node:path";
+import { normalizeRepo, slugForRepo } from "../repository-profiles.js";
 import {
   hasSecuritySignalText,
   makeRunDir,
@@ -48,7 +49,8 @@ function prepare() {
   const reportSha256 = requiredReportSha256(
     stringArg("report-sha256", stringArg("report_sha256", "")),
   );
-  const expectedReportPath = `records/${repoSlug(targetRepo)}/commits/${sha}.md`;
+  const reportSlug = slugForRepo(normalizeRepo(targetRepo));
+  const expectedReportPath = `records/${reportSlug}/commits/${sha}.md`;
   const reportPath = stringArg("report-path", stringArg("report_path", expectedReportPath));
   if (reportPath !== expectedReportPath) {
     die(`report path must be ${expectedReportPath}`);
