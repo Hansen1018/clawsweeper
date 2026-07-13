@@ -587,7 +587,7 @@ test("post-flight rechecks live security immediately before privileged mutations
   assert.ok(closeout.indexOf("beforeCloseSecurityBlock") < closeout.indexOf('["pr", "close"'));
 });
 
-test("post-flight reconciles ambiguous merges and retries only after fresh safety checks", () => {
+test("post-flight reconciles ambiguous merges and issues each merge request at most once", () => {
   const fixture = createVerifiedMergeFixture();
   try {
     const commonEnv = {
@@ -615,6 +615,7 @@ test("post-flight reconciles ambiguous merges and retries only after fresh safet
       FAKE_GH_PULL_FILE: fixture.pullPath,
       FAKE_GH_MERGED_FILE: fixture.mergedPath,
       FAKE_GH_MERGE_COUNT_FILE: fixture.mergeCountPath,
+      FAKE_GH_MERGE_CLAIM_FILE: fixture.mergeClaimPath,
       FAKE_GH_COMMENTS_COUNT_FILE: fixture.commentsCountPath,
       FAKE_GH_FAILURE_COMMENTS_FILE: fixture.failureCommentsPath,
       FAKE_GH_DELAYED_MERGE_FILE: fixture.delayedMergePath,
@@ -656,11 +657,16 @@ test("post-flight reconciles ambiguous merges and retries only after fresh safet
     ]);
 
     fixture.reset();
-    runVerifiedPostFlight(fixture, { ...commonEnv, FAKE_GH_MERGE_MODE: "transient" }, 0);
+    runVerifiedPostFlight(fixture, { ...commonEnv, FAKE_GH_MERGE_MODE: "transient" }, 1);
     report = JSON.parse(fs.readFileSync(fixture.reportPath, "utf8"));
-    assert.equal(report.actions[0]?.status, "executed");
-    assert.equal(report.actions[0]?.merge_attempts, 2);
-    assert.equal(fs.readFileSync(fixture.mergeCountPath, "utf8"), "2");
+    assert.equal(report.outcome, "requeue");
+    assert.equal(report.actions[0]?.status, "blocked");
+    assert.equal(
+      report.actions[0]?.reason,
+      "merge request is already claimed for this exact head; waiting for GitHub outcome",
+    );
+    assert.equal(report.actions[0]?.merge_attempts, 1);
+    assert.equal(fs.readFileSync(fixture.mergeCountPath, "utf8"), "1");
 
     fixture.reset();
     const backoffRun = runVerifiedPostFlight(
@@ -680,7 +686,7 @@ test("post-flight reconciles ambiguous merges and retries only after fresh safet
       report.actions[0]?.reason,
       /^security-sensitive (?:PR|target) requires central security triage$/,
     );
-    assert.equal(report.actions[0]?.merge_attempts, 2);
+    assert.equal(report.actions[0]?.merge_attempts, 1);
     assert.equal(fs.readFileSync(fixture.mergeCountPath, "utf8"), "1");
 
     fixture.reset();
@@ -701,12 +707,44 @@ test("post-flight reconciles ambiguous merges and retries only after fresh safet
       ["started", "mutation_attempted"],
       ["failed", "mutation_outcome_unknown"],
     ]);
+    fs.rmSync(fixture.reportPath, { force: true });
+    const waitingEnv = {
+      ...commonEnv,
+      CLAWSWEEPER_ACTION_LEDGER_INVOCATION: "post-flight-wait",
+      GITHUB_RUN_ATTEMPT: "2",
+      FAKE_GH_MERGE_MODE: "queue",
+    };
+    runVerifiedPostFlight(fixture, waitingEnv, 1);
+    report = JSON.parse(fs.readFileSync(fixture.reportPath, "utf8"));
+    assert.equal(report.outcome, "requeue");
+    assert.equal(report.actions[0]?.status, "blocked");
+    assert.equal(
+      report.actions[0]?.reason,
+      "merge request is already claimed for this exact head; waiting for GitHub outcome",
+    );
+    assert.equal(report.actions[0]?.merge_attempts, 0);
+    assert.equal(fs.readFileSync(fixture.mergeCountPath, "utf8"), "1");
+    fs.rmSync(fixture.reportPath, { force: true });
+    runVerifiedPostFlight(
+      fixture,
+      {
+        ...waitingEnv,
+        CLAWSWEEPER_ACTION_LEDGER_INVOCATION: "post-flight-wait-2",
+        GITHUB_RUN_ATTEMPT: "3",
+      },
+      1,
+    );
+    report = JSON.parse(fs.readFileSync(fixture.reportPath, "utf8"));
+    assert.equal(report.outcome, "requeue");
+    assert.equal(report.actions[0]?.merge_attempts, 0);
+    assert.equal(fs.readFileSync(fixture.mergeCountPath, "utf8"), "1");
+
     fs.writeFileSync(fixture.mergedPath, "1");
     fs.rmSync(fixture.reportPath, { force: true });
     const observedEnv = {
       ...commonEnv,
       CLAWSWEEPER_ACTION_LEDGER_INVOCATION: "post-flight-observe",
-      GITHUB_RUN_ATTEMPT: "2",
+      GITHUB_RUN_ATTEMPT: "4",
     };
     runVerifiedPostFlight(fixture, observedEnv, 0);
     report = JSON.parse(fs.readFileSync(fixture.reportPath, "utf8"));
@@ -823,6 +861,70 @@ test("post-flight reconciles ambiguous merges and retries only after fresh safet
       fixture,
       {
         ...commonEnv,
+        FAKE_GH_HEAD_DRIFT: "1",
+        FAKE_GH_PENDING_READINESS: "1",
+      },
+      1,
+    );
+    report = JSON.parse(fs.readFileSync(fixture.reportPath, "utf8"));
+    assert.equal(report.outcome, "blocked");
+    assert.equal(report.actions[0]?.status, "blocked");
+    assert.equal(
+      report.actions[0]?.reason,
+      "staged validation proof does not match the live pull request head",
+    );
+    assert.equal(report.actions[0]?.retry_recommended, undefined);
+    assert.equal(fs.existsSync(fixture.mergeClaimPath), false);
+    assert.equal(fs.existsSync(fixture.mergeCountPath), false);
+
+    fixture.reset();
+    fs.writeFileSync(
+      fixture.mergeClaimPath,
+      `<!-- clawsweeper-post-flight-merge-claim:v1 pr=123 head=${fixture.headSha} method=squash -->`,
+    );
+    runVerifiedPostFlight(
+      fixture,
+      {
+        ...commonEnv,
+        FAKE_GH_EXISTING_CLAIM_APP_ID: "123",
+      },
+      0,
+    );
+    report = JSON.parse(fs.readFileSync(fixture.reportPath, "utf8"));
+    assert.equal(report.actions[0]?.status, "executed");
+    assert.equal(fs.readFileSync(fixture.mergeCountPath, "utf8"), "1");
+
+    fixture.reset();
+    runVerifiedPostFlight(fixture, { ...commonEnv, FAKE_GH_CLAIM_MODE: "ambiguous" }, 0);
+    report = JSON.parse(fs.readFileSync(fixture.reportPath, "utf8"));
+    assert.equal(report.actions[0]?.status, "executed");
+    assert.equal(fs.readFileSync(fixture.mergeCountPath, "utf8"), "1");
+
+    fixture.reset();
+    runVerifiedPostFlight(fixture, { ...commonEnv, FAKE_GH_CONCURRENT_CLAIM: "1" }, 1);
+    report = JSON.parse(fs.readFileSync(fixture.reportPath, "utf8"));
+    assert.equal(report.outcome, "requeue");
+    assert.equal(report.actions[0]?.status, "blocked");
+    assert.equal(
+      report.actions[0]?.reason,
+      "another verified workflow attempt owns the merge claim for this exact head",
+    );
+    assert.equal(report.actions[0]?.merge_attempts, 0);
+    assert.equal(fs.existsSync(fixture.mergeCountPath), false);
+
+    fixture.reset();
+    runVerifiedPostFlight(fixture, { ...commonEnv, FAKE_GH_CLAIM_MODE: "missing" }, 1);
+    report = JSON.parse(fs.readFileSync(fixture.reportPath, "utf8"));
+    assert.equal(report.outcome, "requeue");
+    assert.equal(report.actions[0]?.status, "blocked");
+    assert.match(report.actions[0]?.reason, /^merge claim was not confirmed:/);
+    assert.equal(fs.existsSync(fixture.mergeCountPath), false);
+
+    fixture.reset();
+    runVerifiedPostFlight(
+      fixture,
+      {
+        ...commonEnv,
         FAKE_GH_MERGE_MODE: "transient",
         FAKE_GH_SECURITY_AFTER_FAILURE: "1",
       },
@@ -836,6 +938,13 @@ test("post-flight reconciles ambiguous merges and retries only after fresh safet
     );
     assert.equal(report.actions[0]?.merge_attempts, 1);
     assert.equal(fs.readFileSync(fixture.mergeCountPath, "utf8"), "1");
+    const securityEvents = finalizeVerifiedActionLedger(fixture, commonEnv);
+    const blockedWorkflow = securityEvents.find(
+      (event) =>
+        event.event_type === "workflow.attempt" && event.attributes?.workflow_phase === "blocked",
+    );
+    assert.equal(blockedWorkflow?.action.mutation, true);
+    assert.equal(blockedWorkflow?.action.retryable, false);
   } finally {
     fixture.cleanup();
   }
@@ -1191,7 +1300,11 @@ function finalizeVerifiedActionLedger(
 
 function mutationReceiptStates(events: Record<string, any>[]) {
   return events
-    .filter((event) => event.event_type === "repair.mutation")
+    .filter(
+      (event) =>
+        event.event_type === "repair.mutation" &&
+        String(event.producer?.component ?? "").startsWith("post_flight."),
+    )
     .sort((left, right) => left.phase_seq - right.phase_seq)
     .map((event) => [event.action.status, event.attributes?.completion_reason]);
 }
@@ -1218,6 +1331,7 @@ function createVerifiedMergeFixture() {
   const pullPath = path.join(root, "pull.json");
   const mergedPath = path.join(root, "merged.txt");
   const mergeCountPath = path.join(root, "merge-count.txt");
+  const mergeClaimPath = path.join(root, "merge-claim.txt");
   const commentsCountPath = path.join(root, "comments-count.txt");
   const failureCommentsPath = path.join(root, "failure-comments.txt");
   const delayedMergePath = path.join(root, "delayed-merge.txt");
@@ -1478,12 +1592,23 @@ function createVerifiedMergeFixture() {
       "if ((delayedMerge || process.env.FAKE_GH_CONFIRMATION_FAILURE_ON_POST_MERGE_READ) && postMergeConfirmationRead) { confirmationCount += 1; fs.writeFileSync(process.env.FAKE_GH_CONFIRMATION_COUNT_FILE, String(confirmationCount)); }",
       "const merged = fs.existsSync(process.env.FAKE_GH_MERGED_FILE) || (delayedMerge && confirmationCount >= 2);",
       "const mergeCount = () => fs.existsSync(process.env.FAKE_GH_MERGE_COUNT_FILE) ? Number(fs.readFileSync(process.env.FAKE_GH_MERGE_COUNT_FILE, 'utf8')) : 0;",
+      "const mergeClaimBody = fs.existsSync(process.env.FAKE_GH_MERGE_CLAIM_FILE) ? fs.readFileSync(process.env.FAKE_GH_MERGE_CLAIM_FILE, 'utf8') : '';",
+      "const existingClaimAppId = Number(process.env.FAKE_GH_EXISTING_CLAIM_APP_ID || '3306130');",
       "if (merged) { pull.state = 'closed'; pull.merged_at = '2026-07-13T08:00:00Z'; pull.merge_commit_sha = 'b'.repeat(40); }",
+      "if (process.env.FAKE_GH_HEAD_DRIFT === '1') pull.head.sha = 'c'.repeat(40);",
       "if (args[0] === 'api' && args[1] === 'repos/openclaw/openclaw/pulls/123') { const commentsCount = fs.existsSync(process.env.FAKE_GH_COMMENTS_COUNT_FILE) ? Number(fs.readFileSync(process.env.FAKE_GH_COMMENTS_COUNT_FILE, 'utf8')) : 0; if (process.env.FAKE_GH_PENDING_BEFORE_MUTATION === '1' && mergeCount() === 0 && commentsCount > 0) fs.writeFileSync(process.env.FAKE_GH_GATE_DRIFT_FILE, '1'); if (process.env.FAKE_GH_CONFIRMATION_FAILURE_AFTER_ATTEMPT === '1' && mergeCount() > 0) { process.stderr.write('gh: HTTP 502: confirmation unavailable\\n'); process.exit(1); } if (process.env.FAKE_GH_CONFIRMATION_FAILURE_ON_POST_MERGE_READ === String(confirmationCount)) { process.stderr.write('gh: HTTP 502: reconciliation unavailable\\n'); process.exit(1); } process.stdout.write(JSON.stringify(pull)); process.exit(0); }",
       "if (args[0] === 'api' && args[1] === 'repos/openclaw/openclaw/pulls/122') { process.stdout.write(JSON.stringify(sourcePull)); process.exit(0); }",
       "if (args[0] === 'api' && args[1] === 'repos/openclaw/openclaw/issues/123') { process.stdout.write(JSON.stringify({ labels: pull.labels })); process.exit(0); }",
       "if (args[0] === 'api' && args[1] === 'repos/openclaw/openclaw/issues/122') { process.stdout.write(JSON.stringify({ labels: sourcePull.labels })); process.exit(0); }",
       "if (args[0] === 'api' && args.includes('repos/openclaw/openclaw/issues/122/comments?per_page=100')) { if (args.includes('--slurp')) process.stdout.write('[[]]'); process.exit(0); }",
+      "if (args[0] === 'api' && args[1] === 'repos/openclaw/openclaw/issues/123/comments' && args.includes('-f')) {",
+      "  const body = String(args.find((arg) => arg.startsWith('body=')) || '').slice(5);",
+      "  if (process.env.FAKE_GH_CLAIM_MODE === 'missing') { process.stderr.write('gh: HTTP 502: claim unavailable\\n'); process.exit(1); }",
+      "  fs.writeFileSync(process.env.FAKE_GH_MERGE_CLAIM_FILE, body);",
+      "  if (process.env.FAKE_GH_CLAIM_MODE === 'ambiguous') { process.stderr.write('gh: HTTP 502: claim response unavailable\\n'); process.exit(1); }",
+      "  process.stdout.write(JSON.stringify({ id: 1001, body, performed_via_github_app: { id: 3306130, slug: 'openclaw-clawsweeper' }, user: { login: 'openclaw-clawsweeper[bot]' } }));",
+      "  process.exit(0);",
+      "}",
       "if (args[0] === 'api' && args.includes('repos/openclaw/openclaw/issues/123/comments?per_page=100')) {",
       "  const count = fs.existsSync(process.env.FAKE_GH_COMMENTS_COUNT_FILE) ? Number(fs.readFileSync(process.env.FAKE_GH_COMMENTS_COUNT_FILE, 'utf8')) : 0;",
       "  fs.writeFileSync(process.env.FAKE_GH_COMMENTS_COUNT_FILE, String(count + 1));",
@@ -1491,15 +1616,20 @@ function createVerifiedMergeFixture() {
       "  const securityAfterFailure = process.env.FAKE_GH_SECURITY_AFTER_FAILURE === '1' && mergeCount() >= 1;",
       "  const securityAfterBackoff = process.env.FAKE_GH_SECURITY_AFTER_BACKOFF === '1' && failedComments >= 0 && count > failedComments + 1;",
       "  const security = securityAfterFailure || securityAfterBackoff;",
-      "  if (args.includes('--slurp')) process.stdout.write(security ? '[[{\"body\":\"<!-- clawsweeper-security:security-sensitive item=123 sha=abc -->\"}]]' : '[[]]');",
-      "  else if (security) process.stdout.write('<!-- clawsweeper-security:security-sensitive item=123 sha=abc -->');",
+      "  const comments = [];",
+      "  const mergeClaimAppId = mergeClaimBody.includes('claimant=') ? 3306130 : existingClaimAppId;",
+      "  if (mergeClaimBody) comments.push({ id: 1001, body: mergeClaimBody, performed_via_github_app: { id: mergeClaimAppId, slug: 'openclaw-clawsweeper' }, user: { login: 'openclaw-clawsweeper[bot]' } });",
+      "  if (process.env.FAKE_GH_CONCURRENT_CLAIM === '1' && mergeClaimBody) comments.push({ id: 1000, body: mergeClaimBody.replace(/claimant=[^ ]+/, 'claimant=521123:99'), performed_via_github_app: { id: 3306130, slug: 'openclaw-clawsweeper' }, user: { login: 'openclaw-clawsweeper[bot]' } });",
+      "  if (security) comments.push({ body: '<!-- clawsweeper-security:security-sensitive item=123 sha=abc -->', user: { login: 'maintainer-user' } });",
+      "  if (args.includes('--slurp')) process.stdout.write(JSON.stringify([comments]));",
+      "  else process.stdout.write(comments.map((comment) => comment.body).join('\\n'));",
       "  process.exit(0);",
       "}",
       "if (args[0] === 'api' && args[1] === 'repos/openclaw/openclaw/rules/branches/main') { process.stdout.write(JSON.stringify([{ type: 'required_status_checks', ruleset_id: 18588237, ruleset_source: 'openclaw/openclaw', ruleset_source_type: 'Repository', parameters: { strict_required_status_checks_policy: true, required_status_checks: [{ context: 'required-ci/exact-merge' }] } }])); process.exit(0); }",
       "if (args[0] === 'api' && args[1] === 'repos/openclaw/openclaw/rulesets/18588237') { process.stdout.write(JSON.stringify({ enforcement: 'active', bypass_actors: [], rules: [{ type: 'required_status_checks', parameters: { strict_required_status_checks_policy: true, required_status_checks: [{ context: 'required-ci/exact-merge' }] } }] })); process.exit(0); }",
       "if (args[0] === 'api' && args[1] === 'repos/openclaw/openclaw/branches/main/protection') { process.stdout.write(JSON.stringify({ required_status_checks: null })); process.exit(0); }",
       "if (args[0] === 'api' && args[1] === 'graphql') { process.stdout.write(JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: { pageInfo: { hasNextPage: false }, nodes: [] } } } } })); process.exit(0); }",
-      "if (args[0] === 'pr' && args[1] === 'view') { const viewMerged = merged || (process.env.FAKE_GH_VIEW_MERGED_ONLY_AFTER_ATTEMPT === '1' && mergeCount() > 0); const pending = (process.env.FAKE_GH_PENDING_AFTER_ATTEMPT === '1' && mergeCount() > 0) || fs.existsSync(process.env.FAKE_GH_GATE_DRIFT_FILE); process.stdout.write(JSON.stringify({ baseRefName: 'main', isDraft: false, mergeable: pending ? 'UNKNOWN' : 'MERGEABLE', mergeCommit: viewMerged ? { oid: 'b'.repeat(40) } : null, mergeStateStatus: 'CLEAN', mergedAt: viewMerged ? '2026-07-13T08:00:00Z' : null, reviewDecision: null, state: viewMerged ? 'MERGED' : 'OPEN', statusCheckRollup: [], title: pull.title, url: 'https://github.com/openclaw/openclaw/pull/123' })); process.exit(0); }",
+      "if (args[0] === 'pr' && args[1] === 'view') { const viewMerged = merged || (process.env.FAKE_GH_VIEW_MERGED_ONLY_AFTER_ATTEMPT === '1' && mergeCount() > 0); const pending = process.env.FAKE_GH_PENDING_READINESS === '1' || (process.env.FAKE_GH_PENDING_AFTER_ATTEMPT === '1' && mergeCount() > 0) || fs.existsSync(process.env.FAKE_GH_GATE_DRIFT_FILE); process.stdout.write(JSON.stringify({ baseRefName: 'main', isDraft: false, mergeable: pending ? 'UNKNOWN' : 'MERGEABLE', mergeCommit: viewMerged ? { oid: 'b'.repeat(40) } : null, mergeStateStatus: 'CLEAN', mergedAt: viewMerged ? '2026-07-13T08:00:00Z' : null, reviewDecision: null, state: viewMerged ? 'MERGED' : 'OPEN', statusCheckRollup: [], title: pull.title, url: 'https://github.com/openclaw/openclaw/pull/123' })); process.exit(0); }",
       "if (args[0] === 'pr' && args[1] === 'merge') {",
       "  const count = mergeCount() + 1;",
       "  fs.writeFileSync(process.env.FAKE_GH_MERGE_COUNT_FILE, String(count));",
@@ -1528,9 +1658,11 @@ function createVerifiedMergeFixture() {
     authorizationSha256: authorization.identity_sha256,
     validationReceiptSha256: validationReceipt.identity_sha256,
     publicationReceiptSha256: receipt.identity_sha256,
+    headSha,
     pullPath,
     mergedPath,
     mergeCountPath,
+    mergeClaimPath,
     commentsCountPath,
     failureCommentsPath,
     delayedMergePath,
@@ -1541,6 +1673,7 @@ function createVerifiedMergeFixture() {
     reset() {
       fs.rmSync(mergedPath, { force: true });
       fs.rmSync(mergeCountPath, { force: true });
+      fs.rmSync(mergeClaimPath, { force: true });
       fs.rmSync(commentsCountPath, { force: true });
       fs.rmSync(failureCommentsPath, { force: true });
       fs.rmSync(delayedMergePath, { force: true });

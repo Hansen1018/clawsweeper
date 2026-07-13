@@ -989,6 +989,49 @@ test("repair workflow reports map to matching terminal lifecycle phases", async 
   }
 });
 
+test("hard workflow blocks stay terminal after an unknown mutation", async () => {
+  const root = fs.realpathSync(
+    fs.mkdtempSync(path.join(os.tmpdir(), "repair-terminal-unknown-ledger-")),
+  );
+  const outputRoot = path.join(root, "output");
+  fs.mkdirSync(outputRoot);
+  const previous = { ...process.env };
+  Object.assign(process.env, workflowEnv(root, outputRoot));
+  const lifecycle = repairLifecycle();
+
+  try {
+    runRepairMutation(lifecycle, {
+      kind: "post_flight_merge",
+      identity: { repo: "openclaw/openclaw", number: 42, headSha: "a".repeat(40) },
+      operation: () => "queued",
+      outcome: () => "unknown",
+    });
+    recordRepairWorkflowEvent(lifecycle, {
+      component: "post_flight",
+      phase: "blocked",
+    });
+    await flushRepairActionEvents();
+
+    const events = readEvents(outputRoot);
+    const mutation = events.find(
+      (event) =>
+        event.event_type === ACTION_EVENT_TYPES.repairMutation &&
+        event.attributes?.completion_reason === "mutation_outcome_unknown",
+    );
+    const blocked = events.find(
+      (event) =>
+        event.event_type === ACTION_EVENT_TYPES.workflowAttempt &&
+        event.attributes?.workflow_phase === "blocked",
+    );
+    assert.equal(mutation?.action.retryable, true);
+    assert.equal(blocked?.action.mutation, true);
+    assert.equal(blocked?.action.retryable, false);
+  } finally {
+    restoreEnv(previous);
+    fs.rmSync(root, { force: true, recursive: true });
+  }
+});
+
 test("repair action ledger CLI finalizes the configured ledger root", () => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "repair-cli-root-")));
   const outputRoot = path.join(root, "output");

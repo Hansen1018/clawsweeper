@@ -559,7 +559,9 @@ export function recordRepairWorkflowEvent(
               ? ACTION_EVENT_REASON_CODES.retryScheduled
               : ACTION_EVENT_REASON_CODES.completed,
     mutation: mutationState.mutationObserved,
-    retryable: options.phase === "requeued" || mutationState.uncertainMutationObserved,
+    retryable:
+      options.phase === "requeued" ||
+      (options.phase === "failed" && mutationState.uncertainMutationObserved),
     component: options.component,
     state: options.phase,
     workflowPhase: options.phase,

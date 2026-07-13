@@ -111,6 +111,10 @@ checkpoint, and status-only commits are intentionally omitted.
   preserving accepted and unknown outcomes through later failures. Merge,
   close, comment, label, CrabFleet, and dashboard requests now emit one receipt
   pair per actual one-shot request, including unknown response-loss outcomes.
+  Repair post-flight writes and verifies an exact-head GitHub App merge claim
+  immediately before the merge request, so later retries reconcile the existing
+  request instead of issuing it again; hard proof or policy drift remains a
+  terminal workflow block even when an earlier mutation outcome is unknown.
   Added digest-bound repair planning, structured-result repair, execution, and
   commit-review Codex log/report lifecycles, request-bound commit-check and
   notification delivery receipts, generic workflow attempt/finalization
