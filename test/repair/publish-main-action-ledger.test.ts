@@ -21,6 +21,8 @@ test("publish-main receipts the durable Git push only when explicitly requested"
   assert.match(source, /operation: \(\) => publishMainCommit\(publishOptions\)/);
   assert.match(source, /result === "committed" \? "accepted" : "rejected"/);
   assert.match(source, /--receipt-kind/);
+  assert.match(source, /--best-effort-refresh/);
+  assert.match(source, /refreshFailureMode: args\.bestEffortRefresh \? "best-effort" : "strict"/);
 });
 
 test("publication identity binds deterministic selected content before mutation", () => {

@@ -11,6 +11,7 @@ import {
   commitMessageForPublishedPaths,
   hardResetToRemoteMain,
   publishMainCommit,
+  refreshSourceAfterAcceptedStatePublish,
   refreshSourceAfterStatePublish,
   setTokenOrigin,
   stagePaths,
@@ -45,9 +46,37 @@ test("commitMessageForPublishedPaths skips CI for generated-only publishes", () 
     "chore: publish\n\n[skip ci]",
   );
   assert.equal(
+    commitMessageForPublishedPaths("chore: claim notifications", ["notifications"]),
+    "chore: claim notifications\n\n[skip ci]",
+  );
+  assert.equal(
     commitMessageForPublishedPaths("fix: update scheduler", ["src/repair/git-publish.ts"]),
     "fix: update scheduler",
   );
+});
+
+test("accepted state publishes may tolerate only local refresh failure", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-refresh-failure-"));
+  const source = path.join(root, "source");
+  const state = path.join(root, "state");
+  fs.mkdirSync(source);
+  fs.mkdirSync(state);
+
+  try {
+    withEnv({ CLAWSWEEPER_STATE_DIR: state }, () =>
+      withCwd(source, () => {
+        assert.throws(
+          () => refreshSourceAfterAcceptedStatePublish(["../outside"], null, "strict"),
+          /Refusing to refresh outside source root/,
+        );
+        assert.doesNotThrow(() =>
+          refreshSourceAfterAcceptedStatePublish(["../outside"], null, "best-effort"),
+        );
+      }),
+    );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("stagePaths normalizes tracked deletion pathspecs", () => {

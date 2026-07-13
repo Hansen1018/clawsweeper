@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { publishMainCommit, type RebaseStrategy } from "./git-publish.js";
+import { publishMainCommit, type GitPublishOptions, type RebaseStrategy } from "./git-publish.js";
 import { repairPublicationContentDigest, runRepairMutation } from "./repair-action-ledger.js";
 
 type Args = {
@@ -10,16 +10,18 @@ type Args = {
   pushAttempts?: number;
   rebaseStrategy?: RebaseStrategy;
   receiptKind?: string;
+  bestEffortRefresh: boolean;
 };
 
 const args = parseArgs(process.argv.slice(2));
-const publishOptions = {
+const publishOptions: GitPublishOptions = {
   message: args.message,
   paths: args.paths,
   restorePaths: args.restorePaths,
   maxAttempts: args.maxAttempts,
   pushAttempts: args.pushAttempts,
   rebaseStrategy: args.rebaseStrategy,
+  refreshFailureMode: args.bestEffortRefresh ? "best-effort" : "strict",
 };
 if (args.receiptKind) {
   const repository = String(process.env.GITHUB_REPOSITORY ?? "openclaw/clawsweeper");
@@ -41,6 +43,7 @@ if (args.receiptKind) {
         paths: [...args.paths].sort(),
         restorePaths: [...args.restorePaths].sort(),
         rebaseStrategy: args.rebaseStrategy ?? "normal",
+        refreshFailureMode: publishOptions.refreshFailureMode,
         publicationContentSha256,
       },
       operation: () => publishMainCommit(publishOptions),
@@ -52,7 +55,7 @@ if (args.receiptKind) {
 }
 
 function parseArgs(argv: readonly string[]): Args {
-  const parsed: Args = { message: "", paths: [], restorePaths: [] };
+  const parsed: Args = { message: "", paths: [], restorePaths: [], bestEffortRefresh: false };
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
     if (arg === "--") continue;
@@ -67,6 +70,7 @@ function parseArgs(argv: readonly string[]): Args {
       parsed.rebaseStrategy = parseRebaseStrategy(requiredValue(argv, ++index, arg));
     else if (arg === "--receipt-kind")
       parsed.receiptKind = parseReceiptKind(requiredValue(argv, ++index, arg));
+    else if (arg === "--best-effort-refresh") parsed.bestEffortRefresh = true;
     else throw new Error(`Unknown argument: ${arg}`);
   }
   if (!parsed.message) throw new Error("--message is required");

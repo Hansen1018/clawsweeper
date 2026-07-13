@@ -44,9 +44,11 @@ export type GitPublishOptions = {
   remote?: string;
   branch?: string;
   rebaseStrategy?: RebaseStrategy | undefined;
+  refreshFailureMode?: RefreshFailureMode | undefined;
 };
 
 export type RebaseStrategy = "normal" | "theirs" | "apply-records" | "reconcile-records";
+export type RefreshFailureMode = "strict" | "best-effort";
 
 export type GitRunOptions = {
   allowFailure?: boolean;
@@ -63,6 +65,7 @@ const GENERATED_PUBLISH_PATHS = [
   "records",
   "results",
   "assets",
+  "notifications",
 ] as const;
 const GIT_PATHSPEC_BATCH_SIZE = 256;
 const GIT_OBJECT_BATCH_SIZE = 512;
@@ -247,6 +250,7 @@ function publishMainCommitInternal(options: GitPublishOptions): PublishResult {
   const maxAttempts = positiveInt(options.maxAttempts, 8);
   const pushAttempts = positiveInt(options.pushAttempts, 3);
   const rebaseStrategy = options.rebaseStrategy ?? "normal";
+  const refreshFailureMode = options.refreshFailureMode ?? "strict";
   gitPublishPhase(
     "sync",
     `paths=${uniqueNonEmpty(options.paths).length} strategy=${rebaseStrategy}`,
@@ -268,7 +272,7 @@ function publishMainCommitInternal(options: GitPublishOptions): PublishResult {
     if (!synchronized) {
       throw new Error(`Failed to synchronize unchanged publish with ${remote}/${branch}`);
     }
-    return completeStatePublish("unchanged", options.paths, stateBaseCommit);
+    return completeStatePublish("unchanged", options.paths, stateBaseCommit, refreshFailureMode);
   }
 
   const commitMessage = commitMessageForPublishedPaths(options.message, options.paths);
@@ -294,7 +298,7 @@ function publishMainCommitInternal(options: GitPublishOptions): PublishResult {
       ) {
         throw new Error(`Failed to synchronize unchanged publish with ${remote}/${branch}`);
       }
-      return completeStatePublish("unchanged", options.paths, stateBaseCommit);
+      return completeStatePublish("unchanged", options.paths, stateBaseCommit, refreshFailureMode);
     }
     const tupleKeys = reconciliationTupleKeysForCommit(sourceCommit);
     reconciliationTupleKeys = new Set(tupleKeys);
@@ -308,7 +312,7 @@ function publishMainCommitInternal(options: GitPublishOptions): PublishResult {
         sourceCommit: reconciliationSourceCommit ?? sourceCommit,
         tupleKeys,
       });
-      return completeStatePublish(result, options.paths, stateBaseCommit);
+      return completeStatePublish(result, options.paths, stateBaseCommit, refreshFailureMode);
     }
   }
   restoreWorktree(options.restorePaths ?? []);
@@ -329,7 +333,7 @@ function publishMainCommitInternal(options: GitPublishOptions): PublishResult {
         "Failed to publish reconciliation without overwriting concurrent record tuples",
       );
     }
-    return completeStatePublish("committed", options.paths, stateBaseCommit);
+    return completeStatePublish("committed", options.paths, stateBaseCommit, refreshFailureMode);
   }
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
@@ -341,7 +345,7 @@ function publishMainCommitInternal(options: GitPublishOptions): PublishResult {
         rebaseStrategy,
       })
     ) {
-      return completeStatePublish("committed", options.paths, stateBaseCommit);
+      return completeStatePublish("committed", options.paths, stateBaseCommit, refreshFailureMode);
     }
     const rebuildResult = rebuildPublishCommit({
       remote,
@@ -351,7 +355,7 @@ function publishMainCommitInternal(options: GitPublishOptions): PublishResult {
       sourceCommit,
     });
     if (rebuildResult === "unchanged") {
-      return completeStatePublish("unchanged", options.paths, stateBaseCommit);
+      return completeStatePublish("unchanged", options.paths, stateBaseCommit, refreshFailureMode);
     }
     if (attempt === maxAttempts) break;
     const delaySeconds = attempt * 3 + Math.floor(Math.random() * 11);
@@ -369,7 +373,7 @@ function publishMainCommitInternal(options: GitPublishOptions): PublishResult {
       rebaseStrategy,
     })
   ) {
-    return completeStatePublish("committed", options.paths, stateBaseCommit);
+    return completeStatePublish("committed", options.paths, stateBaseCommit, refreshFailureMode);
   }
   throw new Error(`Failed to publish commit after ${maxAttempts} attempts`);
 }
@@ -424,9 +428,10 @@ function completeStatePublish(
   result: PublishResult,
   paths: readonly string[],
   stateBaseCommit: string | null,
+  refreshFailureMode: RefreshFailureMode,
 ): PublishResult {
   gitPublishPhase("refresh", `paths=${uniqueNonEmpty(paths).length}`);
-  refreshSourceAfterStatePublish(paths, stateBaseCommit);
+  refreshSourceAfterAcceptedStatePublish(paths, stateBaseCommit, refreshFailureMode);
   gitPublishPhase("complete", `result=${result}`);
   return result;
 }
@@ -567,6 +572,21 @@ export function refreshSourceAfterStatePublish(
       if (!sourcePathMatchesStateCommit(path, stateBaseCommit)) continue;
       refreshSourcePathFromState(path, stateRoot);
     }
+  }
+}
+
+export function refreshSourceAfterAcceptedStatePublish(
+  paths: readonly string[],
+  stateBaseCommit: string | null,
+  failureMode: RefreshFailureMode = "strict",
+): void {
+  try {
+    refreshSourceAfterStatePublish(paths, stateBaseCommit);
+  } catch (error) {
+    if (failureMode === "strict") throw error;
+    console.warn(
+      `State publish was accepted, but local source refresh failed: ${errorMessage(error)}`,
+    );
   }
 }
 

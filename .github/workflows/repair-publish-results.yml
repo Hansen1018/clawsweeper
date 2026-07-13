@@ -555,6 +555,7 @@ jobs:
               --message "chore: claim event notifications" \
               --path notifications \
               --receipt-kind repair_notification_state \
+              --best-effort-refresh \
               --max-attempts 12 \
               --push-attempts 4
           fi
