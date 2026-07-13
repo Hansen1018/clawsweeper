@@ -5,7 +5,9 @@ import { runCommand as run } from "./command-runner.js";
 import type { LooseRecord } from "./json-types.js";
 import { resolveRunArtifact } from "./run-artifact.js";
 
-const args = parseArgs(process.argv.slice(2));
+const argv = process.argv.slice(2);
+// pnpm forwards the script argument separator to the child process.
+const args = parseArgs(argv[0] === "--" ? argv.slice(1) : argv);
 const repository = requiredArg(args, "repository");
 if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository)) {
   throw new Error("repository is invalid");
@@ -50,7 +52,6 @@ writeOutputs({
 });
 
 function parseArgs(values: string[]): Map<string, string> {
-  if (values[0] === "--") values = values.slice(1);
   const parsed = new Map<string, string>();
   for (let index = 0; index < values.length; index += 2) {
     const name = values[index];
