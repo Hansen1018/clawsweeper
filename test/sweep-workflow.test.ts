@@ -316,11 +316,16 @@ test("exact event publish and routing require a successful fresh review artifact
   const workflow = readText(".github/workflows/sweep.yml");
   const routerWorkflow = readText(".github/workflows/repair-comment-router.yml");
   const publisher = readText("src/repair/publish-event-result.ts");
+  const queueClient = readText("src/repair/exact-review-action-ledger.ts");
   const eventReviewJobStart = workflow.indexOf("\n  event-review-apply:");
-  const planJobStart = workflow.indexOf("\n  plan:", eventReviewJobStart);
-  const eventReviewJob = workflow.slice(eventReviewJobStart, planJobStart);
+  const queuePublisherStart = workflow.indexOf(
+    "\n  publish-exact-review-action-ledger:",
+    eventReviewJobStart,
+  );
+  const eventReviewJob = workflow.slice(eventReviewJobStart, queuePublisherStart);
   const liveItemStart = eventReviewJob.indexOf("- name: Check live target item state");
   const setupPnpmStart = eventReviewJob.indexOf("- uses: ./.github/actions/setup-pnpm");
+  const buildRuntimeStart = eventReviewJob.indexOf("- name: Build full exact-review runtime");
   const setupCodexStart = eventReviewJob.indexOf("- uses: ./.github/actions/setup-codex");
   const exactReviewStart = eventReviewJob.indexOf("- name: Review exact event item");
   const publishStart = eventReviewJob.indexOf("- name: Publish event result and apply safe close");
@@ -345,7 +350,7 @@ test("exact event publish and routing require a successful fresh review artifact
     "- name: Complete exact-review queue lease",
     failStart,
   );
-  const liveItemStep = eventReviewJob.slice(liveItemStart, setupPnpmStart);
+  const liveItemStep = eventReviewJob.slice(liveItemStart, buildRuntimeStart);
   const setupCodexStep = eventReviewJob.slice(setupCodexStart, exactReviewStart);
   const exactReviewStep = eventReviewJob.slice(exactReviewStart, publishStart);
   const publishStep = eventReviewJob.slice(publishStart, releaseUnsuccessfulStart);
@@ -368,7 +373,8 @@ test("exact event publish and routing require a successful fresh review artifact
   );
 
   assert.ok(liveItemStart > 0);
-  assert.ok(setupPnpmStart > liveItemStart);
+  assert.ok(setupPnpmStart > 0 && setupPnpmStart < liveItemStart);
+  assert.ok(buildRuntimeStart > liveItemStart);
   assert.ok(deferredRouteStart > routeStart);
   assert.ok(releaseLeaseStart > routeStart);
   assert.ok(confirmTerminalStart > releaseLeaseStart);
@@ -389,7 +395,11 @@ test("exact event publish and routing require a successful fresh review artifact
   assert.match(liveItemStep, /without Codex because the open conversation is locked/);
   assert.match(
     eventReviewJob,
-    /- uses: \.\/\.github\/actions\/setup-pnpm\s+id: setup-pnpm\s+if: \$\{\{ steps\.live-item\.outputs\.proceed == 'true' \|\| \(\(steps\.live-item\.outputs\.terminal_noop == 'true' \|\| steps\.live-item\.outputs\.terminal_missing == 'true' \|\| steps\.live-item\.outputs\.guarded_open == 'true'\)/,
+    /- uses: \.\/\.github\/actions\/setup-pnpm\s+id: setup-pnpm\s+with:\s+build-script: build:repair/,
+  );
+  assert.match(
+    eventReviewJob,
+    /- name: Build full exact-review runtime\s+if: \$\{\{ steps\.live-item\.outputs\.proceed == 'true' \}\}\s+run: pnpm run build:all/,
   );
   assert.match(setupCodexStep, /if: \$\{\{ steps\.live-item\.outputs\.proceed == 'true' \}\}/);
   assert.match(exactReviewStep, /if: \$\{\{ steps\.live-item\.outputs\.proceed == 'true' \}\}/);
@@ -564,12 +574,12 @@ test("exact event publish and routing require a successful fresh review artifact
     eventReviewJob,
     /RETRY_AT: \$\{\{ steps\.review-exact-event-item\.outputs\.retry_at \}\}/,
   );
-  assert.match(eventReviewJob, /\.\.\.\(retryAt \? \{ retry_at: retryAt \} : \{\}\)/);
+  assert.match(queueClient, /\.\.\.\(retryAt \? \{ retry_at: retryAt \} : \{\}\)/);
   assert.match(
     eventReviewJob,
     /REQUEUE_LATEST: \$\{\{ steps\.publish-event-result\.outputs\.requeue_latest \}\}/,
   );
-  assert.match(eventReviewJob, /\.\.\.\(requeueLatest \? \{ requeue_latest: true \} : \{\}\)/);
+  assert.match(queueClient, /\.\.\.\(requeueLatest \? \{ requeue_latest: true \} : \{\}\)/);
   assert.match(eventReviewJob, /id: complete-exact-review-queue/);
   assert.match(
     eventReviewJob,
@@ -591,13 +601,14 @@ test("exact event publish and routing require a successful fresh review artifact
 
 test("exact event workflow binds all work to the canonical queue claim", () => {
   const workflow = readText(".github/workflows/sweep.yml");
+  const client = readText("src/repair/exact-review-action-ledger.ts");
   const eventStart = workflow.indexOf("\n  event-review-apply:");
-  const eventEnd = workflow.indexOf("\n  target-fanout:", eventStart);
+  const eventEnd = workflow.indexOf("\n  publish-exact-review-action-ledger:", eventStart);
   const eventJob = workflow.slice(eventStart, eventEnd);
   const claimStart = eventJob.indexOf("- name: Claim exact-review queue lease");
-  const checkoutStart = eventJob.indexOf("- uses: actions/checkout@v7", claimStart);
-  const claimStep = eventJob.slice(claimStart, checkoutStart);
-  const claimedWork = eventJob.slice(checkoutStart);
+  const resolveStart = eventJob.indexOf("- name: Resolve event payload", claimStart);
+  const claimStep = eventJob.slice(claimStart, resolveStart);
+  const claimedWork = eventJob.slice(resolveStart);
 
   assert.match(
     claimStep,
@@ -607,16 +618,17 @@ test("exact event workflow binds all work to the canonical queue claim", () => {
     claimStep,
     /QUEUE_LEASE_REVISION: \$\{\{ github\.event\.client_payload\.queue_claim\.lease_revision \|\| github\.event\.client_payload\.lease_revision \}\}/,
   );
+  assert.match(claimStep, /exact-review-action-ledger-cli\.js claim/);
+  assert.match(client, /\.\.\.\(hasTuple[\s\S]*item_key: requestedItemKey/);
+  assert.match(client, /parsed\.item_key !== context\.requestedItemKey/);
+  assert.match(client, /parsed\.lease_revision !== context\.requestedLeaseRevision/);
+  assert.match(client, /const itemKey = `\$\{targetRepo\}#\$\{itemNumber\}`/);
   assert.match(
-    claimStep,
-    /hasTuple \? \{ item_key: itemKey, lease_revision: leaseRevision \} : \{\}/,
+    client,
+    /claim_generation: responseProtocol === 2 \? String\(claimGeneration\) : ""/,
   );
-  assert.match(claimStep, /response\.item_key !== requestedItemKey/);
-  assert.match(claimStep, /response\.lease_revision !== requestedLeaseRevision/);
-  assert.match(claimStep, /const itemKey = `\$\{targetRepo\}#\$\{itemNumber\}`/);
-  assert.match(claimStep, /claim_generation=\$\{responseProtocol === 2 \? claimGeneration : ""\}/);
-  assert.match(claimStep, /protocol_version=\$\{responseProtocol\}/);
-  assert.match(claimStep, /decision=\$\{JSON\.stringify\(decision\)\}/);
+  assert.match(client, /protocol_version: String\(responseProtocol\)/);
+  assert.match(client, /decision: JSON\.stringify\(decision\)/);
   assert.doesNotMatch(claimedWork, /github\.event\.client_payload/);
   assert.match(claimedWork, /gh api "repos\/\$TARGET_REPO" --jq \.default_branch/);
   assert.match(claimedWork, /if \.pull_request then "pull_request" else "issue" end/);
@@ -653,32 +665,35 @@ test("exact event workflow binds all work to the canonical queue claim", () => {
     claimedWork,
     /PROTOCOL_VERSION: \$\{\{ steps\.claim-exact-review-queue\.outputs\.protocol_version \}\}/,
   );
-  assert.match(claimedWork, /item_key: process\.env\.ITEM_KEY/);
-  assert.match(claimedWork, /lease_revision: leaseRevision/);
-  assert.match(claimedWork, /claim_generation: claimGeneration/);
+  assert.match(client, /item_key: itemKey/);
+  assert.match(client, /lease_revision: leaseRevision/);
+  assert.match(client, /claim_generation: claimGeneration/);
 });
 
 test("exact event workflow keeps both queue protocol versions live during rolling deploys", () => {
   const workflow = readText(".github/workflows/sweep.yml");
+  const client = readText("src/repair/exact-review-action-ledger.ts");
   const eventStart = workflow.indexOf("\n  event-review-apply:");
-  const eventEnd = workflow.indexOf("\n  target-fanout:", eventStart);
+  const eventEnd = workflow.indexOf("\n  publish-exact-review-action-ledger:", eventStart);
   const eventJob = workflow.slice(eventStart, eventEnd);
   const claimStart = eventJob.indexOf("- name: Claim exact-review queue lease");
-  const checkoutStart = eventJob.indexOf("- uses: actions/checkout@v7", claimStart);
-  const claimStep = eventJob.slice(claimStart, checkoutStart);
+  const resolveStart = eventJob.indexOf("- name: Resolve event payload", claimStart);
+  const claimStep = eventJob.slice(claimStart, resolveStart);
   const completeStart = eventJob.indexOf("- name: Complete exact-review queue lease");
   const completeEnd = eventJob.indexOf("\n      - ", completeStart + 1);
   const completeStep = eventJob.slice(completeStart, completeEnd);
 
   assert.match(claimStep, /DISPATCH_PAYLOAD: \$\{\{ toJSON\(github\.event\.client_payload\) \}\}/);
-  assert.match(claimStep, /const responseProtocol = Number\(response\.protocol_version \|\| 1\)/);
-  assert.match(claimStep, /const legacyDecision = \{/);
-  assert.match(claimStep, /response\.decision && typeof response\.decision === "object"/);
-  assert.match(claimStep, /reviewOptions\.command_status_marker/);
-  assert.match(claimStep, /responseProtocol === 2/);
-  assert.match(completeStep, /protocolVersion !== 1 && protocolVersion !== 2/);
-  assert.match(completeStep, /protocolVersion === 2/);
-  assert.match(completeStep, /: \{\}\),/);
+  assert.match(claimStep, /exact-review-action-ledger-cli\.js claim/);
+  assert.match(client, /const responseProtocol = Number\(parsed\.protocol_version \|\| 1\)/);
+  assert.match(client, /const legacyDecision: JsonObject = \{/);
+  assert.match(client, /parsed\.decision && typeof parsed\.decision === "object"/);
+  assert.match(client, /"command_status_marker", "commandStatusMarker"/);
+  assert.match(client, /responseProtocol === 2/);
+  assert.match(completeStep, /exact-review-action-ledger-cli\.js complete/);
+  assert.match(client, /protocolVersion !== 1 && protocolVersion !== 2/);
+  assert.match(client, /protocolVersion === 2/);
+  assert.match(client, /\.\.\.\(protocolVersion === 2/);
 });
 
 test("dashboard syncs Worker secrets with durable lifecycle storage", () => {
@@ -718,6 +733,12 @@ test("dashboard CI refreshes on cadence without completion-trigger storms", () =
 
 test("terminal exact-review runs reconcile through a signed isolated backstop", () => {
   const workflow = readText(".github/workflows/exact-review-reconcile.yml");
+  const client = readText("src/repair/exact-review-action-ledger.ts");
+  const producer = workflow.slice(
+    workflow.indexOf("\n  reconcile:"),
+    workflow.indexOf("\n  publish-ledger:"),
+  );
+  const publisher = workflow.slice(workflow.indexOf("\n  publish-ledger:"));
 
   assert.match(workflow, /name: Reconcile exact-review leases/);
   assert.match(workflow, /workflow_run:\s+workflows: \[ClawSweeper\]\s+types: \[completed\]/);
@@ -737,14 +758,15 @@ test("terminal exact-review runs reconcile through a signed isolated backstop", 
     /SOURCE_RUN_ATTEMPT: \$\{\{ github\.event\.workflow_run\.run_attempt \}\}/,
   );
   assert.match(workflow, /SOURCE_RUN_ID: \$\{\{ github\.event\.workflow_run\.id \}\}/);
-  assert.match(workflow, /run_id: process\.env\.SOURCE_RUN_ID/);
-  assert.match(workflow, /run_attempt: runAttempt/);
-  assert.match(workflow, /CLAWSWEEPER_WEBHOOK_SECRET/);
-  assert.match(workflow, /x-clawsweeper-exact-review-signature: \$signature/);
-  assert.match(workflow, /--data-binary "\$payload"/);
-  assert.match(workflow, /\/internal\/exact-review\/reconcile/);
-  assert.doesNotMatch(workflow, /actions\/checkout/);
-  assert.doesNotMatch(workflow, /(?:GH_TOKEN|GITHUB_TOKEN|github\.token)/);
+  assert.match(producer, /exact-review-action-ledger-cli\.js reconcile/);
+  assert.match(client, /run_id: sourceRunId/);
+  assert.match(client, /run_attempt: sourceRunAttempt/);
+  assert.match(client, /createHmac\("sha256"/);
+  assert.match(client, /"x-clawsweeper-exact-review-signature": signature/);
+  assert.doesNotMatch(producer, /create-state-token|setup-state/);
+  assert.match(publisher, /create-state-token/);
+  assert.match(publisher, /--expected-job reconcile/);
+  assert.match(publisher, /publish-action-event-paths/);
 });
 
 test("publish workflow dispatches immediate apply through the isolated lane", () => {
@@ -2158,13 +2180,14 @@ test("planned background reviews allow safe content-cache reuse without weakenin
 
 test("sweep event reviews and target fanout avoid storm amplification", () => {
   const workflow = readText(".github/workflows/sweep.yml");
+  const client = readText("src/repair/exact-review-action-ledger.ts");
   const legacyIntakeBlock = workflow.slice(
     workflow.indexOf("legacy-event-queue-intake:"),
     workflow.indexOf("event-review-apply:"),
   );
   const eventBlock = workflow.slice(
     workflow.indexOf("event-review-apply:"),
-    workflow.indexOf("target-fanout:"),
+    workflow.indexOf("publish-exact-review-action-ledger:"),
   );
   const fanoutBlock = workflow.slice(workflow.indexOf("target-fanout:"), workflow.indexOf("plan:"));
 
@@ -2174,16 +2197,17 @@ test("sweep event reviews and target fanout avoid storm amplification", () => {
     /group: clawsweeper-event-review-\$\{\{ github\.event\.client_payload\.queue_claim\.item_key \|\| github\.event\.client_payload\.item_key \|\| github\.run_id \}\}/,
   );
   assert.match(eventBlock, /queue_lease_id != ''/);
-  assert.match(eventBlock, /item_key: process\.env\.ITEM_KEY/);
-  assert.match(eventBlock, /lease_revision: leaseRevision/);
-  assert.match(eventBlock, /claim_generation: claimGeneration/);
-  assert.match(eventBlock, /decision=\$\{JSON\.stringify\(decision\)\}/);
+  assert.match(eventBlock, /exact-review-action-ledger-cli\.js claim/);
+  assert.match(client, /item_key: itemKey/);
+  assert.match(client, /lease_revision: leaseRevision/);
+  assert.match(client, /claim_generation: claimGeneration/);
+  assert.match(client, /decision: JSON\.stringify\(decision\)/);
   assert.match(eventBlock, /cancel-in-progress: false/);
   assert.match(legacyIntakeBlock, /legacy-event-queue-intake:/);
-  assert.match(legacyIntakeBlock, /\/internal\/exact-review\/enqueue/);
-  assert.match(legacyIntakeBlock, /commandStatusMarker: payload\.command_status_marker/);
-  assert.match(legacyIntakeBlock, /statusCommentId: payload\.status_comment_id/);
-  assert.match(legacyIntakeBlock, /additionalPrompt: payload\.additional_prompt/);
+  assert.match(legacyIntakeBlock, /exact-review-action-ledger-cli\.js enqueue/);
+  assert.match(client, /"command_status_marker", "commandStatusMarker"/);
+  assert.match(client, /"status_comment_id", "statusCommentId"/);
+  assert.match(client, /"additional_prompt", "additionalPrompt"/);
   assert.match(
     fanoutBlock,
     /FANOUT_LIMIT: \$\{\{ github\.event\.schedule == '41 \* \* \* \*' && '6' \|\| \(github\.event\.schedule == '37 \*\/6 \* \* \*' && '12' \|\| '10'\) \}\}/,

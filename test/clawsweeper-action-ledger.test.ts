@@ -776,7 +776,7 @@ test("sweep publishes complete immutable shards for every review and apply produ
   assert.match(workflow, /include-hidden-files: true/);
   assert.match(workflow, /--state-root "\$CLAWSWEEPER_STATE_DIR"/);
   assert.match(workflow, /durable_event_path="\$CLAWSWEEPER_STATE_DIR\/\$event_path"/);
-  assert.equal((workflow.match(/publish-action-event-paths/g) ?? []).length, 7);
+  assert.equal((workflow.match(/publish-action-event-paths/g) ?? []).length, 9);
   assert.doesNotMatch(
     workflow,
     /--message "chore: append (?:review|apply).*action ledger"[\s\S]{0,180}--path "ledger\/v1\/events"/,
