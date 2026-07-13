@@ -154,8 +154,7 @@ test("commit finding intake keeps legacy reports audit-only", () => {
   const reportBytes = `---\nresult: findings\nsha: ${sha}\nrepository: ${targetRepo}\n---\n`;
   fs.mkdirSync(path.join(stateRoot, path.dirname(reportPath)), { recursive: true });
   fs.writeFileSync(path.join(stateRoot, reportPath), reportBytes);
-  const revision = commitFixture(stateRoot);
-  const digest = createHash("sha256").update(reportBytes).digest("hex");
+  commitFixture(stateRoot);
 
   try {
     const rebound = runStep(
