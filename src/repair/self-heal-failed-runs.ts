@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import type { JsonValue, LooseRecord } from "./json-types.js";
+import type { JsonObject, JsonValue, LooseRecord } from "./json-types.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -45,6 +45,11 @@ type RecoveredRunCohort = {
   state_revision: string;
   job_sha256: string;
   producer_attempt: number;
+};
+
+type RunGeneration = {
+  latest: JsonObject;
+  records: JsonObject[];
 };
 
 const args = parseArgs(process.argv.slice(2));
@@ -215,29 +220,42 @@ function selectCandidates() {
       (legacyAttemptCountsByJob.get(legacyJobPath) ?? 0) + 1,
     );
   }
-  const latestByJob = new Map();
+  const generationsByJob = new Map<string, Map<string, RunGeneration>>();
 
-  for (const record of records.filter((record: JsonValue) => shouldSelfHealRunRecord(record))) {
+  for (const [recordIndex, record] of records.entries()) {
     const sourceJob = record.source_job;
     if (typeof sourceJob !== "string" || !sourceJob) {
       skippedCandidates.push({ reason: "missing_source_job", run_id: record.run_id ?? null });
       continue;
     }
-    const current = latestByJob.get(sourceJob);
-    // Live records are appended last and must win same-run ties so reruns
-    // recover the newest producer attempt instead of stale published inputs.
-    const recordSortKey = runSortKey(record);
-    const currentSortKey = current ? runSortKey(current) : Number.NEGATIVE_INFINITY;
-    if (
-      !current ||
-      recordSortKey > currentSortKey ||
-      (recordSortKey === currentSortKey && record.live_run_record === true)
-    ) {
-      latestByJob.set(sourceJob, record);
+    let generations = generationsByJob.get(sourceJob);
+    if (!generations) {
+      generations = new Map();
+      generationsByJob.set(sourceJob, generations);
     }
+    const generationKey = runGenerationKey(record, recordIndex);
+    const generation = generations.get(generationKey);
+    if (!generation) {
+      generations.set(generationKey, { latest: record, records: [record] });
+      continue;
+    }
+    generation.records.push(record);
+    if (isNewerRunRecord(record, generation.latest)) generation.latest = record;
   }
 
-  return [...latestByJob.values()]
+  const latestCandidates: JsonObject[] = [];
+  for (const generations of generationsByJob.values()) {
+    let latestGeneration: RunGeneration | null = null;
+    for (const generation of generations.values()) {
+      if (!latestGeneration || isNewerRunRecord(generation.latest, latestGeneration.latest)) {
+        latestGeneration = generation;
+      }
+    }
+    const candidate = latestGeneration ? selfHealCandidate(latestGeneration) : null;
+    if (candidate) latestCandidates.push(candidate);
+  }
+
+  return latestCandidates
     .filter((record: JsonValue) => {
       const timestamp = recordTimestampMs(record);
       if (timestamp >= cutoffMs) return true;
@@ -321,6 +339,65 @@ function selectCandidates() {
       return false;
     })
     .sort((left: JsonValue, right: JsonValue) => runSortKey(right) - runSortKey(left));
+}
+
+function runGenerationKey(record: JsonObject, recordIndex: number): string {
+  const jobSha256 = String(record.source_job_sha256 ?? "").trim();
+  if (JOB_SHA256.test(jobSha256)) return `digest:${jobSha256}`;
+  const runId = String(record.run_id ?? "").trim();
+  if (/^[1-9][0-9]*$/.test(runId)) return `run:${runId}`;
+  return `record:${recordIndex}`;
+}
+
+function isNewerRunRecord(candidate: JsonObject, current: JsonObject): boolean {
+  const candidateSortKey = runSortKey(candidate);
+  const currentSortKey = runSortKey(current);
+  if (candidateSortKey !== currentSortKey) return candidateSortKey > currentSortKey;
+  return candidate.live_run_record === true && current.live_run_record !== true;
+}
+
+function selfHealCandidate(generation: RunGeneration): JsonObject | null {
+  let candidate: JsonObject | null = null;
+  const records = generation.records;
+  const retryable = records.filter((record: JsonValue) => shouldSelfHealRunRecord(record));
+  for (const record of retryable) {
+    if (!candidate || isNewerRunRecord(record, candidate)) candidate = record;
+  }
+  if (!candidate) return null;
+  if (generation.records.some((record) => successfulRepairExecution(record))) return null;
+  return candidate;
+}
+
+function successfulRepairExecution(record: JsonObject): boolean {
+  if (
+    shouldSelfHealRunRecord(record) ||
+    String(record.workflow_conclusion ?? "").toLowerCase() !== "success"
+  ) {
+    return false;
+  }
+  if (record.live_run_record !== true || record.published_run_record === true) return true;
+
+  const runId = String(record.run_id ?? "").trim();
+  if (!/^[1-9][0-9]*$/.test(runId)) return true;
+  try {
+    const response = ghJson<LooseRecord>([
+      "api",
+      "--method",
+      "GET",
+      `repos/${repo}/actions/runs/${runId}/jobs?per_page=100`,
+    ]);
+    const jobs = Array.isArray(response.jobs) ? response.jobs : [];
+    return jobs.some(
+      (job: LooseRecord) =>
+        job.name === "Plan and review cluster" &&
+        String(job.conclusion ?? "").toLowerCase() === "success",
+    );
+  } catch (error) {
+    console.warn(
+      `self-heal: cannot verify whether successful run ${runId} executed repair work: ${ghErrorText(error)}`,
+    );
+    return true;
+  }
 }
 
 function activeRepairJobGenerations() {
@@ -443,6 +520,7 @@ function readRunRecords() {
     const published = publishedByRunId.get(String(record.run_id ?? ""));
     return {
       ...record,
+      published_run_record: published !== undefined,
       ...(published?.post_flight_outcome === undefined
         ? {}
         : { post_flight_outcome: published.post_flight_outcome }),
@@ -492,7 +570,10 @@ function resolveRunRecordJob(record: LooseRecord, sourceJob: string) {
 
 function validatedRunRecordMode(value: unknown): string | null {
   if (value === undefined || value === null || value === "") return null;
-  const mode = String(value).trim();
+  if (typeof value !== "string") {
+    throw new Error("run record has invalid effective repair mode: non-string");
+  }
+  const mode = value.trim();
   if (!REPAIR_MODES.has(mode)) {
     throw new Error(`run record has invalid effective repair mode: ${mode || "empty"}`);
   }

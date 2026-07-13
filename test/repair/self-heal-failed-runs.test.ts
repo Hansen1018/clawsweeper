@@ -248,11 +248,75 @@ test("failed-run self-heal ignores a newer receipt-only duplicate success", () =
         url: `https://github.test/actions/runs/${Number(fixture.runId) + 1}`,
       },
     ]);
+    writeRunJobs(fixture, [
+      { name: "Deduplicate command dispatch receipt", conclusion: "success" },
+      { name: "Plan and review cluster", conclusion: "skipped" },
+    ]);
 
     const summary = runSelfHeal(fixture);
     assert.equal(summary.candidates.length, 1);
     assert.equal(summary.candidates[0].source_run_id, fixture.runId);
     assert.equal(summary.candidates[0].source_job, fixture.jobPath);
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("failed-run self-heal does not replay an older immutable generation after success", () => {
+  const fixture = createSelfHealFixture("newer-success");
+  try {
+    writeRunRecord(fixture.runsDir, fixture.runId, {
+      source_job: fixture.jobPath,
+      source_state_revision: fixture.originalRevision,
+      source_job_sha256: fixture.originalDigest,
+      mode: "plan",
+    });
+    writeLiveRunList(fixture, [
+      {
+        databaseId: Number(fixture.runId) + 1,
+        workflowName: "repair cluster worker",
+        displayTitle: `repair cluster ${fixture.jobPath} (${"f".repeat(64)})`,
+        status: "completed",
+        conclusion: "success",
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        url: `https://github.test/actions/runs/${Number(fixture.runId) + 1}`,
+      },
+    ]);
+    writeRunJobs(fixture, [{ name: "Plan and review cluster", conclusion: "success" }]);
+
+    const summary = runSelfHeal(fixture);
+    assert.equal(summary.candidates.length, 0);
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("failed-run self-heal honors a newer executed success in the same generation", () => {
+  const fixture = createSelfHealFixture("same-generation-success");
+  try {
+    writeRunRecord(fixture.runsDir, fixture.runId, {
+      source_job: fixture.jobPath,
+      source_state_revision: fixture.originalRevision,
+      source_job_sha256: fixture.originalDigest,
+      mode: "plan",
+    });
+    writeLiveRunList(fixture, [
+      {
+        databaseId: Number(fixture.runId) + 1,
+        workflowName: "repair cluster worker",
+        displayTitle: `repair cluster ${fixture.jobPath} (${fixture.originalDigest})`,
+        status: "completed",
+        conclusion: "success",
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        url: `https://github.test/actions/runs/${Number(fixture.runId) + 1}`,
+      },
+    ]);
+    writeRunJobs(fixture, [{ name: "Plan and review cluster", conclusion: "success" }]);
+
+    const summary = runSelfHeal(fixture);
+    assert.equal(summary.candidates.length, 0);
   } finally {
     fs.rmSync(fixture.root, { recursive: true, force: true });
   }
@@ -507,7 +571,9 @@ function createSelfHealFixture(label: string, originalMode: "plan" | "autonomous
   fs.mkdirSync(artifactFixture, { recursive: true });
   fs.mkdirSync(binDir, { recursive: true });
   const runListFixture = path.join(root, "run-list.json");
+  const runJobsFixture = path.join(root, "run-jobs.json");
   fs.writeFileSync(runListFixture, "[]\n");
+  fs.writeFileSync(runJobsFixture, '{"jobs":[]}\n');
   execFileSync("git", ["init", "-q"], { cwd: stateRoot });
   execFileSync("git", ["config", "user.name", "ClawSweeper Test"], { cwd: stateRoot });
   execFileSync("git", ["config", "user.email", "test@example.invalid"], { cwd: stateRoot });
@@ -524,6 +590,7 @@ function createSelfHealFixture(label: string, originalMode: "plan" | "autonomous
     artifactFixture,
     binDir,
     runListFixture,
+    runJobsFixture,
     jobPath,
     originalRevision,
     originalDigest,
@@ -551,6 +618,7 @@ function runSelfHeal(fixture: ReturnType<typeof createSelfHealFixture>) {
         CLAWSWEEPER_STATE_DIR: fixture.stateRoot,
         GH_ARTIFACT_FIXTURE: fixture.artifactFixture,
         GH_RUN_LIST_FIXTURE: fixture.runListFixture,
+        GH_RUN_JOBS_FIXTURE: fixture.runJobsFixture,
       },
     },
   );
@@ -587,6 +655,13 @@ function writeLiveRunList(
   runs: Record<string, unknown>[],
 ): void {
   fs.writeFileSync(fixture.runListFixture, `${JSON.stringify(runs)}\n`);
+}
+
+function writeRunJobs(
+  fixture: ReturnType<typeof createSelfHealFixture>,
+  jobs: Record<string, unknown>[],
+): void {
+  fs.writeFileSync(fixture.runJobsFixture, `${JSON.stringify({ jobs })}\n`);
 }
 
 function writeArtifactCohort(
@@ -718,6 +793,10 @@ if [ "$1" = "run" ] && [ "$2" = "download" ]; then
     fi
     shift
   done
+fi
+if [ "$1" = "api" ]; then
+  cat "$GH_RUN_JOBS_FIXTURE"
+  exit 0
 fi
 echo "unsupported gh invocation: $*" >&2
 exit 1
