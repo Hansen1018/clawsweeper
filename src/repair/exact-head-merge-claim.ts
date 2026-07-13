@@ -296,6 +296,7 @@ export function ensureExactHeadMergeClaim(
   io: {
     listComments: () => LooseRecord[];
     createComment: (body: string, context: ClaimCommentContext) => LooseRecord;
+    dispatchedClaimEffectAbsent?: () => boolean;
     recoverClaim?: (
       candidate: ExactHeadMergeClaimRecoveryCandidate,
     ) => ExactHeadMergeClaimRecoveryDecision;
@@ -305,8 +306,21 @@ export function ensureExactHeadMergeClaim(
   const marker = exactHeadMergeClaimMarker(normalized);
   const initial = inspectExactHeadMergeClaim(normalized, io.listComments);
   if (initial.status === "existing") {
-    if (initial.dispatched || !io.recoverClaim || initial.claimant === normalized.claimant)
+    if (!io.recoverClaim || initial.claimant === normalized.claimant) {
       return initial;
+    }
+    if (initial.dispatched) {
+      if (!io.dispatchedClaimEffectAbsent) return initial;
+      try {
+        if (!io.dispatchedClaimEffectAbsent()) return initial;
+      } catch (error) {
+        return {
+          status: "unknown",
+          reason: `dispatched exact-head merge claim effect could not be inspected: ${errorText(error)}`,
+          claimId: null,
+        };
+      }
+    }
     let recoveryDecision: ExactHeadMergeClaimRecoveryDecision;
     try {
       recoveryDecision = io.recoverClaim({
@@ -706,24 +720,6 @@ function inspectClaims(
     }
   }
   for (const recovery of recoveries) {
-    if (
-      dispatches.some(
-        (dispatch) =>
-          dispatch.dispatch.claimId === recovery.recovery.claimId &&
-          sameClaim(dispatch.dispatch, recovery.recovery) &&
-          dispatch.id < recovery.id,
-      )
-    ) {
-      return {
-        failure: {
-          status: "blocked",
-          reason: "trusted exact-head merge claim was recovered after dispatch",
-          claimId: null,
-        },
-      };
-    }
-  }
-  for (const recovery of recoveries) {
     const referenced = claims.find(
       (claim) =>
         claim.id === recovery.recovery.claimId &&
@@ -973,12 +969,6 @@ export function exactHeadMergeClaimRecoveryDecision(
   nowMs = Date.now(),
   graceMs = DEFAULT_RECOVERY_GRACE_MS,
 ): ExactHeadMergeClaimRecoveryDecision {
-  if (candidate.dispatched) {
-    return {
-      status: "active",
-      reason: "exact-head merge claim crossed the dispatch boundary; reconciliation only",
-    };
-  }
   const currentClaimant = String(env.GITHUB_RUN_ID ?? "").trim();
   const match = candidate.claimant.match(/^[a-z0-9_-]+:([1-9][0-9]*):([1-9][0-9]*)$/);
   if (!match) {
@@ -1027,9 +1017,38 @@ export function exactHeadMergeClaimRecoveryDecision(
     .trim()
     .toLowerCase();
   if (status === "completed") {
+    if (candidate.dispatched) {
+      const conclusion = String(run.conclusion ?? "")
+        .trim()
+        .toLowerCase();
+      if (conclusion === "success") {
+        return {
+          status: "active",
+          reason:
+            "dispatched exact-head merge claim belongs to a successful workflow attempt; reconciliation only",
+        };
+      }
+      if (
+        ![
+          "action_required",
+          "cancelled",
+          "failure",
+          "stale",
+          "startup_failure",
+          "timed_out",
+        ].includes(conclusion)
+      ) {
+        return {
+          status: "unknown",
+          reason: `dispatched exact-head merge claim owner has unsupported terminal conclusion ${conclusion || "missing"}`,
+        };
+      }
+    }
     return {
       status: "recoverable",
-      reason: `workflow run ${runId} attempt ${runAttempt} is terminal and its merge claim was retired`,
+      reason: candidate.dispatched
+        ? `workflow run ${runId} attempt ${runAttempt} failed after dispatch without an observable merge effect`
+        : `workflow run ${runId} attempt ${runAttempt} is terminal and its merge claim was retired`,
     };
   }
   if (["queued", "in_progress", "pending", "waiting", "requested"].includes(status)) {

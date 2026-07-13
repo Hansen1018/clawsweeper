@@ -36,9 +36,11 @@ import {
 } from "./repair-merge-message.js";
 import { runtimeStrictBaseBindingBlock } from "./strict-base-binding.js";
 import {
+  expectedSquashCommitMessage,
   squashAutomergeMethodBlock,
   squashMergedMethodBlock,
   squashMergeQueueMethodBlock,
+  type SquashMergeCommitProof,
 } from "./automerge-effect.js";
 import {
   ensureExactHeadMergeClaim,
@@ -759,6 +761,7 @@ function applyMergeAction({
     reason: "merged by ClawSweeper Repair",
   });
   const bodyFile = writeRepairSquashMergeBody(target, authorizedHeadSha, mergeMessage.body);
+  const squashCommitMessage = expectedSquashCommitMessage(mergeMessage.subject, mergeMessage.body);
   const mergeArgs = [
     "pr",
     "merge",
@@ -774,7 +777,7 @@ function applyMergeAction({
     authorizedHeadSha,
   ];
   let commandError: unknown = null;
-  let squashDispatchSucceeded = false;
+  let dispatchedSquashCommitMessage = "";
   const finalView = fetchPullRequestView(result.repo, target);
   const finalHeadBindingBlock = validateMergeHeadBinding({ authorizedHeadSha, view: finalView });
   if (finalHeadBindingBlock) {
@@ -1059,7 +1062,7 @@ function applyMergeAction({
           }
           mergeRequestStarted = true;
           const output = ghText(mergeArgs);
-          squashDispatchSucceeded = true;
+          dispatchedSquashCommitMessage = squashCommitMessage;
           return output;
         },
         outcome: () => "unknown",
@@ -1081,8 +1084,12 @@ function applyMergeAction({
   }
 
   let merged;
+  let squashCommitProof: SquashMergeCommitProof | undefined;
   try {
     merged = fetchPullRequestOnce(result.repo, target);
+    squashCommitProof = dispatchedSquashCommitMessage
+      ? fetchSquashMergeCommitProof(result.repo, merged, dispatchedSquashCommitMessage)
+      : undefined;
   } catch (error) {
     return {
       ...base,
@@ -1096,7 +1103,7 @@ function applyMergeAction({
   }
   const confirmation = confirmExactMergeSnapshot(merged, authorizedHeadSha, {
     requireSquashMethod: true,
-    squashDispatchSucceeded,
+    ...(squashCommitProof ? { squashCommit: squashCommitProof } : {}),
   });
   if (confirmation.block) {
     return {
@@ -1261,7 +1268,7 @@ function confirmExactMergeSnapshot(
   authorizedHeadSha: string,
   proof: {
     requireSquashMethod?: boolean;
-    squashDispatchSucceeded?: boolean;
+    squashCommit?: SquashMergeCommitProof;
   } = {},
 ): { mergedAt: string | null; block: string } {
   const mergedAt = stringOrNull(pullRequest.merged_at);
@@ -1278,9 +1285,7 @@ function confirmExactMergeSnapshot(
     };
   }
   const methodBlock =
-    proof.requireSquashMethod === true
-      ? squashMergedMethodBlock(proof.squashDispatchSucceeded === true)
-      : "";
+    proof.requireSquashMethod === true ? squashMergedMethodBlock(proof.squashCommit) : "";
   return { mergedAt: methodBlock ? null : mergedAt, block: methodBlock };
 }
 
@@ -1325,6 +1330,15 @@ function claimApplyMergeRequest(repository: string, number: number, headSha: str
           return trusted ? "accepted" : "unknown";
         },
       }),
+    dispatchedClaimEffectAbsent: () => {
+      const pull = fetchPullRequestOnce(repository, number);
+      if (validatePullRequestHeadBinding({ authorizedHeadSha: headSha, pullRequest: pull })) {
+        return false;
+      }
+      if (pull.merged_at) return false;
+      const view = fetchPullRequestViewOnce(repository, number);
+      return !exactHeadPendingMerge(view, headSha);
+    },
     recoverClaim: (candidate) =>
       exactHeadMergeClaimRecoveryDecision(candidate, (path) =>
         ghJsonOnce(["api", path], { env: exactHeadMergeClaimWorkflowRunEnv() }),
@@ -2545,6 +2559,19 @@ function fetchPullRequest(repo: string, number: JsonValue) {
 
 function fetchPullRequestOnce(repo: string, number: JsonValue) {
   return ghJsonOnce(["api", `repos/${repo}/pulls/${number}`]);
+}
+
+function fetchSquashMergeCommitProof(
+  repo: string,
+  pull: LooseRecord,
+  expectedMessage: string,
+): SquashMergeCommitProof | undefined {
+  if (!pull.merged_at) return undefined;
+  const mergeCommitSha = String(pull.merge_commit_sha ?? "").trim();
+  const commit = mergeCommitSha
+    ? ghJsonOnce(["api", `repos/${repo}/commits/${mergeCommitSha}`])
+    : null;
+  return { mergeCommitSha, commit, expectedMessage };
 }
 
 function pullRequestViewArgs(repo: string, number: JsonValue) {

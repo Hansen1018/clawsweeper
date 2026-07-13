@@ -21,8 +21,10 @@ import {
   automergeCommandResponseAmbiguous,
   automergeUnconfirmedFailureDisposition,
   confirmAutomergeEffectSnapshot,
+  expectedSquashCommitMessage,
   squashAutomergeMethodBlock,
   squashMergeQueueMethodBlock,
+  type SquashMergeCommitProof,
 } from "./automerge-effect.js";
 import {
   ensureExactHeadMergeClaim,
@@ -3993,6 +3995,7 @@ function executeAutomerge(command: LooseRecord): LooseRecord {
   }
   // Keep the exact-head merge request one-shot; reconcile its effect before closing the receipt.
   let mergeRequestStarted = false;
+  let squashCommitProof: SquashMergeCommitProof | undefined;
   let result;
   try {
     result = runGitHubSpawnMutation(
@@ -4027,13 +4030,19 @@ function executeAutomerge(command: LooseRecord): LooseRecord {
             const snapshot = fetchAutomergeEffectSnapshot(command.issue_number);
             const squashDispatchSucceeded =
               commandError === null && commandResult?.status === 0 && !commandResult.error;
+            squashCommitProof = squashDispatchSucceeded
+              ? fetchAutomergeSquashCommitProof(
+                  snapshot,
+                  expectedSquashCommitMessage(mergeMessage.subject, mergeMessage.body),
+                )
+              : undefined;
             return {
               command_result: commandResult,
               command_error: commandError,
               snapshot,
               snapshot_error: "",
               confirmation: confirmAutomergeEffectSnapshot(snapshot, command.expected_head_sha, {
-                squashDispatchSucceeded,
+                ...(squashCommitProof ? { squashCommit: squashCommitProof } : {}),
               }),
             };
           } catch (error) {
@@ -4072,6 +4081,7 @@ function executeAutomerge(command: LooseRecord): LooseRecord {
       },
       waitedMs,
       transientObservations,
+      squashCommitProof,
     );
   }
   if (result.confirmation?.mergedAt) {
@@ -4295,6 +4305,18 @@ function fetchAutomergeEffectSnapshot(number: JsonValue) {
   return { pull, view };
 }
 
+function fetchAutomergeSquashCommitProof(
+  snapshot: LooseRecord,
+  expectedMessage: string,
+): SquashMergeCommitProof | undefined {
+  if (!snapshot.pull?.merged_at) return undefined;
+  const mergeCommitSha = String(snapshot.pull?.merge_commit_sha ?? "").trim();
+  const commit = mergeCommitSha
+    ? ghJson(["api", `repos/${targetRepo}/commits/${mergeCommitSha}`], { attempts: 1 })
+    : null;
+  return { mergeCommitSha, commit, expectedMessage };
+}
+
 function claimAutomergeMergeRequest(command: LooseRecord): ExactHeadMergeClaimResult {
   const request = automergeMergeClaimRequest(command);
   return ensureExactHeadMergeClaim(request, {
@@ -4341,6 +4363,14 @@ function claimAutomergeMergeRequest(command: LooseRecord): ExactHeadMergeClaimRe
           return trusted ? "accepted" : "unknown";
         },
       }),
+    dispatchedClaimEffectAbsent: () => {
+      const confirmation = confirmAutomergeEffectSnapshot(
+        fetchAutomergeEffectSnapshot(request.number),
+        request.headSha,
+        { requireSquashMethod: false },
+      );
+      return !confirmation.block && !confirmation.mergedAt && !confirmation.pendingReason;
+    },
     recoverClaim: (candidate) =>
       exactHeadMergeClaimRecoveryDecision(candidate, (path) =>
         ghJson(["api", path], {
@@ -4450,6 +4480,7 @@ function reconcileClaimedAutomergeRequest(
   claim: Exclude<ExactHeadMergeClaimResult, { status: "acquired" }>,
   waitedMs: number,
   transientObservations: LooseRecord[],
+  squashCommitProof?: SquashMergeCommitProof,
 ): LooseRecord {
   if (claim.status === "blocked") {
     return { action: "merge", status: "blocked", reason: claim.reason, merge_method: "squash" };
@@ -4478,6 +4509,7 @@ function reconcileClaimedAutomergeRequest(
     const confirmation = confirmAutomergeEffectSnapshot(
       fetchAutomergeEffectSnapshot(command.issue_number),
       command.expected_head_sha,
+      squashCommitProof ? { squashCommit: squashCommitProof } : {},
     );
     if (confirmation.block) {
       return {

@@ -17,13 +17,24 @@ import {
 } from "../../dist/repair/exact-head-merge-claim.js";
 
 const headSha = "a".repeat(40);
+const mergeCommitSha = "b".repeat(40);
+const squashCommitMessage = "fix: exact merge\n\nvalidated squash payload";
+const squashCommitProof = {
+  mergeCommitSha,
+  commit: {
+    sha: mergeCommitSha,
+    parents: [{ sha: "c".repeat(40) }],
+    commit: { message: squashCommitMessage },
+  },
+  expectedMessage: squashCommitMessage,
+};
 
 test("automerge effect certification binds the merged REST snapshot to the reviewed head", () => {
   const snapshot = {
     pull: {
       head: { sha: headSha },
       merged_at: "2026-07-13T08:00:00Z",
-      merge_commit_sha: "b".repeat(40),
+      merge_commit_sha: mergeCommitSha,
     },
     view: {
       headRefOid: "c".repeat(40),
@@ -31,10 +42,10 @@ test("automerge effect certification binds the merged REST snapshot to the revie
     },
   };
   assert.deepEqual(
-    confirmAutomergeEffectSnapshot(snapshot, headSha, { squashDispatchSucceeded: true }),
+    confirmAutomergeEffectSnapshot(snapshot, headSha, { squashCommit: squashCommitProof }),
     {
       mergedAt: "2026-07-13T08:00:00Z",
-      mergeCommitSha: "b".repeat(40),
+      mergeCommitSha,
       pendingReason: "",
       block: "",
     },
@@ -45,6 +56,34 @@ test("automerge effect certification binds the merged REST snapshot to the revie
     pendingReason: "",
     block: "merged pull request method could not be proven as SQUASH",
   });
+});
+
+test("automerge effect certification rejects non-squash commit topology and payloads", () => {
+  const snapshot = {
+    pull: {
+      head: { sha: headSha },
+      merged_at: "2026-07-13T08:00:00Z",
+      merge_commit_sha: mergeCommitSha,
+    },
+    view: {},
+  };
+  for (const squashCommit of [
+    {
+      ...squashCommitProof,
+      commit: { ...squashCommitProof.commit, parents: [{ sha: headSha }, { sha: mergeCommitSha }] },
+    },
+    {
+      ...squashCommitProof,
+      commit: {
+        ...squashCommitProof.commit,
+        commit: { message: "fix: exact merge\n\nraced payload" },
+      },
+    },
+  ]) {
+    const confirmation = confirmAutomergeEffectSnapshot(snapshot, headSha, { squashCommit });
+    assert.equal(confirmation.mergedAt, null);
+    assert.match(confirmation.block, /squash-merge topology|dispatched squash payload/);
+  }
 });
 
 test("automerge effect certification requires a squash method for queue and auto-merge state", () => {
@@ -262,7 +301,7 @@ test("released exact-head merge claims can be reacquired by a fresh workflow att
   assert.equal(comments.length, 3);
 });
 
-test("dispatched exact-head merge claims cannot be released or recovered", () => {
+test("dispatched exact-head merge claims require live effect absence before recovery", () => {
   const comments: Record<string, any>[] = [];
   let nextId = 1401;
   const request = (runId: number) => ({
@@ -315,6 +354,17 @@ test("dispatched exact-head merge claims cannot be released or recovered", () =>
   assert.equal(retry.status, "existing");
   assert.equal(retry.status === "existing" && retry.dispatched, true);
   assert.equal(recoveryCalls, 0);
+
+  const recovered = ensureExactHeadMergeClaim(request(6902), {
+    ...io,
+    dispatchedClaimEffectAbsent: () => true,
+    recoverClaim: () => {
+      recoveryCalls += 1;
+      return { status: "recoverable" as const, reason: "terminal failure without effect" };
+    },
+  });
+  assert.equal(recovered.status, "recovered");
+  assert.equal(recoveryCalls, 1);
 });
 
 test("terminal stale claims are retired before a fresh workflow may reacquire", () => {
@@ -426,14 +476,23 @@ test("claim recovery requires an aged claim and the exact workflow attempt to be
       { ...candidate, dispatched: true },
       () => {
         workflowReads += 1;
-        return { id: 7001, run_attempt: 2, status: "completed" };
+        return { id: 7001, run_attempt: 2, status: "completed", conclusion: "failure" };
       },
+      env,
+      Date.parse("2026-07-13T08:10:00Z"),
+    ).status,
+    "recoverable",
+  );
+  assert.equal(workflowReads, 1);
+  assert.equal(
+    exactHeadMergeClaimRecoveryDecision(
+      { ...candidate, dispatched: true },
+      () => ({ id: 7001, run_attempt: 2, status: "completed", conclusion: "success" }),
       env,
       Date.parse("2026-07-13T08:10:00Z"),
     ).status,
     "active",
   );
-  assert.equal(workflowReads, 0);
   assert.equal(
     exactHeadMergeClaimRecoveryDecision(
       candidate,

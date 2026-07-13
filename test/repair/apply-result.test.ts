@@ -1121,6 +1121,45 @@ test("repair apply leaves current-main fixed closeout outside coverage proof", (
   }
 });
 
+test("repair apply certifies a successful squash from the recorded commit object", () => {
+  const fixture = writeMergeApplyFixture();
+  try {
+    runMergeApplyResult(fixture);
+
+    const report = readApplyReport(fixture.reportPath);
+    assert.equal(report.actions[0].status, "executed");
+    assert.equal(report.actions[0].merge_method, "squash");
+    assert.equal(report.actions[0].merge_commit_sha, "c".repeat(40));
+    assert.equal(mergeCallCount(fixture.ghLogPath), 1);
+    assert.equal(
+      ghCalls(fixture.ghLogPath).some(
+        (call) =>
+          call.args[0] === "api" &&
+          call.args[1] === `repos/openclaw/openclaw/commits/${"c".repeat(40)}`,
+      ),
+      true,
+    );
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+for (const mergeCommitMode of ["message_mismatch", "two_parents"] as const) {
+  test(`repair apply rejects ${mergeCommitMode} squash proof`, () => {
+    const fixture = writeMergeApplyFixture({ mergeCommitMode });
+    try {
+      runMergeApplyResult(fixture);
+
+      const report = readApplyReport(fixture.reportPath);
+      assert.equal(report.actions[0].status, "blocked");
+      assert.match(report.actions[0].reason, /dispatched squash payload|squash-merge topology/);
+      assert.equal(report.actions[0].merged_at, undefined);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+}
+
 test("repair apply does not certify the merge method after an ambiguous command response", () => {
   const fixture = writeMergeApplyFixture({ mergeMode: "ambiguous_exact" });
   try {
@@ -1911,6 +1950,7 @@ function writeMergeApplyFixture(
     terminalCheckFailureAfterCommand?: boolean;
     terminalCheckMissingConclusion?: boolean;
     legacyStatusContextSuccess?: boolean;
+    mergeCommitMode?: "exact" | "message_mismatch" | "two_parents";
   } = {},
 ): MergeFixture {
   const root = fs.realpathSync(
@@ -1924,6 +1964,7 @@ function writeMergeApplyFixture(
   const ghLogPath = path.join(root, "gh.log");
   const mergeCountPath = path.join(root, "merge-count");
   const mergeClaimPath = path.join(root, "merge-claim");
+  const mergeMessagePath = path.join(root, "merge-message");
   const issueCountPath = path.join(root, "issue-count");
   const ledgerRoot = path.join(root, "ledger");
   const ledgerOutputRoot = path.join(root, "ledger-output");
@@ -1998,6 +2039,7 @@ function writeMergeApplyFixture(
     ghLogPath,
     mergeCountPath,
     mergeClaimPath,
+    mergeMessagePath,
     headSha,
     wrongHeadSha: "b".repeat(40),
     mergeMode: options.mergeMode ?? "success_exact",
@@ -2010,6 +2052,7 @@ function writeMergeApplyFixture(
     terminalCheckFailureAfterCommand: options.terminalCheckFailureAfterCommand ?? false,
     terminalCheckMissingConclusion: options.terminalCheckMissingConclusion ?? false,
     legacyStatusContextSuccess: options.legacyStatusContextSuccess ?? false,
+    mergeCommitMode: options.mergeCommitMode ?? "exact",
     issueCountPath,
   };
   fs.writeFileSync(
@@ -2106,6 +2149,25 @@ if (args[0] === "api") {
     });
     process.exit(0);
   }
+  if (apiPath === "repos/openclaw/openclaw/commits/" + "c".repeat(40)) {
+    const message = fs.existsSync(data.mergeMessagePath)
+      ? fs.readFileSync(data.mergeMessagePath, "utf8")
+      : "";
+    write({
+      sha: "c".repeat(40),
+      commit: {
+        message:
+          data.mergeCommitMode === "message_mismatch"
+            ? "fix: raced merge\\n\\nwrong payload"
+            : message,
+      },
+      parents:
+        data.mergeCommitMode === "two_parents"
+          ? [{ sha: "d".repeat(40) }, { sha: "e".repeat(40) }]
+          : [{ sha: "d".repeat(40) }],
+    });
+    process.exit(0);
+  }
   if (apiPath === "repos/openclaw/openclaw/rules/branches/main") {
     write([]);
     process.exit(0);
@@ -2174,6 +2236,12 @@ if (args[0] === "pr" && args[1] === "view") {
 if (args[0] === "pr" && args[1] === "merge") {
   const count = mergeCount() + 1;
   fs.writeFileSync(data.mergeCountPath, String(count));
+  const subjectIndex = args.indexOf("--subject");
+  const bodyFileIndex = args.indexOf("--body-file");
+  const subject = subjectIndex >= 0 ? args[subjectIndex + 1] : "";
+  const body =
+    bodyFileIndex >= 0 ? fs.readFileSync(args[bodyFileIndex + 1], "utf8").trimEnd() : "";
+  fs.writeFileSync(data.mergeMessagePath, body ? subject + "\\n\\n" + body : subject);
   if (["ambiguous_exact", "ambiguous_unconfirmed"].includes(data.mergeMode)) {
     process.stderr.write("gh: HTTP 502: Bad Gateway\\n");
     process.exit(1);

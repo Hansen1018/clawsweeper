@@ -11,11 +11,40 @@ export type AutomergeEffectConfirmation = {
 
 export type AutomergeEffectProof = {
   requireSquashMethod?: boolean;
-  squashDispatchSucceeded?: boolean;
+  squashCommit?: SquashMergeCommitProof;
 };
 
-export function squashMergedMethodBlock(squashDispatchSucceeded: boolean): string {
-  return squashDispatchSucceeded ? "" : "merged pull request method could not be proven as SQUASH";
+export type SquashMergeCommitProof = {
+  mergeCommitSha: JsonValue;
+  commit: JsonValue;
+  expectedMessage: JsonValue;
+};
+
+export function expectedSquashCommitMessage(subject: JsonValue, body: JsonValue): string {
+  const normalizedSubject = normalizeCommitMessage(subject).trim();
+  const normalizedBody = normalizeCommitMessage(body).trimEnd();
+  return normalizedBody ? `${normalizedSubject}\n\n${normalizedBody}` : normalizedSubject;
+}
+
+export function squashMergedMethodBlock(proof?: SquashMergeCommitProof): string {
+  if (!proof) return "merged pull request method could not be proven as SQUASH";
+  const mergeCommitSha = normalizeSha(proof.mergeCommitSha);
+  const commit = proof.commit;
+  if (!mergeCommitSha || !commit || typeof commit !== "object" || Array.isArray(commit)) {
+    return "merged pull request method could not be proven as SQUASH";
+  }
+  if (normalizeSha(commit.sha) !== mergeCommitSha) {
+    return "observed merge commit does not match the pull request merge commit";
+  }
+  if (!Array.isArray(commit.parents) || commit.parents.length !== 1) {
+    return "observed merge commit does not have squash-merge topology";
+  }
+  const expectedMessage = normalizeCommitMessage(proof.expectedMessage).trimEnd();
+  const actualMessage = normalizeCommitMessage(commit.commit?.message).trimEnd();
+  if (!expectedMessage || actualMessage !== expectedMessage) {
+    return "observed merge commit does not match the dispatched squash payload";
+  }
+  return "";
 }
 
 export function squashAutomergeMethodBlock(autoMergeRequest: JsonValue): string {
@@ -80,9 +109,7 @@ export function confirmAutomergeEffectSnapshot(
   }
   if (mergedAt) {
     const methodBlock =
-      proof.requireSquashMethod === false
-        ? ""
-        : squashMergedMethodBlock(proof.squashDispatchSucceeded === true);
+      proof.requireSquashMethod === false ? "" : squashMergedMethodBlock(proof.squashCommit);
     return {
       mergedAt: methodBlock ? null : mergedAt,
       mergeCommitSha: methodBlock ? null : mergeCommitSha,
@@ -190,6 +217,10 @@ function normalizeSha(value: JsonValue) {
   return String(value ?? "")
     .trim()
     .toLowerCase();
+}
+
+function normalizeCommitMessage(value: JsonValue) {
+  return String(value ?? "").replace(/\r\n?/g, "\n");
 }
 
 function compactFailure(error: unknown) {

@@ -36,9 +36,11 @@ import {
 import { isPassedStagedProofBundle } from "./staged-proof-gates.js";
 import { runtimeStrictBaseBindingBlock } from "./strict-base-binding.js";
 import {
+  expectedSquashCommitMessage,
   squashAutomergeMethodBlock,
   squashMergedMethodBlock,
   squashMergeQueueMethodBlock,
+  type SquashMergeCommitProof,
 } from "./automerge-effect.js";
 import { compactText as compactPlainText } from "./text-utils.js";
 import {
@@ -337,6 +339,7 @@ function finalizeFixPr(action: LooseRecord) {
     reason: "merged by ClawSweeper Repair post-flight",
   });
   const bodyFile = writeRepairSquashMergeBody(parsed.number, pull.head?.sha, mergeMessage.body);
+  const squashCommitMessage = expectedSquashCommitMessage(mergeMessage.subject, mergeMessage.body);
   const mergeArgs = [
     "pr",
     "merge",
@@ -372,7 +375,7 @@ function finalizeFixPr(action: LooseRecord) {
     };
     let acquiredClaimId: number | null = null;
     let mergeRequestStarted = false;
-    let squashDispatchSucceeded = false;
+    let dispatchedSquashCommitMessage = "";
     try {
       mergeAttempt = runVerifiedPostFlightPullMutation(parsed.number, () => {
         const finalPull = fetchPullRequest(result.repo, parsed.number);
@@ -505,14 +508,14 @@ function finalizeFixPr(action: LooseRecord) {
             mergeRequestStarted = true;
             try {
               ghText(mergeArgs);
-              squashDispatchSucceeded = true;
+              dispatchedSquashCommitMessage = squashCommitMessage;
             } catch (error) {
               commandError = error;
             }
             let confirmation: ReturnType<typeof reconcileMergeState>;
             try {
               confirmation = reconcileMergeState(parsed.number, action.commit, {
-                squashDispatchSucceeded,
+                expectedSquashMessage: dispatchedSquashCommitMessage,
               });
             } catch (error) {
               return {
@@ -565,7 +568,7 @@ function finalizeFixPr(action: LooseRecord) {
       let reconciliation: ReturnType<typeof reconcileMergeState>;
       try {
         reconciliation = reconcileMergeState(parsed.number, action.commit, {
-          squashDispatchSucceeded,
+          expectedSquashMessage: dispatchedSquashCommitMessage,
         });
       } catch (reconciliationError) {
         return {
@@ -786,14 +789,22 @@ function finalizeFixPr(action: LooseRecord) {
 function reconcileMergeState(
   number: number,
   expectedHeadSha: JsonValue,
-  proof: { squashDispatchSucceeded?: boolean } = {},
+  proof: { expectedSquashMessage?: string } = {},
 ) {
   const pull = fetchPullRequest(result.repo, number);
   const view = fetchPullRequestView(result.repo, number);
+  const squashCommit = proof.expectedSquashMessage
+    ? fetchSquashMergeCommitProof(result.repo, pull, proof.expectedSquashMessage)
+    : undefined;
   return {
     pull,
     view,
-    ...confirmPostFlightMergeSnapshot(pull, view, expectedHeadSha, proof),
+    ...confirmPostFlightMergeSnapshot(
+      pull,
+      view,
+      expectedHeadSha,
+      squashCommit ? { squashCommit } : {},
+    ),
   };
 }
 
@@ -801,12 +812,12 @@ function confirmPostFlightMergeSnapshot(
   pull: LooseRecord,
   view: LooseRecord,
   expectedHeadSha: JsonValue,
-  proof: { squashDispatchSucceeded?: boolean } = {},
+  proof: { squashCommit?: SquashMergeCommitProof } = {},
 ) {
   const merged = confirmMergedPullSnapshot(pull, expectedHeadSha);
   if (merged.block) return { ...merged, pendingReason: "" };
   if (merged.mergedAt) {
-    const methodBlock = squashMergedMethodBlock(proof.squashDispatchSucceeded === true);
+    const methodBlock = squashMergedMethodBlock(proof.squashCommit);
     return {
       ...merged,
       mergedAt: methodBlock ? null : merged.mergedAt,
@@ -914,6 +925,14 @@ function claimPostFlightMergeRequest(
             env: exactHeadMergeClaimWorkflowRunEnv(),
           }),
         ),
+      dispatchedClaimEffectAbsent: () => {
+        const pull = fetchPullRequest(request.repository, request.number);
+        const view = fetchPullRequestView(request.repository, request.number);
+        const merged = confirmMergedPullSnapshot(pull, request.headSha);
+        return (
+          !merged.block && !merged.mergedAt && !exactHeadPendingMergeReason(view, request.headSha)
+        );
+      },
     });
   } catch (error) {
     return {
@@ -1817,6 +1836,17 @@ function validateResolvedReviewThreads(repo: string, number: JsonValue) {
 
 function fetchPullRequest(repo: string, number: JsonValue) {
   return ghJson(["api", `repos/${repo}/pulls/${number}`]);
+}
+
+function fetchSquashMergeCommitProof(
+  repo: string,
+  pull: LooseRecord,
+  expectedMessage: string,
+): SquashMergeCommitProof | undefined {
+  if (!pull.merged_at) return undefined;
+  const mergeCommitSha = String(pull.merge_commit_sha ?? "").trim();
+  const commit = mergeCommitSha ? ghJson(["api", `repos/${repo}/commits/${mergeCommitSha}`]) : null;
+  return { mergeCommitSha, commit, expectedMessage };
 }
 
 function fetchIssue(repo: string, number: JsonValue) {
