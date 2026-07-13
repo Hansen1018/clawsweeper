@@ -158,7 +158,6 @@ export async function runMaintainerReportNotifier(
     key: `maintainer-report:${pointer.date}`,
   };
   let prepared: {
-    report: JsonObject;
     message: string;
     config: ReturnType<typeof resolveOpenClawHookConfig>;
   };
@@ -166,7 +165,6 @@ export async function runMaintainerReportNotifier(
     const report = await fetchJson(fetcher, pointer.dataUrl, accessHeaders);
     const message = renderMaintainerReportMessage({ report, reportUrl: pointer.reportUrl });
     prepared = {
-      report,
       message,
       config: resolveOpenClawHookConfig(env),
     };
@@ -174,7 +172,7 @@ export async function runMaintainerReportNotifier(
     recordNotificationPreflightFailureSafely(notificationLedgerInput, error);
     throw error;
   }
-  const { report, message, config } = prepared;
+  const { message, config } = prepared;
   if (!config) {
     recordNotificationPhase(notificationLedgerInput, "skipped", "not_configured");
     if (args["write-report"]) {
