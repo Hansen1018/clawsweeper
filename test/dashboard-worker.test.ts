@@ -819,12 +819,31 @@ test("dashboard durable status store persists, expires, and prepends events", as
     [{ id: "second" }, { id: "first" }],
   );
 
-  for (const title of ["old", "new"]) {
+  for (const event of [
+    {
+      id: "event-a",
+      idempotency_key: "event-a",
+      received_at: "2026-07-13T10:00:00.000Z",
+      title: "Event A",
+    },
+    {
+      id: "event-b",
+      idempotency_key: "event-b",
+      received_at: "2026-07-13T10:01:00.000Z",
+      title: "Event B",
+    },
+    {
+      id: "event-a",
+      idempotency_key: "event-a",
+      received_at: "2026-07-13T10:02:00.000Z",
+      title: "Event A retry",
+    },
+  ]) {
     await store.fetch(
       new Request("https://clawsweeper-status-store/events", {
         method: "POST",
         body: JSON.stringify({
-          event: { id: "stable", idempotency_key: "stable-key", title },
+          event,
           limit: 10,
           ttl_seconds: 60,
         }),
@@ -836,11 +855,15 @@ test("dashboard durable status store persists, expires, and prepends events", as
   );
   assert.equal(
     deduplicated.filter(
-      (event: { idempotency_key?: string }) => event.idempotency_key === "stable-key",
+      (event: { idempotency_key?: string }) => event.idempotency_key === "event-a",
     ).length,
     1,
   );
-  assert.equal(deduplicated[0].title, "new");
+  assert.deepEqual(
+    deduplicated.slice(0, 2).map((event: { title: string }) => event.title),
+    ["Event B", "Event A retry"],
+  );
+  assert.equal(deduplicated[1].received_at, "2026-07-13T10:00:00.000Z");
 
   const bayStoreUrl = `https://clawsweeper-status-store/${encodeURIComponent(
     "openclaw-bay:terminal-state:v1",
@@ -5189,7 +5212,7 @@ test("dashboard preserves repeated untargeted activity events", async () => {
   }
 });
 
-test("dashboard deduplicates retried events by idempotency key", async () => {
+test("dashboard preserves event chronology when an earlier idempotency key is retried", async () => {
   const originalFetch = globalThis.fetch;
   const originalCaches = globalThis.caches;
   Object.defineProperty(globalThis, "caches", {
@@ -5211,14 +5234,14 @@ test("dashboard deduplicates retried events by idempotency key", async () => {
       TARGET_REPOS: "openclaw/openclaw",
       CACHE_TTL_SECONDS: "0",
     };
-    for (const title of ["First delivery", "Retried delivery"]) {
-      const ingest = await worker.fetch(
+    const ingest = async (idempotencyKey: string, title: string) => {
+      const response = await worker.fetch(
         new Request("https://clawsweeper.openclaw.ai/api/events", {
           method: "POST",
           headers: {
             Authorization: "Bearer test-token",
             "Content-Type": "application/json",
-            "Idempotency-Key": "stable-event-key",
+            "Idempotency-Key": idempotencyKey,
           },
           body: JSON.stringify({
             event_type: "status.test",
@@ -5230,8 +5253,22 @@ test("dashboard deduplicates retried events by idempotency key", async () => {
         }),
         env,
       );
-      assert.equal(ingest.status, 200);
-    }
+      assert.equal(response.status, 200);
+      return response.json();
+    };
+
+    const firstA = await ingest("event-a", "Event A");
+    await ingest("event-b", "Event B");
+    const retryA = await ingest("event-a", "Event A retry");
+
+    assert.equal(retryA.event.received_at, firstA.event.received_at);
+    const storedEvents = JSON.parse((await env.STATUS_STORE.get("events")) ?? "[]");
+    assert.deepEqual(
+      storedEvents.map((event: { title: string }) => event.title),
+      ["Event B", "Event A retry"],
+    );
+    const latestEvent = JSON.parse((await env.STATUS_STORE.get("latest-event")) ?? "null");
+    assert.equal(latestEvent.title, "Event B");
 
     const response = await worker.fetch(
       new Request("https://clawsweeper.openclaw.ai/api/status"),
@@ -5241,11 +5278,17 @@ test("dashboard deduplicates retried events by idempotency key", async () => {
       },
     );
     const status = await response.json();
+    assert.deepEqual(
+      status.recent.events
+        .filter((event: { event_type?: string }) => event.event_type === "status.test")
+        .map((event: { title: string }) => event.title),
+      ["Event B", "Event A retry"],
+    );
     const events = status.recent.events.filter(
-      (event: { idempotency_key?: string }) => event.idempotency_key === "stable-event-key",
+      (event: { idempotency_key?: string }) => event.idempotency_key === "event-a",
     );
     assert.equal(events.length, 1);
-    assert.equal(events[0].title, "Retried delivery");
+    assert.equal(events[0].title, "Event A retry");
   } finally {
     globalThis.fetch = originalFetch;
     Object.defineProperty(globalThis, "caches", { configurable: true, value: originalCaches });

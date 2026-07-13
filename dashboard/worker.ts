@@ -391,17 +391,15 @@ export class StatusStore {
           : null;
       const parsed = currentValue ? JSON.parse(currentValue) : [];
       const priorEvents = Array.isArray(parsed) ? parsed : [];
-      const events = [body.event, ...withoutMatchingIdempotency(priorEvents, body.event)].slice(
-        0,
-        numberFrom(body.limit, EVENT_LIMIT),
-      );
+      const upserted = upsertStoredEvent(priorEvents, body.event);
+      const events = upserted.events.slice(0, numberFrom(body.limit, EVENT_LIMIT));
       const expiresAt = Date.now() + numberFrom(body.ttl_seconds, EVENT_STORE_TTL_SECONDS) * 1000;
       await this.storage.put("events", {
         value: JSON.stringify(events),
         expires_at: expiresAt,
       });
       await this.scheduleCleanup(expiresAt);
-      return json({ ok: true });
+      return json({ ok: true, event: upserted.event, is_latest: upserted.isLatest });
     }
 
     return new Response("method not allowed", { status: 405 });
@@ -1736,14 +1734,15 @@ async function ingestEvent(request, env) {
     return json({ error: "idempotency_key_too_long" }, 400);
   }
   const event = normalizeEvent(body, idempotencyKey);
-  const writes = [
-    prependStoredEvent(env, event),
-    writeStoredJson(env, "latest-event", event, EVENT_STORE_TTL_SECONDS),
-  ];
+  const stored = await prependStoredEvent(env, event);
+  const writes = [];
+  if (stored.isLatest) {
+    writes.push(writeStoredJson(env, "latest-event", stored.event, EVENT_STORE_TTL_SECONDS));
+  }
   const ci = normalizeCiStatus(body);
   if (ci) writes.push(writeCiStatus(env, ci));
   await Promise.all(writes);
-  return json({ ok: true, event });
+  return json({ ok: true, event: stored.event });
 }
 
 async function githubWebhook(request, env, ctx) {
@@ -6316,21 +6315,33 @@ async function prependStoredEvent(env, event) {
       },
     );
     if (!response.ok) throw new Error(`status store event write failed: ${response.status}`);
-    return;
+    const stored = await response.json();
+    return { event: stored.event, isLatest: stored.is_latest === true };
   }
   const current = await readEvents(env);
+  const upserted = upsertStoredEvent(current, event);
   await writeStoredJson(
     env,
     "events",
-    [event, ...withoutMatchingIdempotency(current, event)].slice(0, EVENT_LIMIT),
+    upserted.events.slice(0, EVENT_LIMIT),
     EVENT_STORE_TTL_SECONDS,
   );
+  return { event: upserted.event, isLatest: upserted.isLatest };
 }
 
-function withoutMatchingIdempotency(events, event) {
+function upsertStoredEvent(events, event) {
   const key = nullableString(event?.idempotency_key);
-  if (!key) return events;
-  return events.filter((candidate) => nullableString(candidate?.idempotency_key) !== key);
+  if (!key) return { events: [event, ...events], event, isLatest: true };
+  const index = events.findIndex((candidate) => nullableString(candidate?.idempotency_key) === key);
+  if (index < 0) return { events: [event, ...events], event, isLatest: true };
+
+  const storedEvent = {
+    ...event,
+    received_at: nullableString(events[index]?.received_at) ?? event.received_at,
+  };
+  const next = [...events];
+  next[index] = storedEvent;
+  return { events: next, event: storedEvent, isLatest: index === 0 };
 }
 
 async function readStatusStoreText(store, key) {
