@@ -31,6 +31,76 @@ test("run-id requeue selects one latest complete producer cohort", () => {
   }
 });
 
+test("run-id requeue recovers early immutable inputs before worker results exist", () => {
+  const fixture = createFixture("early-inputs", "910103");
+  try {
+    writeWorkflowInputs(fixture, 1, {
+      stateRevision: fixture.originalRevision,
+      jobSha256: fixture.originalDigest,
+      requestedMode: "autonomous",
+      effectiveMode: "plan",
+    });
+
+    const result = runRequeue(fixture);
+    assert.equal(result.status, 0, result.stderr);
+    const summary = JSON.parse(result.stdout);
+    assert.equal(summary.source_state_revision, fixture.originalRevision);
+    assert.equal(summary.source_job_sha256, fixture.originalDigest);
+    assert.equal(summary.mode, "plan");
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("run-id requeue prefers the newest early-input producer attempt", () => {
+  const fixture = createFixture("latest-inputs", "910104");
+  try {
+    writeArtifactCohort(fixture, 1, {
+      stateRevision: fixture.originalRevision,
+      jobSha256: fixture.originalDigest,
+      mode: "plan",
+    });
+    writeWorkflowInputs(fixture, 2, {
+      stateRevision: fixture.replacementRevision,
+      jobSha256: fixture.replacementDigest,
+      requestedMode: "autonomous",
+      effectiveMode: "plan",
+    });
+
+    const result = runRequeue(fixture);
+    assert.equal(result.status, 0, result.stderr);
+    const summary = JSON.parse(result.stdout);
+    assert.equal(summary.source_state_revision, fixture.replacementRevision);
+    assert.equal(summary.source_job_sha256, fixture.replacementDigest);
+    assert.equal(summary.mode, "plan");
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("run-id requeue rejects conflicting early and sealed provenance", () => {
+  const fixture = createFixture("conflicting-inputs", "910105");
+  try {
+    writeWorkflowInputs(fixture, 1, {
+      stateRevision: fixture.originalRevision,
+      jobSha256: fixture.originalDigest,
+      requestedMode: "autonomous",
+      effectiveMode: "plan",
+    });
+    writeArtifactCohort(fixture, 1, {
+      stateRevision: fixture.replacementRevision,
+      jobSha256: fixture.replacementDigest,
+      mode: "autonomous",
+    });
+
+    const result = runRequeue(fixture);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /ambiguous repair artifact cohort at attempt 1/);
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
 test("run-id requeue rejects identity and mode from different producer attempts", () => {
   const fixture = createFixture("split", "910102");
   try {
@@ -48,7 +118,10 @@ test("run-id requeue rejects identity and mode from different producer attempts"
 
     const result = runRequeue(fixture);
     assert.notEqual(result.status, 0);
-    assert.match(result.stderr, /did not publish one complete sealed repair artifact cohort/);
+    assert.match(
+      result.stderr,
+      /did not publish immutable workflow inputs or one complete sealed repair artifact cohort/,
+    );
   } finally {
     fs.rmSync(fixture.root, { recursive: true, force: true });
   }
@@ -114,6 +187,39 @@ function writeArtifactCohort(
   fs.mkdirSync(runDir, { recursive: true });
   writeSourceIdentity(runDir, fixture.jobPath, input);
   writePlanAndResult(runDir, fixture.jobPath, input.mode);
+}
+
+function writeWorkflowInputs(
+  fixture: ReturnType<typeof createFixture>,
+  attempt: number,
+  input: {
+    stateRevision: string;
+    jobSha256: string;
+    requestedMode: "plan" | "execute" | "autonomous";
+    effectiveMode: "plan" | "execute" | "autonomous";
+  },
+): void {
+  const inputDir = path.join(
+    fixture.artifactFixture,
+    `clawsweeper-repair-inputs-${fixture.runId}-${attempt}`,
+    "recovery-inputs",
+  );
+  fs.mkdirSync(inputDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(inputDir, "workflow-inputs.json"),
+    `${JSON.stringify(
+      {
+        schema_version: 1,
+        source_job: fixture.jobPath,
+        state_revision: input.stateRevision,
+        job_sha256: input.jobSha256,
+        requested_mode: input.requestedMode,
+        effective_mode: input.effectiveMode,
+      },
+      null,
+      2,
+    )}\n`,
+  );
 }
 
 function artifactRunDir(fixture: ReturnType<typeof createFixture>, attempt: number): string {

@@ -40,6 +40,7 @@ const SOURCE_JOB_PATH = /^jobs\/[A-Za-z0-9_.-]+\/inbox\/[A-Za-z0-9_.-]+\.md$/;
 const STATE_REVISION = /^[a-f0-9]{40}$/;
 const JOB_SHA256 = /^[a-f0-9]{64}$/;
 const REPAIR_MODES = new Set(["plan", "execute", "autonomous"]);
+const WORKFLOW_INPUTS_BASENAME = "workflow-inputs.json";
 
 type RecoveredRunCohort = {
   source_job: string;
@@ -276,6 +277,17 @@ function resolveDownloadedRunCohort(
     const producerAttempt = repairArtifactProducerAttempt(entry.name, runId);
     if (producerAttempt === null) continue;
     const artifactRoot = path.join(root, entry.name);
+    for (const inputPath of findNamedFiles(artifactRoot, WORKFLOW_INPUTS_BASENAME)) {
+      const candidate = readRecoveredWorkflowInputs({
+        inputPath,
+        producerAttempt,
+        expectedSourceJob,
+      });
+      candidatesByAttempt.set(producerAttempt, [
+        ...(candidatesByAttempt.get(producerAttempt) ?? []),
+        candidate,
+      ]);
+    }
     for (const planPath of findNamedFiles(artifactRoot, "cluster-plan.json")) {
       const runDir = path.dirname(planPath);
       const resultPath = path.join(runDir, "result.json");
@@ -310,7 +322,59 @@ function resolveDownloadedRunCohort(
     const selected = unique.values().next().value;
     if (selected) return selected;
   }
-  throw new Error(`run ${runId} did not publish one complete sealed repair artifact cohort`);
+  throw new Error(
+    `run ${runId} did not publish immutable workflow inputs or one complete sealed repair artifact cohort`,
+  );
+}
+
+function readRecoveredWorkflowInputs({
+  inputPath,
+  producerAttempt,
+  expectedSourceJob,
+}: {
+  inputPath: string;
+  producerAttempt: number;
+  expectedSourceJob: string | null;
+}): RecoveredRunCohort {
+  const input = readJsonObject(inputPath, "immutable workflow inputs");
+  const inputKeys = Object.keys(input).sort();
+  if (
+    JSON.stringify(inputKeys) !==
+    JSON.stringify([
+      "effective_mode",
+      "job_sha256",
+      "requested_mode",
+      "schema_version",
+      "source_job",
+      "state_revision",
+    ])
+  ) {
+    throw new Error("immutable workflow inputs have unexpected fields");
+  }
+  const sourceJob = String(input.source_job ?? "").trim();
+  const stateRevision = String(input.state_revision ?? "").trim();
+  const jobSha256 = String(input.job_sha256 ?? "").trim();
+  const requestedMode = String(input.requested_mode ?? "").trim();
+  const effectiveMode = String(input.effective_mode ?? "").trim();
+  if (
+    input.schema_version !== 1 ||
+    !SOURCE_JOB_PATH.test(sourceJob) ||
+    !STATE_REVISION.test(stateRevision) ||
+    !JOB_SHA256.test(jobSha256) ||
+    (expectedSourceJob !== null && sourceJob !== expectedSourceJob) ||
+    !REPAIR_MODES.has(requestedMode) ||
+    !REPAIR_MODES.has(effectiveMode) ||
+    (effectiveMode !== requestedMode && effectiveMode !== "plan")
+  ) {
+    throw new Error("immutable workflow inputs have invalid repair provenance");
+  }
+  return {
+    source_job: sourceJob,
+    mode: effectiveMode,
+    state_revision: stateRevision,
+    job_sha256: jobSha256,
+    producer_attempt: producerAttempt,
+  };
 }
 
 function readRecoveredRunCohort({
@@ -365,7 +429,9 @@ function readRecoveredRunCohort({
 }
 
 function repairArtifactProducerAttempt(name: string, runId: string): number | null {
-  const match = name.match(new RegExp(`^clawsweeper-repair(?:-worker)?-${runId}-([1-9][0-9]*)$`));
+  const match = name.match(
+    new RegExp(`^clawsweeper-repair(?:-(?:inputs|worker))?-${runId}-([1-9][0-9]*)$`),
+  );
   if (!match) return null;
   const attempt = Number(match[1]);
   return Number.isSafeInteger(attempt) ? attempt : null;
