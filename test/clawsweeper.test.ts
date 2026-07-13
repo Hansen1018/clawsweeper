@@ -2151,6 +2151,7 @@ test("sweep workflow executes only durable queue leases without runner-side admi
   const primaryResultIndex = eventReviewBlock.indexOf("- name: Export exact review primary result");
   const failReviewIndex = eventReviewBlock.indexOf("- name: Fail unsuccessful exact review");
   const completeLeaseIndex = eventReviewBlock.indexOf("- name: Complete exact-review queue lease");
+  const publishLedgerIndex = eventReviewBlock.indexOf("- name: Publish exact event action ledger");
   const claimStep = eventReviewBlock.slice(
     claimIndex,
     eventReviewBlock.indexOf("\n      - ", claimIndex + 1),
@@ -2159,7 +2160,8 @@ test("sweep workflow executes only durable queue leases without runner-side admi
     completeLeaseIndex,
     eventReviewBlock.indexOf("\n      - ", completeLeaseIndex + 1),
   );
-  const primaryResultStep = eventReviewBlock.slice(primaryResultIndex, failReviewIndex);
+  const primaryResultStep = eventReviewBlock.slice(primaryResultIndex, completeLeaseIndex);
+  const failReviewStep = eventReviewBlock.slice(failReviewIndex, publishLedgerIndex);
   const exactReviewStep = eventReviewBlock.slice(
     exactReviewIndex,
     eventReviewBlock.indexOf("- name: Create state token", exactReviewIndex),
@@ -2185,8 +2187,9 @@ test("sweep workflow executes only durable queue leases without runner-side admi
   assert.ok(exactReviewIndex > setupCodexIndex);
   assert.ok(primaryResultIndex > exactReviewIndex);
   assert.equal(eventReviewBlock.match(/- name: Fail unsuccessful exact review/g)?.length, 1);
-  assert.ok(failReviewIndex > primaryResultIndex);
-  assert.ok(completeLeaseIndex > failReviewIndex);
+  assert.ok(completeLeaseIndex > primaryResultIndex);
+  assert.ok(failReviewIndex > completeLeaseIndex);
+  assert.ok(publishLedgerIndex > failReviewIndex);
   assert.match(eventReviewBlock, /\/internal\/exact-review\/claim/);
   assert.match(eventReviewBlock, /\/internal\/exact-review\/complete/);
   assert.match(claimStep, /RUN_ATTEMPT: \$\{\{ github\.run_attempt \}\}/);
@@ -2197,18 +2200,9 @@ test("sweep workflow executes only durable queue leases without runner-side admi
   assert.match(claimStep, /response\.protocol_version \|\| 1/);
   assert.match(claimStep, /const legacyDecision = \{/);
   assert.match(claimStep, /run_attempt: runAttempt/);
-  assert.match(
-    eventReviewBlock.slice(failReviewIndex, completeLeaseIndex),
-    /steps\.review-exact-event-item\.outcome != 'success'/,
-  );
-  assert.match(
-    eventReviewBlock.slice(failReviewIndex, completeLeaseIndex),
-    /steps\.publish-event-result\.outcome != 'success'/,
-  );
-  assert.match(
-    eventReviewBlock.slice(failReviewIndex, completeLeaseIndex),
-    /steps\.route-synced-verdict\.outcome != 'success'/,
-  );
+  assert.match(failReviewStep, /steps\.review-exact-event-item\.outcome != 'success'/);
+  assert.match(failReviewStep, /steps\.publish-event-result\.outcome != 'success'/);
+  assert.match(failReviewStep, /steps\.route-synced-verdict\.outcome != 'success'/);
   assert.match(primaryResultStep, /PRIMARY_JOB_STATUS: \$\{\{ job\.status \}\}/);
   assert.doesNotMatch(primaryResultStep, /JOB_CANCELLED|\$\{\{ cancelled\(\) \}\}/);
   assert.match(primaryResultStep, /PRIMARY_JOB_STATUS" = "cancelled"/);
