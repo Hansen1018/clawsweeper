@@ -524,7 +524,7 @@ function conflictCandidateLifecycle(
     repository: repo,
     workKey: `conflict-self-heal:${repo}#${number}:${candidate.immutable_job_key}:${operation}`,
     number,
-    sourceRevision: String(candidate.state_revision ?? candidate.head_sha ?? ""),
+    sourceRevision: String(candidate.head_sha ?? ""),
     recordPath: String(candidate.job_path ?? ""),
     subjectKind: "pull_request",
     subjectId: `pull-request-${number}`,

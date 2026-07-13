@@ -196,6 +196,67 @@ test("dashboard response loss records one unknown POST outcome", async () => {
   }
 });
 
+test("dashboard identity binds the full semantic POST request", async () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "dashboard-identity-")));
+  const outputRoot = path.join(root, "output");
+  fs.mkdirSync(outputRoot);
+  const previous = { ...process.env };
+  Object.assign(process.env, {
+    CLAWSWEEPER_ACTION_LEDGER_FORCE: "1",
+    CLAWSWEEPER_ACTION_LEDGER_ROOT: root,
+    CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT: outputRoot,
+    CLAWSWEEPER_ACTION_LEDGER_PARTITION_DATE: "2026-07-13",
+    CLAWSWEEPER_ACTION_LEDGER_INVOCATION: "dashboard-identity",
+    CLAWSWEEPER_STATUS_INGEST_TOKEN: "dashboard-secret",
+    CLAWSWEEPER_STATUS_INGEST_URL: "https://dashboard.example/events",
+    GITHUB_ACTION: "publish_dashboard",
+    GITHUB_JOB: "mutate",
+    GITHUB_REPOSITORY: "openclaw/clawsweeper",
+    GITHUB_RUN_ATTEMPT: "1",
+    GITHUB_RUN_ID: "4242",
+    GITHUB_SHA: "a".repeat(40),
+    GITHUB_WORKFLOW: "repair cluster worker",
+    GITHUB_WORKFLOW_REF:
+      "openclaw/clawsweeper/.github/workflows/repair-cluster-worker.yml@refs/heads/main",
+  });
+  const base = { ...options, sourceRevision: "b".repeat(40) };
+  try {
+    for (const request of [
+      base,
+      { ...base },
+      { ...base, runUrl: "https://github.com/openclaw/clawsweeper/actions/runs/101" },
+      { ...base, prUrl: "https://github.com/steipete/example/pull/51" },
+      { ...base, title: "Add compact import mode" },
+      { ...base, detail: "Codex is implementing the issue." },
+      { ...base, state: "Building" },
+    ]) {
+      assert.equal(
+        await postDashboardStatus(request, async () => new Response(null, { status: 202 })),
+        "sent",
+      );
+    }
+    await flushRepairActionEvents();
+
+    const keys = readEvents(outputRoot)
+      .filter(
+        (event) =>
+          event.event_type === "repair.mutation" &&
+          (event.action as Record<string, unknown>).status === "started",
+      )
+      .map((event) => event.idempotency_key_sha256);
+    assert.equal(keys.length, 7);
+    assert.equal(keys[0], keys[1]);
+    for (const key of keys.slice(2)) assert.notEqual(key, keys[0]);
+    assert.equal(new Set(keys).size, 6);
+  } finally {
+    for (const key of Object.keys(process.env)) {
+      if (!(key in previous)) delete process.env[key];
+    }
+    Object.assign(process.env, previous);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("dashboard HTTP outcomes preserve ambiguous server failures", async () => {
   for (const [status, expected] of [
     [503, ["failed", "mutation_outcome_unknown", true]],

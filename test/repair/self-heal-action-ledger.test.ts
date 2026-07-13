@@ -54,6 +54,12 @@ test("self-heal mutations emit durable action receipts", () => {
     conflicts,
     /runRepairMutation\(conflictCandidateLifecycle\(candidate, "dispatch"\),[\s\S]*kind: "repair_dispatch"/,
   );
+  const candidateLifecycle = conflicts.slice(
+    conflicts.indexOf("function conflictCandidateLifecycle"),
+    conflicts.indexOf("function conflictPublicationLifecycle"),
+  );
+  assert.match(candidateLifecycle, /sourceRevision: String\(candidate\.head_sha \?\? ""\)/);
+  assert.doesNotMatch(candidateLifecycle, /candidate\.state_revision/);
 });
 
 test("self-heal workflows publish immutable action-ledger shards", () => {

@@ -271,18 +271,7 @@ test("CrabFleet registration records definite request rejection", async () => {
 
 test("CrabFleet update response loss records one unknown request outcome", async () => {
   const fixture = remoteSessionFixture("update");
-  fs.writeFileSync(
-    fixture.metadataPath,
-    `${JSON.stringify({
-      remoteEnabled: true,
-      repository: "openclaw/openclaw",
-      workKey: "openclaw/openclaw:repair-pr-42",
-      workKind: "pr_repair",
-      clusterId: "repair-pr-42",
-      sourceRevision: "b".repeat(40),
-      sessionId: "session-42",
-    })}\n`,
-  );
+  writeRemoteSessionMetadata(fixture.metadataPath);
   let requests = 0;
   try {
     await assert.rejects(
@@ -304,6 +293,41 @@ test("CrabFleet update response loss records one unknown request outcome", async
     );
     assert.equal(requests, 1);
     assertUnknownMutation(fixture.outputRoot);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("CrabFleet update identity binds the full semantic POST request", async () => {
+  const fixture = remoteSessionFixture("update-identity");
+  writeRemoteSessionMetadata(fixture.metadataPath);
+  const base = {
+    state: "running",
+    phase: "review",
+    summary: "Reviewing",
+    completionReason: "",
+  };
+  try {
+    const requests = [
+      base,
+      { ...base },
+      { ...base, summary: "Review complete" },
+      { ...base, completionReason: "review_complete" },
+    ];
+    for (const [index, request] of requests.entries()) {
+      process.env.CLAWSWEEPER_ACTION_LEDGER_INVOCATION = `update-identity-${index}`;
+      process.env.GITHUB_ACTION = `session_update_identity_${index}`;
+      await updateActionSession(request, {
+        fetchImpl: async () => new Response(null, { status: 204 }),
+      });
+    }
+
+    const keys = mutationAttempts(fixture.outputRoot).map((event) => event.idempotency_key_sha256);
+    assert.equal(keys.length, 4);
+    assert.equal(keys[0], keys[1]);
+    assert.notEqual(keys[0], keys[2]);
+    assert.notEqual(keys[0], keys[3]);
+    assert.equal(new Set(keys).size, 3);
   } finally {
     fixture.cleanup();
   }
@@ -375,6 +399,39 @@ function remoteSessionFixture(name: string) {
       fs.rmSync(root, { recursive: true, force: true });
     },
   };
+}
+
+function writeRemoteSessionMetadata(metadataPath: string): void {
+  fs.writeFileSync(
+    metadataPath,
+    `${JSON.stringify({
+      remoteEnabled: true,
+      repository: "openclaw/openclaw",
+      workKey: "openclaw/openclaw:repair-pr-42",
+      workKind: "pr_repair",
+      clusterId: "repair-pr-42",
+      sourceRevision: "b".repeat(40),
+      sessionId: "session-42",
+    })}\n`,
+  );
+}
+
+function mutationAttempts(outputRoot: string): Array<Record<string, unknown>> {
+  return walk(outputRoot)
+    .filter((file) => file.endsWith(".jsonl"))
+    .flatMap((file) =>
+      fs
+        .readFileSync(file, "utf8")
+        .trim()
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => JSON.parse(line)),
+    )
+    .filter(
+      (event) =>
+        event.event_type === "repair.mutation" &&
+        (event.action as Record<string, unknown>).status === "started",
+    );
 }
 
 function assertUnknownMutation(outputRoot: string): void {

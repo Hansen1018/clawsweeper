@@ -463,9 +463,7 @@ export async function postDashboardStatus(options: StatusOptions, fetchImpl: typ
     kind: "issue_status_dashboard_post",
     identity: {
       url,
-      repository: options.repo,
-      itemNumber: options.itemNumber,
-      state,
+      request: requestBody,
     },
     component: "issue_implementation_status",
     operationName: "dashboard",

@@ -314,8 +314,7 @@ export async function updateActionSession(
           identity: {
             url,
             sessionId: String(metadata.sessionId ?? ""),
-            state,
-            phase,
+            request: requestBody,
           },
           component: "action_session",
           operationName: "session",
