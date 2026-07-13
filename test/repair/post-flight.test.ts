@@ -772,6 +772,42 @@ test("post-flight reconciles one exact-head merge effect across retries and queu
       ),
     );
 
+    for (const pendingMode of ["queue", "auto_merge"]) {
+      for (const hardFailure of [
+        {
+          env: { FAKE_GH_REVIEW_DECISION: "CHANGES_REQUESTED" },
+          reason: /^review decision is CHANGES_REQUESTED$/,
+        },
+        {
+          env: { FAKE_GH_UNRESOLVED_THREADS: "1" },
+          reason: /^unresolved review threads remain:/,
+        },
+        {
+          env: { FAKE_GH_FAILED_CHECKS: "1" },
+          reason: /^checks are not clean: required-ci\/exact-merge: FAILURE$/,
+        },
+      ]) {
+        fixture.reset();
+        fs.writeFileSync(fixture.mergeCountPath, "1");
+        runVerifiedPostFlight(
+          fixture,
+          {
+            ...commonEnv,
+            ...hardFailure.env,
+            FAKE_GH_MERGE_MODE: pendingMode,
+          },
+          1,
+        );
+        report = JSON.parse(fs.readFileSync(fixture.reportPath, "utf8"));
+        assert.equal(report.outcome, "blocked");
+        assert.equal(report.actions[0]?.status, "blocked");
+        assert.match(report.actions[0]?.reason, hardFailure.reason);
+        assert.equal(report.actions[0]?.retry_recommended, undefined);
+        assert.equal(report.actions[0]?.merge_attempts, undefined);
+        assert.equal(fs.readFileSync(fixture.mergeCountPath, "utf8"), "1");
+      }
+    }
+
     fixture.reset();
     runVerifiedPostFlight(
       fixture,
@@ -1600,15 +1636,27 @@ function createVerifiedMergeFixture() {
       "if (args[0] === 'api' && args[1] === 'repos/openclaw/openclaw/rules/branches/main') { const rules = process.env.FAKE_GH_STRICT_BASE_FAILURE === '1' ? [] : [{ type: 'required_status_checks', ruleset_id: 18588237, ruleset_source: 'openclaw/openclaw', ruleset_source_type: 'Repository', parameters: { strict_required_status_checks_policy: true, required_status_checks: [{ context: 'required-ci/exact-merge' }] } }]; process.stdout.write(JSON.stringify(rules)); process.exit(0); }",
       "if (args[0] === 'api' && args[1] === 'repos/openclaw/openclaw/rulesets/18588237') { process.stdout.write(JSON.stringify({ enforcement: 'active', bypass_actors: [], rules: [{ type: 'required_status_checks', parameters: { strict_required_status_checks_policy: true, required_status_checks: [{ context: 'required-ci/exact-merge' }] } }] })); process.exit(0); }",
       "if (args[0] === 'api' && args[1] === 'repos/openclaw/openclaw/branches/main/protection') { process.stdout.write(JSON.stringify({ required_status_checks: null })); process.exit(0); }",
-      "if (args[0] === 'api' && args[1] === 'graphql') { process.stdout.write(JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: { pageInfo: { hasNextPage: false }, nodes: [] } } } } })); process.exit(0); }",
-      "if (args[0] === 'pr' && args[1] === 'view') { const viewMerged = merged || (process.env.FAKE_GH_VIEW_MERGED_ONLY_AFTER_ATTEMPT === '1' && mergeCount() > 0); const queued = process.env.FAKE_GH_MERGE_MODE === 'queue' && mergeCount() > 0; const pending = process.env.FAKE_GH_PENDING_READINESS === '1' || (process.env.FAKE_GH_PENDING_AFTER_ATTEMPT === '1' && mergeCount() > 0) || fs.existsSync(process.env.FAKE_GH_GATE_DRIFT_FILE); process.stdout.write(JSON.stringify({ autoMergeRequest: null, baseRefName: 'main', headRefOid: pull.head.sha, isDraft: false, isInMergeQueue: queued, mergeable: pending ? 'UNKNOWN' : 'MERGEABLE', mergeCommit: viewMerged ? { oid: 'b'.repeat(40) } : null, mergeStateStatus: 'CLEAN', mergedAt: viewMerged ? '2026-07-13T08:00:00Z' : null, reviewDecision: null, state: viewMerged ? 'MERGED' : 'OPEN', statusCheckRollup: [], title: pull.title, url: 'https://github.com/openclaw/openclaw/pull/123' })); process.exit(0); }",
+      "if (args[0] === 'api' && args[1] === 'graphql') {",
+      "  const nodes = process.env.FAKE_GH_UNRESOLVED_THREADS === '1' ? [{ isResolved: false, path: 'src/example.ts', line: 7, comments: { nodes: [{ url: 'https://github.com/openclaw/openclaw/pull/123#discussion_r1' }] } }] : [];",
+      "  process.stdout.write(JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: { pageInfo: { hasNextPage: false }, nodes } } } } }));",
+      "  process.exit(0);",
+      "}",
+      "if (args[0] === 'pr' && args[1] === 'view') {",
+      "  const viewMerged = merged || (process.env.FAKE_GH_VIEW_MERGED_ONLY_AFTER_ATTEMPT === '1' && mergeCount() > 0);",
+      "  const queued = process.env.FAKE_GH_MERGE_MODE === 'queue' && mergeCount() > 0;",
+      "  const autoMergePending = process.env.FAKE_GH_MERGE_MODE === 'auto_merge' && mergeCount() > 0;",
+      "  const pending = process.env.FAKE_GH_PENDING_READINESS === '1' || (process.env.FAKE_GH_PENDING_AFTER_ATTEMPT === '1' && mergeCount() > 0) || fs.existsSync(process.env.FAKE_GH_GATE_DRIFT_FILE);",
+      "  const checks = process.env.FAKE_GH_FAILED_CHECKS === '1' ? [{ name: 'required-ci/exact-merge', status: 'COMPLETED', conclusion: 'FAILURE' }] : [];",
+      "  process.stdout.write(JSON.stringify({ autoMergeRequest: autoMergePending ? { enabledAt: '2026-07-13T08:00:00Z' } : null, baseRefName: 'main', headRefOid: pull.head.sha, isDraft: false, isInMergeQueue: queued, mergeable: pending ? 'UNKNOWN' : 'MERGEABLE', mergeCommit: viewMerged ? { oid: 'b'.repeat(40) } : null, mergeStateStatus: 'CLEAN', mergedAt: viewMerged ? '2026-07-13T08:00:00Z' : null, reviewDecision: process.env.FAKE_GH_REVIEW_DECISION || null, state: viewMerged ? 'MERGED' : 'OPEN', statusCheckRollup: checks, title: pull.title, url: 'https://github.com/openclaw/openclaw/pull/123' }));",
+      "  process.exit(0);",
+      "}",
       "if (args[0] === 'pr' && args[1] === 'merge') {",
       "  const count = mergeCount() + 1;",
       "  fs.writeFileSync(process.env.FAKE_GH_MERGE_COUNT_FILE, String(count));",
       "  if (process.env.FAKE_GH_MERGE_MODE === 'ambiguous') { fs.writeFileSync(process.env.FAKE_GH_MERGED_FILE, '1'); process.stderr.write('gh: HTTP 502: Bad Gateway\\n'); process.exit(1); }",
       "  if (process.env.FAKE_GH_MERGE_MODE === 'delayed_ambiguous') { fs.writeFileSync(process.env.FAKE_GH_DELAYED_MERGE_FILE, '1'); process.stderr.write('gh: HTTP 502: Bad Gateway\\n'); process.exit(1); }",
       "  if (process.env.FAKE_GH_MERGE_MODE === 'transient' && count === 1) { process.stderr.write('gh: HTTP 502: Bad Gateway\\n'); process.exit(1); }",
-      "  if (process.env.FAKE_GH_MERGE_MODE === 'queue') process.exit(0);",
+      "  if (['queue', 'auto_merge'].includes(process.env.FAKE_GH_MERGE_MODE)) process.exit(0);",
       "  fs.writeFileSync(process.env.FAKE_GH_MERGED_FILE, '1');",
       "  process.exit(0);",
       "}",

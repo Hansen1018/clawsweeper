@@ -1237,6 +1237,29 @@ test("repair apply reports a post-command terminal check failure before queue st
   }
 });
 
+test("repair apply blocks completed checks without a conclusion before queue state", () => {
+  const fixture = writeMergeApplyFixture({
+    mergeMode: "pending_after_command",
+    pendingKind: "queue",
+    terminalCheckMissingConclusion: true,
+  });
+  try {
+    fs.writeFileSync(fixture.mergeCountPath, "1");
+    runMergeApplyResult(fixture);
+
+    const report = readApplyReport(fixture.reportPath);
+    assert.equal(report.actions[0].status, "blocked");
+    assert.equal(
+      report.actions[0].reason,
+      "checks are not clean: test: UNKNOWN (COMPLETED without conclusion)",
+    );
+    assert.equal(report.actions[0].requeue_required, undefined);
+    assert.equal(mergeCallCount(fixture.ghLogPath), 0);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
 test("repair apply does not transport-retry an ambiguous merge mutation", () => {
   const fixture = writeMergeApplyFixture({ mergeMode: "ambiguous_unconfirmed" });
   try {
@@ -1726,6 +1749,7 @@ function writeMergeApplyFixture(
     securityOnFinalIssueFetch?: boolean;
     terminalCheckFailure?: boolean;
     terminalCheckFailureAfterCommand?: boolean;
+    terminalCheckMissingConclusion?: boolean;
   } = {},
 ): MergeFixture {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-apply-result-merge-"));
@@ -1814,6 +1838,7 @@ function writeMergeApplyFixture(
     securityOnFinalIssueFetch: options.securityOnFinalIssueFetch ?? false,
     terminalCheckFailure: options.terminalCheckFailure ?? false,
     terminalCheckFailureAfterCommand: options.terminalCheckFailureAfterCommand ?? false,
+    terminalCheckMissingConclusion: options.terminalCheckMissingConclusion ?? false,
     issueCountPath,
   };
   fs.writeFileSync(
@@ -1934,7 +1959,11 @@ if (args[0] === "pr" && args[1] === "view") {
       {
         name: "test",
         status: "COMPLETED",
-        conclusion: terminalCheckFailure ? "FAILURE" : "SUCCESS",
+        conclusion: data.terminalCheckMissingConclusion
+          ? null
+          : terminalCheckFailure
+            ? "FAILURE"
+            : "SUCCESS",
       },
     ],
     title: "Exact merge candidate",

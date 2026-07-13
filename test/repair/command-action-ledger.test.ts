@@ -19,6 +19,10 @@ import {
   parseCommandActionLedgerManifest,
   serializeCommandActionLedgerManifest,
 } from "../../dist/repair/command-action-ledger-manifest.js";
+import {
+  applyAutomergeResultToCommand,
+  automergeAttemptReceiptOutcome,
+} from "../../dist/repair/automerge-effect.js";
 import { recordWorkflowActionEvent } from "../../dist/action-ledger-runtime.js";
 import { forcedReplayCommandFields, readCommentRouterConfig } from "../../dist/repair/config.js";
 
@@ -274,6 +278,96 @@ test("command mutation receipts preserve accepted and unknown partial failures",
     assert.equal(terminal?.action.retryable, true);
     assert.equal(terminal?.attributes.completion_reason, "mutation_outcome_unknown");
     assert.equal(new Set(events.map((event) => event.operation_id)).size, 2);
+  } finally {
+    for (const key of Object.keys(process.env)) {
+      if (!(key in previous)) delete process.env[key];
+    }
+    Object.assign(process.env, previous);
+    fs.rmSync(root, { force: true, recursive: true });
+  }
+});
+
+test("ambiguous automerge receipts leave the durable command waiting", async () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "command-automerge-wait-")));
+  const outputRoot = path.join(root, "output");
+  fs.mkdirSync(outputRoot);
+  const previous = { ...process.env };
+  Object.assign(process.env, {
+    CLAWSWEEPER_ACTION_LEDGER_FORCE: "1",
+    CLAWSWEEPER_ACTION_LEDGER_ROOT: root,
+    CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT: outputRoot,
+    CLAWSWEEPER_ACTION_LEDGER_INVOCATION: "automerge-wait",
+    GITHUB_REPOSITORY: "openclaw/clawsweeper",
+    GITHUB_SHA: "7".repeat(40),
+    GITHUB_WORKFLOW: "repair comment router",
+    GITHUB_WORKFLOW_REF:
+      "openclaw/clawsweeper/.github/workflows/repair-comment-router.yml@refs/heads/main",
+    GITHUB_JOB: "route-comments",
+    GITHUB_RUN_ID: "23345",
+    GITHUB_RUN_ATTEMPT: "1",
+    GITHUB_ACTION: "route",
+    GITHUB_RUN_STARTED_AT: "2026-07-12T17:10:00Z",
+    CLAWSWEEPER_CRABFLEET_AGENT_TOKEN: "",
+    CLAWSWEEPER_CRABFLEET_SESSION_ID: "",
+  });
+
+  try {
+    const command = syntheticCommand("e".repeat(40));
+    command.status = "ready";
+    command.actions = [{ action: "merge", status: "pending" }];
+    recordCommandReceived(command);
+
+    const attempt = runCommandMutation(command, {
+      kind: "pull_request_merge",
+      identity: {
+        repository: command.repo,
+        number: command.issue_number,
+        expectedHeadSha: command.target.head_sha,
+        method: "squash",
+      },
+      operation: () => ({
+        command_result: {
+          status: 1,
+          stdout: "",
+          stderr: "gh: HTTP 502: Bad Gateway",
+          error: null,
+        },
+        command_error: null,
+        confirmation: {
+          mergedAt: null,
+          mergeCommitSha: null,
+          pendingReason: "",
+          block: "",
+        },
+      }),
+      outcome: automergeAttemptReceiptOutcome,
+    });
+    assert.equal(
+      applyAutomergeResultToCommand(command, {
+        action: "merge",
+        status: "waiting",
+        reason:
+          "merge command response was transient and its exact-head effect is not yet observable",
+      }),
+      true,
+    );
+    assert.equal(attempt.command_result.status, 1);
+    assert.equal(command.status, "waiting");
+    assert.equal(command.actions[0]?.status, "waiting");
+    recordCommandOutcome(command);
+    await flushCommandActionEvents();
+
+    const events = readEvents(outputRoot);
+    assert.deepEqual(
+      events
+        .filter((event) => event.event_type === "command.mutation")
+        .map((event) => event.attributes.completion_reason),
+      ["mutation_attempted", "mutation_outcome_unknown"],
+    );
+    const waiting = events.find((event) => event.event_type === "command.wait");
+    assert.equal(waiting?.attributes.state, "waiting");
+    assert.equal(waiting?.action.status, "waiting");
+    assert.equal(waiting?.action.mutation, false);
   } finally {
     for (const key of Object.keys(process.env)) {
       if (!(key in previous)) delete process.env[key];

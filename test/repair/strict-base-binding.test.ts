@@ -356,11 +356,23 @@ test("all repair merge owners repeat the shared strict base guard immediately be
       const helper = source.slice(helperStart, helperEnd);
       const helperGuard = helper.indexOf("runtimeStrictBaseBindingBlock({");
       assert.notEqual(helperGuard, -1, `${file} shared merge gate lacks strict base binding`);
+      const hardReadiness = helper.indexOf("validateFixPrMergeHardReadiness({");
+      assert.notEqual(hardReadiness, -1, `${file} shared merge gate lacks hard readiness`);
+      assert.ok(
+        hardReadiness < helperGuard,
+        `${file} must complete network-backed hard readiness before strict base binding`,
+      );
       assert.doesNotMatch(
         helper.slice(helperGuard),
-        /gh(?:Json|Text|Spawn|WithRetry)\(/,
+        /gh(?:Json|Text|Spawn|WithRetry)\(|validateFixPrMergeHardReadiness|validateResolvedReviewThreads|liveSecurityBlockReason/,
         `${file} performs a GitHub call after the final strict base guard`,
       );
+      const hardHelperStart = source.indexOf("function validateFixPrMergeHardReadiness(");
+      const hardHelperEnd = source.indexOf("\nfunction ", hardHelperStart + 1);
+      const hardHelper = source.slice(hardHelperStart, hardHelperEnd);
+      assert.match(hardHelper, /reviewDecision === "CHANGES_REQUESTED"/);
+      assert.match(hardHelper, /validateTerminalStatusChecks/);
+      assert.match(hardHelper, /validateResolvedReviewThreads/);
       continue;
     }
     assert.ok(guards.length >= 2, `${file} must check strict base binding at least twice`);

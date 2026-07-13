@@ -1887,11 +1887,15 @@ function validateTerminalStatusChecks(checks: LooseRecord[]) {
     const status = String(check.status ?? "").toUpperCase();
     const state = String(check.state ?? "").toUpperCase();
     const conclusion = String(check.conclusion ?? "").toUpperCase();
-    if (conclusion && !PASSING_CHECK_CONCLUSIONS.has(conclusion)) {
-      blockers.push(`${name}: ${conclusion}`);
+    if (conclusion) {
+      if (!PASSING_CHECK_CONCLUSIONS.has(conclusion)) blockers.push(`${name}: ${conclusion}`);
       continue;
     }
     const terminalState = status || state;
+    if (["COMPLETED", "SUCCESS"].includes(terminalState)) {
+      blockers.push(`${name}: UNKNOWN (${terminalState} without conclusion)`);
+      continue;
+    }
     if (
       terminalState &&
       ["ACTION_REQUIRED", "CANCELLED", "ERROR", "FAILURE", "STALE", "TIMED_OUT"].includes(

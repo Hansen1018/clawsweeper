@@ -679,6 +679,8 @@ function postFlightMergeRetryBlock({
     validationProofPlan: fixReport.validation_proof_plan,
   });
   if (proofBlock) return proofBlock;
+  const hardReadinessBlock = validateFixPrMergeHardReadiness({ pull, view });
+  if (hardReadinessBlock) return hardReadinessBlock;
   const strictBaseBindingBlock = runtimeStrictBaseBindingBlock({
     repo: result.repo,
     baseBranch: String(view.baseRefName ?? pull.base?.ref ?? ""),
@@ -1136,17 +1138,23 @@ function validateFixPrMergeProof({
   return "";
 }
 
-function validateFixPrMergeReadiness({ pull, view }: LooseRecord) {
+function validateFixPrMergeHardReadiness({ pull, view }: LooseRecord) {
+  if (view.reviewDecision === "CHANGES_REQUESTED") {
+    return "review decision is CHANGES_REQUESTED";
+  }
+
+  const checkBlock = validateTerminalStatusChecks(view.statusCheckRollup ?? []);
+  if (checkBlock) return checkBlock;
+
+  return validateResolvedReviewThreads(result.repo, pull.number);
+}
+
+function validateFixPrMergeReadiness({ view }: LooseRecord) {
   if (view.mergeable !== "MERGEABLE") return `mergeable state is ${view.mergeable || "unknown"}`;
   if (!FIX_PR_MERGE_STATES.has(String(view.mergeStateStatus ?? ""))) {
     return `merge state status is ${view.mergeStateStatus || "unknown"}`;
   }
-  if (["CHANGES_REQUESTED", "REVIEW_REQUIRED"].includes(String(view.reviewDecision ?? ""))) {
-    return `review decision is ${view.reviewDecision}`;
-  }
-
-  const threadBlock = validateResolvedReviewThreads(result.repo, pull.number);
-  if (threadBlock) return threadBlock;
+  if (view.reviewDecision === "REVIEW_REQUIRED") return "review decision is REVIEW_REQUIRED";
 
   const checkBlock = shouldRequirePrChecks()
     ? validateStatusChecks(view.statusCheckRollup ?? [])
@@ -1252,6 +1260,33 @@ function validateStatusChecks(checks: LooseRecord[]) {
     }
   }
   if (considered === 0) return "no PR checks found";
+  if (blockers.length > 0) return `checks are not clean: ${blockers.slice(0, 5).join(", ")}`;
+  return "";
+}
+
+function validateTerminalStatusChecks(checks: LooseRecord[]) {
+  if (!Array.isArray(checks) || checks.length === 0) return "";
+  const ignored = ignoredCheckNames();
+  const blockers: LooseRecord[] = [];
+  for (const check of latestCheckRuns(checks)) {
+    const name = String(check.name ?? check.context ?? "unknown check");
+    if (isIgnoredStatusCheck(check, ignored)) continue;
+    const status = String(check.status ?? check.state ?? "").toUpperCase();
+    const conclusion = String(check.conclusion ?? "").toUpperCase();
+    if (conclusion) {
+      if (!PASSING_CHECK_CONCLUSIONS.has(conclusion)) blockers.push(`${name}: ${conclusion}`);
+      continue;
+    }
+    if (!check.status && PASSING_CHECK_CONCLUSIONS.has(String(check.state ?? "").toUpperCase())) {
+      continue;
+    }
+    if (isPendingStatusCheck(check)) continue;
+    if (["COMPLETED", "SUCCESS"].includes(status)) {
+      blockers.push(`${name}: UNKNOWN (${status} without conclusion)`);
+    } else {
+      blockers.push(`${name}: ${status || "UNKNOWN"}`);
+    }
+  }
   if (blockers.length > 0) return `checks are not clean: ${blockers.slice(0, 5).join(", ")}`;
   return "";
 }
