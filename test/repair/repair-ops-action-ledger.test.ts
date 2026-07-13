@@ -131,6 +131,10 @@ test("repair worker jobs upload shards and one credentialed job publishes them",
 
   assert.match(publisher, /name: Publish immutable repair action ledger/);
   assert.match(publisher, /needs:\s+- cluster\s+- execute\s+- mutate/);
+  assert.match(
+    publisher,
+    /if: \$\{\{ always\(\) && needs\.cluster\.result != 'skipped' && needs\.cluster\.outputs\.job_exists == '1' \}\}/,
+  );
   assert.match(publisher, /create-state-token/);
   assert.match(
     publisher,

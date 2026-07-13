@@ -1892,7 +1892,7 @@ jobs:
       - cluster
       - execute
       - mutate
-    if: ${{ always() && needs.cluster.result != 'skipped' }}
+    if: ${{ always() && needs.cluster.result != 'skipped' && needs.cluster.outputs.job_exists == '1' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
