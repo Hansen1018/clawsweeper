@@ -9,6 +9,63 @@ export type ResolvedRunArtifact = {
   digest: string;
 };
 
+export type ResolvedCommitReviewArtifact = {
+  sha: string;
+  producerAttempt: number;
+  ledger: ResolvedRunArtifact;
+  report: ResolvedRunArtifact;
+};
+
+export function resolveCommitReviewArtifactCohort({
+  artifacts,
+  commitShas,
+  runId,
+  currentAttempt,
+  allowPriorAttempts = process.env.CLAWSWEEPER_ALLOW_PRIOR_ARTIFACT === "1",
+}: {
+  artifacts: LooseRecord[];
+  commitShas: string[];
+  runId: string;
+  currentAttempt: number;
+  allowPriorAttempts?: boolean;
+}): ResolvedCommitReviewArtifact[] {
+  const normalizedShas = commitShas.map((sha) => sha.trim());
+  const sortedShas = [...normalizedShas].sort();
+  if (
+    normalizedShas.length === 0 ||
+    normalizedShas.some((sha) => !/^[a-f0-9]{40}$/.test(sha)) ||
+    new Set(normalizedShas).size !== normalizedShas.length ||
+    normalizedShas.some((sha, index) => sha !== sortedShas[index])
+  ) {
+    throw new Error("commit review artifact SHAs must be canonical, sorted, and unique");
+  }
+  return normalizedShas.map((sha) => {
+    const ledger = resolveRunArtifact({
+      artifacts,
+      prefix: `action-ledger-commit-review-${sha}`,
+      runId,
+      currentAttempt,
+      allowPriorAttempts,
+    });
+    const report = resolveRunArtifact({
+      artifacts,
+      prefix: `commit-review-${sha}`,
+      runId,
+      currentAttempt,
+      allowPriorAttempts,
+    });
+    if (ledger.producerAttempt !== report.producerAttempt) {
+      throw new Error(`commit review report and ledger attempts differ for ${sha}`);
+    }
+    return {
+      sha,
+      producerAttempt: ledger.producerAttempt,
+      ledger,
+      report,
+    };
+  });
+}
+
 export function resolveRunArtifact({
   artifacts,
   prefix,

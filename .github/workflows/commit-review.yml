@@ -518,7 +518,7 @@ jobs:
         if: ${{ always() && steps.review-setup-pnpm.outcome == 'success' }}
         uses: actions/upload-artifact@v7
         with:
-          name: action-ledger-commit-review-${{ matrix.sha }}-${{ github.run_attempt }}
+          name: action-ledger-commit-review-${{ matrix.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ steps.review-action-ledger.outputs.output-root }}/**
           include-hidden-files: true
           if-no-files-found: error
@@ -536,7 +536,7 @@ jobs:
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: commit-review-${{ matrix.sha }}
+          name: commit-review-${{ matrix.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: commit-artifacts
           if-no-files-found: ignore
 
@@ -570,19 +570,114 @@ jobs:
         with:
           build-script: build:all
 
-      - uses: actions/download-artifact@v8
+      - name: Resolve commit review artifact cohort
+        id: review-artifact-cohort
         if: ${{ needs.plan.outputs.planned_count != '0' }}
-        with:
-          pattern: action-ledger-commit-review-*-${{ github.run_attempt }}
-          path: .clawsweeper-repair/action-ledger-download
-          merge-multiple: false
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_COMMIT_MATRIX: ${{ needs.plan.outputs.matrix }}
+          PLANNED_COUNT: ${{ needs.plan.outputs.planned_count }}
+          CLAWSWEEPER_ALLOW_PRIOR_ARTIFACT: "1"
+        run: |
+          set -euo pipefail
+          mkdir -p .artifacts
+          cohort_file=".artifacts/commit-review-artifact-cohort.json"
+          expected_shas_file=".artifacts/expected-commit-review-shas.txt"
+          jq -er 'map(.sha) | if all(.[]; test("^[a-f0-9]{40}$")) then .[] else error("invalid commit review SHA") end' \
+            <<< "$EXPECTED_COMMIT_MATRIX" | sort -u > "$expected_shas_file"
+          if [ "$(wc -l < "$expected_shas_file" | tr -d ' ')" != "$PLANNED_COUNT" ]; then
+            echo "Commit review matrix count does not match planned_count." >&2
+            exit 1
+          fi
+          pnpm run --silent repair:resolve-run-artifact -- \
+            --repository "${{ github.repository }}" \
+            --run-id "${{ github.run_id }}" \
+            --current-attempt "${{ github.run_attempt }}" \
+            --commit-shas-file "$expected_shas_file" \
+            --cohort-file "$cohort_file"
 
       - uses: actions/download-artifact@v8
         if: ${{ needs.plan.outputs.planned_count != '0' }}
         with:
-          pattern: commit-review-*
-          path: commit-artifacts
-          merge-multiple: true
+          artifact-ids: ${{ steps.review-artifact-cohort.outputs.ledger_artifact_ids }}
+          path: .clawsweeper-repair/action-ledger-download
+          merge-multiple: false
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+
+      - uses: actions/download-artifact@v8
+        if: ${{ needs.plan.outputs.planned_count != '0' }}
+        with:
+          artifact-ids: ${{ steps.review-artifact-cohort.outputs.report_artifact_ids }}
+          path: .clawsweeper-repair/commit-review-download
+          merge-multiple: false
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+
+      - name: Verify and assemble commit review artifact cohort
+        if: ${{ needs.plan.outputs.planned_count != '0' }}
+        env:
+          PLANNED_COUNT: ${{ needs.plan.outputs.planned_count }}
+        run: |
+          set -euo pipefail
+          cohort_file=".artifacts/commit-review-artifact-cohort.json"
+          expected_shas_file=".artifacts/expected-commit-review-shas.txt"
+          actual_shas_file=".artifacts/actual-commit-review-shas.txt"
+          test -s "$cohort_file"
+          : > "$actual_shas_file"
+          if [ "$PLANNED_COUNT" = "1" ]; then
+            IFS=$'\t' read -r commit_sha artifact_attempt ledger_name ledger_id report_name report_id \
+              < <(jq -r '.[] | [.sha, (.producerAttempt | tostring), .ledger.name, (.ledger.id | tostring), .report.name, (.report.id | tostring)] | @tsv' "$cohort_file")
+            normalize_single_download() {
+              local download_root="$1"
+              local artifact_name="$2"
+              local staging_root="${download_root}.single"
+              if [ -d "$download_root/$artifact_name" ]; then
+                return
+              fi
+              mv "$download_root" "$staging_root"
+              mkdir -p "$download_root"
+              mv "$staging_root" "$download_root/$artifact_name"
+            }
+            normalize_single_download \
+              .clawsweeper-repair/action-ledger-download \
+              "$ledger_name"
+            normalize_single_download \
+              .clawsweeper-repair/commit-review-download \
+              "$report_name"
+          fi
+          rm -rf commit-artifacts
+          mkdir -p commit-artifacts
+          while IFS=$'\t' read -r commit_sha artifact_attempt ledger_name ledger_id report_name report_id; do
+            review_root=".clawsweeper-repair/action-ledger-download/$ledger_name"
+            report_root=".clawsweeper-repair/commit-review-download/$report_name"
+            test -d "$review_root"
+            test -d "$report_root"
+            test -n "$ledger_id"
+            test -n "$report_id"
+            pnpm run --silent repair:action-ledger -- verify \
+              --repair-lane "commit-review-$commit_sha" \
+              --manifest "$review_root/repair-action-ledger-manifest.json" \
+              --expected-job review \
+              --expected-run-attempt "$artifact_attempt" \
+              --source-root "$review_root" >/dev/null
+            mapfile -d '' report_files < <(find "$report_root" -type f -name '*.md' -print0)
+            if [ "${#report_files[@]}" -ne 1 ] ||
+               [ "$(basename "${report_files[0]:-}" .md)" != "$commit_sha" ]; then
+              echo "Commit review report artifact is incomplete for $commit_sha." >&2
+              exit 1
+            fi
+            cp -R "$report_root"/. commit-artifacts/
+            echo "$commit_sha" >> "$actual_shas_file"
+          done < <(jq -r '.[] | [.sha, (.producerAttempt | tostring), .ledger.name, (.ledger.id | tostring), .report.name, (.report.id | tostring)] | @tsv' "$cohort_file")
+          sort -u -o "$actual_shas_file" "$actual_shas_file"
+          if ! cmp -s "$expected_shas_file" "$actual_shas_file"; then
+            echo "Commit review artifacts do not match the planned matrix." >&2
+            diff -u "$expected_shas_file" "$actual_shas_file" >&2 || true
+            exit 1
+          fi
 
       - uses: actions/download-artifact@v8
         if: ${{ needs.plan.outputs.skipped_count != '0' }}
@@ -711,43 +806,18 @@ jobs:
         if: ${{ always() && steps.publish-setup-pnpm.outcome == 'success' }}
         env:
           ALLOW_EMPTY: ${{ steps.finalize-publication-action-ledger.outputs.allow_empty }}
-          EXPECTED_COMMIT_MATRIX: ${{ needs.plan.outputs.matrix }}
           CHECKS_REQUESTED: ${{ needs.plan.outputs.create_checks }}
+          PLANNED_COUNT: ${{ needs.plan.outputs.planned_count }}
         run: |
           set -euo pipefail
           test -n "${CLAWSWEEPER_STATE_DIR:-}"
           source_root="${CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:?setup-action-ledger output root is required}"
           mkdir -p .artifacts
           event_paths_file=".artifacts/commit-review-action-ledger-paths.txt"
+          cohort_file=".artifacts/commit-review-artifact-cohort.json"
           : > "$event_paths_file"
-          shopt -s nullglob
-          review_roots=(.clawsweeper-repair/action-ledger-download/action-ledger-commit-review-*)
-          expected_shas_file=".artifacts/expected-commit-review-shas.txt"
-          actual_shas_file=".artifacts/actual-commit-review-shas.txt"
-          jq -er 'map(.sha) | if all(.[]; test("^[a-f0-9]{40}$")) then .[] else error("invalid commit review SHA") end' \
-            <<< "$EXPECTED_COMMIT_MATRIX" | sort -u > "$expected_shas_file"
-          if [ "$(wc -l < "$expected_shas_file" | tr -d ' ')" != "${{ needs.plan.outputs.planned_count }}" ]; then
-            echo "Commit review matrix count does not match planned_count." >&2
-            exit 1
-          fi
-          : > "$actual_shas_file"
-          for review_root in "${review_roots[@]}"; do
-            artifact_name="$(basename "$review_root")"
-            artifact_attempt="${artifact_name##*-}"
-            commit_sha="${artifact_name#action-ledger-commit-review-}"
-            commit_sha="${commit_sha%-$artifact_attempt}"
-            if ! [[ "$commit_sha" =~ ^[a-f0-9]{40}$ ]] ||
-               [ "$artifact_attempt" != "$GITHUB_RUN_ATTEMPT" ]; then
-              echo "Invalid commit review action ledger artifact identity: $artifact_name" >&2
-              exit 1
-            fi
-            echo "$commit_sha" >> "$actual_shas_file"
-          done
-          sort -u -o "$actual_shas_file" "$actual_shas_file"
-          if ! cmp -s "$expected_shas_file" "$actual_shas_file"; then
-            echo "Commit review action ledger artifacts do not match the planned matrix." >&2
-            diff -u "$expected_shas_file" "$actual_shas_file" >&2 || true
-            exit 1
+          if [ "$PLANNED_COUNT" != "0" ]; then
+            test -s "$cohort_file"
           fi
           verify_lane() {
             local lane="$1"
@@ -769,18 +839,15 @@ jobs:
               "${allow_empty_args[@]}" \
               --source-root "$source_root" >/dev/null
           }
-          for review_root in "${review_roots[@]}"; do
-            artifact_name="$(basename "$review_root")"
-            artifact_attempt="${artifact_name##*-}"
-            commit_sha="${artifact_name#action-ledger-commit-review-}"
-            commit_sha="${commit_sha%-$artifact_attempt}"
+          while IFS=$'\t' read -r commit_sha artifact_attempt ledger_name ledger_id report_name report_id; do
+            review_root=".clawsweeper-repair/action-ledger-download/$ledger_name"
             verify_lane \
               "commit-review-$commit_sha" \
               review \
               "$artifact_attempt" \
               "$review_root" \
               "$review_root/repair-action-ledger-manifest.json"
-          done
+          done < <(jq -r '.[] | [.sha, (.producerAttempt | tostring), .ledger.name, (.ledger.id | tostring), .report.name, (.report.id | tostring)] | @tsv' "$cohort_file")
           verify_lane \
             commit-publication \
             publish \
@@ -788,11 +855,8 @@ jobs:
             "$source_root" \
             .artifacts/commit-publication-action-ledger-manifest.json \
             "$ALLOW_EMPTY"
-          for review_root in "${review_roots[@]}"; do
-            artifact_name="$(basename "$review_root")"
-            artifact_attempt="${artifact_name##*-}"
-            commit_sha="${artifact_name#action-ledger-commit-review-}"
-            commit_sha="${commit_sha%-$artifact_attempt}"
+          while IFS=$'\t' read -r commit_sha artifact_attempt ledger_name ledger_id report_name report_id; do
+            review_root=".clawsweeper-repair/action-ledger-download/$ledger_name"
             manifest_file="$review_root/repair-action-ledger-manifest.json"
             import_result_file=".artifacts/commit-review-$commit_sha-action-ledger-import.json"
             pnpm run --silent repair:action-ledger -- publish \
@@ -806,7 +870,7 @@ jobs:
               '.eventPaths == $manifest[0].event_paths' \
               "$import_result_file" >/dev/null
             jq -r '.paths[]?' "$import_result_file" >> "$event_paths_file"
-          done
+          done < <(jq -r '.[] | [.sha, (.producerAttempt | tostring), .ledger.name, (.ledger.id | tostring), .report.name, (.report.id | tostring)] | @tsv' "$cohort_file")
           manifest_file=".artifacts/commit-publication-action-ledger-manifest.json"
           import_result_file=".artifacts/commit-publication-action-ledger-import.json"
           test -s "$manifest_file"

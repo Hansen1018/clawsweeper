@@ -1,8 +1,14 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 
-import { resolveRunArtifact } from "../../dist/repair/run-artifact.js";
+import {
+  resolveCommitReviewArtifactCohort,
+  resolveRunArtifact,
+} from "../../dist/repair/run-artifact.js";
 
 const digest1 = "1".repeat(64);
 const digest2 = "2".repeat(64);
@@ -27,6 +33,147 @@ test("reruns select the latest trusted producer attempt instead of the consumer 
       digest: digest2,
     },
   );
+});
+
+test("commit review reruns select one complete report and ledger pair per SHA", () => {
+  const sha1 = "a".repeat(40);
+  const sha2 = "b".repeat(40);
+  assert.deepEqual(
+    resolveCommitReviewArtifactCohort({
+      artifacts: [
+        artifact(101, 1, digest1, `action-ledger-commit-review-${sha1}`),
+        artifact(102, 1, digest1, `commit-review-${sha1}`),
+        artifact(201, 2, digest2, `action-ledger-commit-review-${sha1}`),
+        artifact(202, 2, digest2, `commit-review-${sha1}`),
+        artifact(301, 1, digest1, `action-ledger-commit-review-${sha2}`),
+        artifact(302, 1, digest1, `commit-review-${sha2}`),
+      ],
+      commitShas: [sha1, sha2],
+      runId: "9001",
+      currentAttempt: 2,
+      allowPriorAttempts: true,
+    }).map((entry) => ({
+      sha: entry.sha,
+      producerAttempt: entry.producerAttempt,
+      ledgerId: entry.ledger.id,
+      reportId: entry.report.id,
+    })),
+    [
+      { sha: sha1, producerAttempt: 2, ledgerId: 201, reportId: 202 },
+      { sha: sha2, producerAttempt: 1, ledgerId: 301, reportId: 302 },
+    ],
+  );
+});
+
+test("commit review reruns reject mixed report and ledger attempts", () => {
+  const sha = "a".repeat(40);
+  assert.throws(
+    () =>
+      resolveCommitReviewArtifactCohort({
+        artifacts: [
+          artifact(101, 1, digest1, `action-ledger-commit-review-${sha}`),
+          artifact(102, 1, digest1, `commit-review-${sha}`),
+          artifact(201, 2, digest2, `action-ledger-commit-review-${sha}`),
+        ],
+        commitShas: [sha],
+        runId: "9001",
+        currentAttempt: 2,
+        allowPriorAttempts: true,
+      }),
+    /report and ledger attempts differ/,
+  );
+  assert.throws(
+    () =>
+      resolveCommitReviewArtifactCohort({
+        artifacts: [],
+        commitShas: ["b".repeat(40), "a".repeat(40)],
+        runId: "9001",
+        currentAttempt: 2,
+        allowPriorAttempts: true,
+      }),
+    /canonical, sorted, and unique/,
+  );
+});
+
+test("commit review cohort CLI writes exact artifact ids and the selected cohort", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-artifact-cohort-"));
+  const sha1 = "a".repeat(40);
+  const sha2 = "b".repeat(40);
+  try {
+    const shasFile = path.join(root, "shas.txt");
+    const cohortFile = path.join(root, "cohort.json");
+    const outputFile = path.join(root, "github-output.txt");
+    const responseFile = path.join(root, "artifacts.json");
+    const ghPath = path.join(root, "gh");
+    fs.writeFileSync(shasFile, `${sha1}\n${sha2}\n`);
+    fs.writeFileSync(
+      responseFile,
+      JSON.stringify([
+        {
+          artifacts: [
+            artifact(201, 2, digest2, `action-ledger-commit-review-${sha1}`),
+            artifact(202, 2, digest2, `commit-review-${sha1}`),
+            artifact(301, 1, digest1, `action-ledger-commit-review-${sha2}`),
+            artifact(302, 1, digest1, `commit-review-${sha2}`),
+          ],
+        },
+      ]),
+    );
+    fs.writeFileSync(ghPath, '#!/bin/sh\ncat "$GH_ARTIFACT_RESPONSE"\n');
+    fs.chmodSync(ghPath, 0o755);
+
+    execFileSync(
+      process.execPath,
+      [
+        "dist/repair/resolve-run-artifact.js",
+        "--repository",
+        "openclaw/clawsweeper",
+        "--run-id",
+        "9001",
+        "--current-attempt",
+        "2",
+        "--commit-shas-file",
+        shasFile,
+        "--cohort-file",
+        cohortFile,
+      ],
+      {
+        env: {
+          ...process.env,
+          PATH: `${root}${path.delimiter}${process.env.PATH ?? ""}`,
+          GH_ARTIFACT_RESPONSE: responseFile,
+          GITHUB_OUTPUT: outputFile,
+          CLAWSWEEPER_ALLOW_PRIOR_ARTIFACT: "1",
+        },
+      },
+    );
+
+    assert.equal(
+      fs.readFileSync(outputFile, "utf8"),
+      "ledger_artifact_ids=201,301\nreport_artifact_ids=202,302\n",
+    );
+    assert.deepEqual(
+      JSON.parse(fs.readFileSync(cohortFile, "utf8")).map(
+        (entry: {
+          sha: string;
+          producerAttempt: number;
+          ledger: { id: number };
+          report: { id: number };
+        }) => ({
+          sha: entry.sha,
+          producerAttempt: entry.producerAttempt,
+          ledgerId: entry.ledger.id,
+          reportId: entry.report.id,
+        }),
+      ),
+      [
+        { sha: sha1, producerAttempt: 2, ledgerId: 201, reportId: 202 },
+        { sha: sha2, producerAttempt: 1, ledgerId: 301, reportId: 302 },
+      ],
+    );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("a rerun of the producer cannot fall back to an older artifact", () => {

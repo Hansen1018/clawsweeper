@@ -3,7 +3,7 @@ import fs from "node:fs";
 
 import { runCommand as run } from "./command-runner.js";
 import type { LooseRecord } from "./json-types.js";
-import { resolveRunArtifact } from "./run-artifact.js";
+import { resolveCommitReviewArtifactCohort, resolveRunArtifact } from "./run-artifact.js";
 
 const args = parseArgs(process.argv.slice(2));
 const repository = requiredArg(args, "repository");
@@ -25,29 +25,49 @@ const artifacts = pages.flatMap((page) => {
   if (!Array.isArray(values)) throw new Error("workflow artifact page is invalid");
   return values as LooseRecord[];
 });
-const artifact = resolveRunArtifact({
-  artifacts,
-  prefix: requiredArg(args, "prefix"),
-  runId,
-  currentAttempt: Number(requiredArg(args, "current-attempt")),
-  expectedProducerAttempt: args.get("expected-producer-attempt") ?? null,
-  maxProducerAttempt: args.get("max-producer-attempt") ?? null,
-  expectedArtifactId: args.get("expected-artifact-id") ?? null,
-  expectedArtifactDigest: args.get("expected-artifact-digest") ?? null,
-  fallbackPrefixes: args.has("fallback-prefix") ? [requiredArg(args, "fallback-prefix")] : [],
-  requiredPrefixes: args.has("required-prefixes")
-    ? requiredArg(args, "required-prefixes")
-        .split(",")
-        .map((prefix) => prefix.trim())
-    : [],
-});
+const currentAttempt = Number(requiredArg(args, "current-attempt"));
+if (args.has("commit-shas-file")) {
+  const commitShas = fs
+    .readFileSync(requiredArg(args, "commit-shas-file"), "utf8")
+    .split("\n")
+    .map((sha) => sha.trim())
+    .filter(Boolean);
+  const cohort = resolveCommitReviewArtifactCohort({
+    artifacts,
+    commitShas,
+    runId,
+    currentAttempt,
+  });
+  fs.writeFileSync(requiredArg(args, "cohort-file"), `${JSON.stringify(cohort)}\n`);
+  writeOutputs({
+    ledger_artifact_ids: cohort.map((entry) => entry.ledger.id).join(","),
+    report_artifact_ids: cohort.map((entry) => entry.report.id).join(","),
+  });
+} else {
+  const artifact = resolveRunArtifact({
+    artifacts,
+    prefix: requiredArg(args, "prefix"),
+    runId,
+    currentAttempt,
+    expectedProducerAttempt: args.get("expected-producer-attempt") ?? null,
+    maxProducerAttempt: args.get("max-producer-attempt") ?? null,
+    expectedArtifactId: args.get("expected-artifact-id") ?? null,
+    expectedArtifactDigest: args.get("expected-artifact-digest") ?? null,
+    fallbackPrefixes: args.has("fallback-prefix") ? [requiredArg(args, "fallback-prefix")] : [],
+    requiredPrefixes: args.has("required-prefixes")
+      ? requiredArg(args, "required-prefixes")
+          .split(",")
+          .map((prefix) => prefix.trim())
+      : [],
+  });
 
-writeOutputs({
-  artifact_id: String(artifact.id),
-  artifact_name: artifact.name,
-  producer_attempt: String(artifact.producerAttempt),
-  artifact_digest: artifact.digest,
-});
+  writeOutputs({
+    artifact_id: String(artifact.id),
+    artifact_name: artifact.name,
+    producer_attempt: String(artifact.producerAttempt),
+    artifact_digest: artifact.digest,
+  });
+}
 
 function parseArgs(values: string[]): Map<string, string> {
   const parsed = new Map<string, string>();

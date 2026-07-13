@@ -295,11 +295,33 @@ test("commit review and notification workflows publish their operation receipts"
     review.indexOf("- name: Finish commit review lifecycle") <
       review.indexOf("- name: Finalize commit review action ledger"),
   );
-  assert.match(review, /action-ledger-commit-review-\$\{\{ matrix\.sha \}\}/);
+  assert.match(
+    review,
+    /action-ledger-commit-review-\$\{\{ matrix\.sha \}\}-\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}/,
+  );
+  assert.match(
+    review,
+    /commit-review-\$\{\{ matrix\.sha \}\}-\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}/,
+  );
   assert.match(review, /codex-logs-commit-review-\$\{\{ matrix\.sha \}\}/);
   assert.match(publisher, /create-state-token/);
   assert.match(publisher, /setup-state/);
-  assert.match(publisher, /merge-multiple: true/);
+  assert.match(publisher, /Resolve commit review artifact cohort/);
+  assert.match(publisher, /CLAWSWEEPER_ALLOW_PRIOR_ARTIFACT: "1"/);
+  assert.match(publisher, /pnpm run --silent repair:resolve-run-artifact/);
+  assert.match(publisher, /--commit-shas-file "\$expected_shas_file"/);
+  assert.match(publisher, /--cohort-file "\$cohort_file"/);
+  assert.match(
+    publisher,
+    /artifact-ids: \$\{\{ steps\.review-artifact-cohort\.outputs\.ledger_artifact_ids \}\}/,
+  );
+  assert.match(
+    publisher,
+    /artifact-ids: \$\{\{ steps\.review-artifact-cohort\.outputs\.report_artifact_ids \}\}/,
+  );
+  assert.match(publisher, /normalize_single_download/);
+  assert.match(publisher, /Verify and assemble commit review artifact cohort/);
+  assert.match(publisher, /merge-multiple: false/);
   assert.match(publisher, /Publish immutable commit review action ledger/);
   assert.match(publisher, /append commit review action ledger/);
   assert.match(
@@ -308,6 +330,10 @@ test("commit review and notification workflows publish their operation receipts"
   );
   assert.match(publisher, /node dist\/commit-sweeper\.js dispatch-continuation/);
   assert.doesNotMatch(publisher, /\n\s+gh workflow run commit-review\.yml/);
+  assert.ok(
+    publisher.indexOf("- name: Verify and assemble commit review artifact cohort") <
+      publisher.indexOf("- name: Commit reports"),
+  );
   assert.ok(
     publisher.indexOf("- name: Dispatch commit findings to repair lane") <
       publisher.indexOf("- name: Finalize commit publication action ledger"),
@@ -485,11 +511,17 @@ test("repair and commit publishers require canonical exact manifests", () => {
   assert.match(collector, /publication requires --repair-lane and --manifest/);
   const commit = readText(".github/workflows/commit-review.yml");
   assert.match(commit, /--receipt-kind commit_review_state/);
-  assert.match(commit, /pattern: action-ledger-commit-review-\*-\$\{\{ github\.run_attempt \}\}/);
+  assert.match(
+    commit,
+    /artifact-ids: \$\{\{ steps\.review-artifact-cohort\.outputs\.ledger_artifact_ids \}\}/,
+  );
+  assert.match(commit, /CLAWSWEEPER_ALLOW_PRIOR_ARTIFACT: "1"/);
+  assert.match(commit, /--commit-shas-file "\$expected_shas_file"/);
+  assert.match(commit, /--cohort-file "\$cohort_file"/);
   assert.match(commit, /EXPECTED_COMMIT_MATRIX:/);
   assert.match(commit, /cmp -s "\$expected_shas_file" "\$actual_shas_file"/);
   assert.match(
     commit,
-    /repair:action-ledger -- verify[\s\S]*for review_root in "\$\{review_roots\[@\]\}"[\s\S]*repair:action-ledger -- publish/,
+    /Verify and assemble commit review artifact cohort[\s\S]*repair:action-ledger -- verify[\s\S]*Commit reports[\s\S]*repair:action-ledger -- publish/,
   );
 });
