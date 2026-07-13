@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -29,7 +30,7 @@ test("failed-run self-heal paginates before accepting an older failed run", () =
       2: [
         {
           id: 910_002,
-          display_title: `repair cluster ${fixture.jobPath}`,
+          display_title: `repair cluster ${fixture.jobPath} (${fixture.jobSha256})`,
           status: "completed",
           conclusion: "success",
           created_at: oldCreatedAt,
@@ -94,6 +95,34 @@ test("execute-mode self-heal fails closed when active-run discovery fails", () =
   }
 });
 
+test("failed-run self-heal exposes exact immutable generation provenance", () => {
+  const fixture = createFixture("immutable-generation");
+  try {
+    writeRunRecord(fixture, "910001", {
+      source_job: fixture.jobPath,
+      workflow_conclusion: "failure",
+      workflow_updated_at: new Date().toISOString(),
+      mode: "plan",
+    });
+
+    const result = runSelfHeal(fixture);
+    assert.equal(result.status, 0, result.stderr);
+    const summary = JSON.parse(result.stdout);
+    assert.equal(summary.status, "dry_run");
+    assert.deepEqual(summary.candidates, [
+      {
+        source_run_id: "910001",
+        source_job: fixture.jobPath,
+        source_state_revision: fixture.stateRevision,
+        source_job_sha256: fixture.jobSha256,
+        mode: "plan",
+      },
+    ]);
+  } finally {
+    cleanupFixture(fixture);
+  }
+});
+
 test("failed-run self-heal uses paginated history and receipts real mutations", () => {
   const source = fs.readFileSync("src/repair/self-heal-failed-runs.ts", "utf8");
 
@@ -120,20 +149,9 @@ function createFixture(label: string) {
   const pagesFile = path.join(root, "run-pages.json");
   const commandLog = path.join(root, "gh-commands.log");
   const variablesFile = path.join(root, "variables.json");
-  const jobDirectory = path.join(
-    process.cwd(),
-    "jobs",
-    "test",
-    "inbox",
-    `self-heal-${process.pid}-${path.basename(root)}`,
-  );
-  const jobPath = path.relative(process.cwd(), `${jobDirectory}.md`);
-  fs.mkdirSync(runsDir, { recursive: true });
-  fs.mkdirSync(binDir, { recursive: true });
-  fs.mkdirSync(path.dirname(path.join(process.cwd(), jobPath)), { recursive: true });
-  fs.writeFileSync(
-    path.join(process.cwd(), jobPath),
-    `---
+  const stateRoot = path.join(root, "state");
+  const jobPath = `jobs/test/inbox/self-heal-${process.pid}-${path.basename(root)}.md`;
+  const jobBytes = `---
 repo: openclaw/openclaw
 cluster_id: ${label}
 mode: plan
@@ -144,8 +162,21 @@ candidates:
 ---
 
 # fixture
-`,
-  );
+`;
+  fs.mkdirSync(runsDir, { recursive: true });
+  fs.mkdirSync(binDir, { recursive: true });
+  fs.mkdirSync(path.join(stateRoot, path.dirname(jobPath)), { recursive: true });
+  execFileSync("git", ["init", "-q"], { cwd: stateRoot });
+  execFileSync("git", ["config", "user.name", "ClawSweeper Test"], { cwd: stateRoot });
+  execFileSync("git", ["config", "user.email", "test@example.invalid"], { cwd: stateRoot });
+  fs.writeFileSync(path.join(stateRoot, jobPath), jobBytes);
+  execFileSync("git", ["add", jobPath], { cwd: stateRoot });
+  execFileSync("git", ["commit", "-qm", "fixture"], { cwd: stateRoot });
+  const stateRevision = execFileSync("git", ["rev-parse", "HEAD"], {
+    cwd: stateRoot,
+    encoding: "utf8",
+  }).trim();
+  const jobSha256 = createHash("sha256").update(jobBytes).digest("hex");
   fs.writeFileSync(pagesFile, "{}\n");
   fs.writeFileSync(commandLog, "");
   fs.writeFileSync(
@@ -156,18 +187,33 @@ candidates:
     ])}\n`,
   );
   writeFakeGh(binDir);
-  return { root, runsDir, binDir, pagesFile, commandLog, variablesFile, jobPath };
+  return {
+    root,
+    runsDir,
+    binDir,
+    pagesFile,
+    commandLog,
+    variablesFile,
+    stateRoot,
+    stateRevision,
+    jobPath,
+    jobSha256,
+  };
 }
 
 function cleanupFixture(fixture: Fixture) {
-  fs.rmSync(path.join(process.cwd(), fixture.jobPath), { force: true });
   fs.rmSync(fixture.root, { recursive: true, force: true });
 }
 
 function writeRunRecord(fixture: Fixture, runId: string, record: Record<string, unknown>) {
   fs.writeFileSync(
     path.join(fixture.runsDir, `${runId}.json`),
-    `${JSON.stringify({ run_id: runId, ...record })}\n`,
+    `${JSON.stringify({
+      run_id: runId,
+      source_state_revision: fixture.stateRevision,
+      source_job_sha256: fixture.jobSha256,
+      ...record,
+    })}\n`,
   );
 }
 
@@ -193,6 +239,7 @@ function runSelfHeal(fixture: Fixture, options: { args?: string[]; env?: NodeJS.
         ...process.env,
         PATH: `${fixture.binDir}${path.delimiter}${process.env.PATH ?? ""}`,
         CLAWSWEEPER_REPO: "openclaw/clawsweeper",
+        CLAWSWEEPER_STATE_DIR: fixture.stateRoot,
         GH_COMMAND_LOG: fixture.commandLog,
         GH_RUN_PAGES_FIXTURE: fixture.pagesFile,
         GH_VARIABLES_FIXTURE: fixture.variablesFile,

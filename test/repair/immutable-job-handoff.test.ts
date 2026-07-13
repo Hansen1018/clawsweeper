@@ -266,32 +266,23 @@ fs.appendFileSync(process.env.MOCK_GH_LOG, JSON.stringify(args) + "\\n");
   }
 });
 
-test("commit finding workflows bind terminal receipts and ignore ledger-only artifacts", () => {
+test("commit finding and worker workflows bind immutable review inputs", () => {
   const intake = fs.readFileSync(commitIntakeWorkflowPath, "utf8");
   const worker = fs.readFileSync(workerWorkflowPath, "utf8");
 
-  assert.match(intake, /"Intake commit finding" "Complete durable intake handoff"/);
-  assert.match(
-    intake,
-    /Complete durable intake handoff[\s\S]*PREPARE_OUTCOME[\s\S]*PUBLISH_OUTCOME[\s\S]*DISPATCH_OUTCOME/,
-  );
-  assert.match(
-    intake,
-    /SHOULD_REPAIR[\s\S]*"\$PREPARE_OUTCOME" != "success"[\s\S]*"\$PUBLISH_OUTCOME" != "success"[\s\S]*"\$SHOULD_REPAIR" = "true"[\s\S]*"\$DISPATCH_OUTCOME" != "success"/,
-  );
-  assert.match(
-    intake,
-    /--state-revision "\$\{\{ steps\.published-job\.outputs\.state_revision \}\}"/,
-  );
-  assert.match(intake, /--job-sha256 "\$\{\{ steps\.published-job\.outputs\.job_sha256 \}\}"/);
+  assert.match(intake, /Resolve commit finding report handoff/);
+  assert.match(intake, /payload version 2 requires report_revision and report_sha256/);
+  assert.match(intake, /REPORT_REVISION: \$\{\{ steps\.report-handoff\.outputs\.report_revision \}\}/);
+  assert.match(intake, /REPORT_SHA256: \$\{\{ steps\.report-handoff\.outputs\.report_sha256 \}\}/);
+  assert.doesNotMatch(intake, /repair:dispatch/);
   assert.match(worker, /ref: \$\{\{ steps\.immutable-job\.outputs\.state_revision \}\}/);
   assert.match(worker, /ref: \$\{\{ needs\.cluster\.outputs\.state_revision \}\}/);
   assert.match(worker, /Immutable job SHA-256 mismatch/);
-  assert.match(worker, /Immutable authorization job SHA-256 mismatch/);
+  assert.match(worker, /Immutable execution job SHA-256 mismatch/);
   assert.match(worker, /name: clawsweeper-repair-worker-action-ledger-cluster-/);
   assert.match(worker, /name: clawsweeper-repair-worker-action-ledger-execute-/);
-  assert.match(worker, /name: clawsweeper-repair-worker-action-ledger-mutate-/);
-  assert.doesNotMatch(worker, /name: clawsweeper-repair-action-ledger-(?:cluster|execute|mutate)-/);
+  assert.doesNotMatch(worker, /name: clawsweeper-repair-worker-action-ledger-mutate-/);
+  assert.doesNotMatch(worker, /name: clawsweeper-repair-action-ledger-(?:cluster|execute)-/);
 });
 
 test("all production dispatch callers require exact published job revisions", () => {
@@ -302,7 +293,7 @@ test("all production dispatch callers require exact published job revisions", ()
   const dispatcher = fs.readFileSync("src/repair/dispatch-jobs.ts", "utf8");
   const worker = fs.readFileSync(workerWorkflowPath, "utf8");
 
-  for (const intake of [commit, issue, cluster]) {
+  for (const intake of [issue, cluster]) {
     assert.match(intake, /git -C "\$CLAWSWEEPER_STATE_DIR" rev-parse HEAD/);
     assert.match(
       intake,
@@ -311,6 +302,9 @@ test("all production dispatch callers require exact published job revisions", ()
     assert.match(intake, /--state-revision/);
     assert.match(intake, /--job-sha256/);
   }
+  assert.match(commit, /Resolve commit finding report handoff/);
+  assert.match(commit, /report_revision and report_sha256 must be provided together/);
+  assert.match(commit, /payload version 2 requires report_revision and report_sha256/);
   assert.match(createJob, /dispatch && \(!stateRevision \|\| !jobSha256\)/);
   assert.match(createJob, /git", \["show", `\$\{revision\}:\$\{relativePath\}`\]/);
   assert.match(createJob, /local job bytes do not match published state/);

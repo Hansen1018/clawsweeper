@@ -125,10 +125,10 @@ test("legacy repair payloads are rebound to one state commit and forced plan-onl
         effective_mode: "plan",
       },
     );
-    assert.match(String(workflow.jobs.authorize.if), /needs\.cluster\.outputs\.effective_mode/);
+    assert.match(String(workflow.jobs.execute.if), /needs\.cluster\.outputs\.effective_mode/);
     assert.equal(
-      workflow.jobs.authorize.steps.find(
-        (step: { name?: string }) => step.name === "Checkout immutable authorization job",
+      workflow.jobs.execute.steps.find(
+        (step: { name?: string }) => step.name === "Checkout immutable execution job",
       ).with.ref,
       "${{ needs.cluster.outputs.state_revision }}",
     );

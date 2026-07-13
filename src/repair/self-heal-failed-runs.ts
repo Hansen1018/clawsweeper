@@ -6,17 +6,22 @@ import { execFileSync, spawnSync } from "node:child_process";
 import {
   assertLiveWorkerCapacity,
   currentProjectRepo,
-  listActiveWorkflowRuns,
   parseArgs,
-  parseJob,
+  parseRepairRunTitle,
   readMaxLiveWorkers,
   repoRoot,
-  validateJob,
   waitForLiveWorkerCapacity,
 } from "./lib.js";
 import { ghErrorText, ghJson, ghText } from "./github-cli.js";
 import { sleepMs } from "./timing.js";
 import { REPAIR_CLUSTER_WORKFLOW } from "./constants.js";
+import {
+  immutableJobDispatchArgs,
+  immutableJobIdentityKey,
+  isMissingImmutableJobError,
+  resolveStateJobIdentity,
+} from "./immutable-job-handoff.js";
+import { activeRepairJobGenerations as listActiveRepairJobGenerations } from "./live-worker-capacity.js";
 import { runRepairMutation, type RepairLifecycleInput } from "./repair-action-ledger.js";
 import {
   restoreGateSequence,
@@ -32,7 +37,8 @@ const DEFAULT_RUNNER = process.env.CLAWSWEEPER_WORKER_RUNNER ?? "blacksmith-4vcp
 const DEFAULT_EXECUTION_RUNNER =
   process.env.CLAWSWEEPER_EXECUTION_RUNNER ?? "blacksmith-16vcpu-ubuntu-2404";
 const QUEUED_STATUSES = new Set(["queued", "requested", "waiting", "pending"]);
-const ACTIVE_STATUSES = new Set([...QUEUED_STATUSES, "in_progress"]);
+const SOURCE_JOB_PATH = /^jobs\/[A-Za-z0-9_.-]+\/inbox\/[A-Za-z0-9_.-]+\.md$/;
+const JOB_SHA256 = /^[a-f0-9]{64}$/;
 
 type GateState = {
   exists: boolean;
@@ -118,6 +124,9 @@ const attempts: LooseRecord[] = candidates.map((candidate: JsonValue) => ({
   source_run_id: candidate.run_id,
   cluster_id: candidate.cluster_id,
   source_job: candidate.source_job,
+  source_state_revision: candidate.source_state_revision,
+  source_job_sha256: candidate.source_job_sha256,
+  immutable_job_key: candidate.immutable_job_key,
   mode: candidate.mode,
   runner,
   execution_runner: executionRunner,
@@ -199,17 +208,21 @@ if (cleanupRestoreFailures.length > 0) {
 function selectCandidates() {
   const records = readRunRecords();
   const attempts = readSelfHealLedger().attempts ?? [];
-  const activeSourceJobs = execute ? activeRepairSourceJobs() : new Map<string, string[]>();
+  const activeJobGenerations = execute ? activeRepairJobGenerations() : new Map<string, string[]>();
   const cutoffMs = Date.now() - maxAgeHours * 60 * 60 * 1000;
-  const attemptedRunIds = new Set(
-    attempts.map((attempt: JsonValue) => String(attempt.source_run_id ?? "")).filter(Boolean),
-  );
-  const attemptCountsByJob = new Map<string, number>();
+  const attemptedRunGenerations = new Set<string>();
+  const attemptCountsByGeneration = new Map<string, number>();
   for (const attempt of attempts) {
-    const sourceJob = String(attempt.source_job ?? "");
-    if (sourceJob) attemptCountsByJob.set(sourceJob, (attemptCountsByJob.get(sourceJob) ?? 0) + 1);
+    const generation = attemptImmutableJobKey(attempt);
+    if (!generation) continue;
+    const sourceRunId = String(attempt.source_run_id ?? "");
+    if (sourceRunId) attemptedRunGenerations.add(`${sourceRunId}:${generation}`);
+    attemptCountsByGeneration.set(
+      generation,
+      (attemptCountsByGeneration.get(generation) ?? 0) + 1,
+    );
   }
-  const latestByJob = new Map();
+  const latestByGeneration = new Map<string, LooseRecord>();
 
   for (const record of records) {
     const sourceJob = record.source_job;
@@ -217,13 +230,14 @@ function selectCandidates() {
       skippedCandidates.push({ reason: "missing_source_job", run_id: record.run_id ?? null });
       continue;
     }
-    const current = latestByJob.get(sourceJob);
+    const generation = runRecordGenerationKey(record, sourceJob);
+    const current = latestByGeneration.get(generation);
     if (!current || runSortKey(record) > runSortKey(current)) {
-      latestByJob.set(sourceJob, record);
+      latestByGeneration.set(generation, record);
     }
   }
 
-  return [...latestByJob.values()]
+  return [...latestByGeneration.values()]
     .filter((record: JsonValue) => record.workflow_conclusion === "failure")
     .filter((record: JsonValue) => {
       const timestamp = recordTimestampMs(record);
@@ -238,84 +252,91 @@ function selectCandidates() {
       });
       return false;
     })
-    .filter((record: JsonValue) => {
+    .map((record: JsonValue) => {
       const sourceJob = String(record.source_job ?? "");
-      const activeRunIds = activeSourceJobs.get(sourceJob) ?? [];
+      try {
+        const immutableJob = resolveRunRecordJob(record, sourceJob);
+        return {
+          ...record,
+          source_job: immutableJob.jobPath,
+          source_state_revision: immutableJob.stateRevision,
+          source_job_sha256: immutableJob.jobSha256,
+          immutable_job_key: immutableJob.identityKey,
+          mode: requestedMode ?? record.mode ?? immutableJob.job.frontmatter.mode,
+        };
+      } catch (error) {
+        skippedCandidates.push({
+          reason: isMissingImmutableJobError(error)
+            ? "missing_job_file"
+            : "immutable_provenance_unavailable",
+          run_id: record.run_id ?? null,
+          source_job: sourceJob,
+          detail: error instanceof Error ? error.message : String(error),
+        });
+        return null;
+      }
+    })
+    .filter((record: JsonValue) => record !== null)
+    .filter((record: JsonValue) => {
+      const activeRunIds = [
+        ...(activeJobGenerations.get(
+          activeJobGenerationKey(record.source_job, record.source_job_sha256),
+        ) ?? []),
+        ...(activeJobGenerations.get(String(record.source_job ?? "")) ?? []),
+      ].filter((runId, index, all) => all.indexOf(runId) === index);
       if (activeRunIds.length === 0) return true;
       skippedCandidates.push({
         reason: "active_repair_run",
         run_id: record.run_id ?? null,
-        source_job: sourceJob,
+        source_job: record.source_job,
+        source_state_revision: record.source_state_revision,
+        source_job_sha256: record.source_job_sha256,
         active_run_ids: activeRunIds,
       });
       return false;
     })
     .filter((record: JsonValue) => {
       if (allowRepeat) return true;
-      const sourceJob = String(record.source_job ?? "");
       const runId = String(record.run_id ?? "");
-      if (runId && attemptedRunIds.has(runId)) return false;
-      if ((attemptCountsByJob.get(sourceJob) ?? 0) < maxAttemptsPerJob) return true;
+      const generation = String(record.immutable_job_key ?? "");
+      if (runId && attemptedRunGenerations.has(`${runId}:${generation}`)) return false;
+      if ((attemptCountsByGeneration.get(generation) ?? 0) < maxAttemptsPerJob) return true;
       skippedCandidates.push({
         reason: "retry_limit_reached",
         run_id: runId || null,
-        source_job: sourceJob,
-        attempts: attemptCountsByJob.get(sourceJob) ?? 0,
+        source_job: record.source_job,
+        source_state_revision: record.source_state_revision,
+        source_job_sha256: record.source_job_sha256,
+        attempts: attemptCountsByGeneration.get(generation) ?? 0,
       });
       return false;
     })
-    .map((record: JsonValue) => {
-      const sourceJob = String(record.source_job ?? "");
-      const jobPath = sourceJobPath(sourceJob);
-      if (!fs.existsSync(jobPath)) {
-        skippedCandidates.push({
-          reason: "missing_job_file",
-          run_id: record.run_id ?? null,
-          source_job: sourceJob,
-        });
-        return null;
-      }
-      const job = parseJob(jobPath);
-      const errors = validateJob(job);
-      if (errors.length > 0) {
-        throw new Error(`invalid job ${record.source_job}: ${errors.join("; ")}`);
-      }
-      return {
-        ...record,
-        mode: requestedMode ?? record.mode ?? job.frontmatter.mode,
-      };
-    })
-    .filter(Boolean)
     .sort((left: JsonValue, right: JsonValue) => runSortKey(right) - runSortKey(left));
 }
 
-function sourceJobPath(sourceJob: string) {
-  return path.isAbsolute(sourceJob) ? sourceJob : path.join(repoRoot(), sourceJob);
+function runRecordGenerationKey(record: LooseRecord, sourceJob: string): string {
+  const jobSha256 = String(record.source_job_sha256 ?? "").trim();
+  return JOB_SHA256.test(jobSha256) ? `${sourceJob}:${jobSha256}` : `${sourceJob}:unsealed`;
 }
 
-function activeRepairSourceJobs() {
-  const jobs = new Map<string, string[]>();
+function resolveRunRecordJob(record: LooseRecord, sourceJob: string) {
+  const stateRevision = record.source_state_revision;
+  const jobSha256 = record.source_job_sha256;
+  return resolveStateJobIdentity({
+    jobPath: sourceJob,
+    stateRevision,
+    jobSha256,
+  });
+}
+
+function activeRepairJobGenerations() {
   try {
-    const runs = listActiveWorkflowRuns({ repo, workflow });
-    for (const run of runs) {
-      if (!ACTIVE_STATUSES.has(String(run.status ?? ""))) continue;
-      const sourceJob = sourceJobFromRunTitle(String(run.displayTitle ?? ""));
-      if (!sourceJob) continue;
-      const runId = String(run.databaseId ?? "");
-      jobs.set(sourceJob, [...(jobs.get(sourceJob) ?? []), runId].filter(Boolean));
-    }
+    return listActiveRepairJobGenerations({ repo, workflow });
   } catch (error) {
     throw new Error(
       `cannot verify active repair generations; refusing dispatch: ${ghErrorText(error)}`,
     );
   }
-  return jobs;
-}
-
-function sourceJobFromRunTitle(title: string) {
-  const index = title.indexOf("jobs/");
-  if (index < 0) return null;
-  return title.slice(index).trim();
 }
 
 function dispatchCandidate(candidate: LooseRecord) {
@@ -327,6 +348,10 @@ function dispatchCandidate(candidate: LooseRecord) {
     repo,
     "-f",
     `job=${candidate.source_job}`,
+    ...immutableJobDispatchArgs({
+      stateRevision: candidate.source_state_revision,
+      jobSha256: candidate.source_job_sha256,
+    }),
     "-f",
     `mode=${candidate.mode}`,
     "-f",
@@ -345,6 +370,8 @@ function dispatchCandidate(candidate: LooseRecord) {
       workflow,
       sourceRunId: candidate.run_id,
       jobPath: candidate.source_job,
+      stateRevision: candidate.source_state_revision,
+      jobSha256: candidate.source_job_sha256,
       mode: candidate.mode,
       runner,
       executionRunner,
@@ -434,11 +461,12 @@ function liveRunRecords(cutoffMs: number) {
   try {
     return listClusterRuns({ cutoffMs })
       .map((run: LooseRecord) => {
-        const sourceJob = sourceJobFromRunTitle(String(run.displayTitle ?? ""));
-        if (!sourceJob) return null;
+        const parsed = parseRepairRunTitle(run.displayTitle);
+        if (!parsed) return null;
         return {
           run_id: String(run.databaseId ?? ""),
-          source_job: sourceJob,
+          source_job: parsed.jobPath,
+          source_job_sha256: parsed.jobSha256,
           workflow_conclusion: run.conclusion ?? null,
           workflow_created_at: run.createdAt ?? null,
           workflow_updated_at: run.updatedAt ?? null,
@@ -597,8 +625,8 @@ function writeGateValue(name: string, value: string): string {
 function selfHealDispatchLifecycle(candidate: LooseRecord): RepairLifecycleInput {
   return {
     repository: repo,
-    workKey: `failed-run-self-heal:${candidate.run_id ?? "unknown"}:${candidate.source_job ?? "unknown"}`,
-    sourceRevision: String(candidate.run_id ?? ""),
+    workKey: `failed-run-self-heal:${candidate.run_id ?? "unknown"}:${candidate.immutable_job_key ?? "unknown"}`,
+    sourceRevision: String(candidate.source_state_revision ?? ""),
     recordPath: String(candidate.source_job ?? ""),
     subjectKind: "workflow",
     subjectId: `failed-repair-run-${candidate.run_id ?? "unknown"}`,
@@ -646,8 +674,37 @@ function summarizeCandidate(candidate: LooseRecord) {
     source_run_id: candidate.run_id,
     cluster_id: candidate.cluster_id,
     source_job: candidate.source_job,
+    source_state_revision: candidate.source_state_revision,
+    source_job_sha256: candidate.source_job_sha256,
     mode: candidate.mode,
     result_status: candidate.result_status,
     run_url: candidate.run_url,
   };
+}
+
+function attemptImmutableJobKey(attempt: LooseRecord): string | null {
+  const stateRevision = attempt.source_state_revision;
+  const jobSha256 = attempt.source_job_sha256;
+  if (!stateRevision && !jobSha256) return null;
+  try {
+    return immutableJobIdentityKey({
+      jobPath: attempt.source_job,
+      stateRevision,
+      jobSha256,
+    });
+  } catch {
+    return null;
+  }
+}
+
+function activeJobGenerationKey(jobPath: JsonValue, jobSha256: JsonValue): string {
+  const pathText = String(jobPath ?? "").trim();
+  const digest = String(jobSha256 ?? "").trim();
+  if (!SOURCE_JOB_PATH.test(pathText)) {
+    throw new Error("active repair run contains a malformed job path");
+  }
+  if (!JOB_SHA256.test(digest)) {
+    throw new Error("active repair run contains a malformed job SHA-256");
+  }
+  return `${pathText}:${digest}`;
 }

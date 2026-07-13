@@ -6,13 +6,18 @@ function readText(path: string): string {
   return fs.readFileSync(path, "utf8");
 }
 
-test("failed-run self-heal preserves retry budgets and skips removed jobs", () => {
+test("failed-run self-heal budgets retries by immutable generation", () => {
   const source = readText("src/repair/self-heal-failed-runs.ts");
 
-  assert.match(source, /attemptCountsByJob/);
-  assert.match(source, /attemptCountsByJob\.get\(sourceJob\)[\s\S]*maxAttemptsPerJob/);
-  assert.match(source, /reason: "missing_job_file"/);
-  assert.match(source, /const latestByJob = new Map/);
+  assert.match(source, /attemptCountsByGeneration/);
+  assert.match(
+    source,
+    /attemptCountsByGeneration\.get\(generation\)[\s\S]*maxAttemptsPerJob/,
+  );
+  assert.match(source, /isMissingImmutableJobError\(error\)[\s\S]*"missing_job_file"/);
+  assert.match(source, /const latestByGeneration = new Map/);
+  assert.match(source, /resolveRunRecordJob\(record, sourceJob\)/);
+  assert.match(source, /activeJobGenerationKey\(record\.source_job, record\.source_job_sha256\)/);
   assert.match(source, /fetchWorkflowRunHistory/);
 });
 
