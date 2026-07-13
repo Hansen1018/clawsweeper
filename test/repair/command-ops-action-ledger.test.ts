@@ -67,9 +67,18 @@ test("report-only repair requeues forward a stable dispatch receipt and publish 
   );
   assert.match(publishStep, /publish_manifest\(\)/);
   assert.match(publishStep, /lane_args\+=\(--lane "\$lane"\)/);
+  assert.match(publishStep, /allow_empty_args\+=\(--allow-empty\)/);
   assert.match(publishStep, /--manifest "\$manifest_file"/);
   assert.match(publishStep, /--source-root "\$source_root"/);
+  assert.match(
+    publishStep,
+    /report-status \\\n\s+\.artifacts\/report-repair-action-ledger-manifest\.json \\\n\s+\.artifacts\/report-repair-action-ledger-import\.json \\\n\s+true/,
+  );
   assert.match(publishStep, /command \\\n\s+report-requeue/);
+  assert.match(
+    publishStep,
+    /if \[ ! -s "\$event_paths_file" \]; then[\s\S]*?exit 0[\s\S]*?fi/,
+  );
   assert.match(publishStep, /--message "chore: append report action ledgers"/);
   assert.match(
     workflow,

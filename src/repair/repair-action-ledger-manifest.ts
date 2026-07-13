@@ -14,6 +14,7 @@ const REPAIR_ACTION_LEDGER_MANIFEST_SCHEMA = "clawsweeper.repair-action-ledger-m
 const REPAIR_ACTION_LEDGER_MANIFEST_VERSION = 1;
 const REPAIR_ACTION_LEDGER_MANIFEST_MAX_BYTES = 256 * 1024;
 const REPAIR_ACTION_LEDGER_LANE_PATTERN = /^[a-z0-9][a-z0-9._-]{0,127}$/;
+const COMMAND_EVENT_TYPE_PREFIX = "command.";
 
 type RepairActionLedgerManifestIdentity = {
   schema: typeof REPAIR_ACTION_LEDGER_MANIFEST_SCHEMA;
@@ -43,7 +44,9 @@ export async function finalizeRepairActionLedgerManifest(
 ): Promise<RepairActionLedgerManifest> {
   assertRepairActionLedgerLane(lane);
   const outputRoot = repairActionLedgerOutputRoot();
-  const eventPaths = (await flushRepairActionEvents()).sort();
+  const finalizedPaths = await flushRepairActionEvents();
+  const repairShards = repairActionLedgerShards(outputRoot, finalizedPaths);
+  const eventPaths = repairShards.map((shard) => shard.relativePath).sort();
   if (eventPaths.length === 0 && options.allowEmpty !== true) {
     throw new Error(`repair action ledger lane ${lane} finalized no event shards`);
   }
@@ -52,9 +55,7 @@ export async function finalizeRepairActionLedgerManifest(
       `repair action ledger manifest exceeds ${ACTION_EVENT_SHARD_IMPORT_LIMITS.maxFiles} event paths`,
     );
   }
-  const events = eventPaths.flatMap((relativePath) =>
-    readActionEventShardAt(outputRoot, relativePath),
-  );
+  const events = repairShards.flatMap((shard) => shard.events);
   if (eventPaths.length > 0 && events.length === 0) {
     throw new Error(`repair action ledger lane ${lane} finalized empty event shards`);
   }
@@ -172,7 +173,8 @@ export function assertRepairActionLedgerManifestSource(
   manifest: RepairActionLedgerManifest,
 ): void {
   const batch = readValidatedActionEventShardBatch(sourceRoot);
-  const actual = batch.eventPaths;
+  const repairShards = repairActionLedgerShards(sourceRoot, batch.eventPaths);
+  const actual = repairShards.map((shard) => shard.relativePath).sort();
   if (JSON.stringify(actual) !== JSON.stringify(manifest.event_paths)) {
     const expected = new Set(manifest.event_paths);
     const actualSet = new Set(actual);
@@ -182,7 +184,7 @@ export function assertRepairActionLedgerManifestSource(
       `repair action ledger manifest shard set mismatch: missing=${missing.join(",") || "none"} extra=${extra.join(",") || "none"}`,
     );
   }
-  for (const event of batch.events) {
+  for (const event of repairShards.flatMap((shard) => shard.events)) {
     assertManifestProducerIdentity(event, {
       repository: manifest.repository,
       sha: manifest.sha,
@@ -196,6 +198,30 @@ export function assertRepairActionLedgerManifestSource(
 
 export function serializeRepairActionLedgerManifest(manifest: RepairActionLedgerManifest): string {
   return `${actionLedgerJson(manifest)}\n`;
+}
+
+function repairActionLedgerShards(
+  root: string,
+  eventPaths: readonly string[],
+): { relativePath: string; events: ActionEvent[] }[] {
+  const repairShards = eventPaths
+    .map((relativePath) => ({
+      relativePath,
+      events: readActionEventShardAt(root, relativePath),
+    }))
+    .filter(({ events }) => events.some(repairActionEvent));
+  for (const shard of repairShards) {
+    if (!shard.events.every(repairActionEvent)) {
+      throw new Error(
+        `repair action ledger shard mixes command and non-command events: ${shard.relativePath}`,
+      );
+    }
+  }
+  return repairShards;
+}
+
+function repairActionEvent(event: ActionEvent): boolean {
+  return !event.event_type.startsWith(COMMAND_EVENT_TYPE_PREFIX);
 }
 
 function repairActionLedgerOutputRoot(): string {

@@ -1263,6 +1263,7 @@ jobs:
           mkdir -p .artifacts
           pnpm run --silent repair:action-ledger -- finalize \
             --repair-lane report-status \
+            --allow-empty \
             > .artifacts/report-repair-action-ledger-manifest.json
 
       - name: Finalize report command action ledger
@@ -1291,15 +1292,21 @@ jobs:
             local lane="$2"
             local manifest_file="$3"
             local import_result_file="$4"
+            local allow_empty="${5:-false}"
             local lane_args=()
+            local allow_empty_args=()
             if [ "$family" = "repair" ]; then
               lane_args+=(--repair-lane "$lane")
             else
               lane_args+=(--lane "$lane")
             fi
+            if [ "$allow_empty" = "true" ]; then
+              allow_empty_args+=(--allow-empty)
+            fi
             test -s "$manifest_file"
             pnpm run --silent repair:action-ledger -- publish \
               "${lane_args[@]}" \
+              "${allow_empty_args[@]}" \
               --manifest "$manifest_file" \
               --source-root "$source_root" \
               --state-root "$CLAWSWEEPER_STATE_DIR" > "$import_result_file"
@@ -1316,7 +1323,8 @@ jobs:
               repair \
               report-status \
               .artifacts/report-repair-action-ledger-manifest.json \
-              .artifacts/report-repair-action-ledger-import.json
+              .artifacts/report-repair-action-ledger-import.json \
+              true
           fi
           if [ -n "$REQUEUE_COUNT" ] && [ "$REQUEUE_COUNT" != "0" ]; then
             publish_manifest \
@@ -1327,8 +1335,8 @@ jobs:
           fi
           sort -u -o "$event_paths_file" "$event_paths_file"
           if [ ! -s "$event_paths_file" ]; then
-            echo "Report action event shards existed but no paths were imported." >&2
-            exit 1
+            echo "No report action event shards require publication."
+            exit 0
           fi
           action_ledger_args=()
           while IFS= read -r event_path; do

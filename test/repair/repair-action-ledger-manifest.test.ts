@@ -20,6 +20,8 @@ import {
   flushRepairActionEvents,
   recordRepairLifecycleEvent,
 } from "../../dist/repair/repair-action-ledger.js";
+import { recordCommandReceived } from "../../dist/repair/command-action-ledger.js";
+import { finalizeCommandActionLedgerManifest } from "../../dist/repair/command-action-ledger-manifest.js";
 
 test("repair manifests bind the exact lane, producer run, and complete shard set", async () => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "repair-manifest-")));
@@ -193,6 +195,55 @@ test("repair manifests allow an explicitly empty producer run without weakening 
     assert.throws(
       () => assertRepairActionLedgerManifestSource(outputRoot, manifest),
       /shard set mismatch: .*extra=ledger\//,
+    );
+  } finally {
+    restoreEnv(previous);
+    fs.rmSync(root, { force: true, recursive: true });
+  }
+});
+
+test("repair manifests exclude command shards from a shared workflow output root", async () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "repair-mixed-manifest-")));
+  const outputRoot = path.join(root, "output");
+  fs.mkdirSync(outputRoot);
+  const previous = { ...process.env };
+  Object.assign(process.env, workflowEnv(root, outputRoot));
+
+  try {
+    recordRepairLifecycleEvent(repairLifecycle(), {
+      type: ACTION_EVENT_TYPES.repairPlan,
+      status: ACTION_EVENT_STATUSES.completed,
+      reasonCode: ACTION_EVENT_REASON_CODES.completed,
+      mutation: false,
+      component: "repair_worker",
+      state: "planned",
+    });
+    recordCommandReceived({
+      repo: "openclaw/openclaw",
+      issue_number: 42,
+      idempotency_key: "report-requeue:openclaw/openclaw:42",
+      comment_body_sha256: null,
+      status: "pending",
+      target: {
+        kind: "pull_request",
+        head_sha: "b".repeat(40),
+      },
+      actions: [],
+    });
+
+    const repairManifest = await finalizeRepairActionLedgerManifest("report-status");
+    const commandManifest = await finalizeCommandActionLedgerManifest("report-requeue");
+    assert.ok(commandManifest);
+    assert.equal(repairManifest.event_paths.length, 1);
+    assert.equal(commandManifest.event_paths.length, 1);
+    assert.equal(
+      repairManifest.event_paths.some((eventPath) =>
+        commandManifest.event_paths.includes(eventPath),
+      ),
+      false,
+    );
+    assert.doesNotThrow(() =>
+      assertRepairActionLedgerManifestSource(outputRoot, repairManifest),
     );
   } finally {
     restoreEnv(previous);

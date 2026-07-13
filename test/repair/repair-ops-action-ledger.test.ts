@@ -131,7 +131,7 @@ test("repair worker jobs upload shards and one credentialed job publishes them",
   );
   assert.match(report, /id: publish_terminal_status/);
   assert.match(report, /Finalize report status repair action ledger/);
-  assert.match(report, /--repair-lane report-status/);
+  assert.match(report, /--repair-lane report-status[\s\S]*--allow-empty/);
   assert.match(report, /Finalize report command action ledger/);
   assert.match(report, /--lane report-requeue/);
   assert.match(report, /Publish immutable report action ledgers/);
