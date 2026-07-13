@@ -2340,7 +2340,12 @@ test("failed Codex workers use bounded automatic retry paths", () => {
   const selfHeal = readText("src/repair/self-heal-failed-runs.ts");
 
   assert.match(worker, /appendCodexOutputCapture/);
-  assert.match(worker, /openCodexOutputCapture\(codexTranscriptPath\)/);
+  assert.match(
+    worker,
+    /openCodexOutputCapture\(codexTranscriptPath,\s*\{\s*redactValues: codexRedactValues/,
+  );
+  assert.match(worker, /redactCodexOutputLastMessage\(commandArgs, codexRedactValues\)/);
+  assert.match(executor, /redactCodexOutputLastMessage\(args, redactValues\)/);
   assert.match(outputCapture, /DEFAULT_CODEX_OUTPUT_FILE_BYTES = 128 \* 1024 \* 1024/);
   assert.match(outputCapture, /Codex output truncated; final tail follows/);
   assert.doesNotMatch(worker, /Codex output exceeded|CLAWSWEEPER_CODEX_STDIO_MAX_BUFFER_MB/);
