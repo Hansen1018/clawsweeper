@@ -960,6 +960,7 @@ test("commit finding dispatch records the concrete request before publication fi
       ghArgs.find((arg) => arg.startsWith("dispatch_key=")) ?? "",
       /^dispatch_key=commit-finding-[a-f0-9]{24}$/,
     );
+    assert.ok(ghArgs.includes("payload_version=2"));
     assert.ok(ghArgs.includes(`report_revision=${reportRevision}`));
     assert.match(
       ghArgs.find((arg) => arg.startsWith("report_sha256=")) ?? "",
@@ -1021,6 +1022,8 @@ test("repository and workflow commit finding dispatches share one stable receipt
 
     assert.match(dispatchKey, /^commit-finding-[a-f0-9]{24}$/);
     assert.match(workflowCommand, new RegExp(`dispatch_key=${dispatchKey}`));
+    assert.equal(repositoryPayload.client_payload.payload_version, 2);
+    assert.match(workflowCommand, /payload_version=2/);
     assert.equal(repositoryPayload.client_payload.report_revision, reportRevision);
     assert.match(repositoryPayload.client_payload.report_sha256, /^[a-f0-9]{64}$/);
 

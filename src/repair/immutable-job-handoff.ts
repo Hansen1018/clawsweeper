@@ -96,6 +96,8 @@ export function immutableJobDispatchArgs(
 ): string[] {
   return [
     "-f",
+    "payload_version=2",
+    "-f",
     `state_revision=${identity.stateRevision}`,
     "-f",
     `job_sha256=${identity.jobSha256}`,

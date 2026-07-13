@@ -1,0 +1,318 @@
+import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import test from "node:test";
+import { parse } from "yaml";
+
+const clusterWorkflowPath = ".github/workflows/repair-cluster-worker.yml";
+const commitFindingWorkflowPath = ".github/workflows/repair-commit-finding-intake.yml";
+
+test("repair worker accepts legacy payloads but keeps v2 identities mandatory", () => {
+  const workflow = readWorkflow(clusterWorkflowPath);
+  const inputs = workflow.on.workflow_dispatch.inputs;
+  assert.deepEqual(inputs.payload_version, {
+    description: "Dispatch payload contract; new producers send 2",
+    required: false,
+    default: "",
+    type: "string",
+  });
+  for (const name of ["state_revision", "job_sha256"]) {
+    assert.equal(inputs[name].required, false);
+    assert.equal(inputs[name].default, "");
+  }
+
+  const contract = workflowStep(workflow, "cluster", "Validate job handoff contract");
+  const exact = runStep(contract.run, {
+    JOB_PATH: "jobs/openclaw/inbox/cluster-exact.md",
+    PAYLOAD_VERSION: "2",
+    STATE_REVISION: "a".repeat(40),
+    JOB_SHA256: "b".repeat(64),
+  });
+  assert.equal(exact.status, 0, exact.stderr);
+  assert.match(exact.outputs, /^payload_version=2$/m);
+  assert.match(exact.outputs, /^legacy_unsealed=false$/m);
+
+  const legacy = runStep(contract.run, {
+    JOB_PATH: "jobs/openclaw/inbox/cluster-legacy.md",
+    PAYLOAD_VERSION: "",
+    STATE_REVISION: "",
+    JOB_SHA256: "",
+  });
+  assert.equal(legacy.status, 0, legacy.stderr);
+  assert.match(legacy.outputs, /^payload_version=1$/m);
+  assert.match(legacy.outputs, /^legacy_unsealed=true$/m);
+
+  const missingV2 = runStep(contract.run, {
+    JOB_PATH: "jobs/openclaw/inbox/cluster-missing.md",
+    PAYLOAD_VERSION: "2",
+    STATE_REVISION: "",
+    JOB_SHA256: "",
+  });
+  assert.notEqual(missingV2.status, 0);
+  assert.match(missingV2.stderr, /payload version 2 requires state_revision and job_sha256/);
+
+  const partialLegacy = runStep(contract.run, {
+    JOB_PATH: "jobs/openclaw/inbox/cluster-partial.md",
+    PAYLOAD_VERSION: "",
+    STATE_REVISION: "c".repeat(40),
+    JOB_SHA256: "",
+  });
+  assert.notEqual(partialLegacy.status, 0);
+  assert.match(partialLegacy.stderr, /must be provided together/);
+});
+
+test("legacy repair payloads are rebound to one state commit and forced plan-only", () => {
+  const workflow = readWorkflow(clusterWorkflowPath);
+  const resolve = workflowStep(workflow, "cluster", "Resolve immutable job handoff");
+  const persist = workflowStep(workflow, "cluster", "Persist immutable recovery inputs");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-legacy-worker-"));
+  const stateRoot = path.join(root, "state");
+  const jobPath = "jobs/openclaw/inbox/cluster-legacy.md";
+  const jobBytes = "legacy job bytes\n";
+  fs.mkdirSync(path.join(stateRoot, path.dirname(jobPath)), { recursive: true });
+  fs.writeFileSync(path.join(stateRoot, jobPath), jobBytes);
+  const revision = commitFixture(stateRoot);
+  const digest = createHash("sha256").update(jobBytes).digest("hex");
+
+  try {
+    const resolved = runStep(
+      resolve.run,
+      {
+        JOB_PATH: jobPath,
+        STATE_REVISION: "",
+        JOB_SHA256: "",
+        LEGACY_UNSEALED: "true",
+        CLAWSWEEPER_STATE_DIR: stateRoot,
+      },
+      root,
+    );
+    assert.equal(resolved.status, 0, resolved.stderr);
+    const resolvedOutputs = parseOutputs(resolved.outputs);
+    assert.equal(resolvedOutputs.state_revision, revision);
+    assert.equal(resolvedOutputs.job_sha256, digest);
+    assert.equal(resolvedOutputs.legacy_unsealed, "true");
+
+    const persisted = runStep(
+      persist.run,
+      {
+        JOB_PATH: jobPath,
+        STATE_REVISION: revision,
+        JOB_SHA256: digest,
+        LEGACY_UNSEALED: "true",
+        REQUESTED_MODE: "autonomous",
+        CLAWSWEEPER_ALLOW_EXECUTE: "1",
+      },
+      root,
+    );
+    assert.equal(persisted.status, 0, persisted.stderr);
+    assert.match(persisted.outputs, /^effective_mode=plan$/m);
+    assert.deepEqual(
+      JSON.parse(
+        fs.readFileSync(
+          path.join(root, ".clawsweeper-repair/recovery-inputs/workflow-inputs.json"),
+          "utf8",
+        ),
+      ),
+      {
+        schema_version: 1,
+        source_job: jobPath,
+        state_revision: revision,
+        job_sha256: digest,
+        requested_mode: "autonomous",
+        effective_mode: "plan",
+      },
+    );
+    assert.match(String(workflow.jobs.authorize.if), /needs\.cluster\.outputs\.effective_mode/);
+    assert.equal(
+      workflow.jobs.authorize.steps.find(
+        (step: { name?: string }) => step.name === "Checkout immutable authorization job",
+      ).with.ref,
+      "${{ needs.cluster.outputs.state_revision }}",
+    );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("commit finding intake rebinds legacy reports or records a safe skip", () => {
+  const workflow = readWorkflow(commitFindingWorkflowPath);
+  const inputs = workflow.on.workflow_dispatch.inputs;
+  assert.equal(inputs.report_revision.required, false);
+  assert.equal(inputs.report_sha256.required, false);
+  assert.equal(inputs.report_revision.default, "");
+  assert.equal(inputs.report_sha256.default, "");
+  const resolve = workflowStep(workflow, "intake", "Resolve commit finding report handoff");
+  const prepare = workflowStep(workflow, "intake", "Prepare commit finding intake");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-legacy-finding-"));
+  const stateRoot = path.join(root, "state");
+  const targetRepo = "openclaw/openclaw";
+  const sha = "d".repeat(40);
+  const reportPath = `records/openclaw-openclaw/commits/${sha}.md`;
+  const reportBytes = `---\nresult: findings\nsha: ${sha}\nrepository: ${targetRepo}\n---\n`;
+  fs.mkdirSync(path.join(stateRoot, path.dirname(reportPath)), { recursive: true });
+  fs.writeFileSync(path.join(stateRoot, reportPath), reportBytes);
+  const revision = commitFixture(stateRoot);
+  const digest = createHash("sha256").update(reportBytes).digest("hex");
+
+  try {
+    const rebound = runStep(
+      resolve.run,
+      {
+        PAYLOAD_VERSION: "",
+        TARGET_REPO: targetRepo,
+        COMMIT_SHA: sha,
+        REPORT_REPO: "openclaw/clawsweeper",
+        REPORT_PATH: reportPath,
+        REPORT_REVISION: "",
+        REPORT_SHA256: "",
+        REPORT_URL: `https://github.com/openclaw/clawsweeper/blob/main/${reportPath}`,
+        CLAWSWEEPER_STATE_DIR: stateRoot,
+      },
+      root,
+    );
+    assert.equal(rebound.status, 0, rebound.stderr);
+    assert.deepEqual(parseOutputs(rebound.outputs), {
+      payload_version: "1",
+      processable: "true",
+      legacy_unsealed: "true",
+      report_repo: "openclaw/clawsweeper-state",
+      report_path: reportPath,
+      report_revision: revision,
+      report_sha256: digest,
+      report_url: "",
+    });
+
+    fs.rmSync(path.join(stateRoot, reportPath));
+    const skipped = runStep(
+      resolve.run,
+      {
+        PAYLOAD_VERSION: "",
+        TARGET_REPO: targetRepo,
+        COMMIT_SHA: sha,
+        REPORT_REPO: "openclaw/clawsweeper",
+        REPORT_PATH: reportPath,
+        REPORT_REVISION: "",
+        REPORT_SHA256: "",
+        REPORT_URL: "",
+        CLAWSWEEPER_STATE_DIR: stateRoot,
+      },
+      root,
+    );
+    assert.equal(skipped.status, 0, skipped.stderr);
+    assert.equal(parseOutputs(skipped.outputs).processable, "false");
+
+    const safeSkip = runStep(
+      prepare.run,
+      {
+        TARGET_REPO: targetRepo,
+        COMMIT_SHA: sha,
+        REPORT_PROCESSABLE: "false",
+        REPORT_REPO: "openclaw/clawsweeper-state",
+        REPORT_PATH: reportPath,
+        REPORT_REVISION: "",
+        REPORT_SHA256: "",
+        REPORT_URL: "",
+      },
+      root,
+    );
+    assert.equal(safeSkip.status, 0, safeSkip.stderr);
+    assert.equal(parseOutputs(safeSkip.outputs).status, "legacy_report_unsealed");
+    assert.match(
+      fs.readFileSync(
+        path.join(root, "results/commit-findings/openclaw-openclaw", `${sha}.md`),
+        "utf8",
+      ),
+      /decision: legacy_report_unsealed/,
+    );
+
+    const missingV2 = runStep(
+      resolve.run,
+      {
+        PAYLOAD_VERSION: "2",
+        TARGET_REPO: targetRepo,
+        COMMIT_SHA: sha,
+        REPORT_REPO: "openclaw/clawsweeper-state",
+        REPORT_PATH: reportPath,
+        REPORT_REVISION: "",
+        REPORT_SHA256: "",
+        REPORT_URL: "",
+        CLAWSWEEPER_STATE_DIR: stateRoot,
+      },
+      root,
+    );
+    assert.notEqual(missingV2.status, 0);
+    assert.match(missingV2.stderr, /payload version 2 requires report_revision and report_sha256/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("current repair and commit finding producers identify payload version 2", () => {
+  const dispatcher = fs.readFileSync("src/repair/dispatch-jobs.ts", "utf8");
+  const immutableHandoff = fs.readFileSync("src/repair/immutable-job-handoff.ts", "utf8");
+  const commitSweeper = fs.readFileSync("src/commit-sweeper.ts", "utf8");
+  assert.match(dispatcher, /"payload_version=2"/);
+  assert.match(immutableHandoff, /"payload_version=2"/);
+  assert.match(commitSweeper, /payload_version: 2/);
+  assert.match(commitSweeper, /"payload_version=2"/);
+});
+
+function readWorkflow(file: string): any {
+  return parse(fs.readFileSync(file, "utf8"));
+}
+
+function workflowStep(workflow: any, job: string, name: string): { run: string } {
+  const step = workflow.jobs[job].steps.find(
+    (candidate: { name?: string }) => candidate.name === name,
+  );
+  assert.equal(typeof step?.run, "string", `${job} is missing ${name}`);
+  return step;
+}
+
+function runStep(run: string, env: Record<string, string>, cwd?: string) {
+  const root = cwd ?? fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-workflow-step-"));
+  const outputPath = path.join(root, `output-${Date.now()}-${Math.random()}.txt`);
+  const child = spawnSync("bash", ["-c", run], {
+    cwd: root,
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      ...env,
+      GITHUB_OUTPUT: outputPath,
+    },
+  });
+  const outputs = fs.existsSync(outputPath) ? fs.readFileSync(outputPath, "utf8") : "";
+  if (!cwd) fs.rmSync(root, { recursive: true, force: true });
+  return { ...child, outputs };
+}
+
+function parseOutputs(value: string): Record<string, string> {
+  return Object.fromEntries(
+    value
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => {
+        const separator = line.indexOf("=");
+        return [line.slice(0, separator), line.slice(separator + 1)];
+      }),
+  );
+}
+
+function commitFixture(root: string): string {
+  spawnSync("git", ["init", "-q"], { cwd: root });
+  spawnSync("git", ["config", "user.name", "ClawSweeper Test"], { cwd: root });
+  spawnSync("git", ["config", "user.email", "test@example.invalid"], { cwd: root });
+  spawnSync("git", ["add", "."], { cwd: root });
+  const commit = spawnSync("git", ["commit", "-qm", "fixture"], { cwd: root, encoding: "utf8" });
+  assert.equal(commit.status, 0, commit.stderr);
+  const revision = spawnSync("git", ["rev-parse", "HEAD"], {
+    cwd: root,
+    encoding: "utf8",
+  });
+  assert.equal(revision.status, 0, revision.stderr);
+  return revision.stdout.trim();
+}

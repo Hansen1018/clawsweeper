@@ -217,6 +217,7 @@ fs.appendFileSync(process.env.MOCK_GH_LOG, JSON.stringify(args) + "\\n");
     assert.deepEqual(calls[0], calls[1]);
     assert.notDeepEqual(calls[0], calls[2]);
     assert.ok(calls[0]?.includes(`state_revision=${stateRevision}`));
+    assert.ok(calls[0]?.includes("payload_version=2"));
     assert.ok(calls[2]?.includes(`job_sha256=${jobSha256}`));
     const firstDispatchKey = calls[0]?.find((arg) => arg.startsWith("dispatch_key="));
     const changedDispatchKey = calls[2]?.find((arg) => arg.startsWith("dispatch_key="));
@@ -250,7 +251,8 @@ test("commit finding workflows bind terminal receipts and ignore ledger-only art
     /--state-revision "\$\{\{ steps\.published-job\.outputs\.state_revision \}\}"/,
   );
   assert.match(intake, /--job-sha256 "\$\{\{ steps\.published-job\.outputs\.job_sha256 \}\}"/);
-  assert.match(worker, /ref: \$\{\{ inputs\.state_revision \}\}/);
+  assert.match(worker, /ref: \$\{\{ steps\.immutable-job\.outputs\.state_revision \}\}/);
+  assert.match(worker, /ref: \$\{\{ needs\.cluster\.outputs\.state_revision \}\}/);
   assert.match(worker, /Immutable job SHA-256 mismatch/);
   assert.match(worker, /Immutable authorization job SHA-256 mismatch/);
   assert.match(worker, /name: clawsweeper-repair-worker-action-ledger-cluster-/);
@@ -283,9 +285,15 @@ test("all production dispatch callers require exact published job revisions", ()
   assert.doesNotMatch(createJob, /dispatch_command|npm", \["run", "dispatch"/);
   assert.match(dispatcher, /usage: node scripts\/dispatch-jobs\.ts <job\.md> \[--mode/);
   assert.doesNotMatch(dispatcher, /<job\.md> \[\.\.\.\]/);
-  assert.match(worker, /state_revision:[\s\S]*required: true/);
-  assert.match(worker, /job_sha256:[\s\S]*required: true/);
-  assert.match(worker, /expected_title="\$\{title\} \[\$\{DISPATCH_KEY\}\] \(\$\{JOB_SHA256\}\)"/);
+  assert.match(worker, /payload_version:[\s\S]*required: false[\s\S]*default: ""/);
+  assert.match(worker, /state_revision:[\s\S]*required: false[\s\S]*default: ""/);
+  assert.match(worker, /job_sha256:[\s\S]*required: false[\s\S]*default: ""/);
+  assert.match(
+    worker,
+    /if \[ -n "\$JOB_SHA256" \]; then[\s\S]*expected_title="\$\{expected_title\} \(\$\{JOB_SHA256\}\)"/,
+  );
+  assert.match(worker, /payload version 2 requires state_revision and job_sha256/);
+  assert.match(worker, /Legacy unsealed repair payloads are restricted to plan mode/);
   assert.match(
     worker,
     /group:.*inputs\.requeue.*inputs\.job_sha256.*github\.run_id.*format\('clawsweeper-repair-\{0\}', inputs\.job\)/,

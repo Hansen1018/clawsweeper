@@ -160,6 +160,8 @@ function dispatchJob(relative: JsonValue, position: JsonValue, total: JsonValue)
     `job=${jobPath}`,
     "-f",
     `dispatch_key=${dispatchKey}`,
+    "-f",
+    "payload_version=2",
     ...(stateRevision
       ? ["-f", `state_revision=${stateRevision}`, "-f", `job_sha256=${jobSha256}`]
       : []),

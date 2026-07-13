@@ -675,7 +675,7 @@ test("commit finding intake is merge-disabled and carries no verifier credential
   assert.match(source, /dispatch_key:[\s\S]*Stable commit finding idempotency key/);
   assert.match(
     source,
-    /report_repo:[\s\S]*default: "openclaw\/clawsweeper-state"[\s\S]*report_revision:[\s\S]*required: true[\s\S]*report_sha256:[\s\S]*required: true/,
+    /payload_version:[\s\S]*required: false[\s\S]*report_repo:[\s\S]*default: "openclaw\/clawsweeper-state"[\s\S]*report_revision:[\s\S]*required: false[\s\S]*report_sha256:[\s\S]*required: false/,
   );
   assert.match(
     source,
@@ -685,8 +685,10 @@ test("commit finding intake is merge-disabled and carries no verifier credential
     source,
     /REPORT_SHA256: \$\{\{ github\.event\.inputs\.report_sha256 \|\| github\.event\.client_payload\.report_sha256 \}\}/,
   );
-  assert.match(source, /: "\$\{REPORT_REVISION:\?report_revision is required\}"/);
-  assert.match(source, /: "\$\{REPORT_SHA256:\?report_sha256 is required\}"/);
+  assert.match(source, /payload version 2 requires report_revision and report_sha256/);
+  assert.match(source, /report_revision and report_sha256 must be provided together/);
+  assert.match(source, /Legacy commit finding payload rebound/);
+  assert.match(source, /legacy_report_unsealed/);
   assert.match(source, /--report-revision "\$REPORT_REVISION"/);
   assert.match(source, /--report-sha256 "\$REPORT_SHA256"/);
   assert.match(source, /name: Deduplicate commit finding dispatch receipt/);

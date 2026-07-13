@@ -1101,6 +1101,7 @@ function dispatchPayload(dispatch: CommitFindingDispatch, reportRepo: string): s
   return `${JSON.stringify({
     event_type: "clawsweeper_commit_finding",
     client_payload: {
+      payload_version: 2,
       dispatch_key: commitFindingDispatchKey(dispatch, reportRepo),
       target_repo: dispatch.targetRepo,
       commit_sha: dispatch.sha,
@@ -1136,6 +1137,8 @@ function workflowDispatchArgs(
     `commit_sha=${dispatch.sha}`,
     "-f",
     `dispatch_key=${commitFindingDispatchKey(dispatch, reportRepo)}`,
+    "-f",
+    "payload_version=2",
     "-f",
     `report_repo=${reportRepo}`,
     "-f",

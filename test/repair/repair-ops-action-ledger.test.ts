@@ -515,6 +515,8 @@ test("commit review and notification workflows publish their operation receipts"
   assert.match(commitSweeper, /reportRevision/);
   assert.match(commitSweeper, /report_sha256: dispatch\.reportSha256/);
   assert.match(commitSweeper, /report_revision: dispatch\.reportRevision/);
+  assert.match(commitSweeper, /payload_version: 2/);
+  assert.match(commitSweeper, /"payload_version=2"/);
   assert.match(commitSweeper, /kind: "commit_review_continuation_dispatch"/);
   assert.match(commitSweeper, /continuation_key=\$\{continuationKey\}/);
   assert.match(commitSweeper, /writeCommitPublicationOutput\("dispatch_count"/);
