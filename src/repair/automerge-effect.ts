@@ -9,6 +9,21 @@ export type AutomergeEffectConfirmation = {
   block: string;
 };
 
+export function squashAutomergeMethodBlock(autoMergeRequest: JsonValue): string {
+  if (!autoMergeRequest) return "";
+  if (typeof autoMergeRequest !== "object" || Array.isArray(autoMergeRequest)) {
+    return "pending auto-merge request does not prove the required SQUASH method";
+  }
+  const request = autoMergeRequest as LooseRecord;
+  const method = String(request.mergeMethod ?? request.merge_method ?? "")
+    .trim()
+    .toUpperCase();
+  if (method === "SQUASH") return "";
+  return method
+    ? `pending auto-merge request uses ${method} instead of SQUASH`
+    : "pending auto-merge request does not prove the required SQUASH method";
+}
+
 export function applyAutomergeResultToCommand(command: LooseRecord, merge: LooseRecord): boolean {
   command.actions = (Array.isArray(command.actions) ? command.actions : []).map(
     (action: LooseRecord) =>
@@ -63,6 +78,24 @@ export function confirmAutomergeEffectSnapshot(
       mergeCommitSha: null,
       pendingReason: "",
       block: "pull request head changed before the automerge effect could be confirmed",
+    };
+  }
+  const viewMethodBlock = squashAutomergeMethodBlock(view.autoMergeRequest);
+  if (viewMethodBlock) {
+    return {
+      mergedAt: null,
+      mergeCommitSha: null,
+      pendingReason: "",
+      block: viewMethodBlock,
+    };
+  }
+  const restMethodBlock = squashAutomergeMethodBlock(pull.auto_merge);
+  if (restMethodBlock) {
+    return {
+      mergedAt: null,
+      mergeCommitSha: null,
+      pendingReason: "",
+      block: restMethodBlock,
     };
   }
   const pendingReason =

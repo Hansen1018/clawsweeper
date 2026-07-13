@@ -9,6 +9,8 @@ import {
 import {
   ensureExactHeadMergeClaim,
   exactHeadMergeClaimBody,
+  inspectExactHeadMergeClaim,
+  releaseExactHeadMergeClaim,
 } from "../../dist/repair/exact-head-merge-claim.js";
 
 const headSha = "a".repeat(40);
@@ -63,6 +65,35 @@ test("automerge effect certification uses exact-head GraphQL queue and auto-merg
   );
   assert.equal(autoMerge.pendingReason, `reviewed head ${headSha} has auto-merge pending`);
   assert.equal(automergeAttemptReceiptOutcome({ confirmation: autoMerge }), "accepted");
+});
+
+test("automerge effect certification rejects non-squash and unproven auto-merge methods", () => {
+  const pull = { head: { sha: headSha }, merged_at: null, merge_commit_sha: null };
+  for (const autoMergeRequest of [
+    { mergeMethod: "MERGE" },
+    { mergeMethod: "REBASE" },
+    { enabledAt: "2026-07-13T08:00:00Z" },
+  ]) {
+    const confirmation = confirmAutomergeEffectSnapshot(
+      {
+        pull,
+        view: { headRefOid: headSha, isInMergeQueue: false, autoMergeRequest },
+      },
+      headSha,
+    );
+    assert.match(confirmation.block, /required SQUASH method|instead of SQUASH/);
+    assert.equal(confirmation.pendingReason, "");
+    assert.equal(automergeAttemptReceiptOutcome({ confirmation }), "unknown");
+  }
+
+  const restConfirmation = confirmAutomergeEffectSnapshot(
+    {
+      pull: { ...pull, auto_merge: { merge_method: "rebase" } },
+      view: { headRefOid: headSha, isInMergeQueue: false, autoMergeRequest: null },
+    },
+    headSha,
+  );
+  assert.match(restConfirmation.block, /REBASE instead of SQUASH/);
 });
 
 test("automerge effect certification preserves uncertainty for conflicting head observations", () => {
@@ -132,7 +163,7 @@ test("fresh comment-router attempts reconcile a durable claim after an unknown m
     owner: "comment_router",
     claimant: `comment_router:9001:${runAttempt}`,
     appId: 3306130,
-    appSlug: "openclaw-clawsweeper",
+    appSlug: "clawsweeper",
   });
   const io = {
     listComments: () => comments,
@@ -141,8 +172,8 @@ test("fresh comment-router attempts reconcile a durable claim after an unknown m
       const comment = {
         id: 1000 + claimCreates,
         body,
-        performed_via_github_app: { id: 3306130, slug: "openclaw-clawsweeper" },
-        user: { login: "openclaw-clawsweeper[bot]" },
+        performed_via_github_app: { id: 3306130, slug: "clawsweeper" },
+        user: { login: "clawsweeper[bot]" },
       };
       comments.push(comment);
       return comment;
@@ -160,39 +191,149 @@ test("fresh comment-router attempts reconcile a durable claim after an unknown m
   assert.equal(mergeRequests, 1);
 });
 
-test("exact-head merge claims fail closed on a trusted conflicting head", () => {
-  const conflicting = {
+test("released exact-head merge claims can be reacquired by a fresh workflow attempt", () => {
+  const comments: Record<string, any>[] = [];
+  let nextId = 1001;
+  const request = (runAttempt: number) => ({
     repository: "openclaw/openclaw",
     number: 42,
-    headSha: "b".repeat(40),
+    headSha,
     method: "squash" as const,
     owner: "post_flight",
-    claimant: "post_flight:8001:1",
+    claimant: `post_flight:8001:${runAttempt}`,
     appId: 3306130,
-    appSlug: "openclaw-clawsweeper",
+    appSlug: "clawsweeper",
+  });
+  const io = {
+    listComments: () => comments,
+    createComment: (body: string) => {
+      const comment = {
+        id: nextId++,
+        body,
+        performed_via_github_app: { id: 3306130, slug: "clawsweeper" },
+        user: { login: "clawsweeper[bot]" },
+      };
+      comments.push(comment);
+      return comment;
+    },
+  };
+
+  const first = ensureExactHeadMergeClaim(request(1), io);
+  assert.equal(first.status, "acquired");
+  if (first.status !== "acquired") return;
+  assert.equal(releaseExactHeadMergeClaim(request(1), first.claimId, io).status, "released");
+  assert.equal(inspectExactHeadMergeClaim(request(1), io.listComments).status, "released");
+
+  const retry = ensureExactHeadMergeClaim(request(2), io);
+  assert.equal(retry.status, "acquired");
+  assert.equal(comments.length, 3);
+});
+
+test("an active claim for an older head does not block the superseding head", () => {
+  const comments: Record<string, any>[] = [];
+  let nextId = 2001;
+  const request = (candidateHead: string, runAttempt: number) => ({
+    repository: "openclaw/openclaw",
+    number: 42,
+    headSha: candidateHead,
+    method: "squash" as const,
+    owner: "apply_result",
+    claimant: `apply_result:8002:${runAttempt}`,
+    appId: 3306130,
+    appSlug: "clawsweeper",
+  });
+  const io = {
+    listComments: () => comments,
+    createComment: (body: string) => {
+      const comment = {
+        id: nextId++,
+        body,
+        performed_via_github_app: { id: 3306130, slug: "clawsweeper" },
+        user: { login: "clawsweeper[bot]" },
+      };
+      comments.push(comment);
+      return comment;
+    },
+  };
+
+  assert.equal(ensureExactHeadMergeClaim(request("b".repeat(40), 1), io).status, "acquired");
+  assert.equal(ensureExactHeadMergeClaim(request(headSha, 2), io).status, "acquired");
+  assert.equal(comments.length, 2);
+});
+
+test("trusted claim markers for a different pull request still fail closed", () => {
+  const request = {
+    repository: "openclaw/openclaw",
+    number: 42,
+    headSha,
+    method: "squash" as const,
+    owner: "apply_result",
+    claimant: "apply_result:8002:1",
+    appId: 3306130,
+    appSlug: "clawsweeper",
   };
   const comments = [
     {
-      id: 1001,
-      body: exactHeadMergeClaimBody(conflicting),
-      performed_via_github_app: { id: 3306130, slug: "openclaw-clawsweeper" },
-      user: { login: "openclaw-clawsweeper[bot]" },
+      id: 2501,
+      body: exactHeadMergeClaimBody({ ...request, number: 43 }),
+      performed_via_github_app: { id: 3306130, slug: "clawsweeper" },
+      user: { login: "clawsweeper[bot]" },
     },
   ];
-  const result = ensureExactHeadMergeClaim(
-    {
-      ...conflicting,
-      headSha,
-      owner: "apply_result",
-      claimant: "apply_result:8002:1",
+  const result = ensureExactHeadMergeClaim(request, {
+    listComments: () => comments,
+    createComment: () => {
+      throw new Error("must not create after conflicting durable state");
     },
-    {
-      listComments: () => comments,
-      createComment: () => {
-        throw new Error("must not create a claim after conflicting durable state");
-      },
-    },
-  );
+  });
   assert.equal(result.status, "blocked");
   assert.match(result.reason, /conflicting durable merge claim/);
+});
+
+test("a release marker retires the raced claim generation but not later claims", () => {
+  const request = {
+    repository: "openclaw/openclaw",
+    number: 42,
+    headSha,
+    method: "squash" as const,
+    owner: "post_flight",
+    claimant: "post_flight:8003:1",
+    appId: 3306130,
+    appSlug: "clawsweeper",
+  };
+  const competing = { ...request, claimant: "post_flight:8004:1" };
+  const comments: Record<string, any>[] = [
+    {
+      id: 3001,
+      body: exactHeadMergeClaimBody(request),
+      performed_via_github_app: { id: 3306130, slug: "clawsweeper" },
+      user: { login: "clawsweeper[bot]" },
+    },
+    {
+      id: 3002,
+      body: exactHeadMergeClaimBody(competing),
+      performed_via_github_app: { id: 3306130, slug: "clawsweeper" },
+      user: { login: "clawsweeper[bot]" },
+    },
+  ];
+  let nextId = 3003;
+  const io = {
+    listComments: () => comments,
+    createComment: (body: string) => {
+      const comment = {
+        id: nextId++,
+        body,
+        performed_via_github_app: { id: 3306130, slug: "clawsweeper" },
+        user: { login: "clawsweeper[bot]" },
+      };
+      comments.push(comment);
+      return comment;
+    },
+  };
+
+  assert.equal(releaseExactHeadMergeClaim(request, 3001, io).status, "released");
+  assert.equal(inspectExactHeadMergeClaim(request, io.listComments).status, "released");
+  const retry = ensureExactHeadMergeClaim({ ...request, claimant: "post_flight:8005:1" }, io);
+  assert.equal(retry.status, "acquired");
+  assert.equal(retry.claimId, 3004);
 });

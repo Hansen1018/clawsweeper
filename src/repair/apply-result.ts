@@ -35,12 +35,24 @@ import {
   writeRepairSquashMergeBody,
 } from "./repair-merge-message.js";
 import { runtimeStrictBaseBindingBlock } from "./strict-base-binding.js";
+import { squashAutomergeMethodBlock } from "./automerge-effect.js";
 import {
   ensureExactHeadMergeClaim,
+  exactHeadMergeClaimIdentity,
   exactHeadMergeClaimant,
   inspectExactHeadMergeClaim,
+  isTrustedExactHeadMergeClaimComment,
+  isTrustedExactHeadMergeClaimReleaseComment,
+  releaseExactHeadMergeClaim,
+  type ExactHeadMergeClaimInspection,
   type ExactHeadMergeClaimRequest,
 } from "./exact-head-merge-claim.js";
+import {
+  recordRepairMutationObservedSafely,
+  repairSourceRevision,
+  runRepairMutation,
+  type RepairLifecycleInput,
+} from "./repair-action-ledger.js";
 import {
   compactPrCloseCoverageProofComment,
   compactPrCloseCoverageProofText,
@@ -577,8 +589,12 @@ function applyMergeAction({
   const pullRequest = fetchPullRequest(result.repo, target);
   const view = fetchPullRequestView(result.repo, target);
   const authorizedHeadSha = String(pullRequest.head?.sha ?? "");
-  const preliminaryClaim = inspectApplyMergeClaim(result.repo, target, authorizedHeadSha);
-  if (preliminaryClaim.status === "blocked") {
+  const mergeEnabled = process.env.CLAWSWEEPER_ALLOW_MERGE === "1" && !dryRun;
+  const preliminaryClaim: ExactHeadMergeClaimInspection =
+    mergeEnabled && isFullCommitSha(authorizedHeadSha)
+      ? inspectApplyMergeClaim(result.repo, target, authorizedHeadSha)
+      : { status: "absent", reason: "", claimId: null };
+  if (preliminaryClaim.status === "blocked" || preliminaryClaim.status === "unknown") {
     return {
       ...base,
       status: "blocked",
@@ -586,8 +602,11 @@ function applyMergeAction({
       live_state: live.state,
       live_updated_at: live.updated_at,
       merge_method: "squash",
+      ...(preliminaryClaim.status === "unknown" ? { requeue_required: true } : {}),
     };
   }
+  const trustedClaimHistory =
+    preliminaryClaim.status === "existing" || preliminaryClaim.status === "released";
   const expectedUpdatedAt = action.target_updated_at ?? action.live_updated_at;
   if (!expectedUpdatedAt && !allowMissingUpdatedAt) {
     return {
@@ -598,11 +617,7 @@ function applyMergeAction({
       live_updated_at: live.updated_at,
     };
   }
-  if (
-    expectedUpdatedAt &&
-    expectedUpdatedAt !== live.updated_at &&
-    preliminaryClaim.status !== "existing"
-  ) {
+  if (expectedUpdatedAt && expectedUpdatedAt !== live.updated_at && !trustedClaimHistory) {
     return {
       ...base,
       status: "blocked",
@@ -788,11 +803,7 @@ function applyMergeAction({
       merge_method: "squash",
     };
   }
-  if (
-    expectedUpdatedAt &&
-    finalLive.updated_at !== expectedUpdatedAt &&
-    preliminaryClaim.status !== "existing"
-  ) {
+  if (expectedUpdatedAt && finalLive.updated_at !== expectedUpdatedAt && !trustedClaimHistory) {
     return {
       ...base,
       status: "blocked",
@@ -846,35 +857,84 @@ function applyMergeAction({
     };
   }
   const reconciliationOnly = mergeClaim.status === "existing";
-  if (!reconciliationOnly) {
-    const claimedPull = fetchPullRequestOnce(result.repo, target);
-    const claimedView = fetchPullRequestViewOnce(result.repo, target);
+  if (mergeClaim.status === "acquired") {
+    const releaseBeforeDispatch = (actionResult: LooseRecord) =>
+      releaseApplyMergeClaimBeforeDispatch({
+        actionResult,
+        repository: result.repo,
+        number: target,
+        headSha: authorizedHeadSha,
+        claimId: mergeClaim.claimId,
+      });
+    let claimedPull;
+    let claimedView;
+    try {
+      claimedPull = fetchPullRequestOnce(result.repo, target);
+      claimedView = fetchPullRequestViewOnce(result.repo, target);
+    } catch (error) {
+      return releaseBeforeDispatch({
+        ...base,
+        status: "blocked",
+        reason: `post-claim merge preflight could not be refreshed: ${ghErrorText(error)}`,
+        live_state: finalLive.state,
+        live_updated_at: finalLive.updated_at,
+        merge_method: "squash",
+        requeue_required: true,
+      });
+    }
     const claimedRestHeadBlock = validatePullRequestHeadBinding({
       authorizedHeadSha,
       pullRequest: claimedPull,
     });
     if (claimedRestHeadBlock) {
-      return {
+      return releaseBeforeDispatch({
         ...base,
         status: "blocked",
         reason: claimedRestHeadBlock,
         live_state: claimedPull.state ?? finalLive.state,
         live_updated_at: claimedPull.updated_at ?? finalLive.updated_at,
         merge_method: "squash",
-      };
+      });
     }
     const claimedViewHeadBlock = validateMergeHeadBinding({
       authorizedHeadSha,
       view: claimedView,
     });
     if (claimedViewHeadBlock) {
-      return {
+      return releaseBeforeDispatch({
         ...base,
         status: "blocked",
         reason: claimedViewHeadBlock,
         live_state: claimedPull.state ?? finalLive.state,
         live_updated_at: claimedPull.updated_at ?? finalLive.updated_at,
         merge_method: "squash",
+      });
+    }
+    const claimedMerge = confirmExactMergeSnapshot(claimedPull, authorizedHeadSha);
+    if (claimedMerge.block) {
+      return releaseBeforeDispatch({
+        ...base,
+        status: "blocked",
+        reason: claimedMerge.block,
+        live_state: claimedPull.state ?? finalLive.state,
+        live_updated_at: claimedPull.updated_at ?? finalLive.updated_at,
+        merge_method: "squash",
+      });
+    }
+    if (claimedMerge.mergedAt) {
+      recordApplyMergeObserved(target, authorizedHeadSha);
+      return {
+        ...base,
+        status: "executed",
+        reason: "merge confirmed after exact-head claim",
+        live_state: "merged",
+        live_updated_at: claimedPull.updated_at ?? finalLive.updated_at,
+        merged_at: claimedMerge.mergedAt,
+        merge_commit_sha: claimedPull.merge_commit_sha ?? null,
+        merge_method: "squash",
+        commit_subject: mergeMessage.subject,
+        summary_lines: mergeMessage.summaryLines,
+        fixup_lines: mergeMessage.fixupLines,
       };
     }
     const claimedHardBlock = validateMergeablePullRequestHard({
@@ -882,58 +942,91 @@ function applyMergeAction({
       view: claimedView,
     });
     if (claimedHardBlock) {
-      return {
+      return releaseBeforeDispatch({
         ...base,
         status: "blocked",
         reason: claimedHardBlock,
         live_state: claimedPull.state ?? finalLive.state,
         live_updated_at: claimedPull.updated_at ?? finalLive.updated_at,
         merge_method: "squash",
-      };
+      });
     }
-    const claimedLive = fetchIssue(result.repo, target);
+    let claimedLive;
+    try {
+      claimedLive = fetchIssue(result.repo, target);
+    } catch (error) {
+      return releaseBeforeDispatch({
+        ...base,
+        status: "blocked",
+        reason: `post-claim security state could not be refreshed: ${ghErrorText(error)}`,
+        live_state: claimedPull.state ?? finalLive.state,
+        live_updated_at: claimedPull.updated_at ?? finalLive.updated_at,
+        merge_method: "squash",
+        requeue_required: true,
+      });
+    }
     if (hasSecuritySignal(claimedLive)) {
-      return {
+      return releaseBeforeDispatch({
         ...base,
         status: "blocked",
         reason: "security-sensitive target requires central security triage",
         live_state: claimedLive.state,
         live_updated_at: claimedLive.updated_at,
         merge_method: "squash",
-      };
+      });
     }
-    const claimedStrictBaseBindingBlock = runtimeStrictBaseBindingBlock({
-      repo: result.repo,
-      baseBranch: String(claimedView.baseRefName ?? claimedPull.base?.ref ?? ""),
-      policyReadJson: rulesetPolicyReader(),
-    });
+    let claimedStrictBaseBindingBlock = "";
+    try {
+      claimedStrictBaseBindingBlock = runtimeStrictBaseBindingBlock({
+        repo: result.repo,
+        baseBranch: String(claimedView.baseRefName ?? claimedPull.base?.ref ?? ""),
+        policyReadJson: rulesetPolicyReader(),
+      });
+    } catch (error) {
+      return releaseBeforeDispatch({
+        ...base,
+        status: "blocked",
+        reason: `post-claim strict-base policy could not be refreshed: ${ghErrorText(error)}`,
+        live_state: claimedLive.state,
+        live_updated_at: claimedLive.updated_at,
+        merge_method: "squash",
+        requeue_required: true,
+      });
+    }
     if (claimedStrictBaseBindingBlock) {
-      return {
+      return releaseBeforeDispatch({
         ...base,
         status: "blocked",
         reason: claimedStrictBaseBindingBlock,
         live_state: claimedLive.state,
         live_updated_at: claimedLive.updated_at,
         merge_method: "squash",
-      };
+      });
     }
     const claimedPendingMerge = exactHeadPendingMerge(claimedView, authorizedHeadSha);
     if (claimedPendingMerge) {
+      recordApplyMergeObserved(target, authorizedHeadSha);
       return pendingMergeAction({ base, live: claimedLive, reason: claimedPendingMerge });
     }
     const claimedReadinessBlock = validateMergeablePullRequestReadiness({ view: claimedView });
     if (claimedReadinessBlock) {
-      return {
+      return releaseBeforeDispatch({
         ...base,
         status: "blocked",
         reason: claimedReadinessBlock,
         live_state: claimedLive.state,
         live_updated_at: claimedLive.updated_at,
         merge_method: "squash",
-      };
+      });
     }
     try {
-      ghText(mergeArgs);
+      runRepairMutation(applyResultLifecycle(target), {
+        kind: "apply_result_merge",
+        identity: applyMergeMutationIdentity(target, authorizedHeadSha),
+        component: "apply_result",
+        operation: () => ghText(mergeArgs),
+        outcome: () => "unknown",
+      });
     } catch (error) {
       commandError = error;
     }
@@ -1024,6 +1117,7 @@ function applyMergeAction({
     }
     const pendingReason = exactHeadPendingMerge(reconciledView, authorizedHeadSha);
     if (pendingReason) {
+      recordApplyMergeObserved(target, authorizedHeadSha);
       return pendingMergeAction({
         base,
         live: merged,
@@ -1051,6 +1145,7 @@ function applyMergeAction({
     };
   }
 
+  recordApplyMergeObserved(target, authorizedHeadSha);
   return {
     ...base,
     status: "executed",
@@ -1135,12 +1230,81 @@ function claimApplyMergeRequest(repository: string, number: number, headSha: str
   return ensureExactHeadMergeClaim(request, {
     listComments: () => listApplyMergeClaimComments(request),
     createComment: (body) =>
-      ghJsonOnce([
-        "api",
-        `repos/${request.repository}/issues/${request.number}/comments`,
-        "-f",
-        `body=${body}`,
-      ]),
+      runRepairMutation(applyResultLifecycle(number), {
+        kind: "apply_result_merge_claim",
+        identity: exactHeadMergeClaimIdentity(request),
+        component: "merge_claim",
+        operation: () =>
+          ghJsonOnce([
+            "api",
+            `repos/${request.repository}/issues/${request.number}/comments`,
+            "-f",
+            `body=${body}`,
+          ]),
+        outcome: (comment) =>
+          isTrustedExactHeadMergeClaimComment(comment, request) ? "accepted" : "unknown",
+      }),
+  });
+}
+
+function releaseApplyMergeClaimBeforeDispatch({
+  actionResult,
+  repository,
+  number,
+  headSha,
+  claimId,
+}: {
+  actionResult: LooseRecord;
+  repository: string;
+  number: number;
+  headSha: string;
+  claimId: number;
+}) {
+  let release;
+  try {
+    release = releaseApplyMergeClaim(repository, number, headSha, claimId);
+  } catch (error) {
+    release = {
+      status: "unknown" as const,
+      reason: `exact-head merge claim release failed: ${ghErrorText(error)}`,
+      claimId,
+    };
+  }
+  if (release.status === "released") return actionResult;
+  return {
+    ...actionResult,
+    status: "blocked",
+    reason: `${String(actionResult.reason ?? "merge aborted before dispatch")}; ${release.reason}`,
+    ...(release.status === "unknown" ? { requeue_required: true } : {}),
+  };
+}
+
+function releaseApplyMergeClaim(
+  repository: string,
+  number: number,
+  headSha: string,
+  claimId: number,
+) {
+  const request = applyMergeClaimRequest(repository, number, headSha);
+  return releaseExactHeadMergeClaim(request, claimId, {
+    listComments: () => listApplyMergeClaimComments(request),
+    createComment: (body) =>
+      runRepairMutation(applyResultLifecycle(number), {
+        kind: "apply_result_merge_claim_release",
+        identity: { ...exactHeadMergeClaimIdentity(request), claimId },
+        component: "merge_claim",
+        operation: () =>
+          ghJsonOnce([
+            "api",
+            `repos/${request.repository}/issues/${request.number}/comments`,
+            "-f",
+            `body=${body}`,
+          ]),
+        outcome: (comment) =>
+          isTrustedExactHeadMergeClaimReleaseComment(comment, request, claimId)
+            ? "accepted"
+            : "unknown",
+      }),
   });
 }
 
@@ -1170,6 +1334,35 @@ function listApplyMergeClaimComments(request: ExactHeadMergeClaimRequest) {
   return ghPaged<LooseRecord>(
     `repos/${request.repository}/issues/${request.number}/comments?per_page=100`,
   );
+}
+
+function applyMergeMutationIdentity(number: number, headSha: string) {
+  return {
+    repo: result.repo,
+    number,
+    headSha,
+    method: "squash",
+  };
+}
+
+function recordApplyMergeObserved(number: number, headSha: string) {
+  recordRepairMutationObservedSafely(applyResultLifecycle(number), {
+    kind: "apply_result_merge",
+    identity: applyMergeMutationIdentity(number, headSha),
+    component: "apply_result",
+  });
+}
+
+function applyResultLifecycle(number: number | null): RepairLifecycleInput {
+  return {
+    repository: result.repo,
+    workKey: `apply-result:${result.cluster_id ?? result.run_id ?? result.reviewed_sha ?? "unknown"}`,
+    ...(number && number > 0 ? { number } : {}),
+    sourceRevision:
+      repairSourceRevision(job.frontmatter) ??
+      repairSourceRevision({ reviewed_sha: result.reviewed_sha ?? result.head_sha }),
+    subjectKind: number && number > 0 ? "pull_request" : "workflow",
+  };
 }
 
 function exactHeadPendingMerge(view: LooseRecord, authorizedHeadSha: string): string {
@@ -2009,6 +2202,10 @@ function validateMergeablePullRequestHard({ pullRequest, view }: LooseRecord) {
   if (pullRequest.draft || view.isDraft) return "pull request is draft";
   if (String(view.baseRefName ?? pullRequest.base?.ref ?? "") !== "main")
     return "pull request base is not main";
+  const viewAutomergeMethodBlock = squashAutomergeMethodBlock(view.autoMergeRequest);
+  if (viewAutomergeMethodBlock) return viewAutomergeMethodBlock;
+  const restAutomergeMethodBlock = squashAutomergeMethodBlock(pullRequest.auto_merge);
+  if (restAutomergeMethodBlock) return restAutomergeMethodBlock;
   if (["CHANGES_REQUESTED", "REVIEW_REQUIRED"].includes(String(view.reviewDecision ?? ""))) {
     return `review decision is ${view.reviewDecision}`;
   }

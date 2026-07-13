@@ -21,12 +21,15 @@ import {
   automergeCommandResponseAmbiguous,
   automergeUnconfirmedFailureDisposition,
   confirmAutomergeEffectSnapshot,
+  squashAutomergeMethodBlock,
 } from "./automerge-effect.js";
 import {
   ensureExactHeadMergeClaim,
   exactHeadMergeClaimIdentity,
   exactHeadMergeClaimant,
   isTrustedExactHeadMergeClaimComment,
+  isTrustedExactHeadMergeClaimReleaseComment,
+  releaseExactHeadMergeClaim,
   type ExactHeadMergeClaimRequest,
   type ExactHeadMergeClaimResult,
 } from "./exact-head-merge-claim.js";
@@ -3887,18 +3890,45 @@ function executeAutomerge(command: LooseRecord): LooseRecord {
   if (mergeClaim.status !== "acquired") {
     return reconcileClaimedAutomergeRequest(command, mergeClaim, waitedMs, transientObservations);
   }
-  const claimedView = fetchPullRequestView(command.issue_number);
-  const claimedTarget = latestAutomergeTarget(command, claimedView);
+  const releaseBeforeDispatch = (action: LooseRecord) =>
+    releaseAutomergeMergeClaimBeforeDispatch(command, mergeClaim.claimId, action);
+  let claimedView;
+  let claimedTarget;
+  try {
+    claimedView = fetchPullRequestView(command.issue_number);
+    claimedTarget = latestAutomergeTarget(command, claimedView);
+  } catch (error) {
+    return releaseBeforeDispatch({
+      action: "merge",
+      status: "waiting",
+      reason: `post-claim automerge state could not be refreshed: ${compactGhError(error)}`,
+      merge_method: "squash",
+      transient_wait_ms: waitedMs,
+      transient_observations: transientObservations,
+    });
+  }
   const claimedExistingMerge = observeExistingAutomergeEffect(command, claimedView);
   if (claimedExistingMerge) return claimedExistingMerge;
-  const claimedReviewLeaseBlock = trustedAutomationReviewLeaseBlockReason(command);
+  let claimedReviewLeaseBlock;
+  try {
+    claimedReviewLeaseBlock = trustedAutomationReviewLeaseBlockReason(command);
+  } catch (error) {
+    return releaseBeforeDispatch({
+      action: "merge",
+      status: "waiting",
+      reason: `post-claim review lease could not be refreshed: ${compactGhError(error)}`,
+      merge_method: "squash",
+      transient_wait_ms: waitedMs,
+      transient_observations: transientObservations,
+    });
+  }
   if (claimedReviewLeaseBlock) {
-    return {
+    return releaseBeforeDispatch({
       action: "merge",
       status: claimedReviewLeaseBlock.retryable ? "waiting" : "blocked",
       reason: claimedReviewLeaseBlock.reason,
       merge_method: "squash",
-    };
+    });
   }
   const claimedHardBlock = validateAutomergeHardReadiness({
     command,
@@ -3906,20 +3936,36 @@ function executeAutomerge(command: LooseRecord): LooseRecord {
     target: claimedTarget,
   });
   if (claimedHardBlock) {
-    return automergeReadinessAction(claimedHardBlock, waitedMs, transientObservations);
+    return releaseBeforeDispatch(
+      automergeReadinessAction(claimedHardBlock, waitedMs, transientObservations),
+    );
   }
-  const claimedStrictBaseBindingBlock = runtimeStrictBaseBindingBlock({
-    repo: command.repo,
-    baseBranch: String(claimedView.baseRefName ?? claimedTarget.base_ref ?? targetBranch ?? "main"),
-    policyReadJson: rulesetPolicyReader(),
-  });
+  let claimedStrictBaseBindingBlock = "";
+  try {
+    claimedStrictBaseBindingBlock = runtimeStrictBaseBindingBlock({
+      repo: command.repo,
+      baseBranch: String(
+        claimedView.baseRefName ?? claimedTarget.base_ref ?? targetBranch ?? "main",
+      ),
+      policyReadJson: rulesetPolicyReader(),
+    });
+  } catch (error) {
+    return releaseBeforeDispatch({
+      action: "merge",
+      status: "waiting",
+      reason: `post-claim strict-base policy could not be refreshed: ${compactGhError(error)}`,
+      merge_method: "squash",
+      transient_wait_ms: waitedMs,
+      transient_observations: transientObservations,
+    });
+  }
   if (claimedStrictBaseBindingBlock) {
-    return {
+    return releaseBeforeDispatch({
       action: "merge",
       status: "blocked",
       reason: claimedStrictBaseBindingBlock,
       merge_method: "squash",
-    };
+    });
   }
   const claimedPendingReason = exactHeadAutomergePendingReason(command, claimedView);
   if (claimedPendingReason) {
@@ -3931,7 +3977,9 @@ function executeAutomerge(command: LooseRecord): LooseRecord {
     target: claimedTarget,
   });
   if (claimedReadinessBlock) {
-    return automergeReadinessAction(claimedReadinessBlock, waitedMs, transientObservations);
+    return releaseBeforeDispatch(
+      automergeReadinessAction(claimedReadinessBlock, waitedMs, transientObservations),
+    );
   }
   // Keep the exact-head merge request one-shot; reconcile its effect before closing the receipt.
   const result = runGitHubSpawnMutation(
@@ -4224,6 +4272,58 @@ function claimAutomergeMergeRequest(command: LooseRecord): ExactHeadMergeClaimRe
   });
 }
 
+function releaseAutomergeMergeClaimBeforeDispatch(
+  command: LooseRecord,
+  claimId: number,
+  action: LooseRecord,
+): LooseRecord {
+  let release;
+  try {
+    release = releaseAutomergeMergeClaim(command, claimId);
+  } catch (error) {
+    release = {
+      status: "unknown" as const,
+      reason: `exact-head merge claim release failed: ${compactGhError(error)}`,
+      claimId,
+    };
+  }
+  if (release.status === "released") return action;
+  return {
+    ...action,
+    status: release.status === "unknown" ? "waiting" : "blocked",
+    reason: `${String(action.reason ?? "automerge aborted before dispatch")}; ${release.reason}`,
+  };
+}
+
+function releaseAutomergeMergeClaim(command: LooseRecord, claimId: number) {
+  const request = automergeMergeClaimRequest(command);
+  return releaseExactHeadMergeClaim(request, claimId, {
+    listComments: () =>
+      ghPaged<LooseRecord>(
+        `repos/${request.repository}/issues/${request.number}/comments?per_page=100`,
+      ),
+    createComment: (body) =>
+      runCommandMutation(command, {
+        kind: "pull_request_merge_claim_release",
+        identity: { ...exactHeadMergeClaimIdentity(request), claimId },
+        operation: () =>
+          ghJson(
+            [
+              "api",
+              `repos/${request.repository}/issues/${request.number}/comments`,
+              "-f",
+              `body=${body}`,
+            ],
+            { attempts: 1 },
+          ),
+        outcome: (comment) =>
+          isTrustedExactHeadMergeClaimReleaseComment(comment, request, claimId)
+            ? "accepted"
+            : "unknown",
+      }),
+  });
+}
+
 function automergeMergeClaimRequest(command: LooseRecord): ExactHeadMergeClaimRequest {
   return {
     repository: String(command.repo ?? targetRepo),
@@ -4371,6 +4471,8 @@ function validateAutomergeHardReadiness({ command, view, target }: LooseRecord) 
     return `pull request is ${String(view.state).toLowerCase()}`;
   if (view.isDraft) return "pull request is draft";
   if (String(view.baseRefName ?? "") !== "main") return "pull request base is not main";
+  const automergeMethodBlock = squashAutomergeMethodBlock(view.autoMergeRequest);
+  if (automergeMethodBlock) return automergeMethodBlock;
   const headBlock = reviewedHeadShaBlockReason({
     expectedHeadSha: command.expected_head_sha,
     currentHeadSha: view.headRefOid,

@@ -186,6 +186,33 @@ test("automerge fresh attempts reconcile a durable exact-head claim before merge
   );
 });
 
+test("all exact-head merge owners release unused claims and require squash auto-merge", () => {
+  const apply = readText("src/repair/apply-result.ts");
+  const router = readText("src/repair/comment-router.ts");
+  const postFlight = readText("src/repair/post-flight.ts");
+  const effect = readText("src/repair/automerge-effect.ts");
+
+  assert.match(
+    apply,
+    /function releaseApplyMergeClaim[\s\S]*releaseExactHeadMergeClaim[\s\S]*"apply_result_merge_claim_release"/,
+  );
+  assert.match(
+    router,
+    /function releaseAutomergeMergeClaim[\s\S]*releaseExactHeadMergeClaim[\s\S]*"pull_request_merge_claim_release"/,
+  );
+  assert.match(
+    postFlight,
+    /function releasePostFlightMergeClaim[\s\S]*releaseExactHeadMergeClaim[\s\S]*"post_flight_merge_claim_release"/,
+  );
+  assert.match(apply, /validateMergeablePullRequestHard[\s\S]*squashAutomergeMethodBlock/);
+  assert.match(router, /validateAutomergeHardReadiness[\s\S]*squashAutomergeMethodBlock/);
+  assert.match(postFlight, /validateFixPrMergeHardReadiness[\s\S]*squashAutomergeMethodBlock/);
+  assert.match(
+    effect,
+    /function squashAutomergeMethodBlock[\s\S]*method === "SQUASH"[\s\S]*instead of SQUASH/,
+  );
+});
+
 test("automerge execution never invents a merge timestamp", () => {
   const source = readText("src/repair/comment-router.ts");
   const executeAutomerge = source.slice(

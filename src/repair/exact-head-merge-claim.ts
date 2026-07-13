@@ -1,8 +1,11 @@
 import type { LooseRecord } from "./json-types.js";
 
 const CLAIM_PREFIX = "clawsweeper-exact-head-merge-claim:v1";
+const RELEASE_PREFIX = "clawsweeper-exact-head-merge-release:v1";
 const CLAIM_PATTERN =
   /<!-- clawsweeper-exact-head-merge-claim:v1 repo=([^ ]+) pr=([1-9][0-9]*) head=([a-fA-F0-9]{40}) method=([a-z]+) owner=([a-z0-9_-]+) claimant=([^ ]+) -->/g;
+const RELEASE_PATTERN =
+  /<!-- clawsweeper-exact-head-merge-release:v1 claim=([1-9][0-9]*) repo=([^ ]+) pr=([1-9][0-9]*) head=([a-fA-F0-9]{40}) method=([a-z]+) owner=([a-z0-9_-]+) claimant=([^ ]+) -->/g;
 
 export type ExactHeadMergeClaimIdentity = {
   repository: string;
@@ -25,17 +28,43 @@ export type ExactHeadMergeClaimResult =
 
 export type ExactHeadMergeClaimInspection =
   | { status: "absent"; reason: ""; claimId: null }
+  | {
+      status: "released";
+      reason: "prior exact-head merge claim was explicitly released";
+      claimId: null;
+    }
   | Exclude<ExactHeadMergeClaimResult, { status: "acquired" }>;
+
+export type ExactHeadMergeClaimReleaseResult =
+  | { status: "released"; reason: ""; claimId: number }
+  | { status: "blocked" | "unknown"; reason: string; claimId: number };
 
 type ParsedClaim = ExactHeadMergeClaimIdentity & {
   owner: string;
   claimant: string;
 };
 
+type ParsedRelease = ParsedClaim & {
+  claimId: number;
+};
+
 type TrustedClaim = {
   comment: LooseRecord;
   id: number;
   claim: ParsedClaim;
+};
+
+type TrustedRelease = {
+  comment: LooseRecord;
+  id: number;
+  release: ParsedRelease;
+};
+
+type InspectedClaims = {
+  claims: TrustedClaim[];
+  exact: TrustedClaim[];
+  exactHistory: boolean;
+  releases: TrustedRelease[];
 };
 
 export function exactHeadMergeClaimant(
@@ -61,7 +90,19 @@ export function exactHeadMergeClaimBody(request: ExactHeadMergeClaimRequest): st
   const normalized = normalizeRequest(request);
   return [
     exactHeadMergeClaimMarker(normalized),
-    `ClawSweeper reserved the exact-head squash merge request for \`${normalized.headSha.slice(0, 12)}\`. Later workflow attempts will only reconcile GitHub state and will not issue the merge again.`,
+    `ClawSweeper reserved the exact-head squash merge request for \`${normalized.headSha.slice(0, 12)}\`. Later workflow attempts will only reconcile GitHub state unless this reservation is explicitly released before dispatch.`,
+  ].join("\n");
+}
+
+export function exactHeadMergeClaimReleaseBody(
+  request: ExactHeadMergeClaimRequest,
+  claimId: number,
+): string {
+  const normalized = normalizeRequest(request);
+  const normalizedClaimId = normalizeCommentId(claimId, "claim");
+  return [
+    exactHeadMergeReleaseMarker(normalized, normalizedClaimId),
+    `ClawSweeper released the unused exact-head squash merge reservation for \`${normalized.headSha.slice(0, 12)}\`. No merge request was dispatched under claim ${normalizedClaimId}.`,
   ].join("\n");
 }
 
@@ -74,11 +115,33 @@ export function isTrustedExactHeadMergeClaimComment(
   const body = String(comment.body ?? "");
   const claims = parseClaimMarkers(body);
   return (
-    claimPrefixCount(body) === 1 &&
+    markerCount(body, CLAIM_PREFIX) === 1 &&
+    markerCount(body, RELEASE_PREFIX) === 0 &&
     claims.length === 1 &&
     sameClaim(claims[0]!, normalized) &&
     claims[0]!.owner === normalized.owner &&
     claims[0]!.claimant === normalized.claimant
+  );
+}
+
+export function isTrustedExactHeadMergeClaimReleaseComment(
+  comment: LooseRecord,
+  request: ExactHeadMergeClaimRequest,
+  claimId: number,
+): boolean {
+  const normalized = normalizeRequest(request);
+  const normalizedClaimId = normalizeCommentId(claimId, "claim");
+  if (!trustedClaimAuthor(comment, normalized)) return false;
+  const body = String(comment.body ?? "");
+  const releases = parseReleaseMarkers(body);
+  return (
+    markerCount(body, CLAIM_PREFIX) === 0 &&
+    markerCount(body, RELEASE_PREFIX) === 1 &&
+    releases.length === 1 &&
+    releases[0]!.claimId === normalizedClaimId &&
+    sameClaim(releases[0]!, normalized) &&
+    releases[0]!.owner === normalized.owner &&
+    releases[0]!.claimant === normalized.claimant
   );
 }
 
@@ -92,7 +155,13 @@ export function ensureExactHeadMergeClaim(
   const normalized = normalizeRequest(request);
   const marker = exactHeadMergeClaimMarker(normalized);
   const initial = inspectExactHeadMergeClaim(normalized, io.listComments);
-  if (initial.status !== "absent") return initial;
+  if (
+    initial.status === "existing" ||
+    initial.status === "blocked" ||
+    initial.status === "unknown"
+  ) {
+    return initial;
+  }
 
   let createError = "";
   try {
@@ -103,7 +172,7 @@ export function ensureExactHeadMergeClaim(
 
   const confirmed = inspectClaims(normalized, io.listComments);
   if ("failure" in confirmed) return confirmed.failure;
-  if (confirmed.exact.length === 0) {
+  if (confirmed.value.exact.length === 0) {
     return {
       status: "unknown",
       reason: `exact-head merge claim outcome could not be confirmed${createError ? `: ${createError}` : ""}`,
@@ -111,12 +180,10 @@ export function ensureExactHeadMergeClaim(
     };
   }
 
-  const ownClaims = confirmed.exact.filter((claim) =>
+  const ownClaims = confirmed.value.exact.filter((claim) =>
     String(claim.comment.body ?? "").includes(marker),
   );
-  const winningClaim = confirmed.exact.reduce((winner, claim) =>
-    claim.id < winner.id ? claim : winner,
-  );
+  const winningClaim = confirmed.value.exact[0]!;
   if (ownClaims.some((claim) => claim.id === winningClaim.id)) {
     return { status: "acquired", reason: "", claimId: winningClaim.id };
   }
@@ -127,6 +194,90 @@ export function ensureExactHeadMergeClaim(
   };
 }
 
+export function releaseExactHeadMergeClaim(
+  request: ExactHeadMergeClaimRequest,
+  claimId: number,
+  io: {
+    listComments: () => LooseRecord[];
+    createComment: (body: string) => LooseRecord;
+  },
+): ExactHeadMergeClaimReleaseResult {
+  const normalized = normalizeRequest(request);
+  const normalizedClaimId = normalizeCommentId(claimId, "claim");
+  const initial = inspectClaims(normalized, io.listComments);
+  if ("failure" in initial) {
+    return {
+      status: initial.failure.status,
+      reason: initial.failure.reason,
+      claimId: normalizedClaimId,
+    };
+  }
+  const active = initial.value.exact[0];
+  if (!active) {
+    const referenced = initial.value.claims.find(
+      (claim) =>
+        claim.id === normalizedClaimId &&
+        sameClaim(claim.claim, normalized) &&
+        claim.claim.owner === normalized.owner &&
+        claim.claim.claimant === normalized.claimant,
+    );
+    const released = initial.value.releases.some(
+      (release) =>
+        release.release.claimId === normalizedClaimId &&
+        sameClaim(release.release, normalized) &&
+        release.release.owner === normalized.owner &&
+        release.release.claimant === normalized.claimant,
+    );
+    if (referenced && released) {
+      return { status: "released", reason: "", claimId: normalizedClaimId };
+    }
+    return {
+      status: "blocked",
+      reason: "exact-head merge claim is not active and has no matching release",
+      claimId: normalizedClaimId,
+    };
+  }
+  if (active.id !== normalizedClaimId) {
+    return {
+      status: "blocked",
+      reason: "exact-head merge claim ownership changed before release",
+      claimId: normalizedClaimId,
+    };
+  }
+
+  let createError = "";
+  try {
+    io.createComment(exactHeadMergeClaimReleaseBody(normalized, normalizedClaimId));
+  } catch (error) {
+    createError = errorText(error);
+  }
+
+  const confirmed = inspectClaims(normalized, io.listComments);
+  if ("failure" in confirmed) {
+    return {
+      status: confirmed.failure.status,
+      reason: confirmed.failure.reason,
+      claimId: normalizedClaimId,
+    };
+  }
+  if (
+    confirmed.value.releases.some(
+      (release) =>
+        release.release.claimId === normalizedClaimId &&
+        sameClaim(release.release, normalized) &&
+        release.release.owner === normalized.owner &&
+        release.release.claimant === normalized.claimant,
+    )
+  ) {
+    return { status: "released", reason: "", claimId: normalizedClaimId };
+  }
+  return {
+    status: "unknown",
+    reason: `exact-head merge claim release could not be confirmed${createError ? `: ${createError}` : ""}`,
+    claimId: normalizedClaimId,
+  };
+}
+
 export function inspectExactHeadMergeClaim(
   request: ExactHeadMergeClaimRequest,
   listComments: () => LooseRecord[],
@@ -134,19 +285,28 @@ export function inspectExactHeadMergeClaim(
   const normalized = normalizeRequest(request);
   const inspected = inspectClaims(normalized, listComments);
   if ("failure" in inspected) return inspected.failure;
-  if (inspected.exact.length === 0) return { status: "absent", reason: "", claimId: null };
-  return {
-    status: "existing",
-    reason: "exact-head merge request is durably claimed; reconciliation only",
-    claimId: inspected.exact[0]!.id,
-  };
+  if (inspected.value.exact.length > 0) {
+    return {
+      status: "existing",
+      reason: "exact-head merge request is durably claimed; reconciliation only",
+      claimId: inspected.value.exact[0]!.id,
+    };
+  }
+  if (inspected.value.exactHistory) {
+    return {
+      status: "released",
+      reason: "prior exact-head merge claim was explicitly released",
+      claimId: null,
+    };
+  }
+  return { status: "absent", reason: "", claimId: null };
 }
 
 function inspectClaims(
   request: ExactHeadMergeClaimRequest,
   listComments: () => LooseRecord[],
 ):
-  | { exact: TrustedClaim[] }
+  | { value: InspectedClaims }
   | { failure: Extract<ExactHeadMergeClaimResult, { status: "blocked" | "unknown" }> } {
   let comments: LooseRecord[];
   try {
@@ -170,49 +330,108 @@ function inspectClaims(
     };
   }
 
-  const exact: TrustedClaim[] = [];
+  const claims: TrustedClaim[] = [];
+  const releases: TrustedRelease[] = [];
   for (const comment of comments) {
     if (!trustedClaimAuthor(comment, request)) continue;
     const body = String(comment.body ?? "");
-    if (!body.includes(CLAIM_PREFIX)) continue;
-    const markers = parseClaimMarkers(body);
-    if (claimPrefixCount(body) !== 1 || markers.length !== 1) {
-      return {
-        failure: {
-          status: "blocked",
-          reason: "trusted exact-head merge claim marker is malformed or duplicated",
-          claimId: null,
-        },
-      };
+    const claimCount = markerCount(body, CLAIM_PREFIX);
+    const releaseCount = markerCount(body, RELEASE_PREFIX);
+    if (claimCount === 0 && releaseCount === 0) continue;
+    if (claimCount > 1 || releaseCount > 1 || (claimCount === 1 && releaseCount === 1)) {
+      return malformedMarkerFailure();
     }
     const id = commentId(comment);
     if (!id) {
       return {
         failure: {
           status: "blocked",
-          reason: "trusted exact-head merge claim is missing an immutable comment id",
+          reason: "trusted exact-head merge claim state is missing an immutable comment id",
           claimId: null,
         },
       };
     }
-    const claim = markers[0]!;
-    if (!sameClaim(claim, request)) {
+    if (claimCount === 1) {
+      const markers = parseClaimMarkers(body);
+      if (markers.length !== 1) return malformedMarkerFailure();
+      const claim = markers[0]!;
+      if (!sameClaimScope(claim, request)) return conflictingScopeFailure(claim);
+      claims.push({ comment, id, claim });
+      continue;
+    }
+    const markers = parseReleaseMarkers(body);
+    if (markers.length !== 1) return malformedMarkerFailure();
+    const release = markers[0]!;
+    if (!sameClaimScope(release, request)) return conflictingScopeFailure(release);
+    releases.push({ comment, id, release });
+  }
+
+  claims.sort((left, right) => left.id - right.id);
+  releases.sort((left, right) => left.id - right.id);
+  for (const release of releases) {
+    const referenced = claims.find(
+      (claim) =>
+        claim.id === release.release.claimId &&
+        sameClaim(claim.claim, release.release) &&
+        claim.claim.owner === release.release.owner &&
+        claim.claim.claimant === release.release.claimant,
+    );
+    if (!referenced || release.id <= referenced.id) {
       return {
         failure: {
           status: "blocked",
-          reason: `conflicting durable merge claim exists for ${claim.repository}#${claim.number} at ${claim.headSha}`,
+          reason: "trusted exact-head merge claim release does not match a prior claim",
           claimId: null,
         },
       };
     }
-    exact.push({ comment, id, claim });
   }
-  exact.sort((left, right) => left.id - right.id);
-  return { exact };
+
+  const exactClaims = claims.filter((claim) => sameClaim(claim.claim, request));
+  const exact = exactClaims.filter(
+    (claim) =>
+      !releases.some((release) => sameClaim(release.release, claim.claim) && release.id > claim.id),
+  );
+  return {
+    value: {
+      claims,
+      exact,
+      exactHistory: exactClaims.length > 0,
+      releases,
+    },
+  };
+}
+
+function malformedMarkerFailure(): {
+  failure: { status: "blocked"; reason: string; claimId: null };
+} {
+  return {
+    failure: {
+      status: "blocked",
+      reason: "trusted exact-head merge claim marker is malformed, mixed, or duplicated",
+      claimId: null,
+    },
+  };
+}
+
+function conflictingScopeFailure(claim: ExactHeadMergeClaimIdentity): {
+  failure: { status: "blocked"; reason: string; claimId: null };
+} {
+  return {
+    failure: {
+      status: "blocked",
+      reason: `conflicting durable merge claim exists for ${claim.repository}#${claim.number}`,
+      claimId: null,
+    },
+  };
 }
 
 function exactHeadMergeClaimMarker(request: ExactHeadMergeClaimRequest): string {
   return `<!-- ${CLAIM_PREFIX} repo=${encodeURIComponent(request.repository)} pr=${request.number} head=${request.headSha} method=${request.method} owner=${request.owner} claimant=${encodeURIComponent(request.claimant)} -->`;
+}
+
+function exactHeadMergeReleaseMarker(request: ExactHeadMergeClaimRequest, claimId: number): string {
+  return `<!-- ${RELEASE_PREFIX} claim=${claimId} repo=${encodeURIComponent(request.repository)} pr=${request.number} head=${request.headSha} method=${request.method} owner=${request.owner} claimant=${encodeURIComponent(request.claimant)} -->`;
 }
 
 function parseClaimMarkers(body: string): ParsedClaim[] {
@@ -234,8 +453,28 @@ function parseClaimMarkers(body: string): ParsedClaim[] {
   return claims;
 }
 
-function claimPrefixCount(body: string): number {
-  return body.split(CLAIM_PREFIX).length - 1;
+function parseReleaseMarkers(body: string): ParsedRelease[] {
+  const releases: ParsedRelease[] = [];
+  for (const match of body.matchAll(RELEASE_PATTERN)) {
+    try {
+      releases.push({
+        claimId: normalizeCommentId(Number(match[1]), "claim"),
+        repository: normalizeRepository(decodeURIComponent(match[2]!)),
+        number: normalizeNumber(Number(match[3])),
+        headSha: normalizeHeadSha(match[4]!),
+        method: normalizeMethod(match[5]!),
+        owner: normalizeOwner(match[6]!),
+        claimant: normalizeClaimant(decodeURIComponent(match[7]!)),
+      });
+    } catch {
+      return [];
+    }
+  }
+  return releases;
+}
+
+function markerCount(body: string, marker: string): number {
+  return body.split(marker).length - 1;
 }
 
 function normalizeRequest(request: ExactHeadMergeClaimRequest): ExactHeadMergeClaimRequest {
@@ -345,12 +584,26 @@ function trustedClaimAuthor(comment: LooseRecord, request: ExactHeadMergeClaimRe
 }
 
 function sameClaim(left: ExactHeadMergeClaimIdentity, right: ExactHeadMergeClaimIdentity): boolean {
+  return sameClaimScope(left, right) && left.headSha === right.headSha;
+}
+
+function sameClaimScope(
+  left: ExactHeadMergeClaimIdentity,
+  right: ExactHeadMergeClaimIdentity,
+): boolean {
   return (
     left.repository === right.repository &&
     left.number === right.number &&
-    left.headSha === right.headSha &&
     left.method === right.method
   );
+}
+
+function normalizeCommentId(value: number, kind: string): number {
+  const id = Number(value);
+  if (!Number.isSafeInteger(id) || id < 1) {
+    throw new Error(`${kind} comment id is invalid for the exact-head merge claim`);
+  }
+  return id;
 }
 
 function commentId(comment: LooseRecord): number | null {

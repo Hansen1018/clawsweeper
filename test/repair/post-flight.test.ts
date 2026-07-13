@@ -721,6 +721,28 @@ test("post-flight reconciles one exact-head merge effect across retries and queu
     );
     assert.equal(report.actions[0]?.merge_attempts, 0);
     assert.equal(fs.existsSync(fixture.mergeCountPath), false);
+    let claimComments = JSON.parse(fs.readFileSync(fixture.mergeClaimPath, "utf8"));
+    assert.equal(claimComments.length, 2);
+    assert.match(claimComments[0].body, /clawsweeper-exact-head-merge-claim:v1/);
+    assert.match(claimComments[1].body, /clawsweeper-exact-head-merge-release:v1 claim=1001/);
+
+    fs.rmSync(fixture.reportPath, { force: true });
+    runVerifiedPostFlight(
+      fixture,
+      {
+        ...commonEnv,
+        CLAWSWEEPER_ACTION_LEDGER_INVOCATION: "post-flight-released-retry",
+        GITHUB_RUN_ATTEMPT: "2",
+      },
+      0,
+    );
+    report = JSON.parse(fs.readFileSync(fixture.reportPath, "utf8"));
+    assert.equal(report.actions[0]?.status, "executed");
+    assert.equal(report.actions[0]?.merge_attempts, 1);
+    assert.equal(fs.readFileSync(fixture.mergeCountPath, "utf8"), "1");
+    claimComments = JSON.parse(fs.readFileSync(fixture.mergeClaimPath, "utf8"));
+    assert.equal(claimComments.length, 3);
+    assert.match(claimComments[2].body, /clawsweeper-exact-head-merge-claim:v1/);
 
     fixture.reset();
     runVerifiedPostFlight(fixture, { ...commonEnv, FAKE_GH_MERGE_MODE: "queue" }, 1);
@@ -1645,18 +1667,20 @@ function createVerifiedMergeFixture() {
       "if (args[0] === 'api' && args.includes('repos/openclaw/openclaw/issues/122/comments?per_page=100')) { if (args.includes('--slurp')) process.stdout.write('[[]]'); process.exit(0); }",
       "if (args[0] === 'api' && args[1] === 'repos/openclaw/openclaw/issues/123/comments' && args.includes('-f')) {",
       "  const body = String(args.find((arg) => arg.startsWith('body=')) || '').slice(5);",
-      "  fs.writeFileSync(process.env.FAKE_GH_MERGE_CLAIM_FILE, body);",
-      "  process.stdout.write(JSON.stringify({ id: 1001, body, performed_via_github_app: { id: 3306130, slug: 'openclaw-clawsweeper' }, user: { login: 'openclaw-clawsweeper[bot]' } }));",
+      "  const comments = fs.existsSync(process.env.FAKE_GH_MERGE_CLAIM_FILE) ? JSON.parse(fs.readFileSync(process.env.FAKE_GH_MERGE_CLAIM_FILE, 'utf8')) : [];",
+      "  const comment = { id: 1001 + comments.length, body, performed_via_github_app: { id: 3306130, slug: 'openclaw-clawsweeper' }, user: { login: 'openclaw-clawsweeper[bot]' } };",
+      "  comments.push(comment);",
+      "  fs.writeFileSync(process.env.FAKE_GH_MERGE_CLAIM_FILE, JSON.stringify(comments));",
+      "  process.stdout.write(JSON.stringify(comment));",
       "  process.exit(0);",
       "}",
       "if (args[0] === 'api' && args.includes('repos/openclaw/openclaw/issues/123/comments?per_page=100')) {",
       "  const count = fs.existsSync(process.env.FAKE_GH_COMMENTS_COUNT_FILE) ? Number(fs.readFileSync(process.env.FAKE_GH_COMMENTS_COUNT_FILE, 'utf8')) : 0;",
       "  fs.writeFileSync(process.env.FAKE_GH_COMMENTS_COUNT_FILE, String(count + 1));",
+      "  const comments = fs.existsSync(process.env.FAKE_GH_MERGE_CLAIM_FILE) ? JSON.parse(fs.readFileSync(process.env.FAKE_GH_MERGE_CLAIM_FILE, 'utf8')) : [];",
       "  const securityAfterFailure = process.env.FAKE_GH_SECURITY_AFTER_FAILURE === '1' && mergeCount() >= 1;",
-      "  const securityOnFinalGate = process.env.FAKE_GH_SECURITY_ON_FINAL_GATE === '1' && count >= 3;",
+      "  const securityOnFinalGate = process.env.FAKE_GH_SECURITY_ON_FINAL_GATE === '1' && comments.some((comment) => String(comment.body || '').includes('clawsweeper-exact-head-merge-claim:v1')) && !comments.some((comment) => String(comment.body || '').includes('clawsweeper-exact-head-merge-release:v1'));",
       "  const security = securityAfterFailure || securityOnFinalGate;",
-      "  const comments = [];",
-      "  if (fs.existsSync(process.env.FAKE_GH_MERGE_CLAIM_FILE)) comments.push({ id: 1001, body: fs.readFileSync(process.env.FAKE_GH_MERGE_CLAIM_FILE, 'utf8'), performed_via_github_app: { id: 3306130, slug: 'openclaw-clawsweeper' }, user: { login: 'openclaw-clawsweeper[bot]' } });",
       "  if (security) comments.push({ body: '<!-- clawsweeper-security:security-sensitive item=123 sha=abc -->', user: { login: 'maintainer-user' } });",
       "  if (args.includes('--slurp')) process.stdout.write(JSON.stringify([comments]));",
       "  else process.stdout.write(comments.map((comment) => comment.body).join('\\n'));",
@@ -1676,7 +1700,7 @@ function createVerifiedMergeFixture() {
       "  const autoMergePending = process.env.FAKE_GH_MERGE_MODE === 'auto_merge' && mergeCount() > 0;",
       "  const pending = process.env.FAKE_GH_PENDING_READINESS === '1' || (process.env.FAKE_GH_PENDING_AFTER_ATTEMPT === '1' && mergeCount() > 0) || fs.existsSync(process.env.FAKE_GH_GATE_DRIFT_FILE);",
       "  const checks = process.env.FAKE_GH_FAILED_CHECKS === '1' ? [{ name: 'required-ci/exact-merge', status: 'COMPLETED', conclusion: 'FAILURE' }] : [];",
-      "  process.stdout.write(JSON.stringify({ autoMergeRequest: autoMergePending ? { enabledAt: '2026-07-13T08:00:00Z' } : null, baseRefName: 'main', headRefOid: pull.head.sha, isDraft: false, isInMergeQueue: queued, mergeable: pending ? 'UNKNOWN' : 'MERGEABLE', mergeCommit: viewMerged ? { oid: 'b'.repeat(40) } : null, mergeStateStatus: 'CLEAN', mergedAt: viewMerged ? '2026-07-13T08:00:00Z' : null, reviewDecision: process.env.FAKE_GH_REVIEW_DECISION || null, state: viewMerged ? 'MERGED' : 'OPEN', statusCheckRollup: checks, title: pull.title, url: 'https://github.com/openclaw/openclaw/pull/123' }));",
+      "  process.stdout.write(JSON.stringify({ autoMergeRequest: autoMergePending ? { enabledAt: '2026-07-13T08:00:00Z', mergeMethod: 'SQUASH' } : null, baseRefName: 'main', headRefOid: pull.head.sha, isDraft: false, isInMergeQueue: queued, mergeable: pending ? 'UNKNOWN' : 'MERGEABLE', mergeCommit: viewMerged ? { oid: 'b'.repeat(40) } : null, mergeStateStatus: 'CLEAN', mergedAt: viewMerged ? '2026-07-13T08:00:00Z' : null, reviewDecision: process.env.FAKE_GH_REVIEW_DECISION || null, state: viewMerged ? 'MERGED' : 'OPEN', statusCheckRollup: checks, title: pull.title, url: 'https://github.com/openclaw/openclaw/pull/123' }));",
       "  process.exit(0);",
       "}",
       "if (args[0] === 'pr' && args[1] === 'merge') {",

@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
+import { readSpooledActionEvents } from "../../dist/action-ledger.js";
 import { mockGhBinEnv } from "../helpers.ts";
 
 const repoRoot = process.cwd();
@@ -1359,6 +1360,99 @@ test("repair apply blocks final security drift before the merge request", () => 
   }
 });
 
+test("repair apply releases a post-claim abort and lets the same head merge on retry", () => {
+  const fixture = writeMergeApplyFixture({ securityOnPostClaimIssueFetchOnce: true });
+  try {
+    runMergeApplyResult(fixture, { runAttempt: 1 });
+    let report = readApplyReport(fixture.reportPath);
+    assert.equal(report.actions[0].status, "blocked");
+    assert.equal(
+      report.actions[0].reason,
+      "security-sensitive target requires central security triage",
+    );
+    assert.equal(mergeCallCount(fixture.ghLogPath), 0);
+    let comments = JSON.parse(fs.readFileSync(fixture.mergeClaimPath, "utf8"));
+    assert.equal(comments.length, 2);
+    assert.match(comments[0].body, /clawsweeper-exact-head-merge-claim:v1/);
+    assert.match(comments[1].body, /clawsweeper-exact-head-merge-release:v1 claim=1001/);
+
+    runMergeApplyResult(fixture, { runAttempt: 2 });
+    report = readApplyReport(fixture.reportPath);
+    assert.equal(report.actions[0].status, "executed");
+    assert.equal(mergeCallCount(fixture.ghLogPath), 1);
+    comments = JSON.parse(fs.readFileSync(fixture.mergeClaimPath, "utf8"));
+    assert.equal(comments.length, 3);
+    assert.match(comments[2].body, /clawsweeper-exact-head-merge-claim:v1/);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("repair apply dry-run does not require workflow claim identity", () => {
+  const fixture = writeMergeApplyFixture();
+  try {
+    runMergeApplyResult(fixture, { dryRun: true, omitClaimIdentity: true });
+
+    const report = readApplyReport(fixture.reportPath);
+    assert.equal(report.actions[0].status, "planned");
+    assert.equal(report.actions[0].reason, "dry run");
+    assert.equal(fs.existsSync(fixture.mergeClaimPath), false);
+    assert.equal(
+      ghCalls(fixture.ghLogPath).some(
+        (call) =>
+          call.args[0] === "api" &&
+          call.args[1] === "repos/openclaw/openclaw/issues/101/comments" &&
+          call.args.includes("-f"),
+      ),
+      false,
+    );
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("repair apply records unknown and observed exact-head merge outcomes", () => {
+  const fixture = writeMergeApplyFixture({ mergeMode: "ambiguous_exact" });
+  try {
+    runMergeApplyResult(fixture, {
+      actionLedgerInvocation: "apply-result-ambiguous-exact",
+    });
+
+    const allEvents = readSpooledActionEvents(fixture.ledgerRoot, "openclaw/openclaw");
+    const events = allEvents.filter(
+      (event) =>
+        event.event_type === "repair.mutation" &&
+        String(event.producer.component).startsWith("apply_result."),
+    );
+    assert.deepEqual(
+      events
+        .sort((left, right) => left.phase_seq - right.phase_seq)
+        .map((event) => [event.action.status, event.attributes?.completion_reason]),
+      [
+        ["started", "mutation_attempted"],
+        ["failed", "mutation_outcome_unknown"],
+        ["executed", "mutation_observed"],
+      ],
+    );
+    assert.deepEqual(
+      allEvents
+        .filter(
+          (event) =>
+            event.event_type === "repair.mutation" &&
+            String(event.producer.component).startsWith("merge_claim."),
+        )
+        .sort((left, right) => left.phase_seq - right.phase_seq)
+        .map((event) => [event.action.status, event.attributes?.completion_reason]),
+      [
+        ["started", "mutation_attempted"],
+        ["executed", "mutation_accepted"],
+      ],
+    );
+  } finally {
+    fixture.cleanup();
+  }
+});
+
 type ApplyFixturePaths = {
   binDir: string;
   jobPath: string;
@@ -1778,6 +1872,8 @@ type MergeFixture = {
   ghLogPath: string;
   mergeCountPath: string;
   mergeClaimPath: string;
+  ledgerRoot: string;
+  ledgerOutputRoot: string;
   headSha: string;
   cleanup(): void;
 };
@@ -1794,13 +1890,16 @@ function writeMergeApplyFixture(
     mergeable?: "MERGEABLE" | "UNKNOWN";
     strictBaseBinding?: boolean;
     securityOnFinalIssueFetch?: boolean;
+    securityOnPostClaimIssueFetchOnce?: boolean;
     terminalCheckFailure?: boolean;
     terminalCheckFailureAfterCommand?: boolean;
     terminalCheckMissingConclusion?: boolean;
     legacyStatusContextSuccess?: boolean;
   } = {},
 ): MergeFixture {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-apply-result-merge-"));
+  const root = fs.realpathSync(
+    fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-apply-result-merge-")),
+  );
   const binDir = path.join(root, "bin");
   const runDir = path.join(root, "run");
   const jobPath = path.join(root, "job.md");
@@ -1810,9 +1909,13 @@ function writeMergeApplyFixture(
   const mergeCountPath = path.join(root, "merge-count");
   const mergeClaimPath = path.join(root, "merge-claim");
   const issueCountPath = path.join(root, "issue-count");
+  const ledgerRoot = path.join(root, "ledger");
+  const ledgerOutputRoot = path.join(root, "ledger-output");
   const headSha = "a".repeat(40);
   fs.mkdirSync(binDir, { recursive: true });
   fs.mkdirSync(runDir, { recursive: true });
+  fs.mkdirSync(ledgerRoot);
+  fs.mkdirSync(ledgerOutputRoot);
   fs.writeFileSync(
     jobPath,
     [
@@ -1886,6 +1989,7 @@ function writeMergeApplyFixture(
     mergeable: options.mergeable ?? "MERGEABLE",
     strictBaseBinding: options.strictBaseBinding ?? true,
     securityOnFinalIssueFetch: options.securityOnFinalIssueFetch ?? false,
+    securityOnPostClaimIssueFetchOnce: options.securityOnPostClaimIssueFetchOnce ?? false,
     terminalCheckFailure: options.terminalCheckFailure ?? false,
     terminalCheckFailureAfterCommand: options.terminalCheckFailureAfterCommand ?? false,
     terminalCheckMissingConclusion: options.terminalCheckMissingConclusion ?? false,
@@ -1920,26 +2024,23 @@ if (args[0] === "api") {
   const apiPath = args[1] || "";
   if (apiPath === "repos/openclaw/openclaw/issues/101/comments" && args.includes("-f")) {
     const body = String(args.find((arg) => arg.startsWith("body=")) || "").slice(5);
-    fs.writeFileSync(data.mergeClaimPath, body);
-    write({
-      id: 1001,
+    const comments = fs.existsSync(data.mergeClaimPath)
+      ? JSON.parse(fs.readFileSync(data.mergeClaimPath, "utf8"))
+      : [];
+    const comment = {
+      id: 1001 + comments.length,
       body,
       performed_via_github_app: { id: 3306130, slug: "openclaw-clawsweeper" },
       user: { login: "openclaw-clawsweeper[bot]" },
-    });
+    };
+    comments.push(comment);
+    fs.writeFileSync(data.mergeClaimPath, JSON.stringify(comments));
+    write(comment);
     process.exit(0);
   }
   if (apiPath.includes("/issues/101/comments")) {
-    const body = fs.existsSync(data.mergeClaimPath)
-      ? fs.readFileSync(data.mergeClaimPath, "utf8")
-      : "";
-    const comments = body
-      ? [{
-          id: 1001,
-          body,
-          performed_via_github_app: { id: 3306130, slug: "openclaw-clawsweeper" },
-          user: { login: "openclaw-clawsweeper[bot]" },
-        }]
+    const comments = fs.existsSync(data.mergeClaimPath)
+      ? JSON.parse(fs.readFileSync(data.mergeClaimPath, "utf8"))
       : [];
     write(args.includes("--slurp") ? [comments] : comments);
     process.exit(0);
@@ -1957,7 +2058,11 @@ if (args[0] === "api") {
         : "2026-07-13T07:00:00Z",
       author_association: "CONTRIBUTOR",
       user: { login: "contributor" },
-      labels: data.securityOnFinalIssueFetch && count > 1 ? [{ name: "security" }] : [],
+      labels:
+        (data.securityOnFinalIssueFetch && count > 1) ||
+        (data.securityOnPostClaimIssueFetchOnce && count === 3)
+          ? [{ name: "security" }]
+          : [],
       pull_request: {},
     });
     process.exit(0);
@@ -2075,6 +2180,8 @@ process.exit(1);
     ghLogPath,
     mergeCountPath,
     mergeClaimPath,
+    ledgerRoot,
+    ledgerOutputRoot,
     headSha,
     cleanup() {
       fs.rmSync(root, { recursive: true, force: true });
@@ -2084,11 +2191,22 @@ process.exit(1);
 
 function runMergeApplyResult(
   fixture: MergeFixture,
-  options: { retryAttempts?: number; runAttempt?: number } = {},
+  options: {
+    retryAttempts?: number;
+    runAttempt?: number;
+    dryRun?: boolean;
+    omitClaimIdentity?: boolean;
+    actionLedgerInvocation?: string;
+  } = {},
 ) {
   execFileSync(
     process.execPath,
-    ["dist/repair/apply-result.js", fixture.jobPath, fixture.resultPath],
+    [
+      "dist/repair/apply-result.js",
+      fixture.jobPath,
+      fixture.resultPath,
+      ...(options.dryRun ? ["--dry-run"] : []),
+    ],
     {
       cwd: repoRoot,
       env: {
@@ -2097,8 +2215,8 @@ function runMergeApplyResult(
         CLAWSWEEPER_ALLOW_MERGE: "1",
         CLAWSWEEPER_ALLOWED_OWNER: "openclaw",
         CLAWSWEEPER_APP_SLUG: "openclaw-clawsweeper",
-        CLAWSWEEPER_AUTHENTICATED_APP_ID: "3306130",
-        CLAWSWEEPER_AUTHENTICATED_APP_SLUG: "openclaw-clawsweeper",
+        CLAWSWEEPER_AUTHENTICATED_APP_ID: options.omitClaimIdentity ? "" : "3306130",
+        CLAWSWEEPER_AUTHENTICATED_APP_SLUG: options.omitClaimIdentity ? "" : "openclaw-clawsweeper",
         CLAWSWEEPER_AUTHENTICATED_INSTALLATION_ID: "7001",
         CLAWSWEEPER_RULESET_APP_ID: "3306130",
         CLAWSWEEPER_RULESET_APP_SLUG: "openclaw-clawsweeper",
@@ -2107,6 +2225,22 @@ function runMergeApplyResult(
         CLAWSWEEPER_GH_RETRY_ATTEMPTS: String(options.retryAttempts ?? 1),
         GITHUB_RUN_ATTEMPT: String(options.runAttempt ?? 1),
         GITHUB_RUN_ID: "9001",
+        ...(options.actionLedgerInvocation
+          ? {
+              CLAWSWEEPER_ACTION_LEDGER_FORCE: "1",
+              CLAWSWEEPER_ACTION_LEDGER_ROOT: fixture.ledgerRoot,
+              CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT: fixture.ledgerOutputRoot,
+              CLAWSWEEPER_ACTION_LEDGER_PARTITION_DATE: "2026-07-13",
+              CLAWSWEEPER_ACTION_LEDGER_INVOCATION: options.actionLedgerInvocation,
+              GITHUB_ACTION: "apply_result",
+              GITHUB_JOB: "mutate",
+              GITHUB_REPOSITORY: "openclaw/clawsweeper",
+              GITHUB_SHA: "f".repeat(40),
+              GITHUB_WORKFLOW: "repair cluster worker",
+              GITHUB_WORKFLOW_REF:
+                "openclaw/clawsweeper/.github/workflows/repair-cluster-worker.yml@refs/heads/main",
+            }
+          : {}),
         GH_TOKEN: "write-token",
         ...mockGhBinEnv(path.join(fixture.binDir, "gh.js")),
       },
