@@ -55,6 +55,18 @@ function targetValidationOutputPath(name) {
 
 if (safeTargetValidationTestHome) {
   fs.chmodSync(safeTargetValidationTestHome, 0o700);
+  for (const relativePath of [
+    ".cache",
+    ".config",
+    path.join(".local", "bin"),
+    path.join(".local", "share"),
+    "tmp",
+  ]) {
+    fs.mkdirSync(path.join(safeTargetValidationTestHome, relativePath), {
+      recursive: true,
+      mode: 0o700,
+    });
+  }
   process.env.CLAWSWEEPER_TARGET_VALIDATION_SAFE_TEST_MODE = "1";
   process.env.CLAWSWEEPER_TARGET_VALIDATION_HOME = safeTargetValidationTestHome;
 }

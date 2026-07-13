@@ -2227,14 +2227,9 @@ export function targetValidationIsolationFromEnv(): TargetValidationIsolation | 
       user: os.userInfo().username,
     };
   }
-  if (safeTestMode) {
+  if (safeTestMode && !required && !user) {
     // Unit tests exercise real toolchain commands. Keep that direct-run escape
     // unreachable outside a Node test worker and private temporary storage.
-    if (required || user) {
-      throw new Error(
-        "safe Linux target validation test mode cannot use production user isolation",
-      );
-    }
     if (process.env.NODE_TEST_CONTEXT !== "child-v8") {
       throw new Error(
         "safe Linux target validation test mode is restricted to the Node test runner",
@@ -2310,13 +2305,20 @@ export function runTargetControlledCommand(
       "target-controlled commands require Linux user isolation or explicit safe test mode",
     );
   }
+  const cwd = fs.realpathSync(options.cwd);
   if (isolation.kind === "linux-test") {
-    return run(command, commandArgs, options);
+    if (pathIsWithin(cwd, isolation.home) || pathIsWithin(isolation.home, cwd)) {
+      throw new Error("safe Linux target validation checkout and isolated home must be disjoint");
+    }
+    return run(command, commandArgs, {
+      ...options,
+      cwd,
+      env: Object.fromEntries(isolatedTargetValidationEnv(options.env ?? process.env, isolation)),
+    });
   }
 
   const startedAt = Date.now();
   const timeoutMs = options.timeoutMs ?? DEFAULT_TARGET_VALIDATION_TIMEOUT_MS;
-  const cwd = fs.realpathSync(options.cwd);
   if (isolation.kind === "macos-sandbox") {
     if (pathIsWithin(cwd, isolation.home) || pathIsWithin(isolation.home, cwd)) {
       throw new Error("safe macOS target validation checkout and isolated home must be disjoint");
