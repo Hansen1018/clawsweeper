@@ -1,12 +1,37 @@
 import type { LooseRecord } from "./json-types.js";
 
 const DIGEST_PATTERN = /^[a-f0-9]{64}$/;
+const RESULT_PRODUCER_JOBS = new Set([
+  "Plan and review cluster",
+  "Token-only post-flight mutation",
+]);
+const PRIOR_RESULT_CONSUMER_JOBS = new Set([
+  "Bind immutable execution handoff",
+  "Prepare repair artifact without credentials",
+  "Replay repair proof without credentials",
+  "Report and requeue without target credentials",
+  "Publish immutable repair action ledger",
+]);
 
 export type ResolvedRunArtifact = {
   id: number;
   name: string;
   producerAttempt: number;
   digest: string;
+};
+
+export type ResolveRunArtifactOptions = {
+  artifacts: LooseRecord[];
+  prefix: string;
+  runId: string;
+  currentAttempt: number;
+  expectedProducerAttempt?: string | number | null;
+  maxProducerAttempt?: string | number | null;
+  expectedArtifactId?: string | null;
+  expectedArtifactDigest?: string | null;
+  fallbackPrefixes?: string[];
+  requiredPrefixes?: string[];
+  allowPriorAttempts?: boolean;
 };
 
 export type ResolvedCommitReviewArtifact = {
@@ -66,6 +91,204 @@ export function resolveCommitReviewArtifactCohort({
   });
 }
 
+export function resolveOptionalRunArtifact(
+  options: ResolveRunArtifactOptions,
+): ResolvedRunArtifact | null {
+  try {
+    return resolveRunArtifact(options);
+  } catch (error) {
+    if (error instanceof RunArtifactNotFoundError) return null;
+    throw error;
+  }
+}
+
+export function allowsPriorResultArtifactCohort({
+  jobs,
+  currentAttempt,
+}: {
+  jobs: LooseRecord[];
+  currentAttempt: number;
+}): boolean {
+  if (!Number.isInteger(currentAttempt) || currentAttempt < 1) {
+    throw new Error("current workflow attempt is invalid");
+  }
+  if (jobs.length === 0) throw new Error("current workflow attempt has no jobs");
+  for (const job of jobs) {
+    if (!job || typeof job.name !== "string" || Number(job.run_attempt) !== currentAttempt) {
+      throw new Error("current workflow attempt job provenance is invalid");
+    }
+  }
+  const relevantJobs = jobs.filter(
+    (job) => RESULT_PRODUCER_JOBS.has(job.name) || PRIOR_RESULT_CONSUMER_JOBS.has(job.name),
+  );
+  if (new Set(relevantJobs.map((job) => job.name)).size !== relevantJobs.length) {
+    throw new Error("current workflow attempt job selection is ambiguous");
+  }
+  return (
+    currentAttempt > 1 &&
+    !relevantJobs.some((job) => RESULT_PRODUCER_JOBS.has(job.name)) &&
+    relevantJobs.some((job) => PRIOR_RESULT_CONSUMER_JOBS.has(job.name))
+  );
+}
+
+export function verifyPriorResultArtifactCohort({
+  artifacts,
+  provenance,
+  repository,
+  runId,
+  workflowSha,
+  currentAttempt,
+  producerAttempt,
+  resultArtifactId,
+  resultArtifactName,
+  resultArtifactDigest,
+  provenanceArtifactId,
+  provenanceArtifactName,
+  provenanceArtifactDigest,
+}: {
+  artifacts: LooseRecord[];
+  provenance: LooseRecord;
+  repository: string;
+  runId: string;
+  workflowSha: string;
+  currentAttempt: number;
+  producerAttempt: number;
+  resultArtifactId: string;
+  resultArtifactName: string;
+  resultArtifactDigest: string;
+  provenanceArtifactId: string;
+  provenanceArtifactName: string;
+  provenanceArtifactDigest: string;
+}): void {
+  if (
+    provenance?.schema_version !== 2 ||
+    provenance.workflow_repository !== repository ||
+    String(provenance.workflow_run_id) !== runId ||
+    parseRequiredPositiveInteger(provenance.workflow_run_attempt, "provenance attempt") !==
+      producerAttempt ||
+    provenance.workflow_sha !== workflowSha ||
+    !exactHex(provenance.authorization_sha256, 64) ||
+    !exactHex(provenance.publication_receipt_sha256, 64) ||
+    !exactHex(provenance.publication_provenance_sha256, 64)
+  ) {
+    throw new Error("prior result workflow provenance is invalid");
+  }
+
+  verifyExactClaim({
+    label: "final_worker",
+    prefix: "clawsweeper-repair",
+    expectedAttempt: producerAttempt,
+    expectedId: resultArtifactId,
+    expectedName: resultArtifactName,
+    expectedDigest: resultArtifactDigest,
+  });
+  const provenanceArtifact = resolveRunArtifact({
+    artifacts,
+    prefix: "clawsweeper-repair-provenance",
+    runId,
+    currentAttempt,
+    expectedProducerAttempt: producerAttempt,
+    expectedArtifactId: provenanceArtifactId,
+    expectedArtifactDigest: provenanceArtifactDigest,
+    allowPriorAttempts: true,
+  });
+  const provenanceClaim = provenance.artifacts?.provenance;
+  if (
+    provenanceArtifact.name !== provenanceArtifactName ||
+    provenanceClaim?.name !== provenanceArtifact.name ||
+    provenanceClaim.id !== null ||
+    provenanceClaim.digest !== null ||
+    parseRequiredPositiveInteger(
+      provenanceClaim.producer_attempt,
+      "provenance artifact attempt",
+    ) !== producerAttempt
+  ) {
+    throw new Error("prior result provenance artifact identity is invalid");
+  }
+
+  const sourceAttempts = [
+    verifyClaim("worker", "clawsweeper-repair-worker"),
+    verifyClaim("authorization", "clawsweeper-repair-authorized"),
+    verifyClaim("execution", "clawsweeper-repair-execution"),
+    verifyClaim("validation", "clawsweeper-repair-validation"),
+  ];
+  if (new Set(sourceAttempts).size !== 1 || sourceAttempts[0]! > producerAttempt) {
+    throw new Error("prior result source artifact cohort mixes producer attempts");
+  }
+  verifyClaim("pre_close", "clawsweeper-repair-publication-close", producerAttempt);
+  verifyClaim("publication", "clawsweeper-repair-publication", producerAttempt);
+
+  function verifyClaim(label: string, prefix: string, expectedAttempt?: number): number {
+    const claim = provenance.artifacts?.[label];
+    if (!claim || typeof claim !== "object") {
+      throw new Error(`prior result ${label} artifact provenance is missing`);
+    }
+    const attempt = parseRequiredPositiveInteger(
+      claim.producer_attempt,
+      `${label} producer attempt`,
+    );
+    if (expectedAttempt !== undefined && attempt !== expectedAttempt) {
+      throw new Error(`prior result ${label} artifact attempt is invalid`);
+    }
+    const artifact = resolveRunArtifact({
+      artifacts,
+      prefix,
+      runId,
+      currentAttempt,
+      expectedProducerAttempt: attempt,
+      expectedArtifactId: String(claim.id ?? ""),
+      expectedArtifactDigest: String(claim.digest ?? ""),
+      allowPriorAttempts: true,
+    });
+    if (claim.name !== artifact.name) {
+      throw new Error(`prior result ${label} artifact name is invalid`);
+    }
+    return attempt;
+  }
+
+  function verifyExactClaim({
+    label,
+    prefix,
+    expectedAttempt,
+    expectedId,
+    expectedName,
+    expectedDigest,
+  }: {
+    label: string;
+    prefix: string;
+    expectedAttempt: number;
+    expectedId: string;
+    expectedName: string;
+    expectedDigest: string;
+  }): void {
+    const claim = provenance.artifacts?.[label];
+    if (
+      !claim ||
+      claim.name !== `${prefix}-${runId}-${expectedAttempt}` ||
+      claim.name !== expectedName ||
+      String(claim.id ?? "") !== expectedId ||
+      normalizeOptionalDigest(claim.digest) !== normalizeOptionalDigest(expectedDigest) ||
+      parseRequiredPositiveInteger(claim.producer_attempt, `${label} producer attempt`) !==
+        expectedAttempt
+    ) {
+      throw new Error(`prior result ${label} artifact provenance is invalid`);
+    }
+    const artifact = resolveRunArtifact({
+      artifacts,
+      prefix,
+      runId,
+      currentAttempt,
+      expectedProducerAttempt: expectedAttempt,
+      expectedArtifactId: expectedId,
+      expectedArtifactDigest: expectedDigest,
+      allowPriorAttempts: true,
+    });
+    if (artifact.name !== claim.name) {
+      throw new Error(`prior result ${label} artifact name is invalid`);
+    }
+  }
+}
+
 export function resolveRunArtifact({
   artifacts,
   prefix,
@@ -78,19 +301,7 @@ export function resolveRunArtifact({
   fallbackPrefixes = [],
   requiredPrefixes = [],
   allowPriorAttempts = process.env.CLAWSWEEPER_ALLOW_PRIOR_ARTIFACT === "1",
-}: {
-  artifacts: LooseRecord[];
-  prefix: string;
-  runId: string;
-  currentAttempt: number;
-  expectedProducerAttempt?: string | number | null;
-  maxProducerAttempt?: string | number | null;
-  expectedArtifactId?: string | null;
-  expectedArtifactDigest?: string | null;
-  fallbackPrefixes?: string[];
-  requiredPrefixes?: string[];
-  allowPriorAttempts?: boolean;
-}): ResolvedRunArtifact {
+}: ResolveRunArtifactOptions): ResolvedRunArtifact {
   const prefixes = [prefix, ...fallbackPrefixes];
   if (
     prefixes.some((candidate) => !candidate || !/^[A-Za-z0-9_.-]+$/.test(candidate)) ||
@@ -189,7 +400,7 @@ export function resolveRunArtifact({
         (allowPriorAttempts && artifact.producerAttempt < currentAttempt)),
   );
   if (eligible.length === 0) {
-    throw new Error(
+    throw new RunArtifactNotFoundError(
       allowPriorAttempts
         ? "no trusted current or prior producer artifact matches this workflow run"
         : "current producer attempt did not publish a trusted artifact",
@@ -262,7 +473,9 @@ function resolveArtifactCohortAttempt({
     }
     if (complete) return producerAttempt;
   }
-  throw new Error("no complete trusted producer artifact cohort matches this workflow run");
+  throw new RunArtifactNotFoundError(
+    "no complete trusted producer artifact cohort matches this workflow run",
+  );
 }
 
 function finalizeArtifact(
@@ -304,6 +517,14 @@ function parseOptionalArtifactId(value: unknown): number | null {
   return Number(text);
 }
 
+function parseRequiredPositiveInteger(value: unknown, label: string): number {
+  const text = String(value ?? "");
+  if (!/^[1-9][0-9]*$/.test(text)) throw new Error(`${label} is invalid`);
+  const parsed = Number(text);
+  if (!Number.isSafeInteger(parsed)) throw new Error(`${label} is invalid`);
+  return parsed;
+}
+
 function normalizeOptionalDigest(value: unknown): string | null {
   const normalized = String(value ?? "")
     .trim()
@@ -314,6 +535,11 @@ function normalizeOptionalDigest(value: unknown): string | null {
   return normalized;
 }
 
+function exactHex(value: unknown, length: 40 | 64): string | null {
+  const text = String(value ?? "");
+  return new RegExp(`^[a-f0-9]{${length}}$`).test(text) ? text : null;
+}
+
 function parseArtifactName(name: string, prefix: string, runId: string): number | null {
   const literalPrefix = `${prefix}-${runId}-`;
   if (!name.startsWith(literalPrefix)) return null;
@@ -321,4 +547,8 @@ function parseArtifactName(name: string, prefix: string, runId: string): number 
   if (!/^[1-9][0-9]*$/.test(attempt)) return null;
   const parsed = Number(attempt);
   return Number.isSafeInteger(parsed) ? parsed : null;
+}
+
+class RunArtifactNotFoundError extends Error {
+  override name = "RunArtifactNotFoundError";
 }

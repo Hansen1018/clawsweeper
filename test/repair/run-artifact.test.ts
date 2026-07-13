@@ -6,8 +6,11 @@ import path from "node:path";
 import test from "node:test";
 
 import {
+  allowsPriorResultArtifactCohort,
   resolveCommitReviewArtifactCohort,
+  resolveOptionalRunArtifact,
   resolveRunArtifact,
+  verifyPriorResultArtifactCohort,
 } from "../../dist/repair/run-artifact.js";
 
 const digest1 = "1".repeat(64);
@@ -33,6 +36,125 @@ test("reruns select the latest trusted producer attempt instead of the consumer 
       digest: digest2,
     },
   );
+});
+
+test("optional artifact resolution distinguishes absence from ambiguity", () => {
+  assert.equal(
+    resolveOptionalRunArtifact({
+      artifacts: [],
+      prefix: "clawsweeper-repair",
+      runId: "9001",
+      currentAttempt: 2,
+      allowPriorAttempts: false,
+    }),
+    null,
+  );
+  assert.throws(
+    () =>
+      resolveOptionalRunArtifact({
+        artifacts: [
+          artifact(101, 2, digest1, "clawsweeper-repair"),
+          artifact(102, 2, digest2, "clawsweeper-repair"),
+        ],
+        prefix: "clawsweeper-repair",
+        runId: "9001",
+        currentAttempt: 2,
+        allowPriorAttempts: false,
+      }),
+    /selection is ambiguous/,
+  );
+});
+
+test("prior result reuse policy excludes deduplicated and producer reruns", () => {
+  assert.equal(
+    allowsPriorResultArtifactCohort({
+      jobs: [
+        workflowJob("Deduplicate command dispatch receipt", 2),
+        workflowJob("Plan and review cluster", 2),
+      ],
+      currentAttempt: 2,
+    }),
+    false,
+  );
+  assert.equal(
+    allowsPriorResultArtifactCohort({
+      jobs: [workflowJob("Publish immutable repair action ledger", 2)],
+      currentAttempt: 2,
+    }),
+    true,
+  );
+  assert.equal(
+    allowsPriorResultArtifactCohort({
+      jobs: [workflowJob("Token-only post-flight mutation", 2)],
+      currentAttempt: 2,
+    }),
+    false,
+  );
+  assert.throws(
+    () =>
+      allowsPriorResultArtifactCohort({
+        jobs: [
+          workflowJob("Publish immutable repair action ledger", 2),
+          workflowJob("Publish immutable repair action ledger", 2),
+        ],
+        currentAttempt: 2,
+      }),
+    /selection is ambiguous/,
+  );
+});
+
+test("prior result publication resolves only one complete final provenance cohort", () => {
+  assert.deepEqual(
+    resolveOptionalRunArtifact({
+      artifacts: [
+        artifact(101, 1, digest1, "clawsweeper-repair"),
+        artifact(102, 1, digest1, "clawsweeper-repair-provenance"),
+        artifact(201, 2, digest2, "clawsweeper-repair"),
+      ],
+      prefix: "clawsweeper-repair",
+      requiredPrefixes: ["clawsweeper-repair-provenance"],
+      runId: "9001",
+      currentAttempt: 3,
+      maxProducerAttempt: 2,
+      allowPriorAttempts: true,
+    }),
+    {
+      id: 101,
+      name: "clawsweeper-repair-9001-1",
+      producerAttempt: 1,
+      digest: digest1,
+    },
+  );
+  assert.equal(
+    resolveOptionalRunArtifact({
+      artifacts: [
+        artifact(201, 1, digest1, "clawsweeper-repair"),
+        artifact(202, 2, digest2, "clawsweeper-repair-provenance"),
+      ],
+      prefix: "clawsweeper-repair",
+      requiredPrefixes: ["clawsweeper-repair-provenance"],
+      runId: "9001",
+      currentAttempt: 3,
+      maxProducerAttempt: 2,
+      allowPriorAttempts: true,
+    }),
+    null,
+  );
+});
+
+test("prior result provenance verifies one exact source cohort", () => {
+  const fixture = priorResultCohortFixture();
+  assert.doesNotThrow(() => verifyPriorResultArtifactCohort(fixture));
+
+  const mixed = priorResultCohortFixture();
+  mixed.artifacts.push(artifact(105, 2, digest2, "clawsweeper-repair-validation"));
+  mixed.provenance.artifacts.validation = {
+    name: "clawsweeper-repair-validation-9001-2",
+    id: "105",
+    digest: `sha256:${digest2}`,
+    producer_attempt: "2",
+  };
+  assert.throws(() => verifyPriorResultArtifactCohort(mixed), /mixes producer attempts/);
 });
 
 test("commit review reruns select one complete report and ledger pair per SHA", () => {
@@ -537,5 +659,70 @@ function artifact(
     name: `${prefix}-9001-${attempt}`,
     digest: `sha256:${digest}`,
     expired: false,
+  };
+}
+
+function workflowJob(name: string, attempt: number) {
+  return { name, run_attempt: attempt };
+}
+
+function priorResultCohortFixture() {
+  const artifacts = [
+    artifact(101, 1, digest1, "clawsweeper-repair-worker"),
+    artifact(102, 1, digest1, "clawsweeper-repair-authorized"),
+    artifact(103, 1, digest1, "clawsweeper-repair-execution"),
+    artifact(104, 1, digest1, "clawsweeper-repair-validation"),
+    artifact(201, 2, digest2, "clawsweeper-repair-publication-close"),
+    artifact(202, 2, digest2, "clawsweeper-repair-publication"),
+    artifact(203, 2, digest2, "clawsweeper-repair"),
+    artifact(204, 2, digest2, "clawsweeper-repair-provenance"),
+  ];
+  return {
+    artifacts,
+    provenance: {
+      schema_version: 2,
+      workflow_repository: "openclaw/clawsweeper",
+      workflow_run_id: "9001",
+      workflow_run_attempt: "2",
+      workflow_sha: "a".repeat(40),
+      authorization_sha256: "b".repeat(64),
+      publication_receipt_sha256: "c".repeat(64),
+      publication_provenance_sha256: "d".repeat(64),
+      artifacts: {
+        worker: artifactClaim(101, 1, digest1, "clawsweeper-repair-worker"),
+        authorization: artifactClaim(102, 1, digest1, "clawsweeper-repair-authorized"),
+        execution: artifactClaim(103, 1, digest1, "clawsweeper-repair-execution"),
+        validation: artifactClaim(104, 1, digest1, "clawsweeper-repair-validation"),
+        pre_close: artifactClaim(201, 2, digest2, "clawsweeper-repair-publication-close"),
+        publication: artifactClaim(202, 2, digest2, "clawsweeper-repair-publication"),
+        final_worker: artifactClaim(203, 2, digest2, "clawsweeper-repair"),
+        provenance: {
+          name: "clawsweeper-repair-provenance-9001-2",
+          id: null,
+          digest: null,
+          producer_attempt: "2",
+        },
+      },
+    },
+    repository: "openclaw/clawsweeper",
+    runId: "9001",
+    workflowSha: "a".repeat(40),
+    currentAttempt: 3,
+    producerAttempt: 2,
+    resultArtifactId: "203",
+    resultArtifactName: "clawsweeper-repair-9001-2",
+    resultArtifactDigest: digest2,
+    provenanceArtifactId: "204",
+    provenanceArtifactName: "clawsweeper-repair-provenance-9001-2",
+    provenanceArtifactDigest: digest2,
+  };
+}
+
+function artifactClaim(id: number, attempt: number, digest: string, prefix: string) {
+  return {
+    name: `${prefix}-9001-${attempt}`,
+    id: String(id),
+    digest: `sha256:${digest}`,
+    producer_attempt: String(attempt),
   };
 }

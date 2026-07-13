@@ -144,25 +144,206 @@ jobs:
           done
           pnpm run build:repair
 
-      - name: Resolve exact worker result artifact
-        id: result-artifact
+      - name: Resolve current worker result artifact
+        id: current-result-artifact
         env:
           GH_TOKEN: ${{ steps.app_token.outputs.token }}
           RUN_ID: ${{ github.event.workflow_run.id }}
           RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
-          CLAWSWEEPER_ALLOW_PRIOR_ARTIFACT: "0"
+          ARTIFACT_INVENTORY: ${{ runner.temp }}/clawsweeper-repair-artifacts.json
         run: |
           set -euo pipefail
           rm -rf artifacts
-          mkdir -p artifacts
-          pnpm run --silent repair:resolve-run-artifact -- \
-            --repository "$GITHUB_REPOSITORY" \
-            --run-id "$RUN_ID" \
-            --current-attempt "$RUN_ATTEMPT" \
-            --prefix clawsweeper-repair \
-            --fallback-prefix clawsweeper-repair-worker
+          rm -rf artifact-provenance
+          mkdir -p artifacts artifact-provenance
+          gh api --paginate --slurp \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/artifacts?per_page=100" \
+            > "$ARTIFACT_INVENTORY"
+          node --input-type=module <<'NODE'
+          import fs from "node:fs";
+          import { resolveOptionalRunArtifact } from "./dist/repair/run-artifact.js";
+
+          const pages = JSON.parse(fs.readFileSync(process.env.ARTIFACT_INVENTORY, "utf8"));
+          if (!Array.isArray(pages)) throw new Error("workflow artifact response is invalid");
+          const artifacts = pages.flatMap((page) => {
+            if (!Array.isArray(page?.artifacts)) {
+              throw new Error("workflow artifact page is invalid");
+            }
+            return page.artifacts;
+          });
+          const artifact = resolveOptionalRunArtifact({
+            artifacts,
+            prefix: "clawsweeper-repair",
+            fallbackPrefixes: ["clawsweeper-repair-worker"],
+            runId: process.env.RUN_ID,
+            currentAttempt: Number(process.env.RUN_ATTEMPT),
+            allowPriorAttempts: false,
+          });
+          if (!artifact) {
+            writeOutputs({ artifact_found: "0" });
+          } else {
+            writeOutputs({
+              artifact_found: "1",
+              artifact_id: String(artifact.id),
+              artifact_name: artifact.name,
+              producer_attempt: String(artifact.producerAttempt),
+              artifact_digest: artifact.digest,
+            });
+          }
+
+          function writeOutputs(outputs) {
+            fs.appendFileSync(
+              process.env.GITHUB_OUTPUT,
+              Object.entries(outputs)
+                .map(([name, value]) => `${name}=${value}\n`)
+                .join(""),
+            );
+          }
+          NODE
+
+      - name: Resolve verified prior worker result cohort
+        id: prior-result-artifact
+        if: ${{ steps.current-result-artifact.outputs.artifact_found != '1' }}
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          ARTIFACT_INVENTORY: ${{ runner.temp }}/clawsweeper-repair-artifacts.json
+          CURRENT_ATTEMPT_JOBS: ${{ runner.temp }}/clawsweeper-repair-current-attempt-jobs.json
+        run: |
+          set -euo pipefail
+          gh api --paginate --slurp \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/attempts/${RUN_ATTEMPT}/jobs?per_page=100" \
+            > "$CURRENT_ATTEMPT_JOBS"
+          node --input-type=module <<'NODE'
+          import fs from "node:fs";
+          import {
+            allowsPriorResultArtifactCohort,
+            resolveOptionalRunArtifact,
+            resolveRunArtifact,
+          } from "./dist/repair/run-artifact.js";
+
+          const artifacts = readPages(process.env.ARTIFACT_INVENTORY, "artifacts");
+          const jobs = readPages(process.env.CURRENT_ATTEMPT_JOBS, "jobs");
+          const currentAttempt = Number(process.env.RUN_ATTEMPT);
+          if (!Number.isInteger(currentAttempt) || currentAttempt < 1) {
+            throw new Error("current workflow attempt is invalid");
+          }
+          const policyAllowsPrior = allowsPriorResultArtifactCohort({
+            jobs,
+            currentAttempt,
+          });
+          if (!policyAllowsPrior) {
+            writeOutputs({ artifact_found: "0", selection_policy: "current-attempt-only" });
+            process.exit(0);
+          }
+
+          const artifact = resolveOptionalRunArtifact({
+            artifacts,
+            prefix: "clawsweeper-repair",
+            requiredPrefixes: ["clawsweeper-repair-provenance"],
+            runId: process.env.RUN_ID,
+            currentAttempt,
+            maxProducerAttempt: currentAttempt - 1,
+            allowPriorAttempts: true,
+          });
+          if (!artifact) {
+            writeOutputs({ artifact_found: "0", selection_policy: "no-prior-cohort" });
+            process.exit(0);
+          }
+          const provenance = resolveRunArtifact({
+            artifacts,
+            prefix: "clawsweeper-repair-provenance",
+            runId: process.env.RUN_ID,
+            currentAttempt,
+            expectedProducerAttempt: artifact.producerAttempt,
+            allowPriorAttempts: true,
+          });
+          writeOutputs({
+            artifact_found: "1",
+            selection_policy: "verified-prior-cohort",
+            artifact_id: String(artifact.id),
+            artifact_name: artifact.name,
+            producer_attempt: String(artifact.producerAttempt),
+            artifact_digest: artifact.digest,
+            provenance_artifact_id: String(provenance.id),
+            provenance_artifact_name: provenance.name,
+            provenance_artifact_digest: provenance.digest,
+          });
+
+          function readPages(filePath, key) {
+            const pages = JSON.parse(fs.readFileSync(filePath, "utf8"));
+            if (!Array.isArray(pages)) throw new Error(`workflow ${key} response is invalid`);
+            return pages.flatMap((page) => {
+              if (!Array.isArray(page?.[key])) {
+                throw new Error(`workflow ${key} page is invalid`);
+              }
+              return page[key];
+            });
+          }
+
+          function writeOutputs(outputs) {
+            fs.appendFileSync(
+              process.env.GITHUB_OUTPUT,
+              Object.entries(outputs)
+                .map(([name, value]) => `${name}=${value}\n`)
+                .join(""),
+            );
+          }
+          NODE
+
+      - name: Select worker result artifact
+        id: result-artifact
+        env:
+          CURRENT_FOUND: ${{ steps.current-result-artifact.outputs.artifact_found }}
+          CURRENT_ARTIFACT_ID: ${{ steps.current-result-artifact.outputs.artifact_id }}
+          CURRENT_ARTIFACT_NAME: ${{ steps.current-result-artifact.outputs.artifact_name }}
+          CURRENT_PRODUCER_ATTEMPT: ${{ steps.current-result-artifact.outputs.producer_attempt }}
+          CURRENT_ARTIFACT_DIGEST: ${{ steps.current-result-artifact.outputs.artifact_digest }}
+          PRIOR_FOUND: ${{ steps.prior-result-artifact.outputs.artifact_found }}
+          PRIOR_POLICY: ${{ steps.prior-result-artifact.outputs.selection_policy }}
+          PRIOR_ARTIFACT_ID: ${{ steps.prior-result-artifact.outputs.artifact_id }}
+          PRIOR_ARTIFACT_NAME: ${{ steps.prior-result-artifact.outputs.artifact_name }}
+          PRIOR_PRODUCER_ATTEMPT: ${{ steps.prior-result-artifact.outputs.producer_attempt }}
+          PRIOR_ARTIFACT_DIGEST: ${{ steps.prior-result-artifact.outputs.artifact_digest }}
+          PRIOR_PROVENANCE_ARTIFACT_ID: ${{ steps.prior-result-artifact.outputs.provenance_artifact_id }}
+          PRIOR_PROVENANCE_ARTIFACT_NAME: ${{ steps.prior-result-artifact.outputs.provenance_artifact_name }}
+          PRIOR_PROVENANCE_ARTIFACT_DIGEST: ${{ steps.prior-result-artifact.outputs.provenance_artifact_digest }}
+        run: |
+          set -euo pipefail
+          if [ "$CURRENT_FOUND" = "1" ]; then
+            {
+              echo "artifact_found=1"
+              echo "selection=current"
+              echo "selection_policy=current-attempt"
+              echo "artifact_id=$CURRENT_ARTIFACT_ID"
+              echo "artifact_name=$CURRENT_ARTIFACT_NAME"
+              echo "producer_attempt=$CURRENT_PRODUCER_ATTEMPT"
+              echo "artifact_digest=$CURRENT_ARTIFACT_DIGEST"
+            } >> "$GITHUB_OUTPUT"
+          elif [ "$PRIOR_FOUND" = "1" ]; then
+            {
+              echo "artifact_found=1"
+              echo "selection=prior"
+              echo "selection_policy=$PRIOR_POLICY"
+              echo "artifact_id=$PRIOR_ARTIFACT_ID"
+              echo "artifact_name=$PRIOR_ARTIFACT_NAME"
+              echo "producer_attempt=$PRIOR_PRODUCER_ATTEMPT"
+              echo "artifact_digest=$PRIOR_ARTIFACT_DIGEST"
+              echo "provenance_artifact_id=$PRIOR_PROVENANCE_ARTIFACT_ID"
+              echo "provenance_artifact_name=$PRIOR_PROVENANCE_ARTIFACT_NAME"
+              echo "provenance_artifact_digest=$PRIOR_PROVENANCE_ARTIFACT_DIGEST"
+            } >> "$GITHUB_OUTPUT"
+          else
+            {
+              echo "artifact_found=0"
+              echo "selection=empty"
+              echo "selection_policy=${PRIOR_POLICY:-no-current-artifact}"
+            } >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Download exact worker result artifact
+        if: ${{ steps.result-artifact.outputs.artifact_found == '1' }}
         uses: actions/download-artifact@v8
         with:
           artifact-ids: ${{ steps.result-artifact.outputs.artifact_id }}
@@ -171,27 +352,121 @@ jobs:
           repository: ${{ github.repository }}
           run-id: ${{ github.event.workflow_run.id }}
 
-      - name: Verify exact worker result artifact
+      - name: Download exact worker result provenance
+        if: ${{ steps.result-artifact.outputs.selection == 'prior' }}
+        uses: actions/download-artifact@v8
+        with:
+          artifact-ids: ${{ steps.result-artifact.outputs.provenance_artifact_id }}
+          path: artifact-provenance
+          github-token: ${{ steps.app_token.outputs.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.event.workflow_run.id }}
+
+      - name: Verify selected worker result artifact
         id: download
         env:
+          ARTIFACT_FOUND: ${{ steps.result-artifact.outputs.artifact_found }}
+          SELECTION: ${{ steps.result-artifact.outputs.selection }}
+          SELECTION_POLICY: ${{ steps.result-artifact.outputs.selection_policy }}
           RUN_ID: ${{ github.event.workflow_run.id }}
           RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          WORKER_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          ARTIFACT_ID: ${{ steps.result-artifact.outputs.artifact_id }}
           ARTIFACT_NAME: ${{ steps.result-artifact.outputs.artifact_name }}
+          ARTIFACT_DIGEST: ${{ steps.result-artifact.outputs.artifact_digest }}
           PRODUCER_ATTEMPT: ${{ steps.result-artifact.outputs.producer_attempt }}
+          PROVENANCE_ARTIFACT_ID: ${{ steps.result-artifact.outputs.provenance_artifact_id }}
+          PROVENANCE_ARTIFACT_NAME: ${{ steps.result-artifact.outputs.provenance_artifact_name }}
+          PROVENANCE_ARTIFACT_DIGEST: ${{ steps.result-artifact.outputs.provenance_artifact_digest }}
+          ARTIFACT_INVENTORY: ${{ runner.temp }}/clawsweeper-repair-artifacts.json
         run: |
           set -euo pipefail
-          if [ "$PRODUCER_ATTEMPT" != "$RUN_ATTEMPT" ]; then
-            echo "::error::Resolved worker result producer attempt $PRODUCER_ATTEMPT does not match workflow attempt $RUN_ATTEMPT."
+          if [ "$ARTIFACT_FOUND" != "1" ]; then
+            echo "has_artifacts=0" >> "$GITHUB_OUTPUT"
+            echo "::notice title=No repair artifacts::No verified result payload for worker run $RUN_ID ($SELECTION_POLICY)."
+            exit 0
+          fi
+
+          if [ "$SELECTION" = "current" ]; then
+            if [ "$PRODUCER_ATTEMPT" != "$RUN_ATTEMPT" ]; then
+              echo "::error::Resolved current worker result attempt does not match workflow attempt."
+              exit 1
+            fi
+            case "$ARTIFACT_NAME" in
+              "clawsweeper-repair-${RUN_ID}-${RUN_ATTEMPT}" | \
+              "clawsweeper-repair-worker-${RUN_ID}-${RUN_ATTEMPT}") ;;
+              *)
+                echo "::error::Resolved worker result artifact does not belong to the current attempt."
+                exit 1
+                ;;
+            esac
+          elif [ "$SELECTION" = "prior" ]; then
+            if [ "$PRODUCER_ATTEMPT" -ge "$RUN_ATTEMPT" ] ||
+               [ "$ARTIFACT_NAME" != "clawsweeper-repair-${RUN_ID}-${PRODUCER_ATTEMPT}" ]; then
+              echo "::error::Resolved prior worker result artifact identity is invalid."
+              exit 1
+            fi
+            node --input-type=module <<'NODE'
+            import fs from "node:fs";
+            import path from "node:path";
+            import { verifyPriorResultArtifactCohort } from "./dist/repair/run-artifact.js";
+
+            const pages = JSON.parse(fs.readFileSync(process.env.ARTIFACT_INVENTORY, "utf8"));
+            if (!Array.isArray(pages)) throw new Error("workflow artifact response is invalid");
+            const artifacts = pages.flatMap((page) => {
+              if (!Array.isArray(page?.artifacts)) {
+                throw new Error("workflow artifact page is invalid");
+              }
+              return page.artifacts;
+            });
+            const runId = process.env.RUN_ID;
+            const currentAttempt = positiveInteger(process.env.RUN_ATTEMPT, "current attempt");
+            const producerAttempt = positiveInteger(
+              process.env.PRODUCER_ATTEMPT,
+              "producer attempt",
+            );
+            const provenanceFiles = fs
+              .readdirSync("artifact-provenance", { recursive: true })
+              .map((entry) => path.join("artifact-provenance", String(entry)))
+              .filter(
+                (entry) =>
+                  path.basename(entry) === "final-worker.json" && fs.statSync(entry).isFile(),
+              );
+            if (provenanceFiles.length !== 1) {
+              throw new Error("prior result provenance file is missing or ambiguous");
+            }
+            const provenance = JSON.parse(fs.readFileSync(provenanceFiles[0], "utf8"));
+            verifyPriorResultArtifactCohort({
+              artifacts,
+              provenance,
+              repository: process.env.GITHUB_REPOSITORY,
+              runId,
+              workflowSha: process.env.WORKER_HEAD_SHA,
+              currentAttempt,
+              producerAttempt,
+              resultArtifactId: process.env.ARTIFACT_ID,
+              resultArtifactName: process.env.ARTIFACT_NAME,
+              resultArtifactDigest: process.env.ARTIFACT_DIGEST,
+              provenanceArtifactId: process.env.PROVENANCE_ARTIFACT_ID,
+              provenanceArtifactName: process.env.PROVENANCE_ARTIFACT_NAME,
+              provenanceArtifactDigest: process.env.PROVENANCE_ARTIFACT_DIGEST,
+            });
+
+            function positiveInteger(value, label) {
+              const text = String(value ?? "");
+              if (!/^[1-9][0-9]*$/.test(text)) {
+                throw new Error(`${label} is invalid`);
+              }
+              const parsed = Number(text);
+              if (!Number.isSafeInteger(parsed)) throw new Error(`${label} is invalid`);
+              return parsed;
+            }
+            NODE
+          else
+            echo "::error::Worker result artifact selection is invalid."
             exit 1
           fi
-          case "$ARTIFACT_NAME" in
-            "clawsweeper-repair-${RUN_ID}-${RUN_ATTEMPT}" | \
-            "clawsweeper-repair-worker-${RUN_ID}-${RUN_ATTEMPT}") ;;
-            *)
-              echo "::error::Resolved worker result artifact does not belong to the current attempt."
-              exit 1
-              ;;
-          esac
+
           result_paths_file="$RUNNER_TEMP/clawsweeper-repair-result-paths.txt"
           node --input-type=module > "$result_paths_file" <<'NODE'
           import { findResultPaths } from "./dist/repair/publish-files.js";
