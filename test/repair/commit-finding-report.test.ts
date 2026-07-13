@@ -17,6 +17,24 @@ import {
 } from "../../dist/repair/commit-finding-report.js";
 import { mockGhBinEnv } from "../helpers.ts";
 
+test("commit finding synthetic actions satisfy the strict result schema", () => {
+  const source = fs.readFileSync("src/repair/commit-finding-intake.ts", "utf8");
+  const schema = JSON.parse(fs.readFileSync("schema/repair/codex-result.schema.json", "utf8"));
+  const actionStart = source.indexOf("actions: [", source.indexOf("function writeSyntheticRun"));
+  const actionEnd = source.indexOf("\n    needs_human:", actionStart);
+  const action = source.slice(actionStart, actionEnd);
+  const required = schema.properties.actions.items.required as string[];
+
+  assert.ok(actionStart >= 0 && actionEnd > actionStart);
+  for (const property of required) {
+    assert.match(
+      action,
+      new RegExp(`\\b${property}:`),
+      `missing synthetic action field ${property}`,
+    );
+  }
+});
+
 test("commit finding reports require exact immutable identity values", () => {
   const revision = "a".repeat(40);
   const digest = "b".repeat(64);

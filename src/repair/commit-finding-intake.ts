@@ -341,6 +341,7 @@ function writeSyntheticRun(context: LooseRecord) {
         classification: null,
         target_kind: null,
         target_updated_at: null,
+        target_timeline_cursor: null,
         canonical: null,
         duplicate_of: null,
         candidate_fix: null,
