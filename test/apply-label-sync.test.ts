@@ -7,6 +7,7 @@ import {
   contextHasNonAutomationActivityAfterForTest,
   itemSourceRevisionSha256ForTest,
   renderReviewStartStatusComment,
+  writeCommentPayloadForTest,
 } from "../dist/clawsweeper.js";
 
 import {
@@ -48,6 +49,26 @@ test("command-only timeline activity is ignored only through the completed revie
     }),
     true,
   );
+});
+
+test("comment payload files are unique for concurrent mutations on one item", () => {
+  const paths = [
+    writeCommentPayloadForTest(321, "first body"),
+    writeCommentPayloadForTest(321, "second body"),
+    writeCommentPayloadForTest(321, "first body"),
+  ];
+  try {
+    assert.equal(new Set(paths).size, paths.length);
+    assert.deepEqual(
+      paths.map((path) => JSON.parse(readFileSync(path, "utf8"))),
+      [{ body: "first body" }, { body: "second body" }, { body: "first body" }],
+    );
+  } finally {
+    for (const path of paths) {
+      rmSync(path, { force: true });
+      rmSync(path.replace(/\.json$/, ".md"), { force: true });
+    }
+  }
 });
 
 test("issue apply CAS blocks a newer durable review tuple published after preflight", () => {

@@ -19132,12 +19132,17 @@ function updateReviewCommentMetadata(
 }
 
 function writeCommentPayload(number: number, body: string): string {
-  const commentFile = join(ROOT, ".artifacts", `comment-${number}.md`);
+  const payloadStem = `comment-${number}-${sha256(body).slice(0, 16)}-${randomUUID()}`;
+  const commentFile = join(ROOT, ".artifacts", `${payloadStem}.md`);
   ensureDir(dirname(commentFile));
   writeFileSync(commentFile, body, "utf8");
-  const commentPayloadFile = join(ROOT, ".artifacts", `comment-${number}.json`);
+  const commentPayloadFile = join(ROOT, ".artifacts", `${payloadStem}.json`);
   writeFileSync(commentPayloadFile, JSON.stringify({ body }), "utf8");
   return commentPayloadFile;
+}
+
+export function writeCommentPayloadForTest(number: number, body: string): string {
+  return writeCommentPayload(number, body);
 }
 
 function upsertReviewComment(
@@ -19548,7 +19553,11 @@ function closeItem(options: { number: number; kind: ItemKind; reason: CloseReaso
     });
   } else {
     const reason = isImplementationCloseReason(options.reason) ? "completed" : "not_planned";
-    const closePayloadFile = join(ROOT, ".artifacts", `close-${options.number}.json`);
+    const closePayloadFile = join(
+      ROOT,
+      ".artifacts",
+      `close-${options.number}-${reason}-${randomUUID()}.json`,
+    );
     writeFileSync(
       closePayloadFile,
       JSON.stringify({ state: "closed", state_reason: reason }),
