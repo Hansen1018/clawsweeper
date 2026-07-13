@@ -19,6 +19,14 @@ import {
   recordWorkflowActionEvent,
   workflowActionEventsEnabled,
 } from "./action-ledger-runtime.js";
+import {
+  actionLedgerRecoveryEnvironment,
+  actionLedgerRecoveryRoot,
+  mutationRecoveryPath,
+  readMutationRecoveries,
+  removeMutationRecovery,
+  writeMutationRecovery,
+} from "./action-ledger-recovery.js";
 
 export type CommitLifecycleInput = {
   repository: string;
@@ -55,6 +63,7 @@ type CommitLifecycleEvent = {
   mutation: boolean;
   component: string;
   state: string;
+  parentEventId?: string | null;
   completionReason?: string;
   reviewMode?: string;
   publicationKind?: string;
@@ -67,6 +76,7 @@ type CommitLifecycleEvent = {
 
 type CommitActionLedgerContext = {
   root: string;
+  recoveryRoot: string;
   env: NodeJS.ProcessEnv;
 };
 
@@ -100,7 +110,8 @@ export function recordCommitLifecycleEvent(
       operation: "commit_review",
       operationIdentity,
       attemptIdentity,
-      parentEventId: previous?.event_id ?? null,
+      parentEventId:
+        event.parentEventId !== undefined ? event.parentEventId : (previous?.event_id ?? null),
       phaseSeq,
       ...(event.idempotencyIdentity !== undefined
         ? { idempotencyIdentity: event.idempotencyIdentity }
@@ -219,7 +230,7 @@ export function runCommitMutation<T>(
     requestSha256,
   };
   const requestAttempt = nextRequestAttempt(input, idempotencyIdentity, ledgerContext);
-  recordCommitLifecycleEvent(
+  const attemptEvent = recordCommitLifecycleEvent(
     input,
     {
       type: ACTION_EVENT_TYPES.publicationLifecycle,
@@ -236,6 +247,17 @@ export function runCommitMutation<T>(
     },
     ledgerContext,
   );
+  const recovery = attemptEvent
+    ? beginCommitMutationRecovery(ledgerContext, attemptEvent.event_id, {
+        input,
+        kind: options.kind,
+        requestSha256,
+        requestAttempt,
+        idempotencyIdentity,
+        parentEventId: attemptEvent.event_id,
+        outcome: "unknown",
+      })
+    : null;
   let result: T;
   try {
     result = options.operation();
@@ -253,18 +275,22 @@ export function runCommitMutation<T>(
       requestAttempt,
       idempotencyIdentity,
       outcome,
+      attemptEvent?.event_id ?? null,
       ledgerContext,
+      recovery,
     );
     throw error;
   }
-  recordCommitMutationOutcomeOrDefer(
-    ledgerContext,
+  recordCommitMutationOutcomeWithRecovery(
+    recovery,
     input,
     options.kind,
     requestSha256,
     requestAttempt,
     idempotencyIdentity,
     "accepted",
+    attemptEvent?.event_id ?? null,
+    ledgerContext,
   );
   return result;
 }
@@ -276,6 +302,7 @@ function recordCommitMutationOutcome(
   requestAttempt: number,
   idempotencyIdentity: unknown,
   outcome: "accepted" | "rejected" | "unknown",
+  parentEventId: string | null,
   context?: CommitActionLedgerContext,
 ): void {
   recordCommitLifecycleEvent(
@@ -297,6 +324,7 @@ function recordCommitMutationOutcome(
       mutation: outcome !== "rejected",
       retryable: outcome === "unknown",
       component: "commit_review",
+      parentEventId,
       state: `mutation_${outcome}`,
       completionReason:
         outcome === "accepted"
@@ -319,8 +347,19 @@ function recordCommitMutationOutcomeSafely(
   requestAttempt: number,
   idempotencyIdentity: unknown,
   outcome: "rejected" | "unknown",
+  parentEventId: string | null,
   context?: CommitActionLedgerContext,
-): void {
+  recovery?: CommitMutationRecovery | null,
+): boolean {
+  updateCommitMutationRecoverySafely(recovery, {
+    input,
+    kind,
+    requestSha256,
+    requestAttempt,
+    idempotencyIdentity,
+    parentEventId,
+    outcome,
+  });
   try {
     recordCommitMutationOutcome(
       input,
@@ -329,86 +368,177 @@ function recordCommitMutationOutcomeSafely(
       requestAttempt,
       idempotencyIdentity,
       outcome,
+      parentEventId,
       context,
     );
+    removeCommitMutationRecoverySafely(recovery);
+    return true;
   } catch (receiptError) {
     console.error(
       `[action-ledger] failed to record ${kind} ${outcome} outcome after the primary failure: ${
         receiptError instanceof Error ? receiptError.message : String(receiptError)
       }`,
     );
+    return false;
   }
 }
 
-type DeferredCommitMutationOutcome = {
-  context: CommitActionLedgerContext;
+type CommitMutationOutcome = "accepted" | "rejected" | "unknown";
+
+type CommitMutationRecoveryPayload = {
+  context: {
+    root: string;
+    env: Record<string, string>;
+  };
   input: CommitLifecycleInput;
   kind: string;
   requestSha256: string;
   requestAttempt: number;
   idempotencyIdentity: unknown;
-  outcome: "accepted" | "rejected" | "unknown";
+  parentEventId: string | null;
+  outcome: CommitMutationOutcome;
 };
 
-const deferredCommitMutationOutcomes = new Map<string, DeferredCommitMutationOutcome[]>();
+type CommitMutationRecovery = {
+  key: string;
+  recoveryRoot: string;
+  context: CommitActionLedgerContext;
+};
 
-function recordCommitMutationOutcomeOrDefer(
+function beginCommitMutationRecovery(
   context: CommitActionLedgerContext,
+  key: string,
+  outcome: Omit<CommitMutationRecoveryPayload, "context">,
+): CommitMutationRecovery {
+  const recovery = { key, recoveryRoot: context.recoveryRoot, context };
+  writeCommitMutationRecovery(recovery, outcome);
+  return recovery;
+}
+
+function recordCommitMutationOutcomeWithRecovery(
+  recovery: CommitMutationRecovery | null,
   input: CommitLifecycleInput,
   kind: string,
   requestSha256: string,
   requestAttempt: number,
   idempotencyIdentity: unknown,
-  outcome: "accepted" | "rejected" | "unknown",
+  outcome: CommitMutationOutcome,
+  parentEventId: string | null,
+  context: CommitActionLedgerContext,
 ): void {
-  try {
-    recordCommitMutationOutcome(
-      input,
-      kind,
-      requestSha256,
-      requestAttempt,
-      idempotencyIdentity,
-      outcome,
-      context,
-    );
-  } catch (error) {
-    const deferred = deferredCommitMutationOutcomes.get(context.root) ?? [];
-    deferred.push({
-      context,
-      input: { ...input },
-      kind,
-      requestSha256,
-      requestAttempt,
-      idempotencyIdentity,
-      outcome,
-    });
-    deferredCommitMutationOutcomes.set(context.root, deferred);
-    throw error;
-  }
+  updateCommitMutationRecoverySafely(recovery, {
+    input,
+    kind,
+    requestSha256,
+    requestAttempt,
+    idempotencyIdentity,
+    parentEventId,
+    outcome,
+  });
+  recordCommitMutationOutcome(
+    input,
+    kind,
+    requestSha256,
+    requestAttempt,
+    idempotencyIdentity,
+    outcome,
+    parentEventId,
+    context,
+  );
+  removeCommitMutationRecoverySafely(recovery);
 }
 
-function flushDeferredCommitMutationOutcomes(root: string): void {
-  const deferred = deferredCommitMutationOutcomes.get(root);
-  if (!deferred?.length) return;
-  for (const outcome of deferred) {
+export function recoverCommitMutationOutcomes(): void {
+  const current = commitActionLedgerContext();
+  for (const recovery of readMutationRecoveries<CommitMutationRecoveryPayload>(
+    current.recoveryRoot,
+    "commit",
+  )) {
+    const payload = recovery.payload;
+    const context: CommitActionLedgerContext = {
+      root: payload.context.root,
+      recoveryRoot: current.recoveryRoot,
+      env: { ...process.env, ...payload.context.env },
+    };
+    if (commitMutationOutcomeRecorded(payload, context)) {
+      removeMutationRecovery(recovery.path);
+      continue;
+    }
     recordCommitMutationOutcome(
-      outcome.input,
-      outcome.kind,
-      outcome.requestSha256,
-      outcome.requestAttempt,
-      outcome.idempotencyIdentity,
-      outcome.outcome,
-      outcome.context,
+      payload.input,
+      payload.kind,
+      payload.requestSha256,
+      payload.requestAttempt,
+      payload.idempotencyIdentity,
+      payload.outcome,
+      payload.parentEventId,
+      context,
     );
+    removeMutationRecovery(recovery.path);
   }
-  deferredCommitMutationOutcomes.delete(root);
 }
 
 export async function flushCommitActionEvents(): Promise<string[]> {
   const root = commitActionLedgerRoot();
-  flushDeferredCommitMutationOutcomes(root);
+  recoverCommitMutationOutcomes();
   interruptOpenWorkflowActionEvents(root);
   return flushWorkflowActionEvents(root);
+}
+
+function writeCommitMutationRecovery(
+  recovery: CommitMutationRecovery,
+  outcome: Omit<CommitMutationRecoveryPayload, "context">,
+): void {
+  writeMutationRecovery(recovery.recoveryRoot, "commit", recovery.key, {
+    context: {
+      root: recovery.context.root,
+      env: actionLedgerRecoveryEnvironment(recovery.context.env),
+    },
+    ...outcome,
+  });
+}
+
+function updateCommitMutationRecoverySafely(
+  recovery: CommitMutationRecovery | null | undefined,
+  outcome: Omit<CommitMutationRecoveryPayload, "context">,
+): void {
+  if (!recovery) return;
+  try {
+    writeCommitMutationRecovery(recovery, outcome);
+  } catch (error) {
+    console.error(
+      `[action-ledger] failed to persist ${outcome.kind} ${outcome.outcome} recovery: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+  }
+}
+
+function removeCommitMutationRecoverySafely(
+  recovery: CommitMutationRecovery | null | undefined,
+): void {
+  if (!recovery) return;
+  try {
+    removeMutationRecovery(mutationRecoveryPath(recovery.recoveryRoot, "commit", recovery.key));
+  } catch (error) {
+    console.error(
+      `[action-ledger] failed to clear ${recovery.key} recovery: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+  }
+}
+
+function commitMutationOutcomeRecorded(
+  payload: CommitMutationRecoveryPayload,
+  context: CommitActionLedgerContext,
+): boolean {
+  return commitEvents(payload.input, context).some(
+    (event) =>
+      event.parent_event_id === payload.parentEventId &&
+      event.event_type === ACTION_EVENT_TYPES.publicationLifecycle &&
+      String(event.attributes?.completion_reason ?? "").startsWith("mutation_"),
+  );
 }
 
 function commitOperationIdentity(input: CommitLifecycleInput) {
@@ -437,6 +567,7 @@ function commitActionLedgerContext(): CommitActionLedgerContext {
   const env = { ...process.env };
   return {
     root: commitActionLedgerRoot(env),
+    recoveryRoot: actionLedgerRecoveryRoot(env, commitActionLedgerRoot(env)),
     env,
   };
 }

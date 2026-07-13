@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 
 import { actionLedgerJson, readActionEventShardAt, type ActionEvent } from "../action-ledger.js";
+import { recoverCommitMutationOutcomes } from "../commit-action-ledger.js";
 import {
   ACTION_EVENT_SHARD_IMPORT_LIMITS,
   readValidatedActionEventShardBatch,
@@ -44,6 +45,7 @@ export async function finalizeRepairActionLedgerManifest(
 ): Promise<RepairActionLedgerManifest> {
   assertRepairActionLedgerLane(lane);
   const outputRoot = repairActionLedgerOutputRoot();
+  recoverCommitMutationOutcomes();
   const finalizedPaths = await flushRepairActionEvents();
   const repairShards = repairActionLedgerShards(outputRoot, finalizedPaths);
   const eventPaths = repairShards.map((shard) => shard.relativePath).sort();

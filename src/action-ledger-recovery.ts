@@ -1,0 +1,215 @@
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  rmdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import path from "node:path";
+
+import { actionLedgerJson } from "./action-ledger.js";
+
+const MUTATION_RECOVERY_SCHEMA = "clawsweeper.action-ledger-mutation-recovery";
+const MUTATION_RECOVERY_VERSION = 1;
+const MUTATION_RECOVERY_MAX_FILES = 1024;
+const MUTATION_RECOVERY_MAX_BYTES = 256 * 1024;
+const MUTATION_RECOVERY_FAMILY_PATTERN = /^[a-z][a-z0-9_-]{0,63}$/;
+const MUTATION_RECOVERY_KEY_PATTERN = /^[a-f0-9]{64}$/;
+const MUTATION_RECOVERY_TEMP_PATTERN = /^\.[a-f0-9]{64}\.[1-9][0-9]*\.[0-9]+\.tmp$/;
+const WORKFLOW_ENV_KEYS = [
+  "CLAWSWEEPER_ACTION_LEDGER_FORCE",
+  "CLAWSWEEPER_ACTION_LEDGER_INVOCATION",
+  "CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT",
+  "CLAWSWEEPER_ACTION_LEDGER_PARTITION_DATE",
+  "CLAWSWEEPER_ACTION_LEDGER_ROOT",
+  "CLAWSWEEPER_CRABFLEET_SESSION_ID",
+  "GITHUB_ACTION",
+  "GITHUB_JOB",
+  "GITHUB_REPOSITORY",
+  "GITHUB_RUN_ATTEMPT",
+  "GITHUB_RUN_ID",
+  "GITHUB_RUN_STARTED_AT",
+  "GITHUB_SERVER_URL",
+  "GITHUB_SHA",
+  "GITHUB_WORKFLOW",
+  "GITHUB_WORKFLOW_REF",
+] as const;
+
+type MutationRecoveryEnvelope<T> = {
+  schema: typeof MUTATION_RECOVERY_SCHEMA;
+  schema_version: typeof MUTATION_RECOVERY_VERSION;
+  family: string;
+  key: string;
+  payload: T;
+};
+
+export type MutationRecoveryRecord<T> = {
+  key: string;
+  path: string;
+  payload: T;
+};
+
+export function actionLedgerRecoveryEnvironment(env: NodeJS.ProcessEnv): Record<string, string> {
+  const snapshot: Record<string, string> = {};
+  for (const key of WORKFLOW_ENV_KEYS) {
+    const value = env[key];
+    if (value !== undefined) snapshot[key] = value;
+  }
+  return snapshot;
+}
+
+export function actionLedgerRecoveryRoot(env: NodeJS.ProcessEnv, fallbackRoot: string): string {
+  return (
+    env.CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT?.trim() ||
+    path.join(fallbackRoot, ".clawsweeper-repair", "action-ledger-state")
+  );
+}
+
+export function writeMutationRecovery<T>(
+  recoveryRoot: string,
+  family: string,
+  key: string,
+  payload: T,
+): void {
+  assertMutationRecoveryIdentity(family, key);
+  const directory = prepareMutationRecoveryDirectory(recoveryRoot, family);
+  const target = mutationRecoveryPath(recoveryRoot, family, key);
+  const temporary = path.join(directory, `.${key}.${process.pid}.${Date.now()}.tmp`);
+  const envelope: MutationRecoveryEnvelope<T> = {
+    schema: MUTATION_RECOVERY_SCHEMA,
+    schema_version: MUTATION_RECOVERY_VERSION,
+    family,
+    key,
+    payload,
+  };
+  writeFileSync(temporary, `${actionLedgerJson(envelope)}\n`, {
+    encoding: "utf8",
+    flag: "wx",
+    mode: 0o600,
+  });
+  try {
+    renameSync(temporary, target);
+  } finally {
+    rmSync(temporary, { force: true });
+  }
+}
+
+export function readMutationRecoveries<T>(
+  recoveryRoot: string,
+  family: string,
+): MutationRecoveryRecord<T>[] {
+  assertMutationRecoveryFamily(family);
+  const directory = mutationRecoveryDirectory(recoveryRoot, family);
+  if (!existsSync(directory)) return [];
+  assertDirectory(recoveryRoot);
+  assertDirectory(path.join(recoveryRoot, ".mutation-recovery"));
+  assertDirectory(directory);
+  const entries = readdirSync(directory, { withFileTypes: true });
+  if (entries.length > MUTATION_RECOVERY_MAX_FILES) {
+    throw new Error(`mutation recovery exceeds ${MUTATION_RECOVERY_MAX_FILES} file limit`);
+  }
+  const records: MutationRecoveryRecord<T>[] = [];
+  for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
+    const filePath = path.join(directory, entry.name);
+    if (MUTATION_RECOVERY_TEMP_PATTERN.test(entry.name)) {
+      assertRecoveryFile(filePath, entry.name);
+      rmSync(filePath);
+      continue;
+    }
+    if (!entry.isFile() || !entry.name.endsWith(".json")) {
+      throw new Error(`invalid mutation recovery entry: ${entry.name}`);
+    }
+    const key = entry.name.slice(0, -".json".length);
+    assertMutationRecoveryIdentity(family, key);
+    assertRecoveryFile(filePath, entry.name);
+    const content = readFileSync(filePath, "utf8");
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(content);
+    } catch {
+      throw new Error(`mutation recovery is not valid JSON: ${entry.name}`);
+    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error(`mutation recovery envelope is invalid: ${entry.name}`);
+    }
+    const envelope = parsed as Partial<MutationRecoveryEnvelope<T>>;
+    if (
+      envelope.schema !== MUTATION_RECOVERY_SCHEMA ||
+      envelope.schema_version !== MUTATION_RECOVERY_VERSION ||
+      envelope.family !== family ||
+      envelope.key !== key ||
+      envelope.payload === undefined ||
+      `${actionLedgerJson(envelope)}\n` !== content
+    ) {
+      throw new Error(`mutation recovery identity is invalid: ${entry.name}`);
+    }
+    records.push({ key, path: filePath, payload: envelope.payload });
+  }
+  return records;
+}
+
+export function removeMutationRecovery(filePath: string): void {
+  rmSync(filePath, { force: true });
+  const directory = path.dirname(filePath);
+  if (existsSync(directory) && readdirSync(directory).length === 0) {
+    rmdirSync(directory);
+  }
+}
+
+export function mutationRecoveryPath(recoveryRoot: string, family: string, key: string): string {
+  assertMutationRecoveryIdentity(family, key);
+  return path.join(mutationRecoveryDirectory(recoveryRoot, family), `${key}.json`);
+}
+
+function mutationRecoveryDirectory(recoveryRoot: string, family: string): string {
+  assertMutationRecoveryFamily(family);
+  return path.join(recoveryRoot, ".mutation-recovery", family);
+}
+
+function prepareMutationRecoveryDirectory(recoveryRoot: string, family: string): string {
+  const root = path.resolve(recoveryRoot);
+  mkdirSync(root, { recursive: true, mode: 0o700 });
+  assertDirectory(root);
+  const parent = path.join(root, ".mutation-recovery");
+  if (!existsSync(parent)) mkdirSync(parent, { mode: 0o700 });
+  assertDirectory(parent);
+  const directory = mutationRecoveryDirectory(root, family);
+  if (!existsSync(directory)) mkdirSync(directory, { mode: 0o700 });
+  assertDirectory(directory);
+  return directory;
+}
+
+function assertMutationRecoveryIdentity(family: string, key: string): void {
+  assertMutationRecoveryFamily(family);
+  if (!MUTATION_RECOVERY_KEY_PATTERN.test(key)) {
+    throw new Error("mutation recovery key is invalid");
+  }
+}
+
+function assertMutationRecoveryFamily(family: string): void {
+  if (!MUTATION_RECOVERY_FAMILY_PATTERN.test(family)) {
+    throw new Error("mutation recovery family is invalid");
+  }
+}
+
+function assertDirectory(directory: string): void {
+  const stat = lstatSync(directory);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) {
+    throw new Error(`mutation recovery directory is unsafe: ${directory}`);
+  }
+}
+
+function assertRecoveryFile(filePath: string, name: string) {
+  const stat = lstatSync(filePath);
+  if (!stat.isFile() || stat.isSymbolicLink()) {
+    throw new Error(`invalid mutation recovery file: ${name}`);
+  }
+  if (stat.size > MUTATION_RECOVERY_MAX_BYTES) {
+    throw new Error(`mutation recovery exceeds ${MUTATION_RECOVERY_MAX_BYTES} bytes: ${name}`);
+  }
+  return stat;
+}

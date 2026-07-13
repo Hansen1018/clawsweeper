@@ -25,6 +25,14 @@ import {
   workflowActionProducer,
   workflowActionEventsEnabled,
 } from "../action-ledger-runtime.js";
+import {
+  actionLedgerRecoveryEnvironment,
+  actionLedgerRecoveryRoot,
+  mutationRecoveryPath,
+  readMutationRecoveries,
+  removeMutationRecovery,
+  writeMutationRecovery,
+} from "../action-ledger-recovery.js";
 import { repoRoot } from "./paths.js";
 
 export type RepairLifecycleInput = {
@@ -91,6 +99,7 @@ export type RepairMutationOptions<T> = {
 
 type RepairActionLedgerContext = {
   root: string;
+  recoveryRoot: string;
   env: NodeJS.ProcessEnv;
 };
 
@@ -243,6 +252,21 @@ export function runRepairMutation<T>(
     },
     ledgerContext,
   );
+  const outcomeOptions = {
+    kind,
+    requestSha256,
+    requestAttempt,
+    idempotencyIdentity,
+    operation,
+    parentEventId: attemptEvent?.event_id ?? null,
+    ...(options.component ? { component: options.component } : {}),
+  };
+  const recovery = attemptEvent
+    ? beginRepairMutationRecovery(ledgerContext, attemptEvent.event_id, input, {
+        ...outcomeOptions,
+        outcome: "unknown",
+      })
+    : null;
 
   let result: T;
   try {
@@ -257,16 +281,11 @@ export function runRepairMutation<T>(
     recordRepairMutationOutcomeSafely(
       input,
       {
-        kind,
-        requestSha256,
-        requestAttempt,
-        idempotencyIdentity,
-        operation,
-        parentEventId: attemptEvent?.event_id ?? null,
-        ...(options.component ? { component: options.component } : {}),
+        ...outcomeOptions,
         outcome,
       },
       ledgerContext,
+      recovery,
     );
     throw error;
   }
@@ -278,29 +297,20 @@ export function runRepairMutation<T>(
     recordRepairMutationOutcomeSafely(
       input,
       {
-        kind,
-        requestSha256,
-        requestAttempt,
-        idempotencyIdentity,
-        operation,
-        parentEventId: attemptEvent?.event_id ?? null,
-        ...(options.component ? { component: options.component } : {}),
+        ...outcomeOptions,
         outcome: "unknown",
       },
       ledgerContext,
+      recovery,
     );
     throw error;
   }
-  recordRepairMutationOutcomeOrDefer(ledgerContext, input, {
-    kind,
-    requestSha256,
-    requestAttempt,
-    idempotencyIdentity,
-    operation,
-    parentEventId: attemptEvent?.event_id ?? null,
-    ...(options.component ? { component: options.component } : {}),
-    outcome,
-  });
+  recordRepairMutationOutcomeWithRecovery(
+    recovery,
+    input,
+    { ...outcomeOptions, outcome },
+    ledgerContext,
+  );
   return result;
 }
 
@@ -344,6 +354,21 @@ export async function runRepairMutationAsync<T>(
     },
     ledgerContext,
   );
+  const outcomeOptions = {
+    kind,
+    requestSha256,
+    requestAttempt,
+    idempotencyIdentity,
+    operation,
+    parentEventId: attemptEvent?.event_id ?? null,
+    ...(options.component ? { component: options.component } : {}),
+  };
+  const recovery = attemptEvent
+    ? beginRepairMutationRecovery(ledgerContext, attemptEvent.event_id, input, {
+        ...outcomeOptions,
+        outcome: "unknown",
+      })
+    : null;
 
   let result: T;
   try {
@@ -358,16 +383,11 @@ export async function runRepairMutationAsync<T>(
     recordRepairMutationOutcomeSafely(
       input,
       {
-        kind,
-        requestSha256,
-        requestAttempt,
-        idempotencyIdentity,
-        operation,
-        parentEventId: attemptEvent?.event_id ?? null,
-        ...(options.component ? { component: options.component } : {}),
+        ...outcomeOptions,
         outcome,
       },
       ledgerContext,
+      recovery,
     );
     throw error;
   }
@@ -379,29 +399,20 @@ export async function runRepairMutationAsync<T>(
     recordRepairMutationOutcomeSafely(
       input,
       {
-        kind,
-        requestSha256,
-        requestAttempt,
-        idempotencyIdentity,
-        operation,
-        parentEventId: attemptEvent?.event_id ?? null,
-        ...(options.component ? { component: options.component } : {}),
+        ...outcomeOptions,
         outcome: "unknown",
       },
       ledgerContext,
+      recovery,
     );
     throw error;
   }
-  recordRepairMutationOutcomeOrDefer(ledgerContext, input, {
-    kind,
-    requestSha256,
-    requestAttempt,
-    idempotencyIdentity,
-    operation,
-    parentEventId: attemptEvent?.event_id ?? null,
-    ...(options.component ? { component: options.component } : {}),
-    outcome,
-  });
+  recordRepairMutationOutcomeWithRecovery(
+    recovery,
+    input,
+    { ...outcomeOptions, outcome },
+    ledgerContext,
+  );
   return result;
 }
 
@@ -552,7 +563,7 @@ export function recordRepairLifecycleFailureSafely(
 
 export async function flushRepairActionEvents(): Promise<string[]> {
   const root = repairActionLedgerRoot();
-  flushDeferredRepairMutationOutcomes(root);
+  recoverRepairMutationOutcomes();
   interruptOpenWorkflowActionEvents(root);
   return flushWorkflowActionEvents(root);
 }
@@ -610,6 +621,7 @@ function repairActionLedgerContext(): RepairActionLedgerContext {
   const env = { ...process.env };
   return {
     root: repairActionLedgerRoot(env),
+    recoveryRoot: actionLedgerRecoveryRoot(env, repairActionLedgerRoot(env)),
     env,
   };
 }
@@ -805,54 +817,134 @@ function recordRepairMutationOutcome(
   );
 }
 
-type DeferredRepairMutationOutcome = {
-  context: RepairActionLedgerContext;
+type RepairMutationOutcomeOptions = Parameters<typeof recordRepairMutationOutcome>[1];
+
+type RepairMutationRecoveryPayload = {
+  context: {
+    root: string;
+    env: Record<string, string>;
+  };
   input: RepairLifecycleInput;
-  options: Parameters<typeof recordRepairMutationOutcome>[1];
+  options: RepairMutationOutcomeOptions;
 };
 
-const deferredRepairMutationOutcomes = new Map<string, DeferredRepairMutationOutcome[]>();
+type RepairMutationRecovery = {
+  key: string;
+  recoveryRoot: string;
+  context: RepairActionLedgerContext;
+};
 
-function recordRepairMutationOutcomeOrDefer(
+function beginRepairMutationRecovery(
   context: RepairActionLedgerContext,
+  key: string,
   input: RepairLifecycleInput,
-  options: Parameters<typeof recordRepairMutationOutcome>[1],
-): void {
-  try {
-    recordRepairMutationOutcome(input, options, context);
-  } catch (error) {
-    const deferred = deferredRepairMutationOutcomes.get(context.root) ?? [];
-    deferred.push({
-      context,
-      input: { ...input },
-      options: { ...options },
-    });
-    deferredRepairMutationOutcomes.set(context.root, deferred);
-    throw error;
-  }
+  options: RepairMutationOutcomeOptions,
+): RepairMutationRecovery {
+  const recovery = { key, recoveryRoot: context.recoveryRoot, context };
+  writeRepairMutationRecovery(recovery, input, options);
+  return recovery;
 }
 
-function flushDeferredRepairMutationOutcomes(ledgerRoot: string): void {
-  const deferred = deferredRepairMutationOutcomes.get(ledgerRoot);
-  if (!deferred?.length) return;
-  for (const outcome of deferred) {
-    recordRepairMutationOutcome(outcome.input, outcome.options, outcome.context);
+function recordRepairMutationOutcomeWithRecovery(
+  recovery: RepairMutationRecovery | null,
+  input: RepairLifecycleInput,
+  options: RepairMutationOutcomeOptions,
+  context: RepairActionLedgerContext,
+): void {
+  updateRepairMutationRecoverySafely(recovery, input, options);
+  recordRepairMutationOutcome(input, options, context);
+  removeRepairMutationRecoverySafely(recovery);
+}
+
+export function recoverRepairMutationOutcomes(): void {
+  const current = repairActionLedgerContext();
+  for (const recovery of readMutationRecoveries<RepairMutationRecoveryPayload>(
+    current.recoveryRoot,
+    "repair",
+  )) {
+    const payload = recovery.payload;
+    const context: RepairActionLedgerContext = {
+      root: payload.context.root,
+      recoveryRoot: current.recoveryRoot,
+      env: { ...process.env, ...payload.context.env },
+    };
+    if (!repairMutationOutcomeRecorded(payload, context)) {
+      recordRepairMutationOutcome(payload.input, payload.options, context);
+    }
+    removeMutationRecovery(recovery.path);
   }
-  deferredRepairMutationOutcomes.delete(ledgerRoot);
 }
 
 function recordRepairMutationOutcomeSafely(
   input: RepairLifecycleInput,
-  options: Parameters<typeof recordRepairMutationOutcome>[1],
+  options: RepairMutationOutcomeOptions,
   context?: RepairActionLedgerContext,
-): void {
+  recovery?: RepairMutationRecovery | null,
+): boolean {
+  updateRepairMutationRecoverySafely(recovery, input, options);
   try {
     recordRepairMutationOutcome(input, options, context);
+    removeRepairMutationRecoverySafely(recovery);
+    return true;
   } catch (error) {
     console.error(
       `[action-ledger] failed to record ${options.kind} ${options.outcome} outcome: ${errorText(error)}`,
     );
+    return false;
   }
+}
+
+function writeRepairMutationRecovery(
+  recovery: RepairMutationRecovery,
+  input: RepairLifecycleInput,
+  options: RepairMutationOutcomeOptions,
+): void {
+  writeMutationRecovery(recovery.recoveryRoot, "repair", recovery.key, {
+    context: {
+      root: recovery.context.root,
+      env: actionLedgerRecoveryEnvironment(recovery.context.env),
+    },
+    input,
+    options,
+  });
+}
+
+function updateRepairMutationRecoverySafely(
+  recovery: RepairMutationRecovery | null | undefined,
+  input: RepairLifecycleInput,
+  options: RepairMutationOutcomeOptions,
+): void {
+  if (!recovery) return;
+  try {
+    writeRepairMutationRecovery(recovery, input, options);
+  } catch (error) {
+    console.error(
+      `[action-ledger] failed to persist ${options.kind} ${options.outcome} recovery: ${errorText(error)}`,
+    );
+  }
+}
+
+function removeRepairMutationRecoverySafely(
+  recovery: RepairMutationRecovery | null | undefined,
+): void {
+  if (!recovery) return;
+  try {
+    removeMutationRecovery(mutationRecoveryPath(recovery.recoveryRoot, "repair", recovery.key));
+  } catch (error) {
+    console.error(`[action-ledger] failed to clear ${recovery.key} recovery: ${errorText(error)}`);
+  }
+}
+
+function repairMutationOutcomeRecorded(
+  payload: RepairMutationRecoveryPayload,
+  context: RepairActionLedgerContext,
+): boolean {
+  return repairAttemptEvents(payload.input, payload.options.operation, context).some(
+    (event) =>
+      event.parent_event_id === (payload.options.parentEventId ?? null) &&
+      event.event_type === ACTION_EVENT_TYPES.repairMutation &&
+      String(event.attributes?.completion_reason ?? "").startsWith("mutation_"),
+  );
 }
 
 function repairProducerMatches(

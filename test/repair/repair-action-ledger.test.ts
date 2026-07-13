@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { pathToFileURL } from "node:url";
 
 import {
   ACTION_EVENT_REASON_CODES,
@@ -192,9 +193,9 @@ test("async mutation receipts preserve their workflow context across environment
 });
 
 test(
-  "deferred local receipt failures finalize the known mutation outcome",
+  "repair receipt recovery survives a fresh finalizer process",
   { skip: process.platform === "win32" ? "requires POSIX directory permissions" : false },
-  async () => {
+  () => {
     const root = fs.realpathSync(
       fs.mkdtempSync(path.join(os.tmpdir(), "repair-deferred-receipt-")),
     );
@@ -205,27 +206,82 @@ test(
     let spoolDirectory = "";
 
     try {
-      await assert.rejects(
-        runRepairMutationAsync(repairLifecycle(), {
-          kind: "branch_push",
-          identity: { repo: "openclaw/openclaw", ref: "refs/heads/fix", sha: "b".repeat(40) },
-          operation: async () => {
-            const spoolFile = walk(root).find((file) => file.endsWith(".json"));
-            assert.ok(spoolFile);
-            spoolDirectory = path.dirname(spoolFile);
-            fs.chmodSync(spoolDirectory, 0o500);
-            return "accepted";
-          },
-        }),
-        /EACCES|EPERM|permission/i,
+      const repairModule = pathToFileURL(
+        path.join(process.cwd(), "dist", "repair", "repair-action-ledger.js"),
+      ).href;
+      const lifecycle = repairLifecycle();
+      const mutation = spawnSync(
+        process.execPath,
+        [
+          "--input-type=module",
+          "-e",
+          `
+            import fs from "node:fs";
+            import path from "node:path";
+            const { runRepairMutationAsync } = await import(${JSON.stringify(repairModule)});
+            const root = ${JSON.stringify(root)};
+            const outputRoot = ${JSON.stringify(outputRoot)};
+            const walk = (directory) => fs.readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
+              const target = path.join(directory, entry.name);
+              return entry.isDirectory() ? walk(target) : [target];
+            });
+            await runRepairMutationAsync(${JSON.stringify(lifecycle)}, {
+              kind: "branch_push",
+              identity: {
+                repo: "openclaw/openclaw",
+                ref: "refs/heads/fix",
+                sha: ${JSON.stringify("b".repeat(40))},
+              },
+              operation: async () => {
+                const outputPrefix = path.resolve(outputRoot) + path.sep;
+                const spoolFile = walk(root).find(
+                  (file) => file.endsWith(".json") && !path.resolve(file).startsWith(outputPrefix),
+                );
+                if (!spoolFile) throw new Error("missing repair action spool");
+                fs.chmodSync(path.dirname(spoolFile), 0o500);
+                return "accepted";
+              },
+            });
+          `,
+        ],
+        { cwd: process.cwd(), encoding: "utf8", env: { ...process.env } },
+      );
+      assert.notEqual(mutation.status, 0, mutation.stderr);
+      assert.match(mutation.stderr, /EACCES|EPERM|permission/i);
+
+      const spoolFile = actionEventSpoolFile(root, outputRoot);
+      assert.ok(spoolFile);
+      spoolDirectory = path.dirname(spoolFile);
+      fs.chmodSync(spoolDirectory, 0o700);
+      assert.ok(
+        walk(outputRoot).some((file) =>
+          file.includes(`${path.sep}.mutation-recovery${path.sep}repair${path.sep}`),
+        ),
       );
 
-      fs.chmodSync(spoolDirectory, 0o700);
-      await flushRepairActionEvents();
+      const finalizer = spawnSync(
+        process.execPath,
+        [
+          "--input-type=module",
+          "-e",
+          `
+            const { flushRepairActionEvents } = await import(${JSON.stringify(repairModule)});
+            await flushRepairActionEvents();
+          `,
+        ],
+        { cwd: process.cwd(), encoding: "utf8", env: { ...process.env } },
+      );
+      assert.equal(finalizer.status, 0, finalizer.stderr);
+
       const events = readEvents(outputRoot);
       assert.deepEqual(
         events.map((event) => event.attributes?.completion_reason),
         ["mutation_attempted", "mutation_accepted"],
+      );
+      assert.equal(events[1]?.parent_event_id, events[0]?.event_id);
+      assert.equal(
+        walk(outputRoot).some((file) => file.endsWith(".json")),
+        false,
       );
     } finally {
       if (spoolDirectory) fs.chmodSync(spoolDirectory, 0o700);
@@ -790,4 +846,11 @@ function walk(root: string): string[] {
     const target = path.join(root, entry.name);
     return entry.isDirectory() ? walk(target) : [target];
   });
+}
+
+function actionEventSpoolFile(root: string, outputRoot: string): string | undefined {
+  const outputPrefix = `${path.resolve(outputRoot)}${path.sep}`;
+  return walk(root).find(
+    (file) => file.endsWith(".json") && !path.resolve(file).startsWith(outputPrefix),
+  );
 }

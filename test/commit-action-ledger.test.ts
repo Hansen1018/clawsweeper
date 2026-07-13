@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { pathToFileURL } from "node:url";
 
 import { ACTION_EVENT_TYPES } from "../dist/action-ledger.js";
 import {
@@ -209,7 +210,7 @@ test("commit publication preserves its primary failure when receipt recording al
             kind: "commit_check_publication",
             identity: { sha: "b".repeat(40) },
             operation: () => {
-              const spoolFile = walk(root).find((file) => file.endsWith(".json"));
+              const spoolFile = actionEventSpoolFile(root, outputRoot);
               assert.ok(spoolFile);
               spoolDirectory = path.dirname(spoolFile);
               fs.chmodSync(spoolDirectory, 0o500);
@@ -267,9 +268,9 @@ test("commit mutation receipts preserve their workflow context across environmen
 });
 
 test(
-  "deferred commit receipt failures finalize the known mutation outcome",
+  "commit receipt recovery survives a fresh repair finalizer process",
   { skip: process.platform === "win32" ? "requires POSIX directory permissions" : false },
-  async () => {
+  () => {
     const root = fs.realpathSync(
       fs.mkdtempSync(path.join(os.tmpdir(), "commit-deferred-receipt-")),
     );
@@ -281,28 +282,87 @@ test(
     let spoolDirectory = "";
 
     try {
-      assert.throws(
-        () =>
-          runCommitMutation(lifecycle, {
-            kind: "commit_check_publication",
-            identity: { sha: lifecycle.sha },
-            operation: () => {
-              const spoolFile = walk(root).find((file) => file.endsWith(".json"));
-              assert.ok(spoolFile);
-              spoolDirectory = path.dirname(spoolFile);
-              fs.chmodSync(spoolDirectory, 0o500);
-              return "accepted";
-            },
-          }),
-        /EACCES|EPERM|permission/i,
+      const commitModule = pathToFileURL(
+        path.join(process.cwd(), "dist", "commit-action-ledger.js"),
+      ).href;
+      const mutation = spawnSync(
+        process.execPath,
+        [
+          "--input-type=module",
+          "-e",
+          `
+            import fs from "node:fs";
+            import path from "node:path";
+            const { runCommitMutation } = await import(${JSON.stringify(commitModule)});
+            const root = ${JSON.stringify(root)};
+            const outputRoot = ${JSON.stringify(outputRoot)};
+            const walk = (directory) => fs.readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
+              const target = path.join(directory, entry.name);
+              return entry.isDirectory() ? walk(target) : [target];
+            });
+            runCommitMutation(${JSON.stringify(lifecycle)}, {
+              kind: "commit_check_publication",
+              identity: { sha: ${JSON.stringify(lifecycle.sha)} },
+              operation: () => {
+                const outputPrefix = path.resolve(outputRoot) + path.sep;
+                const spoolFile = walk(root).find(
+                  (file) => file.endsWith(".json") && !path.resolve(file).startsWith(outputPrefix),
+                );
+                if (!spoolFile) throw new Error("missing commit action spool");
+                fs.chmodSync(path.dirname(spoolFile), 0o500);
+                return "accepted";
+              },
+            });
+          `,
+        ],
+        { cwd: process.cwd(), encoding: "utf8", env: { ...process.env } },
+      );
+      assert.notEqual(mutation.status, 0, mutation.stderr);
+      assert.match(mutation.stderr, /EACCES|EPERM|permission/i);
+
+      const spoolFile = actionEventSpoolFile(root, outputRoot);
+      assert.ok(spoolFile);
+      spoolDirectory = path.dirname(spoolFile);
+      fs.chmodSync(spoolDirectory, 0o700);
+      assert.ok(
+        walk(outputRoot).some((file) =>
+          file.includes(`${path.sep}.mutation-recovery${path.sep}commit${path.sep}`),
+        ),
+      );
+      const recoveryFile = walk(outputRoot).find((file) => file.endsWith(".json"));
+      assert.ok(recoveryFile);
+      const recoveryKey = path.basename(recoveryFile, ".json");
+      fs.writeFileSync(
+        path.join(path.dirname(recoveryFile), `.${recoveryKey}.999.123.tmp`),
+        "partial",
       );
 
-      fs.chmodSync(spoolDirectory, 0o700);
-      await flushCommitActionEvents();
+      const manifestModule = pathToFileURL(
+        path.join(process.cwd(), "dist", "repair", "repair-action-ledger-manifest.js"),
+      ).href;
+      const finalizer = spawnSync(
+        process.execPath,
+        [
+          "--input-type=module",
+          "-e",
+          `
+            const { finalizeRepairActionLedgerManifest } = await import(${JSON.stringify(manifestModule)});
+            await finalizeRepairActionLedgerManifest("commit-review");
+          `,
+        ],
+        { cwd: process.cwd(), encoding: "utf8", env: { ...process.env } },
+      );
+      assert.equal(finalizer.status, 0, finalizer.stderr);
+
       const events = readEvents(outputRoot);
       assert.deepEqual(
         events.map((event) => event.attributes?.completion_reason),
         ["mutation_attempted", "mutation_accepted"],
+      );
+      assert.equal(events[1]?.parent_event_id, events[0]?.event_id);
+      assert.equal(
+        walk(outputRoot).some((file) => file.endsWith(".json") || file.endsWith(".tmp")),
+        false,
       );
     } finally {
       if (spoolDirectory) fs.chmodSync(spoolDirectory, 0o700);
@@ -691,6 +751,13 @@ function walk(root: string): string[] {
     const target = path.join(root, entry.name);
     return entry.isDirectory() ? walk(target) : [target];
   });
+}
+
+function actionEventSpoolFile(root: string, outputRoot: string): string | undefined {
+  const outputPrefix = `${path.resolve(outputRoot)}${path.sep}`;
+  return walk(root).find(
+    (file) => file.endsWith(".json") && !path.resolve(file).startsWith(outputPrefix),
+  );
 }
 
 function restoreEnv(previous: NodeJS.ProcessEnv) {

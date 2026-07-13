@@ -10,7 +10,6 @@ import {
   type ChildProcess,
   type SpawnSyncOptionsWithStringEncoding,
 } from "node:child_process";
-import { ACTION_EVENT_TYPES } from "../action-ledger.js";
 import { assertAllowedOwner, parseArgs, parseJob, repoRoot, validateJob } from "./lib.js";
 import {
   automergeRepairOutcomeComment,
