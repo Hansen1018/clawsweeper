@@ -79,6 +79,7 @@ import {
 import {
   recordRepairArtifactPublication,
   recordRepairWorkflowEvent,
+  repairSourceRevision,
   repairWorkflowTerminalPhase,
   runRepairMutation,
   type RepairLifecycleInput,
@@ -401,9 +402,9 @@ function directRepairLifecycle(number: number | null): RepairLifecycleInput {
     workKey: `execute-fix:${result.repo}:${result.cluster_id ?? result.reviewed_sha ?? "unknown"}`,
     clusterId: String(result.cluster_id ?? "") || null,
     ...(number && number > 0 ? { number } : {}),
-    sourceRevision: String(
-      result.reviewed_sha ?? result.head_sha ?? job.frontmatter.expected_head_sha ?? "",
-    ),
+    sourceRevision:
+      repairSourceRevision(job.frontmatter) ??
+      repairSourceRevision({ reviewed_sha: result.reviewed_sha ?? result.head_sha }),
     subjectKind: number && number > 0 ? "pull_request" : "workflow",
   };
 }

@@ -742,10 +742,11 @@ test("post-flight exports a blocked report before exiting unsuccessfully", () =>
   const reportPath = path.join(runDir, "post-flight-report.json");
   const outputPath = path.join(tmp, "github-output.txt");
   const ledgerOutputRoot = path.join(tmp, "ledger-output");
+  const sourceRevision = "b".repeat(64);
 
   fs.mkdirSync(runDir, { recursive: true });
   fs.mkdirSync(ledgerOutputRoot);
-  writeIssueImplementationJob(jobPath);
+  writeIssueImplementationJob(jobPath, sourceRevision);
   fs.writeFileSync(
     resultPath,
     JSON.stringify(
@@ -792,8 +793,10 @@ test("post-flight exports a blocked report before exiting unsuccessfully", () =>
     assert.equal(report.outcome, "blocked");
     assert.match(report.detail, /no fix-execution-report/);
     assert.match(fs.readFileSync(outputPath, "utf8"), /^report_outcome=blocked$/m);
+    const events = readActionEvents(ledgerOutputRoot);
+    assert.ok(events.every((event) => event.subject?.source_revision === sourceRevision));
     assert.deepEqual(
-      readActionEvents(ledgerOutputRoot)
+      events
         .filter((event) => event.event_type === "workflow.attempt")
         .sort((left, right) => left.phase_seq - right.phase_seq)
         .map((event) => [event.attributes?.state, event.action.status]),
@@ -838,7 +841,7 @@ function runPostFlight(
   return child;
 }
 
-function writeIssueImplementationJob(jobPath: string) {
+function writeIssueImplementationJob(jobPath: string, sourceRevision?: string) {
   fs.writeFileSync(
     jobPath,
     [
@@ -866,6 +869,7 @@ function writeIssueImplementationJob(jobPath: string) {
       "security_sensitive: false",
       "target_branch: clawsweeper/issue-openclaw-openclaw-85831",
       "source: issue_implementation",
+      ...(sourceRevision ? [`source_issue_revision_sha256: "${sourceRevision}"`] : []),
       "---",
       "Issue implementation job.",
       "",

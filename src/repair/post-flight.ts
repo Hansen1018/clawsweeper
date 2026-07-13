@@ -40,6 +40,7 @@ import {
 } from "./execution-handoff.js";
 import {
   recordRepairWorkflowEvent,
+  repairSourceRevision,
   repairWorkflowTerminalPhase,
   runRepairMutation,
   type RepairLifecycleInput,
@@ -784,7 +785,9 @@ function postFlightLifecycle(number: number | null): RepairLifecycleInput {
     repository: result.repo,
     workKey: `post-flight:${result.cluster_id ?? result.run_id ?? result.reviewed_sha ?? "unknown"}`,
     ...(number && number > 0 ? { number } : {}),
-    sourceRevision: result.reviewed_sha ?? result.head_sha ?? null,
+    sourceRevision:
+      repairSourceRevision(job.frontmatter) ??
+      repairSourceRevision({ reviewed_sha: result.reviewed_sha ?? result.head_sha }),
     subjectKind: number && number > 0 ? "pull_request" : "workflow",
   };
 }
