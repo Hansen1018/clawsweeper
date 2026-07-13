@@ -109,6 +109,16 @@ test("immutable worker handoff fails closed on a digest mismatch", () => {
   }
 });
 
+test("worker concurrency serializes logical jobs while preserving dedicated requeues", () => {
+  const workflow = parse(fs.readFileSync(workerWorkflowPath, "utf8"));
+
+  assert.equal(
+    workflow.concurrency.group,
+    "${{ inputs.requeue && format('clawsweeper-repair-requeue-{0}-{1}-{2}', inputs.job, inputs.job_sha256, github.run_id) || format('clawsweeper-repair-{0}', inputs.job) }}",
+  );
+  assert.equal(workflow.concurrency["cancel-in-progress"], false);
+});
+
 test("repair dispatch binds dedupe to immutable state and job bytes", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-dispatch-receipt-"));
   const unique = randomUUID().replaceAll("-", "").slice(0, 12);
@@ -275,7 +285,11 @@ test("all production dispatch callers require exact published job revisions", ()
   assert.match(worker, /state_revision:[\s\S]*required: true/);
   assert.match(worker, /job_sha256:[\s\S]*required: true/);
   assert.match(worker, /expected_title="\$\{title\} \[\$\{DISPATCH_KEY\}\] \(\$\{JOB_SHA256\}\)"/);
-  assert.match(worker, /group:.*inputs\.state_revision.*inputs\.job_sha256/);
+  assert.match(
+    worker,
+    /group:.*inputs\.requeue.*inputs\.job_sha256.*github\.run_id.*format\('clawsweeper-repair-\{0\}', inputs\.job\)/,
+  );
+  assert.doesNotMatch(worker, /format\('clawsweeper-repair-\{0\}'.*inputs\.state_revision/);
   assert.doesNotMatch(worker, /scripts\/restore-repair-job\.sh "\$JOB_PATH"/);
 });
 
@@ -366,6 +380,43 @@ test("create-job refuses dispatch before a published immutable identity exists",
     /--dispatch requires --state-revision and --job-sha256 after the job is published/,
   );
   assert.equal(fs.existsSync(jobPath), false);
+});
+
+test("create-job advertises the immutable worker dispatch handoff", () => {
+  const clusterId = `immutable-create-job-handoff-${randomUUID()}`;
+  const jobPath = path.resolve(`jobs/openclaw/inbox/${clusterId}.md`);
+  const result = spawnSync(
+    process.execPath,
+    [
+      path.resolve("dist/repair/create-job.js"),
+      "--repo",
+      "openclaw/openclaw",
+      "--refs",
+      "1",
+      "--prompt",
+      "test immutable handoff metadata",
+      "--cluster-id",
+      clusterId,
+      "--no-check-existing",
+    ],
+    {
+      cwd: process.cwd(),
+      encoding: "utf8",
+    },
+  );
+
+  try {
+    assert.equal(result.status, 0, result.stderr);
+    const output = JSON.parse(result.stdout);
+    assert.deepEqual(output.dispatch_handoff, {
+      status: "publish_required",
+      state_repository: "openclaw/clawsweeper-state",
+      workflow: "repair-cluster-worker.yml",
+      required_inputs: ["state_revision", "job_sha256"],
+    });
+  } finally {
+    fs.rmSync(jobPath, { force: true });
+  }
 });
 
 function commitImmutableState(root: string): string {

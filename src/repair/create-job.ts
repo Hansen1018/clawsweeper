@@ -123,8 +123,8 @@ console.log(
       dispatch_handoff: {
         status: "publish_required",
         state_repository: "openclaw/clawsweeper-state",
-        workflow: "repair-cluster-intake.yml",
-        required_args: ["--state-revision", "--job-sha256"],
+        workflow: "repair-cluster-worker.yml",
+        required_inputs: ["state_revision", "job_sha256"],
       },
     },
     null,
