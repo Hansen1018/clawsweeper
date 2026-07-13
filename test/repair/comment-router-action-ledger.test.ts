@@ -313,6 +313,10 @@ test("activity and strict-base policy are checked after durable dispatch marking
     liveDispatchState,
     /finalDispatchSafetyBlock[\s\S]*readDispatchState\(\)[\s\S]*trustedAutomergeReviewActivityBlockReason\(command\)[\s\S]*readDispatchState\(\)[\s\S]*trustedAutomergeReviewActivityBlockReason\(command\)[\s\S]*readDispatchState\(\)[\s\S]*stableJson\([\s\S]*policyVerifiedBaseBranch/,
   );
+  assert.match(
+    liveDispatchState,
+    /const reverifyStrictBase[\s\S]*middleState = readDispatchState\(\)[\s\S]*reverifyStrictBase\(middleBaseBranch\)[\s\S]*finalState = readDispatchState\(\)[\s\S]*reverifyStrictBase\(finalBaseBranch\)/,
+  );
   assert.match(executeAutomerge, /knownNoMutation: \(\) => !mergeRequestStarted/);
   assert.match(
     executeAutomerge,
@@ -361,8 +365,8 @@ test("all exact-head merge owners release unused claims and require squash auto-
   assert.match(applyExecution, /markApplyMergeClaimDispatched\(/);
   assert.match(applyExecution, /kind: "apply_result_merge"/);
   assert.ok(
-    applyExecution.indexOf('kind: "apply_result_merge"') <
-      applyExecution.indexOf("markApplyMergeClaimDispatched("),
+    applyExecution.indexOf("markApplyMergeClaimDispatched(") <
+      applyExecution.indexOf('kind: "apply_result_merge"'),
   );
   assert.match(routerExecution, /markAutomergeMergeClaimDispatched\(/);
   assert.match(routerExecution, /result = runGitHubSpawnMutation\(/);

@@ -4099,6 +4099,21 @@ function executeAutomerge(command: LooseRecord): LooseRecord {
     reason: string;
     retryable: boolean;
   } | null => {
+    const reverifyStrictBase = (baseBranch: string) => {
+      try {
+        const block = runtimeStrictBaseBindingBlock({
+          repo: command.repo,
+          baseBranch,
+          policyReadJson: rulesetPolicyReader(),
+        });
+        return block ? { reason: block, retryable: false } : null;
+      } catch (error) {
+        return {
+          reason: `final strict-base policy could not be refreshed: ${compactGhError(error)}`,
+          retryable: true,
+        };
+      }
+    };
     let firstState;
     let middleState;
     let finalState;
@@ -4107,6 +4122,11 @@ function executeAutomerge(command: LooseRecord): LooseRecord {
       const firstActivityBlock = trustedAutomergeReviewActivityBlockReason(command);
       if (firstActivityBlock) return firstActivityBlock;
       middleState = readDispatchState();
+      const middleBaseBranch = String(
+        middleState.view.baseRefName ?? middleState.target.base_ref ?? targetBranch ?? "main",
+      );
+      const middlePolicyBlock = reverifyStrictBase(middleBaseBranch);
+      if (middlePolicyBlock) return middlePolicyBlock;
       const secondActivityBlock = trustedAutomergeReviewActivityBlockReason(command);
       if (secondActivityBlock) return secondActivityBlock;
       finalState = readDispatchState();
@@ -4134,7 +4154,7 @@ function executeAutomerge(command: LooseRecord): LooseRecord {
         retryable: false,
       };
     }
-    return null;
+    return reverifyStrictBase(finalBaseBranch);
   };
   let result;
   try {
