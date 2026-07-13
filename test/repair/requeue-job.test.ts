@@ -78,6 +78,38 @@ test("run-id requeue prefers the newest early-input producer attempt", () => {
   }
 });
 
+test("run-id requeue preserves a later plan downgrade over a published autonomous result", () => {
+  const fixture = createFixture("published-downgrade", "910106");
+  try {
+    writeRunRecord(fixture, {
+      source_job: fixture.jobPath,
+      source_state_revision: fixture.replacementRevision,
+      source_job_sha256: fixture.replacementDigest,
+      mode: "autonomous",
+    });
+    writeArtifactCohort(fixture, 1, {
+      stateRevision: fixture.replacementRevision,
+      jobSha256: fixture.replacementDigest,
+      mode: "autonomous",
+    });
+    writeWorkflowInputs(fixture, 2, {
+      stateRevision: fixture.replacementRevision,
+      jobSha256: fixture.replacementDigest,
+      requestedMode: "autonomous",
+      effectiveMode: "plan",
+    });
+
+    const result = runRequeue(fixture);
+    assert.equal(result.status, 0, result.stderr);
+    const summary = JSON.parse(result.stdout);
+    assert.equal(summary.source_state_revision, fixture.replacementRevision);
+    assert.equal(summary.source_job_sha256, fixture.replacementDigest);
+    assert.equal(summary.mode, "plan");
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
 test("run-id requeue rejects conflicting early and sealed provenance", () => {
   const fixture = createFixture("conflicting-inputs", "910105");
   try {
@@ -130,9 +162,11 @@ test("run-id requeue rejects identity and mode from different producer attempts"
 function createFixture(label: string, runId: string) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), `clawsweeper-requeue-${label}-`));
   const stateRoot = path.join(root, "state");
+  const runsDir = path.join(root, "runs");
   const artifactFixture = path.join(root, "artifacts");
   const binDir = path.join(root, "bin");
   fs.mkdirSync(stateRoot, { recursive: true });
+  fs.mkdirSync(runsDir, { recursive: true });
   fs.mkdirSync(artifactFixture, { recursive: true });
   fs.mkdirSync(binDir, { recursive: true });
   execFileSync("git", ["init", "-q"], { cwd: stateRoot });
@@ -149,6 +183,7 @@ function createFixture(label: string, runId: string) {
   return {
     root,
     stateRoot,
+    runsDir,
     artifactFixture,
     binDir,
     jobPath,
@@ -161,17 +196,31 @@ function createFixture(label: string, runId: string) {
 }
 
 function runRequeue(fixture: ReturnType<typeof createFixture>) {
-  return spawnSync(process.execPath, [path.resolve("dist/repair/requeue-job.js"), fixture.runId], {
-    cwd: process.cwd(),
-    encoding: "utf8",
-    env: {
-      ...process.env,
-      PATH: `${fixture.binDir}${path.delimiter}${process.env.PATH ?? ""}`,
-      CLAWSWEEPER_REPO: "openclaw/clawsweeper",
-      CLAWSWEEPER_STATE_DIR: fixture.stateRoot,
-      GH_ARTIFACT_FIXTURE: fixture.artifactFixture,
+  return spawnSync(
+    process.execPath,
+    [path.resolve("dist/repair/requeue-job.js"), fixture.runId, "--runs-dir", fixture.runsDir],
+    {
+      cwd: process.cwd(),
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        PATH: `${fixture.binDir}${path.delimiter}${process.env.PATH ?? ""}`,
+        CLAWSWEEPER_REPO: "openclaw/clawsweeper",
+        CLAWSWEEPER_STATE_DIR: fixture.stateRoot,
+        GH_ARTIFACT_FIXTURE: fixture.artifactFixture,
+      },
     },
-  });
+  );
+}
+
+function writeRunRecord(
+  fixture: ReturnType<typeof createFixture>,
+  provenance: Record<string, string>,
+): void {
+  fs.writeFileSync(
+    path.join(fixture.runsDir, `${fixture.runId}.json`),
+    `${JSON.stringify({ run_id: fixture.runId, ...provenance }, null, 2)}\n`,
+  );
 }
 
 function writeArtifactCohort(

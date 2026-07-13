@@ -227,6 +227,37 @@ test("failed-run self-heal prefers the newest replay-safe input receipt", () => 
   }
 });
 
+test("failed-run self-heal ignores a newer receipt-only duplicate success", () => {
+  const fixture = createSelfHealFixture("receipt-only-duplicate");
+  try {
+    writeRunRecord(fixture.runsDir, fixture.runId, {
+      source_job: fixture.jobPath,
+      source_state_revision: fixture.originalRevision,
+      source_job_sha256: fixture.originalDigest,
+      mode: "plan",
+    });
+    writeLiveRunList(fixture, [
+      {
+        databaseId: Number(fixture.runId) + 1,
+        workflowName: "repair cluster worker",
+        displayTitle: `repair cluster ${fixture.jobPath} (${fixture.originalDigest})`,
+        status: "completed",
+        conclusion: "success",
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        url: `https://github.test/actions/runs/${Number(fixture.runId) + 1}`,
+      },
+    ]);
+
+    const summary = runSelfHeal(fixture);
+    assert.equal(summary.candidates.length, 1);
+    assert.equal(summary.candidates[0].source_run_id, fixture.runId);
+    assert.equal(summary.candidates[0].source_job, fixture.jobPath);
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
 test("failed-run self-heal retains durable post-flight outcomes on live run refresh", () => {
   const fixture = createSelfHealFixture("live-post-flight", "autonomous");
   try {

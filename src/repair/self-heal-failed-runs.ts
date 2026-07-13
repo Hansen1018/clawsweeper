@@ -217,7 +217,7 @@ function selectCandidates() {
   }
   const latestByJob = new Map();
 
-  for (const record of records) {
+  for (const record of records.filter((record: JsonValue) => shouldSelfHealRunRecord(record))) {
     const sourceJob = record.source_job;
     if (typeof sourceJob !== "string" || !sourceJob) {
       skippedCandidates.push({ reason: "missing_source_job", run_id: record.run_id ?? null });
@@ -238,7 +238,6 @@ function selectCandidates() {
   }
 
   return [...latestByJob.values()]
-    .filter((record: JsonValue) => shouldSelfHealRunRecord(record))
     .filter((record: JsonValue) => {
       const timestamp = recordTimestampMs(record);
       if (timestamp >= cutoffMs) return true;

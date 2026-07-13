@@ -64,6 +64,9 @@ const execute = Boolean(args.execute || args.live);
 const openExecuteWindow = Boolean(args["open-execute-window"] || args.live);
 const requestedMode = typeof args.mode === "string" ? args.mode : null;
 const requestedRunId = args["run-id"] ?? (looksLikeRunId(args._[0]) ? args._[0] : null);
+const runRecordsDir = path.resolve(
+  String(args["runs-dir"] ?? args.runs_dir ?? path.join(repoRoot(), "results", "runs")),
+);
 const sourceRunId = String(
   args["source-run-id"] ?? requestedRunId ?? process.env.GITHUB_RUN_ID ?? "",
 ).trim();
@@ -81,7 +84,7 @@ const resolved = requestedRunId
 
 if (!resolved.source_job) {
   console.error(
-    `usage: node scripts/requeue-job.ts <job.md|run-id> [--state-revision sha] [--job-sha256 digest] [--mode plan|execute|autonomous] [--execute] [--open-execute-window] [--source-run-id id] [--source-job-path path] [--requeue-depth n] [--max-requeue-depth n] [--runner label] [--execution-runner label] [--model model] [--max-live-workers ${AUTOMATION_LIMITS.repair_live_runs.default}] [--wait-for-capacity]`,
+    `usage: node scripts/requeue-job.ts <job.md|run-id> [--runs-dir path] [--state-revision sha] [--job-sha256 digest] [--mode plan|execute|autonomous] [--execute] [--open-execute-window] [--source-run-id id] [--source-job-path path] [--requeue-depth n] [--max-requeue-depth n] [--runner label] [--execution-runner label] [--model model] [--max-live-workers ${AUTOMATION_LIMITS.repair_live_runs.default}] [--wait-for-capacity]`,
   );
   process.exit(2);
 }
@@ -222,18 +225,6 @@ function resolveFromRunId(runId: string) {
   const ledgerSourceJob = String(fromLedger?.source_job ?? "").trim();
   const ledgerStateRevision = String(fromLedger?.source_state_revision ?? "").trim();
   const ledgerJobSha256 = String(fromLedger?.source_job_sha256 ?? "").trim();
-  if (
-    SOURCE_JOB_PATH.test(ledgerSourceJob) &&
-    STATE_REVISION.test(ledgerStateRevision) &&
-    JOB_SHA256.test(ledgerJobSha256)
-  ) {
-    return {
-      source_job: ledgerSourceJob,
-      mode: fromLedger.mode,
-      state_revision: ledgerStateRevision,
-      job_sha256: ledgerJobSha256,
-    };
-  }
 
   const artifactDir = fs.mkdtempSync(
     path.join(os.tmpdir(), `clawsweeper-repair-requeue-${runId}-`),
@@ -261,7 +252,7 @@ function resolveFromRunId(runId: string) {
 }
 
 function readPublishedRunRecord(runId: string) {
-  const file = path.join(repoRoot(), "results", "runs", `${runId}.json`);
+  const file = path.join(runRecordsDir, `${runId}.json`);
   if (!fs.existsSync(file)) return null;
   return JSON.parse(fs.readFileSync(file, "utf8"));
 }
