@@ -25,6 +25,12 @@ import {
 } from "./immutable-job-handoff.js";
 import { activeRepairJobGenerations as listActiveRepairJobGenerations } from "./live-worker-capacity.js";
 import { runRepairMutation, type RepairLifecycleInput } from "./repair-action-ledger.js";
+import {
+  restoreGateSequence,
+  restoreGateWithFallback,
+  type GateCleanupFailure,
+  type GateRestoreResult,
+} from "./self-heal-gate-restore.js";
 
 const DEFAULT_REPO = currentProjectRepo();
 const DEFAULT_WORKFLOW = REPAIR_CLUSTER_WORKFLOW;
@@ -68,11 +74,6 @@ type GateState = {
 type GateRestore = {
   name: string;
   previous: GateState;
-};
-
-type GateCleanupFailure = {
-  error: unknown;
-  name: string;
 };
 
 const runRecordProvenanceCache = new WeakMap<JsonObject, RunRecordProvenance>();
@@ -971,13 +972,6 @@ function writeSelfHealLedger(ledger: LooseRecord) {
 }
 
 function selfHealLedgerPath() {
-  const testPath = String(process.env.CLAWSWEEPER_SELF_HEAL_TEST_LEDGER_PATH ?? "").trim();
-  if (testPath) {
-    if (!process.env.NODE_TEST_CONTEXT) {
-      throw new Error("CLAWSWEEPER_SELF_HEAL_TEST_LEDGER_PATH is only available under node:test");
-    }
-    return path.resolve(testPath);
-  }
   return path.join(repoRoot(), "results", "self-heal.json");
 }
 
@@ -1062,57 +1056,31 @@ function restoreOpenedGates(): {
   receiptFailures: GateCleanupFailure[];
   restoreFailures: GateCleanupFailure[];
 } {
-  const receiptFailures: GateCleanupFailure[] = [];
-  const restoreFailures: GateCleanupFailure[] = [];
-  for (const gate of [...gateRestores].reverse()) {
-    const result = restoreGate(gate.name, gate.previous);
-    if (result.receiptError !== null) {
-      receiptFailures.push({ name: gate.name, error: result.receiptError });
-    }
-    if (result.restoreError !== null) {
-      restoreFailures.push({ name: gate.name, error: result.restoreError });
-    }
-  }
-  return { receiptFailures, restoreFailures };
+  return restoreGateSequence(
+    gateRestores.map((gate) => ({ name: gate.name, state: gate.previous })),
+    restoreGate,
+  );
 }
 
-function restoreGate(
-  name: string,
-  state: GateState,
-): { receiptError: unknown | null; restoreError: unknown | null } {
+function restoreGate(name: string, state: GateState): GateRestoreResult {
   const receiptState = state.exists ? `set:${state.value}` : "delete";
-  let restoreStarted = false;
-  let restoreCompleted = false;
-  try {
-    runRepairMutation(selfHealGateLifecycle(name, receiptState), {
-      kind: "repository_variable_update",
-      operationName: "failed_run_self_heal",
-      component: "failed_run_self_heal_gate",
-      identity: {
-        repository: repo,
-        name,
-        exists: state.exists,
-        value: state.value,
-        batchId,
-      },
-      operation: () => {
-        restoreStarted = true;
-        const result = writeGateState(name, state);
-        restoreCompleted = true;
-        return result;
-      },
-    });
-    return { receiptError: null, restoreError: null };
-  } catch (error) {
-    if (restoreCompleted) return { receiptError: error, restoreError: null };
-    if (restoreStarted) return { receiptError: null, restoreError: error };
-    try {
-      writeGateState(name, state);
-      return { receiptError: error, restoreError: null };
-    } catch (restoreError) {
-      return { receiptError: error, restoreError };
-    }
-  }
+  return restoreGateWithFallback({
+    runWithReceipt: (operation) =>
+      runRepairMutation(selfHealGateLifecycle(name, receiptState), {
+        kind: "repository_variable_update",
+        operationName: "failed_run_self_heal",
+        component: "failed_run_self_heal_gate",
+        identity: {
+          repository: repo,
+          name,
+          exists: state.exists,
+          value: state.value,
+          batchId,
+        },
+        operation,
+      }),
+    writeState: () => writeGateState(name, state),
+  });
 }
 
 function writeGateState(name: string, state: GateState): string {
@@ -1122,6 +1090,7 @@ function writeGateState(name: string, state: GateState): string {
     result = ghText(["variable", "delete", name, "--repo", repo]);
   } catch (error) {
     if (!/\bHTTP 404\b|not found/i.test(ghErrorText(error))) throw error;
+    if (readMutableGateState(name).exists) throw error;
   }
   console.log(`${name}=<absent>`);
   return result;

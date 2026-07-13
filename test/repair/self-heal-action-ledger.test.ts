@@ -35,6 +35,16 @@ test("self-heal mutations emit durable action receipts", () => {
     failedRuns,
     /runRepairMutation\(selfHealGateLifecycle\(name, normalizedValue\),[\s\S]*kind: "repository_variable_update"/,
   );
+  assert.match(failedRuns, /immutableJobDispatchArgs\(/);
+  assert.match(failedRuns, /return path\.join\(repoRoot\(\), "results", "self-heal\.json"\)/);
+  assert.doesNotMatch(
+    failedRuns,
+    /CLAWSWEEPER_SELF_HEAL_TEST_LEDGER_PATH|args\["ledger-path"\]|args\.ledger_path/,
+  );
+  assert.match(
+    failedRuns,
+    /if \(!\/\\bHTTP 404\\b\|not found\/i\.test\(ghErrorText\(error\)\)\) throw error;\s+if \(readMutableGateState\(name\)\.exists\) throw error;/,
+  );
   assert.match(
     conflicts,
     /runRepairMutation\(conflictPublicationLifecycle\(publicationContentSha256\),[\s\S]*kind: "conflict_self_heal_job_state"/,
