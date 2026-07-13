@@ -242,9 +242,25 @@ repositories.
 
 Use Blacksmith labels only when you intentionally want a non-parity hosted runner for bulk planning/execution:
 
+Repair intake and recovery workflows resolve immutable job identity
+automatically. A manual dispatch must name the exact published state commit and
+the SHA-256 of the job bytes at that commit:
+
 ```bash
-pnpm run repair:dispatch -- jobs/openclaw/cluster-*.md --mode plan --runner blacksmith-4vcpu-ubuntu-2404
+state_revision=<exact-clawsweeper-state-commit>
+job=jobs/openclaw/inbox/cluster-<id>.md
+job_sha256="$(git -C "$CLAWSWEEPER_STATE_DIR" show "${state_revision}:${job}" | sha256sum | cut -d' ' -f1)"
+
+pnpm run repair:dispatch -- "$job" \
+  --mode plan \
+  --state-revision "$state_revision" \
+  --job-sha256 "$job_sha256" \
+  --runner blacksmith-4vcpu-ubuntu-2404
 ```
+
+The dispatcher and worker reject mutable paths, missing historical objects,
+digest mismatches, and a job generation that differs from the supplied
+identity.
 
 The workflow uses Node 24 and starts a local Codex Responses proxy from
 `OPENAI_API_KEY` inside an isolated per-run `CODEX_HOME`. Codex subprocesses use

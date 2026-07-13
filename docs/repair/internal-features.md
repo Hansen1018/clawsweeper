@@ -262,6 +262,14 @@ The generated job uses `source: clawsweeper_commit` and may have no issue/PR
 `candidates`. The fix artifact uses `repair_strategy: new_fix_pr`; merge and
 close actions remain blocked.
 
+The immutable worker handoff applies to every repair source, not only commit
+findings. Cluster and issue intake, report-only requeues, failed-run self-heal,
+open-PR finalization, and conflict self-heal resolve the exact state commit and
+job SHA-256 before dispatch. The worker checks those bytes during planning and
+again during execution authorization, then includes a sealed copy and identity
+record with each result artifact. Result publication never reopens the mutable
+job path to reconstruct provenance.
+
 ## Issue Implementation Commands
 
 Maintainer comments can turn an open issue into one ClawSweeper implementation

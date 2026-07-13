@@ -359,10 +359,13 @@ and upload them as workflow artifacts. Commit-review follows the same boundary:
 the danger-full-access Codex matrix job has no state token, creates its optional
 check-write token only after Codex exits, and leaves state mutation to the
 separate publication job. A dedicated state-authorized collector lists the
-bounded matching artifact set, fails on discovery or download errors, imports
-the shards, and commits only the canonical ledger paths. The mutation job
-downloads the cluster shard by its trusted artifact ID and digest only as
-causal context. It does not receive state-repository credentials.
+bounded matching artifact set, authenticates each advertised lane
+independently, and durably publishes every valid lane even when a downstream
+job was cancelled before producing an artifact. Missing non-success lanes are
+recorded as absent; malformed, incomplete, or forged advertised lanes still
+fail the collector after valid lanes are preserved. The mutation job downloads
+the cluster shard by its trusted artifact ID and digest only as causal context.
+It does not receive state-repository credentials.
 Result and open-PR finalizer workflows already own state credentials, so they
 import and publish their own finalized shards directly. Additional lanes can
 migrate independently without changing the v1 shard format.

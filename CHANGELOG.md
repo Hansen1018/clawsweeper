@@ -114,15 +114,19 @@ checkpoint, and status-only commits are intentionally omitted.
   notification delivery receipts, generic workflow attempt/finalization
   events, interruption recovery for unfinished generic Codex reviews, and
   immutable workflow publication of the resulting shards.
-- Bound commit-finding dispatch to canonical immutable state reports, exact
-  report bytes, embedded source identity, and a state-revision/job-digest
-  worker handoff through execution authorization. Deterministic no-op intake
-  and paginated commit-review continuations now retain receipt ownership across
-  workflow reruns.
+- Bound every repair-worker dispatch to an exact `clawsweeper-state` commit and
+  job SHA-256, including cluster and issue intake, commit findings, report
+  requeues, failed-run recovery, open-PR finalization, and conflict self-heal.
+  Workers verify the same immutable job again at execution authorization and
+  seal its bytes into result artifacts, while active-run matching and dispatch
+  receipts distinguish later job generations. Commit-finding intake also
+  verifies canonical report paths, exact report bytes, and embedded source
+  identity. Deterministic no-op intake and paginated commit-review
+  continuations retain receipt ownership across workflow reruns.
 - Kept valid blocked and generic repair results publishable without invented
   source revisions, rejected ledger-only result fallbacks, derived publication
-  receipt provenance from the real source intent, and recorded permanent hook
-  rejections as definite no-mutation outcomes.
+  receipt provenance from the sealed source job instead of mutable live state,
+  and recorded permanent hook rejections as definite no-mutation outcomes.
 - Short-circuited authenticated duplicate comment deliveries when their exact
   body version is already terminal in the durable router ledger, while edited,
   retryable, and state-drifted commands retain the full routing path.
