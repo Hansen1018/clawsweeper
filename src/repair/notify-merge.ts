@@ -7,6 +7,7 @@ import { asJsonObject, isJsonObject } from "./json-types.js";
 import { parseArgs, repoRoot } from "./lib.js";
 import { readJsonFile } from "./json-file.js";
 import { deliverNotification, recordNotificationPhase } from "./notification-action-ledger.js";
+import { OpenClawHookHttpError } from "./openclaw-hook.js";
 import type {
   CollectionResult,
   MergeLedgerEntry,
@@ -418,7 +419,7 @@ async function postHookNotification({
     });
     const body = await response.text();
     if (!response.ok) {
-      throw new Error(`OpenClaw hook returned ${response.status}: ${body.slice(0, 500)}`);
+      throw new OpenClawHookHttpError(response.status, body);
     }
     return { runId: readHookRunId(body) };
   } finally {
