@@ -213,8 +213,13 @@ jobs:
           set -euo pipefail
           : "${CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:?setup-action-ledger output root is required}"
           mkdir -p .artifacts
+          allow_empty_args=()
+          if [ "${{ steps.download.outputs.has_artifacts }}" = "0" ]; then
+            allow_empty_args+=(--allow-empty)
+          fi
           pnpm run --silent repair:action-ledger -- finalize \
             --repair-lane repair-publication \
+            "${allow_empty_args[@]}" \
             > .artifacts/repair-publication-action-ledger-manifest.json
 
       - name: Publish immutable repair publication action ledger
@@ -228,9 +233,14 @@ jobs:
           import_result_file=".artifacts/repair-publication-action-ledger-import.json"
           mkdir -p .artifacts
           test -s "$manifest_file"
+          allow_empty_args=()
+          if [ "${{ steps.download.outputs.has_artifacts }}" = "0" ]; then
+            allow_empty_args+=(--allow-empty)
+          fi
           pnpm run --silent repair:action-ledger -- publish \
             --repair-lane repair-publication \
             --manifest "$manifest_file" \
+            "${allow_empty_args[@]}" \
             --source-root "$source_root" \
             --state-root "$CLAWSWEEPER_STATE_DIR" > "$import_result_file"
           jq -e --slurpfile manifest "$manifest_file" \
@@ -238,6 +248,9 @@ jobs:
             "$import_result_file" >/dev/null
           jq -r '.paths[]?' "$import_result_file" | sort -u > "$event_paths_file"
           if [ ! -s "$event_paths_file" ]; then
+            if [ "${{ steps.download.outputs.has_artifacts }}" = "0" ]; then
+              exit 0
+            fi
             echo "Repair publication action event shards existed but no paths were imported." >&2
             exit 1
           fi

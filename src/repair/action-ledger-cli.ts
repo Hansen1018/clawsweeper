@@ -28,7 +28,9 @@ if (command === "finalize") {
     });
     if (manifest) process.stdout.write(serializeCommandActionLedgerManifest(manifest));
   } else if (args.repairLane) {
-    const manifest = await finalizeRepairActionLedgerManifest(args.repairLane);
+    const manifest = await finalizeRepairActionLedgerManifest(args.repairLane, {
+      allowEmpty: args.allowEmpty === true,
+    });
     process.stdout.write(serializeRepairActionLedgerManifest(manifest));
   } else {
     const paths = await flushRepairActionEvents();
@@ -65,14 +67,21 @@ if (command === "finalize") {
     const lane = requiredArg(args.repairLane, "--repair-lane");
     const manifestPath = path.resolve(requiredArg(args.manifest, "--manifest"));
     const current = workflowActionProducer("repair_manifest");
-    const manifest = parseRepairActionLedgerManifest(fs.readFileSync(manifestPath, "utf8"), lane, {
-      repository: current.repository,
-      sha: current.sha,
-      workflow: current.workflow,
-      job: args.expectedJob ?? current.job,
-      runId: current.runId,
-      runAttempt: args.expectedRunAttempt ?? current.runAttempt,
-    });
+    const manifest = parseRepairActionLedgerManifest(
+      fs.readFileSync(manifestPath, "utf8"),
+      lane,
+      {
+        repository: current.repository,
+        sha: current.sha,
+        workflow: current.workflow,
+        job: args.expectedJob ?? current.job,
+        runId: current.runId,
+        runAttempt: args.expectedRunAttempt ?? current.runAttempt,
+      },
+      {
+        allowEmpty: args.allowEmpty === true,
+      },
+    );
     assertRepairActionLedgerManifestSource(sourceRoot, manifest);
     if (command === "verify") {
       console.log(JSON.stringify({ eventPaths: manifest.event_paths }, null, 2));
@@ -101,7 +110,7 @@ if (command === "finalize") {
   }
 } else {
   throw new Error(
-    "usage: action-ledger-cli.ts <finalize|verify|publish> [--lane name --allow-empty | --repair-lane name] [--manifest path] [--expected-job job --expected-run-attempt attempt] [--source-root path --state-root path]",
+    "usage: action-ledger-cli.ts <finalize|verify|publish> [--lane name | --repair-lane name] [--allow-empty] [--manifest path] [--expected-job job --expected-run-attempt attempt] [--source-root path --state-root path]",
   );
 }
 

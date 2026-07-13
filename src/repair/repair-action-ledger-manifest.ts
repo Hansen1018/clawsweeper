@@ -4,6 +4,7 @@ import { actionLedgerJson, readActionEventShardAt, type ActionEvent } from "../a
 import {
   ACTION_EVENT_SHARD_IMPORT_LIMITS,
   readValidatedActionEventShardBatch,
+  workflowActionProducer,
   type ExpectedActionEventProducer,
 } from "../action-ledger-runtime.js";
 import { repoRoot } from "./paths.js";
@@ -38,11 +39,12 @@ export type RepairActionLedgerManifest = RepairActionLedgerManifestIdentity & {
 
 export async function finalizeRepairActionLedgerManifest(
   lane: string,
+  options: { allowEmpty?: boolean } = {},
 ): Promise<RepairActionLedgerManifest> {
   assertRepairActionLedgerLane(lane);
   const outputRoot = repairActionLedgerOutputRoot();
   const eventPaths = (await flushRepairActionEvents()).sort();
-  if (eventPaths.length === 0) {
+  if (eventPaths.length === 0 && options.allowEmpty !== true) {
     throw new Error(`repair action ledger lane ${lane} finalized no event shards`);
   }
   if (eventPaths.length > ACTION_EVENT_SHARD_IMPORT_LIMITS.maxFiles) {
@@ -53,10 +55,20 @@ export async function finalizeRepairActionLedgerManifest(
   const events = eventPaths.flatMap((relativePath) =>
     readActionEventShardAt(outputRoot, relativePath),
   );
-  if (events.length === 0) {
+  if (eventPaths.length > 0 && events.length === 0) {
     throw new Error(`repair action ledger lane ${lane} finalized empty event shards`);
   }
-  const producer = events[0]!.producer;
+  const currentProducer = workflowActionProducer("repair_manifest");
+  const producer =
+    events[0]?.producer ??
+    ({
+      repository: currentProducer.repository,
+      sha: currentProducer.sha,
+      workflow: currentProducer.workflow,
+      job: currentProducer.job,
+      run_id: currentProducer.runId,
+      run_attempt: currentProducer.runAttempt,
+    } satisfies RepairActionLedgerProducerIdentity);
   for (const event of events) assertManifestProducerIdentity(event, producer);
   const identity: RepairActionLedgerManifestIdentity = {
     schema: REPAIR_ACTION_LEDGER_MANIFEST_SCHEMA,
@@ -80,6 +92,7 @@ export function parseRepairActionLedgerManifest(
   content: string,
   expectedLane: string,
   expectedProducer: ExpectedActionEventProducer,
+  options: { allowEmpty?: boolean } = {},
 ): RepairActionLedgerManifest {
   assertRepairActionLedgerLane(expectedLane);
   if (Buffer.byteLength(content, "utf8") > REPAIR_ACTION_LEDGER_MANIFEST_MAX_BYTES) {
@@ -125,7 +138,7 @@ export function parseRepairActionLedgerManifest(
     typeof manifest.run_id !== "string" ||
     !Number.isSafeInteger(manifest.run_attempt) ||
     !Array.isArray(manifest.event_paths) ||
-    manifest.event_paths.length === 0 ||
+    (manifest.event_paths.length === 0 && options.allowEmpty !== true) ||
     manifest.event_paths.some((relativePath) => typeof relativePath !== "string") ||
     typeof manifest.manifest_sha256 !== "string"
   ) {

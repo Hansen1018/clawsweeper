@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -113,6 +114,85 @@ test("repair manifests bind the exact lane, producer run, and complete shard set
     assert.throws(
       () => assertRepairActionLedgerManifestSource(outputRoot, manifest),
       /shard set mismatch: .*missing=ledger\//,
+    );
+  } finally {
+    restoreEnv(previous);
+    fs.rmSync(root, { force: true, recursive: true });
+  }
+});
+
+test("repair manifests allow an explicitly empty producer run without weakening shard checks", async () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "repair-empty-manifest-")));
+  const outputRoot = path.join(root, "output");
+  const manifestPath = path.join(root, "repair-action-ledger-manifest.json");
+  fs.mkdirSync(outputRoot);
+  const previous = { ...process.env };
+  Object.assign(process.env, workflowEnv(root, outputRoot));
+  const expectedProducer = {
+    repository: "openclaw/clawsweeper",
+    sha: "a".repeat(40),
+    workflow: "repair-cluster-worker.yml",
+    job: "cluster",
+    runId: "4242",
+    runAttempt: 3,
+  };
+
+  try {
+    await assert.rejects(
+      finalizeRepairActionLedgerManifest("cluster"),
+      /finalized no event shards/,
+    );
+    const content = execFileSync(
+      process.execPath,
+      [
+        path.join(process.cwd(), "dist", "repair", "action-ledger-cli.js"),
+        "finalize",
+        "--repair-lane",
+        "cluster",
+        "--allow-empty",
+      ],
+      { encoding: "utf8", env: { ...process.env } },
+    );
+    fs.writeFileSync(manifestPath, content);
+    const manifest = parseRepairActionLedgerManifest(content, "cluster", expectedProducer, {
+      allowEmpty: true,
+    });
+    assert.deepEqual(manifest.event_paths, []);
+    assert.throws(
+      () => parseRepairActionLedgerManifest(content, "cluster", expectedProducer),
+      /manifest identity is invalid/,
+    );
+    assert.doesNotThrow(() => assertRepairActionLedgerManifestSource(outputRoot, manifest));
+    assert.doesNotThrow(() =>
+      execFileSync(
+        process.execPath,
+        [
+          path.join(process.cwd(), "dist", "repair", "action-ledger-cli.js"),
+          "verify",
+          "--repair-lane",
+          "cluster",
+          "--allow-empty",
+          "--manifest",
+          manifestPath,
+          "--source-root",
+          outputRoot,
+        ],
+        { env: { ...process.env }, stdio: "pipe" },
+      ),
+    );
+
+    recordRepairLifecycleEvent(repairLifecycle(), {
+      type: ACTION_EVENT_TYPES.repairPlan,
+      status: ACTION_EVENT_STATUSES.completed,
+      reasonCode: ACTION_EVENT_REASON_CODES.completed,
+      mutation: false,
+      component: "repair_worker",
+      state: "unexpected",
+    });
+    await flushRepairActionEvents();
+    assert.throws(
+      () => assertRepairActionLedgerManifestSource(outputRoot, manifest),
+      /shard set mismatch: .*extra=ledger\//,
     );
   } finally {
     restoreEnv(previous);

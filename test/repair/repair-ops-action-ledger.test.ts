@@ -254,6 +254,10 @@ test("commit review and notification workflows publish their operation receipts"
   assert.match(publisher, /merge-multiple: true/);
   assert.match(publisher, /Publish immutable commit review action ledger/);
   assert.match(publisher, /append commit review action ledger/);
+  assert.match(
+    publisher,
+    /--repair-lane commit-publication[\s\S]*--allow-empty[\s\S]*planned_count \}\}" = "0"[\s\S]*CHECKS_REQUESTED" != "true"[\s\S]*exit 0/,
+  );
   for (const workflow of [activity, maintainer]) {
     assert.match(workflow, /setup-action-ledger/);
     assert.match(workflow, /repair:action-ledger -- finalize/);
@@ -293,6 +297,14 @@ test("result and finalizer workflows publish their repair operation receipts", (
     assert.match(workflow, /steps\.setup-pnpm\.outcome == 'success'/);
   }
   assert.match(results, /append repair publication action ledger/);
+  assert.match(
+    results,
+    /steps\.download\.outputs\.has_artifacts[\s\S]*allow_empty_args\+=\(--allow-empty\)[\s\S]*--repair-lane repair-publication/,
+  );
+  assert.match(
+    results,
+    /if \[ "\$\{\{ steps\.download\.outputs\.has_artifacts \}\}" = "0" \]; then[\s\S]*exit 0/,
+  );
   assert.match(results, /CLAWSWEEPER_ACTION_LEDGER_INVOCATION=cluster-results/);
   assert.match(results, /CLAWSWEEPER_ACTION_LEDGER_INVOCATION=open-pr-finalizer/);
   assert.match(results, /CLAWSWEEPER_ACTION_LEDGER_INVOCATION=finalizer-results/);

@@ -662,12 +662,14 @@ jobs:
           mkdir -p .artifacts
           pnpm run --silent repair:action-ledger -- finalize \
             --repair-lane commit-publication \
+            --allow-empty \
             > .artifacts/commit-publication-action-ledger-manifest.json
 
       - name: Publish immutable commit review action ledger
         if: ${{ always() && steps.publish-setup-pnpm.outcome == 'success' }}
         env:
           EXPECTED_COMMIT_MATRIX: ${{ needs.plan.outputs.matrix }}
+          CHECKS_REQUESTED: ${{ needs.plan.outputs.create_checks }}
         run: |
           set -euo pipefail
           test -n "${CLAWSWEEPER_STATE_DIR:-}"
@@ -710,12 +712,18 @@ jobs:
             local run_attempt="$3"
             local source_root="$4"
             local manifest_file="$5"
+            local allow_empty="${6:-}"
+            local allow_empty_args=()
+            if [ "$allow_empty" = "--allow-empty" ]; then
+              allow_empty_args+=(--allow-empty)
+            fi
             test -s "$manifest_file"
             pnpm run --silent repair:action-ledger -- verify \
               --repair-lane "$lane" \
               --manifest "$manifest_file" \
               --expected-job "$job" \
               --expected-run-attempt "$run_attempt" \
+              "${allow_empty_args[@]}" \
               --source-root "$source_root" >/dev/null
           }
           for review_root in "${review_roots[@]}"; do
@@ -735,7 +743,8 @@ jobs:
             publish \
             "$GITHUB_RUN_ATTEMPT" \
             "$source_root" \
-            .artifacts/commit-publication-action-ledger-manifest.json
+            .artifacts/commit-publication-action-ledger-manifest.json \
+            --allow-empty
           for review_root in "${review_roots[@]}"; do
             artifact_name="$(basename "$review_root")"
             artifact_attempt="${artifact_name##*-}"
@@ -761,6 +770,7 @@ jobs:
           pnpm run --silent repair:action-ledger -- publish \
             --repair-lane commit-publication \
             --manifest "$manifest_file" \
+            --allow-empty \
             --source-root "$source_root" \
             --state-root "$CLAWSWEEPER_STATE_DIR" > "$import_result_file"
           jq -e --slurpfile manifest "$manifest_file" \
@@ -769,6 +779,10 @@ jobs:
           jq -r '.paths[]?' "$import_result_file" >> "$event_paths_file"
           sort -u -o "$event_paths_file" "$event_paths_file"
           if [ ! -s "$event_paths_file" ]; then
+            if [ "${{ needs.plan.outputs.planned_count }}" = "0" ] &&
+               [ "$CHECKS_REQUESTED" != "true" ]; then
+              exit 0
+            fi
             echo "Commit review action event shards existed but no paths were imported." >&2
             exit 1
           fi
