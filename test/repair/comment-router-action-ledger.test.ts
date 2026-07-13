@@ -121,7 +121,7 @@ test("automerge reconciles command responses inside the merge receipt without ce
     fetchEffectSnapshot,
     /repos\/\$\{targetRepo\}\/pulls\/\$\{number\}[\s\S]*attempts: 1[\s\S]*"pr",[\s\S]*"view"[\s\S]*"autoMergeRequest"[\s\S]*"headRefOid"[\s\S]*"isInMergeQueue"[\s\S]*"mergedAt"[\s\S]*"state"[\s\S]*attempts: 1/,
   );
-  assert.doesNotMatch(fetchEffectSnapshot, /if \(pull\.merged_at\) return/);
+  assert.match(fetchEffectSnapshot, /if \(pull\.merged_at\) return \{ pull, view: \{\} \}/);
   assert.match(
     source,
     /function fetchAutomergeSquashCommitProof[\s\S]*repos\/\$\{targetRepo\}\/commits\/\$\{mergeCommitSha\}/,

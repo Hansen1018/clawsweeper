@@ -4542,6 +4542,7 @@ function exactHeadAutomergePendingReason(command: LooseRecord, view: LooseRecord
 
 function fetchAutomergeEffectSnapshot(number: JsonValue) {
   const pull = ghJson(["api", `repos/${targetRepo}/pulls/${number}`], { attempts: 1 });
+  if (pull.merged_at) return { pull, view: {} };
   const view = ghJson(
     [
       "pr",
