@@ -138,6 +138,31 @@ test("repair run titles preserve immutable job generations", () => {
   );
 });
 
+test("active legacy repair titles block immutable redispatch during rollout", () => {
+  const job = "jobs/openclaw/inbox/cluster-legacy.md";
+  const activeRunsByPrefix = new Map([
+    [
+      "repair cluster ",
+      [
+        {
+          databaseId: 9,
+          displayTitle: `repair cluster ${job}`,
+          status: "in_progress",
+        },
+      ],
+    ],
+  ]);
+
+  assert.equal(
+    activeRepairWorkflowRunForJob({
+      jobPath: job,
+      jobSha256: "a".repeat(64),
+      activeRunsByPrefix,
+    })?.databaseId,
+    9,
+  );
+});
+
 test("workflow run normalization prefers the human Actions URL", () => {
   const run = normalizeWorkflowRun(
     {

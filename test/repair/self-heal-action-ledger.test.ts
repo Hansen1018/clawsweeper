@@ -15,11 +15,12 @@ test("failed-run self-heal preserves legacy retry budgets and skips removed jobs
     source,
     /\(attemptCountsByIdentity\.get\(immutableKey\) \?\? 0\) \+\s+\(legacyAttemptCountsByJob\.get\(sourceJob\) \?\? 0\)/,
   );
-  assert.match(source, /reason: "missing_job_file"/);
-  assert.match(source, /if \(!isMissingImmutableJobError\(error\)\) throw error/);
-  assert.ok(
-    source.indexOf('reason: "missing_job_file"') < source.indexOf("activeJobGenerations.get("),
+  assert.match(
+    source,
+    /reason: isMissingImmutableJobError\(error\)[\s\S]*\? "missing_job_file"[\s\S]*: "immutable_provenance_unavailable"/,
   );
+  assert.doesNotMatch(source, /if \(!isMissingImmutableJobError\(error\)\) throw error/);
+  assert.ok(source.indexOf('"missing_job_file"') < source.indexOf("activeJobGenerations.get("));
 });
 
 test("self-heal mutations emit durable action receipts", () => {

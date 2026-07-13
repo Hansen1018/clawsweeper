@@ -237,8 +237,8 @@ export function activeRepairJobGenerations({
   const jobs = new Map<string, string[]>();
   for (const run of listActiveWorkflowRuns(workflowRunOptions)) {
     const parsed = parseRepairRunTitle(run.displayTitle, automergeRunNamePrefix);
-    if (!parsed?.jobSha256) continue;
-    const key = `${parsed.jobPath}:${parsed.jobSha256}`;
+    if (!parsed) continue;
+    const key = parsed.jobSha256 ? `${parsed.jobPath}:${parsed.jobSha256}` : parsed.jobPath;
     const runId = String(run.databaseId ?? "");
     jobs.set(key, [...(jobs.get(key) ?? []), runId].filter(Boolean));
   }
@@ -294,7 +294,7 @@ export function activeRepairWorkflowRunForJob({
     activeRuns?.find((run: JsonValue) => {
       const parsed = parseRepairRunTitle(run.displayTitle, automergeRunNamePrefix);
       if (!parsed || parsed.jobPath !== job) return false;
-      return digest ? parsed.jobSha256 === digest : true;
+      return digest ? parsed.jobSha256 === null || parsed.jobSha256 === digest : true;
     }) ?? null
   );
 }

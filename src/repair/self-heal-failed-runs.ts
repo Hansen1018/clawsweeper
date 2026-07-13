@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import type { JsonValue, LooseRecord } from "./json-types.js";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { execFileSync, spawnSync } from "node:child_process";
 import {
@@ -19,7 +20,7 @@ import { shouldSelfHealRunRecord } from "./self-heal-policy.js";
 import {
   immutableJobIdentityKey,
   isMissingImmutableJobError,
-  resolveCurrentStateJobIdentity,
+  resolveStateJobIdentity,
 } from "./immutable-job-handoff.js";
 import { activeRepairJobGenerations as listActiveRepairJobGenerations } from "./live-worker-capacity.js";
 import { runRepairMutation, type RepairLifecycleInput } from "./repair-action-ledger.js";
@@ -30,6 +31,18 @@ const DEFAULT_RUNNER = process.env.CLAWSWEEPER_WORKER_RUNNER ?? "blacksmith-4vcp
 const DEFAULT_EXECUTION_RUNNER =
   process.env.CLAWSWEEPER_EXECUTION_RUNNER ?? "blacksmith-16vcpu-ubuntu-2404";
 const QUEUED_STATUSES = new Set(["queued", "requested", "waiting", "pending"]);
+const SOURCE_JOB_PATH = /^jobs\/[A-Za-z0-9_.-]+\/inbox\/[A-Za-z0-9_.-]+\.md$/;
+const STATE_REVISION = /^[a-f0-9]{40}$/;
+const JOB_SHA256 = /^[a-f0-9]{64}$/;
+const REPAIR_MODES = new Set(["plan", "execute", "autonomous"]);
+
+type RecoveredRunCohort = {
+  source_job: string;
+  mode: string;
+  state_revision: string;
+  job_sha256: string;
+  producer_attempt: number;
+};
 
 const args = parseArgs(process.argv.slice(2));
 const repo = String(args.repo ?? DEFAULT_REPO);
@@ -53,6 +66,9 @@ const execute = Boolean(args.execute);
 const openExecuteWindow = Boolean(args["open-execute-window"] || args.live);
 const allowRepeat = Boolean(args["allow-repeat"]);
 const requestedMode = typeof args.mode === "string" ? args.mode : null;
+const runRecordsDir = path.resolve(
+  String(args["runs-dir"] ?? args.runs_dir ?? path.join(repoRoot(), "results", "runs")),
+);
 const skippedCandidates: LooseRecord[] = [];
 
 if (!Number.isInteger(maxJobs) || maxJobs < 1) {
@@ -224,33 +240,36 @@ function selectCandidates() {
     })
     .map((record: JsonValue) => {
       const sourceJob = String(record.source_job ?? "");
-      let immutableJob;
       try {
-        immutableJob = resolveCurrentStateJobIdentity(sourceJob);
+        const { immutableJob, recoveredMode } = resolveRunRecordJob(record, sourceJob);
+        return {
+          ...record,
+          source_job: immutableJob.jobPath,
+          source_state_revision: immutableJob.stateRevision,
+          source_job_sha256: immutableJob.jobSha256,
+          immutable_job_key: immutableJob.identityKey,
+          mode: requestedMode ?? recoveredMode ?? immutableJob.job.frontmatter.mode,
+        };
       } catch (error) {
-        if (!isMissingImmutableJobError(error)) throw error;
         skippedCandidates.push({
-          reason: "missing_job_file",
+          reason: isMissingImmutableJobError(error)
+            ? "missing_job_file"
+            : "immutable_provenance_unavailable",
           run_id: record.run_id ?? null,
           source_job: sourceJob,
+          detail: error instanceof Error ? error.message : String(error),
         });
         return null;
       }
-      return {
-        ...record,
-        source_job: immutableJob.jobPath,
-        source_state_revision: immutableJob.stateRevision,
-        source_job_sha256: immutableJob.jobSha256,
-        immutable_job_key: immutableJob.identityKey,
-        mode: requestedMode ?? immutableJob.job.frontmatter.mode,
-      };
     })
     .filter((record: JsonValue) => record !== null)
     .filter((record: JsonValue) => {
-      const activeRunIds =
-        activeJobGenerations.get(
+      const activeRunIds = [
+        ...(activeJobGenerations.get(
           activeJobGenerationKey(record.source_job, record.source_job_sha256),
-        ) ?? [];
+        ) ?? []),
+        ...(activeJobGenerations.get(activeLegacyJobKey(record.source_job)) ?? []),
+      ].filter((runId, index, all) => all.indexOf(runId) === index);
       if (activeRunIds.length === 0) return true;
       skippedCandidates.push({
         reason: "active_repair_run",
@@ -398,14 +417,193 @@ function assertExecuteGateOpenIfNeeded(candidates: LooseRecord[]) {
 }
 
 function readRunRecords() {
-  const runsDir = path.join(repoRoot(), "results", "runs");
-  const records = fs.existsSync(runsDir)
+  const records = fs.existsSync(runRecordsDir)
     ? fs
-        .readdirSync(runsDir)
+        .readdirSync(runRecordsDir)
         .filter((name: string) => name.endsWith(".json"))
-        .map((name: string) => JSON.parse(fs.readFileSync(path.join(runsDir, name), "utf8")))
+        .map((name: string) => JSON.parse(fs.readFileSync(path.join(runRecordsDir, name), "utf8")))
     : [];
   return [...records, ...liveRunRecords()];
+}
+
+function resolveRunRecordJob(record: LooseRecord, sourceJob: string) {
+  let stateRevision = String(record.source_state_revision ?? "").trim();
+  let jobSha256 = String(record.source_job_sha256 ?? "").trim();
+  let recoveredMode: string | null = null;
+  if (!STATE_REVISION.test(stateRevision) || !JOB_SHA256.test(jobSha256)) {
+    const runId = String(record.run_id ?? "").trim();
+    if (!/^[1-9][0-9]*$/.test(runId)) {
+      throw new Error("legacy run record is missing a valid workflow run id");
+    }
+    const recovered = recoverRunArtifactCohort(runId, sourceJob);
+    if (stateRevision && stateRevision !== recovered.state_revision) {
+      throw new Error("legacy run record state revision conflicts with its artifact cohort");
+    }
+    if (jobSha256 && jobSha256 !== recovered.job_sha256) {
+      throw new Error("legacy run record job digest conflicts with its artifact cohort");
+    }
+    stateRevision = recovered.state_revision;
+    jobSha256 = recovered.job_sha256;
+    recoveredMode = recovered.mode;
+  }
+  const immutableJob = resolveStateJobIdentity({
+    jobPath: sourceJob,
+    stateRevision,
+    jobSha256,
+  });
+  if (recoveredMode !== null && immutableJob.job.frontmatter.mode !== recoveredMode) {
+    throw new Error("legacy artifact cohort mode does not match its sealed source job");
+  }
+  return { immutableJob, recoveredMode };
+}
+
+function recoverRunArtifactCohort(runId: string, sourceJob: string): RecoveredRunCohort {
+  const artifactDir = fs.mkdtempSync(path.join(os.tmpdir(), `clawsweeper-self-heal-${runId}-`));
+  try {
+    const downloaded = spawnSync(
+      "gh",
+      ["run", "download", runId, "--repo", repo, "--dir", artifactDir],
+      { cwd: repoRoot(), encoding: "utf8", stdio: "pipe" },
+    );
+    if (downloaded.status !== 0) {
+      throw new Error(
+        `could not recover immutable provenance for run ${runId}: ${
+          downloaded.stderr || downloaded.stdout
+        }`,
+      );
+    }
+    return resolveDownloadedRunCohort(artifactDir, runId, sourceJob);
+  } finally {
+    fs.rmSync(artifactDir, { recursive: true, force: true });
+  }
+}
+
+function resolveDownloadedRunCohort(
+  root: string,
+  runId: string,
+  expectedSourceJob: string,
+): RecoveredRunCohort {
+  const candidatesByAttempt = new Map<number, RecoveredRunCohort[]>();
+  for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    const producerAttempt = repairArtifactProducerAttempt(entry.name, runId);
+    if (producerAttempt === null) continue;
+    const artifactRoot = path.join(root, entry.name);
+    for (const planPath of findNamedFiles(artifactRoot, "cluster-plan.json")) {
+      const runDir = path.dirname(planPath);
+      const resultPath = path.join(runDir, "result.json");
+      const identityPath = path.join(runDir, "source-job.json");
+      if (!fs.existsSync(resultPath) || !fs.existsSync(identityPath)) continue;
+      const candidate = readRecoveredRunCohort({
+        planPath,
+        resultPath,
+        identityPath,
+        producerAttempt,
+        expectedSourceJob,
+      });
+      candidatesByAttempt.set(producerAttempt, [
+        ...(candidatesByAttempt.get(producerAttempt) ?? []),
+        candidate,
+      ]);
+    }
+  }
+
+  for (const producerAttempt of [...candidatesByAttempt.keys()].sort(
+    (left, right) => right - left,
+  )) {
+    const candidates = candidatesByAttempt.get(producerAttempt) ?? [];
+    const unique = new Map(
+      candidates.map((candidate) => [JSON.stringify(candidate), candidate] as const),
+    );
+    if (unique.size > 1) {
+      throw new Error(
+        `run ${runId} has an ambiguous repair artifact cohort at attempt ${producerAttempt}`,
+      );
+    }
+    const selected = unique.values().next().value;
+    if (selected) return selected;
+  }
+  throw new Error(`run ${runId} did not publish one complete sealed repair artifact cohort`);
+}
+
+function readRecoveredRunCohort({
+  planPath,
+  resultPath,
+  identityPath,
+  producerAttempt,
+  expectedSourceJob,
+}: {
+  planPath: string;
+  resultPath: string;
+  identityPath: string;
+  producerAttempt: number;
+  expectedSourceJob: string;
+}): RecoveredRunCohort {
+  const plan = readJsonObject(planPath, "cluster plan");
+  const result = readJsonObject(resultPath, "repair result");
+  const identity = readJsonObject(identityPath, "source job identity");
+  const identityKeys = Object.keys(identity).sort();
+  if (
+    JSON.stringify(identityKeys) !==
+    JSON.stringify(["job_sha256", "schema_version", "source_job", "state_revision"])
+  ) {
+    throw new Error("sealed source job identity has unexpected fields");
+  }
+  const sourceJob = String(identity.source_job ?? "").trim();
+  const stateRevision = String(identity.state_revision ?? "").trim();
+  const jobSha256 = String(identity.job_sha256 ?? "").trim();
+  const planSourceJob = String(plan.source_job ?? "").trim();
+  if (
+    identity.schema_version !== 1 ||
+    !SOURCE_JOB_PATH.test(sourceJob) ||
+    !STATE_REVISION.test(stateRevision) ||
+    !JOB_SHA256.test(jobSha256) ||
+    sourceJob !== expectedSourceJob ||
+    planSourceJob !== sourceJob
+  ) {
+    throw new Error("sealed repair artifact cohort has invalid source job provenance");
+  }
+  const planMode = String(plan.mode ?? "").trim();
+  const resultMode = String(result.mode ?? planMode).trim();
+  if (!REPAIR_MODES.has(planMode) || !REPAIR_MODES.has(resultMode) || planMode !== resultMode) {
+    throw new Error("sealed repair artifact cohort has inconsistent repair mode");
+  }
+  return {
+    source_job: sourceJob,
+    mode: resultMode,
+    state_revision: stateRevision,
+    job_sha256: jobSha256,
+    producer_attempt: producerAttempt,
+  };
+}
+
+function repairArtifactProducerAttempt(name: string, runId: string): number | null {
+  const match = name.match(new RegExp(`^clawsweeper-repair(?:-worker)?-${runId}-([1-9][0-9]*)$`));
+  if (!match) return null;
+  const attempt = Number(match[1]);
+  return Number.isSafeInteger(attempt) ? attempt : null;
+}
+
+function findNamedFiles(root: string, basename: string): string[] {
+  const matches: string[] = [];
+  const pending = [root];
+  while (pending.length > 0) {
+    const directory = pending.pop()!;
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+      const candidate = path.join(directory, entry.name);
+      if (entry.isDirectory()) pending.push(candidate);
+      else if (entry.isFile() && entry.name === basename) matches.push(candidate);
+    }
+  }
+  return matches.sort();
+}
+
+function readJsonObject(file: string, label: string): LooseRecord {
+  const value = JSON.parse(fs.readFileSync(file, "utf8"));
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${label} must be a JSON object`);
+  }
+  return value;
 }
 
 function liveRunRecords() {
@@ -606,4 +804,12 @@ function activeJobGenerationKey(jobPath: JsonValue, jobSha256: JsonValue): strin
     throw new Error("active repair run contains a malformed job SHA-256");
   }
   return `${pathText}:${digest}`;
+}
+
+function activeLegacyJobKey(jobPath: JsonValue): string {
+  const pathText = String(jobPath ?? "").trim();
+  if (!SOURCE_JOB_PATH.test(pathText)) {
+    throw new Error("active legacy repair run contains a malformed job path");
+  }
+  return pathText;
 }
