@@ -20,14 +20,27 @@ export type CommitLifecycleInput = {
   sha: string;
 };
 
+const COMMIT_REVIEW_SUCCESS_RESULTS = new Set([
+  "nothing_found",
+  "findings",
+  "inconclusive",
+  "skipped_non_code",
+]);
+
 export function commitReviewLifecycleSucceeded(options: {
   reviewOutcome: string;
   checkOutcome: string;
   checksRequested: boolean;
+  reportResult: string;
 }): boolean {
   const reviewOutcome = options.reviewOutcome.trim().toLowerCase();
   const checkOutcome = options.checkOutcome.trim().toLowerCase();
-  return reviewOutcome === "success" && (!options.checksRequested || checkOutcome === "success");
+  const reportResult = options.reportResult.trim().toLowerCase();
+  return (
+    reviewOutcome === "success" &&
+    COMMIT_REVIEW_SUCCESS_RESULTS.has(reportResult) &&
+    (!options.checksRequested || checkOutcome === "success")
+  );
 }
 
 type CommitLifecycleEvent = {

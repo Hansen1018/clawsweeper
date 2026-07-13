@@ -730,7 +730,16 @@ function finishReviewCommand(args: Args): void {
   const reviewOutcome = argString(args, "review_outcome", "unknown");
   const checkOutcome = argString(args, "check_outcome", "unknown");
   const checksRequested = argBool(args, "checks_requested");
-  if (commitReviewLifecycleSucceeded({ reviewOutcome, checkOutcome, checksRequested })) {
+  const reportPath = argString(args, "report_path", "");
+  const reportResult = commitReviewReportResult(reportPath);
+  if (
+    commitReviewLifecycleSucceeded({
+      reviewOutcome,
+      checkOutcome,
+      checksRequested,
+      reportResult,
+    })
+  ) {
     recordCommitWorkflowEvent(lifecycle, "completed");
   } else {
     recordCommitWorkflowEvent(
@@ -740,12 +749,26 @@ function finishReviewCommand(args: Args): void {
         argString(
           args,
           "error_kind",
-          `review=${reviewOutcome},checks_requested=${checksRequested},check=${checkOutcome}`,
+          `review=${reviewOutcome},report=${reportResult},checks_requested=${checksRequested},check=${checkOutcome}`,
         ),
       ),
     );
   }
   recordCommitWorkflowEvent(lifecycle, "finalized");
+}
+
+function commitReviewReportResult(reportPath: string): string {
+  if (!reportPath || !existsSync(reportPath)) return "missing";
+  try {
+    const { frontMatter } = splitFrontMatter(readFileSync(reportPath, "utf8"));
+    return (
+      String(frontMatter.result ?? "missing")
+        .trim()
+        .toLowerCase() || "missing"
+    );
+  } catch {
+    return "invalid";
+  }
 }
 
 function collectMarkdownFiles(dir: string): string[] {

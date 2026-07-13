@@ -494,13 +494,15 @@ jobs:
           CHECKS_REQUESTED: ${{ needs.plan.outputs.create_checks }}
         run: |
           set -euo pipefail
+          report_path="$(find ../commit-artifacts -name '${{ matrix.sha }}.md' -print -quit)"
           node dist/commit-sweeper.js finish-review \
             --target-repo "${{ needs.plan.outputs.target_repo }}" \
             --commit-sha "${{ matrix.sha }}" \
+            --report-path "$report_path" \
             --review-outcome "$REVIEW_OUTCOME" \
             --check-outcome "$CHECK_OUTCOME" \
             --checks-requested "$CHECKS_REQUESTED" \
-            --error-kind "review=$REVIEW_OUTCOME,checks_requested=$CHECKS_REQUESTED,check=$CHECK_OUTCOME"
+            --error-kind "review=$REVIEW_OUTCOME,report=${report_path:-missing},checks_requested=$CHECKS_REQUESTED,check=$CHECK_OUTCOME"
 
       - name: Finalize commit review action ledger
         if: ${{ always() && steps.review-setup-pnpm.outcome == 'success' }}

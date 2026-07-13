@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -21,6 +22,7 @@ test("commit review terminal success requires requested check publication", () =
       reviewOutcome: "success",
       checkOutcome: "skipped",
       checksRequested: false,
+      reportResult: "nothing_found",
     }),
     true,
   );
@@ -30,6 +32,7 @@ test("commit review terminal success requires requested check publication", () =
         reviewOutcome: "success",
         checkOutcome,
         checksRequested: true,
+        reportResult: "nothing_found",
       }),
       false,
     );
@@ -39,9 +42,74 @@ test("commit review terminal success requires requested check publication", () =
       reviewOutcome: "success",
       checkOutcome: "success",
       checksRequested: true,
+      reportResult: "findings",
     }),
     true,
   );
+  for (const reportResult of ["failed", "missing", "invalid", "unknown"]) {
+    assert.equal(
+      commitReviewLifecycleSucceeded({
+        reviewOutcome: "success",
+        checkOutcome: "success",
+        checksRequested: true,
+        reportResult,
+      }),
+      false,
+    );
+  }
+  assert.equal(
+    commitReviewLifecycleSucceeded({
+      reviewOutcome: "success",
+      checkOutcome: "skipped",
+      checksRequested: false,
+      reportResult: "inconclusive",
+    }),
+    true,
+  );
+});
+
+test("failed commit review reports cannot complete the workflow lifecycle", async () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "commit-failed-report-")));
+  const outputRoot = path.join(root, "output");
+  const reportPath = path.join(root, `${"b".repeat(40)}.md`);
+  fs.mkdirSync(outputRoot);
+  fs.writeFileSync(reportPath, "---\nresult: failed\n---\n\nReview failed.\n");
+  const previous = { ...process.env };
+  Object.assign(process.env, workflowEnv(root, outputRoot));
+
+  try {
+    execFileSync(
+      process.execPath,
+      [
+        path.join(process.cwd(), "dist/commit-sweeper.js"),
+        "finish-review",
+        "--target-repo",
+        "openclaw/openclaw",
+        "--commit-sha",
+        "b".repeat(40),
+        "--report-path",
+        reportPath,
+        "--review-outcome",
+        "success",
+        "--check-outcome",
+        "skipped",
+        "--checks-requested",
+        "false",
+      ],
+      { env: { ...process.env }, stdio: "pipe" },
+    );
+    await flushWorkflowActionEvents(root);
+
+    const workflowStates = readEvents(outputRoot)
+      .filter((event) => event.event_type === ACTION_EVENT_TYPES.workflowAttempt)
+      .sort((left, right) => left.phase_seq - right.phase_seq)
+      .map((event) => event.attributes?.state);
+    assert.deepEqual(workflowStates, ["failed", "finalized"]);
+    assert.doesNotMatch(workflowStates.join(","), /completed/);
+  } finally {
+    restoreEnv(previous);
+    fs.rmSync(root, { force: true, recursive: true });
+  }
 });
 
 test("commit publication uncertainty is preserved by terminal workflow receipts", async () => {

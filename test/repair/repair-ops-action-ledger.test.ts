@@ -244,6 +244,7 @@ test("commit review and notification workflows publish their operation receipts"
   assert.match(review, /--continue-workflow/);
   assert.match(review, /node dist\/commit-sweeper\.js finish-review/);
   assert.match(review, /--review-outcome "\$REVIEW_OUTCOME"/);
+  assert.match(review, /report_path=.*matrix\.sha[\s\S]*--report-path "\$report_path"/);
   assert.match(review, /--check-outcome "\$CHECK_OUTCOME"/);
   assert.match(review, /--checks-requested "\$CHECKS_REQUESTED"/);
   assert.doesNotMatch(review, /CHECK_OUTCOME" = "skipped"/);
