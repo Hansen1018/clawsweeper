@@ -322,6 +322,13 @@ test("commit review and notification workflows publish their operation receipts"
   assert.match(publisher, /normalize_single_download/);
   assert.match(publisher, /Verify and assemble commit review artifact cohort/);
   assert.match(publisher, /merge-multiple: false/);
+  assert.match(publisher, /--commit-report "\$\{report_files\[0\]\}"/);
+  assert.match(publisher, /--expected-commit-repository "\$EXPECTED_TARGET_REPO"/);
+  assert.match(publisher, /--expected-commit-sha "\$commit_sha"/);
+  assert.ok(
+    publisher.indexOf("mapfile -d '' report_files") <
+      publisher.indexOf('--commit-report "${report_files[0]}"'),
+  );
   assert.match(publisher, /Publish immutable commit review action ledger/);
   assert.match(publisher, /append commit review action ledger/);
   assert.match(

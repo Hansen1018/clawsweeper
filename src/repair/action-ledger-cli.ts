@@ -11,6 +11,7 @@ import {
 import { repoRoot } from "./paths.js";
 import { flushRepairActionEvents } from "./repair-action-ledger.js";
 import {
+  assertCommitReviewReportArtifact,
   assertRepairActionLedgerManifestSource,
   finalizeRepairActionLedgerManifest,
   parseRepairActionLedgerManifest,
@@ -83,6 +84,23 @@ if (command === "finalize") {
       },
     );
     assertRepairActionLedgerManifestSource(sourceRoot, manifest);
+    const commitReportArgs = [
+      args.commitReport,
+      args.expectedCommitRepository,
+      args.expectedCommitSha,
+    ];
+    if (commitReportArgs.some(Boolean) && !commitReportArgs.every(Boolean)) {
+      throw new Error(
+        "--commit-report, --expected-commit-repository, and --expected-commit-sha are required together",
+      );
+    }
+    if (args.commitReport && args.expectedCommitRepository && args.expectedCommitSha) {
+      assertCommitReviewReportArtifact(sourceRoot, manifest, {
+        reportPath: path.resolve(args.commitReport),
+        repository: args.expectedCommitRepository,
+        sha: args.expectedCommitSha,
+      });
+    }
     if (command === "verify") {
       console.log(JSON.stringify({ eventPaths: manifest.event_paths }, null, 2));
     } else {
@@ -127,7 +145,7 @@ if (command === "finalize") {
   }
 } else {
   throw new Error(
-    "usage: action-ledger-cli.ts <finalize|verify|publish> [--lane name | --repair-lane name] [--allow-empty] [--manifest path] [--expected-job job --expected-run-attempt attempt] [--source-root path --state-root path]",
+    "usage: action-ledger-cli.ts <finalize|verify|publish> [--lane name | --repair-lane name] [--allow-empty] [--manifest path] [--expected-job job --expected-run-attempt attempt] [--source-root path --state-root path] [--commit-report path --expected-commit-repository owner/repo --expected-commit-sha sha]",
   );
 }
 
@@ -148,6 +166,9 @@ function parseArgs(argv: readonly string[]) {
     stateRoot?: string;
     expectedJob?: string;
     expectedRunAttempt?: number;
+    commitReport?: string;
+    expectedCommitRepository?: string;
+    expectedCommitSha?: string;
   } = {};
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
@@ -158,7 +179,12 @@ function parseArgs(argv: readonly string[]) {
     else if (arg === "--state-root") parsed.stateRoot = requiredValue(argv, ++index, arg);
     else if (arg === "--allow-empty") parsed.allowEmpty = true;
     else if (arg === "--expected-job") parsed.expectedJob = requiredValue(argv, ++index, arg);
-    else if (arg === "--expected-run-attempt") {
+    else if (arg === "--commit-report") parsed.commitReport = requiredValue(argv, ++index, arg);
+    else if (arg === "--expected-commit-repository") {
+      parsed.expectedCommitRepository = requiredValue(argv, ++index, arg);
+    } else if (arg === "--expected-commit-sha") {
+      parsed.expectedCommitSha = requiredValue(argv, ++index, arg);
+    } else if (arg === "--expected-run-attempt") {
       parsed.expectedRunAttempt = positiveInteger(requiredValue(argv, ++index, arg), arg);
     } else throw new Error(`unknown argument: ${arg}`);
   }

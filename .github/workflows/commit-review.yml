@@ -619,6 +619,7 @@ jobs:
       - name: Verify and assemble commit review artifact cohort
         if: ${{ needs.plan.outputs.planned_count != '0' }}
         env:
+          EXPECTED_TARGET_REPO: ${{ needs.plan.outputs.target_repo }}
           PLANNED_COUNT: ${{ needs.plan.outputs.planned_count }}
         run: |
           set -euo pipefail
@@ -657,18 +658,21 @@ jobs:
             test -d "$report_root"
             test -n "$ledger_id"
             test -n "$report_id"
-            pnpm run --silent repair:action-ledger -- verify \
-              --repair-lane "commit-review-$commit_sha" \
-              --manifest "$review_root/repair-action-ledger-manifest.json" \
-              --expected-job review \
-              --expected-run-attempt "$artifact_attempt" \
-              --source-root "$review_root" >/dev/null
             mapfile -d '' report_files < <(find "$report_root" -type f -name '*.md' -print0)
             if [ "${#report_files[@]}" -ne 1 ] ||
                [ "$(basename "${report_files[0]:-}" .md)" != "$commit_sha" ]; then
               echo "Commit review report artifact is incomplete for $commit_sha." >&2
               exit 1
             fi
+            pnpm run --silent repair:action-ledger -- verify \
+              --repair-lane "commit-review-$commit_sha" \
+              --manifest "$review_root/repair-action-ledger-manifest.json" \
+              --expected-job review \
+              --expected-run-attempt "$artifact_attempt" \
+              --commit-report "${report_files[0]}" \
+              --expected-commit-repository "$EXPECTED_TARGET_REPO" \
+              --expected-commit-sha "$commit_sha" \
+              --source-root "$review_root" >/dev/null
             cp -R "$report_root"/. commit-artifacts/
             echo "$commit_sha" >> "$actual_shas_file"
           done < <(jq -r '.[] | [.sha, (.producerAttempt | tostring), .ledger.name, (.ledger.id | tostring), .report.name, (.report.id | tostring)] | @tsv' "$cohort_file")

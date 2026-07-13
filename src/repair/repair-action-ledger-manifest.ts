@@ -1,6 +1,14 @@
 import { createHash } from "node:crypto";
+import { lstatSync, readFileSync } from "node:fs";
 
-import { actionLedgerJson, readActionEventShardAt, type ActionEvent } from "../action-ledger.js";
+import {
+  ACTION_EVENT_STATUSES,
+  ACTION_EVENT_TYPES,
+  actionLedgerJson,
+  readActionEventShardAt,
+  type ActionEvent,
+} from "../action-ledger.js";
+import { splitFrontMatter } from "../commit-checks.js";
 import { recoverCommitMutationOutcomes } from "../commit-action-ledger.js";
 import {
   ACTION_EVENT_SHARD_IMPORT_LIMITS,
@@ -15,6 +23,7 @@ const REPAIR_ACTION_LEDGER_MANIFEST_SCHEMA = "clawsweeper.repair-action-ledger-m
 const REPAIR_ACTION_LEDGER_MANIFEST_VERSION = 1;
 const REPAIR_ACTION_LEDGER_MANIFEST_MAX_BYTES = 256 * 1024;
 const REPAIR_ACTION_LEDGER_LANE_PATTERN = /^[a-z0-9][a-z0-9._-]{0,127}$/;
+const COMMIT_REVIEW_REPORT_MAX_BYTES = 4 * 1024 * 1024;
 const COMMAND_EVENT_TYPE_PREFIX = "command.";
 
 type RepairActionLedgerManifestIdentity = {
@@ -195,6 +204,78 @@ export function assertRepairActionLedgerManifestSource(
       run_id: manifest.run_id,
       run_attempt: manifest.run_attempt,
     });
+  }
+}
+
+export function assertCommitReviewReportArtifact(
+  sourceRoot: string,
+  manifest: RepairActionLedgerManifest,
+  options: {
+    reportPath: string;
+    repository: string;
+    sha: string;
+  },
+): void {
+  assertRepairActionLedgerManifestSource(sourceRoot, manifest);
+  const repository = options.repository.trim().toLowerCase();
+  const sha = options.sha.trim().toLowerCase();
+  if (!/^[a-z0-9_.-]+\/[a-z0-9_.-]+$/.test(repository)) {
+    throw new Error("expected commit review repository is invalid");
+  }
+  if (!/^[a-f0-9]{40}$/.test(sha)) {
+    throw new Error("expected commit review SHA is invalid");
+  }
+  if (manifest.lane !== `commit-review-${sha}`) {
+    throw new Error("commit review report lane does not match the expected SHA");
+  }
+
+  const reportStat = lstatSync(options.reportPath);
+  if (
+    !reportStat.isFile() ||
+    reportStat.size < 1 ||
+    reportStat.size > COMMIT_REVIEW_REPORT_MAX_BYTES
+  ) {
+    throw new Error("commit review report file is invalid");
+  }
+  const report = readFileSync(options.reportPath);
+  const { frontMatter } = splitFrontMatter(report.toString("utf8"));
+  const reportRepository =
+    typeof frontMatter.repository === "string" ? frontMatter.repository.trim().toLowerCase() : "";
+  const reportSha = typeof frontMatter.sha === "string" ? frontMatter.sha.trim().toLowerCase() : "";
+  if (reportRepository !== repository || reportSha !== sha) {
+    throw new Error("commit review report frontmatter does not match the planned target");
+  }
+
+  const reportEvents = manifest.event_paths
+    .flatMap((relativePath) => readActionEventShardAt(sourceRoot, relativePath))
+    .filter(
+      (event) =>
+        event.event_type === ACTION_EVENT_TYPES.reviewLogPublication &&
+        event.action.status === ACTION_EVENT_STATUSES.completed &&
+        event.action.mutation === false &&
+        event.attributes?.state === "prepared" &&
+        event.attributes?.publication_kind === "commit_review_report",
+    );
+  if (reportEvents.length !== 1) {
+    throw new Error("commit review ledger must contain exactly one prepared report event");
+  }
+  const reportEvent = reportEvents[0]!;
+  if (
+    reportEvent.subject.repository.trim().toLowerCase() !== repository ||
+    reportEvent.subject.kind !== "commit" ||
+    reportEvent.subject.subject_id !== `commit-${sha}` ||
+    reportEvent.subject.source_revision?.trim().toLowerCase() !== sha
+  ) {
+    throw new Error("commit review ledger report target does not match the planned target");
+  }
+  const evidence = reportEvent.evidence ?? [];
+  const reportSha256 = createHash("sha256").update(report).digest("hex");
+  if (
+    evidence.length !== 1 ||
+    evidence[0]?.kind !== "commit_review_report" ||
+    evidence[0].sha256 !== reportSha256
+  ) {
+    throw new Error("commit review report digest does not match the immutable ledger");
   }
 }
 

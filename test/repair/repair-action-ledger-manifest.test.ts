@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -11,11 +11,13 @@ import {
   ACTION_EVENT_TYPES,
 } from "../../dist/action-ledger.js";
 import {
+  assertCommitReviewReportArtifact,
   assertRepairActionLedgerManifestSource,
   finalizeRepairActionLedgerManifest,
   parseRepairActionLedgerManifest,
   serializeRepairActionLedgerManifest,
 } from "../../dist/repair/repair-action-ledger-manifest.js";
+import { recordCommitArtifactPrepared } from "../../dist/commit-action-ledger.js";
 import {
   flushRepairActionEvents,
   recordRepairLifecycleEvent,
@@ -202,6 +204,120 @@ test("repair manifests allow an explicitly empty producer run without weakening 
   }
 });
 
+test("commit review report verification binds exact bytes and planned target identity", async () => {
+  const root = fs.realpathSync(
+    fs.mkdtempSync(path.join(os.tmpdir(), "commit-review-report-manifest-")),
+  );
+  const outputRoot = path.join(root, "output");
+  const sha = "b".repeat(40);
+  const reportPath = path.join(root, `${sha}.md`);
+  const manifestPath = path.join(root, "manifest.json");
+  fs.mkdirSync(outputRoot);
+  fs.writeFileSync(
+    reportPath,
+    `---\nsha: ${sha}\nrepository: openclaw/openclaw\nresult: findings\n---\n\nFinding.\n`,
+  );
+  const previous = { ...process.env };
+  Object.assign(process.env, commitReviewWorkflowEnv(root, outputRoot));
+
+  try {
+    recordCommitArtifactPrepared(
+      { repository: "openclaw/openclaw", sha },
+      { path: reportPath, kind: "commit_review_report" },
+    );
+    const manifest = await finalizeRepairActionLedgerManifest(`commit-review-${sha}`);
+    fs.writeFileSync(manifestPath, serializeRepairActionLedgerManifest(manifest));
+    assert.doesNotThrow(() =>
+      assertCommitReviewReportArtifact(outputRoot, manifest, {
+        reportPath,
+        repository: "openclaw/openclaw",
+        sha,
+      }),
+    );
+    const verifyArgs = [
+      path.join(process.cwd(), "dist", "repair", "action-ledger-cli.js"),
+      "verify",
+      "--repair-lane",
+      `commit-review-${sha}`,
+      "--manifest",
+      manifestPath,
+      "--expected-job",
+      "review",
+      "--expected-run-attempt",
+      "3",
+      "--commit-report",
+      reportPath,
+      "--expected-commit-repository",
+      "openclaw/openclaw",
+      "--expected-commit-sha",
+      sha,
+      "--source-root",
+      outputRoot,
+    ];
+    const verified = spawnSync(process.execPath, verifyArgs, {
+      encoding: "utf8",
+      env: { ...process.env },
+    });
+    assert.equal(verified.status, 0, verified.stderr);
+
+    fs.appendFileSync(reportPath, "tampered\n");
+    assert.throws(
+      () =>
+        assertCommitReviewReportArtifact(outputRoot, manifest, {
+          reportPath,
+          repository: "openclaw/openclaw",
+          sha,
+        }),
+      /digest does not match the immutable ledger/,
+    );
+    const rejected = spawnSync(process.execPath, verifyArgs, {
+      encoding: "utf8",
+      env: { ...process.env },
+    });
+    assert.notEqual(rejected.status, 0);
+    assert.match(rejected.stderr, /digest does not match the immutable ledger/);
+  } finally {
+    restoreEnv(previous);
+    fs.rmSync(root, { force: true, recursive: true });
+  }
+});
+
+test("commit review report verification rejects ledger-bound frontmatter for another target", async () => {
+  const root = fs.realpathSync(
+    fs.mkdtempSync(path.join(os.tmpdir(), "commit-review-report-target-")),
+  );
+  const outputRoot = path.join(root, "output");
+  const sha = "b".repeat(40);
+  const reportPath = path.join(root, `${sha}.md`);
+  fs.mkdirSync(outputRoot);
+  fs.writeFileSync(
+    reportPath,
+    `---\nsha: ${"c".repeat(40)}\nrepository: attacker/example\nresult: findings\n---\n\nFinding.\n`,
+  );
+  const previous = { ...process.env };
+  Object.assign(process.env, commitReviewWorkflowEnv(root, outputRoot));
+
+  try {
+    recordCommitArtifactPrepared(
+      { repository: "openclaw/openclaw", sha },
+      { path: reportPath, kind: "commit_review_report" },
+    );
+    const manifest = await finalizeRepairActionLedgerManifest(`commit-review-${sha}`);
+    assert.throws(
+      () =>
+        assertCommitReviewReportArtifact(outputRoot, manifest, {
+          reportPath,
+          repository: "openclaw/openclaw",
+          sha,
+        }),
+      /frontmatter does not match the planned target/,
+    );
+  } finally {
+    restoreEnv(previous);
+    fs.rmSync(root, { force: true, recursive: true });
+  }
+});
+
 test("repair manifests exclude command shards from a shared workflow output root", async () => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "repair-mixed-manifest-")));
   const outputRoot = path.join(root, "output");
@@ -275,6 +391,17 @@ function workflowEnv(root: string, outputRoot: string): NodeJS.ProcessEnv {
     GITHUB_WORKFLOW: "repair cluster worker",
     GITHUB_WORKFLOW_REF:
       "openclaw/clawsweeper/.github/workflows/repair-cluster-worker.yml@refs/heads/main",
+  };
+}
+
+function commitReviewWorkflowEnv(root: string, outputRoot: string): NodeJS.ProcessEnv {
+  return {
+    ...workflowEnv(root, outputRoot),
+    CLAWSWEEPER_ACTION_LEDGER_INVOCATION: "review",
+    GITHUB_ACTION: "review_commit",
+    GITHUB_JOB: "review",
+    GITHUB_WORKFLOW: "commit review",
+    GITHUB_WORKFLOW_REF: "openclaw/clawsweeper/.github/workflows/commit-review.yml@refs/heads/main",
   };
 }
 
