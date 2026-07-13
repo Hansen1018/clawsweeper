@@ -1,5 +1,10 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
+import { parse } from "yaml";
 
 import { readText } from "../helpers.ts";
 
@@ -168,16 +173,35 @@ test("repair worker jobs upload shards and one credentialed job publishes them",
   assert.match(publisher, /--expected-run-attempt "\$run_attempt"/);
   assert.match(
     publisher,
-    /EXECUTE_LEDGER_ALLOW_EMPTY:[\s\S]*allow_empty_args\+=\(--allow-empty\)[\s\S]*verify_lane execute execute "\$EXECUTE_LEDGER_ATTEMPT" "\$EXECUTE_LEDGER_ALLOW_EMPTY"[\s\S]*publish_lane execute execute "\$EXECUTE_LEDGER_ATTEMPT" "\$EXECUTE_LEDGER_ALLOW_EMPTY"/,
+    /EXECUTE_LEDGER_ALLOW_EMPTY:[\s\S]*allow_empty_args\+=\(--allow-empty\)[\s\S]*collect_lane execute execute "\$EXECUTE_JOB_RESULT" "\$EXECUTE_LEDGER_ARTIFACT_ID" "\$EXECUTE_LEDGER_ATTEMPT" "\$EXECUTE_DOWNLOAD_OUTCOME" "\$EXECUTE_LEDGER_ALLOW_EMPTY"/,
   );
-  assert.match(publisher, /publish_lane cluster cluster/);
-  assert.match(publisher, /publish_lane execute execute/);
-  assert.match(publisher, /publish_lane mutate mutate/);
-  assert.match(
-    publisher,
-    /require_lane cluster[\s\S]*require_lane execute[\s\S]*require_lane mutate[\s\S]*verify_lane cluster[\s\S]*verify_lane execute[\s\S]*verify_lane mutate[\s\S]*publish_lane cluster/,
-  );
+  assert.match(publisher, /collect_lane cluster cluster/);
+  assert.match(publisher, /collect_lane execute execute/);
+  assert.match(publisher, /collect_lane mutate mutate/);
+  assert.match(publisher, /Successful \$lane job did not expose an action ledger artifact/);
+  assert.match(publisher, /record_lane "\$lane" "\$job_result" "missing"/);
+  assert.match(publisher, /One or more advertised repair action ledger lanes failed closed/);
+  assert.match(publisher, /continue-on-error: true/);
+  assert.doesNotMatch(publisher, /require_lane/);
   assert.match(publisher, /--message "chore: append repair action ledger"/);
+});
+
+test("repair ledger collector publishes present lanes when downstream lanes are absent", () => {
+  const result = runRepairLedgerCollector();
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.summary, /\| cluster \| success \| published \|/);
+  assert.match(result.summary, /\| execute \| failure \| missing \|/);
+  assert.match(result.summary, /\| mutate \| skipped \| missing \|/);
+  assert.match(result.published, /ledger\/cluster\.json/);
+});
+
+test("repair ledger collector preserves valid lanes but fails closed on a forged lane", () => {
+  const result = runRepairLedgerCollector({ forgedMutate: true });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /advertised repair action ledger lanes failed closed/);
+  assert.match(result.summary, /\| cluster \| success \| published \|/);
+  assert.match(result.summary, /\| mutate \| failure \| invalid: verification failed \|/);
+  assert.match(result.published, /ledger\/cluster\.json/);
 });
 
 test("repair mutation and Codex boundaries emit exact immutable receipts", () => {
@@ -552,3 +576,118 @@ test("repair and commit publishers require canonical exact manifests", () => {
     /Verify and assemble commit review artifact cohort[\s\S]*repair:action-ledger -- verify[\s\S]*Commit reports[\s\S]*repair:action-ledger -- publish/,
   );
 });
+
+function runRepairLedgerCollector({ forgedMutate = false } = {}) {
+  const workflow = parse(readText(".github/workflows/repair-cluster-worker.yml"));
+  const step = workflow.jobs["publish-repair-action-ledger"].steps.find(
+    (candidate: { name?: string }) => candidate.name === "Publish immutable repair action ledger",
+  );
+  assert.equal(typeof step?.run, "string");
+
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-ledger-collector-"));
+  const bin = path.join(root, "bin");
+  const state = path.join(root, "state");
+  const summary = path.join(root, "summary.md");
+  const publishLog = path.join(root, "publish.log");
+  fs.mkdirSync(bin, { recursive: true });
+  fs.mkdirSync(state, { recursive: true });
+  writeLaneManifest(root, "cluster", "ledger/cluster.json");
+  if (forgedMutate) writeLaneManifest(root, "mutate", "ledger/mutate.json");
+  fs.writeFileSync(
+    path.join(bin, "pnpm"),
+    `#!/usr/bin/env node
+import fs from "node:fs";
+import path from "node:path";
+const args = process.argv.slice(2);
+if (args.includes("repair:publish-main")) {
+  fs.appendFileSync(process.env.PUBLISH_LOG, args.join(" ") + "\\n");
+  process.exit(0);
+}
+const separator = args.indexOf("--");
+const operation = separator >= 0 ? args[separator + 1] : "";
+const value = (name) => {
+  const index = args.indexOf(name);
+  return index >= 0 ? args[index + 1] : "";
+};
+const lane = value("--repair-lane");
+if (operation === "verify") {
+  process.exit(process.env.FORGED_MUTATE === "1" && lane === "mutate" ? 1 : 0);
+}
+if (operation === "publish") {
+  const manifest = JSON.parse(fs.readFileSync(value("--manifest"), "utf8"));
+  const stateRoot = value("--state-root");
+  for (const relative of manifest.event_paths) {
+    const target = path.join(stateRoot, relative);
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(target, lane + "\\n");
+  }
+  process.stdout.write(JSON.stringify({ eventPaths: manifest.event_paths, paths: manifest.event_paths }));
+  process.exit(0);
+}
+process.exit(2);
+`,
+    { mode: 0o755 },
+  );
+  fs.writeFileSync(
+    path.join(bin, "jq"),
+    `#!/usr/bin/env node
+import fs from "node:fs";
+const args = process.argv.slice(2);
+if (args[0] === "-r") {
+  const input = JSON.parse(fs.readFileSync(args.at(-1), "utf8"));
+  process.stdout.write(input.paths.map((value) => value + "\\n").join(""));
+  process.exit(0);
+}
+const manifestIndex = args.indexOf("--slurpfile");
+const manifest = JSON.parse(fs.readFileSync(args[manifestIndex + 2], "utf8"));
+const input = JSON.parse(fs.readFileSync(args.at(-1), "utf8"));
+process.exit(JSON.stringify(input.eventPaths) === JSON.stringify(manifest.event_paths) ? 0 : 1);
+`,
+    { mode: 0o755 },
+  );
+
+  try {
+    const child = spawnSync("bash", ["-c", step.run], {
+      cwd: root,
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        PATH: `${bin}${path.delimiter}${process.env.PATH ?? ""}`,
+        CLAWSWEEPER_STATE_DIR: state,
+        GITHUB_STEP_SUMMARY: summary,
+        PUBLISH_LOG: publishLog,
+        FORGED_MUTATE: forgedMutate ? "1" : "0",
+        CLUSTER_LEDGER_ARTIFACT_ID: "101",
+        CLUSTER_LEDGER_ATTEMPT: "1",
+        CLUSTER_JOB_RESULT: "success",
+        CLUSTER_DOWNLOAD_OUTCOME: "success",
+        EXECUTE_LEDGER_ARTIFACT_ID: "",
+        EXECUTE_LEDGER_ATTEMPT: "",
+        EXECUTE_LEDGER_ALLOW_EMPTY: "false",
+        EXECUTE_JOB_RESULT: "failure",
+        EXECUTE_DOWNLOAD_OUTCOME: "skipped",
+        MUTATE_LEDGER_ARTIFACT_ID: forgedMutate ? "303" : "",
+        MUTATE_LEDGER_ATTEMPT: forgedMutate ? "1" : "",
+        MUTATE_JOB_RESULT: forgedMutate ? "failure" : "skipped",
+        MUTATE_DOWNLOAD_OUTCOME: forgedMutate ? "success" : "skipped",
+      },
+    });
+    return {
+      status: child.status,
+      stderr: child.stderr,
+      summary: fs.readFileSync(summary, "utf8"),
+      published: fs.existsSync(publishLog) ? fs.readFileSync(publishLog, "utf8") : "",
+    };
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function writeLaneManifest(root: string, lane: string, eventPath: string) {
+  const laneRoot = path.join(root, ".clawsweeper-repair", "action-ledger-download", lane);
+  fs.mkdirSync(laneRoot, { recursive: true });
+  fs.writeFileSync(
+    path.join(laneRoot, "repair-action-ledger-manifest.json"),
+    `${JSON.stringify({ event_paths: [eventPath] })}\n`,
+  );
+}

@@ -1,6 +1,6 @@
 name: repair cluster worker
 
-run-name: ${{ inputs.dispatch_key && format('{0} [{1}]', contains(inputs.job, '/inbox/issue-') && format('issue implementation {0}', inputs.job) || contains(inputs.job, '/inbox/automerge-') && format('automerge repair {0}', inputs.job) || format('repair cluster {0}', inputs.job), inputs.dispatch_key) || contains(inputs.job, '/inbox/issue-') && format('issue implementation {0}', inputs.job) || contains(inputs.job, '/inbox/automerge-') && format('automerge repair {0}', inputs.job) || format('repair cluster {0}', inputs.job) }}
+run-name: ${{ inputs.dispatch_key && format('{0} [{1}] ({2})', contains(inputs.job, '/inbox/issue-') && format('issue implementation {0}', inputs.job) || contains(inputs.job, '/inbox/automerge-') && format('automerge repair {0}', inputs.job) || format('repair cluster {0}', inputs.job), inputs.dispatch_key, inputs.job_sha256) || format('{0} ({1})', contains(inputs.job, '/inbox/issue-') && format('issue implementation {0}', inputs.job) || contains(inputs.job, '/inbox/automerge-') && format('automerge repair {0}', inputs.job) || format('repair cluster {0}', inputs.job), inputs.job_sha256) }}
 
 on:
   workflow_dispatch:
@@ -15,14 +15,12 @@ on:
         default: ""
         type: string
       state_revision:
-        description: "Optional immutable clawsweeper-state commit containing the job"
-        required: false
-        default: ""
+        description: "Immutable clawsweeper-state commit containing the exact job"
+        required: true
         type: string
       job_sha256:
-        description: "Optional SHA-256 of the exact immutable job bytes"
-        required: false
-        default: ""
+        description: "SHA-256 of the exact immutable job bytes"
+        required: true
         type: string
       mode:
         description: "Worker mode"
@@ -82,7 +80,7 @@ env:
   CLAWSWEEPER_MODEL: internal
 
 concurrency:
-  group: ${{ inputs.requeue && format('clawsweeper-repair-requeue-{0}-{1}', inputs.job, github.run_id) || format('clawsweeper-repair-{0}', inputs.job) }}
+  group: ${{ inputs.requeue && format('clawsweeper-repair-requeue-{0}-{1}-{2}', inputs.job, inputs.job_sha256, github.run_id) || format('clawsweeper-repair-{0}-{1}-{2}', inputs.job, inputs.state_revision, inputs.job_sha256) }}
   # Keep an active execute run alive so its temporary gate cleanup can finish;
   # GitHub still coalesces pending runs in this group to the newest dispatch.
   cancel-in-progress: false
@@ -106,6 +104,7 @@ jobs:
         env:
           DISPATCH_KEY: ${{ inputs.dispatch_key }}
           JOB_PATH: ${{ inputs.job }}
+          JOB_SHA256: ${{ inputs.job_sha256 }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
@@ -118,7 +117,7 @@ jobs:
             */inbox/automerge-*) title="automerge repair $JOB_PATH" ;;
             *) title="repair cluster $JOB_PATH" ;;
           esac
-          expected_title="${title} [${DISPATCH_KEY}]"
+          expected_title="${title} [${DISPATCH_KEY}] (${JOB_SHA256})"
           owner="$(bash scripts/dispatch-receipt-owner.sh \
             repair-cluster-worker.yml "$expected_title" "$GITHUB_RUN_ID" "Plan and review cluster")"
           if [ "$owner" = "owner" ]; then
@@ -226,20 +225,8 @@ jobs:
           JOB_SHA256: ${{ inputs.job_sha256 }}
         run: |
           set -euo pipefail
-          case "$JOB_PATH" in
-            jobs/*/inbox/clawsweeper-commit-*.md) commit_finding=1 ;;
-            *) commit_finding=0 ;;
-          esac
-          if [ -z "$STATE_REVISION" ] && [ -z "$JOB_SHA256" ]; then
-            if [ "$commit_finding" = "1" ]; then
-              echo "Commit finding jobs require immutable state revision and digest." >&2
-              exit 1
-            fi
-            echo "immutable=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
           if [ -z "$STATE_REVISION" ] || [ -z "$JOB_SHA256" ]; then
-            echo "state_revision and job_sha256 must be provided together." >&2
+            echo "state_revision and job_sha256 are required." >&2
             exit 1
           fi
           if ! printf '%s' "$JOB_PATH" | grep -Eq '^jobs/[A-Za-z0-9_.-]+/inbox/[A-Za-z0-9_.-]+\.md$'; then
@@ -257,7 +244,6 @@ jobs:
           echo "immutable=true" >> "$GITHUB_OUTPUT"
 
       - name: Checkout immutable state job
-        if: ${{ steps.immutable-job.outputs.immutable == 'true' }}
         uses: actions/checkout@v7
         with:
           repository: openclaw/clawsweeper-state
@@ -276,15 +262,16 @@ jobs:
         id: check_job
         env:
           JOB_PATH: ${{ inputs.job }}
-          IMMUTABLE_JOB: ${{ steps.immutable-job.outputs.immutable }}
+          STATE_REVISION: ${{ inputs.state_revision }}
           JOB_SHA256: ${{ inputs.job_sha256 }}
         run: |
           set -euo pipefail
-          if [ "$IMMUTABLE_JOB" != "true" ]; then
-            scripts/restore-repair-job.sh "$JOB_PATH" "this worker"
-            exit 0
-          fi
           source_path=".clawsweeper-repair/immutable-state/$JOB_PATH"
+          actual_revision="$(git -C .clawsweeper-repair/immutable-state rev-parse HEAD)"
+          if [ "$actual_revision" != "$STATE_REVISION" ]; then
+            echo "Immutable state revision mismatch: expected $STATE_REVISION, got $actual_revision." >&2
+            exit 1
+          fi
           if [ ! -f "$source_path" ]; then
             echo "Immutable job is missing at $JOB_PATH." >&2
             exit 1
@@ -419,6 +406,45 @@ jobs:
             pnpm run repair:review-results -- .clawsweeper-repair/runs
           fi
 
+      - name: Seal immutable source job provenance
+        id: seal_source_job
+        if: ${{ always() && steps.check_job.outputs.job_exists == '1' && steps.self_heal_head.outputs.matched != 'false' }}
+        env:
+          JOB_PATH: ${{ inputs.job }}
+          STATE_REVISION: ${{ inputs.state_revision }}
+          JOB_SHA256: ${{ inputs.job_sha256 }}
+        run: |
+          set -euo pipefail
+          actual_sha256="$(sha256sum "$JOB_PATH" | cut -d' ' -f1)"
+          if [ "$actual_sha256" != "$JOB_SHA256" ]; then
+            echo "Source job changed after immutable checkout: expected $JOB_SHA256, got $actual_sha256." >&2
+            exit 1
+          fi
+          found=0
+          while IFS= read -r -d '' result_path; do
+            found=1
+            run_dir="$(dirname "$result_path")"
+            cp "$JOB_PATH" "$run_dir/source-job.md"
+            SOURCE_JOB_RUN_DIR="$run_dir" node <<'NODE'
+          const fs = require("node:fs");
+          const path = require("node:path");
+          const identity = {
+            schema_version: 1,
+            source_job: process.env.JOB_PATH,
+            state_revision: process.env.STATE_REVISION,
+            job_sha256: process.env.JOB_SHA256,
+          };
+          fs.writeFileSync(
+            path.join(process.env.SOURCE_JOB_RUN_DIR, "source-job.json"),
+            `${JSON.stringify(identity, null, 2)}\n`,
+          );
+          NODE
+          done < <(find .clawsweeper-repair/runs -name result.json -type f -print0)
+          if [ "$found" != "1" ]; then
+            echo "No worker result exists to bind to the immutable source job." >&2
+            exit 1
+          fi
+
       - name: Collect Codex debug logs
         if: ${{ always() && steps.check_job.outputs.job_exists == '1' }}
         env:
@@ -444,7 +470,7 @@ jobs:
 
       - name: Upload worker transfer artifacts
         id: upload_worker
-        if: ${{ always() && steps.check_job.outputs.job_exists == '1' && steps.self_heal_head.outputs.matched != 'false' && (inputs.mode == 'execute' || inputs.mode == 'autonomous') && !inputs.dry_run }}
+        if: ${{ always() && steps.seal_source_job.outcome == 'success' && (inputs.mode == 'execute' || inputs.mode == 'autonomous') && !inputs.dry_run }}
         uses: actions/upload-artifact@v7
         with:
           name: clawsweeper-repair-worker-${{ github.run_id }}-${{ github.run_attempt }}
@@ -453,7 +479,7 @@ jobs:
           retention-days: 90
 
       - name: Upload final worker artifacts
-        if: ${{ always() && (!((inputs.mode == 'execute' || inputs.mode == 'autonomous') && !inputs.dry_run) || failure() || cancelled()) }}
+        if: ${{ always() && steps.seal_source_job.outcome == 'success' && (!((inputs.mode == 'execute' || inputs.mode == 'autonomous') && !inputs.dry_run) || failure() || cancelled()) }}
         uses: actions/upload-artifact@v7
         with:
           name: clawsweeper-repair-${{ github.run_id }}-${{ github.run_attempt }}
@@ -570,7 +596,6 @@ jobs:
           persist-credentials: "false"
 
       - name: Checkout immutable authorization job
-        if: ${{ inputs.state_revision != '' && inputs.job_sha256 != '' }}
         uses: actions/checkout@v7
         with:
           repository: openclaw/clawsweeper-state
@@ -589,20 +614,8 @@ jobs:
           JOB_SHA256: ${{ inputs.job_sha256 }}
         run: |
           set -euo pipefail
-          case "$JOB_PATH" in
-            jobs/*/inbox/clawsweeper-commit-*.md) commit_finding=1 ;;
-            *) commit_finding=0 ;;
-          esac
-          if [ -z "$STATE_REVISION" ] && [ -z "$JOB_SHA256" ]; then
-            if [ "$commit_finding" = "1" ]; then
-              echo "Commit finding authorization requires immutable job identity." >&2
-              exit 1
-            fi
-            scripts/restore-repair-job.sh "$JOB_PATH" "execution authorization"
-            exit 0
-          fi
           if [ -z "$STATE_REVISION" ] || [ -z "$JOB_SHA256" ]; then
-            echo "state_revision and job_sha256 must be provided together." >&2
+            echo "state_revision and job_sha256 are required for execution authorization." >&2
             exit 1
           fi
           if ! printf '%s' "$JOB_PATH" | grep -Eq '^jobs/[A-Za-z0-9_.-]+/inbox/[A-Za-z0-9_.-]+\.md$'; then
@@ -610,6 +623,11 @@ jobs:
             exit 1
           fi
           source_path=".clawsweeper-repair/immutable-state/$JOB_PATH"
+          actual_revision="$(git -C .clawsweeper-repair/immutable-state rev-parse HEAD)"
+          if [ "$actual_revision" != "$STATE_REVISION" ]; then
+            echo "Immutable authorization state revision mismatch: expected $STATE_REVISION, got $actual_revision." >&2
+            exit 1
+          fi
           if [ ! -f "$source_path" ]; then
             echo "Immutable authorization job is missing at $JOB_PATH." >&2
             exit 1
@@ -2094,10 +2112,14 @@ jobs:
           fetch-depth: 1
 
       - uses: ./.github/actions/setup-pnpm
+        id: repair-ledger-setup-pnpm
         with:
           build-script: build:repair
 
       - name: Download cluster repair action ledger
+        id: download-cluster-ledger
+        if: ${{ needs.cluster.outputs.action_ledger_artifact_id != '' }}
+        continue-on-error: true
         uses: actions/download-artifact@v8
         with:
           artifact-ids: ${{ needs.cluster.outputs.action_ledger_artifact_id }}
@@ -2107,7 +2129,9 @@ jobs:
           run-id: ${{ github.run_id }}
 
       - name: Download execution repair action ledger
+        id: download-execute-ledger
         if: ${{ needs.execute.outputs.action_ledger_artifact_id != '' }}
+        continue-on-error: true
         uses: actions/download-artifact@v8
         with:
           artifact-ids: ${{ needs.execute.outputs.action_ledger_artifact_id }}
@@ -2117,7 +2141,9 @@ jobs:
           run-id: ${{ github.run_id }}
 
       - name: Download mutation repair action ledger
+        id: download-mutate-ledger
         if: ${{ needs.mutate.outputs.action_ledger_artifact_id != '' }}
+        continue-on-error: true
         uses: actions/download-artifact@v8
         with:
           artifact-ids: ${{ needs.mutate.outputs.action_ledger_artifact_id }}
@@ -2127,22 +2153,36 @@ jobs:
           run-id: ${{ github.run_id }}
 
       - name: Publish immutable repair action ledger
+        if: ${{ always() && steps.repair-ledger-setup-pnpm.outcome == 'success' }}
         env:
           CLUSTER_LEDGER_ARTIFACT_ID: ${{ needs.cluster.outputs.action_ledger_artifact_id }}
           CLUSTER_LEDGER_ATTEMPT: ${{ needs.cluster.outputs.producer_attempt }}
+          CLUSTER_JOB_RESULT: ${{ needs.cluster.result }}
+          CLUSTER_DOWNLOAD_OUTCOME: ${{ steps.download-cluster-ledger.outcome }}
           EXECUTE_LEDGER_ARTIFACT_ID: ${{ needs.execute.outputs.action_ledger_artifact_id }}
           EXECUTE_LEDGER_ATTEMPT: ${{ needs.execute.outputs.action_ledger_producer_attempt }}
           EXECUTE_LEDGER_ALLOW_EMPTY: ${{ needs.execute.outputs.action_ledger_allow_empty }}
           EXECUTE_JOB_RESULT: ${{ needs.execute.result }}
+          EXECUTE_DOWNLOAD_OUTCOME: ${{ steps.download-execute-ledger.outcome }}
           MUTATE_LEDGER_ARTIFACT_ID: ${{ needs.mutate.outputs.action_ledger_artifact_id }}
           MUTATE_LEDGER_ATTEMPT: ${{ needs.mutate.outputs.action_ledger_producer_attempt }}
           MUTATE_JOB_RESULT: ${{ needs.mutate.result }}
+          MUTATE_DOWNLOAD_OUTCOME: ${{ steps.download-mutate-ledger.outcome }}
         run: |
           set -euo pipefail
           test -n "${CLAWSWEEPER_STATE_DIR:-}"
           event_paths_file=".artifacts/repair-action-ledger-paths.txt"
+          lane_status_file=".artifacts/repair-action-ledger-lanes.md"
           mkdir -p .artifacts
           : > "$event_paths_file"
+          {
+            echo "| Lane | Job result | Collector status |"
+            echo "| --- | --- | --- |"
+          } > "$lane_status_file"
+          collector_failed=0
+          record_lane() {
+            printf '| %s | %s | %s |\n' "$1" "$2" "$3" >> "$lane_status_file"
+          }
           publish_lane() {
             local lane="$1"
             local job="$2"
@@ -2155,37 +2195,27 @@ jobs:
             if [ "$allow_empty" = "true" ]; then
               allow_empty_args+=(--allow-empty)
             fi
-            test -s "$manifest_file"
-            pnpm run --silent repair:action-ledger -- publish \
+            if [ ! -s "$manifest_file" ]; then
+              echo "$lane action ledger manifest is missing or empty." >&2
+              return 1
+            fi
+            if ! pnpm run --silent repair:action-ledger -- publish \
               --repair-lane "$lane" \
               --manifest "$manifest_file" \
               --expected-job "$job" \
               --expected-run-attempt "$run_attempt" \
               "${allow_empty_args[@]}" \
               --source-root "$source_root" \
-              --state-root "$CLAWSWEEPER_STATE_DIR" > "$import_result_file"
-            jq -e --slurpfile manifest "$manifest_file" \
+              --state-root "$CLAWSWEEPER_STATE_DIR" > "$import_result_file"; then
+              return 1
+            fi
+            if ! jq -e --slurpfile manifest "$manifest_file" \
               '.eventPaths == $manifest[0].event_paths' \
-              "$import_result_file" >/dev/null
+              "$import_result_file" >/dev/null; then
+              echo "$lane action ledger import paths do not match its manifest." >&2
+              return 1
+            fi
             jq -r '.paths[]?' "$import_result_file" >> "$event_paths_file"
-          }
-          require_lane() {
-            local lane="$1"
-            local job_result="$2"
-            local artifact_id="$3"
-            local run_attempt="$4"
-            if [ "$job_result" = "skipped" ]; then
-              if [ -n "$artifact_id" ] || [ -n "$run_attempt" ]; then
-                echo "Skipped $lane job exposed unexpected action ledger outputs." >&2
-                exit 1
-              fi
-              return
-            fi
-            if ! [[ "$artifact_id" =~ ^[1-9][0-9]*$ ]] ||
-               ! [[ "$run_attempt" =~ ^[1-9][0-9]*$ ]]; then
-              echo "$lane job did not expose an exact action ledger artifact and attempt." >&2
-              exit 1
-            fi
           }
           verify_lane() {
             local lane="$1"
@@ -2198,7 +2228,10 @@ jobs:
             if [ "$allow_empty" = "true" ]; then
               allow_empty_args+=(--allow-empty)
             fi
-            test -s "$manifest_file"
+            if [ ! -s "$manifest_file" ]; then
+              echo "$lane action ledger manifest is missing or empty." >&2
+              return 1
+            fi
             pnpm run --silent repair:action-ledger -- verify \
               --repair-lane "$lane" \
               --manifest "$manifest_file" \
@@ -2207,37 +2240,77 @@ jobs:
               "${allow_empty_args[@]}" \
               --source-root "$source_root" >/dev/null
           }
-          require_lane cluster "${{ needs.cluster.result }}" "$CLUSTER_LEDGER_ARTIFACT_ID" "$CLUSTER_LEDGER_ATTEMPT"
-          require_lane execute "$EXECUTE_JOB_RESULT" "$EXECUTE_LEDGER_ARTIFACT_ID" "$EXECUTE_LEDGER_ATTEMPT"
-          require_lane mutate "$MUTATE_JOB_RESULT" "$MUTATE_LEDGER_ARTIFACT_ID" "$MUTATE_LEDGER_ATTEMPT"
-          verify_lane cluster cluster "$CLUSTER_LEDGER_ATTEMPT"
-          if [ "$EXECUTE_JOB_RESULT" != "skipped" ]; then
-            verify_lane execute execute "$EXECUTE_LEDGER_ATTEMPT" "$EXECUTE_LEDGER_ALLOW_EMPTY"
-          fi
-          if [ "$MUTATE_JOB_RESULT" != "skipped" ]; then
-            verify_lane mutate mutate "$MUTATE_LEDGER_ATTEMPT"
-          fi
-          publish_lane cluster cluster "$CLUSTER_LEDGER_ATTEMPT"
-          if [ "$EXECUTE_JOB_RESULT" != "skipped" ]; then
-            publish_lane execute execute "$EXECUTE_LEDGER_ATTEMPT" "$EXECUTE_LEDGER_ALLOW_EMPTY"
-          fi
-          if [ "$MUTATE_JOB_RESULT" != "skipped" ]; then
-            publish_lane mutate mutate "$MUTATE_LEDGER_ATTEMPT"
-          fi
+          collect_lane() {
+            local lane="$1"
+            local job="$2"
+            local job_result="$3"
+            local artifact_id="$4"
+            local run_attempt="$5"
+            local download_outcome="$6"
+            local allow_empty="${7:-false}"
+            if [ -z "$artifact_id" ] && [ -z "$run_attempt" ]; then
+              if [ "$job_result" = "success" ]; then
+                echo "Successful $lane job did not expose an action ledger artifact." >&2
+                record_lane "$lane" "$job_result" "invalid: missing successful artifact"
+                collector_failed=1
+              else
+                record_lane "$lane" "$job_result" "missing"
+              fi
+              return
+            fi
+            if [ "$job_result" = "skipped" ]; then
+              echo "Skipped $lane job exposed unexpected action ledger outputs." >&2
+              record_lane "$lane" "$job_result" "invalid: artifact from skipped job"
+              collector_failed=1
+              return
+            fi
+            if ! [[ "$artifact_id" =~ ^[1-9][0-9]*$ ]] ||
+               ! [[ "$run_attempt" =~ ^[1-9][0-9]*$ ]]; then
+              echo "$lane job exposed incomplete action ledger identity." >&2
+              record_lane "$lane" "$job_result" "invalid: incomplete artifact identity"
+              collector_failed=1
+              return
+            fi
+            if [ "$download_outcome" != "success" ]; then
+              echo "$lane action ledger artifact could not be downloaded." >&2
+              record_lane "$lane" "$job_result" "invalid: download failed"
+              collector_failed=1
+              return
+            fi
+            if ! verify_lane "$lane" "$job" "$run_attempt" "$allow_empty"; then
+              record_lane "$lane" "$job_result" "invalid: verification failed"
+              collector_failed=1
+              return
+            fi
+            if ! publish_lane "$lane" "$job" "$run_attempt" "$allow_empty"; then
+              record_lane "$lane" "$job_result" "invalid: publication failed"
+              collector_failed=1
+              return
+            fi
+            record_lane "$lane" "$job_result" "published"
+          }
+          collect_lane cluster cluster "$CLUSTER_JOB_RESULT" "$CLUSTER_LEDGER_ARTIFACT_ID" "$CLUSTER_LEDGER_ATTEMPT" "$CLUSTER_DOWNLOAD_OUTCOME"
+          collect_lane execute execute "$EXECUTE_JOB_RESULT" "$EXECUTE_LEDGER_ARTIFACT_ID" "$EXECUTE_LEDGER_ATTEMPT" "$EXECUTE_DOWNLOAD_OUTCOME" "$EXECUTE_LEDGER_ALLOW_EMPTY"
+          collect_lane mutate mutate "$MUTATE_JOB_RESULT" "$MUTATE_LEDGER_ARTIFACT_ID" "$MUTATE_LEDGER_ATTEMPT" "$MUTATE_DOWNLOAD_OUTCOME"
+          cat "$lane_status_file" >> "$GITHUB_STEP_SUMMARY"
           sort -u -o "$event_paths_file" "$event_paths_file"
           if [ ! -s "$event_paths_file" ]; then
-            echo "Repair action ledger manifests imported no durable paths." >&2
+            echo "No valid repair action ledger lanes were present for publication."
+          else
+            action_ledger_args=()
+            while IFS= read -r event_path; do
+              durable_event_path="$CLAWSWEEPER_STATE_DIR/$event_path"
+              test -f "$durable_event_path"
+              mkdir -p "$(dirname "$event_path")"
+              cp "$durable_event_path" "$event_path"
+              action_ledger_args+=(--path "$event_path")
+            done < "$event_paths_file"
+            pnpm run repair:publish-main -- \
+              --message "chore: append repair action ledger" \
+              "${action_ledger_args[@]}" \
+              --rebase-strategy normal
+          fi
+          if [ "$collector_failed" != "0" ]; then
+            echo "One or more advertised repair action ledger lanes failed closed." >&2
             exit 1
           fi
-          action_ledger_args=()
-          while IFS= read -r event_path; do
-            durable_event_path="$CLAWSWEEPER_STATE_DIR/$event_path"
-            test -f "$durable_event_path"
-            mkdir -p "$(dirname "$event_path")"
-            cp "$durable_event_path" "$event_path"
-            action_ledger_args+=(--path "$event_path")
-          done < "$event_paths_file"
-          pnpm run repair:publish-main -- \
-            --message "chore: append repair action ledger" \
-            "${action_ledger_args[@]}" \
-            --rebase-strategy normal

@@ -502,7 +502,7 @@ test("repair workflow resolves producer artifacts by trusted id across rerun att
   );
   assert.match(
     workflow,
-    /Upload worker transfer artifacts[\s\S]*?if-no-files-found: error[\s\S]*?retention-days: 90/,
+    /Seal immutable source job provenance[\s\S]*?Upload worker transfer artifacts[\s\S]*?steps\.seal_source_job\.outcome == 'success'[\s\S]*?if-no-files-found: error[\s\S]*?retention-days: 90/,
   );
   assert.match(
     workflow,

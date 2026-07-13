@@ -1,8 +1,14 @@
 import fs from "node:fs";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 
-import { resultPublicationSourceRevision } from "../../dist/repair/publish-result.js";
+import {
+  readSealedPublishedSource,
+  resultPublicationSourceRevision,
+} from "../../dist/repair/publish-result.js";
 import { reviewedResultRevision } from "../../dist/repair/publish-result-source.js";
 import { readText } from "../helpers.ts";
 
@@ -128,17 +134,111 @@ test("published repair receipts ignore schema-invalid legacy revision shapes", (
   );
 });
 
-test("result publication resolves the source job recorded in the cluster plan", () => {
+test("result publication derives source provenance from sealed worker bytes", () => {
+  const runDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-sealed-result-"));
+  const sourceJob = "jobs/openclaw/inbox/issue-openclaw-openclaw-42.md";
+  const job = `---
+repo: openclaw/openclaw
+cluster_id: repair-pr-42
+mode: autonomous
+job_intent: implement_issue
+allowed_actions:
+  - fix
+candidates:
+  - "#42"
+source: issue_implementation
+source_issue_revision_sha256: ${"d".repeat(64)}
+---
+
+# sealed source
+`;
+  const jobSha256 = createHash("sha256").update(job).digest("hex");
+  const result = productionResult({ canonical: "#42", canonical_issue: "#42" });
+  const plan = {
+    repo: "openclaw/openclaw",
+    cluster_id: "repair-pr-42",
+    source_job: sourceJob,
+  };
+  fs.writeFileSync(path.join(runDir, "source-job.md"), job);
+  fs.writeFileSync(
+    path.join(runDir, "source-job.json"),
+    `${JSON.stringify(
+      {
+        schema_version: 1,
+        source_job: sourceJob,
+        state_revision: "a".repeat(40),
+        job_sha256: jobSha256,
+      },
+      null,
+      2,
+    )}\n`,
+  );
+
+  try {
+    const sealed = readSealedPublishedSource(runDir, result, plan);
+    assert.equal(sealed?.sourceJob, sourceJob);
+    assert.equal(sealed?.stateRevision, "a".repeat(40));
+    assert.equal(sealed?.jobSha256, jobSha256);
+    assert.equal(
+      resultPublicationSourceRevision(result, plan, sealed?.frontmatter ?? null),
+      "d".repeat(64),
+    );
+
+    fs.appendFileSync(path.join(runDir, "source-job.md"), "\ntampered\n");
+    assert.throws(
+      () => readSealedPublishedSource(runDir, result, plan),
+      /sealed source job SHA-256 mismatch/,
+    );
+  } finally {
+    fs.rmSync(runDir, { recursive: true, force: true });
+  }
+});
+
+test("result publication rejects mutable or redirected source provenance", () => {
+  const runDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-sealed-redirect-"));
+  const result = productionResult({});
+  const plan = {
+    repo: "openclaw/openclaw",
+    cluster_id: "repair-pr-42",
+    source_job: "jobs/openclaw/inbox/cluster-42.md",
+  };
+  try {
+    assert.throws(
+      () => readSealedPublishedSource(runDir, result, plan),
+      /missing sealed source job provenance/,
+    );
+    fs.writeFileSync(path.join(runDir, "source-job.md"), "not trusted\n");
+    fs.writeFileSync(
+      path.join(runDir, "source-job.json"),
+      `${JSON.stringify({
+        schema_version: 1,
+        source_job: "jobs/openclaw/inbox/other.md",
+        state_revision: "a".repeat(40),
+        job_sha256: createHash("sha256").update("not trusted\n").digest("hex"),
+      })}\n`,
+    );
+    assert.throws(
+      () => readSealedPublishedSource(runDir, result, plan),
+      /sealed source job identity is invalid/,
+    );
+  } finally {
+    fs.rmSync(runDir, { recursive: true, force: true });
+  }
+});
+
+test("result publisher never reopens mutable live source jobs", () => {
   const publisher = readText("src/repair/publish-result.ts");
   const resolver = publisher.slice(
-    publisher.indexOf("function readPublishedSourceContext"),
+    publisher.indexOf("export function readSealedPublishedSource"),
     publisher.indexOf("function updateDashboard"),
   );
 
-  assert.match(publisher, /readPublishedSourceContext\(clusterPlan\)/);
-  assert.match(resolver, /clusterPlan\?\.source_job/);
-  assert.match(resolver, /path\.resolve\(root, sourceJob\)/);
-  assert.doesNotMatch(resolver, /runDir,\s*"\.\.",\s*"job\.md"/);
+  assert.match(publisher, /readSealedPublishedSource\(runDir, result, clusterPlan, resultPath\)/);
+  assert.match(resolver, /path\.join\(runDir, "source-job\.md"\)/);
+  assert.match(resolver, /path\.join\(runDir, "source-job\.json"\)/);
+  assert.match(resolver, /createHash\("sha256"\)/);
+  assert.doesNotMatch(resolver, /path\.resolve\(root/);
+  assert.doesNotMatch(resolver, /fs\.existsSync\(path\.join\(root,\s*sourceJob/);
 });
 
 function productionResult(overrides: Record<string, unknown>) {

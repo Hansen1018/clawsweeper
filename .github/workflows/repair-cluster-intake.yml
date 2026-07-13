@@ -260,6 +260,7 @@ jobs:
           NODE
 
       - name: Publish intake jobs and ledger
+        id: publish-intake
         if: ${{ steps.prepare.outputs.should_import == 'true' }}
         run: |
           set -euo pipefail
@@ -271,6 +272,26 @@ jobs:
             --max-attempts 12 \
             --push-attempts 4
 
+      - name: Bind immutable published jobs
+        id: published-jobs
+        if: ${{ steps.import.outputs.should_dispatch == 'true' && steps.publish-intake.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          state_revision="$(git -C "$CLAWSWEEPER_STATE_DIR" rev-parse HEAD)"
+          if ! printf '%s' "$state_revision" | grep -Eq '^[a-f0-9]{40}$'; then
+            echo "Invalid published state revision: $state_revision" >&2
+            exit 1
+          fi
+          while IFS= read -r job; do
+            [ -n "$job" ] || continue
+            if ! printf '%s' "$job" | grep -Eq '^jobs/[A-Za-z0-9_.-]+/inbox/[A-Za-z0-9_.-]+\.md$'; then
+              echo "Invalid imported cluster job path: $job" >&2
+              exit 1
+            fi
+            git -C "$CLAWSWEEPER_STATE_DIR" cat-file -e "${state_revision}:${job}"
+          done < .artifacts/cluster-repair-intake/generated-paths.txt
+          echo "state_revision=$state_revision" >> "$GITHUB_OUTPUT"
+
       - name: Dispatch imported cluster repair
         if: ${{ steps.import.outputs.should_dispatch == 'true' }}
         env:
@@ -281,13 +302,23 @@ jobs:
         run: |
           set -euo pipefail
           mapfile -t jobs < .artifacts/cluster-repair-intake/generated-paths.txt
-          pnpm run repair:dispatch -- "${jobs[@]}" \
-            --mode autonomous \
-            --wait-for-capacity \
-            --runner "$RUNNER" \
-            --execution-runner "$EXECUTION_RUNNER" \
-            --model "$MODEL" \
-            --ref main
+          state_revision="${{ steps.published-jobs.outputs.state_revision }}"
+          for job in "${jobs[@]}"; do
+            [ -n "$job" ] || continue
+            immutable_job="$RUNNER_TEMP/cluster-job-$(printf '%s' "$job" | sha256sum | cut -d' ' -f1).md"
+            git -C "$CLAWSWEEPER_STATE_DIR" show "${state_revision}:${job}" > "$immutable_job"
+            job_sha256="$(sha256sum "$immutable_job" | cut -d' ' -f1)"
+            cp "$immutable_job" "$job"
+            pnpm run repair:dispatch -- "$job" \
+              --mode autonomous \
+              --wait-for-capacity \
+              --runner "$RUNNER" \
+              --execution-runner "$EXECUTION_RUNNER" \
+              --state-revision "$state_revision" \
+              --job-sha256 "$job_sha256" \
+              --model "$MODEL" \
+              --ref main
+          done
 
       - name: Finalize cluster intake action ledger
         if: ${{ always() && steps.intake-action-ledger.outcome == 'success' }}

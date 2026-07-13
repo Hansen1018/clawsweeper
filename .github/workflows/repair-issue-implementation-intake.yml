@@ -206,6 +206,7 @@ jobs:
           pnpm run repair:issue-implementation-intake -- "${args[@]}"
 
       - name: Commit intake ledger
+        id: publish-intake
         if: always()
         run: |
           set -euo pipefail
@@ -216,6 +217,36 @@ jobs:
             --receipt-kind issue_implementation_intake_state \
             --max-attempts 12 \
             --push-attempts 4
+
+      - name: Bind immutable published job
+        id: published-job
+        if: ${{ steps.prepare.outputs.should_repair == 'true' && steps.publish-intake.outcome == 'success' }}
+        env:
+          JOB_PATH: ${{ steps.prepare.outputs.job_path }}
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$JOB_PATH" | grep -Eq '^jobs/[A-Za-z0-9_.-]+/inbox/[A-Za-z0-9_.-]+\.md$'; then
+            echo "Invalid issue implementation job path: $JOB_PATH" >&2
+            exit 1
+          fi
+          state_revision="$(git -C "$CLAWSWEEPER_STATE_DIR" rev-parse HEAD)"
+          if ! printf '%s' "$state_revision" | grep -Eq '^[a-f0-9]{40}$'; then
+            echo "Invalid published state revision: $state_revision" >&2
+            exit 1
+          fi
+          immutable_job="$RUNNER_TEMP/issue-implementation-job.md"
+          git -C "$CLAWSWEEPER_STATE_DIR" show "${state_revision}:${JOB_PATH}" > "$immutable_job"
+          job_sha256="$(sha256sum "$immutable_job" | cut -d' ' -f1)"
+          if ! printf '%s' "$job_sha256" | grep -Eq '^[a-f0-9]{64}$'; then
+            echo "Invalid published job SHA-256: $job_sha256" >&2
+            exit 1
+          fi
+          mkdir -p "$(dirname "$JOB_PATH")"
+          cp "$immutable_job" "$JOB_PATH"
+          {
+            echo "state_revision=$state_revision"
+            echo "job_sha256=$job_sha256"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Publish automatic implementation queue status
         if: ${{ steps.prepare.outputs.should_repair == 'true' }}
@@ -246,13 +277,14 @@ jobs:
           if [ -n "$MAX_LIVE_WORKERS" ]; then
             cap_args=(--max-live-workers "$MAX_LIVE_WORKERS")
           fi
-          git pull --rebase --autostash
           pnpm run repair:dispatch -- "${{ steps.prepare.outputs.job_path }}" \
             --mode autonomous \
             --wait-for-capacity \
             "${cap_args[@]}" \
             --runner "$RUNNER" \
             --execution-runner "$EXECUTION_RUNNER" \
+            --state-revision "${{ steps.published-job.outputs.state_revision }}" \
+            --job-sha256 "${{ steps.published-job.outputs.job_sha256 }}" \
             --model "$MODEL" \
             --ref main
 

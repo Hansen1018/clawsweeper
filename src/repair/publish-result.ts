@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import type { JsonValue, LooseRecord } from "./json-types.js";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -120,7 +121,8 @@ function publishResult(resultPath: string) {
   const postFlightReport = readSiblingJson(runDir, "post-flight-report.json") ?? { actions: [] };
   const fixReport = readSiblingJson(runDir, "fix-execution-report.json") ?? { actions: [] };
   const clusterPlan = readSiblingJson(runDir, "cluster-plan.json");
-  const sourceContext = readPublishedSourceContext(clusterPlan);
+  const sealedSource = readSealedPublishedSource(runDir, result, clusterPlan, resultPath);
+  const sourceContext = sealedSource?.frontmatter ?? null;
   const reviewedTargetRevision = resultPublicationSourceRevision(
     result,
     clusterPlan,
@@ -169,7 +171,9 @@ function publishResult(resultPath: string) {
     workflow_updated_at:
       metadata?.updatedAt ?? metadata?.updated_at ?? previousRecord?.workflow_updated_at ?? null,
     result_status: result.status ?? null,
-    source_job: clusterPlan?.source_job ?? null,
+    source_job: sealedSource?.sourceJob ?? null,
+    source_state_revision: sealedSource?.stateRevision ?? null,
+    source_job_sha256: sealedSource?.jobSha256 ?? null,
     published_at: new Date().toISOString(),
     canonical: result.canonical ?? null,
     canonical_issue: result.canonical_issue ?? null,
@@ -284,19 +288,69 @@ function resultPublicationRequiresExactRevision(
   ].some((key) => sourceContext?.[key] !== undefined);
 }
 
-function readPublishedSourceContext(clusterPlan: LooseRecord | null): LooseRecord | null {
-  const sourceJob = String(clusterPlan?.source_job ?? "").trim();
-  if (!sourceJob) return null;
-  const sourceJobPath = path.resolve(root, sourceJob);
-  const relativeSourceJobPath = path.relative(root, sourceJobPath);
-  if (
-    relativeSourceJobPath === ".." ||
-    relativeSourceJobPath.startsWith(`..${path.sep}`) ||
-    path.isAbsolute(relativeSourceJobPath)
-  ) {
+export function readSealedPublishedSource(
+  runDir: string,
+  result: LooseRecord,
+  clusterPlan: LooseRecord | null,
+  resultPath = "result.json",
+): {
+  sourceJob: string;
+  stateRevision: string;
+  jobSha256: string;
+  frontmatter: LooseRecord;
+} | null {
+  const plannedSourceJob = String(clusterPlan?.source_job ?? "").trim();
+  const identityPath = path.join(runDir, "source-job.json");
+  const sourceJobPath = path.join(runDir, "source-job.md");
+  const hasIdentity = fs.existsSync(identityPath);
+  const hasJob = fs.existsSync(sourceJobPath);
+  if (!hasIdentity && !hasJob && !plannedSourceJob) {
     return null;
   }
-  return fs.existsSync(sourceJobPath) ? parseJob(sourceJobPath).frontmatter : null;
+  if (!hasIdentity || !hasJob) {
+    throw new Error(`repair result is missing sealed source job provenance: ${resultPath}`);
+  }
+
+  const identity = readJson(identityPath);
+  const identityKeys = Object.keys(identity).sort();
+  const expectedKeys = ["job_sha256", "schema_version", "source_job", "state_revision"];
+  if (JSON.stringify(identityKeys) !== JSON.stringify(expectedKeys)) {
+    throw new Error(`sealed source job identity has unexpected fields: ${resultPath}`);
+  }
+  const sourceJob = String(identity.source_job ?? "").trim();
+  const stateRevision = exactHex(identity.state_revision, 40);
+  const jobSha256 = exactHex(identity.job_sha256, 64);
+  if (
+    identity.schema_version !== 1 ||
+    !/^jobs\/[A-Za-z0-9_.-]+\/(?:[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_.-]+\.md$/.test(sourceJob) ||
+    (plannedSourceJob && plannedSourceJob !== sourceJob) ||
+    !stateRevision ||
+    !jobSha256
+  ) {
+    throw new Error(`sealed source job identity is invalid: ${resultPath}`);
+  }
+  const actualJobSha256 = createHash("sha256").update(fs.readFileSync(sourceJobPath)).digest("hex");
+  if (actualJobSha256 !== jobSha256) {
+    throw new Error(`sealed source job SHA-256 mismatch: ${resultPath}`);
+  }
+
+  const frontmatter = parseJob(sourceJobPath).frontmatter;
+  const expectedRepo = String(result.repo ?? clusterPlan?.repo ?? "");
+  const expectedClusterId = String(result.cluster_id ?? clusterPlan?.cluster_id ?? "");
+  if (
+    String(frontmatter.repo ?? "") !== expectedRepo ||
+    String(frontmatter.cluster_id ?? "") !== expectedClusterId ||
+    (clusterPlan?.repo !== undefined && String(clusterPlan.repo) !== expectedRepo) ||
+    (clusterPlan?.cluster_id !== undefined && String(clusterPlan.cluster_id) !== expectedClusterId)
+  ) {
+    throw new Error(`sealed source job does not match the repair result target: ${resultPath}`);
+  }
+  return { sourceJob, stateRevision, jobSha256, frontmatter };
+}
+
+function exactHex(value: unknown, length: 40 | 64): string | null {
+  const normalized = String(value ?? "").trim();
+  return new RegExp(`^[a-f0-9]{${length}}$`).test(normalized) ? normalized : null;
 }
 
 function updateDashboard() {

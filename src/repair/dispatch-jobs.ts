@@ -5,12 +5,14 @@ import fs from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import {
-  activeRepairWorkflowRunForJob,
   assertLiveWorkerCapacity,
   currentProjectRepo,
+  listActiveWorkflowRuns,
   parseArgs,
   parseJob,
   readMaxLiveWorkers,
+  repairRunNameForJob,
+  repairRunNamePrefixForJob,
   repoRoot,
   validateJob,
   waitForLiveWorkerCapacity,
@@ -50,6 +52,7 @@ const stateRevision = immutableHexArg(
 const jobSha256 = immutableHexArg(args["job-sha256"] ?? args.job_sha256, "job SHA-256", 64);
 const files = args._;
 const activeRepairRunsByPrefix = new Map<string, LooseRecord[]>();
+const jobDispatchKeys = new Map<string, string>();
 const jobWorkerLanes = new Map<string, WorkerLane>();
 
 if (files.length === 0) {
@@ -58,10 +61,10 @@ if (files.length === 0) {
   );
   process.exit(2);
 }
-if (Boolean(stateRevision) !== Boolean(jobSha256)) {
-  throw new Error("--state-revision and --job-sha256 must be provided together");
+if (!stateRevision || !jobSha256) {
+  throw new Error("--state-revision and --job-sha256 are required for immutable job handoff");
 }
-if (stateRevision && files.length !== 1) {
+if (files.length !== 1) {
   throw new Error("immutable job handoff requires exactly one job");
 }
 
@@ -76,13 +79,18 @@ for (const file of files) {
     for (const error of errors) console.error(`- ${error}`);
     continue;
   }
-  if (repairJobIntentForFrontmatter(job.frontmatter) === "commit_finding" && !stateRevision) {
+  const actualJobSha256 = createHash("sha256").update(fs.readFileSync(job.path)).digest("hex");
+  if (actualJobSha256 !== jobSha256) {
     failed = true;
-    console.error(`commit finding job requires immutable state handoff: ${file}`);
+    console.error(
+      `immutable job SHA-256 mismatch for ${file}: expected ${jobSha256}, got ${actualJobSha256}`,
+    );
     continue;
   }
 
   const relative = job.relativePath;
+  const dispatchKey = derivedDispatchKey(relative);
+  jobDispatchKeys.set(relative, dispatchKey);
   jobWorkerLanes.set(
     relative,
     workerLaneForRepairJobIntent(repairJobIntentForFrontmatter(job.frontmatter)),
@@ -139,7 +147,8 @@ while (!failed && index < jobs.length) {
 
 function dispatchJob(relative: JsonValue, position: JsonValue, total: JsonValue) {
   const jobPath = String(relative);
-  const dispatchKey = requestedDispatchKey || derivedDispatchKey(jobPath);
+  const dispatchKey = jobDispatchKeys.get(jobPath);
+  if (!dispatchKey) throw new Error(`missing immutable dispatch key for ${jobPath}`);
   const commandArgs = [
     "workflow",
     "run",
@@ -178,6 +187,7 @@ function dispatchJob(relative: JsonValue, position: JsonValue, total: JsonValue)
         executionRunner,
         model,
         dispatchKey,
+        requestedDispatchKey: requestedDispatchKey || null,
         stateRevision: stateRevision || null,
         jobSha256: jobSha256 || null,
       },
@@ -231,8 +241,9 @@ function derivedDispatchKey(jobPath: string): string {
         ref: ref || null,
         jobPath,
         mode,
-        stateRevision: stateRevision || null,
-        jobSha256: jobSha256 || null,
+        requestedDispatchKey: requestedDispatchKey || null,
+        stateRevision,
+        jobSha256,
       }),
     )
     .digest("hex")
@@ -256,12 +267,24 @@ function dispatchLifecycle(jobPath: string): RepairLifecycleInput {
 }
 
 function shouldDispatchJob(relative: JsonValue) {
-  const activeRun = activeRepairWorkflowRunForJob({
-    repo,
-    workflow,
-    jobPath: relative,
-    activeRunsByPrefix: activeRepairRunsByPrefix,
-  });
+  const jobPath = String(relative);
+  const dispatchKey = jobDispatchKeys.get(jobPath);
+  if (!dispatchKey) throw new Error(`missing immutable dispatch key for ${jobPath}`);
+  const prefix = repairRunNamePrefixForJob(jobPath);
+  if (!activeRepairRunsByPrefix.has(prefix)) {
+    activeRepairRunsByPrefix.set(
+      prefix,
+      listActiveWorkflowRuns({
+        repo,
+        workflow,
+        runNamePrefix: prefix,
+      }),
+    );
+  }
+  const expectedTitle = `${repairRunNameForJob(jobPath, undefined, dispatchKey)} (${jobSha256})`;
+  const activeRun = activeRepairRunsByPrefix
+    .get(prefix)
+    ?.find((run: LooseRecord) => String(run.displayTitle ?? "") === expectedTitle);
   if (!activeRun) return true;
   console.log(
     `skipping ${relative}: active ${workflow} run already exists (${activeRun.url ?? activeRun.databaseId ?? "unknown run"})`,
