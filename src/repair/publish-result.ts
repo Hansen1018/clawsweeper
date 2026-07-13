@@ -325,7 +325,7 @@ export function readSealedPublishedSource(
   const hasIdentity = fs.existsSync(identityPath);
   const hasJob = fs.existsSync(sourceJobPath);
   if (!hasIdentity && !hasJob && !plannedSourceJob) {
-    return null;
+    throw new Error(`repair result is missing sealed source job provenance: ${resultPath}`);
   }
   if (!hasIdentity && !hasJob && trustedLegacyWorkerHead) {
     if (!SOURCE_JOB_PATH.test(plannedSourceJob)) {

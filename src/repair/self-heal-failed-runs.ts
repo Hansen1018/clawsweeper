@@ -437,7 +437,22 @@ function readRunRecords() {
         .filter((name: string) => name.endsWith(".json"))
         .map((name: string) => JSON.parse(fs.readFileSync(path.join(runRecordsDir, name), "utf8")))
     : [];
-  return [...records, ...liveRunRecords()];
+  const publishedByRunId = new Map(
+    records.map((record: LooseRecord) => [String(record.run_id ?? ""), record]),
+  );
+  const liveRecords = liveRunRecords().map((record: LooseRecord) => {
+    const published = publishedByRunId.get(String(record.run_id ?? ""));
+    return {
+      ...record,
+      ...(published?.post_flight_outcome === undefined
+        ? {}
+        : { post_flight_outcome: published.post_flight_outcome }),
+      ...(published?.post_flight_detail === undefined
+        ? {}
+        : { post_flight_detail: published.post_flight_detail }),
+    };
+  });
+  return [...records, ...liveRecords];
 }
 
 function resolveRunRecordJob(record: LooseRecord, sourceJob: string) {

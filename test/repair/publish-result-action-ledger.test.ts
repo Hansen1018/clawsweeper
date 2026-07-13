@@ -285,6 +285,10 @@ test("result publication rejects mutable or redirected source provenance", () =>
   };
   try {
     assert.throws(
+      () => readSealedPublishedSource(runDir, result, null),
+      /missing sealed source job provenance/,
+    );
+    assert.throws(
       () => readSealedPublishedSource(runDir, result, plan),
       /missing sealed source job provenance/,
     );

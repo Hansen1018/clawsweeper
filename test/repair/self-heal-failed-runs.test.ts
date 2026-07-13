@@ -227,6 +227,36 @@ test("failed-run self-heal prefers the newest replay-safe input receipt", () => 
   }
 });
 
+test("failed-run self-heal retains durable post-flight outcomes on live run refresh", () => {
+  const fixture = createSelfHealFixture("live-post-flight", "autonomous");
+  try {
+    writeRunRecord(fixture.runsDir, fixture.runId, {
+      source_job: fixture.jobPath,
+      source_state_revision: fixture.originalRevision,
+      source_job_sha256: fixture.originalDigest,
+      mode: "autonomous",
+      post_flight_outcome: "blocked",
+    });
+    writeLiveRunList(fixture, [
+      {
+        databaseId: Number(fixture.runId),
+        workflowName: "repair cluster worker",
+        displayTitle: `repair cluster ${fixture.jobPath} (${fixture.originalDigest})`,
+        status: "completed",
+        conclusion: "failure",
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        url: `https://github.test/actions/runs/${fixture.runId}`,
+      },
+    ]);
+
+    const summary = runSelfHeal(fixture);
+    assert.equal(summary.candidates.length, 0);
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
 test("failed-run self-heal rejects conflicting input and result provenance", () => {
   const fixture = createSelfHealFixture("conflicting-inputs", "autonomous");
   try {
