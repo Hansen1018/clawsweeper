@@ -104,12 +104,7 @@ const CLEAN_MERGE_STATES = new Set(["CLEAN"]);
 const VIABLE_COVERING_PR_MERGE_STATES = new Set(["CLEAN", "BEHIND"]);
 const PR_CLOSE_COVERAGE_PROOF_COMMENT_LIMIT = 50;
 const GITHUB_MAX_PAGE_SIZE = 100;
-const COMMENT_PROPAGATED_ISSUE_FIELDS = new Set([
-  "comments",
-  "reactions",
-  "updated_at",
-  "updatedAt",
-]);
+const COMMENT_PROPAGATED_ISSUE_FIELDS = new Set(["comments", "updated_at", "updatedAt"]);
 const CLAWSWEEPER_COMMAND_ONLY_PATTERN = /^@clawsweeper\s+(?:re-review|re-run|review)\s*$/i;
 const CLAWSWEEPER_BOT_AUTHORS = new Set(
   [
@@ -1609,6 +1604,34 @@ function applyMergeAction({
         ...base,
         status: "blocked",
         reason: "pull request base changed after strict-base policy verification",
+        live_state: absoluteFinalLive.state,
+        live_updated_at: absoluteFinalLive.updated_at,
+        merge_method: "squash",
+      });
+    }
+    let absoluteFinalStrictBaseBindingBlock = "";
+    try {
+      absoluteFinalStrictBaseBindingBlock = runtimeStrictBaseBindingBlock({
+        repo: result.repo,
+        baseBranch: absoluteFinalBaseBranch,
+        policyReadJson: rulesetPolicyReader(),
+      });
+    } catch (error) {
+      return retireDispatchedClaim({
+        ...base,
+        status: "blocked",
+        reason: `absolute-final strict-base policy could not be refreshed: ${ghErrorText(error)}`,
+        live_state: absoluteFinalLive.state,
+        live_updated_at: absoluteFinalLive.updated_at,
+        merge_method: "squash",
+        requeue_required: true,
+      });
+    }
+    if (absoluteFinalStrictBaseBindingBlock) {
+      return retireDispatchedClaim({
+        ...base,
+        status: "blocked",
+        reason: absoluteFinalStrictBaseBindingBlock,
         live_state: absoluteFinalLive.state,
         live_updated_at: absoluteFinalLive.updated_at,
         merge_method: "squash",

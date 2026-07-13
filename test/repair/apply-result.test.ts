@@ -1441,7 +1441,7 @@ test("repair apply blocks same-second foreign activity before claiming the merge
   }
 });
 
-for (const postClaimContentDrift of ["body", "title", "label"] as const) {
+for (const postClaimContentDrift of ["body", "title", "label", "reaction"] as const) {
   test(`repair apply rejects same-window ${postClaimContentDrift} drift after claiming`, () => {
     const fixture = writeMergeApplyFixture({ postClaimContentDrift });
     try {
@@ -1488,6 +1488,7 @@ for (const [postPolicyDrift, reason] of [
   ["view_head", /head changed during merge preflight/],
   ["base", /base is not main|base changed after strict-base/],
   ["readiness", /merge state status is BLOCKED/],
+  ["strict_base", /lacks server-enforced strict base binding/],
 ] as const) {
   test(`repair apply catches absolute-final ${postPolicyDrift} drift before merge`, () => {
     const fixture = writeMergeApplyFixture({ postPolicyDrift });
@@ -2127,9 +2128,9 @@ function writeMergeApplyFixture(
     legacyStatusContextSuccess?: boolean;
     mergeCommitMode?: "exact" | "message_mismatch" | "two_parents";
     foreignActivityBeyondTimelineCap?: boolean;
-    postClaimContentDrift?: "body" | "title" | "label";
+    postClaimContentDrift?: "body" | "title" | "label" | "reaction";
     postDispatchGuardDrift?: "timeline" | "security" | "strict_base";
-    postPolicyDrift?: "rest_head" | "view_head" | "base" | "readiness";
+    postPolicyDrift?: "rest_head" | "view_head" | "base" | "readiness" | "strict_base";
   } = {},
 ): MergeFixture {
   const root = fs.realpathSync(
@@ -2292,6 +2293,12 @@ function policyReadCompleted() {
   return fs.existsSync(data.policyReadPath);
 }
 
+function policyReadCount() {
+  return policyReadCompleted()
+    ? Number(fs.readFileSync(data.policyReadPath, "utf8").trim() || "0")
+    : 0;
+}
+
 if (args[0] === "api") {
   const apiPath = args[1] || "";
   if (apiPath === "repos/openclaw/openclaw/issues/101/comments" && args.includes("-f")) {
@@ -2406,7 +2413,7 @@ if (args[0] === "api") {
             ? [{ name: "documentation" }]
             : [],
       comments: comments.length,
-      reactions: { total_count: 0 },
+      reactions: { total_count: contentDrift === "reaction" ? 1 : 0 },
       pull_request: {},
     });
     process.exit(0);
@@ -2465,14 +2472,20 @@ if (args[0] === "api") {
   if (apiPath.startsWith("repos/openclaw/openclaw/branches/") && apiPath.endsWith("/protection")) {
     const comments = mergeComments();
     const dispatched = dispatchRecorded(comments);
+    const dispatchedPolicyReads = policyReadCount();
     write({
       required_status_checks:
         data.strictBaseBinding &&
-        !(data.postDispatchGuardDrift === "strict_base" && dispatched)
-        ? { strict: true, contexts: ["required-ci/exact-merge"] }
-        : null,
+        !(data.postDispatchGuardDrift === "strict_base" && dispatched) &&
+        !(
+          data.postPolicyDrift === "strict_base" &&
+          dispatched &&
+          dispatchedPolicyReads >= 1
+        )
+          ? { strict: true, contexts: ["required-ci/exact-merge"] }
+          : null,
     });
-    if (dispatched) fs.writeFileSync(data.policyReadPath, "1");
+    if (dispatched) fs.writeFileSync(data.policyReadPath, String(dispatchedPolicyReads + 1));
     process.exit(0);
   }
   if (args[1] === "graphql") {
