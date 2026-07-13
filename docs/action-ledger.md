@@ -382,6 +382,12 @@ The current implementation instruments these production surfaces:
   shards only from the authenticated workflow producer job, which lets spam,
   proof, fanout, and similar workflows publish without a lane-specific
   manifest format.
+- `repair:publish-main` rejects every receipt-free mutable state publication.
+  Only path sets wholly contained under immutable `ledger/` may bypass a
+  publication receipt, preventing recursive ledger writes while making new
+  mutable call sites fail closed. Workflow guards require setup before the
+  first mutable write, finalization after the last write even on continued
+  errors, and immutable shard publication after finalization.
 - State hydration excludes `ledger/` by default. Workflows that need historical
   ledger data must opt in through the approved `hydrate-paths` input; the
   hydration helper rejects unknown, nested, or unsafe roots.

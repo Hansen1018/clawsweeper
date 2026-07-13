@@ -98,6 +98,11 @@ checkpoint, and status-only commits are intentionally omitted.
   addition, and replacement-label cleanup. Definite pre-write rejection remains
   non-mutating, while transport and server uncertainty remains retryable and
   cannot be rewritten as a clean failure.
+- Required every mutable `repair:publish-main` call to declare a canonical
+  publication receipt, with receipt-free operation limited to path sets wholly
+  under immutable `ledger/`. Added workflow guards for setup, finalization,
+  publication ordering, mixed paths, traversal, absolute paths, and
+  helper-driven apply publications.
 - Completed repair receipts across intake, queue, plan, executor, validation,
   review, publication, post-flight, requeue, recovery, self-heal, status,
   dashboard, notification, session, result, and finalizer lifecycles. Persisted
