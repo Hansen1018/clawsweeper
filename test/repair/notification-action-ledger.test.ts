@@ -10,6 +10,7 @@ import {
   deliverNotification,
   deliverNotificationAttempt,
   deliverRetriedNotification,
+  recordNotificationPhase,
   type NotificationLedgerInput,
 } from "../../dist/repair/notification-action-ledger.js";
 import { flushRepairActionEvents } from "../../dist/repair/repair-action-ledger.js";
@@ -161,6 +162,54 @@ test("hook and status dashboard deliveries keep separate exact attempt outcomes"
     assert.notEqual(idempotencyKeys[0], idempotencyKeys[2]);
     assert.notEqual(events[2]?.event_id, events[4]?.event_id);
     assert.equal(events[5]?.action.retryable, true);
+  } finally {
+    restoreEnv(previous);
+    fs.rmSync(root, { force: true, recursive: true });
+  }
+});
+
+test("terminal dashboard failures retain the dashboard delivery identity", async () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "notification-terminal-")));
+  const outputRoot = path.join(root, "output");
+  fs.mkdirSync(outputRoot);
+  const previous = { ...process.env };
+  Object.assign(process.env, workflowEnv(root, outputRoot));
+  const input: NotificationLedgerInput = {
+    repository: "openclaw/clawsweeper",
+    key: "notification:test:terminal-dashboard",
+    number: 45,
+  };
+
+  try {
+    await deliverNotificationAttempt(input, {
+      kind: "notification_delivery",
+      destination: "openclaw_hook",
+      operation: async () => "hook-accepted",
+    });
+    await assert.rejects(
+      deliverNotificationAttempt(input, {
+        kind: "status_dashboard_delivery",
+        destination: "status_dashboard",
+        operation: async () => {
+          throw new Error("dashboard outcome unknown");
+        },
+      }),
+      /dashboard outcome unknown/,
+    );
+    recordNotificationPhase(input, "failed", "dashboard", "mutation_outcome_unknown", {
+      kind: "status_dashboard_delivery",
+      destination: "status_dashboard",
+    });
+    await flushRepairActionEvents();
+
+    const events = readEvents(outputRoot);
+    const hookAccepted = events.find((event) => event.attributes?.state === "mutation_accepted");
+    const dashboardUnknown = events.find((event) => event.attributes?.state === "mutation_unknown");
+    const terminal = events.find(
+      (event) => event.event_type === ACTION_EVENT_TYPES.notificationFailed,
+    );
+    assert.equal(terminal?.idempotency_key_sha256, dashboardUnknown?.idempotency_key_sha256);
+    assert.notEqual(terminal?.idempotency_key_sha256, hookAccepted?.idempotency_key_sha256);
   } finally {
     restoreEnv(previous);
     fs.rmSync(root, { force: true, recursive: true });

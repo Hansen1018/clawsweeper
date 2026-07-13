@@ -25,12 +25,22 @@ export type NotificationMutationOutcome =
   | "mutation_rejected"
   | "mutation_outcome_unknown";
 export type NotificationAttemptRunner = <T>(operation: () => Promise<T>) => Promise<T>;
+export type NotificationDeliveryIdentity = {
+  kind: string;
+  destination: string;
+};
+
+const OPENCLAW_HOOK_DELIVERY: NotificationDeliveryIdentity = {
+  kind: "notification_delivery",
+  destination: "openclaw_hook",
+};
 
 export function recordNotificationPhase(
   input: NotificationLedgerInput,
   phase: "planned" | "skipped" | "sent" | "failed",
   reason: string = phase,
   failureOutcome: NotificationMutationOutcome = "mutation_outcome_unknown",
+  delivery: NotificationDeliveryIdentity = OPENCLAW_HOOK_DELIVERY,
 ): void {
   const lifecycle = notificationLifecycle(input);
   recordRepairLifecycleEvent(lifecycle, {
@@ -68,9 +78,13 @@ export function recordNotificationPhase(
       : phase === "failed"
         ? { completionReason: failureOutcome }
         : {}),
-    eventIdentity: { key: input.key, reason },
+    eventIdentity: {
+      key: input.key,
+      reason,
+      ...(phase === "sent" || phase === "failed" ? { destination: delivery.destination } : {}),
+    },
     ...(phase === "sent" || phase === "failed"
-      ? { idempotencyIdentity: notificationDeliveryIdempotencyIdentity(input) }
+      ? { idempotencyIdentity: notificationDeliveryIdempotencyIdentity(input, delivery) }
       : {}),
   });
 }
@@ -80,10 +94,11 @@ export function recordNotificationPhaseSafely(
   phase: "planned" | "skipped" | "sent" | "failed",
   reason: string = phase,
   failureOutcome: NotificationMutationOutcome = "mutation_outcome_unknown",
+  delivery: NotificationDeliveryIdentity = OPENCLAW_HOOK_DELIVERY,
   report: (message: string) => void = console.error,
 ): void {
   try {
-    recordNotificationPhase(input, phase, reason, failureOutcome);
+    recordNotificationPhase(input, phase, reason, failureOutcome, delivery);
   } catch (receiptError) {
     report(
       `[action-ledger] failed to record notification ${phase} after the primary failure: ${
@@ -206,10 +221,13 @@ function notificationLifecycle(input: NotificationLedgerInput): RepairLifecycleI
   };
 }
 
-function notificationDeliveryIdempotencyIdentity(input: NotificationLedgerInput) {
+function notificationDeliveryIdempotencyIdentity(
+  input: NotificationLedgerInput,
+  delivery: NotificationDeliveryIdentity,
+) {
   return repairMutationIdempotencyIdentity(notificationLifecycle(input), {
-    kind: "notification_delivery",
+    kind: delivery.kind,
     operationName: "notification",
-    identity: { key: input.key, destination: "openclaw_hook" },
+    identity: { key: input.key, destination: delivery.destination },
   });
 }

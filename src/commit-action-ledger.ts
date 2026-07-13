@@ -41,6 +41,11 @@ const COMMIT_REVIEW_SUCCESS_RESULTS = new Set([
   "inconclusive",
   "skipped_non_code",
 ]);
+const TERMINAL_MUTATION_COMPLETION_REASONS = new Set([
+  "mutation_accepted",
+  "mutation_rejected",
+  "mutation_outcome_unknown",
+]);
 
 export function commitReviewLifecycleSucceeded(options: {
   reviewOutcome: string;
@@ -286,8 +291,7 @@ export function runCommitMutation<T>(
     );
     throw error;
   }
-  recordCommitMutationOutcomeWithRecovery(
-    recovery,
+  recordCommitMutationOutcomeSafely(
     input,
     options.kind,
     requestSha256,
@@ -296,6 +300,8 @@ export function runCommitMutation<T>(
     "accepted",
     attemptEvent?.event_id ?? null,
     ledgerContext,
+    recovery,
+    "after the successful operation",
   );
   return result;
 }
@@ -352,10 +358,11 @@ function recordCommitMutationOutcomeSafely(
   requestSha256: string,
   requestAttempt: number,
   idempotencyIdentity: unknown,
-  outcome: "rejected" | "unknown",
+  outcome: CommitMutationOutcome,
   parentEventId: string | null,
   context?: CommitActionLedgerContext,
   recovery?: CommitMutationRecovery | null,
+  failureContext: string = "after the primary failure",
 ): boolean {
   updateCommitMutationRecoverySafely(recovery, {
     input,
@@ -381,7 +388,7 @@ function recordCommitMutationOutcomeSafely(
     return true;
   } catch (receiptError) {
     console.error(
-      `[action-ledger] failed to record ${kind} ${outcome} outcome after the primary failure: ${
+      `[action-ledger] failed to record ${kind} ${outcome} outcome ${failureContext}; deferred for recovery: ${
         receiptError instanceof Error ? receiptError.message : String(receiptError)
       }`,
     );
@@ -419,39 +426,6 @@ function beginCommitMutationRecovery(
   const recovery = { key, recoveryRoot: context.recoveryRoot, context };
   writeCommitMutationRecovery(recovery, outcome);
   return recovery;
-}
-
-function recordCommitMutationOutcomeWithRecovery(
-  recovery: CommitMutationRecovery | null,
-  input: CommitLifecycleInput,
-  kind: string,
-  requestSha256: string,
-  requestAttempt: number,
-  idempotencyIdentity: unknown,
-  outcome: CommitMutationOutcome,
-  parentEventId: string | null,
-  context: CommitActionLedgerContext,
-): void {
-  updateCommitMutationRecoverySafely(recovery, {
-    input,
-    kind,
-    requestSha256,
-    requestAttempt,
-    idempotencyIdentity,
-    parentEventId,
-    outcome,
-  });
-  recordCommitMutationOutcome(
-    input,
-    kind,
-    requestSha256,
-    requestAttempt,
-    idempotencyIdentity,
-    outcome,
-    parentEventId,
-    context,
-  );
-  removeCommitMutationRecoverySafely(recovery);
 }
 
 export function recoverCommitMutationOutcomes(): void {
@@ -539,11 +513,13 @@ function commitMutationOutcomeRecorded(
   payload: CommitMutationRecoveryPayload,
   context: CommitActionLedgerContext,
 ): boolean {
+  const idempotencyKeySha256 = actionIdempotencyKey(payload.idempotencyIdentity);
   return commitEvents(payload.input, context).some(
     (event) =>
       event.parent_event_id === payload.parentEventId &&
       event.event_type === ACTION_EVENT_TYPES.publicationLifecycle &&
-      String(event.attributes?.completion_reason ?? "").startsWith("mutation_"),
+      event.idempotency_key_sha256 === idempotencyKeySha256 &&
+      TERMINAL_MUTATION_COMPLETION_REASONS.has(String(event.attributes?.completion_reason ?? "")),
   );
 }
 

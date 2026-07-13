@@ -559,6 +559,12 @@ function dispatchCandidateFromPr(pr: JsonValue) {
   const jobPath = normalizedFinalizerDispatchJobPath(pr.job_path);
   const immutableJob = resolveCurrentStateJobIdentity(jobPath);
   const mode = resolveDispatchMode(immutableJob);
+  const idempotencyKey = finalizerDispatchIdempotencyKey({
+    pr: pr.number,
+    headSha: pr.head_sha,
+    jobPath: immutableJob.jobPath,
+    jobSha256: immutableJob.jobSha256,
+  });
   return {
     pr: pr.number,
     url: pr.url,
@@ -573,8 +579,28 @@ function dispatchCandidateFromPr(pr: JsonValue) {
     mode,
     blockers: pr.blockers,
     recommended_next_action: pr.recommended_next_action,
-    idempotency_key: `finalize-open-prs:${repo}#${pr.number}:${pr.head_sha || pr.branch || "unknown"}:${immutableJob.identityKey}`,
+    idempotency_key: idempotencyKey,
   };
+}
+
+function finalizerDispatchIdempotencyKey({
+  pr,
+  headSha,
+  jobPath,
+  jobSha256,
+}: {
+  pr: unknown;
+  headSha: unknown;
+  jobPath: unknown;
+  jobSha256: unknown;
+}): string {
+  const normalizedHeadSha = String(headSha ?? "")
+    .trim()
+    .toLowerCase();
+  if (!/^[a-f0-9]{40}$/.test(normalizedHeadSha)) {
+    throw new Error("finalizer dispatch requires a valid PR head SHA");
+  }
+  return `finalize-open-prs:${repo}#${pr}:${normalizedHeadSha}:${jobPath}:${jobSha256}`;
 }
 
 function normalizedFinalizerDispatchJobPath(value: unknown): string {
@@ -752,7 +778,7 @@ function finalizerDispatchLifecycle(candidate: LooseRecord): RepairLifecycleInpu
   const pr = Number(candidate.pr);
   return {
     repository: repo,
-    workKey: `open-pr-finalizer:${repo}#${pr}:${candidate.immutable_job_key}`,
+    workKey: String(candidate.idempotency_key),
     number: pr,
     sourceRevision: String(candidate.state_revision),
     recordPath: String(candidate.job_path),

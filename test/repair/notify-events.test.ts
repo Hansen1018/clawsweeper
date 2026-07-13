@@ -442,6 +442,8 @@ test("dashboard 429 receipts preserve an ambiguous mutation outcome", async () =
       (event) => event.event_type === ACTION_EVENT_TYPES.notificationFailed,
     );
     assert.equal(failed?.attributes?.completion_reason, "mutation_outcome_unknown");
+    assert.equal(failed?.idempotency_key_sha256, mutationEvents.at(-1)?.idempotency_key_sha256);
+    assert.notEqual(failed?.idempotency_key_sha256, mutationEvents[1]?.idempotency_key_sha256);
   } finally {
     restoreEnv(previous);
     fs.rmSync(root, { force: true, recursive: true });

@@ -134,6 +134,7 @@ test("failed-run self-heal replays the recorded sealed job generation", () => {
       source_job: fixture.jobPath,
       source_state_revision: fixture.originalRevision,
       source_job_sha256: fixture.originalDigest,
+      mode: "plan",
     });
 
     const summary = runSelfHeal(fixture);
@@ -142,6 +143,67 @@ test("failed-run self-heal replays the recorded sealed job generation", () => {
     assert.equal(summary.candidates[0].source_state_revision, fixture.originalRevision);
     assert.equal(summary.candidates[0].source_job_sha256, fixture.originalDigest);
     assert.equal(summary.candidates[0].mode, "plan");
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("failed-run self-heal preserves a durable gate-downgraded effective mode", () => {
+  const fixture = createSelfHealFixture("downgraded", "autonomous");
+  try {
+    writeRunRecord(fixture.runsDir, fixture.runId, {
+      source_job: fixture.jobPath,
+      source_state_revision: fixture.originalRevision,
+      source_job_sha256: fixture.originalDigest,
+      mode: "plan",
+    });
+
+    const summary = runSelfHeal(fixture);
+    assert.equal(summary.candidates.length, 1);
+    assert.equal(summary.candidates[0].mode, "plan");
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("failed-run self-heal recovers a missing effective mode from the sealed artifact cohort", () => {
+  const fixture = createSelfHealFixture("artifact-mode", "autonomous");
+  try {
+    writeRunRecord(fixture.runsDir, fixture.runId, {
+      source_job: fixture.jobPath,
+      source_state_revision: fixture.originalRevision,
+      source_job_sha256: fixture.originalDigest,
+    });
+    writeArtifactCohort(fixture.artifactFixture, fixture.runId, 1, {
+      sourceJob: fixture.jobPath,
+      stateRevision: fixture.originalRevision,
+      jobSha256: fixture.originalDigest,
+      mode: "plan",
+    });
+
+    const summary = runSelfHeal(fixture);
+    assert.equal(summary.candidates.length, 1);
+    assert.equal(summary.candidates[0].mode, "plan");
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("failed-run self-heal rejects an invalid durable effective mode", () => {
+  const fixture = createSelfHealFixture("invalid-mode");
+  try {
+    writeRunRecord(fixture.runsDir, fixture.runId, {
+      source_job: fixture.jobPath,
+      source_state_revision: fixture.originalRevision,
+      source_job_sha256: fixture.originalDigest,
+      mode: "unsafe",
+    });
+
+    const summary = runSelfHeal(fixture);
+    assert.equal(summary.candidates.length, 0);
+    assert.equal(summary.skipped_candidates.length, 1);
+    assert.equal(summary.skipped_candidates[0].reason, "immutable_provenance_unavailable");
+    assert.match(summary.skipped_candidates[0].detail, /invalid effective repair mode/);
   } finally {
     fs.rmSync(fixture.root, { recursive: true, force: true });
   }
@@ -161,6 +223,7 @@ test("failed-run self-heal fetches an exact historical revision from a depth-one
       source_job: fixture.jobPath,
       source_state_revision: fixture.originalRevision,
       source_job_sha256: fixture.originalDigest,
+      mode: "plan",
     });
 
     const summary = runSelfHeal(fixture);
@@ -186,11 +249,13 @@ test("failed-run self-heal skips an unavailable historical revision without drop
       source_job: fixture.jobPath,
       source_state_revision: fixture.originalRevision,
       source_job_sha256: fixture.originalDigest,
+      mode: "plan",
     });
     writeRunRecord(fixture.runsDir, "910002", {
       source_job: "jobs/openclaw/inbox/missing-history.md",
       source_state_revision: "f".repeat(40),
       source_job_sha256: "e".repeat(64),
+      mode: "plan",
     });
 
     const summary = runSelfHeal(fixture);
@@ -257,7 +322,7 @@ test("legacy self-heal records reject identity and plan split across attempts", 
   }
 });
 
-function createSelfHealFixture(label: string) {
+function createSelfHealFixture(label: string, originalMode: "plan" | "autonomous" = "plan") {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), `clawsweeper-self-heal-${label}-`));
   const stateRoot = path.join(root, "state");
   const runsDir = path.join(root, "runs");
@@ -271,7 +336,7 @@ function createSelfHealFixture(label: string) {
   execFileSync("git", ["config", "user.name", "ClawSweeper Test"], { cwd: stateRoot });
   execFileSync("git", ["config", "user.email", "test@example.invalid"], { cwd: stateRoot });
   const jobPath = `jobs/openclaw/inbox/cluster-${label}.md`;
-  const original = repairJob("plan", `${label}-original`);
+  const original = repairJob(originalMode, `${label}-original`);
   const originalRevision = commitJob(stateRoot, jobPath, original, "original");
   const originalDigest = createHash("sha256").update(original).digest("hex");
   commitJob(stateRoot, jobPath, repairJob("autonomous", `${label}-replacement`), "replacement");

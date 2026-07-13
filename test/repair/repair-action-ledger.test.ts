@@ -17,8 +17,10 @@ import {
   recordRepairLifecycleFailureSafely,
   recordRepairWorkflowEvent,
   repairHttpMutationOutcome,
+  repairMutationIdempotencyIdentity,
   repairSourceRevision,
   repairWorkflowTerminalPhase,
+  recoverRepairMutationOutcomes,
   runRepairMutation,
   runRepairMutationAsync,
 } from "../../dist/repair/repair-action-ledger.js";
@@ -197,6 +199,113 @@ test("async mutation receipts preserve their workflow context across environment
 });
 
 test(
+  "successful sync repair mutations defer receipt failures and recover only exact terminal identities",
+  { skip: process.platform === "win32" ? "requires POSIX directory permissions" : false },
+  async () => {
+    const root = fs.realpathSync(
+      fs.mkdtempSync(path.join(os.tmpdir(), "repair-successful-deferred-receipt-")),
+    );
+    const outputRoot = path.join(root, "output");
+    fs.mkdirSync(outputRoot);
+    const previous = { ...process.env };
+    const originalConsoleError = console.error;
+    const receiptErrors: string[] = [];
+    Object.assign(process.env, workflowEnv(root, outputRoot));
+    const lifecycle = repairLifecycle();
+    const kind = "branch_push";
+    const identity = {
+      repo: "openclaw/openclaw",
+      ref: "refs/heads/fix",
+      sha: "a".repeat(40),
+    };
+    const idempotencyIdentity = repairMutationIdempotencyIdentity(lifecycle, {
+      kind,
+      identity,
+    });
+    let spoolDirectory = "";
+
+    try {
+      console.error = (message?: unknown) => receiptErrors.push(String(message));
+      assert.equal(
+        runRepairMutation(lifecycle, {
+          kind,
+          identity,
+          operation: () => {
+            const spoolFile = actionEventSpoolFile(root, outputRoot);
+            assert.ok(spoolFile);
+            spoolDirectory = path.dirname(spoolFile);
+            fs.chmodSync(spoolDirectory, 0o500);
+            return "accepted";
+          },
+        }),
+        "accepted",
+      );
+      assert.match(
+        receiptErrors.join("\n"),
+        /after the successful operation; deferred for recovery/,
+      );
+
+      fs.chmodSync(spoolDirectory, 0o700);
+      const attemptFile = actionEventSpoolFile(root, outputRoot);
+      assert.ok(attemptFile);
+      const attempt = JSON.parse(fs.readFileSync(attemptFile, "utf8"));
+
+      recordRepairLifecycleEvent(lifecycle, {
+        type: ACTION_EVENT_TYPES.repairMutation,
+        status: ACTION_EVENT_STATUSES.started,
+        reasonCode: ACTION_EVENT_REASON_CODES.selected,
+        mutation: false,
+        retryable: true,
+        component: "repair_mutation",
+        operation: "repair",
+        parentEventId: attempt.event_id,
+        state: "mutation_attempted",
+        completionReason: "mutation_attempted",
+        eventIdentity: { kind, requestAttempt: 99, outcome: "attempted" },
+        idempotencyIdentity,
+      });
+      recordRepairLifecycleEvent(lifecycle, {
+        type: ACTION_EVENT_TYPES.repairMutation,
+        status: ACTION_EVENT_STATUSES.executed,
+        reasonCode: ACTION_EVENT_REASON_CODES.completed,
+        mutation: true,
+        component: "repair_mutation",
+        operation: "repair",
+        parentEventId: attempt.event_id,
+        state: "mutation_accepted",
+        completionReason: "mutation_accepted",
+        eventIdentity: { kind: "foreign_branch_push", requestAttempt: 1, outcome: "accepted" },
+        idempotencyIdentity: { mutation: "foreign_branch_push", request: "other" },
+      });
+
+      recoverRepairMutationOutcomes();
+      await flushRepairActionEvents();
+
+      const events = readEvents(outputRoot);
+      const exactTerminal = events.filter(
+        (event) =>
+          event.parent_event_id === attempt.event_id &&
+          event.idempotency_key_sha256 === attempt.idempotency_key_sha256 &&
+          event.attributes?.completion_reason === "mutation_accepted",
+      );
+      assert.equal(exactTerminal.length, 1);
+      assert.equal(exactTerminal[0]?.action.status, ACTION_EVENT_STATUSES.executed);
+      assert.equal(
+        walk(outputRoot).some((file) =>
+          file.includes(`${path.sep}.mutation-recovery${path.sep}repair${path.sep}`),
+        ),
+        false,
+      );
+    } finally {
+      if (spoolDirectory) fs.chmodSync(spoolDirectory, 0o700);
+      console.error = originalConsoleError;
+      restoreEnv(previous);
+      fs.rmSync(root, { force: true, recursive: true });
+    }
+  },
+);
+
+test(
   "repair receipt recovery survives a fresh finalizer process",
   { skip: process.platform === "win32" ? "requires POSIX directory permissions" : false },
   () => {
@@ -229,7 +338,7 @@ test(
               const target = path.join(directory, entry.name);
               return entry.isDirectory() ? walk(target) : [target];
             });
-            await runRepairMutationAsync(${JSON.stringify(lifecycle)}, {
+            const result = await runRepairMutationAsync(${JSON.stringify(lifecycle)}, {
               kind: "branch_push",
               identity: {
                 repo: "openclaw/openclaw",
@@ -246,12 +355,17 @@ test(
                 return "accepted";
               },
             });
+            process.stdout.write(result);
           `,
         ],
         { cwd: process.cwd(), encoding: "utf8", env: { ...process.env } },
       );
-      assert.notEqual(mutation.status, 0, mutation.stderr);
-      assert.match(mutation.stderr, /EACCES|EPERM|permission/i);
+      assert.equal(mutation.status, 0, mutation.stderr);
+      assert.equal(mutation.stdout, "accepted");
+      assert.match(
+        mutation.stderr,
+        /after the successful operation; deferred for recovery.*(?:EACCES|EPERM|permission)/is,
+      );
 
       const spoolFile = actionEventSpoolFile(root, outputRoot);
       assert.ok(spoolFile);

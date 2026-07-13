@@ -365,6 +365,7 @@ function runCodex(options: {
       options.targetDir,
       "--output-last-message",
       outputPath,
+      "--json",
       "--sandbox",
       options.sandboxMode,
       "-",
@@ -372,10 +373,10 @@ function runCodex(options: {
     cwd: options.targetDir,
     env: codexEnv({ ghToken: process.env.COMMIT_SWEEPER_TARGET_GH_TOKEN }),
     input: readFileSync(promptPath, "utf8"),
+    stdoutPath,
+    stderrPath,
     timeoutMs: options.timeoutMs,
   });
-  writeFileSync(stdoutPath, result.stdout ?? "", "utf8");
-  writeFileSync(stderrPath, result.stderr ?? "", "utf8");
   recordCommitArtifactPrepared(lifecycle, {
     path: stdoutPath,
     kind: "commit_review_jsonl",

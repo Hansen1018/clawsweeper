@@ -18,6 +18,7 @@ import {
   ghText,
   ghTextWithRetry as ghWithRetry,
 } from "./github-cli.js";
+import { ghRetryKind, ghRetryWaitMs, type GhRetryKind } from "../github-retry.js";
 import { issueNumberFromRef, parsePullRequestUrl } from "./github-ref.js";
 import { sleepMs } from "./timing.js";
 import {
@@ -67,6 +68,14 @@ const POST_MERGE_CLOSE_ACTIONS = new Set([
 const DEFAULT_IGNORED_CHECKS = ["auto-response", "Labeler", "Stale"];
 const POST_FLIGHT_WAIT_MS = numberEnv("CLAWSWEEPER_POST_FLIGHT_WAIT_MS", 10 * 60 * 1000);
 const POST_FLIGHT_POLL_MS = numberEnv("CLAWSWEEPER_POST_FLIGHT_POLL_MS", 15 * 1000);
+const POST_FLIGHT_MERGE_ATTEMPTS = Math.max(
+  1,
+  Math.floor(numberEnv("CLAWSWEEPER_POST_FLIGHT_MERGE_ATTEMPTS", 3)),
+);
+const POST_FLIGHT_MERGE_RETRY_MAX_WAIT_MS = numberEnv(
+  "CLAWSWEEPER_POST_FLIGHT_MERGE_RETRY_MAX_WAIT_MS",
+  10_000,
+);
 
 const args = parseArgs(process.argv.slice(2));
 const jobPath = args._[0];
@@ -354,52 +363,124 @@ function finalizeFixPr(action: LooseRecord) {
   if (securityBlock) return { ...prBase, status: "blocked", reason: securityBlock };
   const mutationBlock = postFlightPullMutationBlock(parsed.number);
   if (mutationBlock) return { ...prBase, status: "blocked", reason: mutationBlock };
-  try {
-    const mergeAttempt = runVerifiedPostFlightPullMutation(parsed.number, () => {
-      const finalView = fetchPullRequestView(result.repo, parsed.number);
-      const finalStrictBaseBindingBlock = runtimeStrictBaseBindingBlock({
-        repo: result.repo,
-        baseBranch: String(finalView.baseRefName ?? ""),
-        policyReadJson: rulesetPolicyReader(),
-      });
-      if (finalStrictBaseBindingBlock) return { policyBlock: finalStrictBaseBindingBlock };
-      runPostFlightMutation(
-        "post_flight_merge",
-        {
+  let mergeAttempts = 0;
+  for (;;) {
+    mergeAttempts += 1;
+    try {
+      const mergeAttempt = runVerifiedPostFlightPullMutation(parsed.number, () => {
+        const finalView = fetchPullRequestView(result.repo, parsed.number);
+        const finalStrictBaseBindingBlock = runtimeStrictBaseBindingBlock({
           repo: result.repo,
+          baseBranch: String(finalView.baseRefName ?? ""),
+          policyReadJson: rulesetPolicyReader(),
+        });
+        if (finalStrictBaseBindingBlock) return { policyBlock: finalStrictBaseBindingBlock };
+        runPostFlightMutation(
+          "post_flight_merge",
+          {
+            repo: result.repo,
+            number: parsed.number,
+            headSha: action.commit ?? null,
+            method: "squash",
+          },
+          () => ghText(mergeArgs),
+        );
+        return { policyBlock: "" };
+      });
+      if (mergeAttempt.policyBlock) {
+        return {
+          ...prBase,
+          status: "blocked",
+          reason: mergeAttempt.policyBlock,
+          merge_method: "squash",
+          merge_attempts: mergeAttempts,
+          waited_ms: waitedMs,
+        };
+      }
+      break;
+    } catch (error) {
+      const detail = ghErrorText(error);
+      const reconciliation = reconcileFailedMerge(parsed.number, action.commit);
+      pull = reconciliation.pull;
+      view = reconciliation.view;
+      prBase = { ...base, pr: `#${parsed.number}`, title: view.title ?? pull.title ?? null };
+      if (reconciliation.mergedAt) {
+        return {
+          ...prBase,
+          status: "executed",
+          reason: "merge confirmed after ambiguous response",
+          merged_at: reconciliation.mergedAt,
+          merge_commit_sha: pull.merge_commit_sha ?? view.mergeCommit?.oid ?? null,
+          merge_method: "squash",
+          commit_subject: mergeMessage.subject,
+          summary_lines: mergeMessage.summaryLines,
+          fixup_lines: mergeMessage.fixupLines,
+          merge_attempts: mergeAttempts,
+          waited_ms: waitedMs,
+        };
+      }
+      if (reconciliation.block) {
+        return {
+          ...prBase,
+          status: "blocked",
+          reason: reconciliation.block,
+          merge_method: "squash",
+          merge_attempts: mergeAttempts,
+          waited_ms: waitedMs,
+        };
+      }
+
+      const retryKind = ghRetryKind(error);
+      if (retryKind !== "none" && mergeAttempts < POST_FLIGHT_MERGE_ATTEMPTS) {
+        const retryBlock = postFlightMergeRetryBlock({
+          action,
           number: parsed.number,
-          headSha: pull.head?.sha ?? null,
-          method: "squash",
-        },
-        () => ghText(mergeArgs),
-      );
-      return { policyBlock: "" };
-    });
-    if (mergeAttempt.policyBlock) {
-      return {
-        ...prBase,
-        status: "blocked",
-        reason: mergeAttempt.policyBlock,
-        merge_method: "squash",
-        waited_ms: waitedMs,
-      };
+          pull,
+          view,
+        });
+        if (retryBlock) {
+          return {
+            ...prBase,
+            status: "blocked",
+            reason: retryBlock,
+            merge_method: "squash",
+            merge_attempts: mergeAttempts,
+            waited_ms: waitedMs,
+          };
+        }
+        const retryWaitMs = postFlightMergeRetryWaitMs(retryKind, mergeAttempts - 1);
+        sleepMs(retryWaitMs);
+        waitedMs += retryWaitMs;
+        continue;
+      }
+      if (isRecoverableMergeRace(detail)) {
+        return {
+          ...prBase,
+          status: "blocked",
+          reason: `merge attempt needs branch refresh: ${compactText(detail, 500)}`,
+          mergeable: view.mergeable ?? null,
+          merge_state_status: view.mergeStateStatus ?? null,
+          review_decision: view.reviewDecision ?? null,
+          retry_recommended: true,
+          merge_attempts: mergeAttempts,
+          waited_ms: waitedMs,
+        };
+      }
+      if (retryKind !== "none") {
+        return {
+          ...prBase,
+          status: "blocked",
+          reason: `merge attempt remained ${retryKind} after ${mergeAttempts} attempts: ${compactText(detail, 500)}`,
+          mergeable: view.mergeable ?? null,
+          merge_state_status: view.mergeStateStatus ?? null,
+          review_decision: view.reviewDecision ?? null,
+          retry_recommended: true,
+          merge_attempts: mergeAttempts,
+          waited_ms: waitedMs,
+        };
+      }
+      throw error;
     }
-  } catch (error) {
-    const detail = ghErrorText(error);
-    if (isRecoverableMergeRace(detail)) {
-      const latestView = fetchPullRequestView(result.repo, parsed.number);
-      return {
-        ...prBase,
-        status: "blocked",
-        reason: `merge attempt needs branch refresh: ${compactText(detail, 500)}`,
-        mergeable: latestView.mergeable ?? null,
-        merge_state_status: latestView.mergeStateStatus ?? null,
-        review_decision: latestView.reviewDecision ?? null,
-        retry_recommended: true,
-        waited_ms: waitedMs,
-      };
-    }
-    throw error;
   }
   const merged = fetchPullRequest(result.repo, parsed.number);
   return {
@@ -412,8 +493,60 @@ function finalizeFixPr(action: LooseRecord) {
     commit_subject: mergeMessage.subject,
     summary_lines: mergeMessage.summaryLines,
     fixup_lines: mergeMessage.fixupLines,
+    merge_attempts: mergeAttempts,
     waited_ms: waitedMs,
   };
+}
+
+function reconcileFailedMerge(number: number, expectedHeadSha: JsonValue) {
+  const pull = fetchPullRequest(result.repo, number);
+  const view = fetchPullRequestView(result.repo, number);
+  const mergedAt = pull.merged_at ?? view.mergedAt ?? null;
+  if (!mergedAt) return { pull, view, mergedAt: null, block: "" };
+  const mergedHead = String(pull.head?.sha ?? view.headRefOid ?? "");
+  if (!isFullCommitSha(expectedHeadSha) || mergedHead !== expectedHeadSha) {
+    return {
+      pull,
+      view,
+      mergedAt: null,
+      block: "merged pull request head does not match the authorized repair commit",
+    };
+  }
+  return { pull, view, mergedAt, block: "" };
+}
+
+function postFlightMergeRetryBlock({
+  action,
+  number,
+  pull,
+  view,
+}: {
+  action: LooseRecord;
+  number: number;
+  pull: LooseRecord;
+  view: LooseRecord;
+}) {
+  const securityBlock = liveSecurityBlockReason(number, pull.labels ?? []);
+  if (securityBlock) return securityBlock;
+  const policyBlock = validateMergePolicy(action, pull);
+  if (policyBlock) return policyBlock;
+  const mergeBlock = validateMergeableFixPr({
+    pull,
+    view,
+    preflight: action.merge_preflight,
+    expectedHeadSha: action.commit,
+    validationProofPlan: fixReport.validation_proof_plan,
+  });
+  if (mergeBlock) return mergeBlock;
+  return runtimeStrictBaseBindingBlock({
+    repo: result.repo,
+    baseBranch: String(view.baseRefName ?? pull.base?.ref ?? ""),
+    policyReadJson: rulesetPolicyReader(),
+  });
+}
+
+function postFlightMergeRetryWaitMs(kind: GhRetryKind, attempt: number) {
+  return Math.min(POST_FLIGHT_MERGE_RETRY_MAX_WAIT_MS, ghRetryWaitMs(kind, attempt));
 }
 
 function publishedFixAction(fixReport: LooseRecord, receipt: LooseRecord): LooseRecord {

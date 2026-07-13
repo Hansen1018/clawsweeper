@@ -82,6 +82,9 @@ if (!Number.isFinite(maxAgeHours) || maxAgeHours <= 0) {
 if (!Number.isInteger(maxAttemptsPerJob) || maxAttemptsPerJob < 1) {
   throw new Error("CLAWSWEEPER_SELF_HEAL_MAX_ATTEMPTS_PER_JOB must be a positive integer");
 }
+if (requestedMode !== null && !REPAIR_MODES.has(requestedMode)) {
+  throw new Error(`unsupported mode: ${requestedMode}`);
+}
 
 const candidates = selectCandidates().slice(0, maxJobs);
 const summary: LooseRecord = {
@@ -243,14 +246,14 @@ function selectCandidates() {
     .map((record: JsonValue) => {
       const sourceJob = String(record.source_job ?? "");
       try {
-        const { immutableJob, recoveredMode } = resolveRunRecordJob(record, sourceJob);
+        const { immutableJob, effectiveMode } = resolveRunRecordJob(record, sourceJob);
         return {
           ...record,
           source_job: immutableJob.jobPath,
           source_state_revision: immutableJob.stateRevision,
           source_job_sha256: immutableJob.jobSha256,
           immutable_job_key: immutableJob.identityKey,
-          mode: requestedMode ?? recoveredMode ?? immutableJob.job.frontmatter.mode,
+          mode: requestedMode ?? effectiveMode,
         };
       } catch (error) {
         skippedCandidates.push({
@@ -431,22 +434,29 @@ function readRunRecords() {
 function resolveRunRecordJob(record: LooseRecord, sourceJob: string) {
   let stateRevision = String(record.source_state_revision ?? "").trim();
   let jobSha256 = String(record.source_job_sha256 ?? "").trim();
-  let recoveredMode: string | null = null;
-  if (!STATE_REVISION.test(stateRevision) || !JOB_SHA256.test(jobSha256)) {
+  const recordMode = validatedRunRecordMode(record.mode);
+  let recovered: RecoveredRunCohort | null = null;
+  if (!STATE_REVISION.test(stateRevision) || !JOB_SHA256.test(jobSha256) || recordMode === null) {
     const runId = String(record.run_id ?? "").trim();
     if (!/^[1-9][0-9]*$/.test(runId)) {
-      throw new Error("legacy run record is missing a valid workflow run id");
+      throw new Error("run record is missing a valid workflow run id for artifact recovery");
     }
-    const recovered = recoverRunArtifactCohort(runId, sourceJob);
+    recovered = recoverRunArtifactCohort(runId, sourceJob);
     if (stateRevision && stateRevision !== recovered.state_revision) {
-      throw new Error("legacy run record state revision conflicts with its artifact cohort");
+      throw new Error("run record state revision conflicts with its artifact cohort");
     }
     if (jobSha256 && jobSha256 !== recovered.job_sha256) {
-      throw new Error("legacy run record job digest conflicts with its artifact cohort");
+      throw new Error("run record job digest conflicts with its artifact cohort");
+    }
+    if (recordMode !== null && recordMode !== recovered.mode) {
+      throw new Error("run record effective mode conflicts with its artifact cohort");
     }
     stateRevision = recovered.state_revision;
     jobSha256 = recovered.job_sha256;
-    recoveredMode = recovered.mode;
+  }
+  const effectiveMode = recovered?.mode ?? recordMode;
+  if (effectiveMode === null) {
+    throw new Error("run record is missing validated effective repair mode");
   }
   ensureHistoricalStateRevision(stateRevision);
   const immutableJob = resolveStateJobIdentity({
@@ -454,10 +464,16 @@ function resolveRunRecordJob(record: LooseRecord, sourceJob: string) {
     stateRevision,
     jobSha256,
   });
-  if (recoveredMode !== null && immutableJob.job.frontmatter.mode !== recoveredMode) {
-    throw new Error("legacy artifact cohort mode does not match its sealed source job");
+  return { immutableJob, effectiveMode };
+}
+
+function validatedRunRecordMode(value: unknown): string | null {
+  if (value === undefined || value === null || value === "") return null;
+  const mode = String(value).trim();
+  if (!REPAIR_MODES.has(mode)) {
+    throw new Error(`run record has invalid effective repair mode: ${mode || "empty"}`);
   }
-  return { immutableJob, recoveredMode };
+  return mode;
 }
 
 function ensureHistoricalStateRevision(stateRevision: string): void {

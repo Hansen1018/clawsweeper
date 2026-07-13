@@ -18,6 +18,7 @@ import {
   deliverNotificationAttempt,
   recordNotificationPhase,
   recordNotificationPhaseSafely,
+  type NotificationDeliveryIdentity,
 } from "./notification-action-ledger.js";
 
 type EventSeverity = "info" | "warning" | "error";
@@ -365,13 +366,17 @@ export async function runClawSweeperEventNotifier(
   const reportActions: JsonObject[] = [...collected.skipped];
   let nextLedger = ledger;
   for (const event of collected.events) {
+    const ledgerInput = eventNotificationLedgerInput(event);
     if (dryRun) {
-      recordNotificationPhase(eventNotificationLedgerInput(event), "planned", "dry_run");
+      recordNotificationPhase(ledgerInput, "planned", "dry_run");
       reportActions.push(reportRow(event, "planned", "dry run"));
       continue;
     }
+    let failingDelivery: NotificationDeliveryIdentity = {
+      kind: "notification_delivery",
+      destination: "openclaw_hook",
+    };
     try {
-      const ledgerInput = eventNotificationLedgerInput(event);
       recordNotificationPhase(ledgerInput, "planned");
       const result = await postOpenClawAgentHook({
         config,
@@ -391,9 +396,12 @@ export async function runClawSweeperEventNotifier(
       });
       let dashboardStatus = "status dashboard not configured";
       if (dashboardConfig) {
-        await deliverNotificationAttempt(ledgerInput, {
+        failingDelivery = {
           kind: "status_dashboard_delivery",
           destination: "status_dashboard",
+        };
+        await deliverNotificationAttempt(ledgerInput, {
+          ...failingDelivery,
           operation: () => postStatusDashboardEvent({ config: dashboardConfig, fetcher, event }),
           knownNoMutation: isRejectedDashboardDelivery,
         });
@@ -413,13 +421,14 @@ export async function runClawSweeperEventNotifier(
       const failureOutcome = isRejectedOpenClawHookError(error)
         ? "mutation_rejected"
         : isRejectedDashboardDelivery(error)
-          ? "mutation_observed"
+          ? "mutation_rejected"
           : "mutation_outcome_unknown";
       recordNotificationPhaseSafely(
-        eventNotificationLedgerInput(event),
+        ledgerInput,
         "failed",
         error instanceof Error ? error.name : typeof error,
         failureOutcome,
+        failingDelivery,
       );
       reportActions.push(reportRow(event, "failed", errorText(error)));
     }

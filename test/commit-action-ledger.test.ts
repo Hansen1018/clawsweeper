@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -15,6 +16,7 @@ import {
   commitReviewLifecycleSucceeded,
   flushCommitActionEvents,
   recordCommitArtifactPrepared,
+  recordCommitLifecycleEvent,
   recordCommitWorkflowEvent,
   runCommitMutation,
 } from "../dist/commit-action-ledger.js";
@@ -300,7 +302,7 @@ test(
               const target = path.join(directory, entry.name);
               return entry.isDirectory() ? walk(target) : [target];
             });
-            runCommitMutation(${JSON.stringify(lifecycle)}, {
+            const result = runCommitMutation(${JSON.stringify(lifecycle)}, {
               kind: "commit_check_publication",
               identity: { sha: ${JSON.stringify(lifecycle.sha)} },
               operation: () => {
@@ -313,17 +315,59 @@ test(
                 return "accepted";
               },
             });
+            process.stdout.write(result);
           `,
         ],
         { cwd: process.cwd(), encoding: "utf8", env: { ...process.env } },
       );
-      assert.notEqual(mutation.status, 0, mutation.stderr);
-      assert.match(mutation.stderr, /EACCES|EPERM|permission/i);
+      assert.equal(mutation.status, 0, mutation.stderr);
+      assert.equal(mutation.stdout, "accepted");
+      assert.match(
+        mutation.stderr,
+        /after the successful operation; deferred for recovery.*(?:EACCES|EPERM|permission)/is,
+      );
 
       const spoolFile = actionEventSpoolFile(root, outputRoot);
       assert.ok(spoolFile);
       spoolDirectory = path.dirname(spoolFile);
       fs.chmodSync(spoolDirectory, 0o700);
+      const attempt = JSON.parse(fs.readFileSync(spoolFile, "utf8"));
+      const kind = "commit_check_publication";
+      const identity = { sha: lifecycle.sha };
+      const idempotencyIdentity = {
+        operation: lifecycle,
+        mutation: kind,
+        requestSha256: createHash("sha256").update(JSON.stringify(identity)).digest("hex"),
+      };
+      recordCommitLifecycleEvent(lifecycle, {
+        type: ACTION_EVENT_TYPES.publicationLifecycle,
+        status: "started",
+        reasonCode: "selected",
+        mutation: false,
+        retryable: true,
+        component: "commit_review",
+        state: "mutation_attempted",
+        completionReason: "mutation_attempted",
+        publicationKind: kind,
+        parentEventId: attempt.event_id,
+        eventIdentity: { kind, requestAttempt: 99, outcome: "attempted" },
+        idempotencyIdentity,
+        requestAttempt: 99,
+      });
+      recordCommitLifecycleEvent(lifecycle, {
+        type: ACTION_EVENT_TYPES.publicationLifecycle,
+        status: "published",
+        reasonCode: "published",
+        mutation: true,
+        component: "commit_review",
+        state: "mutation_accepted",
+        completionReason: "mutation_accepted",
+        publicationKind: kind,
+        parentEventId: attempt.event_id,
+        eventIdentity: { kind: "foreign_publication", requestAttempt: 1, outcome: "accepted" },
+        idempotencyIdentity: { mutation: "foreign_publication", request: "other" },
+        requestAttempt: 1,
+      });
       assert.ok(
         walk(outputRoot).some((file) =>
           file.includes(`${path.sep}.mutation-recovery${path.sep}commit${path.sep}`),
@@ -355,11 +399,14 @@ test(
       assert.equal(finalizer.status, 0, finalizer.stderr);
 
       const events = readEvents(outputRoot);
-      assert.deepEqual(
-        events.map((event) => event.attributes?.completion_reason),
-        ["mutation_attempted", "mutation_accepted"],
+      const exactTerminal = events.filter(
+        (event) =>
+          event.parent_event_id === attempt.event_id &&
+          event.idempotency_key_sha256 === attempt.idempotency_key_sha256 &&
+          event.attributes?.completion_reason === "mutation_accepted",
       );
-      assert.equal(events[1]?.parent_event_id, events[0]?.event_id);
+      assert.equal(exactTerminal.length, 1);
+      assert.equal(exactTerminal[0]?.action.status, "published");
       assert.equal(
         walk(outputRoot).some((file) => file.endsWith(".json") || file.endsWith(".tmp")),
         false,

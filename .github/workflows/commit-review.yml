@@ -538,7 +538,10 @@ jobs:
           CHECKS_REQUESTED: ${{ needs.plan.outputs.create_checks }}
         run: |
           set -euo pipefail
-          report_path="$(find ../commit-artifacts -name '${{ matrix.sha }}.md' -print -quit)"
+          report_path=""
+          if [ -d ../commit-artifacts ]; then
+            report_path="$(find ../commit-artifacts -name '${{ matrix.sha }}.md' -print -quit)"
+          fi
           node dist/commit-sweeper.js finish-review \
             --target-repo "${{ needs.plan.outputs.target_repo }}" \
             --commit-sha "${{ matrix.sha }}" \

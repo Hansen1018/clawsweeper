@@ -152,6 +152,11 @@ const REPAIR_CAUSAL_MANIFEST_FILE = "repair-action-ledger-manifest.json";
 const REPAIR_CAUSAL_MANIFEST_MAX_BYTES = 256 * 1024;
 const REPAIR_CAUSAL_MANIFEST_LANE = "cluster";
 const REPAIR_CAUSAL_PRODUCER_JOB = "cluster";
+const TERMINAL_MUTATION_COMPLETION_REASONS = new Set([
+  "mutation_accepted",
+  "mutation_rejected",
+  "mutation_outcome_unknown",
+]);
 
 export function repairHttpMutationOutcome(response: {
   ok: boolean;
@@ -341,14 +346,19 @@ export function runRepairMutation<T>(
       },
       ledgerContext,
       recovery,
+      "after the successful operation",
     );
-    throw error;
+    console.error(
+      `[action-ledger] failed to classify ${kind} outcome after the successful operation: ${errorText(error)}`,
+    );
+    return result;
   }
-  recordRepairMutationOutcomeWithRecovery(
-    recovery,
+  recordRepairMutationOutcomeSafely(
     input,
     { ...outcomeOptions, outcome },
     ledgerContext,
+    recovery,
+    "after the successful operation",
   );
   return result;
 }
@@ -437,14 +447,19 @@ export async function runRepairMutationAsync<T>(
       },
       ledgerContext,
       recovery,
+      "after the successful operation",
     );
-    throw error;
+    console.error(
+      `[action-ledger] failed to classify ${kind} outcome after the successful operation: ${errorText(error)}`,
+    );
+    return result;
   }
-  recordRepairMutationOutcomeWithRecovery(
-    recovery,
+  recordRepairMutationOutcomeSafely(
     input,
     { ...outcomeOptions, outcome },
     ledgerContext,
+    recovery,
+    "after the successful operation",
   );
   return result;
 }
@@ -880,17 +895,6 @@ function beginRepairMutationRecovery(
   return recovery;
 }
 
-function recordRepairMutationOutcomeWithRecovery(
-  recovery: RepairMutationRecovery | null,
-  input: RepairLifecycleInput,
-  options: RepairMutationOutcomeOptions,
-  context: RepairActionLedgerContext,
-): void {
-  updateRepairMutationRecoverySafely(recovery, input, options);
-  recordRepairMutationOutcome(input, options, context);
-  removeRepairMutationRecoverySafely(recovery);
-}
-
 export function recoverRepairMutationOutcomes(): void {
   const current = repairActionLedgerContext();
   for (const recovery of readMutationRecoveries<RepairMutationRecoveryPayload>(
@@ -915,6 +919,7 @@ function recordRepairMutationOutcomeSafely(
   options: RepairMutationOutcomeOptions,
   context?: RepairActionLedgerContext,
   recovery?: RepairMutationRecovery | null,
+  failureContext: string = "after the primary failure",
 ): boolean {
   updateRepairMutationRecoverySafely(recovery, input, options);
   try {
@@ -923,7 +928,7 @@ function recordRepairMutationOutcomeSafely(
     return true;
   } catch (error) {
     console.error(
-      `[action-ledger] failed to record ${options.kind} ${options.outcome} outcome: ${errorText(error)}`,
+      `[action-ledger] failed to record ${options.kind} ${options.outcome} outcome ${failureContext}; deferred for recovery: ${errorText(error)}`,
     );
     return false;
   }
@@ -974,11 +979,13 @@ function repairMutationOutcomeRecorded(
   payload: RepairMutationRecoveryPayload,
   context: RepairActionLedgerContext,
 ): boolean {
+  const idempotencyKeySha256 = actionIdempotencyKey(payload.options.idempotencyIdentity);
   return repairAttemptEvents(payload.input, payload.options.operation, context).some(
     (event) =>
       event.parent_event_id === (payload.options.parentEventId ?? null) &&
       event.event_type === ACTION_EVENT_TYPES.repairMutation &&
-      String(event.attributes?.completion_reason ?? "").startsWith("mutation_"),
+      event.idempotency_key_sha256 === idempotencyKeySha256 &&
+      TERMINAL_MUTATION_COMPLETION_REASONS.has(String(event.attributes?.completion_reason ?? "")),
   );
 }
 
