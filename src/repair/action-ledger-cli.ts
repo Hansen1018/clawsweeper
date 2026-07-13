@@ -87,23 +87,40 @@ if (command === "finalize") {
       console.log(JSON.stringify({ eventPaths: manifest.event_paths }, null, 2));
     } else {
       const stateRoot = path.resolve(args.stateRoot ?? repoRoot());
-      console.log(
-        JSON.stringify(
-          importActionEventShards(sourceRoot, stateRoot, {
-            expectedProducer: {
-              repository: manifest.repository,
-              sha: manifest.sha,
-              workflow: manifest.workflow,
-              job: manifest.job,
-              runId: manifest.run_id,
-              runAttempt: manifest.run_attempt,
+      if (manifest.event_paths.length === 0) {
+        console.log(
+          JSON.stringify(
+            {
+              created: 0,
+              unchanged: 0,
+              eventPaths: [],
+              reservationPaths: [],
+              completionPaths: [],
+              paths: [],
             },
-            expectedEventPaths: manifest.event_paths,
-          }),
-          null,
-          2,
-        ),
-      );
+            null,
+            2,
+          ),
+        );
+      } else {
+        console.log(
+          JSON.stringify(
+            importActionEventShards(sourceRoot, stateRoot, {
+              expectedProducer: {
+                repository: manifest.repository,
+                sha: manifest.sha,
+                workflow: manifest.workflow,
+                job: manifest.job,
+                runId: manifest.run_id,
+                runAttempt: manifest.run_attempt,
+              },
+              expectedEventPaths: manifest.event_paths,
+            }),
+            null,
+            2,
+          ),
+        );
+      }
     }
   } else {
     throw new Error("repair action ledger publication requires --repair-lane and --manifest");
