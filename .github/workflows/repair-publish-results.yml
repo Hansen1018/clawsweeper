@@ -537,6 +537,26 @@ jobs:
             --run-record "results/runs/$RUN_ID.json" \
             --write-report
 
+      # This workflow_run job executes trusted main-branch code only; notification
+      # checkpoints are generated locally from already verified result artifacts.
+      # codeql[actions/untrusted-checkout/critical]
+      # lgtm[actions/untrusted-checkout/critical]
+      - name: Commit notification checkpoint
+        if: ${{ steps.download.outputs.has_artifacts == '1' }}
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
+        run: |
+          set -euo pipefail
+          if [ -d notifications ]; then
+            CLAWSWEEPER_ACTION_LEDGER_INVOCATION=notification-state \
+              pnpm run repair:publish-main -- \
+              --message "chore: checkpoint event notifications" \
+              --path notifications \
+              --receipt-kind repair_notification_state \
+              --max-attempts 12 \
+              --push-attempts 4
+          fi
+
       # This workflow_run job executes trusted main-branch code only; artifacts
       # from worker runs are downloaded as data and handled by repair publishers.
       # codeql[actions/untrusted-checkout/critical]
@@ -552,7 +572,6 @@ jobs:
             --path results \
             --path jobs/openclaw/closed \
             --path repair-apply-report.json \
-            --path notifications \
             --receipt-kind repair_result_state \
             --max-attempts 12 \
             --push-attempts 4

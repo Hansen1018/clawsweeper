@@ -23,6 +23,7 @@ import {
 
 type EventSeverity = "info" | "warning" | "error";
 type EventStatus = "sent" | "planned" | "failed" | "skipped";
+type EventDeliveryStatus = "hook_accepted" | "sent";
 type DashboardIngestConfig = {
   url: string;
   token: string;
@@ -51,6 +52,8 @@ export type ClawSweeperEventLedgerEntry = ClawSweeperEvent & {
   notifiedAt: string;
   hookRunId: string | null;
   discordTarget: string | null;
+  deliveryStatus: EventDeliveryStatus;
+  dashboardNotifiedAt: string | null;
 };
 
 export type ClawSweeperEventLedger = {
@@ -115,7 +118,11 @@ export function collectClawSweeperEvents({
   ledger: ClawSweeperEventLedger;
   runId?: string | undefined;
 }): { considered: number; events: ClawSweeperEvent[]; skipped: JsonObject[] } {
-  const seen = new Set(ledger.notifications.map((entry) => entry.key));
+  const seen = new Set(
+    ledger.notifications
+      .filter((entry) => entry.deliveryStatus === "sent")
+      .map((entry) => entry.key),
+  );
   const events: ClawSweeperEvent[] = [];
   const skipped: JsonObject[] = [];
   let considered = 0;
@@ -273,7 +280,13 @@ export function buildFixEvent(row: JsonObject, record: JsonObject): ClawSweeperE
 export function addEventLedgerEntry(
   ledger: ClawSweeperEventLedger,
   event: ClawSweeperEvent,
-  result: { notifiedAt: string; hookRunId: string | null; discordTarget: string | null },
+  result: {
+    notifiedAt: string;
+    hookRunId: string | null;
+    discordTarget: string | null;
+    deliveryStatus?: EventDeliveryStatus;
+    dashboardNotifiedAt?: string | null;
+  },
 ): ClawSweeperEventLedger {
   const existing = new Map(ledger.notifications.map((entry) => [entry.key, entry]));
   existing.set(event.key, {
@@ -281,6 +294,8 @@ export function addEventLedgerEntry(
     notifiedAt: result.notifiedAt,
     hookRunId: result.hookRunId,
     discordTarget: result.discordTarget,
+    deliveryStatus: result.deliveryStatus ?? "sent",
+    dashboardNotifiedAt: result.dashboardNotifiedAt ?? null,
   });
   return {
     version: 1,
@@ -365,6 +380,7 @@ export async function runClawSweeperEventNotifier(
 
   const reportActions: JsonObject[] = [...collected.skipped];
   let nextLedger = ledger;
+  const existingNotifications = new Map(ledger.notifications.map((entry) => [entry.key, entry]));
   for (const event of collected.events) {
     const ledgerInput = eventNotificationLedgerInput(event);
     if (dryRun) {
@@ -378,23 +394,38 @@ export async function runClawSweeperEventNotifier(
     };
     try {
       recordNotificationPhase(ledgerInput, "planned");
-      const result = await postOpenClawAgentHook({
-        config,
-        fetcher,
-        post: {
-          name: eventName(event),
-          message: renderClawSweeperEventMessage(event),
-          idempotencyKey: event.idempotencyKey,
-          deliver: true,
-        },
-        attemptRunner: (operation) =>
-          deliverNotificationAttempt(ledgerInput, {
-            kind: "notification_delivery",
-            destination: "openclaw_hook",
-            operation,
-          }),
-      });
+      const existing = existingNotifications.get(event.key);
+      let hookRunId = existing?.deliveryStatus === "hook_accepted" ? existing.hookRunId : null;
+      const reusedHookCheckpoint = existing?.deliveryStatus === "hook_accepted";
+      if (!reusedHookCheckpoint) {
+        const result = await postOpenClawAgentHook({
+          config,
+          fetcher,
+          post: {
+            name: eventName(event),
+            message: renderClawSweeperEventMessage(event),
+            idempotencyKey: event.idempotencyKey,
+            deliver: true,
+          },
+          attemptRunner: (operation) =>
+            deliverNotificationAttempt(ledgerInput, {
+              kind: "notification_delivery",
+              destination: "openclaw_hook",
+              operation,
+            }),
+        });
+        hookRunId = result.runId;
+        const hookNotifiedAt = now().toISOString();
+        nextLedger = addEventLedgerEntry(nextLedger, event, {
+          notifiedAt: hookNotifiedAt,
+          hookRunId,
+          discordTarget: config.discordTarget,
+          deliveryStatus: "hook_accepted",
+        });
+        writeJsonFile(ledgerPath, nextLedger);
+      }
       let dashboardStatus = "status dashboard not configured";
+      let dashboardNotifiedAt: string | null = null;
       if (dashboardConfig) {
         failingDelivery = {
           kind: "status_dashboard_delivery",
@@ -406,16 +437,25 @@ export async function runClawSweeperEventNotifier(
           knownNoMutation: isRejectedDashboardDelivery,
         });
         dashboardStatus = "sent to status dashboard";
+        dashboardNotifiedAt = now().toISOString();
       }
       recordNotificationPhaseSafely(ledgerInput, "sent");
       const notifiedAt = now().toISOString();
       nextLedger = addEventLedgerEntry(nextLedger, event, {
         notifiedAt,
-        hookRunId: result.runId,
-        discordTarget: config.discordTarget,
+        hookRunId,
+        discordTarget: existing?.discordTarget ?? config.discordTarget,
+        deliveryStatus: "sent",
+        dashboardNotifiedAt,
       });
+      writeJsonFile(ledgerPath, nextLedger);
       reportActions.push(
-        reportRow(event, "sent", `sent to OpenClaw hook; ${dashboardStatus}`, result.runId),
+        reportRow(
+          event,
+          "sent",
+          `${reusedHookCheckpoint ? "reused accepted OpenClaw hook" : "sent to OpenClaw hook"}; ${dashboardStatus}`,
+          hookRunId,
+        ),
       );
     } catch (error) {
       const failureOutcome = isRejectedOpenClawHookError(error)
@@ -434,7 +474,6 @@ export async function runClawSweeperEventNotifier(
     }
   }
 
-  if (!dryRun && nextLedger !== ledger) writeJsonFile(ledgerPath, nextLedger);
   if (reportActions.length > 0 || Boolean(args["write-report"])) {
     writeJsonFile(reportPath, {
       version: 1,
@@ -659,7 +698,16 @@ function normalizeLedgerEntry(row: JsonObject): ClawSweeperEventLedgerEntry | nu
     notifiedAt,
     hookRunId: stringOrNull(row.hookRunId) ?? stringOrNull(row.hook_run_id),
     discordTarget: stringOrNull(row.discordTarget) ?? stringOrNull(row.discord_target),
+    deliveryStatus: normalizeDeliveryStatus(
+      stringOrNull(row.deliveryStatus) ?? stringOrNull(row.delivery_status),
+    ),
+    dashboardNotifiedAt:
+      stringOrNull(row.dashboardNotifiedAt) ?? stringOrNull(row.dashboard_notified_at),
   };
+}
+
+function normalizeDeliveryStatus(value: string | null): EventDeliveryStatus {
+  return value === "hook_accepted" ? value : "sent";
 }
 
 function normalizeSeverity(value: JsonValue): EventSeverity {
@@ -714,7 +762,17 @@ function summaryRow(
 
 function writeJsonFile(filePath: string, value: JsonValue) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+  const temporaryPath = `${filePath}.tmp-${process.pid}`;
+  try {
+    fs.writeFileSync(temporaryPath, `${JSON.stringify(value, null, 2)}\n`, {
+      encoding: "utf8",
+      mode: 0o600,
+    });
+    fs.renameSync(temporaryPath, filePath);
+  } catch (error) {
+    fs.rmSync(temporaryPath, { force: true });
+    throw error;
+  }
 }
 
 async function main() {

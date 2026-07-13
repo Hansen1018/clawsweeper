@@ -122,6 +122,25 @@ test("repair result publication rejects untrusted worker heads before minting wr
   assert.match(classification, /! git merge-base --is-ancestor "\$WORKER_HEAD_SHA"[\s\S]*exit 1/);
 });
 
+test("repair event notifications publish their checkpoint before result state", () => {
+  const workflow = readText(".github/workflows/repair-publish-results.yml");
+  const notifyIndex = workflow.indexOf("- name: Notify OpenClaw about ClawSweeper events");
+  const checkpointIndex = workflow.indexOf("- name: Commit notification checkpoint");
+  const resultIndex = workflow.indexOf("- name: Commit result ledger");
+  const checkpoint = workflow.slice(checkpointIndex, resultIndex);
+  const result = workflow.slice(
+    resultIndex,
+    workflow.indexOf("- name: Finalize repair publication"),
+  );
+
+  assert.ok(notifyIndex >= 0);
+  assert.ok(notifyIndex < checkpointIndex);
+  assert.ok(checkpointIndex < resultIndex);
+  assert.match(checkpoint, /--path notifications/);
+  assert.match(checkpoint, /--receipt-kind repair_notification_state/);
+  assert.doesNotMatch(result, /--path notifications/);
+});
+
 function workerArtifact(id: number, attempt: number) {
   return {
     id,
