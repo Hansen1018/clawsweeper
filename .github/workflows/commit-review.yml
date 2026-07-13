@@ -1,6 +1,6 @@
 name: ClawSweeper Commit Review
 
-run-name: Commit review ${{ github.event.inputs.target_repo || github.event.client_payload.target_repo || 'openclaw/openclaw' }}@${{ github.event.inputs.commit_sha || github.event.client_payload.after_sha || github.event.client_payload.commit_sha || '?' }}
+run-name: ${{ (github.event.inputs.continuation_key || github.event.client_payload.continuation_key) && format('Commit review {0}@{1} [{2}]', github.event.inputs.target_repo || github.event.client_payload.target_repo || 'openclaw/openclaw', github.event.inputs.commit_sha || github.event.client_payload.after_sha || github.event.client_payload.commit_sha || '?', github.event.inputs.continuation_key || github.event.client_payload.continuation_key) || format('Commit review {0}@{1}', github.event.inputs.target_repo || github.event.client_payload.target_repo || 'openclaw/openclaw', github.event.inputs.commit_sha || github.event.client_payload.after_sha || github.event.client_payload.commit_sha || '?') }}
 
 on:
   workflow_dispatch:
@@ -24,6 +24,10 @@ on:
         description: "Internal offset for continuation runs"
         required: false
         default: "0"
+      continuation_key:
+        description: "Stable commit review continuation idempotency key"
+        required: false
+        default: ""
       create_checks:
         description: "Create/update GitHub Checks on reviewed commits"
         required: false
@@ -47,9 +51,48 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  receipt:
+    name: Deduplicate commit review continuation receipt
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      proceed: ${{ steps.receipt.outputs.proceed }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: scripts/dispatch-receipt-owner.sh
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - id: receipt
+        env:
+          CONTINUATION_KEY: ${{ github.event.inputs.continuation_key || github.event.client_payload.continuation_key || '' }}
+          TARGET_REPO: ${{ github.event.inputs.target_repo || github.event.client_payload.target_repo || 'openclaw/openclaw' }}
+          COMMIT_SHA: ${{ github.event.inputs.commit_sha || github.event.client_payload.after_sha || github.event.client_payload.commit_sha || '?' }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ -z "$CONTINUATION_KEY" ]; then
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          expected_title="Commit review ${TARGET_REPO}@${COMMIT_SHA} [${CONTINUATION_KEY}]"
+          owner="$(bash scripts/dispatch-receipt-owner.sh \
+            commit-review.yml "$expected_title" "$GITHUB_RUN_ID" \
+            "Plan commits" "Select commits")"
+          if [ "$owner" = "owner" ]; then
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            echo "An older active or successfully planned continuation already exists; skipping duplicate review."
+            exit 0
+          fi
+          echo "proceed=true" >> "$GITHUB_OUTPUT"
+
   disabled-target:
     name: Skip disabled target commit review
-    if: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.target_repo == 'openclaw/clawhub' && vars.CLAWSWEEPER_ENABLE_CLAWHUB != '1' }}
+    needs: receipt
+    if: ${{ needs.receipt.outputs.proceed == 'true' && github.event_name == 'repository_dispatch' && github.event.client_payload.target_repo == 'openclaw/clawhub' && vars.CLAWSWEEPER_ENABLE_CLAWHUB != '1' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -60,7 +103,8 @@ jobs:
 
   plan:
     name: Plan commits
-    if: ${{ !(github.event_name == 'repository_dispatch' && github.event.client_payload.target_repo == 'openclaw/clawhub' && vars.CLAWSWEEPER_ENABLE_CLAWHUB != '1') }}
+    needs: receipt
+    if: ${{ needs.receipt.outputs.proceed == 'true' && !(github.event_name == 'repository_dispatch' && github.event.client_payload.target_repo == 'openclaw/clawhub' && vars.CLAWSWEEPER_ENABLE_CLAWHUB != '1') }}
     runs-on: ubuntu-latest
     timeout-minutes: 40
     outputs:
@@ -690,6 +734,7 @@ jobs:
           path: commit-artifacts
 
       - name: Commit reports
+        id: publish-reports
         run: |
           set -euo pipefail
           git pull --rebase --autostash
@@ -699,6 +744,12 @@ jobs:
             --path records \
             --receipt-kind commit_review_state \
             --rebase-strategy theirs
+          state_revision="$(git -C "$CLAWSWEEPER_STATE_DIR" rev-parse HEAD)"
+          if ! printf '%s' "$state_revision" | grep -Eq '^[a-f0-9]{40}$'; then
+            echo "Invalid published state revision: $state_revision" >&2
+            exit 1
+          fi
+          echo "state_revision=$state_revision" >> "$GITHUB_OUTPUT"
 
       - name: Create repair dispatch token
         id: clawsweeper-token
@@ -725,7 +776,8 @@ jobs:
             --repair-repo openclaw/clawsweeper \
             --repair-workflow repair-commit-finding-intake.yml \
             --dispatch-mode workflow_dispatch \
-            --report-repo "${{ github.repository }}" \
+            --report-repo openclaw/clawsweeper-state \
+            --report-revision "${{ steps.publish-reports.outputs.state_revision }}" \
             --enabled "$ENABLED"
 
       - name: Create target checks token

@@ -450,6 +450,7 @@ test("commit finding dispatch records the concrete request before publication fi
   const outputRoot = path.join(root, "output");
   const artifactDir = path.join(root, "commit-artifacts", "openclaw-openclaw", "commits");
   const sha = "b".repeat(40);
+  const reportRevision = "f".repeat(40);
   const reportPath = path.join(artifactDir, `${sha}.md`);
   const githubOutput = path.join(root, "github-output.txt");
   const ghLog = path.join(root, "gh.log");
@@ -487,7 +488,9 @@ test("commit finding dispatch records the concrete request before publication fi
         "--dispatch-mode",
         "workflow_dispatch",
         "--report-repo",
-        "openclaw/clawsweeper",
+        "openclaw/clawsweeper-state",
+        "--report-revision",
+        reportRevision,
       ],
       { env, stdio: "pipe" },
     );
@@ -500,6 +503,11 @@ test("commit finding dispatch records the concrete request before publication fi
     assert.match(
       ghArgs.find((arg) => arg.startsWith("dispatch_key=")) ?? "",
       /^dispatch_key=commit-finding-[a-f0-9]{24}$/,
+    );
+    assert.ok(ghArgs.includes(`report_revision=${reportRevision}`));
+    assert.match(
+      ghArgs.find((arg) => arg.startsWith("report_sha256=")) ?? "",
+      /^report_sha256=[a-f0-9]{64}$/,
     );
     const events = readEvents(outputRoot).filter(
       (event) => event.attributes?.publication_kind === "commit_finding_dispatch",
@@ -519,9 +527,11 @@ test("repository and workflow commit finding dispatches share one stable receipt
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "commit-dispatch-key-")));
   const artifactDir = path.join(root, "commit-artifacts", "openclaw-openclaw", "commits");
   const sha = "e".repeat(40);
+  const reportRevision = "a".repeat(40);
+  const reportPath = path.join(artifactDir, `${sha}.md`);
   fs.mkdirSync(artifactDir, { recursive: true });
   fs.writeFileSync(
-    path.join(artifactDir, `${sha}.md`),
+    reportPath,
     `---\nresult: findings\nsha: ${sha}\nrepository: openclaw/openclaw\nhighest_severity: P1\ncheck_conclusion: failure\n---\n`,
   );
 
@@ -536,7 +546,9 @@ test("repository and workflow commit finding dispatches share one stable receipt
       "--repair-workflow",
       "repair-commit-finding-intake.yml",
       "--report-repo",
-      "openclaw/clawsweeper",
+      "openclaw/clawsweeper-state",
+      "--report-revision",
+      reportRevision,
       "--dry-run",
     ];
     const repositoryPayload = JSON.parse(
@@ -553,6 +565,31 @@ test("repository and workflow commit finding dispatches share one stable receipt
 
     assert.match(dispatchKey, /^commit-finding-[a-f0-9]{24}$/);
     assert.match(workflowCommand, new RegExp(`dispatch_key=${dispatchKey}`));
+    assert.equal(repositoryPayload.client_payload.report_revision, reportRevision);
+    assert.match(repositoryPayload.client_payload.report_sha256, /^[a-f0-9]{64}$/);
+
+    const alternateRevisionArgs = [...common];
+    alternateRevisionArgs[alternateRevisionArgs.indexOf(reportRevision)] = "f".repeat(40);
+    const alternateRevisionPayload = JSON.parse(
+      execFileSync(
+        process.execPath,
+        [...alternateRevisionArgs, "--dispatch-mode", "repository_dispatch"],
+        { encoding: "utf8" },
+      ),
+    );
+    assert.equal(alternateRevisionPayload.client_payload.dispatch_key, dispatchKey);
+
+    fs.appendFileSync(reportPath, "\nchanged\n");
+    const changedPayload = JSON.parse(
+      execFileSync(process.execPath, [...common, "--dispatch-mode", "repository_dispatch"], {
+        encoding: "utf8",
+      }),
+    );
+    assert.notEqual(changedPayload.client_payload.dispatch_key, dispatchKey);
+    assert.notEqual(
+      changedPayload.client_payload.report_sha256,
+      repositoryPayload.client_payload.report_sha256,
+    );
   } finally {
     fs.rmSync(root, { force: true, recursive: true });
   }
@@ -565,6 +602,7 @@ test("ambiguous commit finding dispatch failures are not retried", async () => {
   const outputRoot = path.join(root, "output");
   const artifactDir = path.join(root, "commit-artifacts", "openclaw-openclaw", "commits");
   const sha = "d".repeat(40);
+  const reportRevision = "c".repeat(40);
   const reportPath = path.join(artifactDir, `${sha}.md`);
   const ghLog = path.join(root, "gh.log");
   const ghPath = mockGh(root, ghLog, {
@@ -605,7 +643,9 @@ test("ambiguous commit finding dispatch failures are not retried", async () => {
             "--dispatch-mode",
             "workflow_dispatch",
             "--report-repo",
-            "openclaw/clawsweeper",
+            "openclaw/clawsweeper-state",
+            "--report-revision",
+            reportRevision,
           ],
           { env, stdio: "pipe" },
         ),
@@ -677,6 +717,10 @@ test("commit range continuation dispatch records its own request and outcome", a
 
     const ghArgs = JSON.parse(fs.readFileSync(ghLog, "utf8").trim());
     assert.deepEqual(ghArgs.slice(0, 4), ["workflow", "run", "commit-review.yml", "--repo"]);
+    assert.match(
+      ghArgs.find((arg: string) => arg.startsWith("continuation_key=")) ?? "",
+      /^continuation_key=commit-review-continuation-[a-f0-9]{24}$/,
+    );
     const events = readEvents(outputRoot).filter(
       (event) => event.attributes?.publication_kind === "commit_review_continuation_dispatch",
     );
@@ -687,6 +731,57 @@ test("commit range continuation dispatch records its own request and outcome", a
     assert.ok(events.every((event) => event.subject?.source_revision === sha));
   } finally {
     restoreEnv(previous);
+    fs.rmSync(root, { force: true, recursive: true });
+  }
+});
+
+test("commit range continuation dispatch keys are replay-stable and offset-bound", () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "commit-continuation-key-")));
+  const ghLog = path.join(root, "gh.log");
+  const ghPath = mockGh(root, ghLog);
+  const sha = "9".repeat(40);
+  const env = {
+    ...process.env,
+    ...mockGhBinEnv(ghPath, path.dirname(ghPath)),
+    MOCK_GH_LOG: ghLog,
+  };
+  const command = [
+    path.join(process.cwd(), "dist", "commit-sweeper.js"),
+    "dispatch-continuation",
+    "--repository",
+    "openclaw/clawsweeper",
+    "--target-repo",
+    "openclaw/openclaw",
+    "--after-sha",
+    sha,
+    "--commit-offset",
+    "20",
+    "--create-checks",
+    "true",
+  ];
+
+  try {
+    execFileSync(process.execPath, command, { env, stdio: "pipe" });
+    execFileSync(process.execPath, command, { env, stdio: "pipe" });
+    execFileSync(
+      process.execPath,
+      command.map((arg) => (arg === "20" ? "21" : arg)),
+      { env, stdio: "pipe" },
+    );
+
+    const invocations = fs
+      .readFileSync(ghLog, "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as string[]);
+    const keys = invocations.map(
+      (invocation) =>
+        invocation.find((arg) => arg.startsWith("continuation_key="))?.split("=")[1] ?? "",
+    );
+    assert.equal(keys[0], keys[1]);
+    assert.notEqual(keys[1], keys[2]);
+    assert.ok(keys.every((key) => /^commit-review-continuation-[a-f0-9]{24}$/.test(key)));
+  } finally {
     fs.rmSync(root, { force: true, recursive: true });
   }
 });

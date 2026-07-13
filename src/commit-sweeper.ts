@@ -800,6 +800,8 @@ interface CommitFindingDispatch {
   targetRepo: string;
   reportPath: string;
   reportUrl: string;
+  reportRevision: string;
+  reportSha256: string;
   highestSeverity: string;
   checkConclusion: string;
 }
@@ -946,12 +948,15 @@ function githubRunUrl(): string {
   return repository && runId ? `${server}/${repository}/actions/runs/${runId}` : "";
 }
 
-function commitFindingDispatchKey(dispatch: CommitFindingDispatch): string {
+function commitFindingDispatchKey(dispatch: CommitFindingDispatch, reportRepo: string): string {
   const digest = createHash("sha256")
     .update(
       JSON.stringify({
         targetRepo: dispatch.targetRepo,
         sha: dispatch.sha,
+        reportRepo,
+        reportPath: dispatch.reportPath,
+        reportSha256: dispatch.reportSha256,
       }),
     )
     .digest("hex")
@@ -963,12 +968,14 @@ function dispatchPayload(dispatch: CommitFindingDispatch, reportRepo: string): s
   return `${JSON.stringify({
     event_type: "clawsweeper_commit_finding",
     client_payload: {
-      dispatch_key: commitFindingDispatchKey(dispatch),
+      dispatch_key: commitFindingDispatchKey(dispatch, reportRepo),
       target_repo: dispatch.targetRepo,
       commit_sha: dispatch.sha,
       report_repo: reportRepo,
       report_path: dispatch.reportPath,
       report_url: dispatch.reportUrl,
+      report_revision: dispatch.reportRevision,
+      report_sha256: dispatch.reportSha256,
       highest_severity: dispatch.highestSeverity,
       check_conclusion: dispatch.checkConclusion,
       source_run_url: githubRunUrl(),
@@ -995,13 +1002,17 @@ function workflowDispatchArgs(
     "-f",
     `commit_sha=${dispatch.sha}`,
     "-f",
-    `dispatch_key=${commitFindingDispatchKey(dispatch)}`,
+    `dispatch_key=${commitFindingDispatchKey(dispatch, reportRepo)}`,
     "-f",
     `report_repo=${reportRepo}`,
     "-f",
     `report_path=${dispatch.reportPath}`,
     "-f",
     `report_url=${dispatch.reportUrl}`,
+    "-f",
+    `report_revision=${dispatch.reportRevision}`,
+    "-f",
+    `report_sha256=${dispatch.reportSha256}`,
   ];
 }
 
@@ -1032,7 +1043,7 @@ function dispatchCommitFinding(options: {
           arg === "PLACEHOLDER" ? options.repairRepo : arg,
         );
   const lifecycle = commitLifecycle(options.dispatch.targetRepo, options.dispatch.sha);
-  const dispatchKey = commitFindingDispatchKey(options.dispatch);
+  const dispatchKey = commitFindingDispatchKey(options.dispatch, options.reportRepo);
   runCommitMutation(lifecycle, {
     kind: "commit_finding_dispatch",
     identity: {
@@ -1070,15 +1081,12 @@ function dispatchFindingsCommand(args: Args): void {
   const repairRepo = argString(args, "repair_repo", "openclaw/clawsweeper");
   const dispatchMode = argString(args, "dispatch_mode", "workflow_dispatch");
   const repairWorkflow = argString(args, "repair_workflow", "repair-commit-finding-intake.yml");
-  const reportRepo = argString(
-    args,
-    "report_repo",
-    process.env.GITHUB_REPOSITORY || "openclaw/clawsweeper",
-  );
+  const reportRepo = argString(args, "report_repo", "openclaw/clawsweeper-state");
+  const reportRevision = assertSha(argString(args, "report_revision", ""), "report revision");
   const reportBaseUrl = argString(
     args,
     "report_base_url",
-    `https://github.com/${reportRepo}/blob/main`,
+    `https://github.com/${reportRepo}/blob/${reportRevision}`,
   );
   const dryRun = argBool(args, "dry_run");
   const dispatches: CommitFindingDispatch[] = [];
@@ -1097,6 +1105,8 @@ function dispatchFindingsCommand(args: Args): void {
       targetRepo,
       reportPath,
       reportUrl: `${reportBaseUrl.replace(/\/$/, "")}/${reportPath}`,
+      reportRevision,
+      reportSha256: createHash("sha256").update(markdown).digest("hex"),
       highestSeverity: frontMatter.highest_severity ?? "unknown",
       checkConclusion: frontMatter.check_conclusion ?? "neutral",
     });
@@ -1151,6 +1161,20 @@ function dispatchContinuationCommand(args: Args): void {
   }
   const createChecks = argBool(args, "create_checks");
   const additionalPrompt = argString(args, "additional_prompt", "");
+  const continuationIdentity = {
+    repository,
+    workflow,
+    targetRepo,
+    afterSha,
+    beforeSha: beforeSha || null,
+    commitOffset,
+    createChecks,
+    additionalPromptSha256: createHash("sha256").update(additionalPrompt).digest("hex"),
+  };
+  const continuationKey = `commit-review-continuation-${createHash("sha256")
+    .update(JSON.stringify(continuationIdentity))
+    .digest("hex")
+    .slice(0, 24)}`;
   const commandArgs = [
     "workflow",
     "run",
@@ -1171,18 +1195,14 @@ function dispatchContinuationCommand(args: Args): void {
     `create_checks=${createChecks ? "true" : "false"}`,
     "-f",
     `additional_prompt=${additionalPrompt}`,
+    "-f",
+    `continuation_key=${continuationKey}`,
   ];
   runCommitMutation(commitLifecycle(targetRepo, afterSha), {
     kind: "commit_review_continuation_dispatch",
     identity: {
-      repository,
-      workflow,
-      targetRepo,
-      afterSha,
-      beforeSha: beforeSha || null,
-      commitOffset,
-      createChecks,
-      additionalPromptSha256: createHash("sha256").update(additionalPrompt).digest("hex"),
+      ...continuationIdentity,
+      continuationKey,
     },
     operation: () => {
       const result = spawnSync("gh", commandArgs, {

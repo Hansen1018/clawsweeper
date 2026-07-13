@@ -273,6 +273,17 @@ test("commit review and notification workflows publish their operation receipts"
   const review = commit.slice(commit.indexOf("\n  review:"), commit.indexOf("\n  publish:"));
   const publisher = commit.slice(commit.indexOf("\n  publish:"));
 
+  assert.match(commit, /run-name:.*continuation_key/);
+  assert.match(commit, /continuation_key:[\s\S]*Stable commit review continuation idempotency key/);
+  assert.match(commit, /name: Deduplicate commit review continuation receipt/);
+  assert.match(
+    commit,
+    /dispatch-receipt-owner\.sh \\\n\s+commit-review\.yml "\$expected_title" "\$GITHUB_RUN_ID" \\\n\s+"Plan commits" "Select commits"/,
+  );
+  assert.match(
+    commit,
+    /plan:\n\s+name: Plan commits\n\s+needs: receipt\n\s+if:.*needs\.receipt\.outputs\.proceed == 'true'/,
+  );
   assert.match(review, /setup-action-ledger/);
   assert.match(review, /CLAWSWEEPER_ACTION_LEDGER_INVOCATION: commit-\$\{\{ matrix\.sha \}\}/);
   assert.match(review, /--defer-workflow-completion/);
@@ -325,6 +336,12 @@ test("commit review and notification workflows publish their operation receipts"
   assert.match(publisher, /--commit-report "\$\{report_files\[0\]\}"/);
   assert.match(publisher, /--expected-commit-repository "\$EXPECTED_TARGET_REPO"/);
   assert.match(publisher, /--expected-commit-sha "\$commit_sha"/);
+  assert.match(publisher, /state_revision="\$\(git -C "\$CLAWSWEEPER_STATE_DIR" rev-parse HEAD\)"/);
+  assert.match(publisher, /--report-repo openclaw\/clawsweeper-state/);
+  assert.match(
+    publisher,
+    /--report-revision "\$\{\{ steps\.publish-reports\.outputs\.state_revision \}\}"/,
+  );
   assert.ok(
     publisher.indexOf("mapfile -d '' report_files") <
       publisher.indexOf('--commit-report "${report_files[0]}"'),
@@ -362,7 +379,12 @@ test("commit review and notification workflows publish their operation receipts"
   assert.doesNotMatch(findingDispatch, /ghRetryKind|ghRetryWaitMs/);
   assert.match(findingDispatch, /runCommitMutation\(lifecycle/);
   assert.match(findingDispatch, /kind: "commit_finding_dispatch"/);
+  assert.match(commitSweeper, /reportSha256: createHash\("sha256"\)\.update\(markdown\)/);
+  assert.match(commitSweeper, /reportRevision/);
+  assert.match(commitSweeper, /report_sha256: dispatch\.reportSha256/);
+  assert.match(commitSweeper, /report_revision: dispatch\.reportRevision/);
   assert.match(commitSweeper, /kind: "commit_review_continuation_dispatch"/);
+  assert.match(commitSweeper, /continuation_key=\$\{continuationKey\}/);
   assert.match(commitSweeper, /writeCommitPublicationOutput\("dispatch_count"/);
   for (const workflow of [activity, maintainer]) {
     assert.match(workflow, /setup-action-ledger/);

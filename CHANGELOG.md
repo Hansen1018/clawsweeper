@@ -114,6 +114,9 @@ checkpoint, and status-only commits are intentionally omitted.
   notification delivery receipts, generic workflow attempt/finalization
   events, interruption recovery for unfinished generic Codex reviews, and
   immutable workflow publication of the resulting shards.
+- Bound commit-finding dispatch to immutable state revisions and exact report
+  SHA-256 verification, and made paginated commit-review continuations
+  replay-stable through deterministic receipt ownership across workflow reruns.
 - Short-circuited authenticated duplicate comment deliveries when their exact
   body version is already terminal in the durable router ledger, while edited,
   retryable, and state-drifted commands retain the full routing path.
