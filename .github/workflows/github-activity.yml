@@ -104,19 +104,6 @@ jobs:
         with:
           node-version: "24"
 
-      - name: Create notification ledger state token
-        id: notification-state-token
-        if: steps.core-budget.outputs.skip != 'true'
-        uses: ./.github/actions/create-state-token
-        with:
-          client-id: ${{ env.CLAWSWEEPER_APP_CLIENT_ID }}
-          private-key: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
-
-      - uses: ./.github/actions/setup-state
-        if: steps.core-budget.outputs.skip != 'true'
-        with:
-          token: ${{ steps.notification-state-token.outputs.token }}
-
       - uses: ./.github/actions/setup-action-ledger
         if: steps.core-budget.outputs.skip != 'true'
 
@@ -165,6 +152,19 @@ jobs:
             sleep "$((attempt * 10))"
           done
           pnpm run build:repair
+
+      - name: Create notification ledger state token
+        id: notification-state-token
+        if: steps.core-budget.outputs.skip != 'true'
+        uses: ./.github/actions/create-state-token
+        with:
+          client-id: ${{ env.CLAWSWEEPER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
+
+      - uses: ./.github/actions/setup-state
+        if: steps.core-budget.outputs.skip != 'true'
+        with:
+          token: ${{ steps.notification-state-token.outputs.token }}
 
       - name: Dispatch spam scan candidate
         if: steps.core-budget.outputs.skip != 'true'

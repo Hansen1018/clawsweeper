@@ -192,8 +192,8 @@ test("repair worker jobs upload shards and one credentialed job publishes them",
   assert.match(publisher, /collect_lane cluster cluster/);
   assert.match(publisher, /collect_lane execute execute/);
   assert.match(publisher, /collect_lane mutate mutate/);
-  assert.match(publisher, /Successful \$lane job did not expose an action ledger artifact/);
-  assert.match(publisher, /record_lane "\$lane" "\$job_result" "missing"/);
+  assert.match(publisher, /\$lane job \(\$job_result\) did not expose an action ledger artifact/);
+  assert.match(publisher, /record_lane "\$lane" "\$\{job_result:-not-started\}" "missing"/);
   assert.match(publisher, /One or more advertised repair action ledger lanes failed closed/);
   assert.match(publisher, /continue-on-error: true/);
   assert.doesNotMatch(publisher, /require_lane/);
@@ -204,10 +204,36 @@ test("repair ledger collector publishes present lanes when downstream lanes are 
   const result = runRepairLedgerCollector();
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.summary, /\| cluster \| success \| published \|/);
-  assert.match(result.summary, /\| execute \| failure \| missing \|/);
+  assert.match(result.summary, /\| execute \| skipped \| missing \|/);
   assert.match(result.summary, /\| mutate \| skipped \| missing \|/);
   assert.match(result.published, /ledger\/cluster\.json/);
 });
+
+test("repair ledger collector accepts a genuinely non-started lane without an artifact", () => {
+  const result = runRepairLedgerCollector({ executeResult: "" });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.summary, /\| cluster \| success \| published \|/);
+  assert.match(result.summary, /\| execute \| not-started \| missing \|/);
+  assert.match(result.published, /ledger\/cluster\.json/);
+});
+
+for (const jobResult of ["success", "failure", "cancelled"]) {
+  test(`repair ledger collector rejects a ${jobResult} lane without an artifact`, () => {
+    const result = runRepairLedgerCollector({ executeResult: jobResult });
+    assert.notEqual(result.status, 0);
+    assert.match(
+      result.stderr,
+      new RegExp(`execute job \\(${jobResult}\\) did not expose an action ledger artifact`),
+    );
+    assert.match(result.stderr, /advertised repair action ledger lanes failed closed/);
+    assert.match(result.summary, /\| cluster \| success \| published \|/);
+    assert.match(
+      result.summary,
+      new RegExp(`\\| execute \\| ${jobResult} \\| invalid: missing started artifact \\|`),
+    );
+    assert.match(result.published, /ledger\/cluster\.json/);
+  });
+}
 
 test("repair ledger collector preserves valid lanes but fails closed on a forged lane", () => {
   const result = runRepairLedgerCollector({ forgedMutate: true });
@@ -388,6 +414,42 @@ test("commit review and notification workflows publish their operation receipts"
     publisher,
     /artifact-ids: \$\{\{ steps\.review-artifact-cohort\.outputs\.report_artifact_ids \}\}/,
   );
+
+  for (const workflowPath of [
+    ".github/workflows/github-activity.yml",
+    ".github/workflows/maintainer-report-discord.yml",
+  ]) {
+    const workflow = parse(readText(workflowPath)) as {
+      jobs: Record<
+        string,
+        {
+          steps: Array<{
+            id?: string;
+            name?: string;
+            uses?: string;
+            with?: Record<string, unknown>;
+          }>;
+        }
+      >;
+    };
+    const steps = workflow.jobs.notify.steps;
+    const dependencySetup = steps.findIndex((step) => step.id === "setup-pnpm");
+    const stateToken = steps.findIndex(
+      (step) => step.name === "Create notification ledger state token",
+    );
+    const stateCheckout = steps.findIndex((step) => step.uses === "./.github/actions/setup-state");
+    assert.ok(dependencySetup >= 0, `${workflowPath}: missing dependency setup`);
+    assert.ok(stateToken > dependencySetup, `${workflowPath}: state token minted before build`);
+    assert.ok(
+      stateCheckout > stateToken,
+      `${workflowPath}: state credentials persisted before token creation`,
+    );
+    assert.equal(
+      steps[stateCheckout]?.with?.token,
+      "${{ steps.notification-state-token.outputs.token }}",
+      workflowPath,
+    );
+  }
   assert.match(publisher, /normalize_single_download/);
   assert.match(publisher, /Verify and assemble commit review artifact cohort/);
   assert.match(publisher, /merge-multiple: false/);
@@ -618,7 +680,13 @@ test("repair and commit publishers require canonical exact manifests", () => {
   );
 });
 
-function runRepairLedgerCollector({ forgedMutate = false } = {}) {
+function runRepairLedgerCollector({
+  forgedMutate = false,
+  executeResult = "skipped",
+}: {
+  forgedMutate?: boolean;
+  executeResult?: string;
+} = {}) {
   const workflow = parse(readText(".github/workflows/repair-cluster-worker.yml"));
   const step = workflow.jobs["publish-repair-action-ledger"].steps.find(
     (candidate: { name?: string }) => candidate.name === "Publish immutable repair action ledger",
@@ -705,7 +773,7 @@ process.exit(JSON.stringify(input.eventPaths) === JSON.stringify(manifest.event_
         EXECUTE_LEDGER_ARTIFACT_ID: "",
         EXECUTE_LEDGER_ATTEMPT: "",
         EXECUTE_LEDGER_ALLOW_EMPTY: "false",
-        EXECUTE_JOB_RESULT: "failure",
+        EXECUTE_JOB_RESULT: executeResult,
         EXECUTE_DOWNLOAD_OUTCOME: "skipped",
         MUTATE_LEDGER_ARTIFACT_ID: forgedMutate ? "303" : "",
         MUTATE_LEDGER_ATTEMPT: forgedMutate ? "1" : "",

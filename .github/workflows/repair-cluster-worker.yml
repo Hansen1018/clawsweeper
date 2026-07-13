@@ -2255,13 +2255,13 @@ jobs:
             local download_outcome="$6"
             local allow_empty="${7:-false}"
             if [ -z "$artifact_id" ] && [ -z "$run_attempt" ]; then
-              if [ "$job_result" = "success" ]; then
-                echo "Successful $lane job did not expose an action ledger artifact." >&2
-                record_lane "$lane" "$job_result" "invalid: missing successful artifact"
-                collector_failed=1
-              else
-                record_lane "$lane" "$job_result" "missing"
+              if [ -z "$job_result" ] || [ "$job_result" = "skipped" ]; then
+                record_lane "$lane" "${job_result:-not-started}" "missing"
+                return
               fi
+              echo "$lane job ($job_result) did not expose an action ledger artifact." >&2
+              record_lane "$lane" "$job_result" "invalid: missing started artifact"
+              collector_failed=1
               return
             fi
             if [ "$job_result" = "skipped" ]; then

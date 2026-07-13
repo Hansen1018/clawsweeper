@@ -58,6 +58,13 @@ jobs:
           filter: blob:none
           persist-credentials: false
 
+      - uses: ./.github/actions/setup-action-ledger
+
+      - uses: ./.github/actions/setup-pnpm
+        id: setup-pnpm
+        with:
+          build-script: build:repair
+
       - name: Create notification ledger state token
         id: notification-state-token
         uses: ./.github/actions/create-state-token
@@ -68,13 +75,6 @@ jobs:
       - uses: ./.github/actions/setup-state
         with:
           token: ${{ steps.notification-state-token.outputs.token }}
-
-      - uses: ./.github/actions/setup-action-ledger
-
-      - uses: ./.github/actions/setup-pnpm
-        id: setup-pnpm
-        with:
-          build-script: build:repair
 
       - name: Post report summary
         env:
