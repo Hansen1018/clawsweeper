@@ -126,6 +126,7 @@ export async function runMaintainerReportNotifier(
   const strict = Boolean(args.strict || env.CLAWSWEEPER_MAINTAINER_REPORT_STRICT === "1");
   const deliver = boolEnv(env.CLAWSWEEPER_MAINTAINER_REPORT_DELIVER, true);
   const accessHeaders = resolveReportsAccessHeaders(env);
+  const repository = env.GITHUB_REPOSITORY ?? "openclaw/clawsweeper";
 
   const pointer = await fetchReportPointer({
     fetcher,
@@ -135,6 +136,14 @@ export async function runMaintainerReportNotifier(
     ...(date ? { date } : {}),
   });
   if (!pointer) {
+    recordNotificationPhase(
+      {
+        repository,
+        key: `maintainer-report:${date?.trim() || "latest"}`,
+      },
+      "skipped",
+      "report_not_found",
+    );
     const summary = summaryRow("skipped", 0, 0, "daily report not found", null, null, strict);
     log(JSON.stringify(summary));
     return summary;
@@ -144,7 +153,7 @@ export async function runMaintainerReportNotifier(
   const message = renderMaintainerReportMessage({ report, reportUrl: pointer.reportUrl });
   const config = resolveOpenClawHookConfig(env);
   const notificationLedgerInput = {
-    repository: env.GITHUB_REPOSITORY ?? "openclaw/clawsweeper",
+    repository,
     key: `maintainer-report:${pointer.date}`,
   };
   if (!config) {
