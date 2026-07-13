@@ -24,7 +24,6 @@ import { safeOutputTail } from "./clawsweeper-text.js";
 import { codexEnv, codexLoginConfig, codexModelArgs, PUBLIC_CODEX_MODEL } from "./codex-env.js";
 import { codexProcessErrorCode, runCodexProcess } from "./codex-process.js";
 import { runText } from "./command.js";
-import { ghRetryKind, ghRetryWaitMs } from "./github-retry.js";
 import {
   configuredRepositoryProfileFor,
   DEFAULT_TARGET_REPO,
@@ -992,11 +991,6 @@ function workflowDispatchArgs(
   ];
 }
 
-function sleepSync(ms: number): void {
-  if (ms <= 0) return;
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-}
-
 function dispatchFailureError(
   options: { dispatch: CommitFindingDispatch; repairRepo: string },
   result: { stdout?: string | null; stderr?: string | null; error?: Error },
@@ -1024,52 +1018,28 @@ function dispatchCommitFinding(options: {
           arg === "PLACEHOLDER" ? options.repairRepo : arg,
         );
   const lifecycle = commitLifecycle(options.dispatch.targetRepo, options.dispatch.sha);
-  const maxAttempts = 3;
-  for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    let error: Error & { stdout?: string; stderr?: string };
-    try {
-      runCommitMutation(lifecycle, {
-        kind: "commit_finding_dispatch",
-        identity: {
-          repairRepo: options.repairRepo,
-          workflow: options.workflow,
-          mode: options.mode,
-          reportRepo: options.reportRepo,
-          dispatch: options.dispatch,
-        },
-        operation: () => {
-          const result = spawnSync("gh", commandArgs, {
-            input:
-              options.mode === "repository_dispatch"
-                ? dispatchPayload(options.dispatch, options.reportRepo)
-                : undefined,
-            encoding: "utf8",
-            env: process.env,
-          });
-          if (result.status !== 0) throw dispatchFailureError(options, result);
-          return result;
-        },
+  runCommitMutation(lifecycle, {
+    kind: "commit_finding_dispatch",
+    identity: {
+      repairRepo: options.repairRepo,
+      workflow: options.workflow,
+      mode: options.mode,
+      reportRepo: options.reportRepo,
+      dispatch: options.dispatch,
+    },
+    operation: () => {
+      const result = spawnSync("gh", commandArgs, {
+        input:
+          options.mode === "repository_dispatch"
+            ? dispatchPayload(options.dispatch, options.reportRepo)
+            : undefined,
+        encoding: "utf8",
+        env: process.env,
       });
-      return;
-    } catch (cause) {
-      const failure = cause as { stdout?: unknown; stderr?: unknown };
-      error =
-        cause instanceof Error
-          ? Object.assign(cause, {
-              stdout: typeof failure.stdout === "string" ? failure.stdout : "",
-              stderr: typeof failure.stderr === "string" ? failure.stderr : "",
-            })
-          : Object.assign(new Error(String(cause)), { stdout: "", stderr: "" });
-    }
-    const retryKind = ghRetryKind(error);
-    if (attempt >= maxAttempts - 1 || retryKind === "none") throw error;
-
-    const waitMs = ghRetryWaitMs(retryKind, attempt);
-    console.warn(
-      `dispatch failed with ${retryKind} GitHub error; retrying in ${Math.round(waitMs / 1000)}s`,
-    );
-    sleepSync(waitMs);
-  }
+      if (result.status !== 0) throw dispatchFailureError(options, result);
+      return result;
+    },
+  });
 }
 
 function dispatchFindingsCommand(args: Args): void {

@@ -331,6 +331,82 @@ test("commit finding dispatch records the concrete request before publication fi
   }
 });
 
+test("ambiguous commit finding dispatch failures are not retried", async () => {
+  const root = fs.realpathSync(
+    fs.mkdtempSync(path.join(os.tmpdir(), "commit-dispatch-ambiguous-")),
+  );
+  const outputRoot = path.join(root, "output");
+  const artifactDir = path.join(root, "commit-artifacts", "openclaw-openclaw", "commits");
+  const sha = "d".repeat(40);
+  const reportPath = path.join(artifactDir, `${sha}.md`);
+  const ghLog = path.join(root, "gh.log");
+  const ghPath = mockGh(root, ghLog, {
+    exitCode: 1,
+    stderr: "HTTP 502: upstream response lost",
+  });
+  fs.mkdirSync(outputRoot);
+  fs.mkdirSync(artifactDir, { recursive: true });
+  fs.writeFileSync(
+    reportPath,
+    `---\nresult: findings\nsha: ${sha}\nrepository: openclaw/openclaw\nhighest_severity: P1\ncheck_conclusion: failure\n---\n`,
+  );
+  const previous = { ...process.env };
+  const env = {
+    ...process.env,
+    ...workflowEnv(root, outputRoot),
+    ...mockGhBinEnv(ghPath, path.dirname(ghPath)),
+    GITHUB_ACTION: "dispatch_findings",
+    GITHUB_JOB: "publish",
+    MOCK_GH_LOG: ghLog,
+  };
+  Object.assign(process.env, env);
+
+  try {
+    assert.throws(
+      () =>
+        execFileSync(
+          process.execPath,
+          [
+            path.join(process.cwd(), "dist", "commit-sweeper.js"),
+            "dispatch-findings",
+            "--artifact-dir",
+            path.join(root, "commit-artifacts"),
+            "--repair-repo",
+            "openclaw/clawsweeper",
+            "--repair-workflow",
+            "repair-commit-finding-intake.yml",
+            "--dispatch-mode",
+            "workflow_dispatch",
+            "--report-repo",
+            "openclaw/clawsweeper",
+          ],
+          { env, stdio: "pipe" },
+        ),
+      /failed to dispatch/,
+    );
+    await flushWorkflowActionEvents(root);
+
+    assert.equal(fs.readFileSync(ghLog, "utf8").trim().split("\n").length, 1);
+    const events = readEvents(outputRoot).filter(
+      (event) => event.attributes?.publication_kind === "commit_finding_dispatch",
+    );
+    assert.deepEqual(
+      events.map((event) => [
+        event.action.status,
+        event.action.mutation,
+        event.attributes?.completion_reason,
+      ]),
+      [
+        ["started", false, "mutation_attempted"],
+        ["failed", true, "mutation_outcome_unknown"],
+      ],
+    );
+  } finally {
+    restoreEnv(previous);
+    fs.rmSync(root, { force: true, recursive: true });
+  }
+});
+
 test("commit range continuation dispatch records its own request and outcome", async () => {
   const root = fs.realpathSync(
     fs.mkdtempSync(path.join(os.tmpdir(), "commit-continuation-ledger-")),
@@ -408,13 +484,23 @@ function workflowEnv(root: string, outputRoot: string) {
   };
 }
 
-function mockGh(root: string, logPath: string): string {
+function mockGh(
+  root: string,
+  logPath: string,
+  options: { exitCode?: number; stderr?: string } = {},
+): string {
   const binDir = path.join(root, "bin");
   const ghPath = path.join(binDir, "gh");
   fs.mkdirSync(binDir, { recursive: true });
   fs.writeFileSync(
     ghPath,
-    `#!/usr/bin/env node\nrequire("node:fs").appendFileSync(${JSON.stringify(logPath)}, JSON.stringify(process.argv.slice(2)) + "\\n");\n`,
+    [
+      "#!/usr/bin/env node",
+      `require("node:fs").appendFileSync(${JSON.stringify(logPath)}, JSON.stringify(process.argv.slice(2)) + "\\n");`,
+      ...(options.stderr ? [`process.stderr.write(${JSON.stringify(options.stderr)});`] : []),
+      ...(options.exitCode ? [`process.exitCode = ${options.exitCode};`] : []),
+      "",
+    ].join("\n"),
   );
   fs.chmodSync(ghPath, 0o755);
   return ghPath;

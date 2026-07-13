@@ -304,7 +304,8 @@ test("commit review and notification workflows publish their operation receipts"
     commitSweeper.indexOf("function dispatchCommitFinding"),
     commitSweeper.indexOf("function dispatchFindingsCommand"),
   );
-  assert.match(findingDispatch, /for \(let attempt = 0; attempt < maxAttempts; attempt\+\+\)/);
+  assert.doesNotMatch(findingDispatch, /for \(let attempt = 0/);
+  assert.doesNotMatch(findingDispatch, /ghRetryKind|ghRetryWaitMs/);
   assert.match(findingDispatch, /runCommitMutation\(lifecycle/);
   assert.match(findingDispatch, /kind: "commit_finding_dispatch"/);
   assert.match(commitSweeper, /kind: "commit_review_continuation_dispatch"/);
