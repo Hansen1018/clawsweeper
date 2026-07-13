@@ -6,6 +6,7 @@ import path from "node:path";
 import test from "node:test";
 
 import { readSpooledActionEvents } from "../../dist/action-ledger.js";
+import { createReviewedTimelineCursor } from "../../dist/repair/timeline-cursor.js";
 import { mockGhBinEnv } from "../helpers.ts";
 
 const repoRoot = process.cwd();
@@ -1370,6 +1371,22 @@ test("repair apply fresh attempts reconcile an unknown claimed merge without rei
   }
 });
 
+test("repair apply blocks same-second foreign activity before claiming the merge", () => {
+  const fixture = writeMergeApplyFixture();
+  try {
+    fs.writeFileSync(fixture.unrelatedDriftPath, "same_timestamp");
+    runMergeApplyResult(fixture);
+
+    const report = readApplyReport(fixture.reportPath);
+    assert.equal(report.actions[0].status, "blocked");
+    assert.equal(report.actions[0].reason, "target changed since worker review");
+    assert.equal(mergeCallCount(fixture.ghLogPath), 0);
+    assert.equal(fs.existsSync(fixture.mergeClaimPath), false);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
 test("repair apply reconstructs durable squash proof in a fresh process", () => {
   const fixture = writeMergeApplyFixture();
   try {
@@ -1459,6 +1476,9 @@ test("repair apply requires a fresh reviewed timestamp after releasing a post-cl
 
     const refreshedResult = JSON.parse(fs.readFileSync(fixture.resultPath, "utf8"));
     refreshedResult.actions[0].target_updated_at = "2026-07-13T07:02:02.000Z";
+    refreshedResult.actions[0].target_timeline_cursor = createReviewedTimelineCursor(
+      comments.map((comment: Record<string, unknown>) => ({ ...comment, event: "commented" })),
+    );
     fs.writeFileSync(fixture.resultPath, JSON.stringify(refreshedResult, null, 2));
     runMergeApplyResult(fixture, { runAttempt: 3 });
     report = readApplyReport(fixture.reportPath);
@@ -2042,6 +2062,7 @@ function writeMergeApplyFixture(
             target: "#101",
             target_kind: "pull_request",
             target_updated_at: "2026-07-13T07:00:00Z",
+            target_timeline_cursor: createReviewedTimelineCursor([]),
             status: "planned",
           },
         ],
@@ -2152,7 +2173,7 @@ if (args[0] === "api") {
     const driftMode = fs.existsSync(data.unrelatedDriftPath)
       ? fs.readFileSync(data.unrelatedDriftPath, "utf8").trim()
       : "";
-    if (driftMode === "same_timestamp" && comments.length > 0) {
+    if (driftMode === "same_timestamp") {
       timeline.push({
         id: 90001,
         event: "labeled",

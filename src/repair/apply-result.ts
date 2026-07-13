@@ -18,6 +18,7 @@ import {
   githubLimitedPagePath,
   ghJson as ghJsonOnce,
   ghJsonWithRetry as ghJson,
+  ghPagedLimitWithRetry as ghPagedLimit,
   ghPagedWithRetry as ghPaged,
   ghText,
   ghTextWithRetry as ghWithRetry,
@@ -60,6 +61,7 @@ import {
   type ExactHeadMergeClaimInspection,
   type ExactHeadMergeClaimRequest,
 } from "./exact-head-merge-claim.js";
+import { reviewedTimelineTail } from "./timeline-cursor.js";
 import {
   recordRepairMutationObservedSafely,
   repairSourceRevision,
@@ -619,11 +621,21 @@ function applyMergeAction({
     };
   }
   const expectedUpdatedAt = action.target_updated_at ?? action.live_updated_at;
+  const expectedTimelineCursor = action.target_timeline_cursor;
   if (!expectedUpdatedAt && !allowMissingUpdatedAt) {
     return {
       ...base,
       status: "blocked",
       reason: "missing target_updated_at; rerun the worker against live GitHub state",
+      live_state: live.state,
+      live_updated_at: live.updated_at,
+    };
+  }
+  if (!expectedTimelineCursor) {
+    return {
+      ...base,
+      status: "blocked",
+      reason: "missing target_timeline_cursor; rerun the worker against live GitHub state",
       live_state: live.state,
       live_updated_at: live.updated_at,
     };
@@ -686,6 +698,7 @@ function applyMergeAction({
       target,
       authorizedHeadSha,
       expectedUpdatedAt,
+      expectedTimelineCursor,
       live.updated_at,
       preliminaryClaim,
     )
@@ -860,6 +873,7 @@ function applyMergeAction({
       target,
       authorizedHeadSha,
       expectedUpdatedAt,
+      expectedTimelineCursor,
       finalLive.updated_at,
       preliminaryClaim,
     )
@@ -1058,6 +1072,7 @@ function applyMergeAction({
         target,
         authorizedHeadSha,
         expectedUpdatedAt,
+        expectedTimelineCursor,
         claimedLive.updated_at,
         mergeClaim,
       )
@@ -1548,6 +1563,7 @@ function applyMergeUpdatedAtMatches(
   number: number,
   headSha: string,
   expectedUpdatedAt: JsonValue,
+  expectedTimelineCursor: JsonValue,
   liveUpdatedAt: JsonValue,
   claim: {
     status: string;
@@ -1555,14 +1571,17 @@ function applyMergeUpdatedAtMatches(
     lastClaimMutationAt?: string | null;
   },
 ) {
-  if (exactHeadMergeUpdatedAtMatches(expectedUpdatedAt, liveUpdatedAt)) return true;
-  if (claim.status !== "existing" && claim.status !== "acquired") return false;
   try {
     const request = applyMergeClaimRequest(repository, number, headSha);
-    const timeline = ghPaged<LooseRecord>(
-      `repos/${request.repository}/issues/${request.number}/timeline?per_page=100`,
+    const timeline = ghPagedLimit<LooseRecord>(
+      `repos/${request.repository}/issues/${request.number}/timeline`,
+      1_001,
     );
-    return exactHeadMergeClaimOwnsUpdatedAt(claim, expectedUpdatedAt, liveUpdatedAt, timeline);
+    if (exactHeadMergeUpdatedAtMatches(expectedUpdatedAt, liveUpdatedAt)) {
+      return reviewedTimelineTail(expectedTimelineCursor, timeline) !== null;
+    }
+    if (claim.status !== "existing" && claim.status !== "acquired") return false;
+    return exactHeadMergeClaimOwnsUpdatedAt(claim, expectedTimelineCursor, liveUpdatedAt, timeline);
   } catch {
     return false;
   }

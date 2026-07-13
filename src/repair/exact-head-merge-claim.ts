@@ -1,4 +1,5 @@
 import type { LooseRecord } from "./json-types.js";
+import { reviewedTimelineTail } from "./timeline-cursor.js";
 
 const CLAIM_PREFIX = "clawsweeper-exact-head-merge-claim:v1";
 const RELEASE_PREFIX = "clawsweeper-exact-head-merge-release:v1";
@@ -1466,16 +1467,14 @@ export function exactHeadMergeClaimOwnsUpdatedAt(
     lastClaimMutationAt?: string | null;
     claimMutationIds?: number[];
   },
-  reviewedUpdatedAt: unknown,
+  reviewedTimelineCursor: unknown,
   updatedAt: unknown,
   timeline: LooseRecord[],
 ): boolean {
-  const reviewedAt = normalizeTimestamp(reviewedUpdatedAt);
   const mutationId = Number(claim.lastClaimMutationId);
   const mutationAt = normalizeTimestamp(claim.lastClaimMutationAt);
   const liveUpdatedAt = normalizeTimestamp(updatedAt);
   if (
-    !reviewedAt ||
     !Number.isSafeInteger(mutationId) ||
     mutationId < 1 ||
     !mutationAt ||
@@ -1484,11 +1483,9 @@ export function exactHeadMergeClaimOwnsUpdatedAt(
   ) {
     return false;
   }
-  const reviewedAtMs = Date.parse(reviewedAt);
   const mutationMs = Date.parse(mutationAt);
   const liveUpdatedAtMs = Date.parse(liveUpdatedAt);
   if (
-    mutationMs <= reviewedAtMs ||
     liveUpdatedAtMs < mutationMs ||
     liveUpdatedAtMs - mutationMs > CLAIM_ACTIVITY_PROPAGATION_MS
   ) {
@@ -1501,19 +1498,13 @@ export function exactHeadMergeClaimOwnsUpdatedAt(
       ...(Array.isArray(claim.claimMutationIds) ? claim.claimMutationIds.map(Number) : []),
     ].filter((value) => Number.isSafeInteger(value) && value > 0),
   );
+  const tail = reviewedTimelineTail(reviewedTimelineCursor, timeline, allowedMutationIds);
+  if (!tail) return false;
   let matchedMutation = false;
-  for (const activity of timeline) {
+  for (const activity of tail) {
     const activityAt = normalizeTimestamp(activity.updated_at ?? activity.created_at);
     if (!activityAt) continue;
-    const activityAtMs = Date.parse(activityAt);
-    if (activityAtMs <= reviewedAtMs) continue;
     const activityId = Number(activity.id);
-    if (
-      !allowedMutationIds.has(activityId) ||
-      (activity.event !== undefined && String(activity.event) !== "commented")
-    ) {
-      return false;
-    }
     if (activityId === mutationId) {
       if (!exactHeadMergeUpdatedAtMatches(activityAt, mutationAt)) return false;
       matchedMutation = true;
