@@ -372,19 +372,20 @@ export async function runClawSweeperEventNotifier(
     try {
       const ledgerInput = eventNotificationLedgerInput(event);
       recordNotificationPhase(ledgerInput, "planned");
-      const result = await deliverNotificationAttempt(ledgerInput, {
-        kind: "notification_delivery",
-        destination: "openclaw_hook",
-        operation: () =>
-          postOpenClawAgentHook({
-            config,
-            fetcher,
-            post: {
-              name: eventName(event),
-              message: renderClawSweeperEventMessage(event),
-              idempotencyKey: event.idempotencyKey,
-              deliver: true,
-            },
+      const result = await postOpenClawAgentHook({
+        config,
+        fetcher,
+        post: {
+          name: eventName(event),
+          message: renderClawSweeperEventMessage(event),
+          idempotencyKey: event.idempotencyKey,
+          deliver: true,
+        },
+        attemptRunner: (operation) =>
+          deliverNotificationAttempt(ledgerInput, {
+            kind: "notification_delivery",
+            destination: "openclaw_hook",
+            operation,
           }),
       });
       let dashboardStatus = "status dashboard not configured";

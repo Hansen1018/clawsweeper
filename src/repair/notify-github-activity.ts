@@ -14,7 +14,10 @@ import {
   stringArg,
   stringOrNull,
 } from "./openclaw-hook.js";
-import { deliverNotification, recordNotificationPhase } from "./notification-action-ledger.js";
+import {
+  deliverRetriedNotification,
+  recordNotificationPhase,
+} from "./notification-action-ledger.js";
 
 export type GithubActivity = {
   type: string;
@@ -343,17 +346,20 @@ export async function runGithubActivityNotifier(
   let reason: string | null = null;
   if (!dryRun) {
     try {
-      const result = await deliverNotification(activityNotificationLedgerInput(activity), () =>
-        postOpenClawAgentHook({
-          config,
-          fetcher,
-          post: {
-            name: `GitHub ${activity.type} ${activity.repo}`,
-            message: renderGithubActivityMessage(activity, config.discordTarget),
-            idempotencyKey: activity.idempotencyKey,
-            deliver,
-          },
-        }),
+      const result = await deliverRetriedNotification(
+        activityNotificationLedgerInput(activity),
+        (attemptRunner) =>
+          postOpenClawAgentHook({
+            config,
+            fetcher,
+            post: {
+              name: `GitHub ${activity.type} ${activity.repo}`,
+              message: renderGithubActivityMessage(activity, config.discordTarget),
+              idempotencyKey: activity.idempotencyKey,
+              deliver,
+            },
+            attemptRunner,
+          }),
       );
       hookRunId = result.runId;
     } catch (error) {

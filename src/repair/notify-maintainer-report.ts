@@ -13,7 +13,10 @@ import {
   stringArg,
   stringOrNull,
 } from "./openclaw-hook.js";
-import { deliverNotification, recordNotificationPhase } from "./notification-action-ledger.js";
+import {
+  deliverRetriedNotification,
+  recordNotificationPhase,
+} from "./notification-action-ledger.js";
 
 export type MaintainerReportPointer = {
   date: string;
@@ -168,7 +171,7 @@ export async function runMaintainerReportNotifier(
   let reason: string | null = null;
   if (!dryRun) {
     try {
-      const result = await deliverNotification(notificationLedgerInput, () =>
+      const result = await deliverRetriedNotification(notificationLedgerInput, (attemptRunner) =>
         postOpenClawAgentHook({
           config,
           fetcher,
@@ -178,6 +181,7 @@ export async function runMaintainerReportNotifier(
             idempotencyKey: `maintainer-report:${pointer.date}`,
             deliver,
           },
+          attemptRunner,
         }),
       );
       hookRunId = result.runId;

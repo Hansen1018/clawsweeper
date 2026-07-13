@@ -28,6 +28,7 @@ const post = {
 
 test("postOpenClawAgentHook retries transient hook failures with the same idempotency key", async () => {
   const calls: string[] = [];
+  const attempts: number[] = [];
   const fetcher: typeof fetch = async (_input, init) => {
     calls.push(new Headers(init?.headers).get("idempotency-key") ?? "");
     if (calls.length === 1) return new Response("bad gateway", { status: 502 });
@@ -39,11 +40,16 @@ test("postOpenClawAgentHook retries transient hook failures with the same idempo
     config,
     fetcher,
     post,
+    attemptRunner: async (operation) => {
+      attempts.push(attempts.length + 1);
+      return operation();
+    },
     retryDelaysMs: [0, 0],
   });
 
   assert.equal(result.runId, "run-123");
   assert.deepEqual(calls, ["github-activity:test", "github-activity:test", "github-activity:test"]);
+  assert.deepEqual(attempts, [1, 2, 3]);
 });
 
 test("postOpenClawAgentHook does not retry non-transient hook failures", async () => {

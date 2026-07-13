@@ -5,9 +5,11 @@ import path from "node:path";
 import test from "node:test";
 
 import { ACTION_EVENT_TYPES } from "../../dist/action-ledger.js";
+import { postOpenClawAgentHook } from "../../dist/repair/openclaw-hook.js";
 import {
   deliverNotification,
   deliverNotificationAttempt,
+  deliverRetriedNotification,
   type NotificationLedgerInput,
 } from "../../dist/repair/notification-action-ledger.js";
 import { flushRepairActionEvents } from "../../dist/repair/repair-action-ledger.js";
@@ -140,6 +142,86 @@ test("hook and status dashboard deliveries keep separate exact attempt outcomes"
   } finally {
     restoreEnv(previous);
     fs.rmSync(root, { force: true, recursive: true });
+  }
+});
+
+test("retrying hook delivery records every wire request as its own attempt", async () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "notification-retries-")));
+  const outputRoot = path.join(root, "output");
+  fs.mkdirSync(outputRoot);
+  const previous = { ...process.env };
+  Object.assign(process.env, workflowEnv(root, outputRoot));
+  const input: NotificationLedgerInput = {
+    repository: "openclaw/clawsweeper",
+    key: "notification:test:retries",
+    number: 44,
+  };
+  let requests = 0;
+
+  try {
+    const result = await deliverRetriedNotification(input, (attemptRunner) =>
+      postOpenClawAgentHook({
+        config: {
+          hookUrl: "https://claw.example/hooks/agent",
+          token: "secret",
+          agentId: "clawsweeper",
+          channel: "discord",
+          discordTarget: "channel:123",
+          thinking: "low",
+          timeoutSeconds: 1,
+          retryAttempts: 3,
+        },
+        fetcher: async () => {
+          requests += 1;
+          if (requests === 1) return new Response("bad gateway", { status: 502 });
+          if (requests === 2) throw new Error("read ECONNRESET");
+          return Response.json({ runId: "hook-run-3" });
+        },
+        post: {
+          name: "Retry test",
+          message: "hello",
+          idempotencyKey: input.key,
+          deliver: true,
+        },
+        attemptRunner,
+        retryDelaysMs: [0, 0],
+      }),
+    );
+    assert.equal(result.runId, "hook-run-3");
+    assert.equal(requests, 3);
+    await flushRepairActionEvents();
+
+    const events = readEvents(outputRoot);
+    assert.deepEqual(
+      events.map((event) => event.attributes?.state),
+      [
+        "planned",
+        "mutation_attempted",
+        "mutation_unknown",
+        "mutation_attempted",
+        "mutation_unknown",
+        "mutation_attempted",
+        "mutation_accepted",
+        "sent",
+      ],
+    );
+    const attempts = events.filter((event) => event.attributes?.state === "mutation_attempted");
+    assert.equal(attempts.length, 3);
+    assert.equal(new Set(attempts.map((event) => event.event_id)).size, 3);
+  } finally {
+    restoreEnv(previous);
+    fs.rmSync(root, { force: true, recursive: true });
+  }
+});
+
+test("all shared OpenClaw notification callers use per-wire attempt runners", () => {
+  for (const file of [
+    "src/repair/notify-events.ts",
+    "src/repair/notify-github-activity.ts",
+    "src/repair/notify-maintainer-report.ts",
+  ]) {
+    const source = fs.readFileSync(file, "utf8");
+    assert.match(source, /postOpenClawAgentHook\(\{[\s\S]*?attemptRunner[\s\S]*?\}\)/);
   }
 });
 

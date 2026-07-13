@@ -19,6 +19,7 @@ export type NotificationLedgerInput = {
 };
 
 export type NotificationMutationOutcome = "mutation_observed" | "mutation_outcome_unknown";
+export type NotificationAttemptRunner = <T>(operation: () => Promise<T>) => Promise<T>;
 
 export function recordNotificationPhase(
   input: NotificationLedgerInput,
@@ -117,6 +118,31 @@ export async function deliverNotification<T>(
       destination: "openclaw_hook",
       operation,
     });
+    recordNotificationPhase(input, "sent");
+    return result;
+  } catch (error) {
+    recordNotificationPhaseSafely(
+      input,
+      "failed",
+      error instanceof Error ? error.name : typeof error,
+    );
+    throw error;
+  }
+}
+
+export async function deliverRetriedNotification<T>(
+  input: NotificationLedgerInput,
+  operation: (attemptRunner: NotificationAttemptRunner) => Promise<T>,
+): Promise<T> {
+  recordNotificationPhase(input, "planned");
+  try {
+    const result = await operation((attempt) =>
+      deliverNotificationAttempt(input, {
+        kind: "notification_delivery",
+        destination: "openclaw_hook",
+        operation: attempt,
+      }),
+    );
     recordNotificationPhase(input, "sent");
     return result;
   } catch (error) {
