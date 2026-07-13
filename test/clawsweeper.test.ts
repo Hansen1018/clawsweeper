@@ -2201,8 +2201,14 @@ test("sweep workflow executes only durable queue leases without runner-side admi
   assert.match(eventReviewBlock, /exact-review-action-ledger-cli\.js claim/);
   assert.match(eventReviewBlock, /exact-review-action-ledger-cli\.js complete/);
   assert.match(claimStep, /RUN_ATTEMPT: \$\{\{ github\.run_attempt \}\}/);
-  assert.match(exactReviewQueue, /const hasTuple = Boolean\(requestedItemKey \|\| rawLeaseRevision\)/);
-  assert.match(exactReviewQueue, /const responseProtocol = Number\(parsed\.protocol_version \|\| 1\)/);
+  assert.match(
+    exactReviewQueue,
+    /const hasTuple = Boolean\(requestedItemKey \|\| rawLeaseRevision\)/,
+  );
+  assert.match(
+    exactReviewQueue,
+    /const responseProtocol = Number\(parsed\.protocol_version \|\| 1\)/,
+  );
   assert.match(exactReviewQueue, /const legacyDecision: JsonObject = \{/);
   assert.match(exactReviewQueue, /run_attempt: runAttempt/);
   assert.match(
@@ -2226,7 +2232,10 @@ test("sweep workflow executes only durable queue leases without runner-side admi
     /PRIMARY_OUTCOME: \$\{\{ steps\.exact-review-primary-result\.outputs\.outcome \|\| 'failure' \}\}/,
   );
   assert.doesNotMatch(completeLeaseStep, /JOB_STATUS:/);
-  assert.match(completeLeaseStep, /if: \$\{\{ always\(\) \}\}/);
+  assert.match(
+    completeLeaseStep,
+    /if: \$\{\{ always\(\) && steps\.finalize-exact-event-action-ledger\.outcome == 'success' && steps\.publish-exact-event-action-ledger\.outcome == 'success' \}\}/,
+  );
   assert.match(completeLeaseStep, /continue-on-error: true/);
   assert.match(completeLeaseStep, /RUN_ATTEMPT: \$\{\{ github\.run_attempt \}\}/);
   assert.match(
