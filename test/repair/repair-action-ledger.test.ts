@@ -9,6 +9,7 @@ import {
   ACTION_EVENT_REASON_CODES,
   ACTION_EVENT_STATUSES,
   ACTION_EVENT_TYPES,
+  readSpooledActionEvents,
 } from "../../dist/action-ledger.js";
 import {
   flushRepairActionEvents,
@@ -19,6 +20,7 @@ import {
   repairSourceRevision,
   repairWorkflowTerminalPhase,
   runRepairMutation,
+  runRepairMutationAsync,
 } from "../../dist/repair/repair-action-ledger.js";
 
 test("repair receipts preserve operation and mutation identity across workflow retries", async () => {
@@ -146,6 +148,44 @@ test("repair mutation uncertainty survives later workflow failure", async () => 
     assert.equal(failure?.action.mutation, true);
     assert.equal(failure?.action.retryable, true);
     assert.equal(failure?.attributes?.completion_reason, "mutation_outcome_unknown");
+  } finally {
+    restoreEnv(previous);
+    fs.rmSync(root, { force: true, recursive: true });
+  }
+});
+
+test("async receipt write failures do not reclassify successful remote mutations", async () => {
+  const root = fs.realpathSync(
+    fs.mkdtempSync(path.join(os.tmpdir(), "repair-local-receipt-failure-")),
+  );
+  const outputRoot = path.join(root, "output");
+  fs.mkdirSync(outputRoot);
+  const previous = { ...process.env };
+  Object.assign(process.env, workflowEnv(root, outputRoot));
+
+  try {
+    await assert.rejects(
+      runRepairMutationAsync(repairLifecycle(), {
+        kind: "branch_push",
+        identity: { repo: "openclaw/openclaw", ref: "refs/heads/fix", sha: "a".repeat(40) },
+        operation: async () => {
+          process.env.GITHUB_REPOSITORY = "not a repository";
+          return "accepted";
+        },
+      }),
+      /repository/,
+    );
+
+    process.env.GITHUB_REPOSITORY = "openclaw/clawsweeper";
+    const events = readSpooledActionEvents(root, "openclaw/openclaw");
+    assert.equal(events.length, 1);
+    assert.equal(events[0]?.attributes?.completion_reason, "mutation_attempted");
+    assert.equal(
+      events.some(
+        (event) => event.attributes?.completion_reason === "mutation_outcome_unknown",
+      ),
+      false,
+    );
   } finally {
     restoreEnv(previous);
     fs.rmSync(root, { force: true, recursive: true });

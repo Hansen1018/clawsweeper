@@ -303,20 +303,10 @@ export async function runRepairMutationAsync<T>(
     completionReason: "mutation_attempted",
     state: "mutation_attempted",
   });
+
+  let result: T;
   try {
-    const result = await options.operation();
-    const outcome = options.outcome?.(result) ?? "accepted";
-    recordRepairMutationOutcome(input, {
-      kind,
-      requestSha256,
-      requestAttempt,
-      idempotencyIdentity,
-      operation,
-      parentEventId: attemptEvent?.event_id ?? null,
-      ...(options.component ? { component: options.component } : {}),
-      outcome,
-    });
-    return result;
+    result = await options.operation();
   } catch (error) {
     let outcome: RepairMutationOutcome = "unknown";
     try {
@@ -336,6 +326,34 @@ export async function runRepairMutationAsync<T>(
     });
     throw error;
   }
+
+  let outcome: RepairMutationOutcome;
+  try {
+    outcome = options.outcome?.(result) ?? "accepted";
+  } catch (error) {
+    recordRepairMutationOutcomeSafely(input, {
+      kind,
+      requestSha256,
+      requestAttempt,
+      idempotencyIdentity,
+      operation,
+      parentEventId: attemptEvent?.event_id ?? null,
+      ...(options.component ? { component: options.component } : {}),
+      outcome: "unknown",
+    });
+    throw error;
+  }
+  recordRepairMutationOutcome(input, {
+    kind,
+    requestSha256,
+    requestAttempt,
+    idempotencyIdentity,
+    operation,
+    parentEventId: attemptEvent?.event_id ?? null,
+    ...(options.component ? { component: options.component } : {}),
+    outcome,
+  });
+  return result;
 }
 
 export function recordRepairArtifactPublication(
