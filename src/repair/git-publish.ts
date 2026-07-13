@@ -5,6 +5,7 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
+  renameSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -652,10 +653,38 @@ function refreshSourcePathFromState(path: string, stateRoot: string): void {
   if (isPathInsideOrEqual(source, stateRoot)) {
     throw new Error(`Refusing to refresh a source path that contains the state root: ${path}`);
   }
-  rmSync(source, { force: true, recursive: true });
-  if (!existsSync(published)) return;
+
   mkdirSync(dirname(source), { recursive: true });
-  cpSync(published, source, { recursive: true });
+  const stagingRoot = mkdtempSync(join(dirname(source), `.clawsweeper-refresh-${process.pid}-`));
+  const staged = join(stagingRoot, "next");
+  const previous = join(stagingRoot, "previous");
+  const publishedExists = existsSync(published);
+  let sourceMoved = false;
+  let preserveStaging = false;
+  try {
+    if (publishedExists) cpSync(published, staged, { recursive: true });
+    if (existsSync(source)) {
+      renameSync(source, previous);
+      sourceMoved = true;
+    }
+    if (publishedExists) renameSync(staged, source);
+  } catch (error) {
+    if (sourceMoved && !existsSync(source)) {
+      try {
+        renameSync(previous, source);
+        sourceMoved = false;
+      } catch (rollbackError) {
+        preserveStaging = true;
+        throw new AggregateError(
+          [error, rollbackError],
+          `Failed to refresh ${path} and restore its previous source from ${previous}`,
+        );
+      }
+    }
+    throw error;
+  } finally {
+    if (!preserveStaging) rmSync(stagingRoot, { force: true, recursive: true });
+  }
 }
 
 function sourcePathMatchesStateCommit(path: string, commit: string): boolean {

@@ -79,6 +79,35 @@ test("accepted state publishes may tolerate only local refresh failure", () => {
   }
 });
 
+test(
+  "best-effort accepted refresh preserves local claims when state copying fails",
+  { skip: process.platform === "win32" },
+  () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-refresh-rollback-"));
+    const source = path.join(root, "source");
+    const state = path.join(root, "state");
+    const sourceClaim = path.join(source, "notifications", "claim.json");
+    const stateClaim = path.join(state, "notifications", "claim.json");
+    write(sourceClaim, '{"claim":"local"}\n');
+    write(stateClaim, '{"claim":"merged"}\n');
+    fs.chmodSync(stateClaim, 0o000);
+
+    try {
+      withEnv({ CLAWSWEEPER_STATE_DIR: state }, () =>
+        withCwd(source, () => {
+          assert.doesNotThrow(() =>
+            refreshSourceAfterAcceptedStatePublish(["notifications"], null, "best-effort"),
+          );
+          assert.equal(fs.readFileSync(sourceClaim, "utf8"), '{"claim":"local"}\n');
+        }),
+      );
+    } finally {
+      fs.chmodSync(stateClaim, 0o600);
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  },
+);
+
 test("stagePaths normalizes tracked deletion pathspecs", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-stage-paths-"));
   const file = "records/openclaw-openclaw/items/42.md";
