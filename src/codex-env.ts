@@ -52,6 +52,18 @@ export function redactInternalCodexModel(
   codexHome = process.env.CODEX_HOME?.trim() || join(homedir(), ".codex"),
 ): string {
   let redacted = value ?? "";
+  for (const model of codexInternalModelValues(codexHome)) {
+    redacted = redacted.replaceAll(model, "[REDACTED_INTERNAL_MODEL]");
+  }
+  return redacted.replace(
+    /(Rate limit reached for\s+)\S+(?=\s+(?:\(for limit\b|on (?:tokens|requests) per min\b))/gi,
+    "$1[REDACTED_INTERNAL_MODEL]",
+  );
+}
+
+export function codexInternalModelValues(
+  codexHome = process.env.CODEX_HOME?.trim() || join(homedir(), ".codex"),
+): string[] {
   const configuredModels = [process.env.CLAWSWEEPER_INTERNAL_MODEL?.trim() ?? ""];
   const configPath = codexHome ? join(codexHome, "config.toml") : "";
   if (configPath && existsSync(configPath)) {
@@ -66,13 +78,7 @@ export function redactInternalCodexModel(
       }
     }
   }
-  for (const model of configuredModels.filter(Boolean)) {
-    redacted = redacted.replaceAll(model, "[REDACTED_INTERNAL_MODEL]");
-  }
-  return redacted.replace(
-    /(Rate limit reached for\s+)\S+(?=\s+(?:\(for limit\b|on (?:tokens|requests) per min\b))/gi,
-    "$1[REDACTED_INTERNAL_MODEL]",
-  );
+  return [...new Set(configuredModels.filter(Boolean))];
 }
 
 export function codexEnv(options: CodexEnvOptions = {}): NodeJS.ProcessEnv {

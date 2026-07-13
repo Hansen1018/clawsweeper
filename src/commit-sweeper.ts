@@ -24,6 +24,7 @@ import { argBool, argNumber, argString, parseArgs, type Args } from "./clawsweep
 import { safeOutputTail } from "./clawsweeper-text.js";
 import {
   codexEnv,
+  codexInternalModelValues,
   codexLoginConfig,
   codexModelArgs,
   codexSensitiveEnvValues,
@@ -377,10 +378,7 @@ function runCodex(options: {
   if (options.serviceTier) codexConfig.splice(1, 0, `service_tier="${options.serviceTier}"`);
   const processEnv = codexEnv();
   const redactionSecrets = [
-    ...new Set([
-      ...codexSensitiveEnvValues(process.env),
-      String(process.env.CLAWSWEEPER_INTERNAL_MODEL ?? "").trim(),
-    ]),
+    ...new Set([...codexSensitiveEnvValues(process.env), ...codexInternalModelValues()]),
   ].filter((value) => value.length >= 6);
   let rawResult: CodexProcessResult;
   try {

@@ -52,6 +52,9 @@ test("commit review captures the complete structured Codex stream", () => {
     fs.writeFileSync(path.join(targetDir, "review.txt"), "changed\n");
     git(targetDir, "commit", "-qam", "review target");
     const sha = git(targetDir, "rev-parse", "HEAD");
+    const codexHome = path.join(root, "codex-home");
+    fs.mkdirSync(codexHome);
+    fs.writeFileSync(path.join(codexHome, "config.toml"), 'model = "private-model-name"\n');
 
     const codexPath = path.join(binDir, "codex");
     fs.writeFileSync(
@@ -152,7 +155,7 @@ fs.writeFileSync(outputPath, [
         encoding: "utf8",
         env: {
           ...process.env,
-          CLAWSWEEPER_INTERNAL_MODEL: "private-model-name",
+          CODEX_HOME: codexHome,
           COMMIT_SWEEPER_TARGET_GH_TOKEN: "ghs_review-secret-token-123456",
           CODEX_BIN: codexPath,
           PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}`,
