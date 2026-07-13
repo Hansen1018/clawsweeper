@@ -602,7 +602,7 @@ test("post-flight recovers dispatched merge claims only from exact absent effect
   );
   assert.match(
     mergeClaim,
-    /dispatchedClaimEffectAbsent:[\s\S]*automergeEffectDefinitelyAbsent\(\{ pull, view \}, request\.headSha\)/,
+    /dispatchedClaimEffectAbsent:[\s\S]*const pull = fetchPullRequest[\s\S]*if \(pull\.merged_at\) return false;[\s\S]*const view = fetchPullRequestView[\s\S]*automergeEffectDefinitelyAbsent\(\{ pull, view \}, request\.headSha\)/,
   );
   const pullRequestViewStart = source.indexOf("function fetchPullRequestView");
   const pullRequestView = source.slice(

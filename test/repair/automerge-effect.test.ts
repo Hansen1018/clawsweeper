@@ -440,16 +440,22 @@ test("dispatched exact-head merge claims require live effect absence before reco
   assert.equal(retry.status === "existing" && retry.dispatched, true);
   assert.equal(recoveryCalls, 0);
 
+  const recoveryOrder: string[] = [];
   const recovered = ensureExactHeadMergeClaim(request(6902), {
     ...io,
-    dispatchedClaimEffectAbsent: () => true,
+    dispatchedClaimEffectAbsent: () => {
+      recoveryOrder.push("effect");
+      return true;
+    },
     recoverClaim: () => {
+      recoveryOrder.push("terminal");
       recoveryCalls += 1;
       return { status: "recoverable" as const, reason: "terminal failure without effect" };
     },
   });
   assert.equal(recovered.status, "recovered");
   assert.equal(recoveryCalls, 1);
+  assert.deepEqual(recoveryOrder, ["terminal", "effect"]);
 });
 
 test("durable dispatch records distinguish claim-owned timestamp drift", () => {

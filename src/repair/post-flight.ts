@@ -1046,6 +1046,7 @@ function claimPostFlightMergeRequest(
         ),
       dispatchedClaimEffectAbsent: () => {
         const pull = fetchPullRequest(request.repository, request.number);
+        if (pull.merged_at) return false;
         const view = fetchPullRequestView(request.repository, request.number);
         return automergeEffectDefinitelyAbsent({ pull, view }, request.headSha);
       },

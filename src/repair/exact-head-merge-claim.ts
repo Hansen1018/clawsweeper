@@ -422,18 +422,8 @@ export function ensureExactHeadMergeClaim(
     if (!io.recoverClaim || initial.claimant === normalized.claimant) {
       return initial;
     }
-    if (initial.dispatched) {
-      if (!io.dispatchedClaimEffectAbsent) return initial;
-      try {
-        if (!io.dispatchedClaimEffectAbsent()) return initial;
-      } catch (error) {
-        return {
-          status: "unknown",
-          reason: `dispatched exact-head merge claim effect could not be inspected: ${errorText(error)}`,
-          claimId: null,
-        };
-      }
-    }
+    const dispatchedClaimEffectAbsent = io.dispatchedClaimEffectAbsent;
+    if (initial.dispatched && !dispatchedClaimEffectAbsent) return initial;
     let recoveryDecision: ExactHeadMergeClaimRecoveryDecision;
     try {
       recoveryDecision = io.recoverClaim({
@@ -457,6 +447,18 @@ export function ensureExactHeadMergeClaim(
         reason: recoveryDecision.reason,
         claimId: null,
       };
+    }
+    if (initial.dispatched) {
+      if (!dispatchedClaimEffectAbsent) return initial;
+      try {
+        if (!dispatchedClaimEffectAbsent()) return initial;
+      } catch (error) {
+        return {
+          status: "unknown",
+          reason: `dispatched exact-head merge claim effect could not be inspected: ${errorText(error)}`,
+          claimId: null,
+        };
+      }
     }
 
     let createError = "";
