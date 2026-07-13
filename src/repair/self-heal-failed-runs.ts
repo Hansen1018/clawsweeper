@@ -44,6 +44,8 @@ const JOB_SHA256 = /^[a-f0-9]{64}$/;
 const REPAIR_MODES = new Set(["plan", "execute", "autonomous"]);
 const WORKFLOW_INPUTS_BASENAME = "workflow-inputs.json";
 const STATE_REVISION_FETCH_TIMEOUT_MS = 60_000;
+const WORKFLOW_RUN_PAGE_SIZE = 100;
+const WORKFLOW_RUN_PAGE_LIMIT = 100;
 const preparedStateRevisions = new Map<string, string | null>();
 
 type RecoveredRunCohort = {
@@ -584,20 +586,34 @@ function readRunRecords() {
   const publishedByRunId = new Map(
     records.map((record: LooseRecord) => [String(record.run_id ?? ""), record]),
   );
-  const liveRecords = liveRunRecords().map((record: LooseRecord) => {
-    const published = publishedByRunId.get(String(record.run_id ?? ""));
-    return {
-      ...record,
-      published_run_record: published !== undefined,
-      ...(published?.post_flight_outcome === undefined
-        ? {}
-        : { post_flight_outcome: published.post_flight_outcome }),
-      ...(published?.post_flight_detail === undefined
-        ? {}
-        : { post_flight_detail: published.post_flight_detail }),
-    };
-  });
+  const liveRecords = liveRunRecords(liveRunDiscoveryCutoffMs(records)).map(
+    (record: LooseRecord) => {
+      const published = publishedByRunId.get(String(record.run_id ?? ""));
+      return {
+        ...record,
+        published_run_record: published !== undefined,
+        ...(published?.post_flight_outcome === undefined
+          ? {}
+          : { post_flight_outcome: published.post_flight_outcome }),
+        ...(published?.post_flight_detail === undefined
+          ? {}
+          : { post_flight_detail: published.post_flight_detail }),
+      };
+    },
+  );
   return [...records, ...liveRecords];
+}
+
+function liveRunDiscoveryCutoffMs(records: LooseRecord[]): number {
+  const maxAgeCutoffMs = Date.now() - maxAgeHours * 60 * 60 * 1000;
+  let cutoffMs = maxAgeCutoffMs;
+  for (const record of records) {
+    if (recordTimestampMs(record) < maxAgeCutoffMs) continue;
+    const createdAtMs = Date.parse(String(record.workflow_created_at ?? record.published_at ?? ""));
+    if (!Number.isFinite(createdAtMs)) return 0;
+    cutoffMs = Math.min(cutoffMs, createdAtMs);
+  }
+  return cutoffMs;
 }
 
 function resolveRunRecordJob(record: LooseRecord, sourceJob: string) {
@@ -944,9 +960,9 @@ function readJsonObject(file: string, label: string): LooseRecord {
   return value;
 }
 
-function liveRunRecords() {
+function liveRunRecords(cutoffMs: number) {
   try {
-    return listClusterRuns()
+    return listClusterRuns({ cutoffMs })
       .map((run: LooseRecord) => {
         const parsed = parseRepairRunTitle(run.displayTitle);
         if (!parsed) return null;
@@ -963,7 +979,11 @@ function liveRunRecords() {
       })
       .filter(Boolean);
   } catch (error) {
-    console.warn(`self-heal: cannot list live repair runs: ${ghErrorText(error)}`);
+    const detail = ghErrorText(error);
+    if (execute) {
+      throw new Error(`cannot list live repair runs; refusing dispatch: ${detail}`);
+    }
+    console.warn(`self-heal: cannot list live repair runs: ${detail}`);
     return [];
   }
 }
@@ -991,23 +1011,52 @@ function selfHealLedgerPath() {
   return path.join(repoRoot(), "results", "self-heal.json");
 }
 
-function listClusterRuns() {
-  const workflowName = workflowDisplayName(workflow);
-  return ghJson<LooseRecord[]>([
-    "run",
-    "list",
-    "--repo",
-    repo,
-    "--limit",
-    "200",
-    "--json",
-    "databaseId,workflowName,displayTitle,headSha,status,conclusion,createdAt,updatedAt,url",
-  ]).filter((run: LooseRecord) => run.workflowName === workflowName);
+function listClusterRuns({
+  cutoffMs = Date.now() - maxAgeHours * 60 * 60 * 1000,
+}: {
+  cutoffMs?: number;
+} = {}) {
+  const runs: LooseRecord[] = [];
+  for (let page = 1; page <= WORKFLOW_RUN_PAGE_LIMIT; page += 1) {
+    const pageRuns = ghJson<LooseRecord[]>([
+      "api",
+      "--method",
+      "GET",
+      `repos/${repo}/actions/workflows/${encodeURIComponent(workflow)}/runs?per_page=${WORKFLOW_RUN_PAGE_SIZE}&page=${page}`,
+      "--jq",
+      ".workflow_runs",
+    ]);
+    if (!Array.isArray(pageRuns)) {
+      throw new Error("workflow run discovery returned a non-array response");
+    }
+    runs.push(...pageRuns.map(normalizeClusterRun));
+    if (
+      pageRuns.length < WORKFLOW_RUN_PAGE_SIZE ||
+      pageRuns.some((run) => {
+        const createdAtMs = Date.parse(String(run.created_at ?? run.createdAt ?? ""));
+        return Number.isFinite(createdAtMs) && createdAtMs <= cutoffMs;
+      })
+    ) {
+      return runs;
+    }
+  }
+  throw new Error(
+    `workflow run discovery exceeded ${WORKFLOW_RUN_PAGE_LIMIT * WORKFLOW_RUN_PAGE_SIZE} runs before reaching the replay horizon`,
+  );
 }
 
-function workflowDisplayName(workflowNameOrFile: string): string {
-  if (workflowNameOrFile === "repair-cluster-worker.yml") return "repair cluster worker";
-  return workflowNameOrFile;
+function normalizeClusterRun(run: LooseRecord): LooseRecord {
+  return {
+    databaseId: run.databaseId ?? run.id,
+    workflowName: run.workflowName ?? run.name,
+    displayTitle: run.displayTitle ?? run.display_title,
+    headSha: run.headSha ?? run.head_sha,
+    status: run.status,
+    conclusion: run.conclusion,
+    createdAt: run.createdAt ?? run.created_at,
+    updatedAt: run.updatedAt ?? run.updated_at,
+    url: run.url ?? run.html_url,
+  };
 }
 
 function readExecuteGate() {

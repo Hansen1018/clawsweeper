@@ -362,6 +362,76 @@ test("failed-run self-heal blocks older generations behind unresolved newer prov
   }
 });
 
+test("failed-run self-heal paginates workflow runs before selecting an older generation", () => {
+  const fixture = createSelfHealFixture("paginated-newer-unresolved");
+  const newerRunId = String(Number(fixture.runId) + 1);
+  const now = new Date().toISOString();
+  try {
+    writeRunRecord(fixture.runsDir, fixture.runId, {
+      source_job: fixture.jobPath,
+      source_state_revision: fixture.originalRevision,
+      source_job_sha256: fixture.originalDigest,
+      mode: "plan",
+    });
+    writeLiveRunPages(fixture, {
+      1: Array.from({ length: 100 }, (_, index) => ({
+        id: 920_000 + index,
+        display_title: `unrelated maintenance run ${index}`,
+        status: "completed",
+        conclusion: "failure",
+        created_at: now,
+        updated_at: now,
+      })),
+      2: [
+        {
+          id: Number(newerRunId),
+          display_title: `repair cluster ${fixture.jobPath} (${fixture.replacementDigest})`,
+          status: "completed",
+          conclusion: "failure",
+          created_at: now,
+          updated_at: now,
+          html_url: `https://github.test/actions/runs/${newerRunId}`,
+        },
+      ],
+    });
+
+    const summary = runSelfHeal(fixture);
+    assert.equal(summary.candidates.length, 0);
+    const blocked = summary.skipped_candidates.find((candidate) => candidate.run_id === newerRunId);
+    assert.equal(blocked?.reason, "immutable_provenance_unavailable");
+    assert.equal(blocked?.blocks_older_generations, true);
+    assert.equal(blocked?.blocked_run_id, fixture.runId);
+    assert.match(fs.readFileSync(fixture.commandLogPath, "utf8"), /[?&]page=2(?:\s|$)/);
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("execute-mode self-heal fails closed when live run pagination fails", () => {
+  const fixture = createSelfHealFixture("live-run-discovery-failure");
+  try {
+    writeRunRecord(fixture.runsDir, fixture.runId, {
+      source_job: fixture.jobPath,
+      source_state_revision: fixture.originalRevision,
+      source_job_sha256: fixture.originalDigest,
+      mode: "plan",
+    });
+
+    const result = runSelfHealProcess(fixture, {
+      args: ["--execute"],
+      env: { GH_LIVE_RUN_LIST_FAIL: "1" },
+    });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /cannot list live repair runs; refusing dispatch/);
+    assert.doesNotMatch(
+      fs.readFileSync(fixture.commandLogPath, "utf8"),
+      /workflow run repair-cluster-worker\.yml/,
+    );
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
 test("failed-run self-heal honors a newer executed success in the same generation", () => {
   const fixture = createSelfHealFixture("same-generation-success");
   try {
@@ -648,6 +718,7 @@ function createSelfHealFixture(label: string, originalMode: "plan" | "autonomous
   fs.mkdirSync(artifactFixture, { recursive: true });
   fs.mkdirSync(binDir, { recursive: true });
   const runListFixture = path.join(root, "run-list.json");
+  const runPagesFixture = path.join(root, "run-pages.json");
   const postDispatchRunListFixture = path.join(root, "post-dispatch-run-list.json");
   const runJobsFixture = path.join(root, "run-jobs.json");
   const variablesFixture = path.join(root, "variables.json");
@@ -681,6 +752,7 @@ function createSelfHealFixture(label: string, originalMode: "plan" | "autonomous
     artifactFixture,
     binDir,
     runListFixture,
+    runPagesFixture,
     postDispatchRunListFixture,
     runJobsFixture,
     variablesFixture,
@@ -726,6 +798,7 @@ function runSelfHealProcess(
         GH_COMMAND_LOG: fixture.commandLogPath,
         GH_POST_DISPATCH_RUN_LIST_FIXTURE: fixture.postDispatchRunListFixture,
         GH_RUN_LIST_FIXTURE: fixture.runListFixture,
+        GH_RUN_PAGES_FIXTURE: fixture.runPagesFixture,
         GH_RUN_JOBS_FIXTURE: fixture.runJobsFixture,
         GH_VARIABLES_FIXTURE: fixture.variablesFixture,
         ...options.env,
@@ -764,6 +837,13 @@ function writeLiveRunList(
   runs: Record<string, unknown>[],
 ): void {
   fs.writeFileSync(fixture.runListFixture, `${JSON.stringify(runs)}\n`);
+}
+
+function writeLiveRunPages(
+  fixture: ReturnType<typeof createSelfHealFixture>,
+  pages: Record<number, Record<string, unknown>[]>,
+): void {
+  fs.writeFileSync(fixture.runPagesFixture, `${JSON.stringify(pages)}\n`);
 }
 
 function writeRunJobs(
@@ -920,8 +1000,21 @@ if [ "$1" = "run" ] && [ "$2" = "download" ]; then
 fi
 if [ "$1" = "api" ]; then
   case "$*" in
-    *"/actions/workflows/"*)
+    *"/actions/workflows/"*"status="*)
       printf '[]\\n'
+      exit 0
+      ;;
+    *"/actions/workflows/"*)
+      if [ "\${GH_LIVE_RUN_LIST_FAIL:-}" = "1" ]; then
+        echo "workflow run discovery unavailable" >&2
+        exit 1
+      fi
+      if [ -f "\${GH_RUN_PAGES_FIXTURE:-}" ]; then
+        page=$(printf '%s\\n' "$*" | sed -n 's/.*[?&]page=\\([0-9][0-9]*\\).*/\\1/p')
+        node -e 'const fs = require("node:fs"); const pages = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); process.stdout.write(JSON.stringify(pages[process.argv[2]] ?? []) + "\\n");' "$GH_RUN_PAGES_FIXTURE" "$page"
+      else
+        cat "$GH_RUN_LIST_FIXTURE"
+      fi
       exit 0
       ;;
   esac
