@@ -1660,10 +1660,36 @@ test("sweep target tokens fall back when an org app installation is missing", ()
 test("proof nudge workflow is manual-first and scheduled behind repo vars", () => {
   const sweepWorkflow = readText(".github/workflows/sweep.yml");
   const workflow = readText(".github/workflows/proof-nudges.yml");
+  const parsed = YAML.parse(workflow) as {
+    permissions: Record<string, string>;
+    jobs: Record<
+      string,
+      {
+        steps: Array<{
+          id?: string;
+          uses?: string;
+          with?: Record<string, unknown>;
+        }>;
+      }
+    >;
+  };
   const job = workflow.slice(workflow.indexOf("  proof-nudges:"), workflow.length);
   const concurrency = workflow.slice(workflow.indexOf("concurrency:"), workflow.indexOf("\njobs:"));
+  const steps = parsed.jobs["proof-nudges"]?.steps ?? [];
+  const checkout = steps.find((step) => step.uses === "actions/checkout@v7");
+  const stateToken = steps.find((step) => step.id === "state-token");
+  const setupState = steps.find((step) => step.uses === "./.github/actions/setup-state");
 
   assert.doesNotMatch(sweepWorkflow, /proof_nudges/);
+  assert.deepEqual(parsed.permissions, {
+    actions: "read",
+    contents: "read",
+    issues: "write",
+    "pull-requests": "read",
+  });
+  assert.equal(checkout?.with?.["persist-credentials"], false);
+  assert.equal(stateToken?.uses, "./.github/actions/create-state-token");
+  assert.equal(setupState?.with?.token, "${{ steps.state-token.outputs.token }}");
   assert.match(workflow, /execute:[\s\S]*?default: "false"/);
   assert.match(workflow, /cron: "0 10 \* \* \*"/);
   assert.doesNotMatch(workflow, /cron: "0 11 \* \* \*"/);

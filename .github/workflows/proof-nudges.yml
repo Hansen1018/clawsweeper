@@ -46,7 +46,7 @@ on:
 
 permissions:
   actions: read
-  contents: write
+  contents: read
   issues: write
   pull-requests: read
 
@@ -69,6 +69,7 @@ jobs:
         with:
           filter: blob:none
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Resolve target repository
         id: target
