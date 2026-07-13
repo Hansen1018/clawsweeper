@@ -4025,12 +4025,16 @@ function executeAutomerge(command: LooseRecord): LooseRecord {
         reconcile: ({ result: commandResult, error: commandError }) => {
           try {
             const snapshot = fetchAutomergeEffectSnapshot(command.issue_number);
+            const squashDispatchSucceeded =
+              commandError === null && commandResult?.status === 0 && !commandResult.error;
             return {
               command_result: commandResult,
               command_error: commandError,
               snapshot,
               snapshot_error: "",
-              confirmation: confirmAutomergeEffectSnapshot(snapshot, command.expected_head_sha),
+              confirmation: confirmAutomergeEffectSnapshot(snapshot, command.expected_head_sha, {
+                squashDispatchSucceeded,
+              }),
             };
           } catch (error) {
             return {
@@ -4074,9 +4078,7 @@ function executeAutomerge(command: LooseRecord): LooseRecord {
     return {
       action: "merge",
       status: "executed",
-      reason: automergeCommandResponseAmbiguous(result)
-        ? "merge confirmed after ambiguous response"
-        : "merged by ClawSweeper automerge",
+      reason: "merged by ClawSweeper automerge",
       merged_at: result.confirmation.mergedAt,
       merge_commit_sha: result.confirmation.mergeCommitSha,
       merge_method: "squash",
@@ -4230,7 +4232,9 @@ function observeExistingAutomergeEffect(command: LooseRecord, view: LooseRecord)
       merge_method: "squash",
     };
   }
-  const confirmation = confirmAutomergeEffectSnapshot(snapshot, command.expected_head_sha);
+  const confirmation = confirmAutomergeEffectSnapshot(snapshot, command.expected_head_sha, {
+    requireSquashMethod: false,
+  });
   if (confirmation.block) {
     return {
       action: "merge",
@@ -4253,7 +4257,6 @@ function observeExistingAutomergeEffect(command: LooseRecord, view: LooseRecord)
     reason: "merge already confirmed for the reviewed head",
     merged_at: confirmation.mergedAt,
     merge_commit_sha: confirmation.mergeCommitSha,
-    merge_method: "squash",
   };
 }
 

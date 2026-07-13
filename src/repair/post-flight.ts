@@ -35,7 +35,11 @@ import {
 } from "./repair-merge-message.js";
 import { isPassedStagedProofBundle } from "./staged-proof-gates.js";
 import { runtimeStrictBaseBindingBlock } from "./strict-base-binding.js";
-import { squashAutomergeMethodBlock, squashMergeQueueMethodBlock } from "./automerge-effect.js";
+import {
+  squashAutomergeMethodBlock,
+  squashMergedMethodBlock,
+  squashMergeQueueMethodBlock,
+} from "./automerge-effect.js";
 import { compactText as compactPlainText } from "./text-utils.js";
 import {
   runVerifiedPublishedPullMutation,
@@ -368,6 +372,7 @@ function finalizeFixPr(action: LooseRecord) {
     };
     let acquiredClaimId: number | null = null;
     let mergeRequestStarted = false;
+    let squashDispatchSucceeded = false;
     try {
       mergeAttempt = runVerifiedPostFlightPullMutation(parsed.number, () => {
         const finalPull = fetchPullRequest(result.repo, parsed.number);
@@ -500,12 +505,15 @@ function finalizeFixPr(action: LooseRecord) {
             mergeRequestStarted = true;
             try {
               ghText(mergeArgs);
+              squashDispatchSucceeded = true;
             } catch (error) {
               commandError = error;
             }
             let confirmation: ReturnType<typeof reconcileMergeState>;
             try {
-              confirmation = reconcileMergeState(parsed.number, action.commit);
+              confirmation = reconcileMergeState(parsed.number, action.commit, {
+                squashDispatchSucceeded,
+              });
             } catch (error) {
               return {
                 confirmation: null,
@@ -556,7 +564,9 @@ function finalizeFixPr(action: LooseRecord) {
       }
       let reconciliation: ReturnType<typeof reconcileMergeState>;
       try {
-        reconciliation = reconcileMergeState(parsed.number, action.commit);
+        reconciliation = reconcileMergeState(parsed.number, action.commit, {
+          squashDispatchSucceeded,
+        });
       } catch (reconciliationError) {
         return {
           ...prBase,
@@ -773,13 +783,17 @@ function finalizeFixPr(action: LooseRecord) {
   }
 }
 
-function reconcileMergeState(number: number, expectedHeadSha: JsonValue) {
+function reconcileMergeState(
+  number: number,
+  expectedHeadSha: JsonValue,
+  proof: { squashDispatchSucceeded?: boolean } = {},
+) {
   const pull = fetchPullRequest(result.repo, number);
   const view = fetchPullRequestView(result.repo, number);
   return {
     pull,
     view,
-    ...confirmPostFlightMergeSnapshot(pull, view, expectedHeadSha),
+    ...confirmPostFlightMergeSnapshot(pull, view, expectedHeadSha, proof),
   };
 }
 
@@ -787,9 +801,19 @@ function confirmPostFlightMergeSnapshot(
   pull: LooseRecord,
   view: LooseRecord,
   expectedHeadSha: JsonValue,
+  proof: { squashDispatchSucceeded?: boolean } = {},
 ) {
   const merged = confirmMergedPullSnapshot(pull, expectedHeadSha);
-  if (merged.block || merged.mergedAt) return { ...merged, pendingReason: "" };
+  if (merged.block) return { ...merged, pendingReason: "" };
+  if (merged.mergedAt) {
+    const methodBlock = squashMergedMethodBlock(proof.squashDispatchSucceeded === true);
+    return {
+      ...merged,
+      mergedAt: methodBlock ? null : merged.mergedAt,
+      block: methodBlock,
+      pendingReason: "",
+    };
+  }
   const viewAutomergeMethodBlock = squashAutomergeMethodBlock(view.autoMergeRequest);
   if (viewAutomergeMethodBlock) {
     return { mergedAt: null, block: viewAutomergeMethodBlock, pendingReason: "" };

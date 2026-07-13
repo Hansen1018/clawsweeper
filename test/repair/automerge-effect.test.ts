@@ -19,21 +19,19 @@ import {
 const headSha = "a".repeat(40);
 
 test("automerge effect certification binds the merged REST snapshot to the reviewed head", () => {
+  const snapshot = {
+    pull: {
+      head: { sha: headSha },
+      merged_at: "2026-07-13T08:00:00Z",
+      merge_commit_sha: "b".repeat(40),
+    },
+    view: {
+      headRefOid: "c".repeat(40),
+      isInMergeQueue: true,
+    },
+  };
   assert.deepEqual(
-    confirmAutomergeEffectSnapshot(
-      {
-        pull: {
-          head: { sha: headSha },
-          merged_at: "2026-07-13T08:00:00Z",
-          merge_commit_sha: "b".repeat(40),
-        },
-        view: {
-          headRefOid: "c".repeat(40),
-          isInMergeQueue: true,
-        },
-      },
-      headSha,
-    ),
+    confirmAutomergeEffectSnapshot(snapshot, headSha, { squashDispatchSucceeded: true }),
     {
       mergedAt: "2026-07-13T08:00:00Z",
       mergeCommitSha: "b".repeat(40),
@@ -41,6 +39,12 @@ test("automerge effect certification binds the merged REST snapshot to the revie
       block: "",
     },
   );
+  assert.deepEqual(confirmAutomergeEffectSnapshot(snapshot, headSha), {
+    mergedAt: null,
+    mergeCommitSha: null,
+    pendingReason: "",
+    block: "merged pull request method could not be proven as SQUASH",
+  });
 });
 
 test("automerge effect certification requires a squash method for queue and auto-merge state", () => {

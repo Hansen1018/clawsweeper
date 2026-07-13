@@ -535,12 +535,12 @@ test("post-flight rechecks live security immediately before privileged mutations
   );
   assert.match(
     finalizeFixPr,
-    /catch \(error\)[\s\S]*reconcileMergeState\(parsed\.number, action\.commit\)[\s\S]*ghRetryKind\(error\)[\s\S]*did not confirm an exact-head merge effect/,
+    /catch \(error\)[\s\S]*reconcileMergeState\(parsed\.number, action\.commit,[\s\S]*squashDispatchSucceeded[\s\S]*ghRetryKind\(error\)[\s\S]*did not confirm an exact-head merge effect/,
   );
   assert.doesNotMatch(finalizeFixPr, /postFlightMergeRetryWaitMs|mergeAttempts <|continue;/);
   assert.match(
     finalizeFixPr,
-    /kind: "post_flight_merge"[\s\S]*ghText\(mergeArgs\)[\s\S]*reconcileMergeState\(parsed\.number, action\.commit\)[\s\S]*outcome:[\s\S]*confirmation\?\.mergedAt[\s\S]*"accepted"[\s\S]*"unknown"/,
+    /kind: "post_flight_merge"[\s\S]*ghText\(mergeArgs\)[\s\S]*squashDispatchSucceeded = true[\s\S]*reconcileMergeState\(parsed\.number, action\.commit,[\s\S]*squashDispatchSucceeded[\s\S]*outcome:[\s\S]*confirmation\?\.mergedAt[\s\S]*"accepted"[\s\S]*"unknown"/,
   );
   assert.match(
     finalizeFixPr,
@@ -631,15 +631,18 @@ test("post-flight reconciles one exact-head merge effect across retries and queu
       ...mockGhBinEnv(fixture.ghPath, fixture.fakeBin),
     };
 
-    runVerifiedPostFlight(fixture, { ...commonEnv, FAKE_GH_MERGE_MODE: "ambiguous" }, 0);
+    runVerifiedPostFlight(fixture, { ...commonEnv, FAKE_GH_MERGE_MODE: "ambiguous" }, 1);
     let report = JSON.parse(fs.readFileSync(fixture.reportPath, "utf8"));
-    assert.equal(report.actions[0]?.status, "executed");
-    assert.equal(report.actions[0]?.reason, "merge confirmed after ambiguous response");
+    assert.equal(report.actions[0]?.status, "blocked");
+    assert.equal(
+      report.actions[0]?.reason,
+      "merged pull request method could not be proven as SQUASH",
+    );
     assert.equal(report.actions[0]?.merge_attempts, 1);
     assert.equal(fs.readFileSync(fixture.mergeCountPath, "utf8"), "1");
     assert.deepEqual(mutationReceiptStates(finalizeVerifiedActionLedger(fixture, commonEnv)), [
       ["started", "mutation_attempted"],
-      ["executed", "mutation_accepted"],
+      ["failed", "mutation_outcome_unknown"],
     ]);
     fs.rmSync(fixture.reportPath, { force: true });
     runVerifiedPostFlight(
@@ -656,15 +659,17 @@ test("post-flight reconciles one exact-head merge effect across retries and queu
     assert.equal(fs.readFileSync(fixture.mergeCountPath, "utf8"), "1");
 
     fixture.reset();
-    runVerifiedPostFlight(fixture, { ...commonEnv, FAKE_GH_MERGE_MODE: "delayed_ambiguous" }, 0);
+    runVerifiedPostFlight(fixture, { ...commonEnv, FAKE_GH_MERGE_MODE: "delayed_ambiguous" }, 1);
     report = JSON.parse(fs.readFileSync(fixture.reportPath, "utf8"));
-    assert.equal(report.actions[0]?.status, "executed");
-    assert.equal(report.actions[0]?.reason, "merge confirmed after ambiguous response");
+    assert.equal(report.actions[0]?.status, "blocked");
+    assert.equal(
+      report.actions[0]?.reason,
+      "merged pull request method could not be proven as SQUASH",
+    );
     assert.equal(fs.readFileSync(fixture.mergeCountPath, "utf8"), "1");
     assert.deepEqual(mutationReceiptStates(finalizeVerifiedActionLedger(fixture, commonEnv)), [
       ["started", "mutation_attempted"],
       ["failed", "mutation_outcome_unknown"],
-      ["executed", "mutation_observed"],
     ]);
 
     fixture.reset();

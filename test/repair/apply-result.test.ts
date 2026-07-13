@@ -1121,15 +1121,18 @@ test("repair apply leaves current-main fixed closeout outside coverage proof", (
   }
 });
 
-test("repair apply confirms an exact merge after an ambiguous command response", () => {
+test("repair apply does not certify the merge method after an ambiguous command response", () => {
   const fixture = writeMergeApplyFixture({ mergeMode: "ambiguous_exact" });
   try {
     runMergeApplyResult(fixture, { retryAttempts: 4 });
 
     const report = readApplyReport(fixture.reportPath);
-    assert.equal(report.actions[0].status, "executed");
-    assert.equal(report.actions[0].reason, "merge confirmed after ambiguous response");
-    assert.equal(report.actions[0].merged_at, "2026-07-13T08:00:00Z");
+    assert.equal(report.actions[0].status, "blocked");
+    assert.equal(
+      report.actions[0].reason,
+      "merged pull request method could not be proven as SQUASH",
+    );
+    assert.equal(report.actions[0].merged_at, undefined);
     assert.equal(mergeCallCount(fixture.ghLogPath), 1);
     assert.equal(restPullCallCount(fixture.ghLogPath), 3);
     const mergeCall = ghCalls(fixture.ghLogPath).find(
@@ -1423,7 +1426,7 @@ test("repair apply dry-run does not require workflow claim identity", () => {
   }
 });
 
-test("repair apply records unknown and observed exact-head merge outcomes", () => {
+test("repair apply records an unknown exact-head merge outcome without method proof", () => {
   const fixture = writeMergeApplyFixture({ mergeMode: "ambiguous_exact" });
   try {
     runMergeApplyResult(fixture, {
@@ -1443,7 +1446,6 @@ test("repair apply records unknown and observed exact-head merge outcomes", () =
       [
         ["started", "mutation_attempted"],
         ["failed", "mutation_outcome_unknown"],
-        ["executed", "mutation_observed"],
       ],
     );
     assert.deepEqual(

@@ -9,6 +9,15 @@ export type AutomergeEffectConfirmation = {
   block: string;
 };
 
+export type AutomergeEffectProof = {
+  requireSquashMethod?: boolean;
+  squashDispatchSucceeded?: boolean;
+};
+
+export function squashMergedMethodBlock(squashDispatchSucceeded: boolean): string {
+  return squashDispatchSucceeded ? "" : "merged pull request method could not be proven as SQUASH";
+}
+
 export function squashAutomergeMethodBlock(autoMergeRequest: JsonValue): string {
   if (!autoMergeRequest) return "";
   if (typeof autoMergeRequest !== "object" || Array.isArray(autoMergeRequest)) {
@@ -51,6 +60,7 @@ export function applyAutomergeResultToCommand(command: LooseRecord, merge: Loose
 export function confirmAutomergeEffectSnapshot(
   snapshot: LooseRecord,
   expectedHeadSha: JsonValue,
+  proof: AutomergeEffectProof = {},
 ): AutomergeEffectConfirmation {
   const expected = normalizeSha(expectedHeadSha);
   const pull = snapshot.pull ?? {};
@@ -69,11 +79,15 @@ export function confirmAutomergeEffectSnapshot(
     };
   }
   if (mergedAt) {
+    const methodBlock =
+      proof.requireSquashMethod === false
+        ? ""
+        : squashMergedMethodBlock(proof.squashDispatchSucceeded === true);
     return {
-      mergedAt,
-      mergeCommitSha,
+      mergedAt: methodBlock ? null : mergedAt,
+      mergeCommitSha: methodBlock ? null : mergeCommitSha,
       pendingReason: "",
-      block: "",
+      block: methodBlock,
     };
   }
 

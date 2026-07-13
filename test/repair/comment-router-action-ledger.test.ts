@@ -87,7 +87,7 @@ test("command receipt identity excludes list position and binds command attempts
   assert.doesNotMatch(source, /\bindex\b/);
 });
 
-test("automerge reconciles an ambiguous command response inside the merge receipt", () => {
+test("automerge reconciles command responses inside the merge receipt without certifying ambiguous methods", () => {
   const source = readText("src/repair/comment-router.ts");
   const executeAutomerge = source.slice(
     source.indexOf("function executeAutomerge("),
@@ -96,12 +96,9 @@ test("automerge reconciles an ambiguous command response inside the merge receip
 
   assert.match(
     executeAutomerge,
-    /result = runGitHubSpawnMutation\([\s\S]*buildAutomergeMergeArgs\([\s\S]*onDispatchStart:[\s\S]*reconcile: \(\{ result: commandResult, error: commandError \}\) => \{[\s\S]*fetchAutomergeEffectSnapshot\(command\.issue_number\)[\s\S]*confirmAutomergeEffectSnapshot\(snapshot, command\.expected_head_sha\)[\s\S]*outcome: automergeAttemptReceiptOutcome/,
+    /result = runGitHubSpawnMutation\([\s\S]*buildAutomergeMergeArgs\([\s\S]*onDispatchStart:[\s\S]*reconcile: \(\{ result: commandResult, error: commandError \}\) => \{[\s\S]*fetchAutomergeEffectSnapshot\(command\.issue_number\)[\s\S]*squashDispatchSucceeded[\s\S]*confirmAutomergeEffectSnapshot\(snapshot, command\.expected_head_sha,[\s\S]*squashDispatchSucceeded[\s\S]*outcome: automergeAttemptReceiptOutcome/,
   );
-  assert.match(
-    executeAutomerge,
-    /automergeCommandResponseAmbiguous\(result\)[\s\S]*"merge confirmed after ambiguous response"/,
-  );
+  assert.doesNotMatch(executeAutomerge, /"merge confirmed after ambiguous response"/);
   assert.match(
     source,
     /function fetchAutomergeEffectSnapshot[\s\S]*repos\/\$\{targetRepo\}\/pulls\/\$\{number\}[\s\S]*attempts: 1[\s\S]*"pr",[\s\S]*"view"[\s\S]*"isInMergeQueue"[\s\S]*attempts: 1/,
@@ -126,7 +123,10 @@ test("automerge blocks a merged REST snapshot from the wrong head", () => {
     confirmation,
     /observed !== expected[\s\S]*merged pull request head does not match the authorized automerge head/,
   );
-  assert.match(confirmation, /if \(mergedAt\)[\s\S]*mergedAt,[\s\S]*block: ""/);
+  assert.match(
+    confirmation,
+    /if \(mergedAt\)[\s\S]*squashMergedMethodBlock[\s\S]*block: methodBlock/,
+  );
 });
 
 test("automerge observes exact-head queue state before issuing another merge", () => {

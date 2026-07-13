@@ -35,7 +35,11 @@ import {
   writeRepairSquashMergeBody,
 } from "./repair-merge-message.js";
 import { runtimeStrictBaseBindingBlock } from "./strict-base-binding.js";
-import { squashAutomergeMethodBlock, squashMergeQueueMethodBlock } from "./automerge-effect.js";
+import {
+  squashAutomergeMethodBlock,
+  squashMergedMethodBlock,
+  squashMergeQueueMethodBlock,
+} from "./automerge-effect.js";
 import {
   ensureExactHeadMergeClaim,
   exactHeadMergeClaimIdentity,
@@ -770,6 +774,7 @@ function applyMergeAction({
     authorizedHeadSha,
   ];
   let commandError: unknown = null;
+  let squashDispatchSucceeded = false;
   const finalView = fetchPullRequestView(result.repo, target);
   const finalHeadBindingBlock = validateMergeHeadBinding({ authorizedHeadSha, view: finalView });
   if (finalHeadBindingBlock) {
@@ -925,7 +930,9 @@ function applyMergeAction({
         merge_method: "squash",
       });
     }
-    const claimedMerge = confirmExactMergeSnapshot(claimedPull, authorizedHeadSha);
+    const claimedMerge = confirmExactMergeSnapshot(claimedPull, authorizedHeadSha, {
+      requireSquashMethod: true,
+    });
     if (claimedMerge.block) {
       return releaseBeforeDispatch({
         ...base,
@@ -1051,7 +1058,9 @@ function applyMergeAction({
             throw new Error(dispatchBoundary.reason);
           }
           mergeRequestStarted = true;
-          return ghText(mergeArgs);
+          const output = ghText(mergeArgs);
+          squashDispatchSucceeded = true;
+          return output;
         },
         outcome: () => "unknown",
       });
@@ -1085,7 +1094,10 @@ function applyMergeAction({
       requeue_required: true,
     };
   }
-  const confirmation = confirmExactMergeSnapshot(merged, authorizedHeadSha);
+  const confirmation = confirmExactMergeSnapshot(merged, authorizedHeadSha, {
+    requireSquashMethod: true,
+    squashDispatchSucceeded,
+  });
   if (confirmation.block) {
     return {
       ...base,
@@ -1247,6 +1259,10 @@ function validatePullRequestHeadBinding({
 function confirmExactMergeSnapshot(
   pullRequest: LooseRecord,
   authorizedHeadSha: string,
+  proof: {
+    requireSquashMethod?: boolean;
+    squashDispatchSucceeded?: boolean;
+  } = {},
 ): { mergedAt: string | null; block: string } {
   const mergedAt = stringOrNull(pullRequest.merged_at);
   if (!mergedAt) return { mergedAt: null, block: "" };
@@ -1261,7 +1277,11 @@ function confirmExactMergeSnapshot(
       block: "merged pull request head does not match the authorized preflight head",
     };
   }
-  return { mergedAt, block: "" };
+  const methodBlock =
+    proof.requireSquashMethod === true
+      ? squashMergedMethodBlock(proof.squashDispatchSucceeded === true)
+      : "";
+  return { mergedAt: methodBlock ? null : mergedAt, block: methodBlock };
 }
 
 function claimApplyMergeRequest(repository: string, number: number, headSha: string) {
