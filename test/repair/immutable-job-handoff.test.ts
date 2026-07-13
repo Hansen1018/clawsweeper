@@ -341,9 +341,7 @@ test("repair operational callers resolve immutable state before dedupe and dispa
   const finalizer = fs.readFileSync("src/repair/finalize-open-prs.ts", "utf8");
   const conflict = fs.readFileSync("src/repair/conflict-self-heal.ts", "utf8");
 
-  assert.match(selfHeal, /state_revision=/);
-  assert.match(selfHeal, /job_sha256=/);
-  for (const source of [requeue, finalizer, conflict]) {
+  for (const source of [requeue, selfHeal, finalizer, conflict]) {
     assert.match(source, /immutableJobDispatchArgs/);
   }
   assert.match(requeue, /resolveStateJobIdentity\(\{/);
