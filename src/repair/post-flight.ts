@@ -65,9 +65,11 @@ import {
   inspectExactHeadMergeClaim,
   isTrustedExactHeadMergeClaimComment,
   isTrustedExactHeadMergeClaimDispatchComment,
+  isTrustedExactHeadMergeClaimRejectionComment,
   isTrustedExactHeadMergeClaimRecoveryComment,
   isTrustedExactHeadMergeClaimReleaseComment,
   markExactHeadMergeClaimDispatched,
+  rejectExactHeadMergeClaim,
   releaseExactHeadMergeClaim,
   type ExactHeadMergeClaimRequest,
   type ExactHeadMergeClaimResult,
@@ -555,9 +557,45 @@ function finalizeFixPr(action: LooseRecord) {
             if (dispatchBoundary.status !== "dispatched") {
               throw new Error(dispatchBoundary.reason);
             }
-            mergeAttempts += 1;
             let commandError: unknown = null;
             dispatchedSquashCommitMessage = dispatchBoundary.expectedSquashMessage;
+            const dispatchPull = fetchPullRequest(result.repo, parsed.number);
+            const dispatchView = fetchPullRequestView(result.repo, parsed.number);
+            const dispatchPolicyBlock = postFlightMergeRetryBlock({
+              action,
+              number: parsed.number,
+              pull: dispatchPull,
+              view: dispatchView,
+            });
+            if (dispatchPolicyBlock) {
+              let rejection;
+              try {
+                rejection = rejectPostFlightMergeClaim(
+                  parsed.number,
+                  action.commit,
+                  claim.claimId,
+                );
+              } catch (error) {
+                rejection = {
+                  status: "unknown" as const,
+                  reason: `exact-head merge claim rejection failed: ${compactText(ghErrorText(error), 500)}`,
+                  claimId: claim.claimId,
+                };
+              }
+              return {
+                policyBlock:
+                  rejection.status === "rejected"
+                    ? dispatchPolicyBlock
+                    : `${dispatchPolicyBlock}; ${rejection.reason}`,
+                claimRejectionRetry: rejection.status === "unknown",
+                pull: dispatchPull,
+                view: dispatchView,
+                confirmation: null,
+                confirmationError: "",
+                ambiguous: false,
+              };
+            }
+            mergeAttempts += 1;
             mergeRequestStarted = true;
             try {
               ghText(mergeArgs);
@@ -571,6 +609,10 @@ function finalizeFixPr(action: LooseRecord) {
               });
             } catch (error) {
               return {
+                policyBlock: "",
+                claimRejectionRetry: false,
+                pull: dispatchPull,
+                view: dispatchView,
                 confirmation: null,
                 confirmationError: ghErrorText(error),
                 ambiguous: commandError !== null,
@@ -578,26 +620,45 @@ function finalizeFixPr(action: LooseRecord) {
             }
             if (commandError !== null) {
               if ((confirmation.mergedAt || confirmation.pendingReason) && !confirmation.block) {
-                return { confirmation, confirmationError: "", ambiguous: true };
+                return {
+                  policyBlock: "",
+                  claimRejectionRetry: false,
+                  pull: confirmation.pull,
+                  view: confirmation.view,
+                  confirmation,
+                  confirmationError: "",
+                  ambiguous: true,
+                };
               }
               throw commandError;
             }
-            return { confirmation, confirmationError: "", ambiguous: false };
+            return {
+              policyBlock: "",
+              claimRejectionRetry: false,
+              pull: confirmation.pull,
+              view: confirmation.view,
+              confirmation,
+              confirmationError: "",
+              ambiguous: false,
+            };
           },
-          outcome: ({ confirmation }) =>
-            (confirmation?.mergedAt || confirmation?.pendingReason) && !confirmation.block
+          outcome: ({ policyBlock, confirmation }) =>
+            policyBlock
+              ? "rejected"
+              : (confirmation?.mergedAt || confirmation?.pendingReason) && !confirmation.block
               ? "accepted"
               : "unknown",
         });
         return {
-          policyBlock: "",
+          policyBlock: mutation.policyBlock,
           claim,
-          pull: mutation.confirmation?.pull ?? finalPull,
-          view: mutation.confirmation?.view ?? finalView,
+          pull: mutation.pull,
+          view: mutation.view,
           confirmation: mutation.confirmation,
           confirmationError: mutation.confirmationError,
           ambiguous: mutation.ambiguous,
           reconciliationOnly: false,
+          ...(mutation.claimRejectionRetry ? { claimReleaseRetry: true } : {}),
         };
       });
     } catch (error) {
@@ -1038,6 +1099,36 @@ function markPostFlightMergeClaimDispatched(
             claimId,
             expectedSquashMessage,
           )
+            ? "accepted"
+            : "unknown",
+      }),
+  });
+}
+
+function rejectPostFlightMergeClaim(number: number, headSha: JsonValue, claimId: number) {
+  const request = postFlightMergeClaimRequest(number, headSha);
+  return rejectExactHeadMergeClaim(request, claimId, {
+    listComments: () =>
+      ghPaged<LooseRecord>(
+        `repos/${request.repository}/issues/${request.number}/comments?per_page=100`,
+      ),
+    createComment: (body) =>
+      runRepairMutation(postFlightLifecycle(null), {
+        kind: "post_flight_merge_claim_rejection",
+        identity: { ...exactHeadMergeClaimIdentity(request), claimId },
+        component: "merge_claim",
+        operation: () =>
+          ghJson(
+            [
+              "api",
+              `repos/${request.repository}/issues/${request.number}/comments`,
+              "-f",
+              `body=${body}`,
+            ],
+            { attempts: 1 },
+          ),
+        outcome: (comment) =>
+          isTrustedExactHeadMergeClaimRejectionComment(comment, request, claimId)
             ? "accepted"
             : "unknown",
       }),

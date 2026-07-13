@@ -541,7 +541,7 @@ test("post-flight rechecks live security immediately before privileged mutations
   assert.doesNotMatch(finalizeFixPr, /postFlightMergeRetryWaitMs|mergeAttempts <|continue;/);
   assert.match(
     finalizeFixPr,
-    /kind: "post_flight_merge"[\s\S]*markPostFlightMergeClaimDispatched\([\s\S]*squashCommitMessage[\s\S]*dispatchedSquashCommitMessage = dispatchBoundary\.expectedSquashMessage[\s\S]*ghText\(mergeArgs\)[\s\S]*reconcileMergeState\(parsed\.number, action\.commit,[\s\S]*expectedSquashMessage: dispatchedSquashCommitMessage[\s\S]*outcome:[\s\S]*confirmation\?\.mergedAt[\s\S]*"accepted"[\s\S]*"unknown"/,
+    /kind: "post_flight_merge"[\s\S]*markPostFlightMergeClaimDispatched\([\s\S]*squashCommitMessage[\s\S]*dispatchedSquashCommitMessage = dispatchBoundary\.expectedSquashMessage[\s\S]*postFlightMergeRetryBlock\([\s\S]*rejectPostFlightMergeClaim\([\s\S]*ghText\(mergeArgs\)[\s\S]*reconcileMergeState\(parsed\.number, action\.commit,[\s\S]*expectedSquashMessage: dispatchedSquashCommitMessage[\s\S]*outcome:[\s\S]*policyBlock[\s\S]*"rejected"[\s\S]*confirmation\?\.mergedAt[\s\S]*"accepted"[\s\S]*"unknown"/,
   );
   assert.match(
     finalizeFixPr,
@@ -751,6 +751,34 @@ test("post-flight reconciles one exact-head merge effect across retries and queu
     assert.equal(claimComments.length, 4);
     assert.match(claimComments[2].body, /clawsweeper-exact-head-merge-claim:v1/);
     assert.match(claimComments[3].body, /clawsweeper-exact-head-merge-dispatch:v2 claim=1003/);
+
+    fixture.reset();
+    runVerifiedPostFlight(
+      fixture,
+      {
+        ...commonEnv,
+        CLAWSWEEPER_ACTION_LEDGER_INVOCATION: "post-flight-post-dispatch-gate",
+        FAKE_GH_SECURITY_AFTER_DISPATCH: "1",
+      },
+      1,
+    );
+    report = JSON.parse(fs.readFileSync(fixture.reportPath, "utf8"));
+    assert.equal(report.actions[0]?.status, "blocked");
+    assert.match(
+      report.actions[0]?.reason,
+      /^security-sensitive (?:PR|target) requires central security triage$/,
+    );
+    assert.equal(report.actions[0]?.merge_attempts, 0);
+    assert.equal(fs.existsSync(fixture.mergeCountPath), false);
+    claimComments = JSON.parse(fs.readFileSync(fixture.mergeClaimPath, "utf8"));
+    assert.equal(claimComments.length, 3);
+    assert.match(claimComments[0].body, /clawsweeper-exact-head-merge-claim:v1/);
+    assert.match(claimComments[1].body, /clawsweeper-exact-head-merge-dispatch:v2 claim=1001/);
+    assert.match(claimComments[2].body, /clawsweeper-exact-head-merge-rejection:v1 claim=1001/);
+    assert.deepEqual(mutationReceiptStates(finalizeVerifiedActionLedger(fixture, commonEnv)), [
+      ["started", "mutation_attempted"],
+      ["skipped", "mutation_rejected"],
+    ]);
 
     for (const proofFailure of [
       {
@@ -1735,7 +1763,8 @@ function createVerifiedMergeFixture() {
       "  const comments = fs.existsSync(process.env.FAKE_GH_MERGE_CLAIM_FILE) ? JSON.parse(fs.readFileSync(process.env.FAKE_GH_MERGE_CLAIM_FILE, 'utf8')) : [];",
       "  const securityAfterFailure = process.env.FAKE_GH_SECURITY_AFTER_FAILURE === '1' && mergeCount() >= 1;",
       "  const securityOnFinalGate = process.env.FAKE_GH_SECURITY_ON_FINAL_GATE === '1' && comments.some((comment) => String(comment.body || '').includes('clawsweeper-exact-head-merge-claim:v1')) && !comments.some((comment) => String(comment.body || '').includes('clawsweeper-exact-head-merge-release:v1'));",
-      "  const security = securityAfterFailure || securityOnFinalGate;",
+      "  const securityAfterDispatch = process.env.FAKE_GH_SECURITY_AFTER_DISPATCH === '1' && comments.some((comment) => String(comment.body || '').includes('clawsweeper-exact-head-merge-dispatch:v2')) && !comments.some((comment) => String(comment.body || '').includes('clawsweeper-exact-head-merge-rejection:v1'));",
+      "  const security = securityAfterFailure || securityOnFinalGate || securityAfterDispatch;",
       "  if (security) comments.push({ body: '<!-- clawsweeper-security:security-sensitive item=123 sha=abc -->', user: { login: 'maintainer-user' } });",
       "  if (args.includes('--slurp')) process.stdout.write(JSON.stringify([comments]));",
       "  else process.stdout.write(comments.map((comment) => comment.body).join('\\n'));",
