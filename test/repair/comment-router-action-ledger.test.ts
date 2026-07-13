@@ -191,6 +191,18 @@ test("all exact-head merge owners release unused claims and require squash auto-
   const router = readText("src/repair/comment-router.ts");
   const postFlight = readText("src/repair/post-flight.ts");
   const effect = readText("src/repair/automerge-effect.ts");
+  const applyExecution = apply.slice(
+    apply.indexOf("function applyMergeAction("),
+    apply.indexOf("function validateMergeHeadBinding("),
+  );
+  const routerExecution = router.slice(
+    router.indexOf("function executeAutomerge("),
+    router.indexOf("function automergeReadinessAction("),
+  );
+  const postFlightExecution = postFlight.slice(
+    postFlight.indexOf("function finalizeFixPr("),
+    postFlight.indexOf("function reconcileMergeState("),
+  );
 
   assert.match(
     apply,
@@ -203,6 +215,24 @@ test("all exact-head merge owners release unused claims and require squash auto-
   assert.match(
     postFlight,
     /function releasePostFlightMergeClaim[\s\S]*releaseExactHeadMergeClaim[\s\S]*"post_flight_merge_claim_release"/,
+  );
+  assert.match(applyExecution, /markApplyMergeClaimDispatched\(/);
+  assert.match(applyExecution, /kind: "apply_result_merge"/);
+  assert.ok(
+    applyExecution.indexOf("markApplyMergeClaimDispatched(") <
+      applyExecution.indexOf('kind: "apply_result_merge"'),
+  );
+  assert.match(routerExecution, /markAutomergeMergeClaimDispatched\(/);
+  assert.match(routerExecution, /result = runGitHubSpawnMutation\(/);
+  assert.ok(
+    routerExecution.indexOf("markAutomergeMergeClaimDispatched(") <
+      routerExecution.indexOf("result = runGitHubSpawnMutation("),
+  );
+  assert.match(postFlightExecution, /markPostFlightMergeClaimDispatched\(/);
+  assert.match(postFlightExecution, /kind: "post_flight_merge"/);
+  assert.ok(
+    postFlightExecution.indexOf("markPostFlightMergeClaimDispatched(") <
+      postFlightExecution.indexOf('kind: "post_flight_merge"'),
   );
   assert.match(apply, /validateMergeablePullRequestHard[\s\S]*squashAutomergeMethodBlock/);
   assert.match(router, /validateAutomergeHardReadiness[\s\S]*squashAutomergeMethodBlock/);

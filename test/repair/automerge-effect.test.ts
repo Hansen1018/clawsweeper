@@ -12,6 +12,7 @@ import {
   exactHeadMergeClaimRecoveryDecision,
   exactHeadMergeClaimWorkflowRunEnv,
   inspectExactHeadMergeClaim,
+  markExactHeadMergeClaimDispatched,
   releaseExactHeadMergeClaim,
 } from "../../dist/repair/exact-head-merge-claim.js";
 
@@ -42,31 +43,57 @@ test("automerge effect certification binds the merged REST snapshot to the revie
   );
 });
 
-test("automerge effect certification uses exact-head GraphQL queue and auto-merge state", () => {
+test("automerge effect certification requires a squash method for queue and auto-merge state", () => {
   const pull = { head: { sha: headSha }, merged_at: null, merge_commit_sha: null };
-  const queued = confirmAutomergeEffectSnapshot(
+  const unprovenQueue = confirmAutomergeEffectSnapshot(
     {
       pull,
       view: { headRefOid: headSha, isInMergeQueue: true, autoMergeRequest: null },
     },
     headSha,
   );
-  assert.equal(queued.pendingReason, `reviewed head ${headSha} is pending in the merge queue`);
-  assert.equal(automergeAttemptReceiptOutcome({ confirmation: queued }), "accepted");
+  assert.match(unprovenQueue.block, /does not prove the required SQUASH method/);
+  assert.equal(automergeAttemptReceiptOutcome({ confirmation: unprovenQueue }), "unknown");
 
-  const autoMerge = confirmAutomergeEffectSnapshot(
+  for (const isInMergeQueue of [false, true]) {
+    const autoMerge = confirmAutomergeEffectSnapshot(
+      {
+        pull,
+        view: {
+          headRefOid: headSha,
+          isInMergeQueue,
+          autoMergeRequest: { mergeMethod: "SQUASH" },
+        },
+      },
+      headSha,
+    );
+    assert.match(
+      autoMerge.pendingReason,
+      isInMergeQueue ? /pending in the merge queue/ : /has auto-merge pending/,
+    );
+    assert.equal(automergeAttemptReceiptOutcome({ confirmation: autoMerge }), "accepted");
+  }
+});
+
+test("automerge effect certification accepts REST-proven squash queue state", () => {
+  const queued = confirmAutomergeEffectSnapshot(
     {
-      pull,
+      pull: {
+        head: { sha: headSha },
+        merged_at: null,
+        merge_commit_sha: null,
+        auto_merge: { merge_method: "squash" },
+      },
       view: {
         headRefOid: headSha,
-        isInMergeQueue: false,
-        autoMergeRequest: { mergeMethod: "SQUASH" },
+        isInMergeQueue: true,
+        autoMergeRequest: null,
       },
     },
     headSha,
   );
-  assert.equal(autoMerge.pendingReason, `reviewed head ${headSha} has auto-merge pending`);
-  assert.equal(automergeAttemptReceiptOutcome({ confirmation: autoMerge }), "accepted");
+  assert.equal(queued.pendingReason, `reviewed head ${headSha} is pending in the merge queue`);
+  assert.equal(automergeAttemptReceiptOutcome({ confirmation: queued }), "accepted");
 });
 
 test("automerge effect certification rejects non-squash and unproven auto-merge methods", () => {
@@ -231,6 +258,61 @@ test("released exact-head merge claims can be reacquired by a fresh workflow att
   assert.equal(comments.length, 3);
 });
 
+test("dispatched exact-head merge claims cannot be released or recovered", () => {
+  const comments: Record<string, any>[] = [];
+  let nextId = 1401;
+  const request = (runId: number) => ({
+    repository: "openclaw/openclaw",
+    number: 42,
+    headSha,
+    method: "squash" as const,
+    owner: "comment_router",
+    claimant: `comment_router:${runId}:1`,
+    appId: 3306130,
+    appSlug: "clawsweeper",
+  });
+  const io = {
+    listComments: () => comments,
+    createComment: (body: string) => {
+      const comment = {
+        id: nextId++,
+        body,
+        created_at: "2026-07-13T08:00:00Z",
+        performed_via_github_app: { id: 3306130, slug: "clawsweeper" },
+        user: { login: "clawsweeper[bot]" },
+      };
+      comments.push(comment);
+      return comment;
+    },
+  };
+
+  const claim = ensureExactHeadMergeClaim(request(6901), io);
+  assert.equal(claim.status, "acquired");
+  if (claim.status !== "acquired") return;
+  assert.equal(
+    markExactHeadMergeClaimDispatched(request(6901), claim.claimId, io).status,
+    "dispatched",
+  );
+  assert.equal(
+    markExactHeadMergeClaimDispatched(request(6901), claim.claimId, io).status,
+    "dispatched",
+  );
+  assert.equal(comments.length, 2);
+  assert.equal(releaseExactHeadMergeClaim(request(6901), claim.claimId, io).status, "blocked");
+
+  let recoveryCalls = 0;
+  const retry = ensureExactHeadMergeClaim(request(6902), {
+    ...io,
+    recoverClaim: () => {
+      recoveryCalls += 1;
+      return { status: "recoverable" as const, reason: "terminal" };
+    },
+  });
+  assert.equal(retry.status, "existing");
+  assert.equal(retry.status === "existing" && retry.dispatched, true);
+  assert.equal(recoveryCalls, 0);
+});
+
 test("terminal stale claims are retired before a fresh workflow may reacquire", () => {
   const comments: Record<string, any>[] = [];
   let nextId = 1501;
@@ -334,6 +416,20 @@ test("claim recovery requires an aged claim and the exact workflow attempt to be
     GITHUB_RUN_ID: "7002",
     GITHUB_RUN_ATTEMPT: "1",
   };
+  let workflowReads = 0;
+  assert.equal(
+    exactHeadMergeClaimRecoveryDecision(
+      { ...candidate, dispatched: true },
+      () => {
+        workflowReads += 1;
+        return { id: 7001, run_attempt: 2, status: "completed" };
+      },
+      env,
+      Date.parse("2026-07-13T08:10:00Z"),
+    ).status,
+    "active",
+  );
+  assert.equal(workflowReads, 0);
   assert.equal(
     exactHeadMergeClaimRecoveryDecision(
       candidate,

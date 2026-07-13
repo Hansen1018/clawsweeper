@@ -35,7 +35,7 @@ import {
   writeRepairSquashMergeBody,
 } from "./repair-merge-message.js";
 import { runtimeStrictBaseBindingBlock } from "./strict-base-binding.js";
-import { squashAutomergeMethodBlock } from "./automerge-effect.js";
+import { squashAutomergeMethodBlock, squashMergeQueueMethodBlock } from "./automerge-effect.js";
 import {
   ensureExactHeadMergeClaim,
   exactHeadMergeClaimIdentity,
@@ -44,8 +44,10 @@ import {
   exactHeadMergeClaimant,
   inspectExactHeadMergeClaim,
   isTrustedExactHeadMergeClaimComment,
+  isTrustedExactHeadMergeClaimDispatchComment,
   isTrustedExactHeadMergeClaimRecoveryComment,
   isTrustedExactHeadMergeClaimReleaseComment,
+  markExactHeadMergeClaimDispatched,
   releaseExactHeadMergeClaim,
   type ExactHeadMergeClaimInspection,
   type ExactHeadMergeClaimRequest,
@@ -1032,7 +1034,37 @@ function applyMergeAction({
         merge_method: "squash",
       });
     }
-    let mergeRequestStarted = false;
+    let dispatchBoundary;
+    try {
+      dispatchBoundary = markApplyMergeClaimDispatched(
+        result.repo,
+        target,
+        authorizedHeadSha,
+        mergeClaim.claimId,
+      );
+    } catch (error) {
+      return {
+        ...base,
+        status: "blocked",
+        reason: `exact-head merge dispatch boundary failed: ${ghErrorText(error)}`,
+        live_state: claimedLive.state,
+        live_updated_at: claimedLive.updated_at,
+        merge_method: "squash",
+        requeue_required: true,
+      };
+    }
+    if (dispatchBoundary.status !== "dispatched") {
+      return {
+        ...base,
+        status: "blocked",
+        reason: dispatchBoundary.reason,
+        live_state: claimedLive.state,
+        live_updated_at: claimedLive.updated_at,
+        merge_method: "squash",
+        ...(dispatchBoundary.status === "unknown" ? { requeue_required: true } : {}),
+      };
+    }
+    let mergeRequestStarted = true;
     try {
       runRepairMutation(applyResultLifecycle(target), {
         kind: "apply_result_merge",
@@ -1298,6 +1330,35 @@ function claimApplyMergeRequest(repository: string, number: number, headSha: str
       exactHeadMergeClaimRecoveryDecision(candidate, (path) =>
         ghJsonOnce(["api", path], { env: exactHeadMergeClaimWorkflowRunEnv() }),
       ),
+  });
+}
+
+function markApplyMergeClaimDispatched(
+  repository: string,
+  number: number,
+  headSha: string,
+  claimId: number,
+) {
+  const request = applyMergeClaimRequest(repository, number, headSha);
+  return markExactHeadMergeClaimDispatched(request, claimId, {
+    listComments: () => listApplyMergeClaimComments(request),
+    createComment: (body) =>
+      runRepairMutation(applyResultLifecycle(number), {
+        kind: "apply_result_merge_claim_dispatch",
+        identity: { ...exactHeadMergeClaimIdentity(request), claimId },
+        component: "merge_claim",
+        operation: () =>
+          ghJsonOnce([
+            "api",
+            `repos/${request.repository}/issues/${request.number}/comments`,
+            "-f",
+            `body=${body}`,
+          ]),
+        outcome: (comment) =>
+          isTrustedExactHeadMergeClaimDispatchComment(comment, request, claimId)
+            ? "accepted"
+            : "unknown",
+      }),
   });
 }
 
@@ -2256,15 +2317,17 @@ function validateMergeablePullRequestHard({ pullRequest, view }: LooseRecord) {
   if (pullRequest.draft || view.isDraft) return "pull request is draft";
   if (String(view.baseRefName ?? pullRequest.base?.ref ?? "") !== "main")
     return "pull request base is not main";
-  const viewAutomergeMethodBlock = squashAutomergeMethodBlock(view.autoMergeRequest);
-  if (viewAutomergeMethodBlock) return viewAutomergeMethodBlock;
-  const restAutomergeMethodBlock = squashAutomergeMethodBlock(pullRequest.auto_merge);
-  if (restAutomergeMethodBlock) return restAutomergeMethodBlock;
   if (["CHANGES_REQUESTED", "REVIEW_REQUIRED"].includes(String(view.reviewDecision ?? ""))) {
     return `review decision is ${view.reviewDecision}`;
   }
   const terminalCheckBlock = validateTerminalStatusChecks(view.statusCheckRollup ?? []);
   if (terminalCheckBlock) return terminalCheckBlock;
+  const viewAutomergeMethodBlock = squashAutomergeMethodBlock(view.autoMergeRequest);
+  if (viewAutomergeMethodBlock) return viewAutomergeMethodBlock;
+  const restAutomergeMethodBlock = squashAutomergeMethodBlock(pullRequest.auto_merge);
+  if (restAutomergeMethodBlock) return restAutomergeMethodBlock;
+  const queueMethodBlock = squashMergeQueueMethodBlock(view, pullRequest);
+  if (queueMethodBlock) return queueMethodBlock;
   return "";
 }
 

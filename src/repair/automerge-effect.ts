@@ -24,6 +24,12 @@ export function squashAutomergeMethodBlock(autoMergeRequest: JsonValue): string 
     : "pending auto-merge request does not prove the required SQUASH method";
 }
 
+export function squashMergeQueueMethodBlock(view: LooseRecord, pull: LooseRecord): string {
+  if (view.isInMergeQueue !== true) return "";
+  if (view.autoMergeRequest || pull.auto_merge) return "";
+  return "pending merge queue state does not prove the required SQUASH method";
+}
+
 export function applyAutomergeResultToCommand(command: LooseRecord, merge: LooseRecord): boolean {
   command.actions = (Array.isArray(command.actions) ? command.actions : []).map(
     (action: LooseRecord) =>
@@ -96,6 +102,15 @@ export function confirmAutomergeEffectSnapshot(
       mergeCommitSha: null,
       pendingReason: "",
       block: restMethodBlock,
+    };
+  }
+  const queueMethodBlock = squashMergeQueueMethodBlock(view, pull);
+  if (queueMethodBlock) {
+    return {
+      mergedAt: null,
+      mergeCommitSha: null,
+      pendingReason: "",
+      block: queueMethodBlock,
     };
   }
   const pendingReason =

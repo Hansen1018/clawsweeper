@@ -22,6 +22,7 @@ import {
   automergeUnconfirmedFailureDisposition,
   confirmAutomergeEffectSnapshot,
   squashAutomergeMethodBlock,
+  squashMergeQueueMethodBlock,
 } from "./automerge-effect.js";
 import {
   ensureExactHeadMergeClaim,
@@ -30,8 +31,10 @@ import {
   exactHeadMergeClaimWorkflowRunEnv,
   exactHeadMergeClaimant,
   isTrustedExactHeadMergeClaimComment,
+  isTrustedExactHeadMergeClaimDispatchComment,
   isTrustedExactHeadMergeClaimRecoveryComment,
   isTrustedExactHeadMergeClaimReleaseComment,
+  markExactHeadMergeClaimDispatched,
   releaseExactHeadMergeClaim,
   type ExactHeadMergeClaimRequest,
   type ExactHeadMergeClaimResult,
@@ -3986,8 +3989,31 @@ function executeAutomerge(command: LooseRecord): LooseRecord {
       automergeReadinessAction(claimedReadinessBlock, waitedMs, transientObservations),
     );
   }
+  let dispatchBoundary;
+  try {
+    dispatchBoundary = markAutomergeMergeClaimDispatched(command, mergeClaim.claimId);
+  } catch (error) {
+    return {
+      action: "merge",
+      status: "waiting",
+      reason: `exact-head merge dispatch boundary failed: ${compactGhError(error)}`,
+      merge_method: "squash",
+      transient_wait_ms: waitedMs,
+      transient_observations: transientObservations,
+    };
+  }
+  if (dispatchBoundary.status !== "dispatched") {
+    return {
+      action: "merge",
+      status: dispatchBoundary.status === "unknown" ? "waiting" : "blocked",
+      reason: dispatchBoundary.reason,
+      merge_method: "squash",
+      transient_wait_ms: waitedMs,
+      transient_observations: transientObservations,
+    };
+  }
   // Keep the exact-head merge request one-shot; reconcile its effect before closing the receipt.
-  let mergeRequestStarted = false;
+  let mergeRequestStarted = true;
   let result;
   try {
     result = runGitHubSpawnMutation(
@@ -4337,6 +4363,35 @@ function claimAutomergeMergeRequest(command: LooseRecord): ExactHeadMergeClaimRe
   });
 }
 
+function markAutomergeMergeClaimDispatched(command: LooseRecord, claimId: number) {
+  const request = automergeMergeClaimRequest(command);
+  return markExactHeadMergeClaimDispatched(request, claimId, {
+    listComments: () =>
+      ghPaged<LooseRecord>(
+        `repos/${request.repository}/issues/${request.number}/comments?per_page=100`,
+      ),
+    createComment: (body) =>
+      runCommandMutation(command, {
+        kind: "pull_request_merge_claim_dispatch",
+        identity: { ...exactHeadMergeClaimIdentity(request), claimId },
+        operation: () =>
+          ghJson(
+            [
+              "api",
+              `repos/${request.repository}/issues/${request.number}/comments`,
+              "-f",
+              `body=${body}`,
+            ],
+            { attempts: 1 },
+          ),
+        outcome: (comment) =>
+          isTrustedExactHeadMergeClaimDispatchComment(comment, request, claimId)
+            ? "accepted"
+            : "unknown",
+      }),
+  });
+}
+
 function releaseAutomergeMergeClaimBeforeDispatch(
   command: LooseRecord,
   claimId: number,
@@ -4546,8 +4601,6 @@ function validateAutomergeHardReadiness({ command, view, target }: LooseRecord) 
     return `pull request is ${String(view.state).toLowerCase()}`;
   if (view.isDraft) return "pull request is draft";
   if (String(view.baseRefName ?? "") !== "main") return "pull request base is not main";
-  const automergeMethodBlock = squashAutomergeMethodBlock(view.autoMergeRequest);
-  if (automergeMethodBlock) return automergeMethodBlock;
   const headBlock = reviewedHeadShaBlockReason({
     expectedHeadSha: command.expected_head_sha,
     currentHeadSha: view.headRefOid,
@@ -4560,6 +4613,10 @@ function validateAutomergeHardReadiness({ command, view, target }: LooseRecord) 
   if (String(view.reviewDecision ?? "") === "CHANGES_REQUESTED") {
     return `review decision is ${view.reviewDecision}`;
   }
+  const automergeMethodBlock = squashAutomergeMethodBlock(view.autoMergeRequest);
+  if (automergeMethodBlock) return automergeMethodBlock;
+  const queueMethodBlock = squashMergeQueueMethodBlock(view, target);
+  if (queueMethodBlock) return queueMethodBlock;
   const changelogBlock = automergeChangelogBlockReason({
     repo: command.repo,
     title: view.title,

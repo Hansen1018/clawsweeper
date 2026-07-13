@@ -35,7 +35,7 @@ import {
 } from "./repair-merge-message.js";
 import { isPassedStagedProofBundle } from "./staged-proof-gates.js";
 import { runtimeStrictBaseBindingBlock } from "./strict-base-binding.js";
-import { squashAutomergeMethodBlock } from "./automerge-effect.js";
+import { squashAutomergeMethodBlock, squashMergeQueueMethodBlock } from "./automerge-effect.js";
 import { compactText as compactPlainText } from "./text-utils.js";
 import {
   runVerifiedPublishedPullMutation,
@@ -57,8 +57,10 @@ import {
   exactHeadMergeClaimWorkflowRunEnv,
   exactHeadMergeClaimant,
   isTrustedExactHeadMergeClaimComment,
+  isTrustedExactHeadMergeClaimDispatchComment,
   isTrustedExactHeadMergeClaimRecoveryComment,
   isTrustedExactHeadMergeClaimReleaseComment,
+  markExactHeadMergeClaimDispatched,
   releaseExactHeadMergeClaim,
   type ExactHeadMergeClaimRequest,
   type ExactHeadMergeClaimResult,
@@ -480,6 +482,25 @@ function finalizeFixPr(action: LooseRecord) {
             claimReleaseRetry: release.status === "unknown",
           };
         }
+        mergeRequestStarted = true;
+        const dispatchBoundary = markPostFlightMergeClaimDispatched(
+          parsed.number,
+          action.commit,
+          claim.claimId,
+        );
+        if (dispatchBoundary.status !== "dispatched") {
+          return {
+            policyBlock: dispatchBoundary.reason,
+            claim,
+            pull: claimedPull,
+            view: claimedView,
+            confirmation: null,
+            confirmationError: "",
+            ambiguous: false,
+            reconciliationOnly: true,
+            claimReleaseRetry: dispatchBoundary.status === "unknown",
+          };
+        }
         mergeAttempts += 1;
         const mutation = runRepairMutation(postFlightLifecycle(null), {
           kind: "post_flight_merge",
@@ -788,6 +809,10 @@ function confirmPostFlightMergeSnapshot(
   if (restAutomergeMethodBlock) {
     return { mergedAt: null, block: restAutomergeMethodBlock, pendingReason: "" };
   }
+  const queueMethodBlock = squashMergeQueueMethodBlock(view, pull);
+  if (queueMethodBlock) {
+    return { mergedAt: null, block: queueMethodBlock, pendingReason: "" };
+  }
   return {
     mergedAt: null,
     block: "",
@@ -884,6 +909,36 @@ function claimPostFlightMergeRequest(
       claimId: null,
     };
   }
+}
+
+function markPostFlightMergeClaimDispatched(number: number, headSha: JsonValue, claimId: number) {
+  const request = postFlightMergeClaimRequest(number, headSha);
+  return markExactHeadMergeClaimDispatched(request, claimId, {
+    listComments: () =>
+      ghPaged<LooseRecord>(
+        `repos/${request.repository}/issues/${request.number}/comments?per_page=100`,
+      ),
+    createComment: (body) =>
+      runRepairMutation(postFlightLifecycle(null), {
+        kind: "post_flight_merge_claim_dispatch",
+        identity: { ...exactHeadMergeClaimIdentity(request), claimId },
+        component: "merge_claim",
+        operation: () =>
+          ghJson(
+            [
+              "api",
+              `repos/${request.repository}/issues/${request.number}/comments`,
+              "-f",
+              `body=${body}`,
+            ],
+            { attempts: 1 },
+          ),
+        outcome: (comment) =>
+          isTrustedExactHeadMergeClaimDispatchComment(comment, request, claimId)
+            ? "accepted"
+            : "unknown",
+      }),
+  });
 }
 
 function releasePostFlightMergeClaim(number: number, headSha: JsonValue, claimId: number) {
@@ -1442,16 +1497,18 @@ function validateFixPrMergeProof({
 }
 
 function validateFixPrMergeHardReadiness({ pull, view }: LooseRecord) {
-  const viewAutomergeMethodBlock = squashAutomergeMethodBlock(view.autoMergeRequest);
-  if (viewAutomergeMethodBlock) return viewAutomergeMethodBlock;
-  const restAutomergeMethodBlock = squashAutomergeMethodBlock(pull.auto_merge);
-  if (restAutomergeMethodBlock) return restAutomergeMethodBlock;
   if (view.reviewDecision === "CHANGES_REQUESTED") {
     return "review decision is CHANGES_REQUESTED";
   }
 
   const checkBlock = validateTerminalStatusChecks(view.statusCheckRollup ?? []);
   if (checkBlock) return checkBlock;
+  const viewAutomergeMethodBlock = squashAutomergeMethodBlock(view.autoMergeRequest);
+  if (viewAutomergeMethodBlock) return viewAutomergeMethodBlock;
+  const restAutomergeMethodBlock = squashAutomergeMethodBlock(pull.auto_merge);
+  if (restAutomergeMethodBlock) return restAutomergeMethodBlock;
+  const queueMethodBlock = squashMergeQueueMethodBlock(view, pull);
+  if (queueMethodBlock) return queueMethodBlock;
 
   return validateResolvedReviewThreads(result.repo, pull.number);
 }

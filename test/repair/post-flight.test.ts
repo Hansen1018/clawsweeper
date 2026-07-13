@@ -741,8 +741,9 @@ test("post-flight reconciles one exact-head merge effect across retries and queu
     assert.equal(report.actions[0]?.merge_attempts, 1);
     assert.equal(fs.readFileSync(fixture.mergeCountPath, "utf8"), "1");
     claimComments = JSON.parse(fs.readFileSync(fixture.mergeClaimPath, "utf8"));
-    assert.equal(claimComments.length, 3);
+    assert.equal(claimComments.length, 4);
     assert.match(claimComments[2].body, /clawsweeper-exact-head-merge-claim:v1/);
+    assert.match(claimComments[3].body, /clawsweeper-exact-head-merge-dispatch:v1 claim=1003/);
 
     fixture.reset();
     runVerifiedPostFlight(fixture, { ...commonEnv, FAKE_GH_MERGE_MODE: "queue" }, 1);
@@ -1700,7 +1701,7 @@ function createVerifiedMergeFixture() {
       "  const autoMergePending = process.env.FAKE_GH_MERGE_MODE === 'auto_merge' && mergeCount() > 0;",
       "  const pending = process.env.FAKE_GH_PENDING_READINESS === '1' || (process.env.FAKE_GH_PENDING_AFTER_ATTEMPT === '1' && mergeCount() > 0) || fs.existsSync(process.env.FAKE_GH_GATE_DRIFT_FILE);",
       "  const checks = process.env.FAKE_GH_FAILED_CHECKS === '1' ? [{ name: 'required-ci/exact-merge', status: 'COMPLETED', conclusion: 'FAILURE' }] : [];",
-      "  process.stdout.write(JSON.stringify({ autoMergeRequest: autoMergePending ? { enabledAt: '2026-07-13T08:00:00Z', mergeMethod: 'SQUASH' } : null, baseRefName: 'main', headRefOid: pull.head.sha, isDraft: false, isInMergeQueue: queued, mergeable: pending ? 'UNKNOWN' : 'MERGEABLE', mergeCommit: viewMerged ? { oid: 'b'.repeat(40) } : null, mergeStateStatus: 'CLEAN', mergedAt: viewMerged ? '2026-07-13T08:00:00Z' : null, reviewDecision: process.env.FAKE_GH_REVIEW_DECISION || null, state: viewMerged ? 'MERGED' : 'OPEN', statusCheckRollup: checks, title: pull.title, url: 'https://github.com/openclaw/openclaw/pull/123' }));",
+      "  process.stdout.write(JSON.stringify({ autoMergeRequest: (autoMergePending || queued) ? { enabledAt: '2026-07-13T08:00:00Z', mergeMethod: 'SQUASH' } : null, baseRefName: 'main', headRefOid: pull.head.sha, isDraft: false, isInMergeQueue: queued, mergeable: pending ? 'UNKNOWN' : 'MERGEABLE', mergeCommit: viewMerged ? { oid: 'b'.repeat(40) } : null, mergeStateStatus: 'CLEAN', mergedAt: viewMerged ? '2026-07-13T08:00:00Z' : null, reviewDecision: process.env.FAKE_GH_REVIEW_DECISION || null, state: viewMerged ? 'MERGED' : 'OPEN', statusCheckRollup: checks, title: pull.title, url: 'https://github.com/openclaw/openclaw/pull/123' }));",
       "  process.exit(0);",
       "}",
       "if (args[0] === 'pr' && args[1] === 'merge') {",

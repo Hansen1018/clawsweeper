@@ -1392,8 +1392,9 @@ test("repair apply requires a fresh reviewed timestamp after releasing a post-cl
     assert.equal(report.actions[0].status, "executed");
     assert.equal(mergeCallCount(fixture.ghLogPath), 1);
     comments = JSON.parse(fs.readFileSync(fixture.mergeClaimPath, "utf8"));
-    assert.equal(comments.length, 3);
+    assert.equal(comments.length, 4);
     assert.match(comments[2].body, /clawsweeper-exact-head-merge-claim:v1/);
+    assert.match(comments[3].body, /clawsweeper-exact-head-merge-dispatch:v1 claim=1003/);
   } finally {
     fixture.cleanup();
   }
@@ -1455,6 +1456,8 @@ test("repair apply records unknown and observed exact-head merge outcomes", () =
         .sort((left, right) => left.phase_seq - right.phase_seq)
         .map((event) => [event.action.status, event.attributes?.completion_reason]),
       [
+        ["started", "mutation_attempted"],
+        ["executed", "mutation_accepted"],
         ["started", "mutation_attempted"],
         ["executed", "mutation_accepted"],
       ],
@@ -2133,7 +2136,7 @@ if (args[0] === "pr" && args[1] === "view") {
     data.terminalCheckFailure || (data.terminalCheckFailureAfterCommand && mergeCount() > 0);
   write({
     autoMergeRequest:
-      pending && data.pendingKind === "auto_merge"
+      pending && (data.pendingKind === "auto_merge" || data.pendingKind === "queue")
         ? { enabledAt: "2026-07-13T07:30:00Z", mergeMethod: "SQUASH" }
         : null,
     baseRefName: "main",
