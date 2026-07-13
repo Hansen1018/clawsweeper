@@ -35,7 +35,8 @@ const DEFAULT_SINCE_MINUTES = 240;
 const DEFAULT_MAX_BYTES = 100 * 1024 * 1024;
 const SENSITIVE_FIELD_NAME = String.raw`(?=[A-Za-z_])[A-Za-z0-9_.-]*(?:token|api[_-]?key|secret|password|credential|private[_-]?key)[A-Za-z0-9_.-]*`;
 const SENSITIVE_HEADER_NAME = String.raw`(?:authorization|proxy-authorization|cookie|set-cookie)`;
-const SENSITIVE_HEADER_LINE_SOURCE = `^(\\s*${SENSITIVE_HEADER_NAME}\\s*:\\s*)([^\\r\\n]*)$`;
+const SENSITIVE_HEADER_LINE_SOURCE = `^(\\s*(?:[<>*]\\s*)?${SENSITIVE_HEADER_NAME}\\s*:\\s*)([^\\r\\n]*)$`;
+const SENSITIVE_HEADER_TEXT_SOURCE = `(^|[^A-Za-z0-9_-])(${SENSITIVE_HEADER_NAME}\\s*:\\s*)([^\\r\\n]*)`;
 const JWT_PATTERN = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g;
 const BEARER_PATTERN = /\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/gi;
 const PRIVATE_KEY_BEGIN_PATTERN = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/;
@@ -60,6 +61,13 @@ type StructuredSensitiveValueMatch = {
   isRedacted: boolean;
   valueStart: number;
   valueEnd: number;
+};
+
+type EncodedSensitiveHeaderMatch = {
+  depth: number;
+  start: number;
+  end: number;
+  value: string;
 };
 
 type ParsedEncodedJsonValue = {
@@ -176,7 +184,7 @@ export function redactSecrets(text: string, redactValues: string[] = [], codexHo
       `$1: ${REDACTED_VALUE}`,
     );
 
-  return redactStructuredSensitiveValues(redacted);
+  return redactStructuredSensitiveValues(redactEncodedSensitiveHeaders(redacted));
 }
 
 export function containsSensitiveValue(text: string, redactValues: string[]): boolean {
@@ -206,6 +214,9 @@ export function containsSensitiveValue(text: string, redactValues: string[]): bo
   ) {
     return true;
   }
+  if (encodedSensitiveHeaderMatches(text).length > 0) {
+    return true;
+  }
   const unquotedNamedValuePatterns = [
     new RegExp(`\\b(${SENSITIVE_FIELD_NAME})\\s*=\\s*([^\\s"',;]+)`, "gi"),
     new RegExp(`\\b(${SENSITIVE_FIELD_NAME})\\s*:\\s*([^\\s"',;]+)`, "gi"),
@@ -222,6 +233,62 @@ export function containsSensitiveValue(text: string, redactValues: string[]): bo
     return true;
   }
   return structured.hasIncompleteValue;
+}
+
+function redactEncodedSensitiveHeaders(text: string): string {
+  let redacted = text;
+  for (const match of encodedSensitiveHeaderMatches(text).sort(
+    (left, right) => right.start - left.start,
+  )) {
+    redacted =
+      redacted.slice(0, match.start) +
+      encodeJsonStringLiteral(match.value, match.depth) +
+      redacted.slice(match.end);
+  }
+  return redacted;
+}
+
+function encodedSensitiveHeaderMatches(text: string): EncodedSensitiveHeaderMatch[] {
+  const candidates = scanEncodedJsonStrings(text)
+    .tokens.map((token) => {
+      const value = redactSensitiveHeaderText(token.value);
+      if (value === token.value) return null;
+      return {
+        depth: token.depth,
+        start: token.start,
+        end: token.closeQuote + 1,
+        value,
+      };
+    })
+    .filter((match): match is EncodedSensitiveHeaderMatch => match !== null)
+    .sort(
+      (left, right) =>
+        left.end - left.start - (right.end - right.start) ||
+        right.depth - left.depth ||
+        left.start - right.start,
+    );
+  const selected: EncodedSensitiveHeaderMatch[] = [];
+  for (const candidate of candidates) {
+    if (selected.every((match) => candidate.end <= match.start || candidate.start >= match.end)) {
+      selected.push(candidate);
+    }
+  }
+  return selected;
+}
+
+function redactSensitiveHeaderText(value: string): string {
+  return value.replace(
+    new RegExp(SENSITIVE_HEADER_TEXT_SOURCE, "gim"),
+    (match, prefix: string, header: string, headerValue: string) =>
+      isRedactedHeaderTextValue(headerValue) ? match : `${prefix}${header}${REDACTED_VALUE}`,
+  );
+}
+
+function isRedactedHeaderTextValue(value: string): boolean {
+  const trimmed = value.trimStart();
+  if (!trimmed.startsWith(REDACTED_VALUE)) return false;
+  const next = trimmed[REDACTED_VALUE.length];
+  return next === undefined || /[\\"'})\],]/.test(next);
 }
 
 function redactStructuredSensitiveValues(text: string): string {

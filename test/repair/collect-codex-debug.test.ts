@@ -249,6 +249,53 @@ test("redactSecrets masks authorization and cookie headers at every encoding dep
   }
 });
 
+test("redactSecrets masks textual headers inside escaped log messages and curl traces", () => {
+  const payload = JSON.stringify({
+    message: [
+      "request failed",
+      "> Authorization: Basic dXNlcjpwYXNzd29yZA==",
+      "< Set-Cookie: session=secret; HttpOnly",
+    ].join("\n"),
+    visible: "safe",
+  });
+  const representations = [
+    payload,
+    JSON.stringify(payload),
+    JSON.stringify(JSON.stringify(payload)),
+  ];
+
+  for (const representation of representations) {
+    assert.equal(containsSensitiveValue(representation, []), true);
+    const redacted = redactSecrets(representation);
+    assert.equal(containsSensitiveValue(redacted, []), false);
+    assert.doesNotMatch(redacted, /dXNlcjpwYXNzd29yZA|session=secret/);
+
+    let decoded = redacted;
+    while (typeof JSON.parse(decoded) === "string") decoded = JSON.parse(decoded);
+    assert.deepEqual(JSON.parse(decoded), {
+      message: ["request failed", "> Authorization: [REDACTED]", "< Set-Cookie: [REDACTED]"].join(
+        "\n",
+      ),
+      visible: "safe",
+    });
+  }
+});
+
+test("redactSecrets masks a header embedded in an ordinary JSONL message value", () => {
+  const input = JSON.stringify({
+    type: "event",
+    message: "upstream said Authorization: Basic dXNlcjpwYXNzd29yZA==",
+  });
+
+  assert.equal(containsSensitiveValue(input, []), true);
+  const redacted = redactSecrets(input);
+  assert.deepEqual(JSON.parse(redacted), {
+    type: "event",
+    message: "upstream said Authorization: [REDACTED]",
+  });
+  assert.equal(containsSensitiveValue(redacted, []), false);
+});
+
 test("redactSecrets masks named credentials across JSON escape depths", () => {
   const payload = JSON.stringify({
     token: 'historical-secret "quoted" \\tail\nnext',
