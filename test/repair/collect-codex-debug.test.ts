@@ -260,6 +260,33 @@ test("escaped named credential detection stays in parity with redaction", () => 
   }
 });
 
+test("redactSecrets decodes Unicode escapes in sensitive JSON field names", () => {
+  const input = String.raw`{"to\u006ben":"historical-secret","visible":"safe"}`;
+  const redacted = redactSecrets(input);
+
+  assert.deepEqual(JSON.parse(redacted), {
+    token: "[REDACTED]",
+    visible: "safe",
+  });
+  assert.doesNotMatch(redacted, /historical-secret/);
+  assert.equal(containsSensitiveValue(redacted, []), false);
+});
+
+test("redactSecrets preserves JSON when a sensitive value ends with a backslash", () => {
+  const input = JSON.stringify({
+    token: "historical-secret\\",
+    visible: "safe",
+  });
+  const redacted = redactSecrets(input);
+
+  assert.deepEqual(JSON.parse(redacted), {
+    token: "[REDACTED]",
+    visible: "safe",
+  });
+  assert.doesNotMatch(redacted, /historical-secret/);
+  assert.equal(containsSensitiveValue(redacted, []), false);
+});
+
 test("escaped named credential detection fails closed on incomplete JSONL fields", () => {
   const incomplete = String.raw`{\"token\":\"historical-secret`;
   const followingRecord = String.raw`{\"visible\":\"safe\"}`;

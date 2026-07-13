@@ -40,11 +40,20 @@ const PRIVATE_KEY_BEGIN_PATTERN = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/;
 const PRIVATE_KEY_PEM_PATTERN =
   /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)/g;
 const REDACTED_VALUE = "[REDACTED]";
+const SENSITIVE_FIELD_NAME_PATTERN = new RegExp(`^${SENSITIVE_FIELD_NAME}$`, "i");
+
+type EncodedJsonStringToken = {
+  depth: number;
+  start: number;
+  openQuote: number;
+  closeQuote: number;
+  value: string;
+};
 
 type StructuredSensitiveValueMatch = {
-  prefix: string;
   value: string;
-  suffix: string;
+  valueStart: number;
+  valueEnd: number;
 };
 
 export function collectCodexDebug(options: CollectOptions) {
@@ -147,10 +156,7 @@ export function redactSecrets(text: string, redactValues: string[] = [], codexHo
       `$1: ${REDACTED_VALUE}`,
     );
 
-  return redacted.replace(structuredSensitiveValuePattern(), (...args: unknown[]) => {
-    const groups = args.at(-1) as StructuredSensitiveValueMatch;
-    return `${groups.prefix}${REDACTED_VALUE}${groups.suffix}`;
-  });
+  return redactStructuredSensitiveValues(redacted);
 }
 
 export function containsSensitiveValue(text: string, redactValues: string[]): boolean {
@@ -183,28 +189,157 @@ export function containsSensitiveValue(text: string, redactValues: string[]): bo
   ) {
     return true;
   }
-  const structuredMatches = [...text.matchAll(structuredSensitiveValuePattern())];
-  if (structuredMatches.some((match) => !isRedactedValue(match.groups?.value ?? ""))) {
+  const structured = scanStructuredSensitiveValues(text);
+  if (structured.matches.some((match) => !isRedactedValue(match.value))) {
     return true;
   }
-  const completeStarts = new Set(structuredMatches.map((match) => match.index));
-  return [...text.matchAll(structuredSensitiveValueStartPattern())].some(
-    (match) => !completeStarts.has(match.index),
-  );
+  return structured.hasIncompleteValue;
 }
 
-function structuredSensitiveValuePattern(): RegExp {
-  return new RegExp(
-    String.raw`(?<prefix>(?<!\\)(?<escape>\\*)"(?<field>${SENSITIVE_FIELD_NAME})(?<!\\)\k<escape>"\s*:\s*(?<!\\)\k<escape>")(?<value>[^\r\n]*?)(?<suffix>(?<!\\)\k<escape>")`,
-    "gi",
-  );
+function redactStructuredSensitiveValues(text: string): string {
+  const ranges: StructuredSensitiveValueMatch[] = [];
+  for (const match of scanStructuredSensitiveValues(text).matches.sort(
+    (left, right) => left.valueStart - right.valueStart || right.valueEnd - left.valueEnd,
+  )) {
+    const previous = ranges.at(-1);
+    if (!previous || match.valueStart >= previous.valueEnd) ranges.push(match);
+  }
+  let redacted = text;
+  for (const range of ranges.reverse()) {
+    redacted =
+      redacted.slice(0, range.valueStart) + REDACTED_VALUE + redacted.slice(range.valueEnd);
+  }
+  return redacted;
 }
 
-function structuredSensitiveValueStartPattern(): RegExp {
-  return new RegExp(
-    String.raw`(?<!\\)(?<escape>\\*)"${SENSITIVE_FIELD_NAME}(?<!\\)\k<escape>"\s*:\s*(?<!\\)\k<escape>"`,
-    "gi",
+function scanStructuredSensitiveValues(text: string): {
+  matches: StructuredSensitiveValueMatch[];
+  hasIncompleteValue: boolean;
+} {
+  const { tokens, possibleStarts } = scanEncodedJsonStrings(text);
+  const tokenByStart = new Map(
+    tokens.map((token) => [encodedTokenKey(token.depth, token.start), token]),
   );
+  const matches: StructuredSensitiveValueMatch[] = [];
+  let hasIncompleteValue = false;
+
+  for (const keyToken of tokens) {
+    if (!SENSITIVE_FIELD_NAME_PATTERN.test(keyToken.value)) continue;
+    let cursor = skipJsonWhitespace(text, keyToken.closeQuote + 1);
+    if (text[cursor] !== ":") continue;
+    cursor = skipJsonWhitespace(text, cursor + 1);
+    const valueToken = tokenByStart.get(encodedTokenKey(keyToken.depth, cursor));
+    if (!valueToken) {
+      if (possibleStarts.has(encodedTokenKey(keyToken.depth, cursor))) {
+        hasIncompleteValue = true;
+      }
+      continue;
+    }
+    const delimiterBackslashes = 2 ** keyToken.depth - 1;
+    matches.push({
+      value: valueToken.value,
+      valueStart: valueToken.openQuote + 1,
+      valueEnd: valueToken.closeQuote - delimiterBackslashes,
+    });
+  }
+
+  return { matches, hasIncompleteValue };
+}
+
+function scanEncodedJsonStrings(text: string): {
+  tokens: EncodedJsonStringToken[];
+  possibleStarts: Set<string>;
+} {
+  const quotesByDepth = new Map<
+    number,
+    Array<{ index: number; line: number; backslashes: number }>
+  >();
+  let line = 0;
+  for (let index = 0; index < text.length; index += 1) {
+    const character = text[index];
+    if (character === "\n" || character === "\r") {
+      line += 1;
+      continue;
+    }
+    if (character !== '"') continue;
+    const backslashes = backslashRunBefore(text, index);
+    const depth = encodedJsonDepth(backslashes);
+    const quotes = quotesByDepth.get(depth) ?? [];
+    quotes.push({ index, line, backslashes });
+    quotesByDepth.set(depth, quotes);
+  }
+
+  const tokens: EncodedJsonStringToken[] = [];
+  const possibleStarts = new Set<string>();
+  for (const [depth, quotes] of quotesByDepth) {
+    const delimiterBackslashes = 2 ** depth - 1;
+    for (const quote of quotes) {
+      if (quote.backslashes === delimiterBackslashes) {
+        possibleStarts.add(encodedTokenKey(depth, quote.index - delimiterBackslashes));
+      }
+    }
+    for (let index = 0; index + 1 < quotes.length; index += 1) {
+      const opening = quotes[index]!;
+      const closing = quotes[index + 1]!;
+      if (opening.line !== closing.line || opening.backslashes !== delimiterBackslashes) continue;
+      const start = opening.index - delimiterBackslashes;
+      const value = decodeEncodedJsonString(text.slice(start, closing.index + 1), depth);
+      if (value === null) continue;
+      tokens.push({
+        depth,
+        start,
+        openQuote: opening.index,
+        closeQuote: closing.index,
+        value,
+      });
+    }
+  }
+
+  return { tokens, possibleStarts };
+}
+
+function decodeEncodedJsonString(segment: string, depth: number): string | null {
+  try {
+    let decoded = segment;
+    for (let index = 0; index < depth; index += 1) {
+      const value = JSON.parse(`"${decoded}"`);
+      if (typeof value !== "string") return null;
+      decoded = value;
+    }
+    const value = JSON.parse(decoded);
+    return typeof value === "string" ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function encodedJsonDepth(backslashes: number): number {
+  // Depth d delimiters have 2^d - 1 slashes; encoded content adds multiples of 2^(d + 1).
+  let depth = 0;
+  let value = backslashes + 1;
+  while (value % 2 === 0) {
+    depth += 1;
+    value /= 2;
+  }
+  return depth;
+}
+
+function backslashRunBefore(text: string, index: number): number {
+  let count = 0;
+  for (let cursor = index - 1; cursor >= 0 && text[cursor] === "\\"; cursor -= 1) {
+    count += 1;
+  }
+  return count;
+}
+
+function encodedTokenKey(depth: number, start: number): string {
+  return `${depth}:${start}`;
+}
+
+function skipJsonWhitespace(text: string, start: number): number {
+  let cursor = start;
+  while (cursor < text.length && /[\t\n\r ]/.test(text[cursor]!)) cursor += 1;
+  return cursor;
 }
 
 function isRedactedValue(value: string): boolean {
