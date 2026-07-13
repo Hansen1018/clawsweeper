@@ -31275,22 +31275,133 @@ function assistValidateArtifactCommand(args: Args): void {
   repoFromArgs(args);
   const request = assistRequestFromArgs(args);
   const workflow = assistWorkflowIdentity(args);
-  const artifact = parseAssistArtifact(
-    readBoundedUtf8File(assistArtifactPath(args), ASSIST_ARTIFACT_MAX_BYTES, "assist artifact"),
-    {
+  const artifactPath = assistArtifactPath(args);
+  const artifactRecordPath = repoRelativePath(artifactPath);
+  const operationIdentity = {
+    repository: request.targetRepo,
+    number: request.itemNumber,
+    requestSha256: assistRequestSha256(request),
+    mode: request.mode,
+    lens: request.lens,
+    runId: workflow.runId,
+    runAttempt: workflow.runAttempt,
+    artifactName: basename(artifactPath),
+  };
+  const subject: ActionEventSubject = {
+    repository: request.targetRepo,
+    kind: "publication",
+    number: request.itemNumber,
+    ...(artifactRecordPath.startsWith("../") ? {} : { recordPath: artifactRecordPath }),
+  };
+  const startedAtMs = Date.now();
+  const start = recordWorkflowPhaseEvent(ROOT, {
+    phase: ACTION_EVENT_TYPES.proofBinding,
+    status: ACTION_EVENT_STATUSES.started,
+    reasonCode: ACTION_EVENT_REASON_CODES.selected,
+    retryable: false,
+    mutation: false,
+    identity: { slot: "assist_validation_start" },
+    operation: "assist",
+    operationIdentity,
+    phaseSeq: 1,
+    idempotencyIdentity: {
+      operationIdentity,
+      slot: "assist_validation_start",
+    },
+    component: "assist_validate",
+    subject,
+    evidence: workflowRunEvidence(),
+    attributes: {
+      review_mode: request.mode,
+      validation_count: 1,
+      validation_kind: "assist_artifact",
+    },
+    privacy: actionLedgerPrivacy(),
+  });
+  let artifactEvidence: ActionEventEvidence | null = null;
+  try {
+    const artifactText = readBoundedUtf8File(
+      artifactPath,
+      ASSIST_ARTIFACT_MAX_BYTES,
+      "assist artifact",
+    );
+    artifactEvidence = {
+      kind: "assist_review_artifact",
+      sha256: sha256(artifactText),
+      ...(artifactRecordPath.startsWith("../") ? {} : { reportPath: artifactRecordPath }),
+    };
+    const artifact = parseAssistArtifact(artifactText, {
       runId: workflow.runId,
       runAttempt: workflow.runAttempt,
       request,
-    },
-  );
-  console.log(
-    JSON.stringify({
-      valid: true,
-      item: artifact.target.item_number,
-      mode: artifact.request.mode,
-      idempotency_key: artifact.idempotency_key,
-    }),
-  );
+    });
+    recordWorkflowPhaseEvent(ROOT, {
+      phase: ACTION_EVENT_TYPES.proofBinding,
+      status: ACTION_EVENT_STATUSES.completed,
+      reasonCode: ACTION_EVENT_REASON_CODES.completed,
+      retryable: false,
+      mutation: false,
+      identity: { slot: "assist_validation_terminal", completionReason: "validated" },
+      operation: "assist",
+      operationIdentity,
+      parentEventId: start?.event_id ?? null,
+      phaseSeq: 2,
+      idempotencyIdentity: {
+        operationIdentity,
+        slot: "assist_validation_terminal",
+      },
+      component: "assist_validate",
+      subject,
+      evidence: [...workflowRunEvidence(), artifactEvidence],
+      attributes: {
+        completion_reason: "validated",
+        duration_ms: Math.max(0, Date.now() - startedAtMs),
+        publication_kind: "local_artifact",
+        review_mode: request.mode,
+        validation_count: 1,
+        validation_kind: "assist_artifact",
+      },
+      privacy: actionLedgerPrivacy(),
+    });
+    console.log(
+      JSON.stringify({
+        valid: true,
+        item: artifact.target.item_number,
+        mode: artifact.request.mode,
+        idempotency_key: artifact.idempotency_key,
+      }),
+    );
+  } catch (error) {
+    recordWorkflowPhaseEvent(ROOT, {
+      phase: ACTION_EVENT_TYPES.proofBinding,
+      status: ACTION_EVENT_STATUSES.failed,
+      reasonCode: ACTION_EVENT_REASON_CODES.validationFailed,
+      retryable: false,
+      mutation: false,
+      identity: { slot: "assist_validation_terminal", completionReason: "validation_failed" },
+      operation: "assist",
+      operationIdentity,
+      parentEventId: start?.event_id ?? null,
+      phaseSeq: 2,
+      idempotencyIdentity: {
+        operationIdentity,
+        slot: "assist_validation_terminal",
+      },
+      component: "assist_validate",
+      subject,
+      evidence: [...workflowRunEvidence(), ...(artifactEvidence ? [artifactEvidence] : [])],
+      attributes: {
+        completion_reason: "validation_failed",
+        duration_ms: Math.max(0, Date.now() - startedAtMs),
+        publication_kind: "local_artifact",
+        review_mode: request.mode,
+        validation_count: 1,
+        validation_kind: "assist_artifact",
+      },
+      privacy: actionLedgerPrivacy(),
+    });
+    throw error;
+  }
 }
 
 function checkCommand(): void {

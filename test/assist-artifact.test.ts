@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { basename, join } from "node:path";
 import test from "node:test";
+import { readValidatedActionEventShardBatch } from "../dist/action-ledger-runtime.js";
 import {
   ASSIST_ANSWER_MAX_BYTES,
   assertAssistArtifactLiveRevision,
@@ -128,6 +132,96 @@ test("assist artifact validation rejects stale or redirected publication", () =>
       }),
     /prompt context changed/,
   );
+});
+
+test("assist validation records rejected artifacts in the action ledger", () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "assist-validation-ledger-")));
+  const outputRoot = realpathSync(mkdtempSync(join(root, "output-")));
+  const artifactPath = join(root, "assist-result.json");
+  const runId = `${process.pid}${Date.now()}`;
+  try {
+    writeFileSync(
+      artifactPath,
+      JSON.stringify({ ...artifact(), executable: "./payload.sh" }),
+      "utf8",
+    );
+    const result = spawnSync(
+      process.execPath,
+      [
+        "dist/clawsweeper.js",
+        "assist-validate",
+        "--artifact",
+        artifactPath,
+        "--target-repo",
+        request.targetRepo,
+        "--item-number",
+        String(request.itemNumber),
+        "--question",
+        request.question,
+        "--mode",
+        request.mode,
+        "--lens",
+        request.lens,
+        "--comment-id",
+        request.sourceCommentId,
+        "--comment-url",
+        request.sourceCommentUrl,
+        "--author",
+        request.author,
+        "--codex-reasoning-effort",
+        request.reasoningEffort,
+        "--run-id",
+        runId,
+        "--run-attempt",
+        "2",
+      ],
+      {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          CLAWSWEEPER_ACTION_LEDGER_FORCE: "1",
+          CLAWSWEEPER_ACTION_LEDGER_INVOCATION: basename(root).replaceAll(".", "-"),
+          CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT: outputRoot,
+          GITHUB_ACTION: "assist-validate",
+          GITHUB_JOB: "publish",
+          GITHUB_REPOSITORY: "openclaw/clawsweeper",
+          GITHUB_RUN_ATTEMPT: "2",
+          GITHUB_RUN_ID: runId,
+          GITHUB_RUN_STARTED_AT: "2026-07-13T20:00:00Z",
+          GITHUB_SHA: "a".repeat(40),
+          GITHUB_WORKFLOW: "ClawSweeper Assist",
+          GITHUB_WORKFLOW_REF: "openclaw/clawsweeper/.github/workflows/assist.yml@refs/heads/main",
+        },
+      },
+    );
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /unexpected assist artifact fields/);
+
+    const events = readValidatedActionEventShardBatch(outputRoot).events.filter(
+      (event) => event.producer.run_id === runId,
+    );
+    assert.deepEqual(
+      events.map((event) => [
+        event.event_type,
+        event.action.status,
+        event.action.reason_code,
+        event.action.retryable,
+      ]),
+      [
+        ["proof.binding", "started", "selected", false],
+        ["proof.binding", "failed", "validation_failed", false],
+      ],
+    );
+    assert.equal(events[1]?.parent_event_id, events[0]?.event_id);
+    assert.equal(events[1]?.attributes?.completion_reason, "validation_failed");
+    assert.equal(
+      events[1]?.evidence.some((entry) => entry.kind === "assist_review_artifact"),
+      true,
+    );
+    assert.doesNotMatch(JSON.stringify(events), new RegExp(root.replaceAll("\\", "\\\\")));
+  } finally {
+    rmSync(root, { force: true, recursive: true });
+  }
 });
 
 test("assist retry identity stays stable across live context revisions", () => {
