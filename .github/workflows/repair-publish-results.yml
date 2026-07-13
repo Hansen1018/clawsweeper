@@ -348,7 +348,7 @@ jobs:
         with:
           artifact-ids: ${{ steps.result-artifact.outputs.artifact_id }}
           path: artifacts
-          github-token: ${{ steps.app_token.outputs.token }}
+          github-token: ${{ github.token }}
           repository: ${{ github.repository }}
           run-id: ${{ github.event.workflow_run.id }}
 
@@ -358,7 +358,7 @@ jobs:
         with:
           artifact-ids: ${{ steps.result-artifact.outputs.provenance_artifact_id }}
           path: artifact-provenance
-          github-token: ${{ steps.app_token.outputs.token }}
+          github-token: ${{ github.token }}
           repository: ${{ github.repository }}
           run-id: ${{ github.event.workflow_run.id }}
 

@@ -109,6 +109,12 @@ test("repair result publication rejects untrusted worker heads before minting wr
     workflow,
     /uses: \.\/\.github\/actions\/setup-state[\s\S]*?token: \$\{\{ steps\.state-token\.outputs\.token \}\}[\s\S]*?fetch-depth: 0/,
   );
+  for (const block of workflow.matchAll(
+    /uses: actions\/download-artifact@v8\n\s+with:\n([\s\S]*?)(?=\n\s{6}- (?:name|uses):|\n\n)/g,
+  )) {
+    assert.match(block[1] ?? "", /github-token: \$\{\{ github\.token \}\}/);
+    assert.doesNotMatch(block[1] ?? "", /steps\.app_token\.outputs\.token/);
+  }
   assert.match(
     classification,
     /if \[\[ ! "\$WORKER_HEAD_SHA" =~ \^\[a-f0-9\]\{40\}\$ \]\]; then[\s\S]*exit 1/,
