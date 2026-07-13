@@ -1171,7 +1171,7 @@ test("repair apply certifies an ambiguous squash response from the durable dispa
     assert.equal(report.actions[0].reason, "merge confirmed after ambiguous response");
     assert.equal(report.actions[0].merged_at, "2026-07-13T08:00:00Z");
     assert.equal(mergeCallCount(fixture.ghLogPath), 1);
-    assert.equal(restPullCallCount(fixture.ghLogPath), 3);
+    assert.equal(restPullCallCount(fixture.ghLogPath), 5);
     const mergeCall = ghCalls(fixture.ghLogPath).find(
       (call) => call.args[0] === "pr" && call.args[1] === "merge",
     );
@@ -1198,7 +1198,7 @@ test("repair apply rejects a merged REST snapshot for a different head", () => {
     );
     assert.equal(report.actions[0].merged_at, undefined);
     assert.equal(mergeCallCount(fixture.ghLogPath), 1);
-    assert.equal(restPullCallCount(fixture.ghLogPath), 3);
+    assert.equal(restPullCallCount(fixture.ghLogPath), 5);
   } finally {
     fixture.cleanup();
   }
@@ -1222,14 +1222,14 @@ for (const pendingKind of ["queue", "auto_merge"] as const) {
           : "auto-merge is pending for the authorized pull request head",
       );
       assert.equal(mergeCallCount(fixture.ghLogPath), 1);
-      assert.equal(pullRequestViewCallCount(fixture.ghLogPath), 4);
+      assert.equal(pullRequestViewCallCount(fixture.ghLogPath), 6);
 
       runMergeApplyResult(fixture);
       report = readApplyReport(fixture.reportPath);
       assert.equal(report.actions[0].status, "blocked");
       assert.equal(report.actions[0].requeue_required, true);
       assert.equal(mergeCallCount(fixture.ghLogPath), 1);
-      assert.equal(pullRequestViewCallCount(fixture.ghLogPath), 5);
+      assert.equal(pullRequestViewCallCount(fixture.ghLogPath), 7);
     } finally {
       fixture.cleanup();
     }
@@ -1272,7 +1272,7 @@ test("repair apply reports a post-command terminal check failure before queue st
     assert.equal(report.actions[0].reason, "checks are not clean: test: FAILURE");
     assert.equal(report.actions[0].requeue_required, undefined);
     assert.equal(mergeCallCount(fixture.ghLogPath), 1);
-    assert.equal(pullRequestViewCallCount(fixture.ghLogPath), 4);
+    assert.equal(pullRequestViewCallCount(fixture.ghLogPath), 6);
   } finally {
     fixture.cleanup();
   }
@@ -1334,25 +1334,58 @@ test("repair apply does not transport-retry an ambiguous merge mutation", () => 
     assert.equal(report.actions[0].requeue_required, true);
     assert.match(report.actions[0].reason, /merge command failed.*HTTP 502/i);
     assert.equal(mergeCallCount(fixture.ghLogPath), 1);
-    assert.equal(restPullCallCount(fixture.ghLogPath), 3);
+    assert.equal(restPullCallCount(fixture.ghLogPath), 5);
+    const comments = JSON.parse(fs.readFileSync(fixture.mergeClaimPath, "utf8"));
+    assert.equal(comments.length, 2);
+    assert.doesNotMatch(
+      comments.map((comment: Record<string, unknown>) => comment.body).join("\n"),
+      /rejection/,
+    );
   } finally {
     fixture.cleanup();
   }
 });
 
-test("repair apply retires a proven no-effect claim so the same head can retry", () => {
-  const fixture = writeMergeApplyFixture({ mergeMode: "ambiguous_unconfirmed" });
+for (const mergeMode of ["ambiguous_unconfirmed", "timeout_unconfirmed"] as const) {
+  test(`repair apply preserves reconciliation-only claims after ${mergeMode}`, () => {
+    const fixture = writeMergeApplyFixture({ mergeMode });
+    try {
+      runMergeApplyResult(fixture, { runAttempt: 1 });
+      let report = readApplyReport(fixture.reportPath);
+      assert.equal(report.actions[0].status, "blocked");
+      assert.equal(report.actions[0].requeue_required, true);
+      assert.equal(mergeCallCount(fixture.ghLogPath), 1);
+
+      let comments = JSON.parse(fs.readFileSync(fixture.mergeClaimPath, "utf8"));
+      assert.equal(comments.length, 2);
+      assert.match(comments[0].body, /clawsweeper-exact-head-merge-claim:v1/);
+      assert.match(comments[1].body, /clawsweeper-exact-head-merge-dispatch:v2 claim=1001/);
+
+      runMergeApplyResult(fixture, { runAttempt: 2 });
+      report = readApplyReport(fixture.reportPath);
+      assert.equal(report.actions[0].status, "blocked");
+      assert.equal(report.actions[0].requeue_required, true);
+      assert.equal(mergeCallCount(fixture.ghLogPath), 1);
+      comments = JSON.parse(fs.readFileSync(fixture.mergeClaimPath, "utf8"));
+      assert.equal(comments.length, 2);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+}
+
+test("repair apply retires a definitively rejected claim so the same head can retry", () => {
+  const fixture = writeMergeApplyFixture({ mergeMode: "definitive_rejection" });
   try {
     runMergeApplyResult(fixture, { runAttempt: 1 });
     let report = readApplyReport(fixture.reportPath);
     assert.equal(report.actions[0].status, "blocked");
     assert.equal(report.actions[0].requeue_required, true);
+    assert.match(report.actions[0].reason, /definitively rejected/i);
     assert.equal(mergeCallCount(fixture.ghLogPath), 1);
 
     let comments = JSON.parse(fs.readFileSync(fixture.mergeClaimPath, "utf8"));
     assert.equal(comments.length, 3);
-    assert.match(comments[0].body, /clawsweeper-exact-head-merge-claim:v1/);
-    assert.match(comments[1].body, /clawsweeper-exact-head-merge-dispatch:v2 claim=1001/);
     assert.match(comments[2].body, /clawsweeper-exact-head-merge-rejection:v1 claim=1001/);
 
     const refreshedResult = JSON.parse(fs.readFileSync(fixture.resultPath, "utf8"));
@@ -1368,8 +1401,6 @@ test("repair apply retires a proven no-effect claim so the same head can retry",
     assert.equal(mergeCallCount(fixture.ghLogPath), 2);
     comments = JSON.parse(fs.readFileSync(fixture.mergeClaimPath, "utf8"));
     assert.equal(comments.length, 6);
-    assert.match(comments[3].body, /clawsweeper-exact-head-merge-claim:v1/);
-    assert.match(comments[4].body, /clawsweeper-exact-head-merge-dispatch:v2 claim=1004/);
     assert.match(comments[5].body, /clawsweeper-exact-head-merge-rejection:v1 claim=1004/);
   } finally {
     fixture.cleanup();
@@ -1409,6 +1440,72 @@ test("repair apply blocks same-second foreign activity before claiming the merge
     fixture.cleanup();
   }
 });
+
+for (const postClaimContentDrift of ["body", "title", "label"] as const) {
+  test(`repair apply rejects same-window ${postClaimContentDrift} drift after claiming`, () => {
+    const fixture = writeMergeApplyFixture({ postClaimContentDrift });
+    try {
+      runMergeApplyResult(fixture);
+
+      const report = readApplyReport(fixture.reportPath);
+      assert.equal(report.actions[0].status, "blocked");
+      assert.equal(report.actions[0].reason, "target changed after exact-head merge claim");
+      assert.equal(mergeCallCount(fixture.ghLogPath), 0);
+      const comments = JSON.parse(fs.readFileSync(fixture.mergeClaimPath, "utf8"));
+      assert.equal(comments.length, 2);
+      assert.match(comments[1].body, /clawsweeper-exact-head-merge-release:v1 claim=1001/);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+}
+
+for (const [postDispatchGuardDrift, reason] of [
+  ["timeline", /target changed at the merge dispatch boundary/],
+  ["security", /security-sensitive target/],
+  ["strict_base", /lacks server-enforced strict base binding/],
+] as const) {
+  test(`repair apply retires post-marker ${postDispatchGuardDrift} drift before merge`, () => {
+    const fixture = writeMergeApplyFixture({ postDispatchGuardDrift });
+    try {
+      runMergeApplyResult(fixture);
+
+      const report = readApplyReport(fixture.reportPath);
+      assert.equal(report.actions[0].status, "blocked");
+      assert.match(report.actions[0].reason, reason);
+      assert.equal(mergeCallCount(fixture.ghLogPath), 0);
+      const comments = JSON.parse(fs.readFileSync(fixture.mergeClaimPath, "utf8"));
+      assert.equal(comments.length, 3);
+      assert.match(comments[2].body, /clawsweeper-exact-head-merge-rejection:v1 claim=1001/);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+}
+
+for (const [postPolicyDrift, reason] of [
+  ["rest_head", /REST head changed/],
+  ["view_head", /head changed during merge preflight/],
+  ["base", /base is not main|base changed after strict-base/],
+  ["readiness", /merge state status is BLOCKED/],
+] as const) {
+  test(`repair apply catches absolute-final ${postPolicyDrift} drift before merge`, () => {
+    const fixture = writeMergeApplyFixture({ postPolicyDrift });
+    try {
+      runMergeApplyResult(fixture);
+
+      const report = readApplyReport(fixture.reportPath);
+      assert.equal(report.actions[0].status, "blocked");
+      assert.match(report.actions[0].reason, reason);
+      assert.equal(mergeCallCount(fixture.ghLogPath), 0);
+      const comments = JSON.parse(fs.readFileSync(fixture.mergeClaimPath, "utf8"));
+      assert.equal(comments.length, 3);
+      assert.match(comments[2].body, /clawsweeper-exact-head-merge-rejection:v1 claim=1001/);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+}
 
 test("repair apply reconstructs durable squash proof in a fresh process", () => {
   const fixture = writeMergeApplyFixture();
@@ -2015,6 +2112,8 @@ function writeMergeApplyFixture(
       | "success_exact"
       | "ambiguous_exact"
       | "ambiguous_unconfirmed"
+      | "timeout_unconfirmed"
+      | "definitive_rejection"
       | "pending_after_command"
       | "wrong_head_merged";
     pendingKind?: "queue" | "auto_merge";
@@ -2028,6 +2127,9 @@ function writeMergeApplyFixture(
     legacyStatusContextSuccess?: boolean;
     mergeCommitMode?: "exact" | "message_mismatch" | "two_parents";
     foreignActivityBeyondTimelineCap?: boolean;
+    postClaimContentDrift?: "body" | "title" | "label";
+    postDispatchGuardDrift?: "timeline" | "security" | "strict_base";
+    postPolicyDrift?: "rest_head" | "view_head" | "base" | "readiness";
   } = {},
 ): MergeFixture {
   const root = fs.realpathSync(
@@ -2044,6 +2146,7 @@ function writeMergeApplyFixture(
   const unrelatedDriftPath = path.join(root, "unrelated-drift");
   const mergeMessagePath = path.join(root, "merge-message");
   const issueCountPath = path.join(root, "issue-count");
+  const policyReadPath = path.join(root, "policy-read");
   const ledgerRoot = path.join(root, "ledger");
   const ledgerOutputRoot = path.join(root, "ledger-output");
   const headSha = "a".repeat(40);
@@ -2143,7 +2246,11 @@ function writeMergeApplyFixture(
     mergeCommitMode: options.mergeCommitMode ?? "exact",
     reviewedTimeline,
     foreignActivityBeyondTimelineCap: options.foreignActivityBeyondTimelineCap ?? false,
+    postClaimContentDrift: options.postClaimContentDrift ?? null,
+    postDispatchGuardDrift: options.postDispatchGuardDrift ?? null,
+    postPolicyDrift: options.postPolicyDrift ?? null,
     issueCountPath,
+    policyReadPath,
   };
   fs.writeFileSync(
     path.join(binDir, "gh.js"),
@@ -2167,6 +2274,22 @@ function issueCount() {
   return fs.existsSync(data.issueCountPath)
     ? Number(fs.readFileSync(data.issueCountPath, "utf8"))
     : 0;
+}
+
+function mergeComments() {
+  return fs.existsSync(data.mergeClaimPath)
+    ? JSON.parse(fs.readFileSync(data.mergeClaimPath, "utf8"))
+    : [];
+}
+
+function dispatchRecorded(comments = mergeComments()) {
+  return comments.some((comment) =>
+    String(comment.body || "").includes("clawsweeper-exact-head-merge-dispatch:v2"),
+  );
+}
+
+function policyReadCompleted() {
+  return fs.existsSync(data.policyReadPath);
 }
 
 if (args[0] === "api") {
@@ -2200,9 +2323,7 @@ if (args[0] === "api") {
     process.exit(0);
   }
   if (apiPath.includes("/issues/101/timeline")) {
-    const comments = fs.existsSync(data.mergeClaimPath)
-      ? JSON.parse(fs.readFileSync(data.mergeClaimPath, "utf8"))
-      : [];
+    const comments = mergeComments();
     const timeline = [
       ...data.reviewedTimeline,
       ...comments.map((comment) => ({ ...comment, event: "commented" })),
@@ -2226,6 +2347,14 @@ if (args[0] === "api") {
         actor: { login: "maintainer" },
       });
     }
+    if (data.postDispatchGuardDrift === "timeline" && dispatchRecorded(comments)) {
+      timeline.push({
+        id: 90003,
+        event: "labeled",
+        created_at: "2026-07-13T07:02:02Z",
+        actor: { login: "maintainer" },
+      });
+    }
     if (args.includes("--slurp")) {
       write([timeline]);
     } else {
@@ -2239,9 +2368,9 @@ if (args[0] === "api") {
   if (apiPath === "repos/openclaw/openclaw/issues/101") {
     const count = issueCount() + 1;
     fs.writeFileSync(data.issueCountPath, String(count));
-    const comments = fs.existsSync(data.mergeClaimPath)
-      ? JSON.parse(fs.readFileSync(data.mergeClaimPath, "utf8"))
-      : [];
+    const comments = mergeComments();
+    const dispatched = dispatchRecorded(comments);
+    const contentDrift = comments.length > 0 ? data.postClaimContentDrift : null;
     const latestClaimMutation = comments.at(-1)?.created_at || "2026-07-13T07:00:00Z";
     const driftMode = fs.existsSync(data.unrelatedDriftPath)
       ? fs.readFileSync(data.unrelatedDriftPath, "utf8").trim()
@@ -2254,7 +2383,8 @@ if (args[0] === "api") {
         : latestClaimMutation;
     write({
       number: 101,
-      title: "Exact merge candidate",
+      title: contentDrift === "title" ? "Changed merge candidate" : "Exact merge candidate",
+      body: contentDrift === "body" ? "Changed in the claim window." : "Original body.",
       html_url: "https://github.com/openclaw/openclaw/pull/101",
       state: mergeCompleted ? "closed" : "open",
       updated_at:
@@ -2269,9 +2399,14 @@ if (args[0] === "api") {
       user: { login: "contributor" },
       labels:
         (data.securityOnFinalIssueFetch && count > 1) ||
-        (data.securityOnPostClaimIssueFetchOnce && count === 3)
+        (data.securityOnPostClaimIssueFetchOnce && count === 3) ||
+        (data.postDispatchGuardDrift === "security" && dispatched)
           ? [{ name: "security" }]
-          : [],
+          : contentDrift === "label"
+            ? [{ name: "documentation" }]
+            : [],
+      comments: comments.length,
+      reactions: { total_count: 0 },
       pull_request: {},
     });
     process.exit(0);
@@ -2282,7 +2417,10 @@ if (args[0] === "api") {
       attempted &&
       ["success_exact", "ambiguous_exact", "wrong_head_merged"].includes(data.mergeMode);
     const snapshotHead =
-      attempted && data.mergeMode === "wrong_head_merged" ? data.wrongHeadSha : data.headSha;
+      (attempted && data.mergeMode === "wrong_head_merged") ||
+      (policyReadCompleted() && data.postPolicyDrift === "rest_head")
+        ? data.wrongHeadSha
+        : data.headSha;
     write({
       number: 101,
       title: "Exact merge candidate",
@@ -2294,7 +2432,9 @@ if (args[0] === "api") {
       merge_commit_sha: merged ? "c".repeat(40) : null,
       auto_merge: null,
       mergeable_state: "clean",
-      base: { ref: "main" },
+      base: {
+        ref: policyReadCompleted() && data.postPolicyDrift === "base" ? "release" : "main",
+      },
       head: { sha: snapshotHead },
     });
     process.exit(0);
@@ -2318,16 +2458,21 @@ if (args[0] === "api") {
     });
     process.exit(0);
   }
-  if (apiPath === "repos/openclaw/openclaw/rules/branches/main") {
+  if (apiPath.startsWith("repos/openclaw/openclaw/rules/branches/")) {
     write([]);
     process.exit(0);
   }
-  if (apiPath === "repos/openclaw/openclaw/branches/main/protection") {
+  if (apiPath.startsWith("repos/openclaw/openclaw/branches/") && apiPath.endsWith("/protection")) {
+    const comments = mergeComments();
+    const dispatched = dispatchRecorded(comments);
     write({
-      required_status_checks: data.strictBaseBinding
+      required_status_checks:
+        data.strictBaseBinding &&
+        !(data.postDispatchGuardDrift === "strict_base" && dispatched)
         ? { strict: true, contexts: ["required-ci/exact-merge"] }
         : null,
     });
+    if (dispatched) fs.writeFileSync(data.policyReadPath, "1");
     process.exit(0);
   }
   if (args[1] === "graphql") {
@@ -2346,6 +2491,7 @@ if (args[0] === "api") {
 
 if (args[0] === "pr" && args[1] === "view") {
   const pending = mergeCount() > 0 && data.mergeMode === "pending_after_command";
+  const postPolicy = policyReadCompleted();
   const terminalCheckFailure =
     data.terminalCheckFailure || (data.terminalCheckFailureAfterCommand && mergeCount() > 0);
   write({
@@ -2353,13 +2499,15 @@ if (args[0] === "pr" && args[1] === "view") {
       pending && (data.pendingKind === "auto_merge" || data.pendingKind === "queue")
         ? { enabledAt: "2026-07-13T07:30:00Z", mergeMethod: "SQUASH" }
         : null,
-    baseRefName: "main",
-    headRefOid: data.headSha,
+    baseRefName: postPolicy && data.postPolicyDrift === "base" ? "release" : "main",
+    headRefOid:
+      postPolicy && data.postPolicyDrift === "view_head" ? data.wrongHeadSha : data.headSha,
     isDraft: false,
     isInMergeQueue: pending && data.pendingKind === "queue",
     mergeable: data.mergeable,
     mergeCommit: null,
-    mergeStateStatus: "CLEAN",
+    mergeStateStatus:
+      postPolicy && data.postPolicyDrift === "readiness" ? "BLOCKED" : "CLEAN",
     mergedAt: null,
     reviewDecision: null,
     state: "OPEN",
@@ -2394,6 +2542,14 @@ if (args[0] === "pr" && args[1] === "merge") {
   fs.writeFileSync(data.mergeMessagePath, body ? subject + "\\n\\n" + body : subject);
   if (["ambiguous_exact", "ambiguous_unconfirmed"].includes(data.mergeMode)) {
     process.stderr.write("gh: HTTP 502: Bad Gateway\\n");
+    process.exit(1);
+  }
+  if (data.mergeMode === "timeout_unconfirmed") {
+    process.stderr.write("gh: ETIMEDOUT while waiting for api.github.com\\n");
+    process.exit(1);
+  }
+  if (data.mergeMode === "definitive_rejection") {
+    process.stderr.write("GraphQL: Pull Request is not mergeable (mergePullRequest)\\n");
     process.exit(1);
   }
   process.exit(0);

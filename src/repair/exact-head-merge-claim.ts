@@ -20,6 +20,7 @@ const LEGACY_DISPATCH_PATTERN =
 const DISPATCH_PATTERN =
   /<!-- clawsweeper-exact-head-merge-dispatch:v2 claim=([1-9][0-9]*) repo=([^ ]+) pr=([1-9][0-9]*) head=([a-fA-F0-9]{40}) method=([a-z]+) owner=([a-z0-9_-]+) claimant=([^ ]+) expected=([^ ]+) -->/g;
 const DEFAULT_RECOVERY_GRACE_MS = 5 * 60 * 1000;
+const CLAIM_ACTIVITY_PROPAGATION_MS = 10_000;
 
 export type ExactHeadMergeClaimIdentity = {
   repository: string;
@@ -1469,6 +1470,7 @@ export function exactHeadMergeClaimOwnsUpdatedAt(
   reviewedTimelineCursor: unknown,
   updatedAt: unknown,
   timeline: LooseRecord[],
+  options: { verifiedTargetContentUnchanged?: boolean } = {},
 ): boolean {
   const mutationId = Number(claim.lastClaimMutationId);
   const mutationAt = normalizeTimestamp(claim.lastClaimMutationAt);
@@ -1482,7 +1484,17 @@ export function exactHeadMergeClaimOwnsUpdatedAt(
   ) {
     return false;
   }
-  if (!exactHeadMergeUpdatedAtMatches(liveUpdatedAt, mutationAt)) return false;
+  if (!exactHeadMergeUpdatedAtMatches(liveUpdatedAt, mutationAt)) {
+    if (options.verifiedTargetContentUnchanged !== true) return false;
+    const mutationMs = Date.parse(mutationAt);
+    const liveUpdatedAtMs = Date.parse(liveUpdatedAt);
+    if (
+      liveUpdatedAtMs < mutationMs ||
+      liveUpdatedAtMs - mutationMs > CLAIM_ACTIVITY_PROPAGATION_MS
+    ) {
+      return false;
+    }
+  }
   const allowedMutationIds = new Set(
     [
       Number(claim.claimId),
