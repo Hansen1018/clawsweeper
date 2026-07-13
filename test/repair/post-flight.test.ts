@@ -523,7 +523,7 @@ test("post-flight rechecks live security immediately before privileged mutations
   );
   assert.match(
     finalizeFixPr,
-    /liveSecurityBlockReason\([\s\S]*fetchPullRequest[\s\S]*runVerifiedPostFlightPullMutation\(parsed\.number, \(\) => \{[\s\S]*runtimeStrictBaseBindingBlock\(\{[\s\S]*ghText\(mergeArgs\)/,
+    /liveSecurityBlockReason\([\s\S]*fetchPullRequest[\s\S]*runVerifiedPostFlightPullMutation\(parsed\.number, \(\) => \{[\s\S]*postFlightMergeRetryBlock\([\s\S]*ghText\(mergeArgs\)/,
   );
   assert.match(
     finalizeFixPr,
@@ -531,11 +531,19 @@ test("post-flight rechecks live security immediately before privileged mutations
   );
   assert.match(
     finalizeFixPr,
-    /catch \(error\)[\s\S]*reconcileFailedMerge\(parsed\.number, action\.commit\)[\s\S]*ghRetryKind\(error\)[\s\S]*postFlightMergeRetryBlock\(/,
+    /runVerifiedPostFlightPullMutation\(parsed\.number, \(\) => \{[\s\S]*fetchPullRequest\([\s\S]*fetchPullRequestView\([\s\S]*postFlightMergeRetryBlock\([\s\S]*ghText\(mergeArgs\)/,
+  );
+  assert.match(
+    finalizeFixPr,
+    /catch \(error\)[\s\S]*reconcileMergeState\(parsed\.number, action\.commit\)[\s\S]*ghRetryKind\(error\)[\s\S]*postFlightMergeRetryWaitMs\([\s\S]*sleepMs\([\s\S]*continue/,
+  );
+  assert.match(
+    finalizeFixPr,
+    /mergeAttempt\.policyBlock[\s\S]*reconcileMergeState\(parsed\.number, action\.commit\)[\s\S]*!confirmation\.mergedAt[\s\S]*retry_recommended: true/,
   );
   assert.match(
     source,
-    /function reconcileFailedMerge[\s\S]*fetchPullRequest\([\s\S]*fetchPullRequestView\([\s\S]*mergedHead !== expectedHeadSha/,
+    /function reconcileMergeState[\s\S]*fetchPullRequest\([\s\S]*fetchPullRequestView\([\s\S]*mergedHead !== expectedHeadSha/,
   );
   assert.match(
     source,
@@ -583,6 +591,7 @@ test("post-flight reconciles ambiguous merges and retries only after fresh safet
       FAKE_GH_MERGED_FILE: fixture.mergedPath,
       FAKE_GH_MERGE_COUNT_FILE: fixture.mergeCountPath,
       FAKE_GH_COMMENTS_COUNT_FILE: fixture.commentsCountPath,
+      FAKE_GH_FAILURE_COMMENTS_FILE: fixture.failureCommentsPath,
       ...mockGhBinEnv(fixture.ghPath, fixture.fakeBin),
     };
 
@@ -599,6 +608,41 @@ test("post-flight reconciles ambiguous merges and retries only after fresh safet
     assert.equal(report.actions[0]?.status, "executed");
     assert.equal(report.actions[0]?.merge_attempts, 2);
     assert.equal(fs.readFileSync(fixture.mergeCountPath, "utf8"), "2");
+
+    fixture.reset();
+    const backoffRun = runVerifiedPostFlight(
+      fixture,
+      {
+        ...commonEnv,
+        CLAWSWEEPER_POST_FLIGHT_MERGE_RETRY_MAX_WAIT_MS: "50",
+        FAKE_GH_MERGE_MODE: "transient",
+        FAKE_GH_SECURITY_AFTER_BACKOFF: "1",
+      },
+      1,
+    );
+    assert.equal(fs.existsSync(fixture.reportPath), true, backoffRun.stderr || backoffRun.stdout);
+    report = JSON.parse(fs.readFileSync(fixture.reportPath, "utf8"));
+    assert.equal(report.actions[0]?.status, "blocked");
+    assert.match(
+      report.actions[0]?.reason,
+      /^security-sensitive (?:PR|target) requires central security triage$/,
+    );
+    assert.equal(report.actions[0]?.merge_attempts, 2);
+    assert.equal(fs.readFileSync(fixture.mergeCountPath, "utf8"), "1");
+
+    fixture.reset();
+    runVerifiedPostFlight(fixture, { ...commonEnv, FAKE_GH_MERGE_MODE: "queue" }, 1);
+    report = JSON.parse(fs.readFileSync(fixture.reportPath, "utf8"));
+    assert.equal(report.outcome, "requeue");
+    assert.equal(report.actions[0]?.status, "blocked");
+    assert.equal(
+      report.actions[0]?.reason,
+      "merge command completed but GitHub has not confirmed the pull request as merged",
+    );
+    assert.equal(report.actions[0]?.retry_recommended, true);
+    assert.equal(report.actions[0]?.merge_attempts, 1);
+    assert.equal(fs.readFileSync(fixture.mergeCountPath, "utf8"), "1");
+    assert.equal(fs.existsSync(fixture.mergedPath), false);
 
     fixture.reset();
     runVerifiedPostFlight(
@@ -980,6 +1024,7 @@ function createVerifiedMergeFixture() {
   const mergedPath = path.join(root, "merged.txt");
   const mergeCountPath = path.join(root, "merge-count.txt");
   const commentsCountPath = path.join(root, "comments-count.txt");
+  const failureCommentsPath = path.join(root, "failure-comments.txt");
   const clusterId = "automerge-openclaw-openclaw-123";
   const outputBranch = "clawsweeper/automerge-openclaw-openclaw-123";
 
@@ -1236,7 +1281,10 @@ function createVerifiedMergeFixture() {
       "if (args[0] === 'api' && args.includes('repos/openclaw/openclaw/issues/123/comments?per_page=100')) {",
       "  const count = fs.existsSync(process.env.FAKE_GH_COMMENTS_COUNT_FILE) ? Number(fs.readFileSync(process.env.FAKE_GH_COMMENTS_COUNT_FILE, 'utf8')) : 0;",
       "  fs.writeFileSync(process.env.FAKE_GH_COMMENTS_COUNT_FILE, String(count + 1));",
-      "  const security = process.env.FAKE_GH_SECURITY_AFTER_FAILURE === '1' && mergeCount() >= 1;",
+      "  const failedComments = fs.existsSync(process.env.FAKE_GH_FAILURE_COMMENTS_FILE) ? Number(fs.readFileSync(process.env.FAKE_GH_FAILURE_COMMENTS_FILE, 'utf8')) : -1;",
+      "  const securityAfterFailure = process.env.FAKE_GH_SECURITY_AFTER_FAILURE === '1' && mergeCount() >= 1;",
+      "  const securityAfterBackoff = process.env.FAKE_GH_SECURITY_AFTER_BACKOFF === '1' && failedComments >= 0 && count > failedComments + 1;",
+      "  const security = securityAfterFailure || securityAfterBackoff;",
       "  if (args.includes('--slurp')) process.stdout.write(security ? '[[{\"body\":\"<!-- clawsweeper-security:security-sensitive item=123 sha=abc -->\"}]]' : '[[]]');",
       "  else if (security) process.stdout.write('<!-- clawsweeper-security:security-sensitive item=123 sha=abc -->');",
       "  process.exit(0);",
@@ -1250,7 +1298,8 @@ function createVerifiedMergeFixture() {
       "  const count = mergeCount() + 1;",
       "  fs.writeFileSync(process.env.FAKE_GH_MERGE_COUNT_FILE, String(count));",
       "  if (process.env.FAKE_GH_MERGE_MODE === 'ambiguous') { fs.writeFileSync(process.env.FAKE_GH_MERGED_FILE, '1'); process.stderr.write('gh: HTTP 502: Bad Gateway\\n'); process.exit(1); }",
-      "  if (process.env.FAKE_GH_MERGE_MODE === 'transient' && count === 1) { process.stderr.write('gh: HTTP 502: Bad Gateway\\n'); process.exit(1); }",
+      "  if (process.env.FAKE_GH_MERGE_MODE === 'transient' && count === 1) { const comments = fs.existsSync(process.env.FAKE_GH_COMMENTS_COUNT_FILE) ? Number(fs.readFileSync(process.env.FAKE_GH_COMMENTS_COUNT_FILE, 'utf8')) : 0; fs.writeFileSync(process.env.FAKE_GH_FAILURE_COMMENTS_FILE, String(comments)); process.stderr.write('gh: HTTP 502: Bad Gateway\\n'); process.exit(1); }",
+      "  if (process.env.FAKE_GH_MERGE_MODE === 'queue') process.exit(0);",
       "  fs.writeFileSync(process.env.FAKE_GH_MERGED_FILE, '1');",
       "  process.exit(0);",
       "}",
@@ -1276,10 +1325,12 @@ function createVerifiedMergeFixture() {
     mergedPath,
     mergeCountPath,
     commentsCountPath,
+    failureCommentsPath,
     reset() {
       fs.rmSync(mergedPath, { force: true });
       fs.rmSync(mergeCountPath, { force: true });
       fs.rmSync(commentsCountPath, { force: true });
+      fs.rmSync(failureCommentsPath, { force: true });
       fs.rmSync(path.join(handoffRoot, "run", "post-flight-report.json"), { force: true });
     },
     cleanup() {

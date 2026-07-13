@@ -366,15 +366,18 @@ function finalizeFixPr(action: LooseRecord) {
   let mergeAttempts = 0;
   for (;;) {
     mergeAttempts += 1;
+    let mergeAttempt: { policyBlock: string; pull: LooseRecord; view: LooseRecord };
     try {
-      const mergeAttempt = runVerifiedPostFlightPullMutation(parsed.number, () => {
+      mergeAttempt = runVerifiedPostFlightPullMutation(parsed.number, () => {
+        const finalPull = fetchPullRequest(result.repo, parsed.number);
         const finalView = fetchPullRequestView(result.repo, parsed.number);
-        const finalStrictBaseBindingBlock = runtimeStrictBaseBindingBlock({
-          repo: result.repo,
-          baseBranch: String(finalView.baseRefName ?? ""),
-          policyReadJson: rulesetPolicyReader(),
+        const policyBlock = postFlightMergeRetryBlock({
+          action,
+          number: parsed.number,
+          pull: finalPull,
+          view: finalView,
         });
-        if (finalStrictBaseBindingBlock) return { policyBlock: finalStrictBaseBindingBlock };
+        if (policyBlock) return { policyBlock, pull: finalPull, view: finalView };
         runPostFlightMutation(
           "post_flight_merge",
           {
@@ -385,22 +388,11 @@ function finalizeFixPr(action: LooseRecord) {
           },
           () => ghText(mergeArgs),
         );
-        return { policyBlock: "" };
+        return { policyBlock: "", pull: finalPull, view: finalView };
       });
-      if (mergeAttempt.policyBlock) {
-        return {
-          ...prBase,
-          status: "blocked",
-          reason: mergeAttempt.policyBlock,
-          merge_method: "squash",
-          merge_attempts: mergeAttempts,
-          waited_ms: waitedMs,
-        };
-      }
-      break;
     } catch (error) {
       const detail = ghErrorText(error);
-      const reconciliation = reconcileFailedMerge(parsed.number, action.commit);
+      const reconciliation = reconcileMergeState(parsed.number, action.commit);
       pull = reconciliation.pull;
       view = reconciliation.view;
       prBase = { ...base, pr: `#${parsed.number}`, title: view.title ?? pull.title ?? null };
@@ -429,25 +421,25 @@ function finalizeFixPr(action: LooseRecord) {
           waited_ms: waitedMs,
         };
       }
+      const retryBlock = postFlightMergeRetryBlock({
+        action,
+        number: parsed.number,
+        pull,
+        view,
+      });
+      if (retryBlock) {
+        return {
+          ...prBase,
+          status: "blocked",
+          reason: retryBlock,
+          merge_method: "squash",
+          merge_attempts: mergeAttempts,
+          waited_ms: waitedMs,
+        };
+      }
 
       const retryKind = ghRetryKind(error);
       if (retryKind !== "none" && mergeAttempts < POST_FLIGHT_MERGE_ATTEMPTS) {
-        const retryBlock = postFlightMergeRetryBlock({
-          action,
-          number: parsed.number,
-          pull,
-          view,
-        });
-        if (retryBlock) {
-          return {
-            ...prBase,
-            status: "blocked",
-            reason: retryBlock,
-            merge_method: "squash",
-            merge_attempts: mergeAttempts,
-            waited_ms: waitedMs,
-          };
-        }
         const retryWaitMs = postFlightMergeRetryWaitMs(retryKind, mergeAttempts - 1);
         sleepMs(retryWaitMs);
         waitedMs += retryWaitMs;
@@ -481,24 +473,66 @@ function finalizeFixPr(action: LooseRecord) {
       }
       throw error;
     }
+
+    pull = mergeAttempt.pull;
+    view = mergeAttempt.view;
+    prBase = { ...base, pr: `#${parsed.number}`, title: view.title ?? pull.title ?? null };
+    if (mergeAttempt.policyBlock) {
+      return {
+        ...prBase,
+        status: "blocked",
+        reason: mergeAttempt.policyBlock,
+        merge_method: "squash",
+        merge_attempts: mergeAttempts,
+        waited_ms: waitedMs,
+      };
+    }
+
+    const confirmation = reconcileMergeState(parsed.number, action.commit);
+    pull = confirmation.pull;
+    view = confirmation.view;
+    prBase = { ...base, pr: `#${parsed.number}`, title: view.title ?? pull.title ?? null };
+    if (confirmation.block) {
+      return {
+        ...prBase,
+        status: "blocked",
+        reason: confirmation.block,
+        merge_method: "squash",
+        merge_attempts: mergeAttempts,
+        waited_ms: waitedMs,
+      };
+    }
+    if (!confirmation.mergedAt) {
+      return {
+        ...prBase,
+        status: "blocked",
+        reason: "merge command completed but GitHub has not confirmed the pull request as merged",
+        mergeable: view.mergeable ?? null,
+        merge_state_status: view.mergeStateStatus ?? null,
+        review_decision: view.reviewDecision ?? null,
+        live_state: pull.state ?? view.state ?? null,
+        retry_recommended: true,
+        merge_attempts: mergeAttempts,
+        waited_ms: waitedMs,
+      };
+    }
+    return {
+      ...prBase,
+      status: "executed",
+      reason: "merged by ClawSweeper Repair post-flight",
+      merged_at: confirmation.mergedAt,
+      merge_commit_sha: pull.merge_commit_sha ?? view.mergeCommit?.oid ?? null,
+      merge_method: "squash",
+      commit_subject: mergeMessage.subject,
+      summary_lines: mergeMessage.summaryLines,
+      fixup_lines: mergeMessage.fixupLines,
+      merge_attempts: mergeAttempts,
+      waited_ms: waitedMs,
+    };
   }
-  const merged = fetchPullRequest(result.repo, parsed.number);
-  return {
-    ...prBase,
-    status: "executed",
-    reason: "merged by ClawSweeper Repair post-flight",
-    merged_at: merged.merged_at ?? null,
-    merge_commit_sha: merged.merge_commit_sha ?? null,
-    merge_method: "squash",
-    commit_subject: mergeMessage.subject,
-    summary_lines: mergeMessage.summaryLines,
-    fixup_lines: mergeMessage.fixupLines,
-    merge_attempts: mergeAttempts,
-    waited_ms: waitedMs,
-  };
 }
 
-function reconcileFailedMerge(number: number, expectedHeadSha: JsonValue) {
+function reconcileMergeState(number: number, expectedHeadSha: JsonValue) {
   const pull = fetchPullRequest(result.repo, number);
   const view = fetchPullRequestView(result.repo, number);
   const mergedAt = pull.merged_at ?? view.mergedAt ?? null;
