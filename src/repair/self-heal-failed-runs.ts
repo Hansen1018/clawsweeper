@@ -18,6 +18,7 @@ import { sleepMs } from "./timing.js";
 import { REPAIR_CLUSTER_WORKFLOW } from "./constants.js";
 import { shouldSelfHealRunRecord } from "./self-heal-policy.js";
 import {
+  immutableJobDispatchArgs,
   immutableJobIdentityKey,
   isMissingImmutableJobError,
   resolveStateJobIdentity,
@@ -59,6 +60,16 @@ type RunRecordProvenance = {
   stateRevision: string;
 };
 
+type GateRestore = {
+  name: string;
+  previous: JsonValue;
+};
+
+type GateCleanupFailure = {
+  error: unknown;
+  name: string;
+};
+
 const runRecordProvenanceCache = new WeakMap<JsonObject, RunRecordProvenance>();
 
 const args = parseArgs(process.argv.slice(2));
@@ -85,6 +96,11 @@ const allowRepeat = Boolean(args["allow-repeat"]);
 const requestedMode = typeof args.mode === "string" ? args.mode : null;
 const runRecordsDir = path.resolve(
   String(args["runs-dir"] ?? args.runs_dir ?? path.join(repoRoot(), "results", "runs")),
+);
+const selfHealLedgerFile = path.resolve(
+  String(
+    args["ledger-path"] ?? args.ledger_path ?? path.join(repoRoot(), "results", "self-heal.json"),
+  ),
 );
 const skippedCandidates: LooseRecord[] = [];
 
@@ -128,7 +144,7 @@ if (!execute) {
   process.exit(0);
 }
 
-const gateRestores: JsonValue[] = [];
+const gateRestores: GateRestore[] = [];
 const dispatchStartedAt = new Date(Date.now() - 5000).toISOString();
 const headSha = currentHeadSha();
 const ledger = readSelfHealLedger();
@@ -152,6 +168,8 @@ const attempts: LooseRecord[] = candidates.map((candidate: JsonValue) => ({
   status: "pending",
 }));
 
+let primaryFailure: unknown = null;
+let cleanupRestoreFailures: GateCleanupFailure[] = [];
 try {
   if (openExecuteWindow) {
     openGate("CLAWSWEEPER_ALLOW_EXECUTE");
@@ -195,10 +213,26 @@ try {
   summary.batch_id = batchId;
   summary.observed_runs = attempts[0]?.observed_runs ?? [];
   console.log(JSON.stringify(summary, null, 2));
+} catch (error) {
+  primaryFailure = error;
 } finally {
-  for (const gate of gateRestores.reverse()) {
-    setGate(gate.name, gate.previous || "1");
+  const cleanupFailures = restoreOpenedGates();
+  cleanupRestoreFailures = cleanupFailures.restoreFailures;
+  for (const failure of cleanupFailures.receiptFailures) {
+    console.error(
+      `self-heal: restored ${failure.name} but failed to record its cleanup receipt: ${errorText(failure.error)}`,
+    );
   }
+  for (const failure of cleanupFailures.restoreFailures) {
+    console.error(`self-heal: failed to restore ${failure.name}: ${errorText(failure.error)}`);
+  }
+}
+if (primaryFailure !== null) throw primaryFailure;
+if (cleanupRestoreFailures.length > 0) {
+  throw new AggregateError(
+    cleanupRestoreFailures.map((failure) => failure.error),
+    "self-heal failed to restore one or more execution gates",
+  );
 }
 
 function selectCandidates() {
@@ -436,10 +470,10 @@ function dispatchCandidate(candidate: LooseRecord) {
     repo,
     "-f",
     `job=${candidate.source_job}`,
-    "-f",
-    `state_revision=${candidate.source_state_revision}`,
-    "-f",
-    `job_sha256=${candidate.source_job_sha256}`,
+    ...immutableJobDispatchArgs({
+      stateRevision: candidate.source_state_revision,
+      jobSha256: candidate.source_job_sha256,
+    }),
     "-f",
     `mode=${candidate.mode}`,
     "-f",
@@ -937,7 +971,7 @@ function writeSelfHealLedger(ledger: LooseRecord) {
 }
 
 function selfHealLedgerPath() {
-  return path.join(repoRoot(), "results", "self-heal.json");
+  return selfHealLedgerFile;
 }
 
 function listClusterRuns() {
@@ -1004,9 +1038,69 @@ function setGate(name: string, value: JsonValue) {
     operationName: "failed_run_self_heal",
     component: "failed_run_self_heal_gate",
     identity: { repository: repo, name, value: normalizedValue, batchId },
-    operation: () => ghText(["variable", "set", name, "--repo", repo, "--body", normalizedValue]),
+    operation: () => writeGateValue(name, normalizedValue),
   });
+}
+
+function restoreOpenedGates(): {
+  receiptFailures: GateCleanupFailure[];
+  restoreFailures: GateCleanupFailure[];
+} {
+  const receiptFailures: GateCleanupFailure[] = [];
+  const restoreFailures: GateCleanupFailure[] = [];
+  for (const gate of [...gateRestores].reverse()) {
+    const result = restoreGate(gate.name, gate.previous || "1");
+    if (result.receiptError !== null) {
+      receiptFailures.push({ name: gate.name, error: result.receiptError });
+    }
+    if (result.restoreError !== null) {
+      restoreFailures.push({ name: gate.name, error: result.restoreError });
+    }
+  }
+  return { receiptFailures, restoreFailures };
+}
+
+function restoreGate(
+  name: string,
+  value: JsonValue,
+): { receiptError: unknown | null; restoreError: unknown | null } {
+  const normalizedValue = String(value ?? "");
+  let restoreStarted = false;
+  let restoreCompleted = false;
+  try {
+    runRepairMutation(selfHealGateLifecycle(name, normalizedValue), {
+      kind: "repository_variable_update",
+      operationName: "failed_run_self_heal",
+      component: "failed_run_self_heal_gate",
+      identity: { repository: repo, name, value: normalizedValue, batchId },
+      operation: () => {
+        restoreStarted = true;
+        const result = writeGateValue(name, normalizedValue);
+        restoreCompleted = true;
+        return result;
+      },
+    });
+    return { receiptError: null, restoreError: null };
+  } catch (error) {
+    if (restoreCompleted) return { receiptError: error, restoreError: null };
+    if (restoreStarted) return { receiptError: null, restoreError: error };
+    try {
+      writeGateValue(name, normalizedValue);
+      return { receiptError: error, restoreError: null };
+    } catch (restoreError) {
+      return { receiptError: error, restoreError };
+    }
+  }
+}
+
+function writeGateValue(name: string, value: string): string {
+  const result = ghText(["variable", "set", name, "--repo", repo, "--body", value]);
   console.log(`${name}=${value}`);
+  return result;
+}
+
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function currentHeadSha() {
