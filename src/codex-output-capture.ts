@@ -1,4 +1,14 @@
-import { closeSync, ftruncateSync, openSync, writeSync } from "node:fs";
+import {
+  closeSync,
+  existsSync,
+  ftruncateSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  openSync,
+  writeFileSync,
+  writeSync,
+} from "node:fs";
 
 export const DEFAULT_CODEX_OUTPUT_FILE_BYTES = 128 * 1024 * 1024;
 export const DEFAULT_CODEX_OUTPUT_TAIL_BYTES = 64 * 1024;
@@ -84,6 +94,32 @@ export function codexOutputTail(capture: CodexOutputCapture): string {
   return capture.tail.toString("utf8");
 }
 
+export function redactCodexText(value: string, redactValues: readonly string[]): string {
+  return normalizedRedactionStrings(redactValues).reduce(
+    (redacted, secret) => redacted.replaceAll(secret, "[REDACTED]"),
+    value,
+  );
+}
+
+export function redactCodexOutputLastMessage(
+  args: readonly string[],
+  redactValues: readonly string[],
+): void {
+  const outputIndex = args.indexOf("--output-last-message");
+  const filePath = outputIndex >= 0 ? args[outputIndex + 1] : undefined;
+  if (!filePath || !existsSync(filePath)) return;
+  const temporaryPath = `${filePath}.redacted-${process.pid}`;
+  try {
+    const redacted = redactCodexText(readFileSync(filePath, "utf8"), redactValues);
+    writeFileSync(temporaryPath, redacted, { encoding: "utf8", mode: 0o600 });
+    renameSync(temporaryPath, filePath);
+  } catch (error) {
+    rmSync(temporaryPath, { force: true });
+    rmSync(filePath, { force: true });
+    throw error;
+  }
+}
+
 function appendTail(current: Buffer, chunk: Buffer, maxBytes: number): Buffer {
   if (maxBytes <= 0) return Buffer.alloc(0);
   if (chunk.length >= maxBytes) return chunk.subarray(chunk.length - maxBytes);
@@ -107,11 +143,13 @@ function availableTailBytes(maxFileBytes: number): number {
 }
 
 function normalizedRedactions(values: readonly string[] | undefined): Buffer[] {
+  return normalizedRedactionStrings(values).map((value) => Buffer.from(value, "utf8"));
+}
+
+function normalizedRedactionStrings(values: readonly string[] | undefined): string[] {
   return [
     ...new Set((values ?? []).map((value) => value.trim()).filter((value) => value.length >= 6)),
-  ]
-    .sort((left, right) => right.length - left.length)
-    .map((value) => Buffer.from(value, "utf8"));
+  ].sort((left, right) => right.length - left.length);
 }
 
 function redactAvailableBuffer(

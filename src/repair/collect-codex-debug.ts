@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { redactInternalCodexModel } from "../codex-env.js";
+import { codexSensitiveEnvValues, redactInternalCodexModel } from "../codex-env.js";
 
 type CollectOptions = {
   outDir: string;
@@ -39,6 +39,7 @@ export function collectCodexDebug(options: CollectOptions) {
   const roots = codexDebugRoots(options, codexHome);
   const redactValues = [
     ...(options.redactValues ?? []),
+    ...codexSensitiveEnvValues(),
     process.env.CLAWSWEEPER_INTERNAL_MODEL ?? "",
   ];
   const since = Date.now() - options.sinceMinutes * 60 * 1000;
@@ -70,6 +71,10 @@ export function collectCodexDebug(options: CollectOptions) {
       fs.mkdirSync(path.dirname(artifactPath), { recursive: true });
       const raw = fs.readFileSync(filePath, "utf8");
       const redacted = redactSecrets(raw, redactValues, codexHome);
+      if (containsSensitiveValue(redacted, redactValues)) {
+        skipped.push({ source: filePath, reason: "redaction-failed" });
+        continue;
+      }
       fs.writeFileSync(artifactPath, redacted);
       manifest.push({
         source: path.join(root.name, relative),
@@ -104,17 +109,27 @@ export function collectCodexDebug(options: CollectOptions) {
 export function redactSecrets(text: string, redactValues: string[] = [], codexHome?: string) {
   let redacted = redactInternalCodexModel(text, codexHome);
   for (const value of redactValues.map((entry) => entry.trim()).filter(Boolean)) {
-    redacted = redacted.replaceAll(value, "[REDACTED_INTERNAL_MODEL]");
+    redacted = redacted.replaceAll(value, "[REDACTED]");
   }
   return redacted
     .replace(/\bsk-(?:proj-)?[A-Za-z0-9_-]{20,}\b/g, "[REDACTED_OPENAI_KEY]")
     .replace(/\bgithub_pat_[A-Za-z0-9_]{20,}\b/g, "[REDACTED_GITHUB_TOKEN]")
     .replace(/\bgh[pousr]_[A-Za-z0-9_]{20,}\b/g, "[REDACTED_GITHUB_TOKEN]")
-    .replace(/\b(OPENAI_API_KEY|CODEX_API_KEY|GH_TOKEN|GITHUB_TOKEN)=([^\s"']+)/g, "$1=[REDACTED]")
     .replace(
-      /"((?:OPENAI_API_KEY|CODEX_API_KEY|GH_TOKEN|GITHUB_TOKEN))"\s*:\s*"[^"]*"/g,
+      /\b([A-Z][A-Z0-9_]*(?:TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL|PRIVATE)[A-Z0-9_]*)=([^\s"']+)/g,
+      "$1=[REDACTED]",
+    )
+    .replace(
+      /"([A-Z][A-Z0-9_]*(?:TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL|PRIVATE)[A-Z0-9_]*)"\s*:\s*"[^"]*"/g,
       '"$1":"[REDACTED]"',
     );
+}
+
+function containsSensitiveValue(text: string, redactValues: string[]): boolean {
+  return redactValues
+    .map((value) => value.trim())
+    .filter((value) => value.length >= 6)
+    .some((value) => text.includes(value));
 }
 
 function resolveCodexHome(options: CollectOptions): string {

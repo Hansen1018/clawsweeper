@@ -5,6 +5,7 @@ import {
   clawsweeperGitIdentityEnv,
   clawsweeperGitUserName,
   codexModelArgs,
+  repairCodexRedactValues,
   codexSubprocessEnv,
   internalCodexModel,
   repairCodexReasoningEffort,
@@ -23,6 +24,12 @@ test("codexSubprocessEnv forces ClawSweeper git identity and strips tokens", () 
       GITHUB_ACTIONS: "true",
       OPENAI_API_KEY: "secret",
       CODEX_API_KEY: "secret",
+      CODEX_ACCESS_TOKEN: "codex-access-secret",
+      ACTIONS_RUNTIME_TOKEN: "actions-runtime-secret",
+      ACTIONS_RESULTS_URL: "https://results.example.invalid/runtime",
+      ACTIONS_ID_TOKEN_REQUEST_TOKEN: "actions-oidc-secret",
+      GITHUB_ACTIONS_RUNTIME_TOKEN: "github-runtime-secret",
+      AMBIENT_DEPLOY_SECRET: "ambient-secret",
       CLAWSWEEPER_INTERNAL_MODEL: "secret-model",
       CLAWSWEEPER_CRABFLEET_AGENT_TOKEN: "agent-secret",
       CLAWSWEEPER_CRABFLEET_SERVICE_TOKEN: "service-secret",
@@ -42,6 +49,12 @@ test("codexSubprocessEnv forces ClawSweeper git identity and strips tokens", () 
       assert.equal(env.CLAWSWEEPER_RULESET_GH_TOKEN, undefined);
       assert.equal(env.OPENAI_API_KEY, undefined);
       assert.equal(env.CODEX_API_KEY, undefined);
+      assert.equal(env.CODEX_ACCESS_TOKEN, undefined);
+      assert.equal(env.ACTIONS_RUNTIME_TOKEN, undefined);
+      assert.equal(env.ACTIONS_RESULTS_URL, undefined);
+      assert.equal(env.ACTIONS_ID_TOKEN_REQUEST_TOKEN, undefined);
+      assert.equal(env.GITHUB_ACTIONS_RUNTIME_TOKEN, undefined);
+      assert.equal(env.AMBIENT_DEPLOY_SECRET, undefined);
       assert.equal(env.CLAWSWEEPER_INTERNAL_MODEL, undefined);
       assert.equal(env.CLAWSWEEPER_CRABFLEET_AGENT_TOKEN, undefined);
       assert.equal(env.CLAWSWEEPER_CRABFLEET_SERVICE_TOKEN, undefined);
@@ -54,6 +67,35 @@ test("codexSubprocessEnv forces ClawSweeper git identity and strips tokens", () 
         "--model",
         "explicit-public-model",
       ]);
+      const redactValues = repairCodexRedactValues({
+        ACTIONS_RUNTIME_TOKEN: "actions-runtime-secret",
+        ACTIONS_RESULTS_URL: "https://results.example.invalid/runtime",
+        AMBIENT_DEPLOY_SECRET: "ambient-secret",
+      });
+      assert.equal(redactValues.includes("https://results.example.invalid/runtime"), true);
+      assert.equal(redactValues.includes("actions-runtime-secret"), true);
+      assert.equal(redactValues.includes("ambient-secret"), true);
+      assert.equal(redactValues.includes("secret-model"), true);
+    },
+  );
+});
+
+test("codexSubprocessEnv preserves local Codex auth outside Actions", () => {
+  withEnv(
+    {
+      GITHUB_ACTIONS: "",
+      OPENAI_API_KEY: "local-openai-secret",
+      CODEX_API_KEY: "local-codex-secret",
+      CODEX_ACCESS_TOKEN: "local-access-secret",
+      AMBIENT_DEPLOY_SECRET: "ambient-secret",
+    },
+    () => {
+      const env = codexSubprocessEnv();
+
+      assert.equal(env.OPENAI_API_KEY, "local-openai-secret");
+      assert.equal(env.CODEX_API_KEY, "local-codex-secret");
+      assert.equal(env.CODEX_ACCESS_TOKEN, "local-access-secret");
+      assert.equal(env.AMBIENT_DEPLOY_SECRET, undefined);
     },
   );
 });

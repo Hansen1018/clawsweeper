@@ -52,7 +52,7 @@ test("collectCodexDebug copies recent Codex session logs and excludes auth files
     );
     assert.match(
       fs.readFileSync(path.join(outDir, "sessions", "2026", "05", "02", "session.jsonl"), "utf8"),
-      /\[REDACTED_INTERNAL_MODEL\]/,
+      /\[REDACTED\]/,
     );
     assert.match(
       fs.readFileSync(path.join(outDir, "log", "codex-tui.log"), "utf8"),
@@ -255,6 +255,48 @@ test("collectCodexDebug redacts the internal model from Codex config", () => {
     assert.doesNotMatch(artifact, /config-secret-model/);
     assert.match(artifact, /\[REDACTED_INTERNAL_MODEL\]/);
   } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("collectCodexDebug redacts current Actions credentials by default", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-codex-debug-actions-"));
+  const codexHome = path.join(tmp, ".codex");
+  const outDir = path.join(tmp, "out");
+  const previous = {
+    ACTIONS_RUNTIME_TOKEN: process.env.ACTIONS_RUNTIME_TOKEN,
+    ACTIONS_RESULTS_URL: process.env.ACTIONS_RESULTS_URL,
+  };
+  fs.mkdirSync(path.join(codexHome, "sessions"), { recursive: true });
+  fs.writeFileSync(
+    path.join(codexHome, "sessions", "run.jsonl"),
+    [
+      "ACTIONS_RUNTIME_TOKEN=actions-runtime-token-for-test",
+      '{"ACTIONS_RESULTS_URL":"https://results.example.invalid/runtime-secret"}',
+    ].join("\n"),
+  );
+
+  try {
+    process.env.ACTIONS_RUNTIME_TOKEN = "actions-runtime-token-for-test";
+    process.env.ACTIONS_RESULTS_URL = "https://results.example.invalid/runtime-secret";
+    collectCodexDebug({
+      outDir,
+      label: "actions",
+      sinceMinutes: 60,
+      maxBytes: 1024 * 1024,
+      homeDir: tmp,
+      codexHome,
+    });
+
+    const artifact = fs.readFileSync(path.join(outDir, "sessions", "run.jsonl"), "utf8");
+    assert.doesNotMatch(artifact, /actions-runtime-token-for-test|runtime-secret/);
+    assert.match(artifact, /ACTIONS_RUNTIME_TOKEN=\[REDACTED\]/);
+    assert.match(artifact, /"ACTIONS_RESULTS_URL":"\[REDACTED\]"/);
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 });

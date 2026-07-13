@@ -20,6 +20,11 @@ const CODEX_ACTIONS_CREDENTIAL_ENV = [
   "ACTIONS_RUNTIME_URL",
   "GITHUB_ACTIONS_RUNTIME_TOKEN",
 ] as const;
+const CODEX_EXPLICIT_SENSITIVE_ENV = new Set([
+  ...CODEX_ACTIONS_CREDENTIAL_ENV,
+  "CLAWSWEEPER_CRABFLEET_RUNNER_PTY_URL",
+  "CLAWSWEEPER_CRABFLEET_WORK_STATE_URL",
+]);
 const CODEX_AUTH_ENV = new Set(["OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN"]);
 
 export function codexLoginMethod(
@@ -118,7 +123,9 @@ export function codexSensitiveEnvValues(env: NodeJS.ProcessEnv = process.env): s
   return [
     ...new Set(
       Object.entries(env)
-        .filter(([name]) => CODEX_SENSITIVE_ENV_NAME.test(name))
+        .filter(
+          ([name]) => CODEX_EXPLICIT_SENSITIVE_ENV.has(name) || CODEX_SENSITIVE_ENV_NAME.test(name),
+        )
         .map(([, value]) => String(value ?? "").trim())
         .filter((value) => value.length >= 6),
     ),

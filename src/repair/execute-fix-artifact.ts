@@ -35,6 +35,7 @@ import {
   isTerminalCodexErrorMessage,
 } from "../codex-transient.js";
 import { codexAppServerProcessOptionsFromEnv, runCodexProcess } from "../codex-process.js";
+import { redactCodexOutputLastMessage } from "../codex-output-capture.js";
 import {
   branchHasBaseDiff,
   completeRebaseIfResolved,
@@ -60,6 +61,7 @@ import {
   codexLoginConfig,
   codexSubprocessEnv as codexEnv,
   codexModelArgs,
+  repairCodexRedactValues,
   repairCodexReasoningEffort,
   repairGhEnv as ghEnv,
   repairCodexServiceTier,
@@ -453,7 +455,8 @@ function spawnCodexSyncWithHeartbeat(
       throw new Error(`${label} requires string cwd and input.`);
     }
     const appServer = codexAppServerProcessOptionsFromEnv(label);
-    return runCodexProcess({
+    const redactValues = repairCodexRedactValues();
+    const result = runCodexProcess({
       args,
       cwd: options.cwd,
       env: options.env ?? process.env,
@@ -462,7 +465,10 @@ function spawnCodexSyncWithHeartbeat(
       ...(options.stdoutPath ? { stdoutPath: options.stdoutPath } : {}),
       ...(options.stderrPath ? { stderrPath: options.stderrPath } : {}),
       ...(appServer ? { appServer } : {}),
+      redactValues,
     });
+    redactCodexOutputLastMessage(args, redactValues);
+    return result;
   } finally {
     stopCodexHeartbeat(heartbeat);
   }

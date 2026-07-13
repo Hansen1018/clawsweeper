@@ -60,6 +60,9 @@ checkpoint, and status-only commits are intentionally omitted.
 
 ### Changed
 
+- Stripped GitHub Actions artifact and OIDC credentials plus ambient secrets
+  from repair Codex subprocesses, and redacted streamed logs, structured
+  last-message output, and collected debug artifacts before publication.
 - Accepted package-manager argument separators in the action-ledger CLI and
   allowed proven zero-command router runs to finish without empty publication.
 - Made action-ledger publication include every transactional import binding,

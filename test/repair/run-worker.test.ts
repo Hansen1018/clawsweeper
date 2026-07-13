@@ -70,14 +70,18 @@ test("run-worker starts Codex in the target checkout when one is available", () 
       "fs.writeFileSync(process.env.FAKE_CODEX_CWD_FILE, process.cwd());",
       "fs.writeFileSync(process.env.FAKE_CODEX_ARGS_FILE, JSON.stringify(process.argv.slice(2)));",
       "if (process.env.CLAWSWEEPER_INTERNAL_MODEL) process.exit(9);",
+      "if (process.env.ACTIONS_RUNTIME_TOKEN) process.exit(10);",
+      "if (process.env.ACTIONS_RESULTS_URL) process.exit(11);",
+      "if (process.env.AMBIENT_DEPLOY_SECRET) process.exit(12);",
       "const outputIndex = process.argv.indexOf('--output-last-message');",
       "const outputPath = process.argv[outputIndex + 1];",
+      "const secret = 'actions-runtime-token-for-test';",
       "const result = {",
       "  status: 'planned',",
       "  repo: 'openclaw/openclaw',",
       "  cluster_id: 'clawsweeper-run-worker-target-checkout',",
       "  mode: 'plan',",
-      "  summary: 'fake codex result',",
+      "  summary: secret,",
       "  actions: [],",
       "  needs_human: [],",
       "  canonical: null,",
@@ -87,8 +91,11 @@ test("run-worker starts Codex in the target checkout when one is available", () 
       "  fix_artifact: null,",
       "};",
       "fs.writeFileSync(outputPath, `${JSON.stringify(result, null, 2)}\\n`);",
+      'process.stdout.write("actions-runtime-");',
+      'process.stdout.write("token-for-test\\n");',
       'process.stdout.write("s".repeat(2 * 1024 * 1024));',
       'process.stdout.write(\'{"type":"fake"}\\n\');',
+      'process.stderr.write("actions-runtime-token-for-test\\n");',
       'process.stderr.write("e".repeat(2 * 1024 * 1024));',
     ].join("\n"),
     { mode: 0o755 },
@@ -122,6 +129,9 @@ test("run-worker starts Codex in the target checkout when one is available", () 
         FAKE_CODEX_CWD_FILE: cwdFile,
         FAKE_CODEX_ARGS_FILE: argsFile,
         CLAWSWEEPER_INTERNAL_MODEL: "secret-model-for-test",
+        ACTIONS_RUNTIME_TOKEN: "actions-runtime-token-for-test",
+        ACTIONS_RESULTS_URL: "https://results.example.invalid/runtime-secret",
+        AMBIENT_DEPLOY_SECRET: "ambient-secret-for-test",
         CLAWSWEEPER_CODEX_STDIO_MAX_BUFFER_MB: "1",
         CLAWSWEEPER_CODEX_PLANNER_SANDBOX: "danger-full-access",
         CLAWSWEEPER_STEERABLE_CODEX: "0",
@@ -141,7 +151,17 @@ test("run-worker starts Codex in the target checkout when one is available", () 
     const runDir = runDirs[0];
     assert.ok(runDir);
     assert.ok(fs.statSync(path.join(runDir, "codex.jsonl")).size > 2 * 1024 * 1024);
-    assert.equal(fs.statSync(path.join(runDir, "codex.stderr.log")).size, 2 * 1024 * 1024);
+    assert.ok(fs.statSync(path.join(runDir, "codex.stderr.log")).size >= 2 * 1024 * 1024);
+    for (const artifact of ["result.json", "codex.jsonl", "codex.stderr.log"]) {
+      assert.doesNotMatch(
+        fs.readFileSync(path.join(runDir, artifact), "utf8"),
+        /actions-runtime-token-for-test/,
+      );
+    }
+    assert.equal(
+      JSON.parse(fs.readFileSync(path.join(runDir, "result.json"), "utf8")).summary,
+      "[REDACTED]",
+    );
   } finally {
     for (const runDir of fs.globSync(
       path.join(repoRoot, `.clawsweeper-repair/runs/${jobName}-plan-*`),

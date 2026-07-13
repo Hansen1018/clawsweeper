@@ -9,6 +9,7 @@ import {
   closeCodexOutputCapture,
   codexOutputTail,
   openCodexOutputCapture,
+  redactCodexOutputLastMessage,
 } from "../dist/codex-output-capture.js";
 
 test("Codex output redaction spans stream chunk boundaries before persistence", () => {
@@ -50,6 +51,24 @@ test("Codex output redaction prefers the longest value and flushes partial suffi
       "[REDACTED] then [REDACTED] and harmless-sec",
     );
     assert.equal(codexOutputTail(capture), "[REDACTED] then [REDACTED] and harmless-sec");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Codex last-message redaction atomically replaces structured output", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-last-message-redaction-"));
+  const outputPath = path.join(root, "result.json");
+  const secret = "runtime-token-123456";
+  fs.writeFileSync(outputPath, `${JSON.stringify({ summary: secret })}\n`);
+
+  try {
+    redactCodexOutputLastMessage(["exec", "--output-last-message", outputPath, "--json"], [secret]);
+
+    assert.deepEqual(JSON.parse(fs.readFileSync(outputPath, "utf8")), {
+      summary: "[REDACTED]",
+    });
+    assert.deepEqual(fs.readdirSync(root), ["result.json"]);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

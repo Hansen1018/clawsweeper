@@ -9,6 +9,7 @@ import {
   closeCodexOutputCapture,
   codexOutputTail,
   openCodexOutputCapture,
+  redactCodexOutputLastMessage,
 } from "../codex-output-capture.js";
 import { codexAppServerProcessOptionsFromEnv, runCodexProcess } from "../codex-process.js";
 import { spawnCodex, terminateCodexProcessTree } from "../codex-spawn.js";
@@ -26,6 +27,7 @@ import {
   codexLoginConfig,
   codexSubprocessEnv,
   codexModelArgs,
+  repairCodexRedactValues,
   repairCodexReasoningEffort,
   repairCodexServiceTier,
 } from "./process-env.js";
@@ -48,6 +50,7 @@ const resultRepairTimeoutMs = Number(
 );
 const codexReasoningEffort = repairCodexReasoningEffort();
 const codexServiceTier = repairCodexServiceTier();
+const codexRedactValues = repairCodexRedactValues();
 const codexPlannerSandbox =
   process.env.CLAWSWEEPER_CODEX_PLANNER_SANDBOX === "danger-full-access"
     ? "danger-full-access"
@@ -285,25 +288,30 @@ function spawnCodexWithHeartbeat({
 }: LooseRecord): Promise<LooseRecord> {
   const appServer = codexAppServerProcessOptionsFromEnv("Codex planning worker");
   if (appServer) {
-    return Promise.resolve(
-      runCodexProcess({
-        args: commandArgs,
-        cwd,
-        env: codexEnv(),
-        input,
-        timeoutMs,
-        stdoutPath: codexTranscriptPath,
-        stderrPath,
-        appServer,
-      }),
-    );
+    const result = runCodexProcess({
+      args: commandArgs,
+      cwd,
+      env: codexEnv(),
+      input,
+      timeoutMs,
+      stdoutPath: codexTranscriptPath,
+      stderrPath,
+      appServer,
+      redactValues: codexRedactValues,
+    });
+    redactCodexOutputLastMessage(commandArgs, codexRedactValues);
+    return Promise.resolve(result);
   }
   return new Promise((resolve) => {
     const startedAt = Date.now();
     let settled = false;
     let timeoutError: Error | null = null;
-    const stdout = openCodexOutputCapture(codexTranscriptPath);
-    const stderr = openCodexOutputCapture(stderrPath);
+    const stdout = openCodexOutputCapture(codexTranscriptPath, {
+      redactValues: codexRedactValues,
+    });
+    const stderr = openCodexOutputCapture(stderrPath, {
+      redactValues: codexRedactValues,
+    });
 
     const childEnv = codexEnv();
     const child = spawnCodex(commandArgs, { cwd, env: childEnv });
@@ -327,7 +335,15 @@ function spawnCodexWithHeartbeat({
       clearTimeout(timeout);
       closeCodexOutputCapture(stdout);
       closeCodexOutputCapture(stderr);
-      resolve(result);
+      try {
+        redactCodexOutputLastMessage(commandArgs, codexRedactValues);
+        resolve(result);
+      } catch (error) {
+        resolve({
+          ...result,
+          error: error instanceof Error ? error : new Error(String(error)),
+        });
+      }
     };
 
     const append = (stream: "stdout" | "stderr", chunk: Buffer) => {
