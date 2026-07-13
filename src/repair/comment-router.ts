@@ -4154,7 +4154,31 @@ function executeAutomerge(command: LooseRecord): LooseRecord {
         retryable: false,
       };
     }
-    return reverifyStrictBase(finalBaseBranch);
+    const finalPolicyBlock = reverifyStrictBase(finalBaseBranch);
+    if (finalPolicyBlock) return finalPolicyBlock;
+    let postPolicyState;
+    let terminalState;
+    try {
+      const postPolicyActivityBlock = trustedAutomergeReviewActivityBlockReason(command);
+      if (postPolicyActivityBlock) return postPolicyActivityBlock;
+      postPolicyState = readDispatchState();
+      const terminalActivityBlock = trustedAutomergeReviewActivityBlockReason(command);
+      if (terminalActivityBlock) return terminalActivityBlock;
+      terminalState = readDispatchState();
+    } catch (error) {
+      return {
+        reason: `post-policy safety snapshot could not be refreshed: ${compactGhError(error)}`,
+        retryable: true,
+      };
+    }
+    const finalDigest = stableJson(finalState);
+    if (finalDigest !== stableJson(postPolicyState) || finalDigest !== stableJson(terminalState)) {
+      return {
+        reason: "pull request state changed during final strict-base policy verification",
+        retryable: true,
+      };
+    }
+    return dispatchStateBlock(terminalState);
   };
   let result;
   try {

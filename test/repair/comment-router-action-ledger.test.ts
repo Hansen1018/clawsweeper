@@ -315,7 +315,7 @@ test("activity and strict-base policy are checked after durable dispatch marking
   );
   assert.match(
     liveDispatchState,
-    /const reverifyStrictBase[\s\S]*middleState = readDispatchState\(\)[\s\S]*reverifyStrictBase\(middleBaseBranch\)[\s\S]*finalState = readDispatchState\(\)[\s\S]*reverifyStrictBase\(finalBaseBranch\)/,
+    /const reverifyStrictBase[\s\S]*middleState = readDispatchState\(\)[\s\S]*reverifyStrictBase\(middleBaseBranch\)[\s\S]*finalState = readDispatchState\(\)[\s\S]*reverifyStrictBase\(finalBaseBranch\)[\s\S]*trustedAutomergeReviewActivityBlockReason\(command\)[\s\S]*postPolicyState = readDispatchState\(\)[\s\S]*trustedAutomergeReviewActivityBlockReason\(command\)[\s\S]*terminalState = readDispatchState\(\)/,
   );
   assert.match(executeAutomerge, /knownNoMutation: \(\) => !mergeRequestStarted/);
   assert.match(
