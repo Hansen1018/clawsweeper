@@ -54,14 +54,16 @@ import {
   inspectExactHeadMergeClaim,
   isTrustedExactHeadMergeClaimComment,
   isTrustedExactHeadMergeClaimDispatchComment,
+  isTrustedExactHeadMergeClaimRejectionComment,
   isTrustedExactHeadMergeClaimRecoveryComment,
   isTrustedExactHeadMergeClaimReleaseComment,
   markExactHeadMergeClaimDispatched,
+  rejectExactHeadMergeClaim,
   releaseExactHeadMergeClaim,
   type ExactHeadMergeClaimInspection,
   type ExactHeadMergeClaimRequest,
 } from "./exact-head-merge-claim.js";
-import { reviewedTimelineTail } from "./timeline-cursor.js";
+import { MAX_REVIEWED_TIMELINE_EVENTS, reviewedTimelineTail } from "./timeline-cursor.js";
 import {
   recordRepairMutationObservedSafely,
   repairSourceRevision,
@@ -941,6 +943,17 @@ function applyMergeAction({
       ...(mergeClaim.status === "unknown" ? { requeue_required: true } : {}),
     };
   }
+  if (mergeClaim.status !== "acquired" && mergeClaim.status !== "existing") {
+    return {
+      ...base,
+      status: "blocked",
+      reason: "exact-head merge claim entered an unsupported state",
+      live_state: finalLive.state,
+      live_updated_at: finalLive.updated_at,
+      merge_method: "squash",
+      requeue_required: true,
+    };
+  }
   const reconciliationOnly = mergeClaim.status === "existing";
   if (mergeClaim.status === "existing" && mergeClaim.dispatched) {
     dispatchedSquashCommitMessage = mergeClaim.expectedSquashMessage ?? "";
@@ -1270,13 +1283,21 @@ function applyMergeAction({
         reason: pendingReason,
       });
     }
+    const rejectNoEffectClaim = (actionResult: LooseRecord) =>
+      rejectApplyMergeClaimAfterNoEffect({
+        actionResult,
+        repository: result.repo,
+        number: target,
+        headSha: authorizedHeadSha,
+        claim: mergeClaim,
+      });
     if (commandError && isLockedConversationCommentError(commandError)) {
-      return {
+      return rejectNoEffectClaim({
         ...lockedConversationSkip(base, live, { terminalWriteError: true }),
         merge_method: "squash",
-      };
+      });
     }
-    return {
+    return rejectNoEffectClaim({
       ...base,
       status: "blocked",
       reason: commandError
@@ -1288,7 +1309,7 @@ function applyMergeAction({
       live_updated_at: merged.updated_at ?? live.updated_at,
       merge_method: "squash",
       requeue_required: true,
-    };
+    });
   }
 
   recordApplyMergeObserved(target, authorizedHeadSha);
@@ -1501,6 +1522,74 @@ function releaseApplyMergeClaimBeforeDispatch({
   };
 }
 
+function rejectApplyMergeClaimAfterNoEffect({
+  actionResult,
+  repository,
+  number,
+  headSha,
+  claim,
+}: {
+  actionResult: LooseRecord;
+  repository: string;
+  number: number;
+  headSha: string;
+  claim:
+    | Extract<ReturnType<typeof claimApplyMergeRequest>, { status: "acquired" }>
+    | Extract<ReturnType<typeof claimApplyMergeRequest>, { status: "existing" }>;
+}) {
+  let rejection;
+  try {
+    rejection = rejectApplyMergeClaim(repository, number, headSha, claim);
+  } catch (error) {
+    rejection = {
+      status: "unknown" as const,
+      reason: `exact-head merge claim rejection failed: ${ghErrorText(error)}`,
+      claimId: claim.claimId,
+    };
+  }
+  if (rejection.status === "rejected") return actionResult;
+  return {
+    ...actionResult,
+    status: "blocked",
+    reason: `${String(actionResult.reason ?? "merge produced no effect")}; ${rejection.reason}`,
+    requeue_required: true,
+  };
+}
+
+function rejectApplyMergeClaim(
+  repository: string,
+  number: number,
+  headSha: string,
+  claim:
+    | Extract<ReturnType<typeof claimApplyMergeRequest>, { status: "acquired" }>
+    | Extract<ReturnType<typeof claimApplyMergeRequest>, { status: "existing" }>,
+) {
+  const request = applyMergeClaimRequest(repository, number, headSha, {
+    owner: claim.status === "existing" ? claim.owner : "apply_result",
+    claimant: claim.status === "existing" ? claim.claimant : exactHeadMergeClaimant("apply_result"),
+  });
+  return rejectExactHeadMergeClaim(request, claim.claimId, {
+    listComments: () => listApplyMergeClaimComments(request),
+    createComment: (body) =>
+      runRepairMutation(applyResultLifecycle(number), {
+        kind: "apply_result_merge_claim_rejection",
+        identity: { ...exactHeadMergeClaimIdentity(request), claimId: claim.claimId },
+        component: "merge_claim",
+        operation: () =>
+          ghJsonOnce([
+            "api",
+            `repos/${request.repository}/issues/${request.number}/comments`,
+            "-f",
+            `body=${body}`,
+          ]),
+        outcome: (comment) =>
+          isTrustedExactHeadMergeClaimRejectionComment(comment, request, claim.claimId)
+            ? "accepted"
+            : "unknown",
+      }),
+  });
+}
+
 function releaseApplyMergeClaim(
   repository: string,
   number: number,
@@ -1539,14 +1628,18 @@ function applyMergeClaimRequest(
   repository: string,
   number: number,
   headSha: string,
+  claimIdentity: { owner: string; claimant: string } = {
+    owner: "apply_result",
+    claimant: exactHeadMergeClaimant("apply_result"),
+  },
 ): ExactHeadMergeClaimRequest {
   return {
     repository,
     number,
     headSha,
     method: "squash",
-    owner: "apply_result",
-    claimant: exactHeadMergeClaimant("apply_result"),
+    owner: claimIdentity.owner,
+    claimant: claimIdentity.claimant,
     appId: Number(process.env.CLAWSWEEPER_AUTHENTICATED_APP_ID),
     appSlug: String(process.env.CLAWSWEEPER_AUTHENTICATED_APP_SLUG ?? ""),
   };
@@ -1575,8 +1668,9 @@ function applyMergeUpdatedAtMatches(
     const request = applyMergeClaimRequest(repository, number, headSha);
     const timeline = ghPagedLimit<LooseRecord>(
       `repos/${request.repository}/issues/${request.number}/timeline`,
-      1_001,
+      MAX_REVIEWED_TIMELINE_EVENTS + 1,
     );
+    if (timeline.length > MAX_REVIEWED_TIMELINE_EVENTS) return false;
     if (exactHeadMergeUpdatedAtMatches(expectedUpdatedAt, liveUpdatedAt)) {
       return reviewedTimelineTail(expectedTimelineCursor, timeline) !== null;
     }

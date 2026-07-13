@@ -1340,7 +1340,7 @@ test("repair apply does not transport-retry an ambiguous merge mutation", () => 
   }
 });
 
-test("repair apply fresh attempts reconcile an unknown claimed merge without reissuing it", () => {
+test("repair apply retires a proven no-effect claim so the same head can retry", () => {
   const fixture = writeMergeApplyFixture({ mergeMode: "ambiguous_unconfirmed" });
   try {
     runMergeApplyResult(fixture, { runAttempt: 1 });
@@ -1349,23 +1349,46 @@ test("repair apply fresh attempts reconcile an unknown claimed merge without rei
     assert.equal(report.actions[0].requeue_required, true);
     assert.equal(mergeCallCount(fixture.ghLogPath), 1);
 
+    let comments = JSON.parse(fs.readFileSync(fixture.mergeClaimPath, "utf8"));
+    assert.equal(comments.length, 3);
+    assert.match(comments[0].body, /clawsweeper-exact-head-merge-claim:v1/);
+    assert.match(comments[1].body, /clawsweeper-exact-head-merge-dispatch:v2 claim=1001/);
+    assert.match(comments[2].body, /clawsweeper-exact-head-merge-rejection:v1 claim=1001/);
+
+    const refreshedResult = JSON.parse(fs.readFileSync(fixture.resultPath, "utf8"));
+    refreshedResult.actions[0].target_updated_at = "2026-07-13T07:03:02.000Z";
+    refreshedResult.actions[0].target_timeline_cursor = createReviewedTimelineCursor(
+      comments.map((comment: Record<string, unknown>) => ({ ...comment, event: "commented" })),
+    );
+    fs.writeFileSync(fixture.resultPath, JSON.stringify(refreshedResult, null, 2));
     runMergeApplyResult(fixture, { runAttempt: 2 });
     report = readApplyReport(fixture.reportPath);
     assert.equal(report.actions[0].status, "blocked");
-    assert.equal(
-      report.actions[0].reason,
-      "exact-head merge request is durably claimed; reconciliation only",
-    );
     assert.equal(report.actions[0].requeue_required, true);
-    assert.equal(mergeCallCount(fixture.ghLogPath), 1);
+    assert.equal(mergeCallCount(fixture.ghLogPath), 2);
+    comments = JSON.parse(fs.readFileSync(fixture.mergeClaimPath, "utf8"));
+    assert.equal(comments.length, 6);
+    assert.match(comments[3].body, /clawsweeper-exact-head-merge-claim:v1/);
+    assert.match(comments[4].body, /clawsweeper-exact-head-merge-dispatch:v2 claim=1004/);
+    assert.match(comments[5].body, /clawsweeper-exact-head-merge-rejection:v1 claim=1004/);
+  } finally {
+    fixture.cleanup();
+  }
+});
 
-    fs.writeFileSync(fixture.unrelatedDriftPath, "same_timestamp");
-    runMergeApplyResult(fixture, { runAttempt: 3 });
-    report = readApplyReport(fixture.reportPath);
+test("repair apply fails closed when post-claim timeline hydration reaches its cap", () => {
+  const fixture = writeMergeApplyFixture({ foreignActivityBeyondTimelineCap: true });
+  try {
+    runMergeApplyResult(fixture);
+
+    const report = readApplyReport(fixture.reportPath);
     assert.equal(report.actions[0].status, "blocked");
-    assert.equal(report.actions[0].reason, "target changed since worker review");
-    assert.equal(report.actions[0].live_updated_at, "2026-07-13T07:02:02.000Z");
-    assert.equal(mergeCallCount(fixture.ghLogPath), 1);
+    assert.equal(report.actions[0].reason, "target changed after exact-head merge claim");
+    assert.equal(mergeCallCount(fixture.ghLogPath), 0);
+    const comments = JSON.parse(fs.readFileSync(fixture.mergeClaimPath, "utf8"));
+    assert.equal(comments.length, 2);
+    assert.match(comments[0].body, /clawsweeper-exact-head-merge-claim:v1/);
+    assert.match(comments[1].body, /clawsweeper-exact-head-merge-release:v1 claim=1001/);
   } finally {
     fixture.cleanup();
   }
@@ -2004,6 +2027,7 @@ function writeMergeApplyFixture(
     terminalCheckMissingConclusion?: boolean;
     legacyStatusContextSuccess?: boolean;
     mergeCommitMode?: "exact" | "message_mismatch" | "two_parents";
+    foreignActivityBeyondTimelineCap?: boolean;
   } = {},
 ): MergeFixture {
   const root = fs.realpathSync(
@@ -2023,6 +2047,14 @@ function writeMergeApplyFixture(
   const ledgerRoot = path.join(root, "ledger");
   const ledgerOutputRoot = path.join(root, "ledger-output");
   const headSha = "a".repeat(40);
+  const reviewedTimeline = options.foreignActivityBeyondTimelineCap
+    ? Array.from({ length: 1_000 }, (_, index) => ({
+        id: index + 1,
+        event: "commented",
+        created_at: new Date(Date.parse("2026-07-12T00:00:00Z") + index * 1_000).toISOString(),
+        actor: { login: "reviewer" },
+      }))
+    : [];
   fs.mkdirSync(binDir, { recursive: true });
   fs.mkdirSync(runDir, { recursive: true });
   fs.mkdirSync(ledgerRoot);
@@ -2062,7 +2094,7 @@ function writeMergeApplyFixture(
             target: "#101",
             target_kind: "pull_request",
             target_updated_at: "2026-07-13T07:00:00Z",
-            target_timeline_cursor: createReviewedTimelineCursor([]),
+            target_timeline_cursor: createReviewedTimelineCursor(reviewedTimeline),
             status: "planned",
           },
         ],
@@ -2109,6 +2141,8 @@ function writeMergeApplyFixture(
     terminalCheckMissingConclusion: options.terminalCheckMissingConclusion ?? false,
     legacyStatusContextSuccess: options.legacyStatusContextSuccess ?? false,
     mergeCommitMode: options.mergeCommitMode ?? "exact",
+    reviewedTimeline,
+    foreignActivityBeyondTimelineCap: options.foreignActivityBeyondTimelineCap ?? false,
     issueCountPath,
   };
   fs.writeFileSync(
@@ -2169,7 +2203,10 @@ if (args[0] === "api") {
     const comments = fs.existsSync(data.mergeClaimPath)
       ? JSON.parse(fs.readFileSync(data.mergeClaimPath, "utf8"))
       : [];
-    const timeline = comments.map((comment) => ({ ...comment, event: "commented" }));
+    const timeline = [
+      ...data.reviewedTimeline,
+      ...comments.map((comment) => ({ ...comment, event: "commented" })),
+    ];
     const driftMode = fs.existsSync(data.unrelatedDriftPath)
       ? fs.readFileSync(data.unrelatedDriftPath, "utf8").trim()
       : "";
@@ -2181,7 +2218,22 @@ if (args[0] === "api") {
         actor: { login: "maintainer" },
       });
     }
-    write(args.includes("--slurp") ? [timeline] : timeline);
+    if (data.foreignActivityBeyondTimelineCap && comments.length > 0) {
+      timeline.push({
+        id: 90002,
+        event: "labeled",
+        created_at: comments.at(-1).created_at,
+        actor: { login: "maintainer" },
+      });
+    }
+    if (args.includes("--slurp")) {
+      write([timeline]);
+    } else {
+      const query = new URLSearchParams(apiPath.split("?")[1] || "");
+      const perPage = Number(query.get("per_page") || timeline.length || 1);
+      const page = Number(query.get("page") || 1);
+      write(timeline.slice((page - 1) * perPage, page * perPage));
+    }
     process.exit(0);
   }
   if (apiPath === "repos/openclaw/openclaw/issues/101") {
