@@ -248,6 +248,9 @@ function resolveFromRunId(runId: string) {
     if (downloaded.status === 0) {
       return resolveDownloadedRunCohort(artifactDir, runId, null);
     }
+    if (!artifactDownloadUnavailable(downloaded.stderr, downloaded.stdout)) {
+      throw new Error(`could not resolve run ${runId}: ${downloaded.stderr || downloaded.stdout}`);
+    }
 
     const fromLedger = readPublishedRunRecord(runId);
     const ledgerSourceJob = publishedRecordField(
@@ -284,6 +287,18 @@ function resolveFromRunId(runId: string) {
   } finally {
     fs.rmSync(artifactDir, { recursive: true, force: true });
   }
+}
+
+function artifactDownloadUnavailable(stderr: unknown, stdout: unknown): boolean {
+  const detail = `${String(stderr ?? "")}\n${String(stdout ?? "")}`.toLowerCase();
+  return [
+    "artifact has expired",
+    "artifacts expired",
+    "no artifacts found",
+    "no valid artifacts",
+    "not found",
+    "http 404",
+  ].some((message) => detail.includes(message));
 }
 
 function ensureHistoricalStateRevision(value: unknown): void {

@@ -131,6 +131,24 @@ test("run-id requeue uses complete published provenance after Actions artifacts 
   }
 });
 
+test("run-id requeue does not mask artifact transport failures with durable provenance", () => {
+  const fixture = createFixture("published-auth-failure", "910112");
+  try {
+    writeRunRecord(fixture, {
+      source_job: fixture.jobPath,
+      source_state_revision: fixture.replacementRevision,
+      source_job_sha256: fixture.replacementDigest,
+      mode: "autonomous",
+    });
+
+    const result = runRequeue(fixture, { GH_ARTIFACT_FAILURE: "auth" });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /HTTP 401: Bad credentials/);
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
 test("run-id requeue does not replace incomplete available artifacts with durable provenance", () => {
   const fixture = createFixture("published-incomplete", "910108");
   try {
@@ -327,6 +345,7 @@ function runRequeue(fixture: ReturnType<typeof createFixture>, extraEnv: NodeJS.
         CLAWSWEEPER_STATE_DIR: fixture.stateRoot,
         GH_ARTIFACT_FIXTURE: fixture.artifactFixture,
         GH_ARTIFACT_EXPIRED: "0",
+        GH_ARTIFACT_FAILURE: "",
         ...extraEnv,
       },
     },
@@ -470,6 +489,10 @@ function writeFakeGh(binDir: string): void {
     `#!/bin/sh
 set -eu
 if [ "$1" = "run" ] && [ "$2" = "download" ]; then
+  if [ "$GH_ARTIFACT_FAILURE" = "auth" ]; then
+    echo "HTTP 401: Bad credentials" >&2
+    exit 1
+  fi
   if [ "$GH_ARTIFACT_EXPIRED" = "1" ]; then
     echo "Actions artifacts expired" >&2
     exit 1
