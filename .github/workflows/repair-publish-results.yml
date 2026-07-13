@@ -497,6 +497,8 @@ jobs:
           RUN_URL: ${{ github.event.workflow_run.html_url }}
           HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
           CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          WORKFLOW_CREATED_AT: ${{ github.event.workflow_run.created_at }}
+          PRODUCER_ATTEMPT: ${{ steps.result-artifact.outputs.producer_attempt }}
           TRUSTED_LEGACY_WORKER_HEAD: ${{ steps.worker-contract.outputs.trusted_legacy_worker_head }}
         run: |
           set -euo pipefail
@@ -513,11 +515,20 @@ jobs:
             --run-url "$RUN_URL" \
             --head-sha "$HEAD_SHA" \
             --conclusion "$CONCLUSION" \
+            --workflow-created-at "$WORKFLOW_CREATED_AT" \
+            --producer-attempt "$PRODUCER_ATTEMPT" \
             "${legacy_worker_args[@]}"
           CLAWSWEEPER_ACTION_LEDGER_INVOCATION=open-pr-finalizer \
             pnpm run repair:finalize-open-prs -- --write-report
           CLAWSWEEPER_ACTION_LEDGER_INVOCATION=finalizer-results \
-            pnpm run repair:publish-result -- --skip-dashboard
+            pnpm run repair:publish-result -- \
+              --skip-dashboard \
+              --run-id "$RUN_ID" \
+              --run-url "$RUN_URL" \
+              --head-sha "$HEAD_SHA" \
+              --conclusion "$CONCLUSION" \
+              --workflow-created-at "$WORKFLOW_CREATED_AT" \
+              --producer-attempt "$PRODUCER_ATTEMPT"
 
       # This workflow_run job executes trusted main-branch code only; artifacts
       # from worker runs are downloaded as data and handled by repair publishers.

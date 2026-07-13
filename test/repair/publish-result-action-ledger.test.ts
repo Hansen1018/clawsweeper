@@ -10,7 +10,11 @@ import {
   readSealedPublishedSource,
   resultPublicationSourceRevision,
 } from "../../dist/repair/publish-result.js";
-import { reviewedResultRevision } from "../../dist/repair/publish-result-source.js";
+import {
+  canonicalResultPublicationDecision,
+  latestResultPublicationRecords,
+  reviewedResultRevision,
+} from "../../dist/repair/publish-result-source.js";
 import { readText } from "../helpers.ts";
 
 test("published repair receipts use production-valid result and plan revision fields", () => {
@@ -170,6 +174,109 @@ test("published repair receipts ignore schema-invalid legacy revision shapes", (
       },
     ),
     null,
+  );
+});
+
+test("out-of-order publishers cannot replace a newer canonical cluster generation", () => {
+  const newerGeneration = publicationRecord({
+    run_id: "9002",
+    workflow_created_at: "2026-07-13T10:01:00Z",
+    producer_attempt: 1,
+    published_at: "2026-07-13T10:02:00Z",
+  });
+  const olderFinishingLater = publicationRecord({
+    run_id: "9001",
+    workflow_created_at: "2026-07-13T10:00:00Z",
+    producer_attempt: 1,
+    published_at: "2026-07-13T10:03:00Z",
+  });
+
+  assert.deepEqual(canonicalResultPublicationDecision(olderFinishingLater, [newerGeneration]), {
+    publish: false,
+    reason: "stale_generation",
+    supersededByRunId: "9002",
+  });
+  assert.equal(
+    latestResultPublicationRecords([newerGeneration, olderFinishingLater])[0]?.run_id,
+    "9002",
+  );
+});
+
+test("publisher keeps the newer canonical report when an older generation finishes later", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-publish-order-"));
+  try {
+    fs.cpSync("dist", path.join(root, "dist"), { recursive: true });
+    fs.cpSync("config", path.join(root, "config"), { recursive: true });
+    fs.cpSync("schema", path.join(root, "schema"), { recursive: true });
+    fs.writeFileSync(path.join(root, "package.json"), '{"type":"module"}\n');
+
+    publishFixture(root, {
+      runId: "9002",
+      publisherRunId: "9902",
+      createdAt: "2026-07-13T10:01:00Z",
+      summary: "newer generation",
+    });
+    const staleOutput = publishFixture(root, {
+      runId: "9001",
+      publisherRunId: "9901",
+      createdAt: "2026-07-13T10:00:00Z",
+      summary: "older generation finishing later",
+    });
+
+    const canonical = fs.readFileSync(path.join(root, "results/openclaw/repair-pr-42.md"), "utf8");
+    const staleRecord = JSON.parse(
+      fs.readFileSync(path.join(root, "results/runs/9001.json"), "utf8"),
+    );
+    assert.match(canonical, /newer generation/);
+    assert.doesNotMatch(canonical, /older generation finishing later/);
+    assert.equal(staleRecord.canonical_publication_status, "stale_noop");
+    assert.equal(staleRecord.canonical_superseded_by_run_id, "9002");
+    assert.equal(staleOutput.records[0]?.canonical_publication_status, "stale_noop");
+    assert.equal(staleOutput.records[0]?.run_record_status, "published");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a later immutable producer attempt replaces an earlier attempt of the same worker run", () => {
+  const firstAttempt = publicationRecord({
+    run_id: "9001",
+    workflow_created_at: "2026-07-13T10:00:00Z",
+    producer_attempt: 1,
+  });
+  const secondAttempt = publicationRecord({
+    run_id: "9001",
+    workflow_created_at: "2026-07-13T10:00:00Z",
+    producer_attempt: 2,
+  });
+
+  assert.deepEqual(canonicalResultPublicationDecision(secondAttempt, [firstAttempt]), {
+    publish: true,
+    reason: "newer_generation",
+    supersededByRunId: null,
+  });
+});
+
+test("legacy run ids prevent older queued generations from winning during metadata rollout", () => {
+  const legacyNewerGeneration = publicationRecord({
+    run_id: "9002",
+    workflow_created_at: null,
+    published_at: "2026-07-13T10:02:00Z",
+  });
+  const orderedOlderGeneration = publicationRecord({
+    run_id: "9001",
+    workflow_created_at: "2026-07-13T10:00:00Z",
+    producer_attempt: 1,
+    published_at: "2026-07-13T10:03:00Z",
+  });
+
+  assert.deepEqual(
+    canonicalResultPublicationDecision(orderedOlderGeneration, [legacyNewerGeneration]),
+    {
+      publish: false,
+      reason: "stale_generation",
+      supersededByRunId: "9002",
+    },
   );
 });
 
@@ -379,6 +486,81 @@ function productionResult(overrides: Record<string, unknown>) {
     fix_artifact: null,
     ...overrides,
   };
+}
+
+function publicationRecord(overrides: Record<string, unknown>) {
+  return {
+    repo: "openclaw/openclaw",
+    cluster_id: "repair-pr-42",
+    published_at: "2026-07-13T10:00:00Z",
+    ...overrides,
+  };
+}
+
+function publishFixture(
+  root: string,
+  fixture: {
+    runId: string;
+    publisherRunId: string;
+    createdAt: string;
+    summary: string;
+  },
+) {
+  const runDir = path.join(root, "artifacts", `clawsweeper-repair-${fixture.runId}-1`, "run");
+  fs.mkdirSync(runDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(runDir, "result.json"),
+    `${JSON.stringify(
+      productionResult({
+        cluster_id: "repair-pr-42",
+        canonical_issue: "#42",
+        summary: fixture.summary,
+      }),
+    )}\n`,
+  );
+  fs.writeFileSync(
+    path.join(runDir, "cluster-plan.json"),
+    `${JSON.stringify({
+      repo: "openclaw/openclaw",
+      cluster_id: "repair-pr-42",
+      source_job: "jobs/openclaw/inbox/repair-pr-42.md",
+      items: [],
+    })}\n`,
+  );
+  const output = execFileSync(
+    process.execPath,
+    [
+      "dist/repair/publish-result.js",
+      path.join("artifacts", `clawsweeper-repair-${fixture.runId}-1`),
+      "--skip-dashboard",
+      "--run-id",
+      fixture.runId,
+      "--workflow-created-at",
+      fixture.createdAt,
+      "--producer-attempt",
+      "1",
+      "--trusted-legacy-worker-head",
+      "e".repeat(40),
+    ],
+    {
+      cwd: root,
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        CLAWSWEEPER_ACTION_LEDGER_INVOCATION: `publish-order-${fixture.runId}`,
+        CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT: path.join(root, "action-ledger"),
+        GITHUB_JOB: "publish",
+        GITHUB_REPOSITORY: "openclaw/clawsweeper",
+        GITHUB_RUN_ATTEMPT: "1",
+        GITHUB_RUN_ID: fixture.publisherRunId,
+        GITHUB_SHA: "a".repeat(40),
+        GITHUB_WORKFLOW: "repair publish cluster results",
+        GITHUB_WORKFLOW_REF:
+          "openclaw/clawsweeper/.github/workflows/repair-publish-results.yml@refs/heads/main",
+      },
+    },
+  );
+  return JSON.parse(output);
 }
 
 function repairJob(body: string): string {

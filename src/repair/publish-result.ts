@@ -16,7 +16,6 @@ import { renderClusterReport, writeClosedRecord } from "./publish-cluster-report
 import {
   findResultPaths,
   inferRunId,
-  latestClusterRecords,
   readArchivedClusters,
   readExistingRunRecord,
   readRunMetadata,
@@ -37,7 +36,12 @@ import {
   hydrateClosureRows,
   sortNewestClosureRowFirst,
 } from "./publish-tracked-rows.js";
-import { reviewedResultRevision } from "./publish-result-source.js";
+import {
+  canonicalResultPublicationDecision,
+  compareResultPublicationGeneration,
+  latestResultPublicationRecords,
+  reviewedResultRevision,
+} from "./publish-result-source.js";
 import {
   flushRepairActionEvents,
   recordRepairLifecycleEvent,
@@ -157,6 +161,20 @@ function publishResult(resultPath: string) {
     args.conclusion ?? metadata?.conclusion ?? previousRecord?.workflow_conclusion ?? "",
   );
   const workflowStatus = String(metadata?.status ?? previousRecord?.workflow_status ?? "");
+  const workflowCreatedAt = publicationTimestamp(
+    args["workflow-created-at"] ??
+      metadata?.createdAt ??
+      metadata?.created_at ??
+      previousRecord?.workflow_created_at,
+    "--workflow-created-at",
+  );
+  const producerAttempt = publicationPositiveInteger(
+    args["producer-attempt"] ??
+      metadata?.runAttempt ??
+      metadata?.run_attempt ??
+      previousRecord?.producer_attempt,
+    "--producer-attempt",
+  );
   const repo = String(result.repo ?? "unknown/unknown");
   const owner = repo.split("/")[0] || "unknown";
   const clusterId = String(result.cluster_id ?? path.basename(runDir));
@@ -180,10 +198,10 @@ function publishResult(resultPath: string) {
     workflow_status: workflowStatus || null,
     post_flight_outcome: postFlightReport.outcome ?? null,
     post_flight_detail: postFlightReport.detail ?? null,
-    workflow_created_at:
-      metadata?.createdAt ?? metadata?.created_at ?? previousRecord?.workflow_created_at ?? null,
+    workflow_created_at: workflowCreatedAt,
     workflow_updated_at:
       metadata?.updatedAt ?? metadata?.updated_at ?? previousRecord?.workflow_updated_at ?? null,
+    producer_attempt: producerAttempt,
     result_status: result.status ?? null,
     source_job: sealedSource?.sourceJob ?? null,
     source_state_revision: sealedSource?.stateRevision ?? null,
@@ -211,15 +229,27 @@ function publishResult(resultPath: string) {
 
   const reportDir = path.join(root, "results", owner);
   fs.mkdirSync(reportDir, { recursive: true });
-  fs.writeFileSync(
-    path.join(reportDir, `${slug(clusterId)}.md`),
-    renderClusterReport(report),
-    "utf8",
-  );
+  const existingRecords = readRunRecords(root);
+  const canonicalDecision = canonicalResultPublicationDecision(report, existingRecords);
+  const canonicalPublicationStatus = canonicalDecision.publish ? "published" : "stale_noop";
+  Object.assign(report, {
+    canonical_publication_status: canonicalPublicationStatus,
+    canonical_publication_reason: canonicalDecision.reason,
+    canonical_superseded_by_run_id: canonicalDecision.supersededByRunId,
+  });
+  if (canonicalDecision.publish) {
+    fs.writeFileSync(
+      path.join(reportDir, `${slug(clusterId)}.md`),
+      renderClusterReport(report),
+      "utf8",
+    );
+  }
 
   const runDirOut = path.join(root, "results", "runs");
   fs.mkdirSync(runDirOut, { recursive: true });
-  if (runId) {
+  const replaceRunRecord =
+    !previousRecord || compareResultPublicationGeneration(report, previousRecord) >= 0;
+  if (runId && replaceRunRecord) {
     fs.writeFileSync(
       path.join(runDirOut, `${runId}.json`),
       `${JSON.stringify(report, null, 2)}\n`,
@@ -243,17 +273,21 @@ function publishResult(resultPath: string) {
     },
     {
       type: ACTION_EVENT_TYPES.publicationLifecycle,
-      status: ACTION_EVENT_STATUSES.completed,
-      reasonCode: ACTION_EVENT_REASON_CODES.completed,
+      status: canonicalDecision.publish
+        ? ACTION_EVENT_STATUSES.completed
+        : ACTION_EVENT_STATUSES.skipped,
+      reasonCode: canonicalDecision.publish
+        ? ACTION_EVENT_REASON_CODES.completed
+        : ACTION_EVENT_REASON_CODES.stale,
       mutation: false,
       component: "publish_result",
       operation: "publication",
-      state: "prepared",
+      state: canonicalDecision.publish ? "prepared" : "stale_noop",
       publicationKind: "cluster_result",
       eventIdentity: {
         publicationKind: "cluster_result",
         runId: runId || clusterId,
-        state: "prepared",
+        state: canonicalDecision.publish ? "prepared" : "stale_noop",
       },
     },
   );
@@ -263,9 +297,34 @@ function publishResult(resultPath: string) {
     run_id: report.run_id,
     result_status: report.result_status,
     workflow_conclusion: report.workflow_conclusion,
+    canonical_publication_status: canonicalPublicationStatus,
+    canonical_superseded_by_run_id: canonicalDecision.supersededByRunId,
+    run_record_status: replaceRunRecord ? "published" : "stale_noop",
     fix_counts: report.fix_counts,
     apply_counts: report.apply_counts,
   };
+}
+
+function publicationTimestamp(value: unknown, label: string): string | null {
+  const text = String(value ?? "").trim();
+  if (!text) return null;
+  if (!Number.isFinite(Date.parse(text))) {
+    throw new Error(`${label} must be a valid timestamp`);
+  }
+  return text;
+}
+
+function publicationPositiveInteger(value: unknown, label: string): number | null {
+  const text = String(value ?? "").trim();
+  if (!text) return null;
+  if (!/^[1-9][0-9]*$/.test(text)) {
+    throw new Error(`${label} must be a positive integer`);
+  }
+  const parsed = Number(text);
+  if (!Number.isSafeInteger(parsed)) {
+    throw new Error(`${label} must be a safe positive integer`);
+  }
+  return parsed;
 }
 
 export function resultPublicationSourceRevision(
@@ -408,7 +467,7 @@ function updateDashboard() {
   if (!fs.existsSync(readmePath)) return;
   const readme = fs.readFileSync(readmePath, "utf8");
   const records = readRunRecords(root);
-  const allLatestByCluster = latestClusterRecords(records).sort(sortNewestRecordFirst);
+  const allLatestByCluster = latestResultPublicationRecords(records).sort(sortNewestRecordFirst);
   const latestByCluster = allLatestByCluster.filter(
     (record: JsonValue) => !archivedClusters.has(record.cluster_id),
   );
@@ -790,7 +849,7 @@ function normalizeReportRow(row: LooseRecord): LooseRecord {
 }
 
 function sortNewestRecordFirst(left: JsonValue, right: JsonValue) {
-  return String(right.published_at ?? "").localeCompare(String(left.published_at ?? ""));
+  return compareResultPublicationGeneration(right, left);
 }
 
 function countRows(rows: LooseRecord[], predicate: (row: LooseRecord) => boolean) {

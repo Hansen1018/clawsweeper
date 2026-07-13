@@ -18,6 +18,22 @@ test("repair result publication serializes every completed worker generation", (
   assert.equal(publisher.concurrency?.queue, "max");
 });
 
+test("repair result publication binds canonical replacement to immutable producer order", () => {
+  const workflow = readText(".github/workflows/repair-publish-results.yml");
+  const publish = workflow.slice(
+    workflow.indexOf("- name: Publish result ledger"),
+    workflow.indexOf("- name: Prepare durable notification claims"),
+  );
+
+  assert.match(publish, /WORKFLOW_CREATED_AT: \$\{\{ github\.event\.workflow_run\.created_at \}\}/);
+  assert.match(
+    publish,
+    /PRODUCER_ATTEMPT: \$\{\{ steps\.result-artifact\.outputs\.producer_attempt \}\}/,
+  );
+  assert.equal((publish.match(/--workflow-created-at "\$WORKFLOW_CREATED_AT"/g) ?? []).length, 2);
+  assert.equal((publish.match(/--producer-attempt "\$PRODUCER_ATTEMPT"/g) ?? []).length, 2);
+});
+
 test("repair result publication treats a missing current artifact as an explicit empty outcome", () => {
   const workflow = readText(".github/workflows/repair-publish-results.yml");
   const current = workflow.slice(
