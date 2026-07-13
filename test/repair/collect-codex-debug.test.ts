@@ -296,6 +296,20 @@ test("redactSecrets masks a header embedded in an ordinary JSONL message value",
   assert.equal(containsSensitiveValue(redacted, []), false);
 });
 
+test("redactSecrets independently masks repeated headers on one escaped line", () => {
+  const input = JSON.stringify({
+    message:
+      "Cookie: [REDACTED] Authorization: Basic dXNlcjpwYXNzd29yZA== Proxy-Authorization: Digest secret",
+  });
+
+  assert.equal(containsSensitiveValue(input, []), true);
+  const redacted = redactSecrets(input);
+  assert.deepEqual(JSON.parse(redacted), {
+    message: "Cookie: [REDACTED] Authorization: [REDACTED] Proxy-Authorization: [REDACTED]",
+  });
+  assert.equal(containsSensitiveValue(redacted, []), false);
+});
+
 test("redactSecrets masks named credentials across JSON escape depths", () => {
   const payload = JSON.stringify({
     token: 'historical-secret "quoted" \\tail\nnext',

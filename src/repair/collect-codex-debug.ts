@@ -36,7 +36,7 @@ const DEFAULT_MAX_BYTES = 100 * 1024 * 1024;
 const SENSITIVE_FIELD_NAME = String.raw`(?=[A-Za-z_])[A-Za-z0-9_.-]*(?:token|api[_-]?key|secret|password|credential|private[_-]?key)[A-Za-z0-9_.-]*`;
 const SENSITIVE_HEADER_NAME = String.raw`(?:authorization|proxy-authorization|cookie|set-cookie)`;
 const SENSITIVE_HEADER_LINE_SOURCE = `^(\\s*(?:[<>*]\\s*)?${SENSITIVE_HEADER_NAME}\\s*:\\s*)([^\\r\\n]*)$`;
-const SENSITIVE_HEADER_TEXT_SOURCE = `(^|[^A-Za-z0-9_-])(${SENSITIVE_HEADER_NAME}\\s*:\\s*)([^\\r\\n]*)`;
+const SENSITIVE_HEADER_TEXT_SOURCE = `(^|[^A-Za-z0-9_-])(${SENSITIVE_HEADER_NAME}\\s*:\\s*)`;
 const JWT_PATTERN = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g;
 const BEARER_PATTERN = /\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/gi;
 const PRIVATE_KEY_BEGIN_PATTERN = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/;
@@ -68,6 +68,11 @@ type EncodedSensitiveHeaderMatch = {
   start: number;
   end: number;
   value: string;
+};
+
+type SensitiveHeaderValueRange = {
+  start: number;
+  end: number;
 };
 
 type ParsedEncodedJsonValue = {
@@ -277,11 +282,24 @@ function encodedSensitiveHeaderMatches(text: string): EncodedSensitiveHeaderMatc
 }
 
 function redactSensitiveHeaderText(value: string): string {
-  return value.replace(
-    new RegExp(SENSITIVE_HEADER_TEXT_SOURCE, "gim"),
-    (match, prefix: string, header: string, headerValue: string) =>
-      isRedactedHeaderTextValue(headerValue) ? match : `${prefix}${header}${REDACTED_VALUE}`,
-  );
+  let redacted = value;
+  for (const range of sensitiveHeaderValueRanges(value).reverse()) {
+    const headerValue = value.slice(range.start, range.end);
+    if (isRedactedHeaderTextValue(headerValue)) continue;
+    redacted = redacted.slice(0, range.start) + REDACTED_VALUE + redacted.slice(range.end);
+  }
+  return redacted;
+}
+
+function sensitiveHeaderValueRanges(value: string): SensitiveHeaderValueRange[] {
+  const headers = [...value.matchAll(new RegExp(SENSITIVE_HEADER_TEXT_SOURCE, "gim"))];
+  return headers.map((header, index) => {
+    const start = (header.index ?? 0) + header[0].length;
+    const nextHeaderStart = headers[index + 1]?.index ?? value.length;
+    const lineBreakOffset = value.slice(start).search(/[\r\n]/);
+    const lineEnd = lineBreakOffset === -1 ? value.length : start + lineBreakOffset;
+    return { start, end: Math.min(nextHeaderStart, lineEnd) };
+  });
 }
 
 function isRedactedHeaderTextValue(value: string): boolean {
