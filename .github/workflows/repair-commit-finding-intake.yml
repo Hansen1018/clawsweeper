@@ -29,12 +29,20 @@ on:
       report_repo:
         description: "Repository containing the ClawSweeper report"
         required: false
-        default: "openclaw/clawsweeper"
+        default: "openclaw/clawsweeper-state"
         type: string
       report_path:
         description: "Path to the ClawSweeper report"
         required: false
         default: ""
+        type: string
+      report_revision:
+        description: "Immutable commit SHA containing the ClawSweeper report"
+        required: true
+        type: string
+      report_sha256:
+        description: "SHA-256 of the exact ClawSweeper report bytes"
+        required: true
         type: string
       report_url:
         description: "Public report URL"
@@ -192,17 +200,23 @@ jobs:
           ENABLED: ${{ github.event.inputs.enabled || github.event.client_payload.enabled || vars.CLAWSWEEPER_COMMIT_FINDING_INTAKE_ENABLED || 'true' }}
           TARGET_REPO: ${{ github.event.inputs.target_repo || github.event.client_payload.target_repo || 'openclaw/openclaw' }}
           COMMIT_SHA: ${{ github.event.inputs.commit_sha || github.event.client_payload.commit_sha }}
-          REPORT_REPO: ${{ github.event.inputs.report_repo || github.event.client_payload.report_repo || 'openclaw/clawsweeper' }}
+          REPORT_REPO: ${{ github.event.inputs.report_repo || github.event.client_payload.report_repo || 'openclaw/clawsweeper-state' }}
           REPORT_PATH: ${{ github.event.inputs.report_path || github.event.client_payload.report_path }}
+          REPORT_REVISION: ${{ github.event.inputs.report_revision || github.event.client_payload.report_revision }}
+          REPORT_SHA256: ${{ github.event.inputs.report_sha256 || github.event.client_payload.report_sha256 }}
           REPORT_URL: ${{ github.event.inputs.report_url || github.event.client_payload.report_url }}
         run: |
           set -euo pipefail
+          : "${REPORT_REVISION:?report_revision is required}"
+          : "${REPORT_SHA256:?report_sha256 is required}"
           args=(
             prepare
             --enabled "$ENABLED"
             --target-repo "$TARGET_REPO"
             --commit-sha "$COMMIT_SHA"
             --report-repo "$REPORT_REPO"
+            --report-revision "$REPORT_REVISION"
+            --report-sha256 "$REPORT_SHA256"
           )
           if [ -n "${REPORT_PATH:-}" ]; then
             args+=(--report-path "$REPORT_PATH")
