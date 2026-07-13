@@ -7,7 +7,7 @@ import test from "node:test";
 import { pathToFileURL } from "node:url";
 
 import { actionLedgerJson } from "../dist/action-ledger.js";
-import { readMutationRecoveries } from "../dist/action-ledger-recovery.js";
+import { readMutationRecoveries, writeMutationRecovery } from "../dist/action-ledger-recovery.js";
 
 test("mutation recovery writers sync content and its directory around the atomic rename", async () => {
   const result = await runInstrumentedWriter("success");
@@ -110,6 +110,53 @@ test("mutation recovery writers skip unsupported directory synchronization on Wi
     "rename",
     "cleanup:temporary",
   ]);
+});
+
+test("mutation recovery writers reject oversized payloads before replacing durable state", () => {
+  const root = fs.realpathSync(
+    fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-recovery-size-")),
+  );
+  const key = "e".repeat(64);
+
+  try {
+    writeMutationRecovery(root, "repair", key, { state: "pending" });
+    assert.throws(
+      () =>
+        writeMutationRecovery(root, "repair", key, {
+          state: "x".repeat(300 * 1024),
+        }),
+      /mutation recovery exceeds 262144 bytes/,
+    );
+    assert.deepEqual(
+      readMutationRecoveries(root, "repair").map((record) => record.payload),
+      [{ state: "pending" }],
+    );
+  } finally {
+    fs.rmSync(root, { force: true, recursive: true });
+  }
+});
+
+test("mutation recovery writers reject symlinked root ancestors before creating state", () => {
+  const root = fs.realpathSync(
+    fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-recovery-root-link-")),
+  );
+  const outside = path.join(root, "outside");
+  const linked = path.join(root, "linked");
+  fs.mkdirSync(outside);
+  fs.symlinkSync(outside, linked, process.platform === "win32" ? "junction" : "dir");
+
+  try {
+    assert.throws(
+      () =>
+        writeMutationRecovery(path.join(linked, "state"), "repair", "f".repeat(64), {
+          state: "pending",
+        }),
+      /refusing (?:symbolic link or junction|link-resolved).*mutation recovery root ancestor/,
+    );
+    assert.equal(fs.existsSync(path.join(outside, "state")), false);
+  } finally {
+    fs.rmSync(root, { force: true, recursive: true });
+  }
 });
 
 test("mutation recovery readers preserve a live writer staging file", async () => {

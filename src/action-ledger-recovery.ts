@@ -5,7 +5,6 @@ import {
   lstatSync,
   mkdirSync,
   openSync,
-  readFileSync,
   readdirSync,
   renameSync,
   rmdirSync,
@@ -17,8 +16,12 @@ import path from "node:path";
 
 import {
   fsyncDirectory,
+  prepareSafeReadRoot,
+  prepareSafeReadTarget,
   processIncarnationIdentitySha256,
   processIsDefunct,
+  readDirectoryEntriesNoFollow,
+  readUtf8FileNoFollow,
 } from "./action-ledger-files.js";
 import { actionLedgerJson } from "./action-ledger.js";
 
@@ -105,10 +108,14 @@ export function writeMutationRecovery<T>(
     key,
     payload,
   };
+  const content = `${actionLedgerJson(envelope)}\n`;
+  if (Buffer.byteLength(content, "utf8") > MUTATION_RECOVERY_MAX_BYTES) {
+    throw new Error(`mutation recovery exceeds ${MUTATION_RECOVERY_MAX_BYTES} bytes`);
+  }
   try {
     const temporaryDescriptor = openSync(temporary, "wx", 0o600);
     try {
-      writeFileSync(temporaryDescriptor, `${actionLedgerJson(envelope)}\n`, {
+      writeFileSync(temporaryDescriptor, content, {
         encoding: "utf8",
       });
       fsyncSync(temporaryDescriptor);
@@ -127,14 +134,22 @@ export function readMutationRecoveries<T>(
   family: string,
 ): MutationRecoveryRecord<T>[] {
   assertMutationRecoveryFamily(family);
-  const directory = mutationRecoveryDirectory(recoveryRoot, family);
+  const root = path.resolve(recoveryRoot);
+  const directory = mutationRecoveryDirectory(root, family);
   if (!existsSync(directory)) return [];
-  assertDirectory(recoveryRoot);
-  assertDirectory(path.join(recoveryRoot, ".mutation-recovery"));
-  assertDirectory(directory);
-  const entries = readdirSync(directory, { withFileTypes: true });
-  if (entries.length > MUTATION_RECOVERY_MAX_FILES) {
-    throw new Error(`mutation recovery exceeds ${MUTATION_RECOVERY_MAX_FILES} file limit`);
+  const safeRoot = prepareSafeReadRoot(root, "mutation recovery");
+  const relativeDirectory = path.join(".mutation-recovery", family);
+  let entries: ReturnType<typeof readDirectoryEntriesNoFollow>;
+  try {
+    entries = readDirectoryEntriesNoFollow(
+      safeRoot,
+      relativeDirectory,
+      "mutation recovery",
+      MUTATION_RECOVERY_MAX_FILES,
+    );
+  } catch (error) {
+    if (isNotFoundError(error)) return [];
+    throw error;
   }
   const records: MutationRecoveryRecord<T>[] = [];
   for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
@@ -162,8 +177,14 @@ export function readMutationRecoveries<T>(
     }
     const key = entry.name.slice(0, -".json".length);
     assertMutationRecoveryIdentity(family, key);
-    assertRecoveryFile(filePath, entry.name);
-    const content = readFileSync(filePath, "utf8");
+    const content = readUtf8FileNoFollow(
+      prepareSafeReadTarget(
+        safeRoot,
+        path.join(relativeDirectory, entry.name),
+        "mutation recovery",
+      ),
+      MUTATION_RECOVERY_MAX_BYTES,
+    );
     let parsed: unknown;
     try {
       parsed = JSON.parse(content);
@@ -209,13 +230,30 @@ function mutationRecoveryDirectory(recoveryRoot: string, family: string): string
 
 function prepareMutationRecoveryDirectory(recoveryRoot: string, family: string): string {
   const root = path.resolve(recoveryRoot);
-  mkdirSync(root, { recursive: true, mode: 0o700 });
-  assertDirectory(root);
+  prepareMutationRecoveryRoot(root);
   const parent = path.join(root, ".mutation-recovery");
   ensureMutationRecoveryDirectory(root, parent);
   const directory = mutationRecoveryDirectory(root, family);
   ensureMutationRecoveryDirectory(parent, directory);
   return directory;
+}
+
+function prepareMutationRecoveryRoot(root: string): void {
+  const missing: string[] = [];
+  let ancestor = root;
+  while (!existsSync(ancestor)) {
+    missing.push(ancestor);
+    const parent = path.dirname(ancestor);
+    if (parent === ancestor) throw new Error(`mutation recovery root is unavailable: ${root}`);
+    ancestor = parent;
+  }
+  prepareSafeReadRoot(ancestor, "mutation recovery root ancestor");
+  for (const directory of missing.reverse()) {
+    mkdirSync(directory, { mode: 0o700 });
+    assertDirectory(directory);
+    fsyncDirectory(path.dirname(directory), "mutation recovery root");
+  }
+  prepareSafeReadRoot(root, "mutation recovery");
 }
 
 function ensureMutationRecoveryDirectory(parent: string, directory: string): void {
@@ -244,6 +282,12 @@ function assertMutationRecoveryFamily(family: string): void {
 function isAlreadyExistsError(error: unknown): boolean {
   return (
     error instanceof Error && "code" in error && (error as NodeJS.ErrnoException).code === "EEXIST"
+  );
+}
+
+function isNotFoundError(error: unknown): boolean {
+  return (
+    error instanceof Error && "code" in error && (error as NodeJS.ErrnoException).code === "ENOENT"
   );
 }
 
