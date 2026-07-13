@@ -27,7 +27,7 @@ test("report-only repair requeues forward a stable dispatch receipt and publish 
   );
   const receiptIndex = source.indexOf("recordCommandRequeue(requeueLifecycle", dispatchIndex);
   const finalizeStart = workflow.indexOf("- name: Finalize report command action ledger");
-  const publishStart = workflow.indexOf("- name: Publish immutable report command action ledger");
+  const publishStart = workflow.indexOf("- name: Publish immutable report action ledgers");
   const mutateStart = workflow.indexOf("\n  mutate:", publishStart);
   const finalizeStep = workflow.slice(finalizeStart, publishStart);
   const publishStep = workflow.slice(publishStart, mutateStart);
@@ -57,13 +57,20 @@ test("report-only repair requeues forward a stable dispatch receipt and publish 
   );
   assert.match(
     publishStep,
-    /if: \$\{\{ always\(\) && steps\.report-setup-pnpm\.outcome == 'success' && steps\.repair_requeue\.outputs\.count != '' && steps\.repair_requeue\.outputs\.count != '0' \}\}/,
+    /if: \$\{\{ always\(\) && steps\.report-setup-pnpm\.outcome == 'success' && \(steps\.publish_terminal_status\.outcome != 'skipped' \|\| \(steps\.repair_requeue\.outputs\.count != '' && steps\.repair_requeue\.outputs\.count != '0'\)\) \}\}/,
   );
   assertCommandFinalizerUsesCanonicalRoot(finalizeStep);
-  assertCommandPublisherUsesCanonicalRoot(publishStep);
   assert.match(finalizeStep, /--lane report-requeue/);
-  assert.match(publishStep, /--lane report-requeue/);
-  assert.match(publishStep, /--message "chore: append report command action ledger"/);
+  assert.match(
+    publishStep,
+    /source_root="\$\{CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:\?setup-action-ledger output root is required\}"/,
+  );
+  assert.match(publishStep, /publish_manifest\(\)/);
+  assert.match(publishStep, /lane_args\+=\(--lane "\$lane"\)/);
+  assert.match(publishStep, /--manifest "\$manifest_file"/);
+  assert.match(publishStep, /--source-root "\$source_root"/);
+  assert.match(publishStep, /command \\\n\s+report-requeue/);
+  assert.match(publishStep, /--message "chore: append report action ledgers"/);
   assert.match(
     workflow,
     /--source-job-path "\$\{\{ needs\.authorize\.outputs\.source_job_path \}\}"/,
