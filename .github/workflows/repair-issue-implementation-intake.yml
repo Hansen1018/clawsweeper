@@ -213,6 +213,7 @@ jobs:
             --message "chore: record issue implementation intake" \
             --path jobs \
             --path results \
+            --receipt-kind issue_implementation_intake_state \
             --max-attempts 12 \
             --push-attempts 4
 

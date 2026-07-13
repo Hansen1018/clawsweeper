@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { publishMainCommit, type RebaseStrategy } from "./git-publish.js";
+import { runRepairMutation } from "./repair-action-ledger.js";
 
 type Args = {
   message: string;
@@ -8,17 +9,45 @@ type Args = {
   maxAttempts?: number;
   pushAttempts?: number;
   rebaseStrategy?: RebaseStrategy;
+  receiptKind?: string;
 };
 
 const args = parseArgs(process.argv.slice(2));
-publishMainCommit({
+const publishOptions = {
   message: args.message,
   paths: args.paths,
   restorePaths: args.restorePaths,
   maxAttempts: args.maxAttempts,
   pushAttempts: args.pushAttempts,
   rebaseStrategy: args.rebaseStrategy,
-});
+};
+if (args.receiptKind) {
+  const repository = String(process.env.GITHUB_REPOSITORY ?? "openclaw/clawsweeper");
+  runRepairMutation(
+    {
+      repository,
+      workKey: `state-publication:${args.receiptKind}`,
+      sourceRevision: String(process.env.GITHUB_SHA ?? ""),
+      recordPath: args.paths[0] ?? null,
+      subjectKind: "workflow",
+    },
+    {
+      kind: args.receiptKind,
+      operationName: "state_publication",
+      component: "publish_main",
+      identity: {
+        message: args.message,
+        paths: [...args.paths].sort(),
+        restorePaths: [...args.restorePaths].sort(),
+        rebaseStrategy: args.rebaseStrategy ?? "normal",
+      },
+      operation: () => publishMainCommit(publishOptions),
+      outcome: (result) => (result === "committed" ? "accepted" : "rejected"),
+    },
+  );
+} else {
+  publishMainCommit(publishOptions);
+}
 
 function parseArgs(argv: readonly string[]): Args {
   const parsed: Args = { message: "", paths: [], restorePaths: [] };
@@ -34,11 +63,20 @@ function parseArgs(argv: readonly string[]): Args {
       parsed.pushAttempts = parsePositiveInt(requiredValue(argv, ++index, arg), arg);
     else if (arg === "--rebase-strategy")
       parsed.rebaseStrategy = parseRebaseStrategy(requiredValue(argv, ++index, arg));
+    else if (arg === "--receipt-kind")
+      parsed.receiptKind = parseReceiptKind(requiredValue(argv, ++index, arg));
     else throw new Error(`Unknown argument: ${arg}`);
   }
   if (!parsed.message) throw new Error("--message is required");
   if (parsed.paths.length === 0) throw new Error("At least one --path is required");
   return parsed;
+}
+
+function parseReceiptKind(value: string): string {
+  if (!/^[a-z0-9][a-z0-9._-]{0,127}$/.test(value)) {
+    throw new Error("--receipt-kind must be a bounded machine identifier");
+  }
+  return value;
 }
 
 function requiredValue(argv: readonly string[], index: number, flag: string): string {

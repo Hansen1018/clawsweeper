@@ -77,10 +77,10 @@ async function runPublishResult() {
     }
 
     writeAggregateApplyReport();
-    recordAggregatePublication("apply_report");
+    recordAggregatePreparation("apply_report");
     if (args["write-dashboard"]) {
       updateDashboard();
-      recordAggregatePublication("repair_dashboard");
+      recordAggregatePreparation("repair_dashboard");
     }
 
     console.log(JSON.stringify({ published: published.length, records: published }, null, 2));
@@ -220,19 +220,19 @@ function publishResult(resultPath: string) {
       recordPath: path.posix.join("results", owner, `${slug(clusterId)}.md`),
     },
     {
-      type: ACTION_EVENT_TYPES.repairPublish,
+      type: ACTION_EVENT_TYPES.publicationLifecycle,
       status: ACTION_EVENT_STATUSES.completed,
-      reasonCode: ACTION_EVENT_REASON_CODES.published,
-      mutation: true,
+      reasonCode: ACTION_EVENT_REASON_CODES.completed,
+      mutation: false,
       component: "publish_result",
       operation: "publication",
-      state: "published",
+      state: "prepared",
       publicationKind: "cluster_result",
       eventIdentity: {
         publicationKind: "cluster_result",
         runId: runId || clusterId,
+        state: "prepared",
       },
-      idempotencySlot: `cluster_result:${runId || clusterId}`,
     },
   );
 
@@ -513,20 +513,24 @@ function writeAggregateApplyReport() {
   );
 }
 
-function recordAggregatePublication(publicationKind: string) {
+function recordAggregatePreparation(publicationKind: string) {
   recordRepairLifecycleEvent(aggregateLifecycle(publicationKind), {
     type:
       publicationKind === "repair_dashboard"
         ? ACTION_EVENT_TYPES.dashboardLifecycle
         : ACTION_EVENT_TYPES.publicationLifecycle,
     status: ACTION_EVENT_STATUSES.completed,
-    reasonCode: ACTION_EVENT_REASON_CODES.published,
-    mutation: true,
+    reasonCode: ACTION_EVENT_REASON_CODES.completed,
+    mutation: false,
     component: "publish_result",
     operation: "publication",
-    state: "published",
+    state: "prepared",
     publicationKind,
-    idempotencySlot: `${publicationKind}:${String(args["run-id"] ?? "latest")}`,
+    eventIdentity: {
+      publicationKind,
+      runId: String(args["run-id"] ?? "latest"),
+      state: "prepared",
+    },
   });
 }
 

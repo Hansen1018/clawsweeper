@@ -4,7 +4,7 @@ import {
   ACTION_EVENT_TYPES,
 } from "../action-ledger.js";
 import {
-  recordRepairArtifactPublication,
+  recordRepairArtifactPrepared,
   recordRepairLifecycleEvent,
   type RepairLifecycleInput,
 } from "./repair-action-ledger.js";
@@ -176,11 +176,10 @@ function publishArtifactsSafely(
   for (const [kind, artifactPath] of Object.entries(options.paths)) {
     if (!artifactPath) continue;
     try {
-      recordRepairArtifactPublication(input, {
+      recordRepairArtifactPrepared(input, {
         path: artifactPath,
         kind: `${options.action}_${kind}`,
         component: "execute_fix_codex",
-        ...(kind === "report" ? { type: ACTION_EVENT_TYPES.reviewPublished } : {}),
         reviewMode: options.action,
       });
     } catch (receiptError) {

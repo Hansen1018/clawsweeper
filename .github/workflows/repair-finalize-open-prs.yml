@@ -105,6 +105,7 @@ jobs:
             --message "chore: record open PR finalizer" \
             --path repair-apply-report.json \
             --path results/finalize-open-prs.json \
+            --receipt-kind open_pr_finalizer_state \
             --path results/finalize-open-prs.md \
             --path results/finalize-open-prs-dispatch.json \
             --rebase-strategy theirs

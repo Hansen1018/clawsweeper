@@ -405,13 +405,12 @@ export async function runRepairMutationAsync<T>(
   return result;
 }
 
-export function recordRepairArtifactPublication(
+export function recordRepairArtifactPrepared(
   input: RepairLifecycleInput,
   options: {
     path: string;
     kind: string;
     component: string;
-    type?: string;
     reviewMode?: string;
   },
 ): void {
@@ -419,15 +418,15 @@ export function recordRepairArtifactPublication(
   const sha256 = createHash("sha256").update(fs.readFileSync(options.path)).digest("hex");
   const kind = machineText(options.kind, "artifact");
   recordRepairLifecycleEvent(input, {
-    type: options.type ?? ACTION_EVENT_TYPES.reviewLogPublication,
-    status: ACTION_EVENT_STATUSES.published,
-    reasonCode: ACTION_EVENT_REASON_CODES.published,
+    type: ACTION_EVENT_TYPES.reviewLogPublication,
+    status: ACTION_EVENT_STATUSES.completed,
+    reasonCode: ACTION_EVENT_REASON_CODES.completed,
     mutation: false,
     component: options.component,
-    state: "published",
+    state: "prepared",
     publicationKind: kind,
     ...(options.reviewMode ? { reviewMode: options.reviewMode } : {}),
-    eventIdentity: { kind, sha256 },
+    eventIdentity: { kind, sha256, state: "prepared" },
     evidence: [{ kind, sha256 }],
   });
 }

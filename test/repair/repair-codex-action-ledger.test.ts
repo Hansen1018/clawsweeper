@@ -53,12 +53,19 @@ test("typed final repair Codex attempts publish lifecycle and artifact digests",
         ACTION_EVENT_TYPES.reviewStarted,
         ACTION_EVENT_TYPES.reviewLogPublication,
         ACTION_EVENT_TYPES.reviewLogPublication,
-        ACTION_EVENT_TYPES.reviewPublished,
+        ACTION_EVENT_TYPES.reviewLogPublication,
         ACTION_EVENT_TYPES.reviewCompleted,
       ],
     );
     assert.equal(events.filter((event) => event.evidence?.[0]?.sha256).length, 3);
     assert.ok(events.every((event) => event.attributes?.review_mode === "repair_review_fix"));
+    assert.ok(
+      events
+        .filter((event) => event.event_type === ACTION_EVENT_TYPES.reviewLogPublication)
+        .every(
+          (event) => event.action.status === "completed" && event.attributes?.state === "prepared",
+        ),
+    );
   } finally {
     restoreEnv(previous);
     fs.rmSync(root, { force: true, recursive: true });

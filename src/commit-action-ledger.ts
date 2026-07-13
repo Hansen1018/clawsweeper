@@ -178,27 +178,26 @@ export function recordCommitWorkflowEvent(
   });
 }
 
-export function recordCommitArtifact(
+export function recordCommitArtifactPrepared(
   input: CommitLifecycleInput,
   options: {
     path: string;
     kind: string;
-    type?: string;
     logKind?: string;
   },
 ): void {
   if (!existsSync(options.path) || !statSync(options.path).isFile()) return;
   const sha256 = createHash("sha256").update(readFileSync(options.path)).digest("hex");
   recordCommitLifecycleEvent(input, {
-    type: options.type ?? ACTION_EVENT_TYPES.reviewLogPublication,
-    status: ACTION_EVENT_STATUSES.published,
-    reasonCode: ACTION_EVENT_REASON_CODES.published,
+    type: ACTION_EVENT_TYPES.reviewLogPublication,
+    status: ACTION_EVENT_STATUSES.completed,
+    reasonCode: ACTION_EVENT_REASON_CODES.completed,
     mutation: false,
     component: "commit_review",
-    state: "published",
+    state: "prepared",
     publicationKind: options.kind,
     ...(options.logKind ? { logKind: options.logKind } : {}),
-    eventIdentity: { kind: options.kind, sha256 },
+    eventIdentity: { kind: options.kind, sha256, state: "prepared" },
     evidence: [{ kind: options.kind, sha256 }],
   });
 }

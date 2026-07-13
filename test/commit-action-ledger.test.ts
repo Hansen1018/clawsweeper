@@ -13,6 +13,7 @@ import {
 import {
   commitReviewLifecycleSucceeded,
   flushCommitActionEvents,
+  recordCommitArtifactPrepared,
   recordCommitWorkflowEvent,
   runCommitMutation,
 } from "../dist/commit-action-ledger.js";
@@ -68,6 +69,33 @@ test("commit review terminal success requires requested check publication", () =
     }),
     true,
   );
+});
+
+test("commit review artifacts are prepared locally before external publication", async () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "commit-artifact-ledger-")));
+  const outputRoot = path.join(root, "output");
+  const artifactPath = path.join(root, "review.md");
+  fs.mkdirSync(outputRoot);
+  fs.writeFileSync(artifactPath, "review\n");
+  const previous = { ...process.env };
+  Object.assign(process.env, workflowEnv(root, outputRoot));
+
+  try {
+    recordCommitArtifactPrepared(
+      { repository: "openclaw/openclaw", sha: "b".repeat(40) },
+      { path: artifactPath, kind: "commit_review_report" },
+    );
+    await flushCommitActionEvents();
+
+    const [event] = readEvents(outputRoot);
+    assert.equal(event?.event_type, ACTION_EVENT_TYPES.reviewLogPublication);
+    assert.equal(event?.action.status, "completed");
+    assert.equal(event?.attributes?.state, "prepared");
+    assert.equal(event?.attributes?.publication_kind, "commit_review_report");
+  } finally {
+    restoreEnv(previous);
+    fs.rmSync(root, { force: true, recursive: true });
+  }
 });
 
 test("failed commit review reports cannot complete the workflow lifecycle", async () => {

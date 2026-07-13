@@ -231,6 +231,7 @@ jobs:
             --path jobs \
             --path results \
             --restore repair-apply-report.json \
+            --receipt-kind commit_finding_intake_state \
             --max-attempts 12 \
             --push-attempts 4
 

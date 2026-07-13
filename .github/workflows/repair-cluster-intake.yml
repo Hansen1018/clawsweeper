@@ -267,6 +267,7 @@ jobs:
             --message "chore: record cluster repair intake" \
             --path jobs \
             --path results/cluster-repair-intake \
+            --receipt-kind cluster_intake_state \
             --max-attempts 12 \
             --push-attempts 4
 

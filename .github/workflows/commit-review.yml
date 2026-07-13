@@ -598,6 +598,7 @@ jobs:
           pnpm run repair:publish-main -- \
             --message "chore: update commit review reports" \
             --path records \
+            --receipt-kind commit_review_state \
             --rebase-strategy theirs
 
       - name: Create repair dispatch token

@@ -31,7 +31,7 @@ import {
 } from "./repository-profiles.js";
 import {
   commitReviewLifecycleSucceeded,
-  recordCommitArtifact,
+  recordCommitArtifactPrepared,
   recordCommitLifecycleEvent,
   recordCommitWorkflowEvent,
   runCommitMutation,
@@ -376,12 +376,12 @@ function runCodex(options: {
   });
   writeFileSync(stdoutPath, result.stdout ?? "", "utf8");
   writeFileSync(stderrPath, result.stderr ?? "", "utf8");
-  recordCommitArtifact(lifecycle, {
+  recordCommitArtifactPrepared(lifecycle, {
     path: stdoutPath,
     kind: "commit_review_jsonl",
     logKind: "jsonl",
   });
-  recordCommitArtifact(lifecycle, {
+  recordCommitArtifactPrepared(lifecycle, {
     path: stderrPath,
     kind: "commit_review_stderr",
     logKind: "stderr",
@@ -416,10 +416,9 @@ function runCodex(options: {
       timeout,
     });
   }
-  recordCommitArtifact(lifecycle, {
+  recordCommitArtifactPrepared(lifecycle, {
     path: outputPath,
     kind: "commit_review_raw_report",
-    type: ACTION_EVENT_TYPES.reviewPublished,
   });
   recordCommitLifecycleEvent(lifecycle, {
     type: ACTION_EVENT_TYPES.reviewCompleted,
@@ -475,10 +474,9 @@ function reviewCommand(args: Args): void {
     );
     ensureDir(dirname(outputPath));
     writeFileSync(outputPath, markdown.endsWith("\n") ? markdown : `${markdown}\n`, "utf8");
-    recordCommitArtifact(lifecycle, {
+    recordCommitArtifactPrepared(lifecycle, {
       path: outputPath,
       kind: "commit_review_report",
-      type: ACTION_EVENT_TYPES.reviewPublished,
     });
     if (!deferWorkflowCompletion) {
       recordCommitWorkflowEvent(lifecycle, "completed");

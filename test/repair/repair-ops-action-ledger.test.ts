@@ -43,7 +43,10 @@ test("repair sessions, statuses, and result publication flush immutable receipts
   assert.match(status, /recordRepairLifecycleFailureSafely/);
 
   const resultWrite = publisher.indexOf("writeClosedRecord");
-  const resultReceipt = publisher.indexOf("type: ACTION_EVENT_TYPES.repairPublish", resultWrite);
+  const resultReceipt = publisher.indexOf(
+    "type: ACTION_EVENT_TYPES.publicationLifecycle",
+    resultWrite,
+  );
   assert.ok(resultWrite >= 0);
   assert.ok(resultReceipt > resultWrite);
   assert.match(publisher, /ACTION_EVENT_TYPES\.publicationLifecycle/);
@@ -56,9 +59,11 @@ test("repair sessions, statuses, and result publication flush immutable receipts
   );
   assert.match(
     publisher,
-    /eventIdentity:\s*\{\s*publicationKind: "cluster_result",\s*runId: runId \|\| clusterId/,
+    /eventIdentity:\s*\{\s*publicationKind: "cluster_result",\s*runId: runId \|\| clusterId,\s*state: "prepared"/,
   );
-  assert.doesNotMatch(publisher, /recordAggregatePublication\([^)]*,/);
+  assert.match(publisher, /state: "prepared"/);
+  assert.doesNotMatch(publisher, /state: "published"/);
+  assert.doesNotMatch(publisher, /recordAggregatePreparation\([^)]*,/);
 });
 
 test("repair worker jobs upload shards and one credentialed job publishes them", () => {
@@ -358,6 +363,7 @@ test("issue implementation intake finalizes and publishes source-bound status re
   );
   assert.match(workflow, /jq -r '\.paths\[\]\?'/);
   assert.match(workflow, /append issue implementation intake action ledger/);
+  assert.match(workflow, /--receipt-kind issue_implementation_intake_state/);
   assert.ok(
     workflow.indexOf("Dispatch repair worker") <
       workflow.indexOf("Finalize issue implementation intake action ledger"),
@@ -403,6 +409,7 @@ test("commit finding and cluster intake publish their dispatch receipts", () => 
     assert.match(workflow, /\.eventPaths == \$manifest\[0\]\.event_paths/);
     assert.match(workflow, /jq -r '\.paths\[\]\?'/);
     assert.match(workflow, new RegExp(`append ${expected.label} action ledger`));
+    assert.match(workflow, /--receipt-kind [a-z0-9_]+_state/);
     assert.ok(
       workflow.indexOf(expected.dispatch) <
         workflow.indexOf(`Finalize ${expected.label} action ledger`),
@@ -424,6 +431,7 @@ test("result and finalizer workflows publish their repair operation receipts", (
     assert.match(workflow, /steps\.setup-pnpm\.outcome == 'success'/);
   }
   assert.match(results, /append repair publication action ledger/);
+  assert.match(results, /--receipt-kind repair_result_state/);
   assert.match(
     results,
     /steps\.download\.outputs\.has_artifacts[\s\S]*allow_empty_args\+=\(--allow-empty\)[\s\S]*--repair-lane repair-publication/,
@@ -436,6 +444,7 @@ test("result and finalizer workflows publish their repair operation receipts", (
   assert.match(results, /CLAWSWEEPER_ACTION_LEDGER_INVOCATION=open-pr-finalizer/);
   assert.match(results, /CLAWSWEEPER_ACTION_LEDGER_INVOCATION=finalizer-results/);
   assert.match(finalizer, /append repair finalizer action ledger/);
+  assert.match(finalizer, /--receipt-kind open_pr_finalizer_state/);
   const finalizerSource = readText("src/repair/finalize-open-prs.ts");
   assert.match(finalizerSource, /runRepairMutation\(finalizerDispatchLifecycle\(candidate\)/);
   assert.match(finalizerSource, /operationName: "open_pr_finalizer"/);
@@ -475,6 +484,7 @@ test("repair and commit publishers require canonical exact manifests", () => {
   assert.match(collector, /expectedEventPaths: manifest\.event_paths/);
   assert.match(collector, /publication requires --repair-lane and --manifest/);
   const commit = readText(".github/workflows/commit-review.yml");
+  assert.match(commit, /--receipt-kind commit_review_state/);
   assert.match(commit, /pattern: action-ledger-commit-review-\*-\$\{\{ github\.run_attempt \}\}/);
   assert.match(commit, /EXPECTED_COMMIT_MATRIX:/);
   assert.match(commit, /cmp -s "\$expected_shas_file" "\$actual_shas_file"/);

@@ -204,6 +204,7 @@ jobs:
             --path jobs/openclaw/closed \
             --path repair-apply-report.json \
             --path notifications \
+            --receipt-kind repair_result_state \
             --max-attempts 12 \
             --push-attempts 4
 

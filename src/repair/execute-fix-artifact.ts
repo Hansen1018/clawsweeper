@@ -77,7 +77,7 @@ import {
   COMMIT_FINDING_LABEL_DESCRIPTION,
 } from "./constants.js";
 import {
-  recordRepairArtifactPublication,
+  recordRepairArtifactPrepared,
   recordRepairWorkflowEvent,
   repairSourceRevision,
   repairWorkflowTerminalPhase,
@@ -4347,11 +4347,10 @@ function writeReport(report: LooseRecord, resultPath: string) {
     serialize: () => `${JSON.stringify(report, null, 2)}\n`,
     publish: () => publishReportOutcome(report, resultPath),
   });
-  recordRepairArtifactPublication(directRepairLifecycle(null), {
+  recordRepairArtifactPrepared(directRepairLifecycle(null), {
     path: reportPath,
     kind: "repair_execution_report",
     component: "execute_fix",
-    type: ACTION_EVENT_TYPES.reviewPublished,
     reviewMode: "repair_execution",
   });
   recordRepairWorkflowEventSafely(repairWorkflowTerminalPhase(report));
@@ -4372,11 +4371,10 @@ function publishPersistedReport(resultPath: string) {
     serialize: () => `${JSON.stringify(persistedReport, null, 2)}\n`,
     publish: () => publishReportOutcome(persistedReport, resultPath),
   });
-  recordRepairArtifactPublication(directRepairLifecycle(null), {
+  recordRepairArtifactPrepared(directRepairLifecycle(null), {
     path: reportPath,
     kind: "repair_execution_report",
     component: "execute_fix",
-    type: ACTION_EVENT_TYPES.reviewPublished,
     reviewMode: "repair_execution",
   });
   recordRepairWorkflowEventSafely(repairWorkflowTerminalPhase(persistedReport));
