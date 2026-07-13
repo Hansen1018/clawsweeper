@@ -166,6 +166,97 @@ test("failed-run self-heal preserves a durable gate-downgraded effective mode", 
   }
 });
 
+test("failed-run self-heal recovers an early gate downgrade before worker results exist", () => {
+  const fixture = createSelfHealFixture("early-downgrade", "autonomous");
+  try {
+    writeRunRecord(fixture.runsDir, fixture.runId, {
+      source_job: fixture.jobPath,
+    });
+    writeWorkflowInputs(fixture.artifactFixture, fixture.runId, 1, {
+      sourceJob: fixture.jobPath,
+      stateRevision: fixture.originalRevision,
+      jobSha256: fixture.originalDigest,
+      requestedMode: "autonomous",
+      effectiveMode: "plan",
+    });
+
+    const summary = runSelfHeal(fixture);
+    assert.equal(summary.candidates.length, 1);
+    assert.equal(summary.candidates[0].source_state_revision, fixture.originalRevision);
+    assert.equal(summary.candidates[0].source_job_sha256, fixture.originalDigest);
+    assert.equal(summary.candidates[0].mode, "plan");
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("failed-run self-heal prefers the newest replay-safe input receipt", () => {
+  const fixture = createSelfHealFixture("latest-inputs", "autonomous");
+  try {
+    writeRunRecord(fixture.runsDir, fixture.runId, {
+      source_job: fixture.jobPath,
+      source_state_revision: fixture.originalRevision,
+      source_job_sha256: fixture.originalDigest,
+      mode: "autonomous",
+    });
+    writeWorkflowInputs(fixture.artifactFixture, fixture.runId, 2, {
+      sourceJob: fixture.jobPath,
+      stateRevision: fixture.originalRevision,
+      jobSha256: fixture.originalDigest,
+      requestedMode: "autonomous",
+      effectiveMode: "plan",
+    });
+    writeLiveRunList(fixture, [
+      {
+        databaseId: Number(fixture.runId),
+        workflowName: "repair cluster worker",
+        displayTitle: `repair cluster ${fixture.jobPath} (${fixture.originalDigest})`,
+        status: "completed",
+        conclusion: "failure",
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        url: `https://github.test/actions/runs/${fixture.runId}`,
+      },
+    ]);
+
+    const summary = runSelfHeal(fixture);
+    assert.equal(summary.candidates.length, 1);
+    assert.equal(summary.candidates[0].mode, "plan");
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("failed-run self-heal rejects conflicting input and result provenance", () => {
+  const fixture = createSelfHealFixture("conflicting-inputs", "autonomous");
+  try {
+    writeRunRecord(fixture.runsDir, fixture.runId, {
+      source_job: fixture.jobPath,
+    });
+    writeWorkflowInputs(fixture.artifactFixture, fixture.runId, 1, {
+      sourceJob: fixture.jobPath,
+      stateRevision: fixture.originalRevision,
+      jobSha256: fixture.originalDigest,
+      requestedMode: "autonomous",
+      effectiveMode: "plan",
+    });
+    writeArtifactCohort(fixture.artifactFixture, fixture.runId, 1, {
+      sourceJob: fixture.jobPath,
+      stateRevision: fixture.originalRevision,
+      jobSha256: fixture.originalDigest,
+      mode: "autonomous",
+    });
+
+    const summary = runSelfHeal(fixture);
+    assert.equal(summary.candidates.length, 0);
+    assert.equal(summary.skipped_candidates.length, 1);
+    assert.equal(summary.skipped_candidates[0].reason, "immutable_provenance_unavailable");
+    assert.match(summary.skipped_candidates[0].detail, /ambiguous repair artifact cohort/);
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
 test("failed-run self-heal recovers a missing effective mode from the sealed artifact cohort", () => {
   const fixture = createSelfHealFixture("artifact-mode", "autonomous");
   try {
@@ -315,11 +406,33 @@ test("legacy self-heal records reject identity and plan split across attempts", 
     assert.equal(summary.skipped_candidates[0].reason, "immutable_provenance_unavailable");
     assert.match(
       summary.skipped_candidates[0].detail,
-      /did not publish one complete sealed repair artifact cohort/,
+      /did not publish immutable workflow inputs or one complete sealed repair artifact cohort/,
     );
   } finally {
     fs.rmSync(fixture.root, { recursive: true, force: true });
   }
+});
+
+test("repair workflow uploads immutable inputs before worker setup and reuses the persisted mode", () => {
+  const workflow = fs.readFileSync(".github/workflows/repair-cluster-worker.yml", "utf8");
+  const persistIndex = workflow.indexOf("- name: Persist immutable recovery inputs");
+  const uploadIndex = workflow.indexOf("- name: Upload immutable recovery inputs");
+  const tokenIndex = workflow.indexOf("- name: Create GitHub App token");
+  const setupIndex = workflow.indexOf("- uses: ./.github/actions/setup-pnpm");
+  assert.ok(persistIndex >= 0);
+  assert.ok(uploadIndex > persistIndex);
+  assert.ok(tokenIndex > uploadIndex);
+  assert.ok(setupIndex > uploadIndex);
+  assert.match(workflow, /requested_mode: process\.env\.REQUESTED_MODE/);
+  assert.match(workflow, /effective_mode: process\.env\.EFFECTIVE_MODE/);
+  assert.match(
+    workflow,
+    /name: clawsweeper-repair-inputs-\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}/,
+  );
+  assert.match(
+    workflow,
+    /worker_mode="\$\{\{ steps\.recovery_inputs\.outputs\.effective_mode \}\}"/,
+  );
 });
 
 function createSelfHealFixture(label: string, originalMode: "plan" | "autonomous" = "plan") {
@@ -332,6 +445,8 @@ function createSelfHealFixture(label: string, originalMode: "plan" | "autonomous
   fs.mkdirSync(runsDir, { recursive: true });
   fs.mkdirSync(artifactFixture, { recursive: true });
   fs.mkdirSync(binDir, { recursive: true });
+  const runListFixture = path.join(root, "run-list.json");
+  fs.writeFileSync(runListFixture, "[]\n");
   execFileSync("git", ["init", "-q"], { cwd: stateRoot });
   execFileSync("git", ["config", "user.name", "ClawSweeper Test"], { cwd: stateRoot });
   execFileSync("git", ["config", "user.email", "test@example.invalid"], { cwd: stateRoot });
@@ -347,6 +462,7 @@ function createSelfHealFixture(label: string, originalMode: "plan" | "autonomous
     runsDir,
     artifactFixture,
     binDir,
+    runListFixture,
     jobPath,
     originalRevision,
     originalDigest,
@@ -373,6 +489,7 @@ function runSelfHeal(fixture: ReturnType<typeof createSelfHealFixture>) {
         CLAWSWEEPER_REPO: "openclaw/clawsweeper",
         CLAWSWEEPER_STATE_DIR: fixture.stateRoot,
         GH_ARTIFACT_FIXTURE: fixture.artifactFixture,
+        GH_RUN_LIST_FIXTURE: fixture.runListFixture,
       },
     },
   );
@@ -404,6 +521,13 @@ function writeRunRecord(runsDir: string, runId: string, provenance: Record<strin
   );
 }
 
+function writeLiveRunList(
+  fixture: ReturnType<typeof createSelfHealFixture>,
+  runs: Record<string, unknown>[],
+): void {
+  fs.writeFileSync(fixture.runListFixture, `${JSON.stringify(runs)}\n`);
+}
+
 function writeArtifactCohort(
   root: string,
   runId: string,
@@ -419,6 +543,41 @@ function writeArtifactCohort(
   fs.mkdirSync(runDir, { recursive: true });
   writeSourceIdentity(runDir, input);
   writePlanAndResult(runDir, input.sourceJob, input.mode);
+}
+
+function writeWorkflowInputs(
+  root: string,
+  runId: string,
+  attempt: number,
+  input: {
+    sourceJob: string;
+    stateRevision: string;
+    jobSha256: string;
+    requestedMode: "plan" | "execute" | "autonomous";
+    effectiveMode: "plan" | "execute" | "autonomous";
+  },
+): void {
+  const inputDir = path.join(
+    root,
+    `clawsweeper-repair-inputs-${runId}-${attempt}`,
+    "recovery-inputs",
+  );
+  fs.mkdirSync(inputDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(inputDir, "workflow-inputs.json"),
+    `${JSON.stringify(
+      {
+        schema_version: 1,
+        source_job: input.sourceJob,
+        state_revision: input.stateRevision,
+        job_sha256: input.jobSha256,
+        requested_mode: input.requestedMode,
+        effective_mode: input.effectiveMode,
+      },
+      null,
+      2,
+    )}\n`,
+  );
 }
 
 function artifactRunDir(root: string, runId: string, attempt: number): string {
@@ -486,7 +645,7 @@ function writeFakeGh(binDir: string): void {
     `#!/bin/sh
 set -eu
 if [ "$1" = "run" ] && [ "$2" = "list" ]; then
-  printf '[]\\n'
+  cat "$GH_RUN_LIST_FIXTURE"
   exit 0
 fi
 if [ "$1" = "run" ] && [ "$2" = "download" ]; then

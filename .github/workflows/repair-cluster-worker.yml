@@ -171,6 +171,79 @@ jobs:
         with:
           filter: blob:none
 
+      - name: Validate immutable job handoff
+        id: immutable-job
+        env:
+          JOB_PATH: ${{ inputs.job }}
+          STATE_REVISION: ${{ inputs.state_revision }}
+          JOB_SHA256: ${{ inputs.job_sha256 }}
+        run: |
+          set -euo pipefail
+          if [ -z "$STATE_REVISION" ] || [ -z "$JOB_SHA256" ]; then
+            echo "state_revision and job_sha256 are required." >&2
+            exit 1
+          fi
+          if ! printf '%s' "$JOB_PATH" | grep -Eq '^jobs/[A-Za-z0-9_.-]+/inbox/[A-Za-z0-9_.-]+\.md$'; then
+            echo "Invalid immutable job path: $JOB_PATH" >&2
+            exit 1
+          fi
+          if ! printf '%s' "$STATE_REVISION" | grep -Eq '^[a-f0-9]{40}$'; then
+            echo "Invalid immutable state revision: $STATE_REVISION" >&2
+            exit 1
+          fi
+          if ! printf '%s' "$JOB_SHA256" | grep -Eq '^[a-f0-9]{64}$'; then
+            echo "Invalid immutable job SHA-256: $JOB_SHA256" >&2
+            exit 1
+          fi
+          echo "immutable=true" >> "$GITHUB_OUTPUT"
+
+      - name: Persist immutable recovery inputs
+        id: recovery_inputs
+        env:
+          JOB_PATH: ${{ inputs.job }}
+          STATE_REVISION: ${{ inputs.state_revision }}
+          JOB_SHA256: ${{ inputs.job_sha256 }}
+          REQUESTED_MODE: ${{ inputs.mode }}
+        run: |
+          set -euo pipefail
+          case "$REQUESTED_MODE" in
+            plan|execute|autonomous) ;;
+            *)
+              echo "Invalid requested repair mode: $REQUESTED_MODE" >&2
+              exit 1
+              ;;
+          esac
+          effective_mode="$REQUESTED_MODE"
+          if [ "$effective_mode" != "plan" ] && [ "${CLAWSWEEPER_ALLOW_EXECUTE}" != "1" ]; then
+            echo "CLAWSWEEPER_ALLOW_EXECUTE is not explicitly 1; persisting plan-only mode for requested $effective_mode run"
+            effective_mode="plan"
+          fi
+          mkdir -p .clawsweeper-repair/recovery-inputs
+          EFFECTIVE_MODE="$effective_mode" node <<'NODE'
+          const fs = require("node:fs");
+          const input = {
+            schema_version: 1,
+            source_job: process.env.JOB_PATH,
+            state_revision: process.env.STATE_REVISION,
+            job_sha256: process.env.JOB_SHA256,
+            requested_mode: process.env.REQUESTED_MODE,
+            effective_mode: process.env.EFFECTIVE_MODE,
+          };
+          fs.writeFileSync(
+            ".clawsweeper-repair/recovery-inputs/workflow-inputs.json",
+            `${JSON.stringify(input, null, 2)}\n`,
+          );
+          NODE
+          echo "effective_mode=$effective_mode" >> "$GITHUB_OUTPUT"
+
+      - name: Upload immutable recovery inputs
+        uses: actions/upload-artifact@v7
+        with:
+          name: clawsweeper-repair-inputs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .clawsweeper-repair/recovery-inputs/workflow-inputs.json
+          if-no-files-found: error
+          retention-days: 90
+
       - name: Resolve target owner
         id: target
         env:
@@ -216,32 +289,6 @@ jobs:
           fetch-depth: 1
           sparse-checkout: jobs
           persist-credentials: "false"
-
-      - name: Validate immutable job handoff
-        id: immutable-job
-        env:
-          JOB_PATH: ${{ inputs.job }}
-          STATE_REVISION: ${{ inputs.state_revision }}
-          JOB_SHA256: ${{ inputs.job_sha256 }}
-        run: |
-          set -euo pipefail
-          if [ -z "$STATE_REVISION" ] || [ -z "$JOB_SHA256" ]; then
-            echo "state_revision and job_sha256 are required." >&2
-            exit 1
-          fi
-          if ! printf '%s' "$JOB_PATH" | grep -Eq '^jobs/[A-Za-z0-9_.-]+/inbox/[A-Za-z0-9_.-]+\.md$'; then
-            echo "Invalid immutable job path: $JOB_PATH" >&2
-            exit 1
-          fi
-          if ! printf '%s' "$STATE_REVISION" | grep -Eq '^[a-f0-9]{40}$'; then
-            echo "Invalid immutable state revision: $STATE_REVISION" >&2
-            exit 1
-          fi
-          if ! printf '%s' "$JOB_SHA256" | grep -Eq '^[a-f0-9]{64}$'; then
-            echo "Invalid immutable job SHA-256: $JOB_SHA256" >&2
-            exit 1
-          fi
-          echo "immutable=true" >> "$GITHUB_OUTPUT"
 
       - name: Checkout immutable state job
         uses: actions/checkout@v7
@@ -390,10 +437,10 @@ jobs:
           CLAWSWEEPER_ALLOWED_OWNER: ${{ steps.target.outputs.target_owner }}
           CLAWSWEEPER_ACTION_LEDGER_INVOCATION: repair-worker-codex
         run: |
-          worker_mode="${{ inputs.mode }}"
-          if [ "$worker_mode" != "plan" ] && [ "${CLAWSWEEPER_ALLOW_EXECUTE}" != "1" ]; then
-            echo "CLAWSWEEPER_ALLOW_EXECUTE is not explicitly 1; rendering plan-only output for requested $worker_mode run"
-            worker_mode="plan"
+          worker_mode="${{ steps.recovery_inputs.outputs.effective_mode }}"
+          if [ -z "$worker_mode" ]; then
+            echo "Persisted effective repair mode is missing." >&2
+            exit 1
           fi
           args=("${{ inputs.job }}" --mode "$worker_mode")
           if [ "${{ inputs.dry_run }}" = "true" ]; then
