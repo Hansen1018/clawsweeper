@@ -39,6 +39,13 @@ const BEARER_PATTERN = /\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/gi;
 const PRIVATE_KEY_BEGIN_PATTERN = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/;
 const PRIVATE_KEY_PEM_PATTERN =
   /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)/g;
+const REDACTED_VALUE = "[REDACTED]";
+
+type StructuredSensitiveValueMatch = {
+  prefix: string;
+  value: string;
+  suffix: string;
+};
 
 export function collectCodexDebug(options: CollectOptions) {
   const codexHome = resolveCodexHome(options);
@@ -115,9 +122,9 @@ export function collectCodexDebug(options: CollectOptions) {
 export function redactSecrets(text: string, redactValues: string[] = [], codexHome?: string) {
   let redacted = redactInternalCodexModel(text, codexHome);
   for (const value of redactValues.map((entry) => entry.trim()).filter(Boolean)) {
-    redacted = redacted.replaceAll(value, "[REDACTED]");
+    redacted = redacted.replaceAll(value, REDACTED_VALUE);
   }
-  return redacted
+  redacted = redacted
     .replace(/\bsk-(?:proj-)?[A-Za-z0-9_-]{20,}\b/g, "[REDACTED_OPENAI_KEY]")
     .replace(/\bgithub_pat_[A-Za-z0-9_]{20,}\b/g, "[REDACTED_GITHUB_TOKEN]")
     .replace(/\bgh[pousr]_[A-Za-z0-9_]{20,}\b/g, "[REDACTED_GITHUB_TOKEN]")
@@ -133,19 +140,20 @@ export function redactSecrets(text: string, redactValues: string[] = [], codexHo
     )
     .replace(
       new RegExp(`\\b(${SENSITIVE_FIELD_NAME})\\s*=\\s*([^\\s"',;]+)`, "gi"),
-      "$1=[REDACTED]",
-    )
-    .replace(
-      new RegExp(`"(${SENSITIVE_FIELD_NAME})"\\s*:\\s*"(?:\\\\.|[^"\\\\])*"`, "gi"),
-      '"$1":"[REDACTED]"',
+      `$1=${REDACTED_VALUE}`,
     )
     .replace(
       new RegExp(`\\b(${SENSITIVE_FIELD_NAME})\\s*:\\s*([^\\s"',;]+)`, "gi"),
-      "$1: [REDACTED]",
+      `$1: ${REDACTED_VALUE}`,
     );
+
+  return redacted.replace(structuredSensitiveValuePattern(), (...args: unknown[]) => {
+    const groups = args.at(-1) as StructuredSensitiveValueMatch;
+    return `${groups.prefix}${REDACTED_VALUE}${groups.suffix}`;
+  });
 }
 
-function containsSensitiveValue(text: string, redactValues: string[]): boolean {
+export function containsSensitiveValue(text: string, redactValues: string[]): boolean {
   if (
     redactValues
       .map((value) => value.trim())
@@ -164,14 +172,43 @@ function containsSensitiveValue(text: string, redactValues: string[]): boolean {
   ) {
     return true;
   }
-  const namedValuePatterns = [
+  const unquotedNamedValuePatterns = [
     new RegExp(`\\b(${SENSITIVE_FIELD_NAME})\\s*=\\s*([^\\s"',;]+)`, "gi"),
-    new RegExp(`"(${SENSITIVE_FIELD_NAME})"\\s*:\\s*"((?:\\\\.|[^"\\\\])*)"`, "gi"),
     new RegExp(`\\b(${SENSITIVE_FIELD_NAME})\\s*:\\s*([^\\s"',;]+)`, "gi"),
   ];
-  return namedValuePatterns.some((pattern) =>
-    [...text.matchAll(pattern)].some((match) => !String(match[2] ?? "").includes("[REDACTED]")),
+  if (
+    unquotedNamedValuePatterns.some((pattern) =>
+      [...text.matchAll(pattern)].some((match) => !isRedactedValue(String(match[2] ?? ""))),
+    )
+  ) {
+    return true;
+  }
+  const structuredMatches = [...text.matchAll(structuredSensitiveValuePattern())];
+  if (structuredMatches.some((match) => !isRedactedValue(match.groups?.value ?? ""))) {
+    return true;
+  }
+  const completeStarts = new Set(structuredMatches.map((match) => match.index));
+  return [...text.matchAll(structuredSensitiveValueStartPattern())].some(
+    (match) => !completeStarts.has(match.index),
   );
+}
+
+function structuredSensitiveValuePattern(): RegExp {
+  return new RegExp(
+    String.raw`(?<prefix>(?<!\\)(?<escape>\\*)"(?<field>${SENSITIVE_FIELD_NAME})(?<!\\)\k<escape>"\s*:\s*(?<!\\)\k<escape>")(?<value>[^\r\n]*?)(?<suffix>(?<!\\)\k<escape>")`,
+    "gi",
+  );
+}
+
+function structuredSensitiveValueStartPattern(): RegExp {
+  return new RegExp(
+    String.raw`(?<!\\)(?<escape>\\*)"${SENSITIVE_FIELD_NAME}(?<!\\)\k<escape>"\s*:\s*(?<!\\)\k<escape>"`,
+    "gi",
+  );
+}
+
+function isRedactedValue(value: string): boolean {
+  return value === REDACTED_VALUE;
 }
 
 function resolveCodexHome(options: CollectOptions): string {

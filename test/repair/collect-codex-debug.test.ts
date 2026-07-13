@@ -4,7 +4,11 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { collectCodexDebug, redactSecrets } from "../../dist/repair/collect-codex-debug.js";
+import {
+  collectCodexDebug,
+  containsSensitiveValue,
+  redactSecrets,
+} from "../../dist/repair/collect-codex-debug.js";
 
 test("collectCodexDebug copies recent Codex session logs and excludes auth files", () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-codex-debug-"));
@@ -206,6 +210,65 @@ test("redactSecrets masks common token shapes", () => {
   );
 });
 
+test("redactSecrets masks named credentials across JSON escape depths", () => {
+  const payload = JSON.stringify({
+    token: 'historical-secret "quoted" \\tail\nnext',
+    nested: { api_key: "nested-secret" },
+    visible: 'quote " slash \\ newline\n',
+  });
+  const jsonlEvent = JSON.stringify({ type: "item.completed", item: { text: payload } });
+  const twiceEncoded = JSON.stringify(jsonlEvent);
+  const standaloneEscaped = String.raw`prefix {\"credential\":\"standalone-secret\"} suffix`;
+
+  const redactedEvent = redactSecrets(jsonlEvent);
+  const redactedTwice = redactSecrets(twiceEncoded);
+  const redactedStandalone = redactSecrets(standaloneEscaped);
+
+  assert.deepEqual(JSON.parse(JSON.parse(redactedEvent).item.text), {
+    token: "[REDACTED]",
+    nested: { api_key: "[REDACTED]" },
+    visible: 'quote " slash \\ newline\n',
+  });
+  assert.deepEqual(JSON.parse(JSON.parse(JSON.parse(redactedTwice)).item.text), {
+    token: "[REDACTED]",
+    nested: { api_key: "[REDACTED]" },
+    visible: 'quote " slash \\ newline\n',
+  });
+  assert.equal(redactedStandalone, String.raw`prefix {\"credential\":\"[REDACTED]\"} suffix`);
+  assert.doesNotMatch(
+    [redactedEvent, redactedTwice, redactedStandalone].join("\n"),
+    /historical-secret|nested-secret|standalone-secret/,
+  );
+});
+
+test("escaped named credential detection stays in parity with redaction", () => {
+  const representations = [
+    '{"token":"historical-secret"}',
+    String.raw`{\"token\":\"historical-secret\"}`,
+    JSON.stringify(JSON.stringify({ token: "historical-secret" })),
+    JSON.stringify({
+      type: "item.completed",
+      item: { text: JSON.stringify({ credential: "historical-secret" }) },
+    }),
+  ];
+
+  for (const representation of representations) {
+    assert.equal(containsSensitiveValue(representation, []), true);
+    const redacted = redactSecrets(representation);
+    assert.equal(containsSensitiveValue(redacted, []), false);
+    assert.doesNotMatch(redacted, /historical-secret/);
+  }
+});
+
+test("escaped named credential detection fails closed on incomplete JSONL fields", () => {
+  const incomplete = String.raw`{\"token\":\"historical-secret`;
+  const followingRecord = String.raw`{\"visible\":\"safe\"}`;
+  const input = `${incomplete}\n${followingRecord}`;
+
+  assert.equal(redactSecrets(input), input);
+  assert.equal(containsSensitiveValue(input, []), true);
+});
+
 test("redactSecrets masks multiline credentials and private keys", () => {
   for (const indicator of ["|", "|2", "|2-", "|-2", ">2-"]) {
     const redacted = redactSecrets(
@@ -272,6 +335,54 @@ test("collectCodexDebug redacts file-sourced credentials absent from the current
     assert.match(artifact, /"actions_token":"\[REDACTED\]"/);
     assert.match(artifact, /Bearer \[REDACTED\]/);
     assert.match(artifact, /"token":"\[REDACTED\]"/);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("collectCodexDebug redacts nested JSONL credential representations before publication", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-codex-debug-escaped-"));
+  const codexHome = path.join(tmp, ".codex");
+  const outDir = path.join(tmp, "out");
+  const sessionPath = path.join(codexHome, "sessions", "escaped.jsonl");
+  const payload = JSON.stringify({
+    credentials: {
+      access_token: "nested-historical-secret",
+      private_key: "nested-private-material",
+    },
+  });
+  fs.mkdirSync(path.dirname(sessionPath), { recursive: true });
+  fs.writeFileSync(
+    sessionPath,
+    `${JSON.stringify({ type: "item.completed", item: { text: JSON.stringify(payload) } })}\n`,
+  );
+
+  try {
+    const result = collectCodexDebug({
+      outDir,
+      label: "escaped",
+      sinceMinutes: 60,
+      maxBytes: 1024 * 1024,
+      homeDir: tmp,
+      codexHome,
+    });
+
+    assert.equal(result.manifest.length, 1);
+    assert.equal(
+      result.skipped.some((entry) => entry.reason === "redaction-failed"),
+      false,
+    );
+    const artifact = fs.readFileSync(path.join(outDir, "sessions", "escaped.jsonl"), "utf8");
+    const event = JSON.parse(artifact);
+    const retained = JSON.parse(JSON.parse(event.item.text));
+    assert.deepEqual(retained, {
+      credentials: {
+        access_token: "[REDACTED]",
+        private_key: "[REDACTED]",
+      },
+    });
+    assert.doesNotMatch(artifact, /nested-historical-secret|nested-private-material/);
+    assert.equal(containsSensitiveValue(artifact, []), false);
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
