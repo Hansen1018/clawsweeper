@@ -10,6 +10,7 @@ import {
   codexOutputTail,
   createCodexTextRedactor,
   openCodexOutputCapture,
+  publishRedactedCodexOutputLastMessage,
   redactCodexOutputLastMessage,
   redactCodexTextChunk,
 } from "../dist/codex-output-capture.js";
@@ -122,5 +123,28 @@ test("Codex last-message redaction atomically replaces structured output", () =>
     assert.deepEqual(fs.readdirSync(root), ["result.json"]);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Codex last-message publication keeps raw output outside the retained tree", () => {
+  const rawRoot = fs.mkdtempSync(path.join(os.tmpdir(), "codex-last-message-raw-"));
+  const retainedRoot = fs.mkdtempSync(path.join(os.tmpdir(), "codex-last-message-retained-"));
+  const rawPath = path.join(rawRoot, "last-message.raw");
+  const retainedPath = path.join(retainedRoot, "reports", "result.json");
+  const secret = "runtime-token-123456";
+  fs.writeFileSync(rawPath, `${JSON.stringify({ summary: secret })}\n`);
+
+  try {
+    assert.equal(fs.existsSync(retainedPath), false);
+    publishRedactedCodexOutputLastMessage(rawPath, retainedPath, [secret]);
+
+    assert.equal(fs.readFileSync(rawPath, "utf8").includes(secret), true);
+    assert.deepEqual(JSON.parse(fs.readFileSync(retainedPath, "utf8")), {
+      summary: "[REDACTED]",
+    });
+    assert.deepEqual(fs.readdirSync(path.dirname(retainedPath)), ["result.json"]);
+  } finally {
+    fs.rmSync(rawRoot, { recursive: true, force: true });
+    fs.rmSync(retainedRoot, { recursive: true, force: true });
   }
 });

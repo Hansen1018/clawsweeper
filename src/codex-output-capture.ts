@@ -2,6 +2,7 @@ import {
   closeSync,
   existsSync,
   ftruncateSync,
+  mkdirSync,
   readFileSync,
   renameSync,
   rmSync,
@@ -9,6 +10,8 @@ import {
   writeFileSync,
   writeSync,
 } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { basename, dirname, join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 
 export const DEFAULT_CODEX_OUTPUT_FILE_BYTES = 128 * 1024 * 1024;
@@ -134,14 +137,27 @@ export function redactCodexOutputLastMessage(
   const outputIndex = args.indexOf("--output-last-message");
   const filePath = outputIndex >= 0 ? args[outputIndex + 1] : undefined;
   if (!filePath || !existsSync(filePath)) return;
-  const temporaryPath = `${filePath}.redacted-${process.pid}`;
+  publishRedactedCodexOutputLastMessage(filePath, filePath, redactValues);
+}
+
+export function publishRedactedCodexOutputLastMessage(
+  rawPath: string,
+  retainedPath: string,
+  redactValues: readonly string[],
+): void {
+  if (!existsSync(rawPath)) return;
+  mkdirSync(dirname(retainedPath), { recursive: true });
+  const temporaryPath = join(
+    dirname(retainedPath),
+    `.${basename(retainedPath)}.${process.pid}.${randomUUID()}.tmp`,
+  );
   try {
-    const redacted = redactCodexText(readFileSync(filePath, "utf8"), redactValues);
+    const redacted = redactCodexText(readFileSync(rawPath, "utf8"), redactValues);
     writeFileSync(temporaryPath, redacted, { encoding: "utf8", mode: 0o600 });
-    renameSync(temporaryPath, filePath);
+    renameSync(temporaryPath, retainedPath);
   } catch (error) {
     rmSync(temporaryPath, { force: true });
-    rmSync(filePath, { force: true });
+    if (rawPath === retainedPath) rmSync(rawPath, { force: true });
     throw error;
   }
 }

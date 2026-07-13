@@ -166,7 +166,7 @@ test("terminal Codex failures do not request repair requeue", () => {
   );
 });
 
-test("repair Codex heartbeat wrapper uses bounded process capture", () => {
+test("repair Codex heartbeat wrapper uses bounded capture and isolated last-message retention", () => {
   const sourcePath = path.join(process.cwd(), "src/repair/execute-fix-artifact.ts");
   const source = readText(sourcePath);
   const helperStart = source.indexOf("function spawnCodexSyncWithHeartbeat(");
@@ -175,9 +175,32 @@ test("repair Codex heartbeat wrapper uses bounded process capture", () => {
   assert.notEqual(helperStart, -1);
   assert.notEqual(helperEnd, -1);
   const helper = source.slice(helperStart, helperEnd);
-  assert.match(helper, /return runCodexProcess\(\{/);
+  assert.match(helper, /lastMessage = isolateCodexLastMessage\(originalArgs\);/);
+  assert.match(helper, /const args = lastMessage\.args;/);
+  assert.match(helper, /const result = runCodexProcess\(\{/);
+  assert.match(helper, /redactCodexOutputLastMessage\(args, redactValues\)/);
   assert.match(helper, /\{ stdoutPath: options\.stdoutPath \}/);
   assert.match(helper, /\{ stderrPath: options\.stderrPath \}/);
+  assert.match(
+    helper,
+    /publishRedactedCodexOutputLastMessage\(\s*lastMessage\.rawPath,\s*lastMessage\.retainedPath,\s*redactValues,\s*\)/,
+  );
+  assert.ok(
+    helper.indexOf("redactCodexOutputLastMessage(args, redactValues)") <
+      helper.indexOf("publishRedactedCodexOutputLastMessage(") &&
+      helper.indexOf("publishRedactedCodexOutputLastMessage(") < helper.indexOf("return result;"),
+    "the isolated last message must be sanitized, atomically published, then returned",
+  );
+  assert.match(
+    helper,
+    /finally \{[\s\S]*fs\.rmSync\(lastMessage\.rawRoot, \{ recursive: true, force: true \}\)/,
+  );
+  assert.match(helper, /function isolateCodexLastMessage\(args: readonly string\[\]\)/);
+  assert.match(
+    helper,
+    /fs\.mkdtempSync\(path\.join\(os\.tmpdir\(\), "clawsweeper-codex-last-message-"\)\)/,
+  );
+  assert.match(helper, /isolatedArgs\[outputIndex \+ 1\] = rawPath/);
   assert.doesNotMatch(helper, /spawnSync\("codex"/);
   assert.doesNotMatch(source, /CLAWSWEEPER_CODEX_STDIO_MAX_BUFFER_MB/);
   assert.doesNotMatch(source, /writeFileSync\([^)]*codexResult\.stdout/);
