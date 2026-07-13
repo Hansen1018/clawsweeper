@@ -523,12 +523,13 @@ jobs:
           GH_TOKEN: ${{ steps.target-read-token.outputs.token }}
           TARGET_REPO: ${{ steps.target.outputs.target_repo }}
           ITEM_NUMBER: ${{ steps.target.outputs.item_number }}
+          RECOVERY_TARGET_BRANCH: ${{ fromJSON(steps.claim-exact-review-queue.outputs.decision).sourceAction == 'failed_review_shard_recovery' && fromJSON(steps.claim-exact-review-queue.outputs.decision).targetBranch || '' }}
         run: |
           set -euo pipefail
           test -n "$GH_TOKEN"
-          target_branch="$(gh api "repos/$TARGET_REPO" --jq .default_branch)"
+          target_branch="${RECOVERY_TARGET_BRANCH:-$(gh api "repos/$TARGET_REPO" --jq .default_branch)}"
           if ! printf '%s' "$target_branch" | grep -Eq '^[A-Za-z0-9_.\/-]+$'; then
-            echo "Invalid live default branch for $TARGET_REPO: $target_branch" >&2
+            echo "Invalid target branch for $TARGET_REPO: $target_branch" >&2
             exit 1
           fi
           echo "target_branch=$target_branch" >> "$GITHUB_OUTPUT"
@@ -819,6 +820,7 @@ jobs:
           ITEM_NUMBER: ${{ steps.target.outputs.item_number }}
           CLOSE_REASONS: implemented_on_main,duplicate_or_superseded,low_signal_unmergeable_pr
           MIN_AGE_MINUTES: "0"
+          REVIEW_ONLY: ${{ fromJSON(steps.claim-exact-review-queue.outputs.decision).sourceAction == 'failed_review_shard_recovery' && 'true' || 'false' }}
         run: |
           set -euo pipefail
           live_item_error="$(mktemp)"
@@ -874,10 +876,20 @@ jobs:
             gh api "repos/$TARGET_REPO/issues/comments/$lease_id" --method DELETE
             echo "Released unsuccessful review lease comment $lease_id owned by $LEASE_OWNER."
           done <<< "$lease_ids"
+          reaction_ids="$(
+            gh api "repos/$TARGET_REPO/issues/$ITEM_NUMBER/reactions?content=eyes&per_page=100" \
+              --paginate \
+              --jq '.[] | select(.content == "eyes") | select(.user.login == "clawsweeper" or .user.login == "clawsweeper[bot]" or .user.login == "openclaw-clawsweeper[bot]") | .id'
+          )"
+          while IFS= read -r reaction_id; do
+            [ -n "$reaction_id" ] || continue
+            gh api "repos/$TARGET_REPO/issues/$ITEM_NUMBER/reactions/$reaction_id" --method DELETE
+            echo "Removed unsuccessful eyes reaction $reaction_id from $TARGET_REPO#$ITEM_NUMBER."
+          done <<< "$reaction_ids"
 
       - name: Route synced ClawSweeper verdict
         id: route-synced-verdict
-        if: ${{ steps.review-exact-event-item.outcome == 'success' && steps.publish-event-result.outcome == 'success' && steps.publish-event-result.outputs.terminal_noop != 'true' && steps.publish-event-result.outputs.terminal_missing != 'true' && steps.publish-event-result.outputs.terminal_closed != 'true' && steps.publish-event-result.outputs.guarded_open != 'true' && steps.publish-event-result.outputs.policy_noop != 'true' && steps.publish-event-result.outputs.requeue_latest != 'true' && steps.publish-event-result.outputs.remote_tuple_verified == 'true' && steps.publish-event-result.outputs.routing_deferred == 'false' }}
+        if: ${{ fromJSON(steps.claim-exact-review-queue.outputs.decision).sourceAction != 'failed_review_shard_recovery' && steps.review-exact-event-item.outcome == 'success' && steps.publish-event-result.outcome == 'success' && steps.publish-event-result.outputs.terminal_noop != 'true' && steps.publish-event-result.outputs.terminal_missing != 'true' && steps.publish-event-result.outputs.terminal_closed != 'true' && steps.publish-event-result.outputs.guarded_open != 'true' && steps.publish-event-result.outputs.policy_noop != 'true' && steps.publish-event-result.outputs.requeue_latest != 'true' && steps.publish-event-result.outputs.remote_tuple_verified == 'true' && steps.publish-event-result.outputs.routing_deferred == 'false' }}
         timeout-minutes: 4
         env:
           GH_TOKEN: ${{ steps.target-write-token.outputs.token }}
@@ -901,7 +913,7 @@ jobs:
 
       - name: Queue deferred exact verdict router
         id: queue-deferred-verdict-router
-        if: ${{ steps.review-exact-event-item.outcome == 'success' && steps.publish-event-result.outcome == 'success' && steps.publish-event-result.outputs.remote_tuple_verified == 'true' && steps.publish-event-result.outputs.routing_deferred == 'true' }}
+        if: ${{ fromJSON(steps.claim-exact-review-queue.outputs.decision).sourceAction != 'failed_review_shard_recovery' && steps.review-exact-event-item.outcome == 'success' && steps.publish-event-result.outcome == 'success' && steps.publish-event-result.outputs.remote_tuple_verified == 'true' && steps.publish-event-result.outputs.routing_deferred == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           TARGET_REPO: ${{ steps.target.outputs.target_repo }}
@@ -991,6 +1003,7 @@ jobs:
           ROUTING_DEFERRED: ${{ steps.publish-event-result.outputs.routing_deferred }}
           POLICY_NOOP: ${{ steps.publish-event-result.outputs.policy_noop }}
           REQUEUE_LATEST: ${{ steps.publish-event-result.outputs.requeue_latest }}
+          REVIEW_ONLY: ${{ fromJSON(steps.claim-exact-review-queue.outputs.decision).sourceAction == 'failed_review_shard_recovery' && 'true' || 'false' }}
         run: |
           state="Failed"
           detail="The targeted re-review did not finish cleanly. Check the workflow run for details."
@@ -1017,6 +1030,10 @@ jobs:
           if [ "$REVIEW_OUTCOME" = "success" ] && [ "$PUBLISH_OUTCOME" = "success" ] && [ "$REMOTE_TUPLE_VERIFIED" = "true" ] && [ "$ROUTING_DEFERRED" = "true" ] && [ "$ROUTE_HANDOFF_OUTCOME" = "success" ]; then
             state="Complete"
             detail="The targeted re-review published an exact durable review comment and queued an executing target-wide serialized router scan."
+          fi
+          if [ "$REVIEW_OUTCOME" = "success" ] && [ "$PUBLISH_OUTCOME" = "success" ] && [ "$REMOTE_TUPLE_VERIFIED" = "true" ] && [ "$REVIEW_ONLY" = "true" ]; then
+            state="Complete"
+            detail="The failed-shard recovery published a durable review comment without routing any close verdict."
           fi
           if [ "$REVIEW_OUTCOME" = "success" ] && [ "$PUBLISH_OUTCOME" = "success" ] && [ "$TERMINAL_CLOSED" = "true" ] && [ "${{ steps.confirm-terminal-item.outputs.confirmed }}" = "true" ]; then
             state="Complete"
@@ -1054,13 +1071,14 @@ jobs:
             --rebase-strategy theirs
 
       - name: React to target item completion
-        if: ${{ steps.live-item.outputs.guarded_open == 'true' || (steps.review-exact-event-item.outcome == 'success' && steps.publish-event-result.outcome == 'success' && (steps.publish-event-result.outputs.terminal_closed == 'true' || steps.publish-event-result.outputs.guarded_open == 'true' || steps.publish-event-result.outputs.policy_noop == 'true' || steps.queue-deferred-verdict-router.outcome == 'success' || steps.route-synced-verdict.outcome == 'success')) }}
+        if: ${{ steps.live-item.outputs.guarded_open == 'true' || (steps.review-exact-event-item.outcome == 'success' && steps.publish-event-result.outcome == 'success' && (steps.publish-event-result.outputs.terminal_closed == 'true' || steps.publish-event-result.outputs.guarded_open == 'true' || steps.publish-event-result.outputs.policy_noop == 'true' || steps.queue-deferred-verdict-router.outcome == 'success' || steps.route-synced-verdict.outcome == 'success' || (fromJSON(steps.claim-exact-review-queue.outputs.decision).sourceAction == 'failed_review_shard_recovery' && steps.publish-event-result.outputs.remote_tuple_verified == 'true'))) }}
         continue-on-error: true
         env:
           GH_TOKEN: ${{ steps.target-write-token.outputs.token }}
           TARGET_REPO: ${{ steps.target.outputs.target_repo }}
           ITEM_NUMBER: ${{ steps.target.outputs.item_number }}
           POLICY_NOOP: ${{ steps.publish-event-result.outputs.policy_noop }}
+          REVIEW_ONLY: ${{ fromJSON(steps.claim-exact-review-queue.outputs.decision).sourceAction == 'failed_review_shard_recovery' && 'true' || 'false' }}
         run: |
           set -euo pipefail
           test -n "$GH_TOKEN"
@@ -1110,7 +1128,7 @@ jobs:
               rm -f "$err"
             done <<< "$ids"
           }
-          if [ "$POLICY_NOOP" != "true" ]; then
+          if [ "$POLICY_NOOP" != "true" ] && [ "$REVIEW_ONLY" != "true" ]; then
             add_completion_reaction
           fi
           remove_own_eyes_reactions
@@ -1135,6 +1153,7 @@ jobs:
           REQUEUE_LATEST: ${{ steps.publish-event-result.outputs.requeue_latest }}
           DIRECT_ROUTE_OUTCOME: ${{ steps.route-synced-verdict.outcome }}
           DEFERRED_ROUTE_OUTCOME: ${{ steps.queue-deferred-verdict-router.outcome }}
+          REVIEW_ONLY: ${{ fromJSON(steps.claim-exact-review-queue.outputs.decision).sourceAction == 'failed_review_shard_recovery' && 'true' || 'false' }}
         run: |
           outcome=failure
           if [ "$PRIMARY_JOB_STATUS" = "cancelled" ] || [ "$REVIEW_OUTCOME" = "cancelled" ]; then
@@ -1154,6 +1173,7 @@ jobs:
             { [ "$TERMINAL_MISSING" = "true" ] ||
               [ "$TERMINAL_CLOSED" = "true" ] ||
               [ "$GUARDED_OPEN" = "true" ] ||
+              [ "$REVIEW_ONLY" = "true" ] ||
               [ "$DIRECT_ROUTE_OUTCOME" = "success" ] ||
               [ "$DEFERRED_ROUTE_OUTCOME" = "success" ]; }; then
             outcome=success
@@ -1231,7 +1251,7 @@ jobs:
           exit 1
 
       - name: Fail unsuccessful exact review
-        if: ${{ always() && steps.target.outputs.target_enabled != 'false' && steps.live-item.outputs.proceed != 'false' && steps.publish-event-result.outputs.terminal_noop != 'true' && steps.publish-event-result.outputs.policy_noop != 'true' && steps.publish-event-result.outputs.requeue_latest != 'true' && (steps.review-exact-event-item.outcome != 'success' || steps.publish-event-result.outcome != 'success' || (steps.publish-event-result.outputs.terminal_missing != 'true' && steps.publish-event-result.outputs.terminal_closed != 'true' && steps.publish-event-result.outputs.guarded_open != 'true' && steps.route-synced-verdict.outcome != 'success' && steps.queue-deferred-verdict-router.outcome != 'success')) }}
+        if: ${{ always() && steps.target.outputs.target_enabled != 'false' && steps.live-item.outputs.proceed != 'false' && steps.publish-event-result.outputs.terminal_noop != 'true' && steps.publish-event-result.outputs.policy_noop != 'true' && steps.publish-event-result.outputs.requeue_latest != 'true' && (steps.review-exact-event-item.outcome != 'success' || steps.publish-event-result.outcome != 'success' || (steps.publish-event-result.outputs.terminal_missing != 'true' && steps.publish-event-result.outputs.terminal_closed != 'true' && steps.publish-event-result.outputs.guarded_open != 'true' && fromJSON(steps.claim-exact-review-queue.outputs.decision).sourceAction != 'failed_review_shard_recovery' && steps.route-synced-verdict.outcome != 'success' && steps.queue-deferred-verdict-router.outcome != 'success')) }}
         run: exit 1
 
       - name: Publish exact event action ledger
@@ -2752,7 +2772,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
-      actions: write
+      actions: read
       contents: read
     steps:
       - uses: actions/download-artifact@v8
@@ -2768,11 +2788,27 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           ADDITIONAL_PROMPT: ${{ github.event.inputs.additional_prompt || '' }}
           MATRIX_JSON: ${{ needs.plan.outputs.matrix }}
+          QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
+          CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
         run: |
           set -euo pipefail
-          recovery_prompt="[clawsweeper-recovery-attempt=1]"
-          if [ -n "$ADDITIONAL_PROMPT" ]; then
-            recovery_prompt="$(printf '%s\n\n%s' "$ADDITIONAL_PROMPT" "$recovery_prompt")"
+          test -n "$CLAWSWEEPER_WEBHOOK_SECRET"
+          queue_url="${QUEUE_URL%/}"
+          recovery_marker="[clawsweeper-recovery-attempt=1]"
+          max_additional_prompt_bytes=$((5000 - ${#recovery_marker} - 2))
+          additional_prompt_bytes="$(printf '%s' "$ADDITIONAL_PROMPT" | LC_ALL=C wc -c | tr -d '[:space:]')"
+          recovery_prefix="$ADDITIONAL_PROMPT"
+          if [ "$additional_prompt_bytes" -gt "$max_additional_prompt_bytes" ]; then
+            # The queue validates JavaScript string length. A UTF-8 byte cap is deliberately
+            # stricter, so no recovery delivery can exceed that character limit.
+            recovery_prefix="$(
+              set +o pipefail
+              printf '%s' "$ADDITIONAL_PROMPT" | LC_ALL=C head -c "$max_additional_prompt_bytes" | iconv -f UTF-8 -t UTF-8 -c
+            )"
+          fi
+          recovery_prompt="$recovery_marker"
+          if [ -n "$recovery_prefix" ]; then
+            recovery_prompt="$(printf '%s\n\n%s' "$recovery_prefix" "$recovery_marker")"
           fi
           failed_shards=""
           if [ -d failed-review-shards ]; then
@@ -2812,33 +2848,66 @@ jobs:
             echo "Failed shards had no item numbers to requeue: $failed_shards"
             exit 0
           fi
-          recovery_shard_count="$(
-            jq -r --arg failed_shards ",$failed_shards," '
-              [
-                .[]
-                | . as $matrix_entry
-                | select($failed_shards | contains("," + ($matrix_entry.shard | tostring) + ","))
-              ]
-              | length
-              | if . < 1 then 1 else . end
-            ' <<<"$MATRIX_JSON"
-          )"
-          args=(
-            workflow run sweep.yml
-            --repo "$GITHUB_REPOSITORY"
-            --ref main
-            -f apply_existing=false
-            -f hot_intake=false
-            -f target_repo="${{ needs.plan.outputs.target_repo }}"
-            -f target_branch="${{ needs.plan.outputs.target_branch }}"
-            -f batch_size="${{ needs.plan.outputs.batch_size }}"
-            -f shard_count="$recovery_shard_count"
-            -f codex_timeout_ms="${{ needs.plan.outputs.codex_timeout_ms }}"
-            -f item_numbers="$item_numbers"
-            -f additional_prompt="$recovery_prompt"
-          )
-          echo "Requeueing failed review shards $failed_shards with item numbers: $item_numbers"
-          gh "${args[@]}"
+          IFS=',' read -r -a recovery_items <<<"$item_numbers"
+          failed_recovery_dispatches=()
+          for item_number in "${recovery_items[@]}"; do
+            if ! [[ "$item_number" =~ ^[0-9]+$ ]]; then
+              echo "Invalid failed-review recovery item number: $item_number" >&2
+              exit 1
+            fi
+            dispatch_key="failed-review-recovery-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${item_number}"
+            payload="$(jq -n \
+              --arg target_repo "${{ needs.plan.outputs.target_repo }}" \
+              --arg target_branch "${{ needs.plan.outputs.target_branch }}" \
+              --arg item_number "$item_number" \
+              --arg dispatch_key "$dispatch_key" \
+              --arg codex_timeout_ms "${{ needs.plan.outputs.codex_timeout_ms }}" \
+              --arg additional_prompt "$recovery_prompt" \
+              '{
+                delivery_id: ("router:" + $dispatch_key),
+                decision: {
+                  targetRepo: $target_repo,
+                  targetBranch: $target_branch,
+                  itemNumber: ($item_number | tonumber),
+                  itemKind: "issue",
+                  sourceEvent: "issues",
+                  sourceAction: "failed_review_shard_recovery",
+                  supersedesInProgress: false,
+                  codexTimeoutMs: ($codex_timeout_ms | tonumber),
+                  additionalPrompt: $additional_prompt
+                }
+              }')"
+            queued=false
+            for attempt in 1 2 3; do
+              # shellcheck disable=SC2016 # The Node source must retain its literal template expression.
+              signature="$(PAYLOAD="$payload" node -e 'const crypto=require("node:crypto"); process.stdout.write(`sha256=${crypto.createHmac("sha256", process.env.CLAWSWEEPER_WEBHOOK_SECRET).update(process.env.PAYLOAD).digest("hex")}`)')"
+              response="$(curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
+                --request POST \
+                --header "content-type: application/json" \
+                --header "x-clawsweeper-exact-review-signature: $signature" \
+                --data "$payload" \
+                "$queue_url/internal/exact-review/enqueue")" || response=""
+              if jq -e '.ok == true and (.queued == true or .deduped == true or .accepted == false)' <<<"$response" >/dev/null; then
+                if jq -e '.accepted == false' <<<"$response" >/dev/null; then
+                  echo "Recovery skipped because the target is disabled."
+                fi
+                queued=true
+                break
+              fi
+              echo "Recovery queue acknowledgement was not accepted on attempt $attempt." >&2
+              if [ "$attempt" -lt 3 ]; then
+                sleep "$((attempt * 5))"
+              fi
+            done
+            if [ "$queued" != "true" ]; then
+              failed_recovery_dispatches+=("$item_number")
+            fi
+          done
+          if [ "${#failed_recovery_dispatches[@]}" -gt 0 ]; then
+            echo "Unable to queue failed review recovery for item numbers: ${failed_recovery_dispatches[*]}" >&2
+            exit 1
+          fi
+          echo "Queued failed review shards $failed_shards through the exact-review control plane: $item_numbers"
 
   retry-failed-reviews:
     name: Retry failed Codex reviews

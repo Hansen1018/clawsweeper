@@ -122,6 +122,24 @@ test("close proposals that require maintainer decisions render as kept open", ()
   assert.doesNotMatch(comment, /clawsweeper-action:close-required/);
 });
 
+test("review-only comments omit actionable automation markers", () => {
+  const report = implementedCloseReport({
+    repository: "openclaw/openclaw",
+    type: "pull_request",
+    pull_head_sha: "abc123def456",
+  });
+  const routableComment = renderReviewCommentFromReport(report, "implemented_or_shipped");
+  const comment = renderReviewCommentFromReport(report, "implemented_or_shipped", {
+    suppressAutomationMarkers: true,
+  });
+
+  assert.match(routableComment, /clawsweeper-(?:verdict|action):/);
+  assert.match(comment, /Review details/);
+  assert.match(comment, /clawsweeper-review-version/);
+  assert.doesNotMatch(comment, /clawsweeper-verdict:/);
+  assert.doesNotMatch(comment, /clawsweeper-action:/);
+});
+
 test("apply-decisions archives live-closed skipped records without reopening close gates", () => {
   const root = mkdtempSync(tmpPrefix);
   try {
@@ -2506,6 +2524,13 @@ test("sweep target write tokens can merge pull requests", () => {
 
 test("sweep review recovery uses explicit failed shard artifacts", () => {
   const workflow = readText(".github/workflows/sweep.yml");
+  const publishEventResult = readText("src/repair/publish-event-result.ts");
+  const recoveryStart = workflow.indexOf("\n  recover-review-failures:");
+  const retryStart = workflow.indexOf("\n  retry-failed-reviews:", recoveryStart);
+  const eventReviewStart = workflow.indexOf("\n  event-review-apply:");
+  const targetFanoutStart = workflow.indexOf("\n  target-fanout:", eventReviewStart);
+  const recoveryJob = workflow.slice(recoveryStart, retryStart);
+  const eventReviewJob = workflow.slice(eventReviewStart, targetFanoutStart);
 
   assert.match(
     workflow,
@@ -2524,6 +2549,64 @@ test("sweep review recovery uses explicit failed shard artifacts", () => {
   assert.doesNotMatch(
     workflow,
     /needs\.review\.result == 'failure' \|\| needs\.review\.result == 'cancelled'/,
+  );
+  assert.match(recoveryJob, /actions: read/);
+  assert.match(recoveryJob, /contents: read/);
+  assert.match(recoveryJob, /QUEUE_URL:/);
+  assert.match(recoveryJob, /CLAWSWEEPER_WEBHOOK_SECRET:/);
+  assert.match(recoveryJob, /delivery_id: \("router:" \+ \$dispatch_key\)/);
+  assert.match(recoveryJob, /sourceAction: "failed_review_shard_recovery"/);
+  assert.match(recoveryJob, /--arg dispatch_key/);
+  assert.match(recoveryJob, /x-clawsweeper-exact-review-signature/);
+  assert.match(recoveryJob, /\/internal\/exact-review\/enqueue/);
+  assert.match(
+    recoveryJob,
+    /\.ok == true and \(\.queued == true or \.deduped == true or \.accepted == false\)/,
+  );
+  assert.match(recoveryJob, /Recovery skipped because the target is disabled/);
+  assert.match(recoveryJob, /for attempt in 1 2 3/);
+  assert.match(recoveryJob, /failed_recovery_dispatches/);
+  assert.match(
+    recoveryJob,
+    /max_additional_prompt_bytes=\$\(\(5000 - \$\{#recovery_marker\} - 2\)\)/,
+  );
+  assert.match(recoveryJob, /LC_ALL=C wc -c/);
+  assert.match(recoveryJob, /set \+o pipefail/);
+  assert.match(recoveryJob, /iconv -f UTF-8 -t UTF-8 -c/);
+  assert.doesNotMatch(recoveryJob, /workflow run sweep\.yml/);
+  assert.doesNotMatch(recoveryJob, /repos\/\$GITHUB_REPOSITORY\/dispatches/);
+  assert.match(eventReviewJob, /RECOVERY_TARGET_BRANCH:/);
+  assert.match(eventReviewJob, /RECOVERY_TARGET_BRANCH:-\$\(gh api/);
+  assert.match(eventReviewJob, /REVIEW_ONLY:/);
+  assert.match(
+    eventReviewJob,
+    /sourceAction == 'failed_review_shard_recovery' && 'true' \|\| 'false'/,
+  );
+  assert.match(
+    eventReviewJob,
+    /Route synced ClawSweeper verdict[\s\S]*sourceAction != 'failed_review_shard_recovery'/,
+  );
+  assert.match(
+    eventReviewJob,
+    /Queue deferred exact verdict router[\s\S]*sourceAction != 'failed_review_shard_recovery'/,
+  );
+  assert.match(
+    eventReviewJob,
+    /Fail unsuccessful exact review[\s\S]*sourceAction != 'failed_review_shard_recovery'/,
+  );
+  assert.match(
+    eventReviewJob,
+    /React to target item completion[\s\S]*sourceAction == 'failed_review_shard_recovery'/,
+  );
+  assert.match(eventReviewJob, /\[ "\$REVIEW_ONLY" != "true" \]/);
+  assert.match(
+    eventReviewJob,
+    /Export exact review primary result[\s\S]*REVIEW_ONLY:[\s\S]*\[ "\$REVIEW_ONLY" = "true" \]/,
+  );
+  assert.match(publishEventResult, /reviewOnly: process\.env\.REVIEW_ONLY === "true"/);
+  assert.match(
+    publishEventResult,
+    /options\.reviewOnly \? \["--sync-comments-only", "--suppress-automation-markers"\] : \[\]/,
   );
 });
 

@@ -25,6 +25,9 @@ type WorkflowRunSummary = {
   created_at?: string;
   updated_at?: string;
 };
+
+const FAILED_REVIEW_SHARD_RECOVERY_SOURCE_ACTION = "failed_review_shard_recovery";
+
 type ExactReviewDecision = {
   targetRepo: string;
   targetBranch: string;
@@ -487,21 +490,30 @@ export class ExactReviewQueue {
         }
 
         const state = this.readStateSync();
+        // A delayed or lost alarm must not let an expired one-shot recovery
+        // suppress the next failed shard's recovery delivery.
+        reclaimExpiredExactReviewLeases(state, now);
         const key = exactReviewItemKey(decision);
         const current = state.items[key];
         const nextAttemptAt = exactReviewQueueEnqueueAttemptAt(state, now);
         if (current) {
-          // A pending command has no executor yet, so an ordinary item event must not erase its
-          // acknowledgement context. Once dispatched, that lease already owns the context and a
-          // newer revision should start clean unless it carries its own command fields.
-          current.decision =
-            current.state === "pending"
-              ? mergePendingExactReviewDecision(current.decision, decision)
-              : decision;
-          current.revision += 1;
-          current.updatedAt = now;
-          current.nextAttemptAt = nextAttemptAt;
-          if (current.state === "pending") current.attempts = 0;
+          const ignoredRecovery =
+            decision.sourceAction === FAILED_REVIEW_SHARD_RECOVERY_SOURCE_ACTION;
+          // A recovery is only a one-shot repair of a failed shard. It may create a queue item,
+          // but must never supersede an existing pending, dispatching, or leased decision: doing
+          // so can leave either ordinary work or another recovery as a stale follow-up revision.
+          // Ordinary source events retain normal replacement behavior, including the
+          // command-context merge for pending items.
+          if (!ignoredRecovery) {
+            current.decision =
+              current.state === "pending"
+                ? mergePendingExactReviewDecision(current.decision, decision)
+                : decision;
+            current.revision += 1;
+            current.updatedAt = now;
+            current.nextAttemptAt = nextAttemptAt;
+            if (current.state === "pending") current.attempts = 0;
+          }
         } else {
           state.items[key] = {
             key,
@@ -2427,11 +2439,16 @@ function finishExactReviewQueueItem(
 ) {
   const retryingFailure = outcome !== "success";
   const hasNewerRevision = item.revision > Number(item.leaseRevision || 0);
-  const requeued = retryingFailure || hasNewerRevision || requeueLatest;
+  // A regular queue item may back off and retry after a failed lease. Failed
+  // sweep shards already consumed their one recovery attempt before reaching
+  // the queue, so only a newer source revision may supersede that recovery.
+  const oneShotRecovery =
+    item.leaseDecision?.sourceAction === FAILED_REVIEW_SHARD_RECOVERY_SOURCE_ACTION;
+  const requeued = (!oneShotRecovery && retryingFailure) || hasNewerRevision || requeueLatest;
   if (requeued) {
     clearExactReviewLease(item);
     item.state = "pending";
-    if (retryingFailure) {
+    if (retryingFailure && !hasNewerRevision && !requeueLatest) {
       item.attempts += 1;
       item.nextAttemptAt = Math.max(
         exactReviewQueueEnqueueAttemptAt(state, now),
@@ -2476,14 +2493,24 @@ function isLiveExactReviewLease(item: ExactReviewQueueItem, now: number) {
 
 function reclaimExpiredExactReviewLeases(state: ExactReviewQueueState, now: number) {
   let changed = false;
-  for (const item of Object.values(state.items)) {
+  for (const [key, item] of Object.entries(state.items)) {
     if (
       (item.state === "dispatching" || item.state === "leased") &&
       !isLiveExactReviewLease(item, now)
     ) {
+      const oneShotRecovery =
+        (item.leaseDecision || item.decision).sourceAction ===
+        FAILED_REVIEW_SHARD_RECOVERY_SOURCE_ACTION;
+      const hasNewerRevision = item.revision > Number(item.leaseRevision || 0);
+      if (oneShotRecovery && !hasNewerRevision) {
+        delete state.items[key];
+        changed = true;
+        continue;
+      }
       clearExactReviewLease(item);
       item.state = "pending";
       item.nextAttemptAt = now;
+      if (hasNewerRevision) item.attempts = 0;
       item.updatedAt = now;
       changed = true;
     }
