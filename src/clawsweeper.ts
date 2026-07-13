@@ -184,7 +184,10 @@ import {
   type ReviewHistoryLedger,
 } from "./review-history.js";
 import { trailingHtmlComments } from "./review-comment-markers.js";
-import { createReviewedPrActivityCursor } from "./review-activity-cursor.js";
+import {
+  createReviewedPrActivityCursor,
+  isReviewedPrActivityCursor,
+} from "./review-activity-cursor.js";
 import {
   ACTION_EVENT_REASON_CODES,
   ACTION_EVENT_STATUSES,
@@ -25494,6 +25497,8 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
       lease: AcquiredReviewStartLease,
     ): string | null => {
       try {
+        const reviewActivityBlock = currentReviewActivityBlock();
+        if (reviewActivityBlock) return reviewActivityBlock.reason;
         const revisionBefore = fetchLiveReviewHeadSha();
         const refreshed = issueReviewCommentState(number);
         const revisionAfter = fetchLiveReviewHeadSha();
@@ -25569,6 +25574,8 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
       return ownedApplyMutationLeaseBlockReason(lease);
     };
     const currentApplyMutationLeaseBlockReason = (): string | null => {
+      const reviewActivityBlock = currentReviewActivityBlock();
+      if (reviewActivityBlock) return reviewActivityBlock.reason;
       if (dryRun || !requiresApplyMutationLease) return null;
       const active = activeApplyMutationLease;
       if (!active || active.itemNumber !== number) return "apply mutation lease is not held";
@@ -25597,6 +25604,100 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
             `${reason}; stale canonical comment correction remains pending`,
           )
         : recordReviewGuardSkip("kept_open", reason, restoreOriginal);
+    const markChangedSinceReview = (options: {
+      reason: string;
+      currentUpdatedAt?: string | undefined;
+      currentSnapshotHash?: string | undefined;
+    }): boolean => {
+      markdown = replaceFrontMatterValue(
+        markdown,
+        "action_taken",
+        "skipped_changed_since_review",
+      );
+      if (options.currentUpdatedAt) {
+        markdown = replaceFrontMatterValue(
+          markdown,
+          "current_item_updated_at",
+          options.currentUpdatedAt,
+        );
+      }
+      if (options.currentSnapshotHash) {
+        markdown = replaceFrontMatterValue(
+          markdown,
+          "current_item_snapshot_hash",
+          options.currentSnapshotHash,
+        );
+      }
+      markdown = replaceFrontMatterValue(markdown, "apply_checked_at", new Date().toISOString());
+      if (!dryRun) writeReportMarkdown(path, markdown);
+      results.push({
+        number,
+        action: "skipped_changed_since_review",
+        reason: options.reason,
+        ...eventApplyDispositionProof("skipped_changed_since_review"),
+      });
+      processedCount += 1;
+      maybeLogProgress(`skipped #${number}: ${options.reason}`);
+      return processedCount >= processedLimit;
+    };
+    const expectedReviewActivityCursor = frontMatterValue(
+      markdownBeforeApplyDecisionMutations,
+      "review_activity_cursor",
+    );
+    const currentReviewActivityBlock = (): {
+      sourceChanged: boolean;
+      reason: string;
+    } | null => {
+      if (
+        item.kind !== "pull_request" ||
+        !expectedReviewActivityCursor ||
+        expectedReviewActivityCursor === "unknown"
+      ) {
+        return null;
+      }
+      if (!isReviewedPrActivityCursor(expectedReviewActivityCursor)) {
+        return {
+          sourceChanged: false,
+          reason: "stored pull request review activity cursor is invalid; fresh review required",
+        };
+      }
+      try {
+        const currentReviewActivityCursor = createReviewedPrActivityCursor({
+          reviews: ghPaged<unknown>(`repos/${targetRepo()}/pulls/${number}/reviews`),
+          inlineComments: ghPaged<unknown>(`repos/${targetRepo()}/pulls/${number}/comments`),
+        });
+        if (!currentReviewActivityCursor) {
+          return {
+            sourceChanged: true,
+            reason: "pull request review activity exceeds the bounded reviewed cursor",
+          };
+        }
+        if (currentReviewActivityCursor !== expectedReviewActivityCursor) {
+          return {
+            sourceChanged: true,
+            reason: "pull request review activity changed since review",
+          };
+        }
+        return null;
+      } catch (error) {
+        if (error instanceof GitHubRuntimeBudgetError) throw error;
+        const detail = trimMiddle(
+          (error instanceof Error ? error.message : String(error)).replace(/\s+/g, " "),
+          180,
+        );
+        return {
+          sourceChanged: false,
+          reason: `pull request review activity could not be refreshed; next apply will retry: ${detail}`,
+        };
+      }
+    };
+    const recordReviewActivityBlock = (block: {
+      sourceChanged: boolean;
+      reason: string;
+    }): boolean =>
+      block.sourceChanged
+        ? markChangedSinceReview({ reason: block.reason })
+        : recordReviewLeaseSkip(block.reason);
     const recordActiveReviewLeaseSkip = (expiresAt: string): boolean =>
       recordReviewLeaseSkip(
         `${item.kind === "pull_request" ? "same-head" : "same-revision"} ClawSweeper review is active until ${expiresAt}`,
@@ -26390,6 +26491,11 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
         : null;
     let currentPrStatusKind: PrStatusLabelKind | null = null;
     if (state === "open") {
+      const reviewActivityBlock = currentReviewActivityBlock();
+      if (reviewActivityBlock) {
+        if (recordReviewActivityBlock(reviewActivityBlock)) break;
+        continue;
+      }
       const lateLeaseState = refreshReviewStartLeaseState();
       if (lateLeaseState.blockReason) {
         if (recordReviewLeaseSkip(lateLeaseState.blockReason)) break;
@@ -26553,42 +26659,6 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
         break;
       continue;
     }
-    const markChangedSinceReview = (options: {
-      reason: string;
-      currentUpdatedAt?: string | undefined;
-      currentSnapshotHash?: string | undefined;
-    }): boolean => {
-      markdown = replaceFrontMatterValue(
-        markdown,
-        "action_taken",
-        "skipped_changed_since_review",
-      );
-      if (options.currentUpdatedAt) {
-        markdown = replaceFrontMatterValue(
-          markdown,
-          "current_item_updated_at",
-          options.currentUpdatedAt,
-        );
-      }
-      if (options.currentSnapshotHash) {
-        markdown = replaceFrontMatterValue(
-          markdown,
-          "current_item_snapshot_hash",
-          options.currentSnapshotHash,
-        );
-      }
-      markdown = replaceFrontMatterValue(markdown, "apply_checked_at", new Date().toISOString());
-      if (!dryRun) writeReportMarkdown(path, markdown);
-      results.push({
-        number,
-        action: "skipped_changed_since_review",
-        reason: options.reason,
-        ...eventApplyDispositionProof("skipped_changed_since_review"),
-      });
-      processedCount += 1;
-      maybeLogProgress(`skipped #${number}: ${options.reason}`);
-      return processedCount >= processedLimit;
-    };
     const postProofFreshnessBlock = (): {
       reason: string;
       currentUpdatedAt?: string;
