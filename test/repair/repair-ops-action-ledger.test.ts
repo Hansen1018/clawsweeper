@@ -289,7 +289,7 @@ test("commit review and notification workflows publish their operation receipts"
   );
   assert.match(review, /setup-action-ledger/);
   assert.match(review, /CLAWSWEEPER_ACTION_LEDGER_INVOCATION: commit-\$\{\{ matrix\.sha \}\}/);
-  assert.match(review, /--defer-workflow-completion/);
+  assert.doesNotMatch(review, /--defer-workflow-completion/);
   assert.doesNotMatch(review, /publish-check|permission-checks: write|finish-review/);
   assert.doesNotMatch(review, /create-state-token|setup-state|CLAWSWEEPER_STATE_DIR/);
   assert.match(

@@ -516,8 +516,7 @@ jobs:
             --require-publishable-report \
             --prehydrated-github-metadata \
             --github-author "${{ steps.commit-identities.outputs.github_author }}" \
-            --github-committer "${{ steps.commit-identities.outputs.github_committer }}" \
-            --defer-workflow-completion
+            --github-committer "${{ steps.commit-identities.outputs.github_committer }}"
 
       - name: Upload commit review diagnostic
         if: always()

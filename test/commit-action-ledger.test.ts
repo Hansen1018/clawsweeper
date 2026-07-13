@@ -20,6 +20,7 @@ import {
   recordCommitWorkflowEvent,
   runCommitMutation,
 } from "../dist/commit-action-ledger.js";
+import { finalizeRepairActionLedgerManifest } from "../dist/repair/repair-action-ledger-manifest.js";
 import { mockGhBinEnv, readText } from "./helpers.ts";
 
 test("commit review terminal success requires requested check publication", () => {
@@ -95,6 +96,39 @@ test("commit review artifacts are prepared locally before external publication",
     assert.equal(event?.action.status, "completed");
     assert.equal(event?.attributes?.state, "prepared");
     assert.equal(event?.attributes?.publication_kind, "commit_review_report");
+  } finally {
+    restoreEnv(previous);
+    fs.rmSync(root, { force: true, recursive: true });
+  }
+});
+
+test("commit review finalization preserves a completed producer lifecycle", async () => {
+  const root = fs.realpathSync(
+    fs.mkdtempSync(path.join(os.tmpdir(), "commit-completed-finalizer-")),
+  );
+  const outputRoot = path.join(root, "output");
+  fs.mkdirSync(outputRoot);
+  const previous = { ...process.env };
+  Object.assign(process.env, workflowEnv(root, outputRoot));
+  const lifecycle = { repository: "openclaw/openclaw", sha: "b".repeat(40) };
+
+  try {
+    recordCommitWorkflowEvent(lifecycle, "started");
+    recordCommitWorkflowEvent(lifecycle, "completed");
+    recordCommitWorkflowEvent(lifecycle, "finalized");
+    await finalizeRepairActionLedgerManifest("commit-review");
+
+    const workflowEvents = readEvents(outputRoot)
+      .filter((event) => event.event_type === ACTION_EVENT_TYPES.workflowAttempt)
+      .sort((left, right) => left.phase_seq - right.phase_seq);
+    assert.deepEqual(
+      workflowEvents.map((event) => event.attributes?.state),
+      ["started", "completed", "finalized"],
+    );
+    assert.doesNotMatch(
+      JSON.stringify(workflowEvents),
+      /workflow_interrupted|workflow_failed|"reason_code":"timeout"/,
+    );
   } finally {
     restoreEnv(previous);
     fs.rmSync(root, { force: true, recursive: true });
