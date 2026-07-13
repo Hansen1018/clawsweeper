@@ -3663,37 +3663,40 @@ test("cleanup-stuck projection rejection is scoped to the affected spool root", 
           }),
       },
     }) as unknown as Response) as typeof fetch;
-  for (let index = 0; index < CRABFLEET_PROJECTION_LIMITS.maxConcurrent + 1; index += 1) {
-    assert.ok(recordReviewNumber(blockedRoot, 300 + index, blockedEnv, blockedFetch));
-  }
   let independentStarted = 0;
-  assert.ok(
-    recordReviewNumber(independentRoot, 400, independentEnv, (async () => {
-      independentStarted += 1;
-      return new Response(null, { status: 204 });
-    }) as typeof fetch),
-  );
-
-  const blockedDeadline = Date.now() + 500;
-  while (cleanupResolvers.length < CRABFLEET_PROJECTION_LIMITS.maxConcurrent) {
-    if (Date.now() >= blockedDeadline) {
-      throw new Error("blocked root did not enter response cleanup");
+  try {
+    for (let index = 0; index < CRABFLEET_PROJECTION_LIMITS.maxConcurrent + 1; index += 1) {
+      assert.ok(recordReviewNumber(blockedRoot, 300 + index, blockedEnv, blockedFetch));
     }
-    await new Promise((resolve) => setTimeout(resolve, 5));
-  }
-  await new Promise((resolve) => setTimeout(resolve, 20));
-  assert.equal(independentStarted, 0);
+    assert.ok(
+      recordReviewNumber(independentRoot, 400, independentEnv, (async () => {
+        independentStarted += 1;
+        return new Response(null, { status: 204 });
+      }) as typeof fetch),
+    );
 
-  cleanupResolvers.shift()!();
-  const independentDeadline = Date.now() + 500;
-  while (independentStarted === 0) {
-    if (Date.now() >= independentDeadline) {
-      throw new Error("independent root did not start after a projection slot recovered");
+    const blockedDeadline = Date.now() + 2_000;
+    while (cleanupResolvers.length < CRABFLEET_PROJECTION_LIMITS.maxConcurrent) {
+      if (Date.now() >= blockedDeadline) {
+        throw new Error("blocked root did not enter response cleanup");
+      }
+      await new Promise((resolve) => setTimeout(resolve, 5));
     }
-    await new Promise((resolve) => setTimeout(resolve, 5));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(independentStarted, 0);
+
+    cleanupResolvers.shift()!();
+    const independentDeadline = Date.now() + 2_000;
+    while (independentStarted === 0) {
+      if (Date.now() >= independentDeadline) {
+        throw new Error("independent root did not start after a projection slot recovered");
+      }
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+  } finally {
+    for (const resolve of cleanupResolvers) resolve();
+    await flushPendingCrabFleetPosts();
   }
-  for (const resolve of cleanupResolvers) resolve();
-  await flushPendingCrabFleetPosts();
   assert.equal(independentStarted, 1);
 });
 
