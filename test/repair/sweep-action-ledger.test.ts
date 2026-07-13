@@ -48,10 +48,10 @@ test("sweep caller mutations use the validated receipt CLI", () => {
   assert.match(source, /gh api -X GET[\s\S]*reactions/);
   assert.doesNotMatch(source, /for attempt in 1 2 3; do[\s\S]{0,500}sweep-mutation-cli/);
   assert.match(source, /hard runner loss[\s\S]{0,160}at-least-once safe/);
-  assert.match(
-    fs.readFileSync("src/repair/sweep-mutation.ts", "utf8"),
-    /hard runner loss before receipt publication[\s\S]*at-least-once delivery/,
-  );
+  const mutationSource = fs.readFileSync("src/repair/sweep-mutation.ts", "utf8");
+  assert.match(mutationSource, /if \(runAttempt > 1\)/);
+  assert.match(mutationSource, /readImportedRepairMutationEvents/);
+  assert.match(mutationSource, /readDurableDispatchEvents/);
 });
 
 test("each sweep caller producer finalizes and publishes after its last mutation", () => {

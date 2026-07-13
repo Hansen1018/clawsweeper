@@ -89,13 +89,15 @@ test("exact review publishes status receipts created after its first ledger publ
   const sourceDriftStatus = workflow.indexOf("- name: Mark source-drift re-review queued");
   const lateFinalize = workflow.indexOf("- name: Finalize late command status action ledger");
   const latePublish = workflow.indexOf("- name: Publish late command status action ledger");
+  const exactEventFinalize = workflow.indexOf("- name: Finalize exact event action ledger");
   const targetFanout = workflow.indexOf("\n  target-fanout:", latePublish);
   const finalizeStep = workflow.slice(lateFinalize, latePublish);
-  const publishStep = workflow.slice(latePublish, targetFanout);
+  const publishStep = workflow.slice(latePublish, exactEventFinalize);
 
   assert.ok(sourceDriftStatus >= 0);
   assert.ok(lateFinalize > sourceDriftStatus);
   assert.ok(latePublish > lateFinalize);
+  assert.ok(exactEventFinalize > latePublish);
   assert.ok(targetFanout > latePublish);
   assert.match(setupAction, /CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT=\$output_root/);
   assert.match(source, /await flushCommandActionEvents\(\)/);
