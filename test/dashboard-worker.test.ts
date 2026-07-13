@@ -4709,6 +4709,7 @@ test("dashboard reads stored CI status for active PR rows", async () => {
             total: 12,
             failing: 0,
             pending: 0,
+            updated_at: new Date().toISOString(),
           },
         }),
       }),
@@ -4772,6 +4773,7 @@ test("dashboard falls back to edge cache storage when KV is not bound", async ()
             total: 12,
             failing: 0,
             pending: 2,
+            updated_at: new Date().toISOString(),
           },
         }),
       }),
@@ -5411,6 +5413,143 @@ test("dashboard CI projection preserves per-item chronology across retried event
     events.slice(0, 3).map((event: { title: string }) => event.title),
     ["Other item CI", "Newer item CI retry", "Older item CI retry"],
   );
+});
+
+function createCiProjectionHarness() {
+  const storage = new MemoryDurableStorage();
+  const store = new StatusStore({ storage });
+  const statusStoreStub = {
+    fetch: (request: Request, init?: RequestInit) =>
+      store.fetch(init ? new Request(request, init) : request),
+  };
+  const env = {
+    INGEST_TOKEN: "test-token",
+    STATUS_STORE: new MemoryDurableNamespace(statusStoreStub),
+  };
+  const ingest = async ({
+    idempotencyKey,
+    state,
+    title,
+    updatedAt,
+  }: {
+    idempotencyKey: string;
+    state: string;
+    title: string;
+    updatedAt: string;
+  }) => {
+    const response = await worker.fetch(
+      new Request("https://clawsweeper.openclaw.ai/api/events", {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer test-token",
+          "Content-Type": "application/json",
+          "Idempotency-Key": idempotencyKey,
+        },
+        body: JSON.stringify({
+          event_type: "ci.status",
+          repository: "openclaw/openclaw",
+          item_number: 80609,
+          status: state,
+          title,
+          ci: {
+            repository: "openclaw/openclaw",
+            item_number: 80609,
+            state,
+            source: "github-checks",
+            head_sha: `${idempotencyKey}-${state}`,
+            updated_at: updatedAt,
+          },
+        }),
+      }),
+      env,
+    );
+    assert.equal(response.status, 200);
+  };
+  const projection = async () => {
+    const response = await store.fetch(
+      new Request(
+        `https://clawsweeper-status-store/${encodeURIComponent("ci:openclaw/openclaw#80609")}`,
+      ),
+    );
+    assert.equal(response.status, 200);
+    return response.json();
+  };
+  const events = async () =>
+    JSON.parse(
+      await (await store.fetch(new Request("https://clawsweeper-status-store/events"))).text(),
+    );
+  return { ingest, projection, events };
+}
+
+test("dashboard CI projection ignores delayed distinct keys and malformed source timestamps", async () => {
+  const harness = createCiProjectionHarness();
+  await harness.ingest({
+    idempotencyKey: "ci-b",
+    state: "green",
+    title: "Newer CI",
+    updatedAt: "2026-07-13T10:02:00.000Z",
+  });
+  await harness.ingest({
+    idempotencyKey: "ci-c",
+    state: "red",
+    title: "Delayed older CI",
+    updatedAt: "2026-07-13T10:01:00.000Z",
+  });
+  await harness.ingest({
+    idempotencyKey: "ci-z",
+    state: "pending",
+    title: "Malformed CI",
+    updatedAt: "not-a-timestamp",
+  });
+
+  const projected = await harness.projection();
+  assert.deepEqual(
+    {
+      state: projected.state,
+      head_sha: projected.head_sha,
+      updated_at: projected.updated_at,
+    },
+    {
+      state: "green",
+      head_sha: "ci-b-green",
+      updated_at: "2026-07-13T10:02:00.000Z",
+    },
+  );
+  assert.deepEqual(
+    (await harness.events()).map((event: { title: string }) => event.title),
+    ["Malformed CI", "Delayed older CI", "Newer CI"],
+  );
+});
+
+test("dashboard CI projection resolves equal source timestamps by stable event key", async () => {
+  const runOrder = async (keys: string[]) => {
+    const harness = createCiProjectionHarness();
+    for (const key of keys) {
+      await harness.ingest({
+        idempotencyKey: key,
+        state: key === "ci-z" ? "green" : "red",
+        title: `CI ${key}`,
+        updatedAt: "2026-07-13T10:02:00.000Z",
+      });
+    }
+    const projected = await harness.projection();
+    return {
+      state: projected.state,
+      head_sha: projected.head_sha,
+      eventCount: (await harness.events()).length,
+    };
+  };
+
+  assert.deepEqual(await runOrder(["ci-z", "ci-a"]), {
+    state: "green",
+    head_sha: "ci-z-green",
+    eventCount: 2,
+  });
+  assert.deepEqual(await runOrder(["ci-a", "ci-z"]), {
+    state: "green",
+    head_sha: "ci-z-green",
+    eventCount: 2,
+  });
 });
 
 test("dashboard counts cluster-fixer operation events", async () => {

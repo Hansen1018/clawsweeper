@@ -399,11 +399,19 @@ export class StatusStore {
         expires_at: expiresAt,
       });
       await this.scheduleCleanup(expiresAt);
+      const ciProjected =
+        body.ci && upserted.isLatestForItem
+          ? await this.projectCiStatus(
+              body.ci,
+              numberFrom(body.ci_ttl_seconds, CI_STATUS_TTL_SECONDS),
+            )
+          : false;
       return json({
         ok: true,
         event: upserted.event,
         is_latest: upserted.isLatest,
         is_latest_for_item: upserted.isLatestForItem,
+        ci_projected: ciProjected,
       });
     }
 
@@ -428,6 +436,29 @@ export class StatusStore {
   private async scheduleCleanup(expiresAt: number) {
     const scheduled = await this.storage.getAlarm();
     if (scheduled === null || expiresAt < scheduled) await this.storage.setAlarm(expiresAt);
+  }
+
+  private async projectCiStatus(ci: unknown, ttlSeconds: number) {
+    const value = objectValue(ci);
+    const repository = nullableString(value.repository);
+    const itemNumber = numberOrNull(value.item_number);
+    if (!repository || !itemNumber) return false;
+
+    const key = ciStatusKey(repository, itemNumber);
+    const current = (await this.storage.get(key)) as StoredValue | undefined;
+    const currentValue =
+      current?.value && (!current.expires_at || current.expires_at > Date.now())
+        ? JSON.parse(current.value)
+        : null;
+    if (!shouldAdvanceCiProjection(currentValue, value)) return false;
+
+    const expiresAt = Date.now() + ttlSeconds * 1000;
+    await this.storage.put(key, {
+      value: JSON.stringify(value),
+      expires_at: expiresAt,
+    });
+    await this.scheduleCleanup(expiresAt);
+    return true;
   }
 }
 
@@ -1738,14 +1769,14 @@ async function ingestEvent(request, env) {
   if (idempotencyKey && idempotencyKey.length > 256) {
     return json({ error: "idempotency_key_too_long" }, 400);
   }
-  const ci = normalizeCiStatus(body);
+  const ci = normalizeCiStatus(body, idempotencyKey);
   const event = normalizeEvent(body, idempotencyKey, ci);
-  const stored = await prependStoredEvent(env, event);
+  const stored = await prependStoredEvent(env, event, ci);
   const writes = [];
   if (stored.isLatest) {
     writes.push(writeStoredJson(env, "latest-event", stored.event, EVENT_STORE_TTL_SECONDS));
   }
-  if (ci && stored.isLatestForItem) writes.push(writeCiStatus(env, ci));
+  if (ci && stored.shouldWriteCi) writes.push(writeCiStatus(env, ci));
   await Promise.all(writes);
   return json({ ok: true, event: stored.event });
 }
@@ -6305,7 +6336,7 @@ async function writeStoredJson(
   );
 }
 
-async function prependStoredEvent(env, event) {
+async function prependStoredEvent(env, event, ci = null) {
   const store = env.STATUS_STORE;
   if (isDurableStatusStore(store)) {
     const response = await durableStatusStoreStub(store).fetch(
@@ -6314,8 +6345,10 @@ async function prependStoredEvent(env, event) {
         method: "POST",
         body: JSON.stringify({
           event,
+          ci,
           limit: EVENT_LIMIT,
           ttl_seconds: EVENT_STORE_TTL_SECONDS,
+          ci_ttl_seconds: numberFrom(env.CI_STATUS_TTL_SECONDS, CI_STATUS_TTL_SECONDS),
         }),
       },
     );
@@ -6325,6 +6358,7 @@ async function prependStoredEvent(env, event) {
       event: stored.event,
       isLatest: stored.is_latest === true,
       isLatestForItem: stored.is_latest_for_item === true,
+      shouldWriteCi: false,
     };
   }
   const current = await readEvents(env);
@@ -6339,6 +6373,13 @@ async function prependStoredEvent(env, event) {
     event: upserted.event,
     isLatest: upserted.isLatest,
     isLatestForItem: upserted.isLatestForItem,
+    shouldWriteCi:
+      ci !== null &&
+      upserted.isLatestForItem &&
+      shouldAdvanceCiProjection(
+        await readStoredJson(env, ciStatusKey(ci.repository, ci.item_number)),
+        ci,
+      ),
   };
 }
 
@@ -6359,13 +6400,12 @@ function upsertStoredEvent(events, event) {
 
 function storedEventResult(events, event, index) {
   const itemKey = storedEventItemKey(event);
+  const projectionIndex = latestStoredEventProjectionIndex(events, itemKey);
   return {
     events,
     event,
     isLatest: index === 0,
-    isLatestForItem:
-      itemKey !== null &&
-      events.findIndex((candidate) => storedEventItemKey(candidate) === itemKey) === index,
+    isLatestForItem: projectionIndex !== -1 && projectionIndex === index,
   };
 }
 
@@ -6373,6 +6413,54 @@ function storedEventItemKey(event) {
   const repository = nullableString(event?.repository);
   const itemNumber = numberOrNull(event?.item_number);
   return repository && itemNumber ? `${repository}#${itemNumber}` : null;
+}
+
+function latestStoredEventProjectionIndex(events, itemKey) {
+  if (itemKey === null) return -1;
+  let winner = -1;
+  for (let index = 0; index < events.length; index += 1) {
+    if (storedEventItemKey(events[index]) !== itemKey) continue;
+    const order = ciProjectionOrder(events[index]);
+    if (!order) continue;
+    if (winner === -1 || compareCiProjectionOrder(order, ciProjectionOrder(events[winner])) > 0) {
+      winner = index;
+    }
+  }
+  return winner;
+}
+
+function shouldAdvanceCiProjection(current, incoming) {
+  const incomingOrder = ciProjectionOrder(incoming);
+  if (!incomingOrder) return false;
+  const currentTimestamp = canonicalCiSourceTimestamp(
+    current?.ci_projection_updated_at ?? current?.updated_at,
+  );
+  if (!currentTimestamp) return true;
+
+  const timestampOrder = compareCanonicalText(incomingOrder.timestamp, currentTimestamp);
+  if (timestampOrder !== 0) return timestampOrder > 0;
+  const currentKey = nullableString(current?.ci_projection_key ?? current?.source_event_key);
+  if (!currentKey) return false;
+  return (
+    incomingOrder.key === currentKey || compareCanonicalText(incomingOrder.key, currentKey) > 0
+  );
+}
+
+function ciProjectionOrder(value) {
+  const timestamp = canonicalCiSourceTimestamp(value?.ci_projection_updated_at);
+  const key = nullableString(value?.ci_projection_key);
+  return timestamp && key ? { timestamp, key } : null;
+}
+
+function compareCiProjectionOrder(left, right) {
+  if (!right) return 1;
+  const timestampOrder = compareCanonicalText(left.timestamp, right.timestamp);
+  return timestampOrder || compareCanonicalText(left.key, right.key);
+}
+
+function compareCanonicalText(left, right) {
+  if (left === right) return 0;
+  return left > right ? 1 : -1;
 }
 
 async function readStatusStoreText(store, key) {
@@ -6717,10 +6805,16 @@ function normalizeEvent(body, idempotencyKey = null, ci = null) {
     cluster_id: nullableString(body.cluster_id),
     duration_ms: numberOrNull(body.duration_ms),
     note: nullableString(body.note),
+    ...(ci?.ci_projection_updated_at
+      ? {
+          ci_projection_updated_at: ci.ci_projection_updated_at,
+          ci_projection_key: ci.ci_projection_key,
+        }
+      : {}),
   };
 }
 
-function normalizeCiStatus(body) {
+function normalizeCiStatus(body, idempotencyKey = null) {
   const ci =
     body.ci && typeof body.ci === "object"
       ? body.ci
@@ -6732,7 +6826,10 @@ function normalizeCiStatus(body) {
   const itemNumber = numberOrNull(ci.item_number ?? body.item_number);
   if (!repository || !Number.isInteger(itemNumber) || itemNumber <= 0) return null;
   const state = normalizeCiState(ci.state ?? ci.status ?? body.status);
-  return {
+  const receivedAt = new Date().toISOString();
+  const suppliedUpdatedAt = nullableString(ci.updated_at);
+  const projectionUpdatedAt = canonicalCiSourceTimestamp(suppliedUpdatedAt);
+  const normalized = {
     state,
     source: stringField(ci.source ?? body.source, "stored"),
     label: nullableString(ci.label),
@@ -6746,9 +6843,38 @@ function normalizeCiStatus(body) {
     total: Math.max(0, numberOrNull(ci.total) ?? 0),
     failing: Math.max(0, numberOrNull(ci.failing) ?? 0),
     pending: Math.max(0, numberOrNull(ci.pending) ?? 0),
-    updated_at: nullableString(ci.updated_at) || new Date().toISOString(),
-    received_at: new Date().toISOString(),
+    updated_at: projectionUpdatedAt ?? suppliedUpdatedAt,
+    received_at: receivedAt,
   };
+  if (!projectionUpdatedAt) return normalized;
+  return {
+    ...normalized,
+    ci_projection_updated_at: projectionUpdatedAt,
+    ci_projection_key: ciProjectionKey(normalized, idempotencyKey),
+  };
+}
+
+function canonicalCiSourceTimestamp(value) {
+  const text = nullableString(value);
+  if (!text) return null;
+  const timestamp = Date.parse(text);
+  return Number.isFinite(timestamp) ? new Date(timestamp).toISOString() : null;
+}
+
+function ciProjectionKey(ci, idempotencyKey) {
+  if (idempotencyKey) return `idempotency:${idempotencyKey}`;
+  return `snapshot:${JSON.stringify([
+    ci.repository,
+    ci.item_number,
+    ci.source,
+    ci.label,
+    ci.run_url,
+    ci.head_sha,
+    ci.state,
+    ci.total,
+    ci.failing,
+    ci.pending,
+  ])}`;
 }
 
 function normalizeCiState(value) {
