@@ -248,13 +248,13 @@ local `setup-codex` action's `auth-mode: login` input.
 Codex runs in a read-only sandbox for classification and receives no GitHub token. GitHub read access is scoped to deterministic preflight scripts. For reviewed fix artifacts, `execute-fix-artifact` gives Codex a temporary target checkout without GitHub credentials, then the deterministic executor commits, pushes, opens the replacement PR, and closes uneditable source PRs only after the replacement exists. When a replacement carries contributor work forward, non-bot source PR authors are added as `Co-authored-by` trailers and named in the replacement PR body and source close comment. Remaining write access is scoped to `apply-result`.
 
 The repair worker wrapper emits a heartbeat while Codex is running. Execute-side
-edit, review, final rebase, and write-preflight subprocesses emit the same
+edit, review, and final rebase subprocesses emit the same
 heartbeat. If a model call is slow, Actions logs should show
 `[clawsweeper repair] ... still running` about once a minute instead of ending
 with a silent no-output timeout.
 
 Automerge repair execution also updates the existing mutable automerge status
-comment at coarse milestones: validation plan, write preflight, Codex edit
+comment at coarse milestones: validation plan, Codex edit
 passes, validation/review loops, final base sync, and the post-repair automerge
 wait. These updates append or replace rows in the single progress timeline
 instead of adding new comments.

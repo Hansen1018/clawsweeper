@@ -49,7 +49,7 @@ test("no-op automerge repair updates outcome and re-enters router before exit", 
   );
 });
 
-test("repair source branch writability preflight runs before expensive repair preflights", () => {
+test("repair source branch writability preflight runs before target repair", () => {
   const sourcePath = path.join(process.cwd(), "src/repair/execute-fix-artifact.ts");
   const source = readText(sourcePath);
 
@@ -58,17 +58,17 @@ test("repair source branch writability preflight runs before expensive repair pr
   );
   const checkoutIndex = source.indexOf("ensureTargetCheckout(result.repo, targetDir);");
   const validationIndex = source.indexOf("preflightTargetValidationPlan(");
-  const codexPreflightIndex = source.indexOf("const writePreflight = runCodexWritePreflight();");
+  const repairIndex = source.indexOf("outcome = executeRepairBranch({ fixArtifact, targetDir });");
 
   assert.notEqual(branchPreflightIndex, -1);
   assert.notEqual(checkoutIndex, -1);
   assert.notEqual(validationIndex, -1);
-  assert.notEqual(codexPreflightIndex, -1);
+  assert.notEqual(repairIndex, -1);
   assert.ok(
     branchPreflightIndex < checkoutIndex &&
       checkoutIndex < validationIndex &&
-      validationIndex < codexPreflightIndex,
-    "live source-branch writability must be resolved before checkout, validation planning, and Codex write preflight",
+      validationIndex < repairIndex,
+    "live source-branch writability must be resolved before checkout, validation planning, and repair",
   );
 });
 
@@ -143,7 +143,7 @@ test("merged source replacement skip runs before publishing replacement PRs", ()
   );
 });
 
-test("terminal Codex failures do not request repair requeue", () => {
+test("terminal Codex and persistent setup failures do not request repair requeue", () => {
   const sourcePath = path.join(process.cwd(), "src/repair/execute-fix-artifact.ts");
   const source = readText(sourcePath);
   const helperStart = source.indexOf("function isRetryableCodexFailure(");
@@ -155,14 +155,19 @@ test("terminal Codex failures do not request repair requeue", () => {
   const terminalGuardIndex = helper.indexOf(
     "if (messages.some((value) => isTerminalCodexErrorMessage(value))) return false;",
   );
+  const setupGuardIndex = helper.indexOf(
+    "if (isPersistentCodexSetupFailure(message)) return false;",
+  );
   const broadFallbackIndex = helper.indexOf("/Codex .*(?:timed out|failed|exited)");
 
   assert.notEqual(terminalGuardIndex, -1);
+  assert.notEqual(setupGuardIndex, -1);
   assert.notEqual(broadFallbackIndex, -1);
   assert.ok(
-    terminalGuardIndex < broadFallbackIndex,
-    "terminal model-access failures must be rejected before the broad Codex failure fallback",
+    terminalGuardIndex < setupGuardIndex && setupGuardIndex < broadFallbackIndex,
+    "terminal and persistent setup failures must be rejected before the broad Codex failure fallback",
   );
+  assert.match(source, /sandbox \(\?:wrapper\|startup\)/);
 });
 
 test("repair Codex heartbeat wrapper uses bounded process capture", () => {

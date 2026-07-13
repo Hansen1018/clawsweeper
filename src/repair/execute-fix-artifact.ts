@@ -171,9 +171,6 @@ const executionModelArgs = codexModelArgs(model);
 const { codexTimeoutMs, fixStepTimeoutMs, lateWorkerReserveMs } = repairTimeoutBudgetFromEnv(
   process.env,
 );
-const codexPreflightTimeoutMs = Number(
-  process.env.CLAWSWEEPER_FIX_PREFLIGHT_TIMEOUT_MS ?? 2 * 60 * 1000,
-);
 const codexReasoningEffort = repairCodexReasoningEffort();
 const scriptStartedAt = new Date();
 const codexServiceTier = repairCodexServiceTier();
@@ -184,7 +181,6 @@ const codexHeartbeatMs = Math.max(
 const maxEditAttempts = Math.max(1, Number(process.env.CLAWSWEEPER_FIX_EDIT_ATTEMPTS ?? 3));
 const maxReviewAttempts = Math.max(1, Number(process.env.CLAWSWEEPER_CODEX_REVIEW_ATTEMPTS ?? 4));
 const resolveReviewThreads = process.env.CLAWSWEEPER_RESOLVE_REVIEW_THREADS !== "0";
-const skipCodexWritePreflight = process.env.CLAWSWEEPER_SKIP_CODEX_WRITE_PREFLIGHT === "1";
 const allowExpensiveValidation = process.env.CLAWSWEEPER_ALLOW_EXPENSIVE_VALIDATION === "1";
 const installTargetDeps = process.env.CLAWSWEEPER_INSTALL_TARGET_DEPS !== "0";
 const allowBroadFixArtifacts = process.env.CLAWSWEEPER_ALLOW_BROAD_FIX_ARTIFACTS === "1";
@@ -600,39 +596,6 @@ updateAutomergeProgressStatus({
   details: listOrNone(validationPreflight.resolved_commands ?? []),
 });
 
-logProgress("running Codex write preflight", {
-  timeout_ms: codexPreflightTimeoutMs,
-  sandbox: codexWriteSandbox,
-});
-updateAutomergeProgressStatus({
-  id: "codex-write-preflight",
-  label: "Codex write preflight",
-  status: "running",
-  details: codexWriteSandbox,
-});
-const writePreflight = runCodexWritePreflight();
-report.preflight = writePreflight;
-if (writePreflight.status === "blocked") {
-  report.status = "blocked";
-  report.reason = writePreflight.reason;
-  report.actions.push({
-    action: "execute_fix",
-    status: "blocked",
-    repair_strategy: fixArtifact.repair_strategy,
-    reason: writePreflight.reason,
-    evidence: writePreflight.evidence,
-  });
-  writeReport(report, resultPath);
-  process.exit(isRetryableCodexFailure(writePreflight.reason, writePreflight.evidence) ? 1 : 0);
-}
-logProgress("Codex write preflight passed", { status: writePreflight.status });
-updateAutomergeProgressStatus({
-  id: "codex-write-preflight",
-  label: "Codex write preflight",
-  status: writePreflight.status,
-  details: codexWriteSandbox,
-});
-
 let outcome: JsonValue;
 try {
   if (fixArtifact.repair_strategy === "repair_contributor_branch") {
@@ -731,9 +694,16 @@ function isRetryableCodexFailure(...values: JsonValue[]) {
   const messages = values.flat().map(String);
   const message = messages.join("\n");
   if (messages.some((value) => isTerminalCodexErrorMessage(value))) return false;
+  if (isPersistentCodexSetupFailure(message)) return false;
   return (
     isRetryableCodexTransportError(message) ||
     /Codex .*(?:timed out|failed|exited)|Codex produced no structured result/i.test(message)
+  );
+}
+
+function isPersistentCodexSetupFailure(message: string) {
+  return /can(?:not|'t|’t)\s+create\s+files?\s+in\s+this\s+mode|switch\s+to\s+execution\s+mode|bwrap|loopback|uid map|sandbox (?:wrapper|startup)|operation not permitted|auth(?:entication)? unavailable|login required|api key|401|403|unauthorized|forbidden/i.test(
+    message,
   );
 }
 
@@ -2569,92 +2539,6 @@ function readTextIfExists(filePath: string) {
   return fs.existsSync(filePath) ? fs.readFileSync(filePath, "utf8") : "";
 }
 
-function runCodexWritePreflight() {
-  if (skipCodexWritePreflight) {
-    return {
-      status: "skipped",
-      reason: "CLAWSWEEPER_SKIP_CODEX_WRITE_PREFLIGHT=1",
-      sandbox: codexWriteSandbox,
-    };
-  }
-
-  const smokeDir = fs.mkdtempSync(path.join(workRoot, "codex-write-preflight-"));
-  const summaryPath = path.join(workRoot, "codex-write-preflight-summary.md");
-  const expectedPath = path.join(smokeDir, "preflight.txt");
-  const prompt = [
-    "You are running a ClawSweeper Repair Codex write preflight.",
-    "",
-    "Create or overwrite `preflight.txt` in the current directory with exactly:",
-    "",
-    "ok",
-    "",
-    "Do not inspect environment variables, credentials, tokens, or secrets.",
-    "Do not call gh, git push, open PRs, or mutate anything outside the current directory.",
-  ].join("\n");
-  const child = spawnCodexSyncWithHeartbeat(
-    "Codex write preflight",
-    [
-      "exec",
-      "--cd",
-      smokeDir,
-      ...executionModelArgs,
-      "--sandbox",
-      codexWriteSandbox,
-      ...codexWriteSandboxConfigArgs(),
-      ...codexConfigArgs(),
-      "--output-last-message",
-      summaryPath,
-      "--json",
-      "--skip-git-repo-check",
-      "-",
-    ],
-    {
-      cwd: smokeDir,
-      input: prompt,
-      encoding: "utf8",
-      env: codexEnv(),
-      timeout: codexPreflightTimeoutMs,
-      stdoutPath: path.join(workRoot, "codex-write-preflight.jsonl"),
-      stderrPath: path.join(workRoot, "codex-write-preflight.stderr.log"),
-    },
-  );
-
-  if ((child.error as JsonValue)?.code === "ETIMEDOUT") {
-    return blockedCodexWritePreflight(
-      `Codex write preflight timed out after ${codexPreflightTimeoutMs}ms`,
-      child.stderr || child.stdout,
-    );
-  }
-  if (child.status !== 0) {
-    return blockedCodexWritePreflight("Codex write preflight failed", child.stderr || child.stdout);
-  }
-  const written = readTextIfExists(expectedPath).trim();
-  if (written !== "ok") {
-    return blockedCodexWritePreflight(
-      "Codex write preflight did not create the expected file",
-      readTextIfExists(summaryPath) || child.stderr || child.stdout,
-    );
-  }
-  return {
-    status: "passed",
-    sandbox: codexWriteSandbox,
-    timeout_ms: codexPreflightTimeoutMs,
-    evidence: [`Codex wrote ${path.basename(expectedPath)} in an isolated preflight directory.`],
-  };
-}
-
-function blockedCodexWritePreflight(reason: string, detail: string) {
-  const failureClass = classifyCodexFailure(detail);
-  return {
-    status: "blocked",
-    reason: `${reason}: ${compactText(detail || "no Codex output", 900)}`,
-    failure_class: failureClass,
-    sandbox: codexWriteSandbox,
-    timeout_ms: codexPreflightTimeoutMs,
-    evidence: [`Codex write preflight failed before target repo mutation; class=${failureClass}`],
-  };
-}
-
 function codexFailureDetail(child: LooseRecord, fallback: string) {
   const detail =
     codexJsonlFailureDetail(String(child.stdout ?? "")) ||
@@ -2684,26 +2568,6 @@ function stripAnsi(value: string) {
     }
   }
   return out;
-}
-
-function classifyCodexFailure(detail: string) {
-  const text = String(detail ?? "");
-  if (
-    /can(?:not|'t|’t)\s+create\s+files?\s+in\s+this\s+mode|switch\s+to\s+execution\s+mode|create\s+`?preflight\.txt`?\s+containing/i.test(
-      text,
-    )
-  ) {
-    return "codex_execution_mode_unavailable";
-  }
-  if (
-    /bwrap|loopback|uid map|sandbox wrapper|sandbox startup|operation not permitted/i.test(text)
-  ) {
-    return "sandbox_unavailable";
-  }
-  if (/auth|login|api key|401|403|unauthorized|forbidden/i.test(text)) {
-    return "auth_unavailable";
-  }
-  return "codex_unavailable";
 }
 
 function codexWriteSandboxConfigArgs() {

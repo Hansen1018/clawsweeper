@@ -56,6 +56,11 @@ on:
         required: false
         default: false
         type: boolean
+      requeue_depth:
+        description: "Bounded automatic repair retry depth"
+        required: false
+        default: 0
+        type: number
 
 permissions:
   contents: read
@@ -397,6 +402,9 @@ jobs:
     if: ${{ needs.cluster.result == 'success' && needs.cluster.outputs.job_exists == '1' && (inputs.mode == 'execute' || inputs.mode == 'autonomous') && !inputs.dry_run }}
     runs-on: ${{ inputs.execution_runner }}
     timeout-minutes: 75
+    permissions:
+      actions: read
+      contents: read
     env:
       CLAWSWEEPER_ALLOWED_OWNER: ${{ vars.CLAWSWEEPER_ALLOWED_OWNER || 'openclaw' }}
       CLAWSWEEPER_ALLOW_EXECUTE: ${{ needs.cluster.outputs.allow_execute == '1' && '1' || '0' }}
@@ -407,7 +415,6 @@ jobs:
       CLAWSWEEPER_FIX_CODEX_TIMEOUT_MS: ${{ vars.CLAWSWEEPER_FIX_CODEX_TIMEOUT_MS || '1800000' }}
       CLAWSWEEPER_FIX_STEP_TIMEOUT_MS: ${{ vars.CLAWSWEEPER_FIX_STEP_TIMEOUT_MS || '4200000' }}
       CLAWSWEEPER_FIX_TIMEOUT_RESERVE_MS: ${{ vars.CLAWSWEEPER_FIX_TIMEOUT_RESERVE_MS || '1800000' }}
-      CLAWSWEEPER_FIX_PREFLIGHT_TIMEOUT_MS: ${{ vars.CLAWSWEEPER_FIX_PREFLIGHT_TIMEOUT_MS || '120000' }}
       CLAWSWEEPER_RESOLVE_REVIEW_THREADS: ${{ vars.CLAWSWEEPER_RESOLVE_REVIEW_THREADS || '1' }}
       CLAWSWEEPER_TARGET_VALIDATION_MODE: ${{ vars.CLAWSWEEPER_TARGET_VALIDATION_MODE || 'changed-only' }}
       CLAWSWEEPER_POST_FLIGHT_IGNORE_CHECKS: ${{ vars.CLAWSWEEPER_POST_FLIGHT_IGNORE_CHECKS || 'auto-response,Labeler,Stale' }}
@@ -479,7 +486,9 @@ jobs:
         with:
           token: ${{ steps.state-token.outputs.token }}
           fetch-depth: 1
-          sparse-checkout: jobs
+          sparse-checkout: |
+            jobs
+            ledger
 
       - name: Check job file
         id: check_job
@@ -501,6 +510,7 @@ jobs:
           echo "CLAWSWEEPER_CODEX_THREAD_STATE=$codex_home/clawsweeper-thread-state.json" >> "$GITHUB_ENV"
 
       - uses: ./.github/actions/setup-pnpm
+        id: execute-setup-pnpm
         if: ${{ steps.check_job.outputs.job_exists == '1' }}
         with:
           build-script: build:repair
@@ -740,9 +750,13 @@ jobs:
           count="$(pnpm run --silent workflow -- count-requeue-required --dir .clawsweeper-repair/runs)"
           echo "count=$count" >> "$GITHUB_OUTPUT"
 
+      - uses: ./.github/actions/setup-action-ledger
+        id: repair-requeue-ledger
+        if: ${{ always() && steps.repair_requeue.outputs.count != '' && steps.repair_requeue.outputs.count != '0' }}
+
       - name: Requeue source-head repair races
         id: requeue_dispatch
-        if: ${{ always() && steps.repair_requeue.outputs.count != '' && steps.repair_requeue.outputs.count != '0' }}
+        if: ${{ always() && steps.repair-requeue-ledger.outcome == 'success' && steps.repair_requeue.outputs.count != '' && steps.repair_requeue.outputs.count != '0' }}
         env:
           GH_TOKEN: ${{ steps.requeue-token.outputs.token }}
           CLAWSWEEPER_MUTATION_TOKEN_SOURCE: clawsweeper-app
@@ -754,9 +768,62 @@ jobs:
             --execute \
             --open-execute-window \
             --wait-for-capacity \
+            --source-job-path "${{ inputs.job }}" \
+            --requeue-depth "${{ inputs.requeue_depth }}" \
+            --max-requeue-depth 1 \
             --runner "${{ inputs.runner }}" \
             --execution-runner "${{ inputs.execution_runner }}" \
             --model "${{ inputs.model }}"
+
+      - name: Finalize repair requeue action ledger
+        if: ${{ always() && steps.execute-setup-pnpm.outcome == 'success' && steps.repair-requeue-ledger.outcome == 'success' && steps.repair_requeue.outputs.count != '' && steps.repair_requeue.outputs.count != '0' }}
+        run: |
+          set -euo pipefail
+          : "${CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:?setup-action-ledger output root is required}"
+          mkdir -p .artifacts
+          pnpm run --silent repair:action-ledger -- finalize \
+            --lane repair-requeue \
+            > .artifacts/repair-requeue-action-ledger-manifest.json
+
+      - name: Publish immutable repair requeue action ledger
+        if: ${{ always() && steps.execute-setup-pnpm.outcome == 'success' && steps.repair-requeue-ledger.outcome == 'success' && steps.repair_requeue.outputs.count != '' && steps.repair_requeue.outputs.count != '0' }}
+        run: |
+          set -euo pipefail
+          test -n "${CLAWSWEEPER_STATE_DIR:-}"
+          source_root="${CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:?setup-action-ledger output root is required}"
+          manifest_file=".artifacts/repair-requeue-action-ledger-manifest.json"
+          test -s "$manifest_file"
+          event_paths_file=".artifacts/repair-requeue-action-ledger-paths.txt"
+          import_result_file=".artifacts/repair-requeue-action-ledger-import.json"
+          pnpm run --silent repair:action-ledger -- publish \
+            --lane repair-requeue \
+            --manifest "$manifest_file" \
+            --source-root "$source_root" \
+            --state-root "$CLAWSWEEPER_STATE_DIR" > "$import_result_file"
+          if ! jq -e --slurpfile manifest "$manifest_file" \
+            '.eventPaths == $manifest[0].event_paths' \
+            "$import_result_file" >/dev/null; then
+            echo "Imported repair requeue action event paths do not match the finalized manifest." >&2
+            exit 1
+          fi
+          jq -r '.paths[]?' "$import_result_file" |
+            sort -u > "$event_paths_file"
+          if [ ! -s "$event_paths_file" ]; then
+            echo "Repair requeue action event shards existed but no paths were imported." >&2
+            exit 1
+          fi
+          action_ledger_args=()
+          while IFS= read -r event_path; do
+            durable_event_path="$CLAWSWEEPER_STATE_DIR/$event_path"
+            test -f "$durable_event_path"
+            mkdir -p "$(dirname "$event_path")"
+            cp "$durable_event_path" "$event_path"
+            action_ledger_args+=(--path "$event_path")
+          done < "$event_paths_file"
+          pnpm run repair:publish-main -- \
+            --message "chore: append repair requeue action ledger" \
+            "${action_ledger_args[@]}" \
+            --rebase-strategy normal
 
       - name: Record requeued work
         if: ${{ always() && steps.crabfleet_session.outcome == 'success' && steps.repair_requeue.outputs.count != '' && steps.repair_requeue.outputs.count != '0' && steps.requeue_dispatch.outcome == 'success' }}
