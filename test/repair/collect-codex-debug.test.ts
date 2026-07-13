@@ -206,6 +206,20 @@ test("redactSecrets masks common token shapes", () => {
   );
 });
 
+test("redactSecrets masks multiline credentials and private keys", () => {
+  const redacted = redactSecrets(
+    [
+      "private_key: |",
+      "  -----BEGIN PRIVATE KEY-----",
+      "  sensitive-key-material",
+      "  -----END PRIVATE KEY-----",
+    ].join("\n"),
+  );
+
+  assert.doesNotMatch(redacted, /BEGIN PRIVATE KEY|sensitive-key-material|END PRIVATE KEY/);
+  assert.match(redacted, /private_key: \[REDACTED\]\n  \[REDACTED_MULTILINE\]/);
+});
+
 test("collectCodexDebug redacts file-sourced credentials absent from the current environment", () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-codex-debug-historical-"));
   const codexHome = path.join(tmp, ".codex");
@@ -236,6 +250,40 @@ test("collectCodexDebug redacts file-sourced credentials absent from the current
     assert.match(artifact, /"actions_token":"\[REDACTED\]"/);
     assert.match(artifact, /Bearer \[REDACTED\]/);
     assert.match(artifact, /"token":"\[REDACTED\]"/);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("collectCodexDebug redacts retained multiline private keys", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-codex-debug-private-key-"));
+  const codexHome = path.join(tmp, ".codex");
+  const outDir = path.join(tmp, "out");
+  fs.mkdirSync(path.join(codexHome, "sessions"), { recursive: true });
+  fs.writeFileSync(
+    path.join(codexHome, "sessions", "private-key.jsonl"),
+    [
+      "private_key: |",
+      "  -----BEGIN PRIVATE KEY-----",
+      "  sensitive-key-material",
+      "  -----END PRIVATE KEY-----",
+    ].join("\n"),
+  );
+
+  try {
+    const result = collectCodexDebug({
+      outDir,
+      label: "private-key",
+      sinceMinutes: 60,
+      maxBytes: 1024 * 1024,
+      homeDir: tmp,
+      codexHome,
+    });
+
+    assert.equal(result.manifest.length, 1);
+    const artifact = fs.readFileSync(path.join(outDir, "sessions", "private-key.jsonl"), "utf8");
+    assert.doesNotMatch(artifact, /BEGIN PRIVATE KEY|sensitive-key-material|END PRIVATE KEY/);
+    assert.match(artifact, /\[REDACTED_MULTILINE\]/);
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }

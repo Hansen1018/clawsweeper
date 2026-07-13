@@ -36,6 +36,8 @@ const DEFAULT_MAX_BYTES = 100 * 1024 * 1024;
 const SENSITIVE_FIELD_NAME = String.raw`(?=[A-Za-z_])[A-Za-z0-9_.-]*(?:token|api[_-]?key|secret|password|credential|private[_-]?key)[A-Za-z0-9_.-]*`;
 const JWT_PATTERN = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g;
 const BEARER_PATTERN = /\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/gi;
+const PRIVATE_KEY_PEM_PATTERN =
+  /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/g;
 
 export function collectCodexDebug(options: CollectOptions) {
   const codexHome = resolveCodexHome(options);
@@ -120,6 +122,14 @@ export function redactSecrets(text: string, redactValues: string[] = [], codexHo
     .replace(/\bgh[pousr]_[A-Za-z0-9_]{20,}\b/g, "[REDACTED_GITHUB_TOKEN]")
     .replace(JWT_PATTERN, "[REDACTED_JWT]")
     .replace(BEARER_PATTERN, "Bearer [REDACTED]")
+    .replace(PRIVATE_KEY_PEM_PATTERN, "[REDACTED_PRIVATE_KEY]")
+    .replace(
+      new RegExp(
+        `^(\\s*${SENSITIVE_FIELD_NAME}\\s*:\\s*[>|][+-]?\\s*)\\r?\\n(?:[ \\t]+.*(?:\\r?\\n|$))+`,
+        "gim",
+      ),
+      "$1\n  [REDACTED_MULTILINE]\n",
+    )
     .replace(
       new RegExp(`\\b(${SENSITIVE_FIELD_NAME})\\s*=\\s*([^\\s"',;]+)`, "gi"),
       "$1=[REDACTED]",
@@ -148,7 +158,8 @@ function containsSensitiveValue(text: string, redactValues: string[]): boolean {
     /\bgithub_pat_[A-Za-z0-9_]{20,}\b/.test(text) ||
     /\bgh[pousr]_[A-Za-z0-9_]{20,}\b/.test(text) ||
     new RegExp(JWT_PATTERN.source).test(text) ||
-    new RegExp(BEARER_PATTERN.source, "i").test(text)
+    new RegExp(BEARER_PATTERN.source, "i").test(text) ||
+    new RegExp(PRIVATE_KEY_PEM_PATTERN.source).test(text)
   ) {
     return true;
   }

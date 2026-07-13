@@ -30,6 +30,11 @@ export interface CodexOutputCapture {
   pending: Buffer<ArrayBufferLike>;
 }
 
+export interface CodexTextRedactor {
+  redactions: Buffer<ArrayBufferLike>[];
+  pending: Buffer<ArrayBufferLike>;
+}
+
 export function openCodexOutputCapture(
   filePath: string,
   options: { maxFileBytes?: number; tailBytes?: number; redactValues?: readonly string[] } = {},
@@ -99,6 +104,24 @@ export function redactCodexText(value: string, redactValues: readonly string[]):
     (redacted, secret) => redacted.replaceAll(secret, "[REDACTED]"),
     value,
   );
+}
+
+export function createCodexTextRedactor(redactValues: readonly string[] = []): CodexTextRedactor {
+  return {
+    redactions: normalizedRedactions(redactValues),
+    pending: Buffer.alloc(0),
+  };
+}
+
+export function redactCodexTextChunk(
+  redactor: CodexTextRedactor,
+  value: string,
+  flush = false,
+): string {
+  const combined = Buffer.concat([redactor.pending, Buffer.from(value, "utf8")]);
+  const redacted = redactAvailableBuffer(combined, redactor.redactions, flush);
+  redactor.pending = redacted.pending;
+  return redacted.output.toString("utf8");
 }
 
 export function redactCodexOutputLastMessage(

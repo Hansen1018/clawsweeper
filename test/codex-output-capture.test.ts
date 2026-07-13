@@ -8,8 +8,10 @@ import {
   appendCodexOutputCapture,
   closeCodexOutputCapture,
   codexOutputTail,
+  createCodexTextRedactor,
   openCodexOutputCapture,
   redactCodexOutputLastMessage,
+  redactCodexTextChunk,
 } from "../dist/codex-output-capture.js";
 
 test("Codex output redaction spans stream chunk boundaries before persistence", () => {
@@ -54,6 +56,17 @@ test("Codex output redaction prefers the longest value and flushes partial suffi
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("Codex text redaction spans independently delivered chunks", () => {
+  const secret = "runtime-token-123456";
+  const redactor = createCodexTextRedactor([secret]);
+
+  const first = redactCodexTextChunk(redactor, "before runtime-token-");
+  const second = redactCodexTextChunk(redactor, "123456 after", true);
+
+  assert.doesNotMatch(first, /runtime-token/);
+  assert.equal(first + second, "before [REDACTED] after");
 });
 
 test("Codex last-message redaction atomically replaces structured output", () => {

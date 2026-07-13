@@ -51,10 +51,7 @@ const resultRepairTimeoutMs = Number(
 const codexReasoningEffort = repairCodexReasoningEffort();
 const codexServiceTier = repairCodexServiceTier();
 const codexRedactValues = repairCodexRedactValues();
-const codexPlannerSandbox =
-  process.env.CLAWSWEEPER_CODEX_PLANNER_SANDBOX === "danger-full-access"
-    ? "danger-full-access"
-    : "read-only";
+const codexPlannerSandbox = "read-only";
 const codexHeartbeatMs = Math.max(
   10_000,
   Number(process.env.CLAWSWEEPER_CODEX_HEARTBEAT_MS ?? 60_000),
@@ -94,6 +91,7 @@ const promptPath = path.join(runDir, "prompt.md");
 const resultPath = path.join(runDir, "result.json");
 const transcriptPath = path.join(runDir, "codex.jsonl");
 const codexStderrPath = path.join(runDir, "codex.stderr.log");
+let codexResultTempDir = "";
 const promptContext: Record<string, string> = {};
 const targetCheckout = dryRun ? "" : prepareTargetCheckout(job);
 if (targetCheckout) {
@@ -179,10 +177,11 @@ const plannerAction = beginRepairCodexAction(repairWorkerLifecycle(), {
   component: "repair_worker_codex",
 });
 let child: LooseRecord;
+const initialCodexResultPath = temporaryCodexResultPath("initial");
 try {
   child = await runCodex({
     input: prompt,
-    outputPath: resultPath,
+    outputPath: initialCodexResultPath,
     transcriptPath,
     stderrPath: codexStderrPath,
     timeoutMs: codexTimeoutMs,
@@ -216,14 +215,14 @@ if (child.status !== 0) {
   process.exit(1);
 }
 
-if (!fs.existsSync(resultPath)) {
+if (!fs.existsSync(initialCodexResultPath)) {
   const detail = "Codex worker completed without a structured result.json artifact.";
   plannerAction.fail(new Error(detail));
   writeBlockedResult(detail);
   process.exit(1);
 }
 try {
-  sanitizeResultFile(resultPath);
+  publishSanitizedCodexResult(initialCodexResultPath, resultPath);
   plannerAction.complete();
 } catch (error) {
   plannerAction.fail(error);
@@ -428,6 +427,7 @@ async function repairResultIfNeeded() {
 
     const repairTranscriptPath = path.join(runDir, `codex-repair-${attempt}.jsonl`);
     const repairStderrPath = path.join(runDir, `codex-repair-${attempt}.stderr.log`);
+    const repairOutputPath = temporaryCodexResultPath(`repair-${attempt}`);
     const repairAction = beginRepairCodexAction(repairWorkerLifecycle(), {
       action: "repair_result_repair",
       mode: String(mode),
@@ -439,7 +439,7 @@ async function repairResultIfNeeded() {
     try {
       repair = await runCodex({
         input: repairPrompt,
-        outputPath: resultPath,
+        outputPath: repairOutputPath,
         transcriptPath: repairTranscriptPath,
         stderrPath: repairStderrPath,
         timeoutMs: resultRepairTimeoutMs,
@@ -462,7 +462,7 @@ async function repairResultIfNeeded() {
       return;
     }
     try {
-      sanitizeResultFile(resultPath);
+      publishSanitizedCodexResult(repairOutputPath, resultPath);
       repairAction.complete();
     } catch (error) {
       repairAction.fail(error);
@@ -546,6 +546,35 @@ function writeBlockedResult(summary: LooseRecord) {
   };
   sanitizeResultEvidence(result);
   fs.writeFileSync(resultPath, `${JSON.stringify(result, null, 2)}\n`);
+}
+
+function temporaryCodexResultPath(label: string): string {
+  if (!codexResultTempDir) {
+    codexResultTempDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-codex-result-"));
+    process.once("exit", () => fs.rmSync(codexResultTempDir, { recursive: true, force: true }));
+  }
+  return path.join(codexResultTempDir, `${label}.json`);
+}
+
+function publishSanitizedCodexResult(sourcePath: string, destinationPath: string): void {
+  const parsed = JSON.parse(fs.readFileSync(sourcePath, "utf8"));
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("Codex structured result must be a JSON object");
+  }
+  sanitizeResultEvidence(parsed as LooseRecord);
+  const temporaryPath = `${destinationPath}.sanitized-${process.pid}`;
+  try {
+    fs.writeFileSync(temporaryPath, `${JSON.stringify(parsed, null, 2)}\n`, {
+      encoding: "utf8",
+      mode: 0o600,
+    });
+    fs.renameSync(temporaryPath, destinationPath);
+  } catch (error) {
+    fs.rmSync(temporaryPath, { force: true });
+    throw error;
+  } finally {
+    fs.rmSync(sourcePath, { force: true });
+  }
 }
 
 function sanitizeResultFile(filePath: string) {

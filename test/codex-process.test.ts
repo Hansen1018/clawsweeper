@@ -344,7 +344,12 @@ rl.on("line", (line) => {
       send({ method: "item/agentMessage/delta", params: {
         threadId: "thread-1",
         turnId: "turn-1",
-        delta: "runtime-token-123456"
+        delta: "runtime-token-"
+      } });
+      send({ method: "item/agentMessage/delta", params: {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        delta: "123456"
       } });
       send({ method: "item/completed", params: {
         threadId: "thread-1",
@@ -406,6 +411,7 @@ rl.on("line", (line) => {
       assert.equal(result.error, undefined);
       assert.equal(readFileSync(outputPath, "utf8"), '{"status":"planned","token":"[REDACTED]"}');
       assert.doesNotMatch(result.stdout, new RegExp(secret));
+      assert.match(result.stdout, /\[REDACTED\]/);
     }
 
     const state = JSON.parse(readFileSync(statePath, "utf8"));

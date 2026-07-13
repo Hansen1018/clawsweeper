@@ -5,8 +5,9 @@ import {
   appendCodexOutputCapture,
   closeCodexOutputCapture,
   codexOutputTail,
+  createCodexTextRedactor,
   openCodexOutputCapture,
-  redactCodexText,
+  redactCodexTextChunk,
 } from "./codex-output-capture.js";
 import { spawnCodex, terminateCodexProcessTree, waitForCodexProcessExit } from "./codex-spawn.js";
 
@@ -74,6 +75,7 @@ const stderr = openCodexOutputCapture(options.stderrPath, {
   tailBytes: options.tailBytes,
   redactValues: input.redactValues,
 });
+const terminalRedactor = createCodexTextRedactor(input.redactValues);
 process.env.CODEX_BIN = options.command;
 const child = spawnCodex(
   [
@@ -245,7 +247,8 @@ async function handleRpcMessage(message: RpcMessage): Promise<void> {
   if (message.method === "item/completed") {
     const item = recordAt(message.params, ["item"]);
     if (item?.type === "agentMessage" && typeof item.text === "string") {
-      finalMessage = redactCodexText(item.text, input.redactValues);
+      const finalRedactor = createCodexTextRedactor(input.redactValues);
+      finalMessage = redactCodexTextChunk(finalRedactor, item.text, true);
     }
     return;
   }
@@ -261,6 +264,7 @@ async function handleRpcMessage(message: RpcMessage): Promise<void> {
   terminalWrite(
     `\r\n\r\n[ClawSweeper] Codex turn ${turnStatus || "finished"}. Deterministic repair gates continue in GitHub Actions.\r\n`,
   );
+  flushTerminalOutput();
   clearTimeout(timeout);
   await updateWorkState(
     failed ? "blocked" : "running",
@@ -383,8 +387,15 @@ async function updateWorkState(state: string, phase: string, summary: string): P
 
 function terminalWrite(value: string): void {
   if (terminal?.readyState === WebSocket.OPEN) {
-    terminal.send(redactCodexText(value, input.redactValues));
+    const output = redactCodexTextChunk(terminalRedactor, value);
+    if (output) terminal.send(output);
   }
+}
+
+function flushTerminalOutput(): void {
+  if (terminal?.readyState !== WebSocket.OPEN) return;
+  const output = redactCodexTextChunk(terminalRedactor, "", true);
+  if (output) terminal.send(output);
 }
 
 async function finish(status: number, signal: NodeJS.Signals | null, error?: Error): Promise<void> {
@@ -401,6 +412,7 @@ async function finish(status: number, signal: NodeJS.Signals | null, error?: Err
     forceKillTimer = terminateCodexProcessTree(child);
     await waitForCodexProcessExit(child);
   }
+  flushTerminalOutput();
   terminal?.close(1000, "turn complete");
   closeCodexOutputCapture(stdout);
   closeCodexOutputCapture(stderr);

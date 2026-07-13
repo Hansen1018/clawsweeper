@@ -133,7 +133,6 @@ test("run-worker starts Codex in the target checkout when one is available", () 
         ACTIONS_RESULTS_URL: "https://results.example.invalid/runtime-secret",
         AMBIENT_DEPLOY_SECRET: "ambient-secret-for-test",
         CLAWSWEEPER_CODEX_STDIO_MAX_BUFFER_MB: "1",
-        CLAWSWEEPER_CODEX_PLANNER_SANDBOX: "danger-full-access",
         CLAWSWEEPER_STEERABLE_CODEX: "0",
         PATH: `${fakeBin}${path.delimiter}${process.env.PATH ?? ""}`,
       },
@@ -143,13 +142,16 @@ test("run-worker starts Codex in the target checkout when one is available", () 
     assert.equal(fs.readFileSync(cwdFile, "utf8"), fs.realpathSync(targetCheckout));
     const args = JSON.parse(fs.readFileSync(argsFile, "utf8"));
     assert.equal(args[args.indexOf("--cd") + 1], targetCheckout);
-    assert.equal(args[args.indexOf("--sandbox") + 1], "danger-full-access");
+    assert.equal(args[args.indexOf("--sandbox") + 1], "read-only");
     assert.equal(args.includes("--model"), false);
     assert.equal(args.includes("secret-model-for-test"), false);
     const runDirs = fs.globSync(path.join(repoRoot, `.clawsweeper-repair/runs/${jobName}-plan-*`));
     assert.equal(runDirs.length, 1);
     const runDir = runDirs[0];
     assert.ok(runDir);
+    const rawOutputPath = args[args.indexOf("--output-last-message") + 1];
+    assert.equal(path.relative(os.tmpdir(), rawOutputPath).startsWith(".."), false);
+    assert.equal(path.relative(runDir, rawOutputPath).startsWith(".."), true);
     assert.ok(fs.statSync(path.join(runDir, "codex.jsonl")).size > 2 * 1024 * 1024);
     assert.ok(fs.statSync(path.join(runDir, "codex.stderr.log")).size >= 2 * 1024 * 1024);
     for (const artifact of ["result.json", "codex.jsonl", "codex.stderr.log"]) {

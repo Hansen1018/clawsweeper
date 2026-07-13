@@ -2350,8 +2350,12 @@ test("failed Codex workers use bounded automatic retry paths", () => {
   assert.match(outputCapture, /Codex output truncated; final tail follows/);
   assert.doesNotMatch(worker, /Codex output exceeded|CLAWSWEEPER_CODEX_STDIO_MAX_BUFFER_MB/);
   assert.match(worker, /Codex worker timed out[\s\S]*process\.exit\(1\)/);
-  assert.match(worker, /CLAWSWEEPER_CODEX_PLANNER_SANDBOX/);
-  assert.match(worker, /\? "danger-full-access"\s*:\s*"read-only"/);
+  assert.match(worker, /const codexPlannerSandbox = "read-only"/);
+  assert.doesNotMatch(worker, /CLAWSWEEPER_CODEX_PLANNER_SANDBOX|danger-full-access/);
+  assert.match(worker, /temporaryCodexResultPath\("initial"\)/);
+  assert.match(worker, /publishSanitizedCodexResult\(initialCodexResultPath, resultPath\)/);
+  assert.match(outputCapture, /export function createCodexTextRedactor/);
+  assert.match(outputCapture, /export function redactCodexTextChunk/);
   assert.match(executor, /const defaultCodexWriteSandbox = "workspace-write"/);
   assert.match(executor, /const defaultCodexReviewSandbox = "read-only"/);
   assert.doesNotMatch(
@@ -2368,13 +2372,11 @@ test("failed Codex workers use bounded automatic retry paths", () => {
   assert.match(selfHeal, /reason: "retry_limit_reached"/);
 });
 
-test("repair workers expose an explicit sandbox fallback for trusted ephemeral runners", () => {
+test("repair workers keep planning read-only in GitHub Actions", () => {
   const workflow = readText(".github/workflows/repair-cluster-worker.yml");
 
-  assert.match(workflow, /planner_sandbox:/);
-  assert.match(workflow, /default: read-only/);
-  assert.match(workflow, /- danger-full-access/);
-  assert.match(workflow, /CLAWSWEEPER_CODEX_PLANNER_SANDBOX: \$\{\{ inputs\.planner_sandbox \}\}/);
+  assert.doesNotMatch(workflow, /planner_sandbox|CLAWSWEEPER_CODEX_PLANNER_SANDBOX/);
+  assert.doesNotMatch(workflow, /danger-full-access/);
 });
 
 test("repair workflows preserve existing dispatch while scheduled cluster intake stays gated", () => {
