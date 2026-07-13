@@ -176,6 +176,27 @@ export function confirmAutomergeEffectSnapshot(
   };
 }
 
+export function automergeEffectDefinitelyAbsent(
+  snapshot: LooseRecord,
+  expectedHeadSha: JsonValue,
+): boolean {
+  const confirmation = confirmAutomergeEffectSnapshot(snapshot, expectedHeadSha, {
+    requireSquashMethod: false,
+  });
+  const view = snapshot.view ?? {};
+  const graphMergedAt = String(view.mergedAt ?? "").trim();
+  const graphState = String(view.state ?? "")
+    .trim()
+    .toUpperCase();
+  return Boolean(
+    !graphMergedAt &&
+    graphState !== "MERGED" &&
+    !confirmation.block &&
+    !confirmation.mergedAt &&
+    !confirmation.pendingReason,
+  );
+}
+
 export function automergeCommandResponseAmbiguous(attempt: LooseRecord) {
   return Boolean(
     attempt.command_error || attempt.command_result?.error || attempt.command_result?.status !== 0,

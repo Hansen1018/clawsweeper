@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  automergeEffectDefinitelyAbsent,
   automergeAttemptReceiptOutcome,
   automergeUnconfirmedFailureDisposition,
   confirmAutomergeEffectSnapshot,
@@ -184,6 +185,56 @@ test("automerge effect certification preserves uncertainty for conflicting head 
     "pull request head changed before the automerge effect could be confirmed",
   );
   assert.equal(automergeAttemptReceiptOutcome({ confirmation }), "unknown");
+});
+
+test("automerge effect absence requires REST and GraphQL to agree no effect exists", () => {
+  const emptySnapshot = {
+    pull: { head: { sha: headSha }, merged_at: null, auto_merge: null },
+    view: {
+      headRefOid: headSha,
+      mergedAt: null,
+      state: "OPEN",
+      isInMergeQueue: false,
+      autoMergeRequest: null,
+    },
+  };
+  assert.equal(automergeEffectDefinitelyAbsent(emptySnapshot, headSha), true);
+
+  for (const snapshot of [
+    {
+      ...emptySnapshot,
+      pull: { ...emptySnapshot.pull, auto_merge: { merge_method: "squash" } },
+    },
+    {
+      ...emptySnapshot,
+      view: {
+        ...emptySnapshot.view,
+        autoMergeRequest: { mergeMethod: "SQUASH" },
+      },
+    },
+    {
+      ...emptySnapshot,
+      view: {
+        ...emptySnapshot.view,
+        isInMergeQueue: true,
+        autoMergeRequest: { mergeMethod: "SQUASH" },
+      },
+    },
+    {
+      ...emptySnapshot,
+      view: { ...emptySnapshot.view, mergedAt: "2026-07-13T08:00:00Z" },
+    },
+    {
+      ...emptySnapshot,
+      view: { ...emptySnapshot.view, state: "MERGED" },
+    },
+    {
+      ...emptySnapshot,
+      view: { ...emptySnapshot.view, headRefOid: "c".repeat(40) },
+    },
+  ]) {
+    assert.equal(automergeEffectDefinitelyAbsent(snapshot, headSha), false);
+  }
 });
 
 test("transient unconfirmed merge responses remain waiting with unknown receipts", () => {

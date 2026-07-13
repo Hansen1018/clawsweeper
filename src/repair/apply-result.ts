@@ -38,6 +38,7 @@ import {
 } from "./repair-merge-message.js";
 import { runtimeStrictBaseBindingBlock } from "./strict-base-binding.js";
 import {
+  automergeEffectDefinitelyAbsent,
   automergeUnconfirmedFailureDisposition,
   expectedSquashCommitMessage,
   squashAutomergeMethodBlock,
@@ -1931,8 +1932,7 @@ function claimApplyMergeRequest(repository: string, number: number, headSha: str
     dispatchedClaimEffectAbsent: () => {
       const pullRequest = fetchPullRequestOnce(repository, number);
       const view = fetchPullRequestViewOnce(repository, number);
-      const merged = confirmExactMergeSnapshot(pullRequest, headSha);
-      return !merged.block && !merged.mergedAt && !exactHeadPendingMerge(view, headSha);
+      return automergeEffectDefinitelyAbsent({ pull: pullRequest, view }, headSha);
     },
   });
 }
