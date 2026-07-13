@@ -113,7 +113,9 @@ checkpoint, and status-only commits are intentionally omitted.
   commit-review Codex log/report lifecycles, request-bound commit-check and
   notification delivery receipts, generic workflow attempt/finalization
   events, interruption recovery for unfinished generic Codex reviews, and
-  immutable workflow publication of the resulting shards.
+  immutable workflow publication of the resulting shards. Bulk event
+  notifications now preserve permanent OpenClaw hook rejections as terminal,
+  non-retryable no-mutation outcomes.
 - Bound every repair-worker dispatch to an exact `clawsweeper-state` commit and
   job SHA-256, including cluster and issue intake, commit findings, report
   requeues, failed-run recovery, open-PR finalization, and conflict self-heal.
@@ -126,7 +128,9 @@ checkpoint, and status-only commits are intentionally omitted.
   handoff contract, and those records carry explicit legacy provenance.
   Commit-finding intake also verifies canonical report paths, exact report
   bytes, and embedded source identity. Deterministic no-op intake and paginated
-  commit-review continuations retain receipt ownership across workflow reruns.
+  commit-review continuations retain receipt ownership across workflow reruns,
+  while deduplicated continuations skip publication without reading empty plan
+  outputs.
 - Kept valid blocked and generic repair results publishable without invented
   source revisions, rejected ledger-only result fallbacks, derived publication
   receipt provenance from the sealed source job instead of mutable live state,

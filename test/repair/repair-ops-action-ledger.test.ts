@@ -336,6 +336,10 @@ test("commit review and notification workflows publish their operation receipts"
     /commit-review-\$\{\{ matrix\.sha \}\}-\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}/,
   );
   assert.match(review, /codex-logs-commit-review-\$\{\{ matrix\.sha \}\}/);
+  assert.match(
+    publisher,
+    /if: \$\{\{ always\(\) && needs\.plan\.result == 'success' && \(needs\.plan\.outputs\.planned_count != '0'/,
+  );
   assert.match(publisher, /create-state-token/);
   assert.match(publisher, /setup-state/);
   assert.match(publisher, /Resolve commit review artifact cohort/);

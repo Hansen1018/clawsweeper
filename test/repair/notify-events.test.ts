@@ -215,6 +215,62 @@ test("runClawSweeperEventNotifier posts hook payloads and records ledger", async
   assert.equal(ledger.notifications[0].discordTarget, "channel:123");
 });
 
+test("permanent hook rejection records a terminal no-mutation notification", async () => {
+  const root = fs.realpathSync(
+    fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-events-hook-rejected-")),
+  );
+  fs.writeFileSync(
+    path.join(root, "repair-apply-report.json"),
+    `${JSON.stringify([
+      {
+        repo: "openclaw/openclaw",
+        target: "#123",
+        action: "close_duplicate",
+        status: "executed",
+        run_id: "987",
+        published_at: "2026-05-02T10:00:00Z",
+      },
+    ])}\n`,
+  );
+  const outputRoot = path.join(root, "action-ledger-output");
+  fs.mkdirSync(outputRoot);
+  const previous = { ...process.env };
+  Object.assign(process.env, notificationWorkflowEnv(root, outputRoot));
+
+  try {
+    const summary = await runClawSweeperEventNotifier(["--run-id", "987"], {
+      root,
+      fetch: async () => new Response("invalid request", { status: 422 }),
+      log: () => undefined,
+      env: {
+        CLAWSWEEPER_OPENCLAW_HOOK_URL: "https://claw.example/hooks",
+        CLAWSWEEPER_OPENCLAW_HOOK_TOKEN: "secret",
+        CLAWSWEEPER_DISCORD_TARGET: "channel:123",
+      },
+    });
+    assert.equal(summary.failed, 1);
+    await flushRepairActionEvents();
+
+    const events = readActionEvents(outputRoot);
+    const mutationEvents = events.filter(
+      (event) => event.event_type === ACTION_EVENT_TYPES.repairMutation,
+    );
+    assert.deepEqual(
+      mutationEvents.map((event) => event.attributes?.state),
+      ["mutation_attempted", "mutation_rejected"],
+    );
+    const failed = events.find(
+      (event) => event.event_type === ACTION_EVENT_TYPES.notificationFailed,
+    );
+    assert.equal(failed?.attributes?.completion_reason, "mutation_rejected");
+    assert.equal(failed?.action.mutation, false);
+    assert.equal(failed?.action.retryable, false);
+  } finally {
+    restoreEnv(previous);
+    fs.rmSync(root, { force: true, recursive: true });
+  }
+});
+
 test("runClawSweeperEventNotifier mirrors events to the live status dashboard", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-events-dashboard-"));
   fs.writeFileSync(

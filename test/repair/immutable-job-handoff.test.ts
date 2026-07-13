@@ -248,6 +248,7 @@ test("all production dispatch callers require exact published job revisions", ()
   const issue = fs.readFileSync(issueIntakeWorkflowPath, "utf8");
   const cluster = fs.readFileSync(clusterIntakeWorkflowPath, "utf8");
   const createJob = fs.readFileSync(createJobPath, "utf8");
+  const dispatcher = fs.readFileSync("src/repair/dispatch-jobs.ts", "utf8");
   const worker = fs.readFileSync(workerWorkflowPath, "utf8");
 
   for (const intake of [commit, issue, cluster]) {
@@ -264,6 +265,8 @@ test("all production dispatch callers require exact published job revisions", ()
   assert.match(createJob, /local job bytes do not match published state/);
   assert.match(createJob, /"repair:dispatch"/);
   assert.doesNotMatch(createJob, /dispatch_command|npm", \["run", "dispatch"/);
+  assert.match(dispatcher, /usage: node scripts\/dispatch-jobs\.ts <job\.md> \[--mode/);
+  assert.doesNotMatch(dispatcher, /<job\.md> \[\.\.\.\]/);
   assert.match(worker, /state_revision:[\s\S]*required: true/);
   assert.match(worker, /job_sha256:[\s\S]*required: true/);
   assert.match(worker, /expected_title="\$\{title\} \[\$\{DISPATCH_KEY\}\] \(\$\{JOB_SHA256\}\)"/);

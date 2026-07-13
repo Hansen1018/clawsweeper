@@ -587,7 +587,7 @@ jobs:
   publish:
     name: Commit reports
     needs: [plan, review]
-    if: ${{ always() && (needs.plan.outputs.planned_count != '0' || needs.plan.outputs.skipped_count != '0') }}
+    if: ${{ always() && needs.plan.result == 'success' && (needs.plan.outputs.planned_count != '0' || needs.plan.outputs.skipped_count != '0') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:

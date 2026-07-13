@@ -57,7 +57,7 @@ const jobWorkerLanes = new Map<string, WorkerLane>();
 
 if (files.length === 0) {
   console.error(
-    `usage: node scripts/dispatch-jobs.ts <job.md> [...] [--mode plan|execute|autonomous] [--runner label] [--execution-runner label] [--model model] [--dispatch-key key] [--state-revision sha] [--job-sha256 digest] [--max-live-workers ${AUTOMATION_LIMITS.repair_live_runs.default}] [--wait-for-capacity]`,
+    `usage: node scripts/dispatch-jobs.ts <job.md> [--mode plan|execute|autonomous] [--runner label] [--execution-runner label] [--model model] [--dispatch-key key] [--state-revision sha] [--job-sha256 digest] [--max-live-workers ${AUTOMATION_LIMITS.repair_live_runs.default}] [--wait-for-capacity]`,
   );
   process.exit(2);
 }

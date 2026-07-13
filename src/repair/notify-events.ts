@@ -8,6 +8,7 @@ import { parseArgs, repoRoot } from "./lib.js";
 import { readJsonFile } from "./json-file.js";
 import {
   errorText,
+  isRejectedOpenClawHookError,
   postOpenClawAgentHook,
   resolveOpenClawHookConfig,
   stringArg,
@@ -409,11 +410,16 @@ export async function runClawSweeperEventNotifier(
         reportRow(event, "sent", `sent to OpenClaw hook; ${dashboardStatus}`, result.runId),
       );
     } catch (error) {
+      const failureOutcome = isRejectedOpenClawHookError(error)
+        ? "mutation_rejected"
+        : isRejectedDashboardDelivery(error)
+          ? "mutation_observed"
+          : "mutation_outcome_unknown";
       recordNotificationPhaseSafely(
         eventNotificationLedgerInput(event),
         "failed",
         error instanceof Error ? error.name : typeof error,
-        isRejectedDashboardDelivery(error) ? "mutation_observed" : "mutation_outcome_unknown",
+        failureOutcome,
       );
       reportActions.push(reportRow(event, "failed", errorText(error)));
     }
