@@ -392,13 +392,25 @@ function codexConfigArgs() {
 }
 
 async function repairResultIfNeeded() {
-  for (let attempt = 1; attempt <= resultRepairAttempts; attempt += 1) {
+  for (let completedRepairs = 0; completedRepairs <= resultRepairAttempts; completedRepairs += 1) {
     const review = reviewResult();
     if (review.status === 0) return;
+    const finalReview = completedRepairs === resultRepairAttempts;
+    const attempt = completedRepairs + 1;
     fs.writeFileSync(
-      path.join(runDir, `review-results-failed-${attempt}.json`),
+      path.join(
+        runDir,
+        finalReview ? "review-results-final.json" : `review-results-failed-${attempt}.json`,
+      ),
       review.stdout || review.stderr || "",
     );
+    if (finalReview) {
+      throw new Error(
+        `worker result failed deterministic validation after ${completedRepairs} repair attempt(s): ${
+          review.stderr || review.stdout || "unknown validation failure"
+        }`.trim(),
+      );
+    }
     if (!fs.existsSync(resultPath)) return;
 
     const beforePath = path.join(runDir, `result.before-repair-${attempt}.json`);

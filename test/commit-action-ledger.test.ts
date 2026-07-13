@@ -726,6 +726,11 @@ test("commit check publisher owns every privileged check write and installs atte
     publisher,
     /find commit-artifacts[\s\S]*node dist\/commit-sweeper\.js publish-check/,
   );
+  assert.match(publisher, /--report-repo openclaw\/clawsweeper-state/);
+  assert.match(
+    publisher,
+    /--report-revision "\$\{\{ steps\.publish-reports\.outputs\.state_revision \}\}"/,
+  );
   assert.match(
     publisher,
     /Finalize commit reviews without checks[\s\S]*finish-review[\s\S]*--start-workflow/,
@@ -734,6 +739,56 @@ test("commit check publisher owns every privileged check write and installs atte
     publisher.indexOf("repair:action-ledger -- verify") <
       publisher.indexOf("CLAWSWEEPER_COMMIT_ACTION_LEDGER_PRIOR_CONTEXT="),
   );
+});
+
+test("commit checks link to the exact immutable report revision", () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "commit-check-report-url-")));
+  const reportPath = path.join(root, "report.md");
+  const sha = "b".repeat(40);
+  const reportRevision = "f".repeat(40);
+  const relativePath = `records/openclaw-openclaw/commits/${sha}.md`;
+  const ghLog = path.join(root, "gh.log");
+  const ghPath = mockGh(root, ghLog);
+  fs.writeFileSync(
+    reportPath,
+    `---\nresult: findings\nsha: ${sha}\nrepository: openclaw/openclaw\nhighest_severity: high\n---\n`,
+  );
+
+  try {
+    execFileSync(
+      process.execPath,
+      [
+        path.join(process.cwd(), "dist", "commit-sweeper.js"),
+        "publish-check",
+        "--target-repo",
+        "openclaw/openclaw",
+        "--commit-sha",
+        sha,
+        "--report-path",
+        reportPath,
+        "--report-relative-path",
+        relativePath,
+        "--report-repo",
+        "openclaw/clawsweeper-state",
+        "--report-revision",
+        reportRevision,
+      ],
+      {
+        env: {
+          ...process.env,
+          ...mockGhBinEnv(ghPath, path.dirname(ghPath)),
+        },
+        stdio: "pipe",
+      },
+    );
+
+    const payload = JSON.parse(fs.readFileSync(path.join(root, "report.check-run.json"), "utf8"));
+    const expectedUrl = `https://github.com/openclaw/clawsweeper-state/blob/${reportRevision}/${relativePath}`;
+    assert.equal(payload.details_url, expectedUrl);
+    assert.equal(payload.output.text, `Report: ${expectedUrl}`);
+  } finally {
+    fs.rmSync(root, { force: true, recursive: true });
+  }
 });
 
 test("commit check retries continue authenticated shard causality", async () => {

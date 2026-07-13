@@ -7,6 +7,24 @@ import test from "node:test";
 
 const repoRoot = process.cwd();
 
+test("run-worker persists the final deterministic review failure", () => {
+  const source = fs.readFileSync(path.join(repoRoot, "src/repair/run-worker.ts"), "utf8");
+  const start = source.indexOf("async function repairResultIfNeeded()");
+  const end = source.indexOf("\nfunction reviewResult()", start);
+  const helper = source.slice(start, end);
+
+  assert.match(
+    helper,
+    /completedRepairs <= resultRepairAttempts[\s\S]*const review = reviewResult\(\)/,
+  );
+  assert.match(helper, /finalReview \? "review-results-final\.json"/);
+  assert.match(helper, /worker result failed deterministic validation after/);
+  assert.ok(
+    helper.indexOf("review-results-final.json") < helper.indexOf("throw new Error("),
+    "the final review failure must be persisted before the worker exits",
+  );
+});
+
 test("repair output schema keeps every strict object property required", () => {
   const schema = JSON.parse(
     fs.readFileSync(path.join(repoRoot, "schema/repair/codex-result.schema.json"), "utf8"),

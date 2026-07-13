@@ -760,7 +760,8 @@ jobs:
               --commit-sha "$sha" \
               --report-path "$report_path" \
               --report-relative-path "$relative_path" \
-              --report-repo "${{ github.repository }}"
+              --report-repo openclaw/clawsweeper-state \
+              --report-revision "${{ steps.publish-reports.outputs.state_revision }}"
           done
 
       - name: Finalize commit reviews without checks
