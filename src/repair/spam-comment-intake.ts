@@ -430,14 +430,19 @@ async function dispatchSpamScanner({
     throw error;
   }
   if (!response.ok) {
+    const outcome = spamDispatchHttpOutcome(response);
     const error = new Error(`spam scanner dispatch rejected: ${response.status}`);
+    if (outcome === "unknown") {
+      ledger.mutationObserved = true;
+      ledger.uncertainMutationObserved = true;
+    }
     try {
       recordDispatchOutcome(ledger, {
         attemptEventId: attempt?.event_id ?? null,
         idempotencyIdentity,
         evidence,
         requestSha256,
-        outcome: "rejected",
+        outcome,
       });
     } catch (receiptError) {
       console.error(
@@ -724,7 +729,7 @@ function recordDispatchOutcome(
           : options.outcome === "rejected"
             ? ACTION_EVENT_REASON_CODES.notApplicable
             : ACTION_EVENT_REASON_CODES.unavailable,
-      retryable: false,
+      retryable: options.outcome === "unknown",
       mutation: options.outcome !== "rejected",
       identity: {
         slot: "spam_dispatch_outcome",
@@ -778,7 +783,7 @@ function recordIntakeTerminal(
             ? ACTION_EVENT_STATUSES.skipped
             : ACTION_EVENT_STATUSES.failed,
       reasonCode: terminalReasonCode(summary),
-      retryable: false,
+      retryable: ledger.uncertainMutationObserved,
       mutation: ledger.mutationObserved,
       identity: {
         slot: "spam_intake_terminal",
@@ -787,7 +792,7 @@ function recordIntakeTerminal(
       operation: "spam_comment_intake",
       operationIdentity: ledger.operationIdentity,
       parentEventId: ledger.lastEventId,
-      phaseSeq: 1_000_000,
+      phaseSeq: nextPhaseSeq(ledger),
       idempotencyIdentity: {
         operationIdentity: ledger.operationIdentity,
         slot: "spam_intake_terminal",
@@ -911,6 +916,17 @@ function nextPhaseSeq(ledger: SpamCommentIntakeLedger): number {
   const phaseSeq = ledger.nextPhaseSeq;
   ledger.nextPhaseSeq += 1;
   return phaseSeq;
+}
+
+export function spamDispatchHttpOutcome(response: { status: number }): "rejected" | "unknown" {
+  if (
+    response.status >= 400 &&
+    response.status < 500 &&
+    ![408, 425, 429].includes(response.status)
+  ) {
+    return "rejected";
+  }
+  return "unknown";
 }
 
 function sha256(value: string | Buffer): string {

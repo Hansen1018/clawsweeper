@@ -8,6 +8,7 @@ import test from "node:test";
 import {
   classifySpamCommentActivity,
   runSpamCommentIntake,
+  spamDispatchHttpOutcome,
 } from "../../dist/repair/spam-comment-intake.js";
 
 function spamActivity() {
@@ -289,13 +290,14 @@ test("spam comment intake records unknown transport outcomes without masking the
     );
     assert.ok(outcome);
     assert.equal(outcome.action.mutation, true);
-    assert.equal(outcome.action.retryable, false);
+    assert.equal(outcome.action.retryable, true);
     assert.equal(outcome.attributes?.completion_reason, "mutation_outcome_unknown");
 
     const terminal = result.events.at(-1);
     assert.equal(terminal?.event_type, "review.batch");
     assert.equal(terminal?.action.status, "failed");
     assert.equal(terminal?.action.mutation, true);
+    assert.equal(terminal?.action.retryable, true);
     assert.equal(terminal?.attributes?.partial, true);
     assert.equal(terminal?.attributes?.completion_reason, "dispatch_outcome_unknown");
   } finally {
@@ -334,39 +336,57 @@ test("spam comment intake preserves dispatch failures when receipt finalization 
   }
 });
 
+test("spam comment intake treats ambiguous HTTP failures as unknown", () => {
+  assert.equal(spamDispatchHttpOutcome({ status: 422 }), "rejected");
+  assert.equal(spamDispatchHttpOutcome({ status: 408 }), "unknown");
+  assert.equal(spamDispatchHttpOutcome({ status: 429 }), "unknown");
+  assert.equal(spamDispatchHttpOutcome({ status: 503 }), "unknown");
+});
+
 test("spam comment intake workflow publishes only exact current-attempt shards", () => {
   const workflow = fs.readFileSync(".github/workflows/spam-comment-intake.yml", "utf8");
+  const producer = workflow.slice(
+    workflow.indexOf("\n  intake:"),
+    workflow.indexOf("\n  publish-ledger:"),
+  );
+  const publisher = workflow.slice(workflow.indexOf("\n  publish-ledger:"));
 
-  assert.match(workflow, /permissions:\n\s+actions: read\n\s+contents: read/);
-  assert.match(workflow, /persist-credentials: false/);
-  assert.match(workflow, /uses: \.\/\.github\/actions\/setup-action-ledger/);
-  assert.match(workflow, /hydrate-paths: ledger/);
+  assert.match(workflow, /permissions:\n\s+actions: write\n\s+contents: read/);
+  assert.match(producer, /persist-credentials: false/);
+  assert.match(producer, /uses: \.\/\.github\/actions\/setup-action-ledger/);
+  assert.match(producer, /actions\/upload-artifact@v7/);
+  assert.doesNotMatch(producer, /create-state-token|setup-state|hydrate-paths: ledger/);
+  assert.match(publisher, /actions: read\n\s+contents: read/);
+  assert.match(publisher, /create-state-token/);
+  assert.match(publisher, /hydrate-paths: ledger/);
+  assert.match(publisher, /actions\/download-artifact@v8/);
   assert.match(
-    workflow,
+    publisher,
     /repair:action-ledger -- publish-workflow \\\n\s+--expected-producer-job intake/,
   );
-  assert.match(workflow, /jq -r '\.paths\[\]\?'/);
-  assert.match(workflow, /cp "\$durable_event_path" "\$event_path"/);
-  assert.match(workflow, /chore: append spam comment intake action ledger/);
+  assert.match(publisher, /jq -r '\.paths\[\]\?'/);
+  assert.match(publisher, /cp "\$durable_event_path" "\$event_path"/);
+  assert.match(publisher, /publish-action-event-paths/);
+  assert.match(publisher, /chore: append spam comment intake action ledger/);
   for (const requiredPath of [
     "scripts/hydrate-state.ts",
     "src/action-ledger-files.ts",
     "src/action-ledger-runtime.ts",
     "src/action-ledger.ts",
   ]) {
-    assert.match(workflow, new RegExp(`^\\s+${requiredPath.replaceAll(".", "\\.")}$`, "m"));
+    assert.match(producer, new RegExp(`^\\s+${requiredPath.replaceAll(".", "\\.")}$`, "m"));
   }
   assert.ok(
-    workflow.indexOf("Dispatch exact spam scan") <
-      workflow.indexOf("Finalize spam comment intake action ledger"),
+    producer.indexOf("Dispatch exact spam scan") <
+      producer.indexOf("Finalize spam comment intake action ledger"),
   );
   assert.ok(
-    workflow.indexOf("Finalize spam comment intake action ledger") <
-      workflow.indexOf("Import immutable spam comment intake action ledger"),
+    producer.indexOf("Finalize spam comment intake action ledger") <
+      producer.indexOf("Upload spam comment intake action ledger"),
   );
   assert.ok(
-    workflow.indexOf("Import immutable spam comment intake action ledger") <
-      workflow.indexOf("Publish immutable spam comment intake action ledger"),
+    publisher.indexOf("- name: Import immutable spam comment intake action ledger") <
+      publisher.indexOf("- name: Publish immutable spam comment intake action ledger"),
   );
 });
 
