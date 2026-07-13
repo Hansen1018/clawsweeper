@@ -41,6 +41,7 @@ const STATE_REVISION = /^[a-f0-9]{40}$/;
 const JOB_SHA256 = /^[a-f0-9]{64}$/;
 const REPAIR_MODES = new Set(["plan", "execute", "autonomous"]);
 const WORKFLOW_INPUTS_BASENAME = "workflow-inputs.json";
+const STATE_REVISION_FETCH_TIMEOUT_MS = 60_000;
 
 type RecoveredRunCohort = {
   source_job: string;
@@ -93,9 +94,12 @@ const sourceJobPath = normalizedRequeueSourceJobPath(
   args["source-job-path"],
   String(resolved.source_job),
 );
+const sourceStateRevision =
+  args["state-revision"] ?? args.state_revision ?? resolved.state_revision;
+ensureHistoricalStateRevision(sourceStateRevision);
 const immutableJob = resolveStateJobIdentity({
   jobPath: sourceJobPath,
-  stateRevision: args["state-revision"] ?? args.state_revision ?? resolved.state_revision,
+  stateRevision: sourceStateRevision,
   jobSha256: args["job-sha256"] ?? args.job_sha256 ?? resolved.job_sha256,
 });
 const job = immutableJob.job;
@@ -232,38 +236,6 @@ try {
 if (commandError) throw commandError;
 
 function resolveFromRunId(runId: string) {
-  const fromLedger = readPublishedRunRecord(runId);
-  const ledgerSourceJob = publishedRecordField(
-    fromLedger,
-    "source_job",
-    SOURCE_JOB_PATH,
-    runId,
-    "source job",
-  );
-  const ledgerStateRevision = publishedRecordField(
-    fromLedger,
-    "source_state_revision",
-    STATE_REVISION,
-    runId,
-    "state revision",
-  );
-  const ledgerJobSha256 = publishedRecordField(
-    fromLedger,
-    "source_job_sha256",
-    JOB_SHA256,
-    runId,
-    "job digest",
-  );
-  const ledgerMode = publishedRecordMode(fromLedger, runId);
-  if (ledgerSourceJob && ledgerStateRevision && ledgerJobSha256 && ledgerMode) {
-    return {
-      source_job: ledgerSourceJob,
-      mode: ledgerMode,
-      state_revision: ledgerStateRevision,
-      job_sha256: ledgerJobSha256,
-    };
-  }
-
   const artifactDir = fs.mkdtempSync(
     path.join(os.tmpdir(), `clawsweeper-repair-requeue-${runId}-`),
   );
@@ -273,23 +245,99 @@ function resolveFromRunId(runId: string) {
       ["run", "download", runId, "--repo", repo, "--dir", artifactDir],
       { cwd: repoRoot(), encoding: "utf8", stdio: "pipe" },
     );
-    if (downloaded.status !== 0) {
-      throw new Error(`could not resolve run ${runId}: ${downloaded.stderr || downloaded.stdout}`);
+    if (downloaded.status === 0) {
+      return resolveDownloadedRunCohort(artifactDir, runId, null);
     }
-    const recovered = resolveDownloadedRunCohort(artifactDir, runId, ledgerSourceJob || null);
-    if (ledgerStateRevision && ledgerStateRevision !== recovered.state_revision) {
-      throw new Error(`run ${runId} record state revision conflicts with its artifact cohort`);
+
+    const fromLedger = readPublishedRunRecord(runId);
+    const ledgerSourceJob = publishedRecordField(
+      fromLedger,
+      "source_job",
+      SOURCE_JOB_PATH,
+      runId,
+      "source job",
+    );
+    const ledgerStateRevision = publishedRecordField(
+      fromLedger,
+      "source_state_revision",
+      STATE_REVISION,
+      runId,
+      "state revision",
+    );
+    const ledgerJobSha256 = publishedRecordField(
+      fromLedger,
+      "source_job_sha256",
+      JOB_SHA256,
+      runId,
+      "job digest",
+    );
+    const ledgerMode = publishedRecordMode(fromLedger, runId);
+    if (ledgerSourceJob && ledgerStateRevision && ledgerJobSha256 && ledgerMode) {
+      return {
+        source_job: ledgerSourceJob,
+        mode: ledgerMode,
+        state_revision: ledgerStateRevision,
+        job_sha256: ledgerJobSha256,
+      };
     }
-    if (ledgerJobSha256 && ledgerJobSha256 !== recovered.job_sha256) {
-      throw new Error(`run ${runId} record job digest conflicts with its artifact cohort`);
-    }
-    if (ledgerMode && ledgerMode !== recovered.mode) {
-      throw new Error(`run ${runId} record effective mode conflicts with its artifact cohort`);
-    }
-    return recovered;
+    throw new Error(`could not resolve run ${runId}: ${downloaded.stderr || downloaded.stdout}`);
   } finally {
     fs.rmSync(artifactDir, { recursive: true, force: true });
   }
+}
+
+function ensureHistoricalStateRevision(value: unknown): void {
+  const stateRevision = String(value ?? "").trim();
+  if (!STATE_REVISION.test(stateRevision)) {
+    throw new Error("state revision is malformed");
+  }
+  const stateRoot = String(process.env.CLAWSWEEPER_STATE_DIR ?? "").trim();
+  if (!stateRoot) {
+    throw new Error("CLAWSWEEPER_STATE_DIR is required for immutable job handoff");
+  }
+  if (stateCommitExists(stateRoot, stateRevision)) return;
+
+  const fetched = spawnSync(
+    "git",
+    [
+      "-C",
+      stateRoot,
+      "fetch",
+      "--no-tags",
+      "--no-recurse-submodules",
+      "--depth=1",
+      "--filter=blob:none",
+      "origin",
+      stateRevision,
+    ],
+    {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: STATE_REVISION_FETCH_TIMEOUT_MS,
+      maxBuffer: 1024 * 1024,
+    },
+  );
+  if (fetched.status !== 0 || fetched.error || !stateCommitExists(stateRoot, stateRevision)) {
+    const detail = String(fetched.stderr || fetched.stdout || fetched.error?.message || "").trim();
+    throw new Error(
+      detail
+        ? `could not fetch historical clawsweeper-state commit ${stateRevision}: ${detail}`
+        : `could not fetch historical clawsweeper-state commit ${stateRevision}`,
+    );
+  }
+}
+
+function stateCommitExists(stateRoot: string, stateRevision: string): boolean {
+  const result = spawnSync(
+    "git",
+    ["-C", stateRoot, "cat-file", "-e", `${stateRevision}^{commit}`],
+    {
+      encoding: "utf8",
+      stdio: ["ignore", "ignore", "ignore"],
+      timeout: 10_000,
+    },
+  );
+  return result.status === 0 && !result.error;
 }
 
 function readPublishedRunRecord(runId: string): LooseRecord | null {

@@ -78,8 +78,40 @@ test("run-id requeue prefers the newest early-input producer attempt", () => {
   }
 });
 
+test("run-id requeue prefers a newer plan attempt over complete older durable provenance", () => {
+  const fixture = createFixture("published-downgrade", "910106");
+  try {
+    writeRunRecord(fixture, {
+      source_job: fixture.jobPath,
+      source_state_revision: fixture.replacementRevision,
+      source_job_sha256: fixture.replacementDigest,
+      mode: "autonomous",
+    });
+    writeArtifactCohort(fixture, 1, {
+      stateRevision: fixture.replacementRevision,
+      jobSha256: fixture.replacementDigest,
+      mode: "autonomous",
+    });
+    writeWorkflowInputs(fixture, 2, {
+      stateRevision: fixture.replacementRevision,
+      jobSha256: fixture.replacementDigest,
+      requestedMode: "autonomous",
+      effectiveMode: "plan",
+    });
+
+    const result = runRequeue(fixture);
+    assert.equal(result.status, 0, result.stderr);
+    const summary = JSON.parse(result.stdout);
+    assert.equal(summary.source_state_revision, fixture.replacementRevision);
+    assert.equal(summary.source_job_sha256, fixture.replacementDigest);
+    assert.equal(summary.mode, "plan");
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
 test("run-id requeue uses complete published provenance after Actions artifacts expire", () => {
-  const fixture = createFixture("published-expired", "910106");
+  const fixture = createFixture("published-expired", "910107");
   try {
     writeRunRecord(fixture, {
       source_job: fixture.jobPath,
@@ -99,8 +131,29 @@ test("run-id requeue uses complete published provenance after Actions artifacts 
   }
 });
 
+test("run-id requeue does not replace incomplete available artifacts with durable provenance", () => {
+  const fixture = createFixture("published-incomplete", "910108");
+  try {
+    writeRunRecord(fixture, {
+      source_job: fixture.jobPath,
+      source_state_revision: fixture.replacementRevision,
+      source_job_sha256: fixture.replacementDigest,
+      mode: "autonomous",
+    });
+
+    const result = runRequeue(fixture);
+    assert.notEqual(result.status, 0);
+    assert.match(
+      result.stderr,
+      /did not publish immutable workflow inputs or one complete sealed repair artifact cohort/,
+    );
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
 test("run-id requeue rejects published provenance whose digest does not match state bytes", () => {
-  const fixture = createFixture("published-digest-mismatch", "910107");
+  const fixture = createFixture("published-digest-mismatch", "910109");
   try {
     writeRunRecord(fixture, {
       source_job: fixture.jobPath,
@@ -119,7 +172,7 @@ test("run-id requeue rejects published provenance whose digest does not match st
 });
 
 test("run-id requeue rejects published effective mode that conflicts with job bytes", () => {
-  const fixture = createFixture("published-mode-mismatch", "910108");
+  const fixture = createFixture("published-mode-mismatch", "910110");
   try {
     writeRunRecord(fixture, {
       source_job: fixture.jobPath,
@@ -135,6 +188,41 @@ test("run-id requeue rejects published effective mode that conflicts with job by
       /recovered effective mode autonomous conflicts with immutable job mode plan/,
     );
     assert.doesNotMatch(result.stderr, /Actions artifacts expired/);
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("run-id requeue fetches an exact historical revision from a depth-one state checkout", () => {
+  const fixture = createFixture("published-shallow", "910111");
+  try {
+    replaceStateWithDepthOneClone(fixture);
+    assert.notEqual(
+      spawnSync("git", ["cat-file", "-e", `${fixture.originalRevision}^{commit}`], {
+        cwd: fixture.stateRoot,
+      }).status,
+      0,
+    );
+    writeRunRecord(fixture, {
+      source_job: fixture.jobPath,
+      source_state_revision: fixture.originalRevision,
+      source_job_sha256: fixture.originalDigest,
+      mode: "plan",
+    });
+
+    const result = runRequeue(fixture, { GH_ARTIFACT_EXPIRED: "1" });
+    assert.equal(result.status, 0, result.stderr);
+    const summary = JSON.parse(result.stdout);
+    assert.equal(summary.source_state_revision, fixture.originalRevision);
+    assert.equal(summary.source_job_sha256, fixture.originalDigest);
+    assert.equal(summary.mode, "plan");
+    assert.equal(
+      spawnSync("git", ["cat-file", "-e", `${fixture.originalRevision}^{commit}`], {
+        cwd: fixture.stateRoot,
+      }).status,
+      0,
+    );
+    assert.equal(fs.existsSync(path.join(fixture.stateRoot, ".git", "shallow")), true);
   } finally {
     fs.rmSync(fixture.root, { recursive: true, force: true });
   }
@@ -243,6 +331,14 @@ function runRequeue(fixture: ReturnType<typeof createFixture>, extraEnv: NodeJS.
       },
     },
   );
+}
+
+function replaceStateWithDepthOneClone(fixture: ReturnType<typeof createFixture>): void {
+  const sourceRoot = path.join(fixture.root, "state-source");
+  const remoteRoot = path.join(fixture.root, "state-origin.git");
+  fs.renameSync(fixture.stateRoot, sourceRoot);
+  execFileSync("git", ["clone", "-q", "--bare", sourceRoot, remoteRoot]);
+  execFileSync("git", ["clone", "-q", "--depth=1", `file://${remoteRoot}`, fixture.stateRoot]);
 }
 
 function writeRunRecord(
