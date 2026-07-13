@@ -14,6 +14,16 @@ on:
         required: false
         default: ""
         type: string
+      state_revision:
+        description: "Optional immutable clawsweeper-state commit containing the job"
+        required: false
+        default: ""
+        type: string
+      job_sha256:
+        description: "Optional SHA-256 of the exact immutable job bytes"
+        required: false
+        default: ""
+        type: string
       mode:
         description: "Worker mode"
         required: true
@@ -208,6 +218,57 @@ jobs:
           sparse-checkout: jobs
           persist-credentials: "false"
 
+      - name: Validate immutable job handoff
+        id: immutable-job
+        env:
+          JOB_PATH: ${{ inputs.job }}
+          STATE_REVISION: ${{ inputs.state_revision }}
+          JOB_SHA256: ${{ inputs.job_sha256 }}
+        run: |
+          set -euo pipefail
+          case "$JOB_PATH" in
+            jobs/*/inbox/clawsweeper-commit-*.md) commit_finding=1 ;;
+            *) commit_finding=0 ;;
+          esac
+          if [ -z "$STATE_REVISION" ] && [ -z "$JOB_SHA256" ]; then
+            if [ "$commit_finding" = "1" ]; then
+              echo "Commit finding jobs require immutable state revision and digest." >&2
+              exit 1
+            fi
+            echo "immutable=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ -z "$STATE_REVISION" ] || [ -z "$JOB_SHA256" ]; then
+            echo "state_revision and job_sha256 must be provided together." >&2
+            exit 1
+          fi
+          if ! printf '%s' "$JOB_PATH" | grep -Eq '^jobs/[A-Za-z0-9_.-]+/inbox/[A-Za-z0-9_.-]+\.md$'; then
+            echo "Invalid immutable job path: $JOB_PATH" >&2
+            exit 1
+          fi
+          if ! printf '%s' "$STATE_REVISION" | grep -Eq '^[a-f0-9]{40}$'; then
+            echo "Invalid immutable state revision: $STATE_REVISION" >&2
+            exit 1
+          fi
+          if ! printf '%s' "$JOB_SHA256" | grep -Eq '^[a-f0-9]{64}$'; then
+            echo "Invalid immutable job SHA-256: $JOB_SHA256" >&2
+            exit 1
+          fi
+          echo "immutable=true" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout immutable state job
+        if: ${{ steps.immutable-job.outputs.immutable == 'true' }}
+        uses: actions/checkout@v7
+        with:
+          repository: openclaw/clawsweeper-state
+          ref: ${{ inputs.state_revision }}
+          path: .clawsweeper-repair/immutable-state
+          token: ${{ steps.state-token.outputs.token }}
+          fetch-depth: 1
+          sparse-checkout: ${{ inputs.job }}
+          sparse-checkout-cone-mode: false
+          persist-credentials: "false"
+
       - uses: ./.github/actions/setup-action-ledger
         id: cluster-action-ledger
 
@@ -215,7 +276,27 @@ jobs:
         id: check_job
         env:
           JOB_PATH: ${{ inputs.job }}
-        run: scripts/restore-repair-job.sh "$JOB_PATH" "this worker"
+          IMMUTABLE_JOB: ${{ steps.immutable-job.outputs.immutable }}
+          JOB_SHA256: ${{ inputs.job_sha256 }}
+        run: |
+          set -euo pipefail
+          if [ "$IMMUTABLE_JOB" != "true" ]; then
+            scripts/restore-repair-job.sh "$JOB_PATH" "this worker"
+            exit 0
+          fi
+          source_path=".clawsweeper-repair/immutable-state/$JOB_PATH"
+          if [ ! -f "$source_path" ]; then
+            echo "Immutable job is missing at $JOB_PATH." >&2
+            exit 1
+          fi
+          actual_sha256="$(sha256sum "$source_path" | cut -d' ' -f1)"
+          if [ "$actual_sha256" != "$JOB_SHA256" ]; then
+            echo "Immutable job SHA-256 mismatch: expected $JOB_SHA256, got $actual_sha256." >&2
+            exit 1
+          fi
+          mkdir -p "$(dirname "$JOB_PATH")"
+          cp "$source_path" "$JOB_PATH"
+          echo "job_exists=1" >> "$GITHUB_OUTPUT"
 
       - name: Capture execution gates
         id: capture_gates
@@ -424,7 +505,7 @@ jobs:
         if: ${{ always() && steps.cluster-setup-pnpm.outcome == 'success' }}
         uses: actions/upload-artifact@v7
         with:
-          name: clawsweeper-repair-action-ledger-cluster-${{ github.run_id }}-${{ github.run_attempt }}
+          name: clawsweeper-repair-worker-action-ledger-cluster-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ steps.cluster-action-ledger.outputs.output-root }}/**
           include-hidden-files: true
           if-no-files-found: error
@@ -488,10 +569,58 @@ jobs:
           sparse-checkout: jobs
           persist-credentials: "false"
 
+      - name: Checkout immutable authorization job
+        if: ${{ inputs.state_revision != '' && inputs.job_sha256 != '' }}
+        uses: actions/checkout@v7
+        with:
+          repository: openclaw/clawsweeper-state
+          ref: ${{ inputs.state_revision }}
+          path: .clawsweeper-repair/immutable-state
+          token: ${{ steps.state-token.outputs.token }}
+          fetch-depth: 1
+          sparse-checkout: ${{ inputs.job }}
+          sparse-checkout-cone-mode: false
+          persist-credentials: "false"
+
       - name: Restore immutable job
         env:
           JOB_PATH: ${{ inputs.job }}
-        run: scripts/restore-repair-job.sh "$JOB_PATH" "execution authorization"
+          STATE_REVISION: ${{ inputs.state_revision }}
+          JOB_SHA256: ${{ inputs.job_sha256 }}
+        run: |
+          set -euo pipefail
+          case "$JOB_PATH" in
+            jobs/*/inbox/clawsweeper-commit-*.md) commit_finding=1 ;;
+            *) commit_finding=0 ;;
+          esac
+          if [ -z "$STATE_REVISION" ] && [ -z "$JOB_SHA256" ]; then
+            if [ "$commit_finding" = "1" ]; then
+              echo "Commit finding authorization requires immutable job identity." >&2
+              exit 1
+            fi
+            scripts/restore-repair-job.sh "$JOB_PATH" "execution authorization"
+            exit 0
+          fi
+          if [ -z "$STATE_REVISION" ] || [ -z "$JOB_SHA256" ]; then
+            echo "state_revision and job_sha256 must be provided together." >&2
+            exit 1
+          fi
+          if ! printf '%s' "$JOB_PATH" | grep -Eq '^jobs/[A-Za-z0-9_.-]+/inbox/[A-Za-z0-9_.-]+\.md$'; then
+            echo "Invalid immutable authorization job path: $JOB_PATH" >&2
+            exit 1
+          fi
+          source_path=".clawsweeper-repair/immutable-state/$JOB_PATH"
+          if [ ! -f "$source_path" ]; then
+            echo "Immutable authorization job is missing at $JOB_PATH." >&2
+            exit 1
+          fi
+          actual_sha256="$(sha256sum "$source_path" | cut -d' ' -f1)"
+          if [ "$actual_sha256" != "$JOB_SHA256" ]; then
+            echo "Immutable authorization job SHA-256 mismatch: expected $JOB_SHA256, got $actual_sha256." >&2
+            exit 1
+          fi
+          mkdir -p "$(dirname "$JOB_PATH")"
+          cp "$source_path" "$JOB_PATH"
 
       - name: Resolve exact target repository
         id: target
@@ -795,7 +924,7 @@ jobs:
             --repository "${{ github.repository }}" \
             --run-id "${{ github.run_id }}" \
             --current-attempt "${{ github.run_attempt }}" \
-            --prefix clawsweeper-repair-action-ledger-cluster \
+            --prefix clawsweeper-repair-worker-action-ledger-cluster \
             --expected-artifact-id "${{ needs.cluster.outputs.action_ledger_artifact_id }}" \
             --expected-artifact-digest "${{ needs.cluster.outputs.action_ledger_artifact_digest }}"
 
@@ -1002,7 +1131,7 @@ jobs:
         if: ${{ always() && steps.execute-setup-pnpm.outcome == 'success' }}
         uses: actions/upload-artifact@v7
         with:
-          name: clawsweeper-repair-action-ledger-execute-${{ github.run_id }}-${{ github.run_attempt }}
+          name: clawsweeper-repair-worker-action-ledger-execute-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ steps.execute-action-ledger.outputs.output-root }}/**
           include-hidden-files: true
           if-no-files-found: error
@@ -1411,7 +1540,7 @@ jobs:
             --repository "${{ github.repository }}" \
             --run-id "${{ github.run_id }}" \
             --current-attempt "${{ github.run_attempt }}" \
-            --prefix clawsweeper-repair-action-ledger-cluster \
+            --prefix clawsweeper-repair-worker-action-ledger-cluster \
             --expected-artifact-id "${{ needs.cluster.outputs.action_ledger_artifact_id }}" \
             --expected-artifact-digest "${{ needs.cluster.outputs.action_ledger_artifact_digest }}"
 
@@ -1918,7 +2047,7 @@ jobs:
         if: ${{ always() && steps.mutate-setup-pnpm.outcome == 'success' }}
         uses: actions/upload-artifact@v7
         with:
-          name: clawsweeper-repair-action-ledger-mutate-${{ github.run_id }}-${{ github.run_attempt }}
+          name: clawsweeper-repair-worker-action-ledger-mutate-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ steps.mutate-action-ledger.outputs.output-root }}/**
           include-hidden-files: true
           if-no-files-found: error

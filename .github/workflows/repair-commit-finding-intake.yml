@@ -120,7 +120,7 @@ jobs:
           expected_title="Commit finding ${TARGET_REPO}@${COMMIT_SHA} [${DISPATCH_KEY}]"
           owner="$(bash scripts/dispatch-receipt-owner.sh \
             repair-commit-finding-intake.yml "$expected_title" "$GITHUB_RUN_ID" \
-            "Intake commit finding" "Dispatch sealed repair worker")"
+            "Intake commit finding" "Complete durable intake handoff")"
           if [ "$owner" = "owner" ]; then
             echo "proceed=false" >> "$GITHUB_OUTPUT"
             echo "An older active or successfully executed commit finding dispatch already exists; skipping duplicate intake."
@@ -237,6 +237,7 @@ jobs:
           fi
 
       - name: Commit intake ledger
+        id: publish-intake
         if: always()
         run: |
           set -euo pipefail
@@ -249,7 +250,41 @@ jobs:
             --max-attempts 12 \
             --push-attempts 4
 
+      - name: Bind immutable published job
+        id: published-job
+        if: ${{ steps.prepare.outputs.should_repair == 'true' && steps.publish-intake.outcome == 'success' }}
+        env:
+          JOB_PATH: ${{ steps.prepare.outputs.job_path }}
+        run: |
+          set -euo pipefail
+          case "$JOB_PATH" in
+            jobs/*/inbox/clawsweeper-commit-*.md) ;;
+            *)
+              echo "Invalid commit finding job path: $JOB_PATH" >&2
+              exit 1
+              ;;
+          esac
+          state_revision="$(git -C "$CLAWSWEEPER_STATE_DIR" rev-parse HEAD)"
+          if ! printf '%s' "$state_revision" | grep -Eq '^[a-f0-9]{40}$'; then
+            echo "Invalid published state revision: $state_revision" >&2
+            exit 1
+          fi
+          immutable_job="$RUNNER_TEMP/commit-finding-job.md"
+          git -C "$CLAWSWEEPER_STATE_DIR" show "${state_revision}:${JOB_PATH}" > "$immutable_job"
+          job_sha256="$(sha256sum "$immutable_job" | cut -d' ' -f1)"
+          if ! printf '%s' "$job_sha256" | grep -Eq '^[a-f0-9]{64}$'; then
+            echo "Invalid published job SHA-256: $job_sha256" >&2
+            exit 1
+          fi
+          mkdir -p "$(dirname "$JOB_PATH")"
+          cp "$immutable_job" "$JOB_PATH"
+          {
+            echo "state_revision=$state_revision"
+            echo "job_sha256=$job_sha256"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Dispatch sealed repair worker
+        id: dispatch-worker
         if: ${{ steps.prepare.outputs.should_repair == 'true' }}
         env:
           GH_TOKEN: ${{ steps.dispatch-token.outputs.token }}
@@ -263,7 +298,6 @@ jobs:
           if [ -n "$MAX_LIVE_WORKERS" ]; then
             cap_args=(--max-live-workers "$MAX_LIVE_WORKERS")
           fi
-          git pull --rebase --autostash
           pnpm run repair:dispatch -- "${{ steps.prepare.outputs.job_path }}" \
             --mode autonomous \
             --wait-for-capacity \
@@ -271,8 +305,29 @@ jobs:
             --runner "$RUNNER" \
             --execution-runner "$EXECUTION_RUNNER" \
             --dispatch-key "$DISPATCH_KEY" \
+            --state-revision "${{ steps.published-job.outputs.state_revision }}" \
+            --job-sha256 "${{ steps.published-job.outputs.job_sha256 }}" \
             --model internal \
             --ref main
+
+      - name: Complete durable intake handoff
+        if: always()
+        env:
+          SHOULD_REPAIR: ${{ steps.prepare.outputs.should_repair }}
+          PREPARE_OUTCOME: ${{ steps.prepare.outcome }}
+          PUBLISH_OUTCOME: ${{ steps.publish-intake.outcome }}
+          DISPATCH_OUTCOME: ${{ steps.dispatch-worker.outcome }}
+        run: |
+          set -euo pipefail
+          if [ "$PREPARE_OUTCOME" != "success" ] || [ "$PUBLISH_OUTCOME" != "success" ]; then
+            echo "Commit finding intake did not publish durable audit/job state." >&2
+            exit 1
+          fi
+          if [ "$SHOULD_REPAIR" = "true" ] && [ "$DISPATCH_OUTCOME" != "success" ]; then
+            echo "Commit finding repair was prepared but worker dispatch did not succeed." >&2
+            exit 1
+          fi
+          echo "Durable commit finding intake handoff completed."
 
       - name: Finalize commit finding intake action ledger
         if: ${{ always() && steps.intake-action-ledger.outcome == 'success' }}

@@ -42,15 +42,27 @@ const model = String(args.model ?? process.env.CLAWSWEEPER_MODEL ?? "internal");
 const waitForCapacity = Boolean(args["wait-for-capacity"]);
 const ref = args.ref ? String(args.ref) : "";
 const requestedDispatchKey = dispatchKeyArg(args["dispatch-key"] ?? args.dispatch_key);
+const stateRevision = immutableHexArg(
+  args["state-revision"] ?? args.state_revision,
+  "state revision",
+  40,
+);
+const jobSha256 = immutableHexArg(args["job-sha256"] ?? args.job_sha256, "job SHA-256", 64);
 const files = args._;
 const activeRepairRunsByPrefix = new Map<string, LooseRecord[]>();
 const jobWorkerLanes = new Map<string, WorkerLane>();
 
 if (files.length === 0) {
   console.error(
-    `usage: node scripts/dispatch-jobs.ts <job.md> [...] [--mode plan|execute|autonomous] [--runner label] [--execution-runner label] [--model model] [--dispatch-key key] [--max-live-workers ${AUTOMATION_LIMITS.repair_live_runs.default}] [--wait-for-capacity]`,
+    `usage: node scripts/dispatch-jobs.ts <job.md> [...] [--mode plan|execute|autonomous] [--runner label] [--execution-runner label] [--model model] [--dispatch-key key] [--state-revision sha] [--job-sha256 digest] [--max-live-workers ${AUTOMATION_LIMITS.repair_live_runs.default}] [--wait-for-capacity]`,
   );
   process.exit(2);
+}
+if (Boolean(stateRevision) !== Boolean(jobSha256)) {
+  throw new Error("--state-revision and --job-sha256 must be provided together");
+}
+if (stateRevision && files.length !== 1) {
+  throw new Error("immutable job handoff requires exactly one job");
 }
 
 let failed = false;
@@ -62,6 +74,11 @@ for (const file of files) {
     failed = true;
     console.error(`invalid job: ${file}`);
     for (const error of errors) console.error(`- ${error}`);
+    continue;
+  }
+  if (repairJobIntentForFrontmatter(job.frontmatter) === "commit_finding" && !stateRevision) {
+    failed = true;
+    console.error(`commit finding job requires immutable state handoff: ${file}`);
     continue;
   }
 
@@ -134,6 +151,9 @@ function dispatchJob(relative: JsonValue, position: JsonValue, total: JsonValue)
     `job=${jobPath}`,
     "-f",
     `dispatch_key=${dispatchKey}`,
+    ...(stateRevision
+      ? ["-f", `state_revision=${stateRevision}`, "-f", `job_sha256=${jobSha256}`]
+      : []),
     "-f",
     `mode=${mode}`,
     "-f",
@@ -158,6 +178,8 @@ function dispatchJob(relative: JsonValue, position: JsonValue, total: JsonValue)
         executionRunner,
         model,
         dispatchKey,
+        stateRevision: stateRevision || null,
+        jobSha256: jobSha256 || null,
       },
       operation: () => {
         const result = spawnSync("gh", commandArgs, {
@@ -191,6 +213,15 @@ function dispatchKeyArg(value: JsonValue | undefined): string {
   return key;
 }
 
+function immutableHexArg(value: JsonValue | undefined, label: string, length: 40 | 64): string {
+  const normalized = String(value ?? "").trim();
+  if (!normalized) return "";
+  if (!new RegExp(`^[a-f0-9]{${length}}$`).test(normalized)) {
+    throw new Error(`${label} must be an exact lowercase ${length}-hex value`);
+  }
+  return normalized;
+}
+
 function derivedDispatchKey(jobPath: string): string {
   const digest = createHash("sha256")
     .update(
@@ -200,6 +231,8 @@ function derivedDispatchKey(jobPath: string): string {
         ref: ref || null,
         jobPath,
         mode,
+        stateRevision: stateRevision || null,
+        jobSha256: jobSha256 || null,
       }),
     )
     .digest("hex")

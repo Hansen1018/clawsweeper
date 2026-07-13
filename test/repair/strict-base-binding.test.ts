@@ -654,7 +654,7 @@ test("commit finding intake is merge-disabled and carries no verifier credential
   assert.match(source, /name: Deduplicate commit finding dispatch receipt/);
   assert.match(
     source,
-    /dispatch-receipt-owner\.sh \\\n\s+repair-commit-finding-intake\.yml "\$expected_title" "\$GITHUB_RUN_ID" \\\n\s+"Intake commit finding" "Dispatch sealed repair worker"/,
+    /dispatch-receipt-owner\.sh \\\n\s+repair-commit-finding-intake\.yml "\$expected_title" "\$GITHUB_RUN_ID" \\\n\s+"Intake commit finding" "Complete durable intake handoff"/,
   );
   assert.match(source, /name: Intake commit finding[\s\S]*needs: receipt/);
   assert.match(source, /needs\.receipt\.outputs\.proceed == 'true'/);
@@ -677,7 +677,11 @@ test("commit finding intake is merge-disabled and carries no verifier credential
   assert.match(dispatchToken, /permission-contents: read/);
   assert.doesNotMatch(dispatchToken, /permission-contents: write/);
   assert.match(source, /pnpm run repair:dispatch --/);
-  assert.match(source, /--mode autonomous[\s\S]*--execution-runner "\$EXECUTION_RUNNER"/);
+  assert.match(
+    source,
+    /--mode autonomous[\s\S]*--execution-runner "\$EXECUTION_RUNNER"[\s\S]*--state-revision "\$\{\{ steps\.published-job\.outputs\.state_revision \}\}"[\s\S]*--job-sha256 "\$\{\{ steps\.published-job\.outputs\.job_sha256 \}\}"/,
+  );
+  assert.match(source, /name: Complete durable intake handoff/);
   assert.doesNotMatch(source, /repair:execute-fix|repair:post-flight|setup-codex/);
   assert.doesNotMatch(source, /ruleset-verifier-token/);
   assert.doesNotMatch(source, /CLAWSWEEPER_RULESET_GH_TOKEN/);

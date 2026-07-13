@@ -91,7 +91,7 @@ test("repair worker jobs upload shards and one credentialed job publishes them",
   assert.match(cluster, /permissions:\s+actions: read\s+contents: read/);
   assert.match(cluster, /uses: \.\/\.github\/actions\/setup-action-ledger/);
   assert.match(cluster, /Finalize cluster repair action ledger/);
-  assert.match(cluster, /clawsweeper-repair-action-ledger-cluster-/);
+  assert.match(cluster, /clawsweeper-repair-worker-action-ledger-cluster-/);
   assert.match(clusterRegistration, /CLAWSWEEPER_ACTION_SESSION_REMOTE:/);
   assert.match(
     clusterRegistration,
@@ -104,7 +104,7 @@ test("repair worker jobs upload shards and one credentialed job publishes them",
   assert.doesNotMatch(clusterRegistration, /if:.*CLAWSWEEPER_STEERABLE_CODEX/);
   assert.match(mutate, /uses: \.\/\.github\/actions\/setup-action-ledger/);
   assert.match(mutate, /Finalize mutation repair action ledger/);
-  assert.match(mutate, /clawsweeper-repair-action-ledger-mutate-/);
+  assert.match(mutate, /clawsweeper-repair-worker-action-ledger-mutate-/);
   assert.match(mutationRegistration, /CLAWSWEEPER_ACTION_SESSION_REMOTE:/);
   assert.match(
     mutationRegistration,
@@ -126,7 +126,7 @@ test("repair worker jobs upload shards and one credentialed job publishes them",
   assert.match(execute, /CLAWSWEEPER_ACTION_LEDGER_CAUSAL_ROOTS:/);
   assert.match(execute, /Resolve planning action ledger context/);
   assert.match(execute, /Finalize execution repair action ledger/);
-  assert.match(execute, /clawsweeper-repair-action-ledger-execute-/);
+  assert.match(execute, /clawsweeper-repair-worker-action-ledger-execute-/);
   assert.match(
     execute,
     /checkpoint_recovered \}\}" = "1"[\s\S]*allow_empty_args\+=\(--allow-empty\)[\s\S]*--repair-lane execute/,
@@ -469,7 +469,8 @@ test("commit finding and cluster intake publish their dispatch receipts", () => 
   }
   const commitFinding = readText(".github/workflows/repair-commit-finding-intake.yml");
   assert.match(commitFinding, /--dispatch-key "\$DISPATCH_KEY"/);
-  assert.match(commitFinding, /"Intake commit finding" "Dispatch sealed repair worker"/);
+  assert.match(commitFinding, /"Intake commit finding" "Complete durable intake handoff"/);
+  assert.match(commitFinding, /name: Complete durable intake handoff/);
 });
 
 test("result and finalizer workflows publish their repair operation receipts", () => {
