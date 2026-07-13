@@ -1120,6 +1120,132 @@ test("repair apply leaves current-main fixed closeout outside coverage proof", (
   }
 });
 
+test("repair apply confirms an exact merge after an ambiguous command response", () => {
+  const fixture = writeMergeApplyFixture({ mergeMode: "ambiguous_exact" });
+  try {
+    runMergeApplyResult(fixture, { retryAttempts: 4 });
+
+    const report = readApplyReport(fixture.reportPath);
+    assert.equal(report.actions[0].status, "executed");
+    assert.equal(report.actions[0].reason, "merge confirmed after ambiguous response");
+    assert.equal(report.actions[0].merged_at, "2026-07-13T08:00:00Z");
+    assert.equal(mergeCallCount(fixture.ghLogPath), 1);
+    assert.equal(restPullCallCount(fixture.ghLogPath), 2);
+    const mergeCall = ghCalls(fixture.ghLogPath).find(
+      (call) => call.args[0] === "pr" && call.args[1] === "merge",
+    );
+    assert.ok(mergeCall);
+    assert.deepEqual(mergeCall.args.slice(mergeCall.args.indexOf("--match-head-commit")), [
+      "--match-head-commit",
+      fixture.headSha,
+    ]);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("repair apply rejects a merged REST snapshot for a different head", () => {
+  const fixture = writeMergeApplyFixture({ mergeMode: "wrong_head_merged" });
+  try {
+    runMergeApplyResult(fixture);
+
+    const report = readApplyReport(fixture.reportPath);
+    assert.equal(report.actions[0].status, "blocked");
+    assert.equal(
+      report.actions[0].reason,
+      "merged pull request head does not match the authorized preflight head",
+    );
+    assert.equal(report.actions[0].merged_at, undefined);
+    assert.equal(mergeCallCount(fixture.ghLogPath), 1);
+    assert.equal(restPullCallCount(fixture.ghLogPath), 2);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+for (const pendingKind of ["queue", "auto_merge"] as const) {
+  test(`repair apply observes exact-head ${pendingKind} state without reissuing merge`, () => {
+    const fixture = writeMergeApplyFixture({
+      mergeMode: "pending_after_command",
+      pendingKind,
+    });
+    try {
+      runMergeApplyResult(fixture);
+      let report = readApplyReport(fixture.reportPath);
+      assert.equal(report.actions[0].status, "blocked");
+      assert.equal(report.actions[0].requeue_required, true);
+      assert.equal(
+        report.actions[0].reason,
+        pendingKind === "queue"
+          ? "merge is pending in GitHub's merge queue for the authorized pull request head"
+          : "auto-merge is pending for the authorized pull request head",
+      );
+      assert.equal(mergeCallCount(fixture.ghLogPath), 1);
+
+      runMergeApplyResult(fixture);
+      report = readApplyReport(fixture.reportPath);
+      assert.equal(report.actions[0].status, "blocked");
+      assert.equal(report.actions[0].requeue_required, true);
+      assert.equal(mergeCallCount(fixture.ghLogPath), 1);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+}
+
+test("repair apply does not transport-retry an ambiguous merge mutation", () => {
+  const fixture = writeMergeApplyFixture({ mergeMode: "ambiguous_unconfirmed" });
+  try {
+    runMergeApplyResult(fixture, { retryAttempts: 5 });
+
+    const report = readApplyReport(fixture.reportPath);
+    assert.equal(report.actions[0].status, "blocked");
+    assert.equal(report.actions[0].requeue_required, true);
+    assert.match(report.actions[0].reason, /merge command failed.*HTTP 502/i);
+    assert.equal(mergeCallCount(fixture.ghLogPath), 1);
+    assert.equal(restPullCallCount(fixture.ghLogPath), 2);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("repair apply reports strict-base failure before UNKNOWN mergeability", () => {
+  const fixture = writeMergeApplyFixture({
+    mergeable: "UNKNOWN",
+    strictBaseBinding: false,
+  });
+  try {
+    runMergeApplyResult(fixture);
+
+    const report = readApplyReport(fixture.reportPath);
+    assert.equal(report.actions[0].status, "blocked");
+    assert.equal(
+      report.actions[0].reason,
+      "automerge disabled: main lacks server-enforced strict base binding",
+    );
+    assert.equal(mergeCallCount(fixture.ghLogPath), 0);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("repair apply blocks final security drift before the merge request", () => {
+  const fixture = writeMergeApplyFixture({ securityOnFinalIssueFetch: true });
+  try {
+    runMergeApplyResult(fixture);
+
+    const report = readApplyReport(fixture.reportPath);
+    assert.equal(report.actions[0].status, "blocked");
+    assert.equal(
+      report.actions[0].reason,
+      "security-sensitive target requires central security triage",
+    );
+    assert.equal(mergeCallCount(fixture.ghLogPath), 0);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
 type ApplyFixturePaths = {
   binDir: string;
   jobPath: string;
@@ -1528,4 +1654,315 @@ function ghCalls(logPath: string): { args: string[] }[] {
 
 function hasPrCloseCall(logPath: string): boolean {
   return ghCalls(logPath).some((call) => call.args[0] === "pr" && call.args[1] === "close");
+}
+
+type MergeFixture = {
+  root: string;
+  binDir: string;
+  jobPath: string;
+  resultPath: string;
+  reportPath: string;
+  ghLogPath: string;
+  mergeCountPath: string;
+  headSha: string;
+  cleanup(): void;
+};
+
+function writeMergeApplyFixture(
+  options: {
+    mergeMode?:
+      | "success_exact"
+      | "ambiguous_exact"
+      | "ambiguous_unconfirmed"
+      | "pending_after_command"
+      | "wrong_head_merged";
+    pendingKind?: "queue" | "auto_merge";
+    mergeable?: "MERGEABLE" | "UNKNOWN";
+    strictBaseBinding?: boolean;
+    securityOnFinalIssueFetch?: boolean;
+  } = {},
+): MergeFixture {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-apply-result-merge-"));
+  const binDir = path.join(root, "bin");
+  const runDir = path.join(root, "run");
+  const jobPath = path.join(root, "job.md");
+  const resultPath = path.join(runDir, "result.json");
+  const reportPath = path.join(runDir, "apply-report.json");
+  const ghLogPath = path.join(root, "gh.log");
+  const mergeCountPath = path.join(root, "merge-count");
+  const issueCountPath = path.join(root, "issue-count");
+  const headSha = "a".repeat(40);
+  fs.mkdirSync(binDir, { recursive: true });
+  fs.mkdirSync(runDir, { recursive: true });
+  fs.writeFileSync(
+    jobPath,
+    [
+      "---",
+      "repo: openclaw/openclaw",
+      "cluster_id: repair-pr-merge-cas",
+      "mode: autonomous",
+      "allowed_actions:",
+      "  - merge",
+      "canonical:",
+      "  - '#101'",
+      "candidates:",
+      "  - '#101'",
+      "cluster_refs:",
+      "  - '#101'",
+      "allow_merge: true",
+      "---",
+      "Repair merge job.",
+      "",
+    ].join("\n"),
+  );
+  fs.writeFileSync(
+    resultPath,
+    JSON.stringify(
+      {
+        repo: "openclaw/openclaw",
+        cluster_id: "repair-pr-merge-cas",
+        mode: "autonomous",
+        actions: [
+          {
+            action: "merge_candidate",
+            classification: "fixed_by_candidate",
+            target: "#101",
+            target_kind: "pull_request",
+            target_updated_at: "2026-07-13T07:00:00Z",
+            status: "planned",
+          },
+        ],
+        merge_preflight: [
+          {
+            target: "#101",
+            security_status: "cleared",
+            security_evidence: ["No security signal."],
+            comments_status: "resolved",
+            comments_evidence: ["No unresolved review comments."],
+            bot_comments_status: "resolved",
+            bot_comments_evidence: ["No unresolved bot comments."],
+            validation_commands: ["pnpm test"],
+            codex_review: {
+              command: "/review",
+              status: "passed",
+              findings_addressed: true,
+              evidence: ["Codex /review passed."],
+            },
+          },
+        ],
+      },
+      null,
+      2,
+    ),
+  );
+
+  const fakeData = {
+    ghLogPath,
+    mergeCountPath,
+    headSha,
+    wrongHeadSha: "b".repeat(40),
+    mergeMode: options.mergeMode ?? "success_exact",
+    pendingKind: options.pendingKind ?? null,
+    mergeable: options.mergeable ?? "MERGEABLE",
+    strictBaseBinding: options.strictBaseBinding ?? true,
+    securityOnFinalIssueFetch: options.securityOnFinalIssueFetch ?? false,
+    issueCountPath,
+  };
+  fs.writeFileSync(
+    path.join(binDir, "gh.js"),
+    `#!/usr/bin/env node
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+const data = ${JSON.stringify(fakeData)};
+fs.appendFileSync(data.ghLogPath, JSON.stringify({ args }) + "\\n");
+
+function write(value) {
+  process.stdout.write(JSON.stringify(value));
+}
+
+function mergeCount() {
+  return fs.existsSync(data.mergeCountPath)
+    ? Number(fs.readFileSync(data.mergeCountPath, "utf8"))
+    : 0;
+}
+
+function issueCount() {
+  return fs.existsSync(data.issueCountPath)
+    ? Number(fs.readFileSync(data.issueCountPath, "utf8"))
+    : 0;
+}
+
+if (args[0] === "api") {
+  const apiPath = args[1] || "";
+  if (apiPath.includes("/issues/101/comments")) {
+    write(args.includes("--slurp") ? [[]] : []);
+    process.exit(0);
+  }
+  if (apiPath === "repos/openclaw/openclaw/issues/101") {
+    const count = issueCount() + 1;
+    fs.writeFileSync(data.issueCountPath, String(count));
+    write({
+      number: 101,
+      title: "Exact merge candidate",
+      html_url: "https://github.com/openclaw/openclaw/pull/101",
+      state: "open",
+      updated_at: "2026-07-13T07:00:00Z",
+      author_association: "CONTRIBUTOR",
+      user: { login: "contributor" },
+      labels: data.securityOnFinalIssueFetch && count > 1 ? [{ name: "security" }] : [],
+      pull_request: {},
+    });
+    process.exit(0);
+  }
+  if (apiPath === "repos/openclaw/openclaw/pulls/101") {
+    const attempted = mergeCount() > 0;
+    const pending = attempted && data.mergeMode === "pending_after_command";
+    const merged =
+      attempted &&
+      ["success_exact", "ambiguous_exact", "wrong_head_merged"].includes(data.mergeMode);
+    const snapshotHead =
+      attempted && data.mergeMode === "wrong_head_merged" ? data.wrongHeadSha : data.headSha;
+    write({
+      number: 101,
+      title: "Exact merge candidate",
+      html_url: "https://github.com/openclaw/openclaw/pull/101",
+      state: merged ? "closed" : "open",
+      draft: false,
+      updated_at: merged ? "2026-07-13T08:00:00Z" : "2026-07-13T07:00:00Z",
+      merged_at: merged ? "2026-07-13T08:00:00Z" : null,
+      merge_commit_sha: merged ? "c".repeat(40) : null,
+      auto_merge:
+        pending && data.pendingKind === "auto_merge"
+          ? { enabled_by: { login: "maintainer" } }
+          : null,
+      mergeable_state: pending && data.pendingKind === "queue" ? "queued" : "clean",
+      base: { ref: "main" },
+      head: { sha: snapshotHead },
+    });
+    process.exit(0);
+  }
+  if (apiPath === "repos/openclaw/openclaw/rules/branches/main") {
+    write([]);
+    process.exit(0);
+  }
+  if (apiPath === "repos/openclaw/openclaw/branches/main/protection") {
+    write({
+      required_status_checks: data.strictBaseBinding
+        ? { strict: true, contexts: ["required-ci/exact-merge"] }
+        : null,
+    });
+    process.exit(0);
+  }
+  if (args[1] === "graphql") {
+    write({
+      data: {
+        repository: {
+          pullRequest: {
+            reviewThreads: { pageInfo: { hasNextPage: false }, nodes: [] },
+          },
+        },
+      },
+    });
+    process.exit(0);
+  }
+}
+
+if (args[0] === "pr" && args[1] === "view") {
+  const pending = mergeCount() > 0 && data.mergeMode === "pending_after_command";
+  write({
+    autoMergeRequest:
+      pending && data.pendingKind === "auto_merge"
+        ? { enabledAt: "2026-07-13T07:30:00Z", mergeMethod: "SQUASH" }
+        : null,
+    baseRefName: "main",
+    headRefOid: data.headSha,
+    isDraft: false,
+    isInMergeQueue: pending && data.pendingKind === "queue",
+    mergeable: data.mergeable,
+    mergeCommit: null,
+    mergeStateStatus: "CLEAN",
+    mergedAt: null,
+    reviewDecision: null,
+    state: "OPEN",
+    statusCheckRollup: [{ name: "test", status: "COMPLETED", conclusion: "SUCCESS" }],
+    title: "Exact merge candidate",
+    updatedAt: "2026-07-13T07:00:00Z",
+    url: "https://github.com/openclaw/openclaw/pull/101",
+  });
+  process.exit(0);
+}
+
+if (args[0] === "pr" && args[1] === "merge") {
+  const count = mergeCount() + 1;
+  fs.writeFileSync(data.mergeCountPath, String(count));
+  if (["ambiguous_exact", "ambiguous_unconfirmed"].includes(data.mergeMode)) {
+    process.stderr.write("gh: HTTP 502: Bad Gateway\\n");
+    process.exit(1);
+  }
+  process.exit(0);
+}
+
+process.stderr.write("unexpected gh args: " + JSON.stringify(args) + "\\n");
+process.exit(1);
+`,
+    { mode: 0o755 },
+  );
+
+  return {
+    root,
+    binDir,
+    jobPath,
+    resultPath,
+    reportPath,
+    ghLogPath,
+    mergeCountPath,
+    headSha,
+    cleanup() {
+      fs.rmSync(root, { recursive: true, force: true });
+    },
+  };
+}
+
+function runMergeApplyResult(fixture: MergeFixture, options: { retryAttempts?: number } = {}) {
+  execFileSync(
+    process.execPath,
+    ["dist/repair/apply-result.js", fixture.jobPath, fixture.resultPath],
+    {
+      cwd: repoRoot,
+      env: {
+        ...process.env,
+        CLAWSWEEPER_ALLOW_EXECUTE: "1",
+        CLAWSWEEPER_ALLOW_MERGE: "1",
+        CLAWSWEEPER_ALLOWED_OWNER: "openclaw",
+        CLAWSWEEPER_APP_SLUG: "openclaw-clawsweeper",
+        CLAWSWEEPER_AUTHENTICATED_APP_ID: "3306130",
+        CLAWSWEEPER_AUTHENTICATED_APP_SLUG: "openclaw-clawsweeper",
+        CLAWSWEEPER_AUTHENTICATED_INSTALLATION_ID: "7001",
+        CLAWSWEEPER_RULESET_APP_ID: "3306130",
+        CLAWSWEEPER_RULESET_APP_SLUG: "openclaw-clawsweeper",
+        CLAWSWEEPER_RULESET_GH_TOKEN: "ruleset-token",
+        CLAWSWEEPER_RULESET_INSTALLATION_ID: "7001",
+        CLAWSWEEPER_GH_RETRY_ATTEMPTS: String(options.retryAttempts ?? 1),
+        GH_TOKEN: "write-token",
+        ...mockGhBinEnv(path.join(fixture.binDir, "gh.js")),
+      },
+      stdio: "pipe",
+    },
+  );
+}
+
+function readApplyReport(reportPath: string) {
+  return JSON.parse(fs.readFileSync(reportPath, "utf8"));
+}
+
+function mergeCallCount(logPath: string): number {
+  if (!fs.existsSync(logPath)) return 0;
+  return ghCalls(logPath).filter((call) => call.args[0] === "pr" && call.args[1] === "merge")
+    .length;
+}
+
+function restPullCallCount(logPath: string): number {
+  return ghCalls(logPath).filter(
+    (call) => call.args[0] === "api" && call.args[1] === "repos/openclaw/openclaw/pulls/101",
+  ).length;
 }

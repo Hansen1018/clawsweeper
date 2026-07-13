@@ -10,7 +10,7 @@ import {
   repoRoot,
   validateJob,
 } from "./lib.js";
-import { isAllowedMutationActor, stripAnsi } from "./comment-router-utils.js";
+import { stripAnsi } from "./comment-router-utils.js";
 import { externalMessageProvenance, postMergeCloseoutComment } from "./external-messages.js";
 import {
   ghErrorText,
@@ -18,7 +18,7 @@ import {
   ghText,
   ghTextWithRetry as ghWithRetry,
 } from "./github-cli.js";
-import { ghRetryKind, ghRetryWaitMs, type GhRetryKind } from "../github-retry.js";
+import { ghRetryKind } from "../github-retry.js";
 import { issueNumberFromRef, parsePullRequestUrl } from "./github-ref.js";
 import { sleepMs } from "./timing.js";
 import {
@@ -69,14 +69,6 @@ const POST_MERGE_CLOSE_ACTIONS = new Set([
 const DEFAULT_IGNORED_CHECKS = ["auto-response", "Labeler", "Stale"];
 const POST_FLIGHT_WAIT_MS = numberEnv("CLAWSWEEPER_POST_FLIGHT_WAIT_MS", 10 * 60 * 1000);
 const POST_FLIGHT_POLL_MS = numberEnv("CLAWSWEEPER_POST_FLIGHT_POLL_MS", 15 * 1000);
-const POST_FLIGHT_MERGE_ATTEMPTS = Math.max(
-  1,
-  Math.floor(numberEnv("CLAWSWEEPER_POST_FLIGHT_MERGE_ATTEMPTS", 3)),
-);
-const POST_FLIGHT_MERGE_RETRY_MAX_WAIT_MS = numberEnv(
-  "CLAWSWEEPER_POST_FLIGHT_MERGE_RETRY_MAX_WAIT_MS",
-  10_000,
-);
 
 const args = parseArgs(process.argv.slice(2));
 const jobPath = args._[0];
@@ -260,12 +252,11 @@ function finalizeFixPr(action: LooseRecord) {
       };
     }
 
-    mergeBlock = validateMergeableFixPr({
+    mergeBlock = postFlightMergeRetryBlock({
+      action,
+      number: parsed.number,
       pull,
       view,
-      preflight: action.merge_preflight,
-      expectedHeadSha: action.commit,
-      validationProofPlan: fixReport.validation_proof_plan,
     });
     if (!mergeBlock) break;
     const waitable = shouldWaitForMergeReadiness({ mergeBlock, view });
@@ -317,21 +308,6 @@ function finalizeFixPr(action: LooseRecord) {
     };
   }
 
-  const strictBaseBindingBlock = runtimeStrictBaseBindingBlock({
-    repo: result.repo,
-    baseBranch: String(view.baseRefName ?? pull.base?.ref ?? ""),
-    policyReadJson: rulesetPolicyReader(),
-  });
-  if (strictBaseBindingBlock) {
-    return {
-      ...prBase,
-      status: "blocked",
-      reason: strictBaseBindingBlock,
-      merge_method: "squash",
-      waited_ms: waitedMs,
-    };
-  }
-
   const mergeMessage = buildRepairSquashMergeMessage({
     target: parsed.number,
     title: view.title ?? pull.title,
@@ -364,7 +340,6 @@ function finalizeFixPr(action: LooseRecord) {
   for (;;) {
     let mergeAttempt: {
       policyBlock: string;
-      claimBlock: string;
       pull: LooseRecord;
       view: LooseRecord;
       confirmation: ReturnType<typeof reconcileMergeState> | null;
@@ -384,19 +359,6 @@ function finalizeFixPr(action: LooseRecord) {
         if (policyBlock) {
           return {
             policyBlock,
-            claimBlock: "",
-            pull: finalPull,
-            view: finalView,
-            confirmation: null,
-            confirmationError: "",
-            ambiguous: false,
-          };
-        }
-        const claim = ensurePostFlightMergeClaim(parsed.number, action.commit);
-        if (claim.status !== "created") {
-          return {
-            policyBlock: "",
-            claimBlock: claim.reason,
             pull: finalPull,
             view: finalView,
             confirmation: null,
@@ -427,7 +389,7 @@ function finalizeFixPr(action: LooseRecord) {
               };
             }
             if (commandError !== null) {
-              if (confirmation.mergedAt && !confirmation.block) {
+              if ((confirmation.mergedAt || confirmation.pendingReason) && !confirmation.block) {
                 return { confirmation, confirmationError: "", ambiguous: true };
               }
               throw commandError;
@@ -435,11 +397,12 @@ function finalizeFixPr(action: LooseRecord) {
             return { confirmation, confirmationError: "", ambiguous: false };
           },
           outcome: ({ confirmation }) =>
-            confirmation?.mergedAt && !confirmation.block ? "accepted" : "unknown",
+            (confirmation?.mergedAt || confirmation?.pendingReason) && !confirmation.block
+              ? "accepted"
+              : "unknown",
         });
         return {
           policyBlock: "",
-          claimBlock: "",
           pull: mutation.confirmation?.pull ?? finalPull,
           view: mutation.confirmation?.view ?? finalView,
           confirmation: mutation.confirmation,
@@ -492,6 +455,18 @@ function finalizeFixPr(action: LooseRecord) {
           waited_ms: waitedMs,
         };
       }
+      if (reconciliation.pendingReason) {
+        recordPostFlightMergeObserved(parsed.number, action.commit);
+        return {
+          ...prBase,
+          status: "blocked",
+          reason: reconciliation.pendingReason,
+          merge_method: "squash",
+          retry_recommended: true,
+          merge_attempts: mergeAttempts,
+          waited_ms: waitedMs,
+        };
+      }
       const retryBlock = postFlightMergeRetryBlock({
         action,
         number: parsed.number,
@@ -511,13 +486,6 @@ function finalizeFixPr(action: LooseRecord) {
         };
       }
 
-      const retryKind = ghRetryKind(error);
-      if (retryKind !== "none" && mergeAttempts < POST_FLIGHT_MERGE_ATTEMPTS) {
-        const retryWaitMs = postFlightMergeRetryWaitMs(retryKind, mergeAttempts - 1);
-        sleepMs(retryWaitMs);
-        waitedMs += retryWaitMs;
-        continue;
-      }
       if (isRecoverableMergeRace(detail)) {
         return {
           ...prBase,
@@ -531,11 +499,12 @@ function finalizeFixPr(action: LooseRecord) {
           waited_ms: waitedMs,
         };
       }
+      const retryKind = ghRetryKind(error);
       if (retryKind !== "none") {
         return {
           ...prBase,
           status: "blocked",
-          reason: `merge attempt remained ${retryKind} after ${mergeAttempts} attempts: ${compactText(detail, 500)}`,
+          reason: `merge attempt was ${retryKind} and GitHub did not confirm an exact-head merge effect: ${compactText(detail, 500)}`,
           mergeable: view.mergeable ?? null,
           merge_state_status: view.mergeStateStatus ?? null,
           review_decision: view.reviewDecision ?? null,
@@ -566,18 +535,6 @@ function finalizeFixPr(action: LooseRecord) {
       };
     }
 
-    if (mergeAttempt.claimBlock) {
-      return {
-        ...prBase,
-        status: "blocked",
-        reason: mergeAttempt.claimBlock,
-        merge_method: "squash",
-        retry_recommended: true,
-        merge_attempts: mergeAttempts,
-        waited_ms: waitedMs,
-      };
-    }
-
     const confirmation = mergeAttempt.confirmation;
     if (!confirmation) {
       return {
@@ -599,6 +556,17 @@ function finalizeFixPr(action: LooseRecord) {
         status: "blocked",
         reason: confirmation.block,
         merge_method: "squash",
+        merge_attempts: mergeAttempts,
+        waited_ms: waitedMs,
+      };
+    }
+    if (confirmation.pendingReason) {
+      return {
+        ...prBase,
+        status: "blocked",
+        reason: confirmation.pendingReason,
+        merge_method: "squash",
+        retry_recommended: true,
         merge_attempts: mergeAttempts,
         waited_ms: waitedMs,
       };
@@ -638,7 +606,12 @@ function finalizeFixPr(action: LooseRecord) {
 function reconcileMergeState(number: number, expectedHeadSha: JsonValue) {
   const pull = fetchPullRequest(result.repo, number);
   const view = fetchPullRequestView(result.repo, number);
-  return { pull, view, ...confirmMergedPullSnapshot(pull, expectedHeadSha) };
+  return {
+    pull,
+    view,
+    ...confirmMergedPullSnapshot(pull, expectedHeadSha),
+    pendingReason: exactHeadPendingMergeReason(view, expectedHeadSha),
+  };
 }
 
 function confirmMergedPullSnapshot(pull: LooseRecord, expectedHeadSha: JsonValue) {
@@ -664,191 +637,15 @@ function postFlightMergeMutationIdentity(number: number, headSha: JsonValue) {
   };
 }
 
-function postFlightMergeClaimIdentity(number: number, headSha: JsonValue) {
-  return {
-    ...postFlightMergeMutationIdentity(number, headSha),
-    claim: "write_ahead",
-  };
-}
-
-function postFlightMergeClaimKey(number: number, headSha: JsonValue) {
-  return `clawsweeper-post-flight-merge-claim:v1 pr=${number} head=${String(headSha)} method=squash`;
-}
-
-function postFlightMergeClaimant() {
-  const runId = String(process.env.GITHUB_RUN_ID ?? "").trim();
-  const runAttempt = String(process.env.GITHUB_RUN_ATTEMPT ?? "").trim();
-  if (!/^[1-9][0-9]*$/.test(runId) || !/^[1-9][0-9]*$/.test(runAttempt)) {
-    throw new Error("workflow identity is invalid for the post-flight merge claim");
+function exactHeadPendingMergeReason(view: LooseRecord, expectedHeadSha: JsonValue) {
+  if (!isFullCommitSha(expectedHeadSha) || view.headRefOid !== expectedHeadSha) return "";
+  if (view.isInMergeQueue === true) {
+    return "exact-head merge request is queued; waiting for GitHub outcome";
   }
-  return `${runId}:${runAttempt}`;
-}
-
-function postFlightMergeClaimMarker(number: number, headSha: JsonValue) {
-  return `<!-- ${postFlightMergeClaimKey(number, headSha)} claimant=${postFlightMergeClaimant()} -->`;
-}
-
-function postFlightMergeClaimBody(number: number, headSha: JsonValue) {
-  return [
-    postFlightMergeClaimMarker(number, headSha),
-    `ClawSweeper claimed the verified squash-merge request for \`${String(headSha).slice(0, 12)}\`. Later workflow attempts will only reconcile this request, not issue it again.`,
-  ].join("\n");
-}
-
-function fetchPullRequestComments(number: number): LooseRecord[] {
-  const pages = ghJson([
-    "api",
-    `repos/${result.repo}/issues/${number}/comments?per_page=100`,
-    "--paginate",
-    "--slurp",
-  ]);
-  if (!Array.isArray(pages)) throw new Error("pull request comments response is invalid");
-  const comments = pages.flatMap((page) => {
-    if (!Array.isArray(page)) throw new Error("pull request comments page is invalid");
-    return page;
-  });
-  if (
-    comments.some((comment) => !comment || typeof comment !== "object" || Array.isArray(comment))
-  ) {
-    throw new Error("pull request comment record is invalid");
+  if (view.autoMergeRequest) {
+    return "exact-head auto-merge request is pending; waiting for GitHub outcome";
   }
-  return comments as LooseRecord[];
-}
-
-function trustedPostFlightMergeClaim(
-  comment: LooseRecord,
-  number: number,
-  headSha: JsonValue,
-): boolean {
-  const appSlug = String(process.env.CLAWSWEEPER_AUTHENTICATED_APP_SLUG ?? "").trim();
-  const appId = Number(process.env.CLAWSWEEPER_AUTHENTICATED_APP_ID);
-  const performedViaApp = comment.performed_via_github_app;
-  if (
-    !appSlug ||
-    !Number.isSafeInteger(appId) ||
-    appId < 1 ||
-    !performedViaApp ||
-    Number(performedViaApp.id) !== appId ||
-    String(performedViaApp.slug ?? "").trim() !== appSlug
-  ) {
-    return false;
-  }
-  const botLogin = appSlug.endsWith("[bot]") ? appSlug : `${appSlug}[bot]`;
-  return (
-    isAllowedMutationActor(comment.user?.login, [appSlug, botLogin]) &&
-    String(comment.body ?? "").includes(postFlightMergeClaimKey(number, headSha))
-  );
-}
-
-function postFlightMergeClaims(number: number, headSha: JsonValue): LooseRecord[] {
-  return fetchPullRequestComments(number).filter((comment) =>
-    trustedPostFlightMergeClaim(comment, number, headSha),
-  );
-}
-
-function postFlightMergeClaimId(comment: LooseRecord): number | null {
-  const id = Number(comment.id);
-  return Number.isSafeInteger(id) && id > 0 ? id : null;
-}
-
-function ensurePostFlightMergeClaim(
-  number: number,
-  headSha: JsonValue,
-): { status: "created" | "existing" | "unknown"; reason: string } {
-  const identity = postFlightMergeClaimIdentity(number, headSha);
-  const ownMarker = postFlightMergeClaimMarker(number, headSha);
-  let existingClaims: LooseRecord[];
-  try {
-    existingClaims = postFlightMergeClaims(number, headSha);
-  } catch (error) {
-    return {
-      status: "unknown",
-      reason: `merge claim state could not be read: ${compactText(ghErrorText(error), 500)}`,
-    };
-  }
-  if (existingClaims.length > 0) {
-    recordRepairMutationObservedSafely(postFlightLifecycle(null), {
-      kind: "post_flight_merge_claim",
-      identity,
-      component: "post_flight_merge_claim",
-    });
-    return {
-      status: "existing",
-      reason: "merge request is already claimed for this exact head; waiting for GitHub outcome",
-    };
-  }
-
-  let createError = "";
-  let createdClaimId: number | null = null;
-  try {
-    const comment = runRepairMutation(postFlightLifecycle(null), {
-      kind: "post_flight_merge_claim",
-      identity,
-      component: "post_flight_merge_claim",
-      operation: () =>
-        ghJson([
-          "api",
-          `repos/${result.repo}/issues/${number}/comments`,
-          "-f",
-          `body=${postFlightMergeClaimBody(number, headSha)}`,
-        ]),
-      outcome: (created) =>
-        trustedPostFlightMergeClaim(created, number, headSha) &&
-        String(created.body ?? "").includes(ownMarker) &&
-        postFlightMergeClaimId(created)
-          ? "accepted"
-          : "unknown",
-    });
-    if (
-      trustedPostFlightMergeClaim(comment, number, headSha) &&
-      String(comment.body ?? "").includes(ownMarker)
-    ) {
-      createdClaimId = postFlightMergeClaimId(comment);
-    }
-    if (!createdClaimId) createError = "GitHub returned an unverified merge claim";
-  } catch (error) {
-    createError = ghErrorText(error);
-  }
-
-  let claims: LooseRecord[];
-  try {
-    claims = postFlightMergeClaims(number, headSha);
-  } catch (error) {
-    return {
-      status: "unknown",
-      reason: `merge claim outcome could not be confirmed: ${compactText(ghErrorText(error), 500)}`,
-    };
-  }
-  const claimIds = claims.map(postFlightMergeClaimId);
-  if (claimIds.some((id) => id === null)) {
-    return {
-      status: "unknown",
-      reason: "merge claim ownership could not be verified from GitHub comment identities",
-    };
-  }
-  const ownClaims = claims.filter((comment) => String(comment.body ?? "").includes(ownMarker));
-  const ownClaimId = createdClaimId ?? ownClaims.map(postFlightMergeClaimId).find(Boolean) ?? null;
-  if (ownClaimId) {
-    const winningClaimId = Math.min(...(claimIds as number[]));
-    if (!createdClaimId) {
-      recordRepairMutationObservedSafely(postFlightLifecycle(null), {
-        kind: "post_flight_merge_claim",
-        identity,
-        component: "post_flight_merge_claim",
-      });
-    }
-    if (ownClaimId === winningClaimId) return { status: "created", reason: "" };
-  }
-  if (claims.length > 0) {
-    return {
-      status: "existing",
-      reason: "another verified workflow attempt owns the merge claim for this exact head",
-    };
-  }
-  return {
-    status: "unknown",
-    reason: `merge claim was not confirmed: ${compactText(createError, 500)}`,
-  };
+  return "";
 }
 
 function recordPostFlightMergeObserved(number: number, headSha: JsonValue) {
@@ -874,23 +671,23 @@ function postFlightMergeRetryBlock({
   if (securityBlock) return securityBlock;
   const policyBlock = validateMergePolicy(action, pull);
   if (policyBlock) return policyBlock;
-  const mergeBlock = validateMergeableFixPr({
+  const proofBlock = validateFixPrMergeProof({
     pull,
     view,
     preflight: action.merge_preflight,
     expectedHeadSha: action.commit,
     validationProofPlan: fixReport.validation_proof_plan,
   });
-  if (mergeBlock) return mergeBlock;
-  return runtimeStrictBaseBindingBlock({
+  if (proofBlock) return proofBlock;
+  const strictBaseBindingBlock = runtimeStrictBaseBindingBlock({
     repo: result.repo,
     baseBranch: String(view.baseRefName ?? pull.base?.ref ?? ""),
     policyReadJson: rulesetPolicyReader(),
   });
-}
-
-function postFlightMergeRetryWaitMs(kind: GhRetryKind, attempt: number) {
-  return Math.min(POST_FLIGHT_MERGE_RETRY_MAX_WAIT_MS, ghRetryWaitMs(kind, attempt));
+  if (strictBaseBindingBlock) return strictBaseBindingBlock;
+  const pendingReason = exactHeadPendingMergeReason(view, action.commit);
+  if (pendingReason) return pendingReason;
+  return validateFixPrMergeReadiness({ pull, view });
 }
 
 function publishedFixAction(fixReport: LooseRecord, receipt: LooseRecord): LooseRecord {
@@ -1317,7 +1114,7 @@ function freshLiveSecurityBlockReason(number: JsonValue) {
   return liveSecurityBlockReason(number, issue.labels ?? []);
 }
 
-function validateMergeableFixPr({
+function validateFixPrMergeProof({
   pull,
   view,
   preflight,
@@ -1328,9 +1125,6 @@ function validateMergeableFixPr({
   if (pull.draft || view.isDraft) return "pull request is draft";
   if (String(view.baseRefName ?? pull.base?.ref ?? "") !== "main")
     return "pull request base is not main";
-  if (hasLiveSecuritySignal(pull.number, pull.labels ?? [])) {
-    return "security-sensitive PR requires central security triage";
-  }
   const preflightBlock = validateMergePreflight(preflight, {
     expectedHeadSha,
     liveHeadSha: pull.head?.sha,
@@ -1339,6 +1133,10 @@ function validateMergeableFixPr({
   });
   if (preflightBlock) return preflightBlock;
 
+  return "";
+}
+
+function validateFixPrMergeReadiness({ pull, view }: LooseRecord) {
   if (view.mergeable !== "MERGEABLE") return `mergeable state is ${view.mergeable || "unknown"}`;
   if (!FIX_PR_MERGE_STATES.has(String(view.mergeStateStatus ?? ""))) {
     return `merge state status is ${view.mergeStateStatus || "unknown"}`;
@@ -1460,6 +1258,8 @@ function validateStatusChecks(checks: LooseRecord[]) {
 
 function shouldWaitForMergeReadiness({ mergeBlock, view }: LooseRecord) {
   const message = String(mergeBlock ?? "").toLowerCase();
+  if (message.includes("exact-head merge request is queued")) return true;
+  if (message.includes("exact-head auto-merge request is pending")) return true;
   if (message.includes("mergeable state is unknown")) return true;
   if (message.includes("merge state status is unknown")) return true;
   if (message === "no pr checks found") return true;
@@ -1620,8 +1420,11 @@ function fetchPullRequestView(repo: string, number: JsonValue) {
     repo,
     "--json",
     [
+      "autoMergeRequest",
       "baseRefName",
+      "headRefOid",
       "isDraft",
+      "isInMergeQueue",
       "mergeable",
       "mergeCommit",
       "mergeStateStatus",

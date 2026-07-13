@@ -16,8 +16,10 @@ import {
   ghBestEffortWithRetry as ghBestEffort,
   ghErrorText,
   githubLimitedPagePath,
+  ghJson as ghJsonOnce,
   ghJsonWithRetry as ghJson,
   ghPagedWithRetry as ghPaged,
+  ghText,
   ghTextWithRetry as ghWithRetry,
 } from "./github-cli.js";
 import { issueNumberFromRef } from "./github-ref.js";
@@ -589,31 +591,31 @@ function applyMergeAction({
 
   const pullRequest = fetchPullRequest(result.repo, target);
   const view = fetchPullRequestView(result.repo, target);
-  const mergedAt = pullRequest.merged_at ?? view.mergedAt ?? null;
-  if (mergedAt) {
+  const authorizedHeadSha = String(pullRequest.head?.sha ?? "");
+  const existingMerge = confirmExactMergeSnapshot(pullRequest, authorizedHeadSha);
+  if (existingMerge.block) {
+    return {
+      ...base,
+      status: "blocked",
+      reason: existingMerge.block,
+      live_state: live.state,
+      live_updated_at: live.updated_at,
+    };
+  }
+  if (existingMerge.mergedAt) {
     return {
       ...base,
       status: "executed",
       reason: "already merged",
       live_state: "merged",
       live_updated_at: live.updated_at,
-      merged_at: mergedAt,
-      merge_commit_sha: pullRequest.merge_commit_sha ?? view.mergeCommit?.oid ?? null,
+      merged_at: existingMerge.mergedAt,
+      merge_commit_sha: pullRequest.merge_commit_sha ?? null,
     };
   }
   const lockedSkip = lockedConversationSkipIfLocked(base, live);
   if (lockedSkip) return { ...lockedSkip, merge_method: "squash" };
 
-  const mergeBlock = validateMergeablePullRequest({ pullRequest, view });
-  if (mergeBlock) {
-    return {
-      ...base,
-      status: "blocked",
-      reason: mergeBlock,
-      live_state: live.state,
-      live_updated_at: live.updated_at,
-    };
-  }
   const mergePreflightBlock = validateMergePreflight({ result, target });
   if (mergePreflightBlock) {
     return {
@@ -624,7 +626,61 @@ function applyMergeAction({
       live_updated_at: live.updated_at,
     };
   }
+  const headBindingBlock = validateMergeHeadBinding({ authorizedHeadSha, view });
+  if (headBindingBlock) {
+    return {
+      ...base,
+      status: "blocked",
+      reason: headBindingBlock,
+      live_state: live.state,
+      live_updated_at: live.updated_at,
+    };
+  }
   const mergePreflight = findMergePreflight(result, target);
+  const hardMergeBlock = validateMergeablePullRequestHard({ pullRequest, view });
+  if (hardMergeBlock) {
+    return {
+      ...base,
+      status: "blocked",
+      reason: hardMergeBlock,
+      live_state: live.state,
+      live_updated_at: live.updated_at,
+    };
+  }
+
+  if (process.env.CLAWSWEEPER_ALLOW_MERGE === "1" && !dryRun) {
+    const strictBaseBindingBlock = runtimeStrictBaseBindingBlock({
+      repo: result.repo,
+      baseBranch: String(view.baseRefName ?? pullRequest.base?.ref ?? ""),
+      policyReadJson: rulesetPolicyReader(),
+    });
+    if (strictBaseBindingBlock) {
+      return {
+        ...base,
+        status: "blocked",
+        reason: strictBaseBindingBlock,
+        live_state: live.state,
+        live_updated_at: live.updated_at,
+        merge_method: "squash",
+      };
+    }
+  }
+
+  const pendingMerge = exactHeadPendingMerge(view, authorizedHeadSha);
+  if (pendingMerge) {
+    return pendingMergeAction({ base, live, reason: pendingMerge });
+  }
+
+  const mergeBlock = validateMergeablePullRequestReadiness({ view });
+  if (mergeBlock) {
+    return {
+      ...base,
+      status: "blocked",
+      reason: mergeBlock,
+      live_state: live.state,
+      live_updated_at: live.updated_at,
+    };
+  }
 
   if (process.env.CLAWSWEEPER_ALLOW_MERGE !== "1") {
     if (!dryRun) labelForClawSweeperReview(result.repo, target);
@@ -649,30 +705,14 @@ function applyMergeAction({
     };
   }
 
-  const strictBaseBindingBlock = runtimeStrictBaseBindingBlock({
-    repo: result.repo,
-    baseBranch: String(view.baseRefName ?? pullRequest.base?.ref ?? ""),
-    policyReadJson: rulesetPolicyReader(),
-  });
-  if (strictBaseBindingBlock) {
-    return {
-      ...base,
-      status: "blocked",
-      reason: strictBaseBindingBlock,
-      live_state: live.state,
-      live_updated_at: live.updated_at,
-      merge_method: "squash",
-    };
-  }
-
   const mergeMessage = buildRepairSquashMergeMessage({
     target,
     title: view.title ?? pullRequest.title,
-    headSha: pullRequest.head?.sha,
+    headSha: authorizedHeadSha,
     preflight: mergePreflight,
     reason: "merged by ClawSweeper Repair",
   });
-  const bodyFile = writeRepairSquashMergeBody(target, pullRequest.head?.sha, mergeMessage.body);
+  const bodyFile = writeRepairSquashMergeBody(target, authorizedHeadSha, mergeMessage.body);
   const mergeArgs = [
     "pr",
     "merge",
@@ -684,48 +724,239 @@ function applyMergeAction({
     String(mergeMessage.subject),
     "--body-file",
     bodyFile,
+    "--match-head-commit",
+    authorizedHeadSha,
   ];
-  if (pullRequest.head?.sha) mergeArgs.push("--match-head-commit", String(pullRequest.head.sha));
+  let commandError: unknown = null;
+  const finalView = fetchPullRequestView(result.repo, target);
+  const finalHeadBindingBlock = validateMergeHeadBinding({ authorizedHeadSha, view: finalView });
+  if (finalHeadBindingBlock) {
+    return {
+      ...base,
+      status: "blocked",
+      reason: finalHeadBindingBlock,
+      live_state: live.state,
+      live_updated_at: live.updated_at,
+      merge_method: "squash",
+    };
+  }
+  const finalHardMergeBlock = validateMergeablePullRequestHard({
+    pullRequest,
+    view: finalView,
+  });
+  if (finalHardMergeBlock) {
+    return {
+      ...base,
+      status: "blocked",
+      reason: finalHardMergeBlock,
+      live_state: live.state,
+      live_updated_at: live.updated_at,
+      merge_method: "squash",
+    };
+  }
+  const finalLive = fetchIssue(result.repo, target);
+  if (hasSecuritySignal(finalLive)) {
+    return {
+      ...base,
+      status: "blocked",
+      reason: "security-sensitive target requires central security triage",
+      live_state: finalLive.state,
+      live_updated_at: finalLive.updated_at,
+      merge_method: "squash",
+    };
+  }
+  if (expectedUpdatedAt && finalLive.updated_at !== expectedUpdatedAt) {
+    return {
+      ...base,
+      status: "blocked",
+      reason: "target changed during final merge preflight",
+      expected_updated_at: expectedUpdatedAt,
+      live_updated_at: finalLive.updated_at,
+      live_state: finalLive.state,
+      merge_method: "squash",
+    };
+  }
+  const finalStrictBaseBindingBlock = runtimeStrictBaseBindingBlock({
+    repo: result.repo,
+    baseBranch: String(finalView.baseRefName ?? ""),
+    policyReadJson: rulesetPolicyReader(),
+  });
+  if (finalStrictBaseBindingBlock) {
+    return {
+      ...base,
+      status: "blocked",
+      reason: finalStrictBaseBindingBlock,
+      live_state: finalLive.state,
+      live_updated_at: finalLive.updated_at,
+      merge_method: "squash",
+    };
+  }
+  const finalPendingMerge = exactHeadPendingMerge(finalView, authorizedHeadSha);
+  if (finalPendingMerge) {
+    return pendingMergeAction({ base, live: finalLive, reason: finalPendingMerge });
+  }
+  const finalMergeBlock = validateMergeablePullRequestReadiness({ view: finalView });
+  if (finalMergeBlock) {
+    return {
+      ...base,
+      status: "blocked",
+      reason: finalMergeBlock,
+      live_state: finalLive.state,
+      live_updated_at: finalLive.updated_at,
+      merge_method: "squash",
+    };
+  }
   try {
-    const finalView = fetchPullRequestView(result.repo, target);
-    const finalStrictBaseBindingBlock = runtimeStrictBaseBindingBlock({
-      repo: result.repo,
-      baseBranch: String(finalView.baseRefName ?? ""),
-      policyReadJson: rulesetPolicyReader(),
-    });
-    if (finalStrictBaseBindingBlock) {
-      return {
-        ...base,
-        status: "blocked",
-        reason: finalStrictBaseBindingBlock,
-        live_state: live.state,
-        live_updated_at: live.updated_at,
-        merge_method: "squash",
-      };
-    }
-    ghWithRetry(mergeArgs);
+    // Keep this one-shot: retrying an ambiguous merge response can duplicate the request.
+    ghText(mergeArgs);
   } catch (error) {
-    if (isLockedConversationCommentError(error)) {
+    commandError = error;
+  }
+
+  let merged;
+  try {
+    merged = fetchPullRequestOnce(result.repo, target);
+  } catch (error) {
+    return {
+      ...base,
+      status: "blocked",
+      reason: `merge outcome could not be reconciled from GitHub REST: ${ghErrorText(error)}`,
+      live_state: live.state,
+      live_updated_at: live.updated_at,
+      merge_method: "squash",
+      requeue_required: true,
+    };
+  }
+  const confirmation = confirmExactMergeSnapshot(merged, authorizedHeadSha);
+  if (confirmation.block) {
+    return {
+      ...base,
+      status: "blocked",
+      reason: confirmation.block,
+      live_state: merged.state ?? live.state,
+      live_updated_at: merged.updated_at ?? live.updated_at,
+      merge_method: "squash",
+    };
+  }
+  if (!confirmation.mergedAt) {
+    const pendingReason = exactHeadRestPendingMergeReason(merged, authorizedHeadSha);
+    if (pendingReason) {
+      return pendingMergeAction({
+        base,
+        live: merged,
+        reason: pendingReason,
+      });
+    }
+    if (commandError && isLockedConversationCommentError(commandError)) {
       return {
         ...lockedConversationSkip(base, live, { terminalWriteError: true }),
         merge_method: "squash",
       };
     }
-    throw error;
+    return {
+      ...base,
+      status: "blocked",
+      reason: commandError
+        ? `merge command failed and the exact outcome was not confirmed: ${ghErrorText(commandError)}`
+        : "merge command completed but GitHub has not confirmed the exact merge",
+      live_state: merged.state ?? live.state,
+      live_updated_at: merged.updated_at ?? live.updated_at,
+      merge_method: "squash",
+      requeue_required: true,
+    };
   }
-  const merged = fetchPullRequest(result.repo, target);
+
   return {
     ...base,
     status: "executed",
-    reason: "merged by clawsweeper-repair",
+    reason: commandError
+      ? "merge confirmed after ambiguous response"
+      : "merged by clawsweeper-repair",
     live_state: "merged",
-    live_updated_at: live.updated_at,
-    merged_at: merged.merged_at ?? null,
+    live_updated_at: merged.updated_at ?? live.updated_at,
+    merged_at: confirmation.mergedAt,
     merge_commit_sha: merged.merge_commit_sha ?? null,
     merge_method: "squash",
     commit_subject: mergeMessage.subject,
     summary_lines: mergeMessage.summaryLines,
     fixup_lines: mergeMessage.fixupLines,
+  };
+}
+
+function validateMergeHeadBinding({
+  authorizedHeadSha,
+  view,
+}: {
+  authorizedHeadSha: string;
+  view: LooseRecord;
+}): string {
+  if (!isFullCommitSha(authorizedHeadSha)) {
+    return "pull request head is missing or malformed for exact merge binding";
+  }
+  const viewHeadSha = String(view.headRefOid ?? "");
+  if (!isFullCommitSha(viewHeadSha)) {
+    return "pull request view head is missing or malformed for exact merge binding";
+  }
+  if (viewHeadSha !== authorizedHeadSha) {
+    return "pull request head changed during merge preflight";
+  }
+  return "";
+}
+
+function confirmExactMergeSnapshot(
+  pullRequest: LooseRecord,
+  authorizedHeadSha: string,
+): { mergedAt: string | null; block: string } {
+  const mergedAt = stringOrNull(pullRequest.merged_at);
+  if (!mergedAt) return { mergedAt: null, block: "" };
+  const mergedHeadSha = String(pullRequest.head?.sha ?? "");
+  if (
+    !isFullCommitSha(authorizedHeadSha) ||
+    !isFullCommitSha(mergedHeadSha) ||
+    mergedHeadSha !== authorizedHeadSha
+  ) {
+    return {
+      mergedAt: null,
+      block: "merged pull request head does not match the authorized preflight head",
+    };
+  }
+  return { mergedAt, block: "" };
+}
+
+function exactHeadPendingMerge(view: LooseRecord, authorizedHeadSha: string): string {
+  if (String(view.headRefOid ?? "") !== authorizedHeadSha) return "";
+  if (view.isInMergeQueue === true) {
+    return "merge is pending in GitHub's merge queue for the authorized pull request head";
+  }
+  if (view.autoMergeRequest) {
+    return "auto-merge is pending for the authorized pull request head";
+  }
+  return "";
+}
+
+function exactHeadRestPendingMergeReason(
+  pullRequest: LooseRecord,
+  authorizedHeadSha: string,
+): string {
+  if (String(pullRequest.head?.sha ?? "") !== authorizedHeadSha) return "";
+  if (pullRequest.auto_merge) {
+    return "auto-merge is pending for the authorized pull request head";
+  }
+  if (String(pullRequest.mergeable_state ?? "").toLowerCase() === "queued") {
+    return "merge is pending in GitHub's merge queue for the authorized pull request head";
+  }
+  return "";
+}
+
+function pendingMergeAction({ base, live, reason }: LooseRecord) {
+  return {
+    ...base,
+    status: "blocked",
+    reason,
+    live_state: live.state,
+    live_updated_at: live.updated_at,
+    merge_method: "squash",
+    requeue_required: true,
   };
 }
 
@@ -1533,16 +1764,29 @@ function validateMergeablePullRequest({
   view,
   allowedMergeStates = CLEAN_MERGE_STATES,
 }: LooseRecord) {
+  const hardBlock = validateMergeablePullRequestHard({ pullRequest, view });
+  if (hardBlock) return hardBlock;
+  return validateMergeablePullRequestReadiness({ view, allowedMergeStates });
+}
+
+function validateMergeablePullRequestHard({ pullRequest, view }: LooseRecord) {
   if (pullRequest.state !== "open") return `pull request is ${pullRequest.state}`;
   if (pullRequest.draft || view.isDraft) return "pull request is draft";
   if (String(view.baseRefName ?? pullRequest.base?.ref ?? "") !== "main")
     return "pull request base is not main";
+  if (["CHANGES_REQUESTED", "REVIEW_REQUIRED"].includes(String(view.reviewDecision ?? ""))) {
+    return `review decision is ${view.reviewDecision}`;
+  }
+  return "";
+}
+
+function validateMergeablePullRequestReadiness({
+  view,
+  allowedMergeStates = CLEAN_MERGE_STATES,
+}: LooseRecord) {
   if (view.mergeable !== "MERGEABLE") return `mergeable state is ${view.mergeable || "unknown"}`;
   if (!allowedMergeStates.has(String(view.mergeStateStatus ?? ""))) {
     return `merge state status is ${view.mergeStateStatus || "unknown"}`;
-  }
-  if (["CHANGES_REQUESTED", "REVIEW_REQUIRED"].includes(String(view.reviewDecision ?? ""))) {
-    return `review decision is ${view.reviewDecision}`;
   }
   const checkBlock = validateStatusChecks(view.statusCheckRollup ?? []);
   if (checkBlock) return checkBlock;
@@ -1714,6 +1958,10 @@ function fetchPullRequest(repo: string, number: JsonValue) {
   return ghJson(["api", `repos/${repo}/pulls/${number}`]);
 }
 
+function fetchPullRequestOnce(repo: string, number: JsonValue) {
+  return ghJsonOnce(["api", `repos/${repo}/pulls/${number}`]);
+}
+
 function fetchPullRequestView(repo: string, number: JsonValue) {
   return ghJson([
     "pr",
@@ -1724,11 +1972,14 @@ function fetchPullRequestView(repo: string, number: JsonValue) {
     "--json",
     [
       "baseRefName",
+      "headRefOid",
       "isDraft",
+      "isInMergeQueue",
       "mergeable",
       "mergeCommit",
       "mergeStateStatus",
       "mergedAt",
+      "autoMergeRequest",
       "reviewDecision",
       "state",
       "statusCheckRollup",
@@ -1801,6 +2052,10 @@ function stringFromUnknown(value: JsonValue) {
 
 function stringOrNull(value: JsonValue) {
   return typeof value === "string" && value.trim() ? value : null;
+}
+
+function isFullCommitSha(value: unknown): value is string {
+  return typeof value === "string" && /^[a-f0-9]{40}$/.test(value);
 }
 
 function nonNegativeIntegerFromUnknown(value: JsonValue): number | null {

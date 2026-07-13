@@ -26,7 +26,7 @@ test("comment router wraps every GitHub mutation at the request boundary", () =>
   const source = readText("src/repair/comment-router.ts");
 
   assert.equal(source.match(/\bghText\(/g)?.length, 2);
-  assert.equal(source.match(/\bghSpawn\(/g)?.length, 1);
+  assert.equal(source.match(/\bresult = ghSpawn\(/g)?.length, 1);
   assert.doesNotMatch(source, /\bghBestEffort\b/);
   assert.doesNotMatch(source, /ghTextWithRetry as ghText/);
   assert.match(source, /function runGitHubTextMutation[\s\S]*runCommandMutationWithRetry/);
@@ -85,4 +85,85 @@ test("command receipt identity excludes list position and binds command attempts
   assert.match(source, /durableAttemptId: commandDurableAttemptId\(command\)/);
   assert.match(source, /invocation: String\(process\.env\.CLAWSWEEPER_ACTION_LEDGER_INVOCATION/);
   assert.doesNotMatch(source, /\bindex\b/);
+});
+
+test("automerge reconciles an ambiguous command response inside the merge receipt", () => {
+  const source = readText("src/repair/comment-router.ts");
+  const executeAutomerge = source.slice(
+    source.indexOf("function executeAutomerge("),
+    source.indexOf("function automergeReadinessAction("),
+  );
+
+  assert.match(
+    executeAutomerge,
+    /const result = runGitHubSpawnMutation\([\s\S]*buildAutomergeMergeArgs\([\s\S]*reconcile: \(\{ result: commandResult, error: commandError \}\) => \{[\s\S]*fetchAutomergeEffectSnapshot\(command\.issue_number\)[\s\S]*confirmAutomergeEffectSnapshot\(snapshot, command\.expected_head_sha\)[\s\S]*outcome: \(attempt\) =>[\s\S]*attempt\.confirmation\.mergedAt[\s\S]*"accepted"[\s\S]*"unknown"/,
+  );
+  assert.match(
+    executeAutomerge,
+    /automergeCommandResponseAmbiguous\(result\)[\s\S]*"merge confirmed after ambiguous response"/,
+  );
+  assert.match(
+    source,
+    /function fetchAutomergeEffectSnapshot[\s\S]*repos\/\$\{targetRepo\}\/pulls\/\$\{number\}[\s\S]*attempts: 1/,
+  );
+});
+
+test("automerge blocks a merged REST snapshot from the wrong head", () => {
+  const source = readText("src/repair/comment-router.ts");
+  const confirmation = source.slice(
+    source.indexOf("function confirmAutomergeEffectSnapshot("),
+    source.indexOf("function automergeCommandResponseAmbiguous("),
+  );
+
+  assert.match(confirmation, /snapshot\.merged_at/);
+  assert.match(confirmation, /snapshot\.head\?\.sha/);
+  assert.match(
+    confirmation,
+    /observed !== expected[\s\S]*merged pull request head does not match the authorized automerge head/,
+  );
+  assert.match(confirmation, /if \(mergedAt\)[\s\S]*mergedAt,[\s\S]*block: ""/);
+});
+
+test("automerge observes exact-head queue state before issuing another merge", () => {
+  const source = readText("src/repair/comment-router.ts");
+  const executeAutomerge = source.slice(
+    source.indexOf("function executeAutomerge("),
+    source.indexOf("function automergeReadinessAction("),
+  );
+  const hardCheck = executeAutomerge.indexOf("validateAutomergeHardReadiness({");
+  const strictBaseCheck = executeAutomerge.indexOf("runtimeStrictBaseBindingBlock({");
+  const pendingCheck = executeAutomerge.indexOf("exactHeadAutomergePendingReason(command, view)");
+  const readinessCheck = executeAutomerge.indexOf("validateAutomergeReadiness({");
+  const mergeCall = executeAutomerge.indexOf("const result = runGitHubSpawnMutation(");
+
+  assert.ok(hardCheck >= 0);
+  assert.ok(strictBaseCheck > hardCheck);
+  assert.ok(pendingCheck > strictBaseCheck);
+  assert.ok(readinessCheck > pendingCheck);
+  assert.ok(mergeCall > pendingCheck);
+  const finalHardCheck = executeAutomerge.indexOf("const finalHardBlock");
+  const finalStrictBaseCheck = executeAutomerge.indexOf("const finalStrictBaseBindingBlock");
+  const finalPendingCheck = executeAutomerge.indexOf("const finalPendingReason");
+  const finalReadinessCheck = executeAutomerge.indexOf("const finalReadinessBlock");
+  assert.ok(finalStrictBaseCheck > finalHardCheck);
+  assert.ok(finalPendingCheck > finalStrictBaseCheck);
+  assert.ok(finalReadinessCheck > finalPendingCheck);
+  assert.match(
+    source,
+    /function exactHeadAutomergePendingReason[\s\S]*view\.headRefOid[\s\S]*currentHeadSha !== expectedHeadSha[\s\S]*view\.isInMergeQueue[\s\S]*view\.autoMergeRequest/,
+  );
+  assert.equal(source.match(/"isInMergeQueue"/g)?.length, 2);
+  assert.equal(source.match(/"autoMergeRequest"/g)?.length, 2);
+});
+
+test("automerge execution never invents a merge timestamp", () => {
+  const source = readText("src/repair/comment-router.ts");
+  const executeAutomerge = source.slice(
+    source.indexOf("function executeAutomerge("),
+    source.indexOf("function automergeReadinessAction("),
+  );
+
+  assert.match(executeAutomerge, /merged_at: result\.confirmation\.mergedAt/);
+  assert.doesNotMatch(executeAutomerge, /merged_at:[^\n]*new Date/);
+  assert.doesNotMatch(executeAutomerge, /mergedAt \?\? new Date/);
 });

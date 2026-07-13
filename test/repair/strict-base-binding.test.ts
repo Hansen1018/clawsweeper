@@ -322,7 +322,7 @@ test("strict base binding fails closed for non-repository rulesets without fetch
 
 test("all repair merge owners repeat the shared strict base guard immediately before merge", () => {
   for (const [file, functionName, mergeCall] of [
-    ["src/repair/apply-result.ts", "function applyMergeAction(", "ghWithRetry(mergeArgs)"],
+    ["src/repair/apply-result.ts", "function applyMergeAction(", "ghText(mergeArgs);"],
     [
       "src/repair/comment-router.ts",
       "function executeAutomerge(",
@@ -339,10 +339,18 @@ test("all repair merge owners repeat the shared strict base guard immediately be
     );
     const merge = owner.indexOf(mergeCall);
     if (file === "src/repair/post-flight.ts") {
-      assert.equal(guards.length, 1, `${file} must keep its initial strict base guard`);
-      const helperCall = owner.indexOf("const policyBlock = postFlightMergeRetryBlock({");
-      assert.ok(helperCall > guards[0]!, `${file} does not repeat the shared merge gate`);
-      assert.ok(merge > helperCall, `${file} does not guard the final merge call`);
+      assert.equal(guards.length, 0, `${file} must use the shared merge gate`);
+      const helperCalls = [...owner.matchAll(/postFlightMergeRetryBlock\(\{/g)].map(
+        (match) => match.index!,
+      );
+      assert.ok(helperCalls.length >= 2, `${file} must repeat the shared merge gate`);
+      const finalHelperCall = helperCalls.filter((offset) => offset < merge).at(-1);
+      assert.notEqual(finalHelperCall, undefined, `${file} does not guard the final merge call`);
+      assert.doesNotMatch(
+        owner.slice(finalHelperCall!, merge),
+        /fetchPullRequest(?:View)?\(|gh(?:Json|Text|Spawn|WithRetry)\(/,
+        `${file} performs a GitHub call after the final shared merge gate`,
+      );
       const helperStart = source.indexOf("function postFlightMergeRetryBlock(");
       const helperEnd = source.indexOf("\nfunction ", helperStart + 1);
       const helper = source.slice(helperStart, helperEnd);
@@ -355,9 +363,10 @@ test("all repair merge owners repeat the shared strict base guard immediately be
       );
       continue;
     }
-    assert.equal(guards.length, 2, `${file} must check strict base binding twice`);
-    assert.ok(merge > guards[1]!, `${file} does not guard the final merge call`);
-    const finalGuard = owner.slice(guards[1]!, merge);
+    assert.ok(guards.length >= 2, `${file} must check strict base binding at least twice`);
+    const finalGuardOffset = guards.at(-1)!;
+    assert.ok(merge > finalGuardOffset, `${file} does not guard the final merge call`);
+    const finalGuard = owner.slice(finalGuardOffset, merge);
     assert.match(finalGuard, /policyReadJson: rulesetPolicyReader\(\)/);
     assert.doesNotMatch(finalGuard, /gh(?:Json|Text|Spawn|WithRetry)\(/);
   }

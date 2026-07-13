@@ -2391,13 +2391,53 @@ function runGitHubTextMutationOnce(
   });
 }
 
+type GitHubSpawnResult = ReturnType<typeof ghSpawn>;
+
+type GitHubSpawnMutationReceipt<T> = {
+  reconcile: (response: { result: GitHubSpawnResult | null; error: unknown | null }) => T;
+  outcome: (result: T) => "accepted" | "rejected" | "unknown";
+};
+
 function runGitHubSpawnMutation(
   command: LooseRecord,
   kind: string,
   identity: unknown,
   ghArgs: string[],
+  options?: Parameters<typeof ghSpawn>[1],
+): GitHubSpawnResult;
+function runGitHubSpawnMutation<T>(
+  command: LooseRecord,
+  kind: string,
+  identity: unknown,
+  ghArgs: string[],
+  options: Parameters<typeof ghSpawn>[1],
+  receipt: GitHubSpawnMutationReceipt<T>,
+): T;
+function runGitHubSpawnMutation<T>(
+  command: LooseRecord,
+  kind: string,
+  identity: unknown,
+  ghArgs: string[],
   options: Parameters<typeof ghSpawn>[1] = {},
-) {
+  receipt?: GitHubSpawnMutationReceipt<T>,
+): GitHubSpawnResult | T {
+  if (receipt) {
+    return runCommandMutation(command, {
+      kind,
+      identity,
+      operation: () => {
+        let result: GitHubSpawnResult | null = null;
+        let error: unknown | null = null;
+        try {
+          result = ghSpawn(ghArgs, options);
+        } catch (caught) {
+          error = caught;
+        }
+        return receipt.reconcile({ result, error });
+      },
+      outcome: receipt.outcome,
+    });
+  }
   return runCommandMutation(command, {
     kind,
     identity,
@@ -3674,7 +3714,7 @@ function closeIssueOrPullRequest(command: LooseRecord, number: number, kind: str
   );
 }
 
-function executeAutomerge(command: LooseRecord) {
+function executeAutomerge(command: LooseRecord): LooseRecord {
   const stoppedReason = repairLoopStoppedReason(command);
   if (stoppedReason) {
     return { action: "merge", status: "blocked", reason: stoppedReason, merge_method: "squash" };
@@ -3684,48 +3724,8 @@ function executeAutomerge(command: LooseRecord) {
   let waitedMs = 0;
   let view = fetchPullRequestView(command.issue_number);
   let latestTarget = latestAutomergeTarget(command, view);
-  let block = validateAutomergeReadiness({ command, view, target: latestTarget });
-  while (block && isTransientAutomergeBlock(block) && waitedMs < transientWait.maxWaitMs) {
-    const waitMs = Math.min(transientWait.intervalMs, transientWait.maxWaitMs - waitedMs);
-    transientObservations.push(automergeTransientObservation(block, view, waitedMs, waitMs));
-    sleepMs(waitMs);
-    waitedMs += waitMs;
-    view = fetchPullRequestView(command.issue_number);
-    latestTarget = latestAutomergeTarget(command, view);
-    block = validateAutomergeReadiness({ command, view, target: latestTarget });
-  }
-  if (block) {
-    if (isTransientAutomergeBlock(block)) {
-      return {
-        action: "merge",
-        status: "waiting",
-        reason: block,
-        merge_method: "squash",
-        transient_wait_ms: waitedMs,
-        transient_observations: transientObservations,
-      };
-    }
-    if (isAutomergeCheckBlock(block)) {
-      return {
-        action: "merge",
-        status: "repair_needed",
-        reason: block,
-        repair_reason: `failed required checks before automerge: ${block.replace(/^checks are not green:\s*/i, "")}`,
-        merge_method: "squash",
-      };
-    }
-    const readinessRepairReason = automergeReadinessRepairReason(block);
-    if (readinessRepairReason) {
-      return {
-        action: "merge",
-        status: "repair_needed",
-        reason: block,
-        repair_reason: readinessRepairReason,
-        merge_method: "squash",
-      };
-    }
-    return { action: "merge", status: "blocked", reason: block, merge_method: "squash" };
-  }
+  const existingMerge = observeExistingAutomergeEffect(command, view);
+  if (existingMerge) return existingMerge;
   const gateBlock = automergeGateBlockReason(process.env);
   if (gateBlock) {
     ensureHumanReviewLabel(command);
@@ -3753,16 +3753,6 @@ function executeAutomerge(command: LooseRecord) {
     );
     return { action: "merge", status: "blocked", reason: gateBlock, merge_method: "squash" };
   }
-  const mergeMessage = buildAutomergeSquashMessage({
-    command: {
-      ...command,
-      maintainer_attribution: latestAutomergeMaintainerAttribution(command),
-    },
-    view,
-    target: latestTarget,
-    comments: issueCommentsFor(command.issue_number),
-  });
-  const bodyFile = writeAutomergeMergeBody(command, latestTarget, mergeMessage.body);
   const reviewLeaseBlock = trustedAutomationReviewLeaseBlockReason(command);
   if (reviewLeaseBlock) {
     return {
@@ -3771,6 +3761,10 @@ function executeAutomerge(command: LooseRecord) {
       reason: reviewLeaseBlock.reason,
       merge_method: "squash",
     };
+  }
+  const hardBlock = validateAutomergeHardReadiness({ command, view, target: latestTarget });
+  if (hardBlock) {
+    return automergeReadinessAction(hardBlock, waitedMs, transientObservations);
   }
   const strictBaseBindingBlock = runtimeStrictBaseBindingBlock({
     repo: command.repo,
@@ -3785,8 +3779,79 @@ function executeAutomerge(command: LooseRecord) {
       merge_method: "squash",
     };
   }
+  const pendingReason = exactHeadAutomergePendingReason(command, view);
+  if (pendingReason) return automergePendingAction(pendingReason, waitedMs, transientObservations);
+  let block = validateAutomergeReadiness({ command, view, target: latestTarget });
+  while (block && isTransientAutomergeBlock(block) && waitedMs < transientWait.maxWaitMs) {
+    const waitMs = Math.min(transientWait.intervalMs, transientWait.maxWaitMs - waitedMs);
+    transientObservations.push(automergeTransientObservation(block, view, waitedMs, waitMs));
+    sleepMs(waitMs);
+    waitedMs += waitMs;
+    view = fetchPullRequestView(command.issue_number);
+    latestTarget = latestAutomergeTarget(command, view);
+    const observedMerge = observeExistingAutomergeEffect(command, view);
+    if (observedMerge) return observedMerge;
+    const observedHardBlock = validateAutomergeHardReadiness({
+      command,
+      view,
+      target: latestTarget,
+    });
+    if (observedHardBlock) {
+      return automergeReadinessAction(observedHardBlock, waitedMs, transientObservations);
+    }
+    const observedStrictBaseBlock = runtimeStrictBaseBindingBlock({
+      repo: command.repo,
+      baseBranch: String(view.baseRefName ?? latestTarget.base_ref ?? targetBranch ?? "main"),
+      policyReadJson: rulesetPolicyReader(),
+    });
+    if (observedStrictBaseBlock) {
+      return {
+        action: "merge",
+        status: "blocked",
+        reason: observedStrictBaseBlock,
+        merge_method: "squash",
+      };
+    }
+    const observedPending = exactHeadAutomergePendingReason(command, view);
+    if (observedPending) {
+      return automergePendingAction(observedPending, waitedMs, transientObservations);
+    }
+    block = validateAutomergeReadiness({ command, view, target: latestTarget });
+  }
+  if (block) {
+    return automergeReadinessAction(block, waitedMs, transientObservations);
+  }
+  const mergeMessage = buildAutomergeSquashMessage({
+    command: {
+      ...command,
+      maintainer_attribution: latestAutomergeMaintainerAttribution(command),
+    },
+    view,
+    target: latestTarget,
+    comments: issueCommentsFor(command.issue_number),
+  });
+  const bodyFile = writeAutomergeMergeBody(command, latestTarget, mergeMessage.body);
   const finalView = fetchPullRequestView(command.issue_number);
   const finalTarget = latestAutomergeTarget(command, finalView);
+  const finalExistingMerge = observeExistingAutomergeEffect(command, finalView);
+  if (finalExistingMerge) return finalExistingMerge;
+  const finalReviewLeaseBlock = trustedAutomationReviewLeaseBlockReason(command);
+  if (finalReviewLeaseBlock) {
+    return {
+      action: "merge",
+      status: finalReviewLeaseBlock.retryable ? "waiting" : "blocked",
+      reason: finalReviewLeaseBlock.reason,
+      merge_method: "squash",
+    };
+  }
+  const finalHardBlock = validateAutomergeHardReadiness({
+    command,
+    view: finalView,
+    target: finalTarget,
+  });
+  if (finalHardBlock) {
+    return automergeReadinessAction(finalHardBlock, waitedMs, transientObservations);
+  }
   const finalStrictBaseBindingBlock = runtimeStrictBaseBindingBlock({
     repo: command.repo,
     baseBranch: String(finalView.baseRefName ?? finalTarget.base_ref ?? targetBranch ?? "main"),
@@ -3800,6 +3865,19 @@ function executeAutomerge(command: LooseRecord) {
       merge_method: "squash",
     };
   }
+  const finalPendingReason = exactHeadAutomergePendingReason(command, finalView);
+  if (finalPendingReason) {
+    return automergePendingAction(finalPendingReason, waitedMs, transientObservations);
+  }
+  const finalReadinessBlock = validateAutomergeReadiness({
+    command,
+    view: finalView,
+    target: finalTarget,
+  });
+  if (finalReadinessBlock) {
+    return automergeReadinessAction(finalReadinessBlock, waitedMs, transientObservations);
+  }
+  // Keep the exact-head merge request one-shot; reconcile its effect before closing the receipt.
   const result = runGitHubSpawnMutation(
     command,
     "pull_request_merge",
@@ -3816,9 +3894,81 @@ function executeAutomerge(command: LooseRecord) {
       subject: mergeMessage.subject,
       bodyFile,
     }),
+    {},
+    {
+      reconcile: ({ result: commandResult, error: commandError }) => {
+        try {
+          const snapshot = fetchAutomergeEffectSnapshot(command.issue_number);
+          return {
+            command_result: commandResult,
+            command_error: commandError,
+            snapshot,
+            snapshot_error: "",
+            confirmation: confirmAutomergeEffectSnapshot(snapshot, command.expected_head_sha),
+          };
+        } catch (error) {
+          return {
+            command_result: commandResult,
+            command_error: commandError,
+            snapshot: null,
+            snapshot_error: compactGhError(error),
+            confirmation: null,
+          };
+        }
+      },
+      outcome: (attempt) =>
+        attempt.confirmation &&
+        !attempt.confirmation.block &&
+        (attempt.confirmation.mergedAt || attempt.confirmation.pendingReason)
+          ? "accepted"
+          : "unknown",
+    },
   );
-  if (result.status !== 0) {
-    const failure = stripAnsi(result.stderr || result.stdout).trim();
+  if (result.confirmation?.mergedAt) {
+    return {
+      action: "merge",
+      status: "executed",
+      reason: automergeCommandResponseAmbiguous(result)
+        ? "merge confirmed after ambiguous response"
+        : "merged by ClawSweeper automerge",
+      merged_at: result.confirmation.mergedAt,
+      merge_commit_sha: result.confirmation.mergeCommitSha,
+      merge_method: "squash",
+      prepared_head_sha: latestTarget.head_sha ?? null,
+      commit_subject: mergeMessage.subject,
+      summary_lines: mergeMessage.summaryLines,
+      fixup_lines: mergeMessage.fixupLines,
+      transient_wait_ms: waitedMs,
+      transient_observations: transientObservations,
+    };
+  }
+  if (result.confirmation?.pendingReason) {
+    return automergePendingAction(
+      result.confirmation.pendingReason,
+      waitedMs,
+      transientObservations,
+    );
+  }
+  if (result.confirmation?.block) {
+    return {
+      action: "merge",
+      status: "blocked",
+      reason: result.confirmation.block,
+      merge_method: "squash",
+    };
+  }
+  if (result.snapshot_error) {
+    return {
+      action: "merge",
+      status: "waiting",
+      reason: `merge command outcome could not be confirmed from GitHub: ${result.snapshot_error}`,
+      merge_method: "squash",
+      transient_wait_ms: waitedMs,
+      transient_observations: transientObservations,
+    };
+  }
+  if (automergeCommandResponseAmbiguous(result)) {
+    const failure = automergeCommandFailure(result);
     const repairReason = automergeMergeFailureRepairReason(failure);
     if (repairReason) {
       return {
@@ -3856,21 +4006,175 @@ function executeAutomerge(command: LooseRecord) {
       merge_method: "squash",
     };
   }
-  const merged = fetchPullRequestView(command.issue_number);
   return {
     action: "merge",
-    status: "executed",
-    reason: "merged by ClawSweeper automerge",
-    merged_at: merged.mergedAt ?? new Date().toISOString(),
-    merge_commit_sha: merged.mergeCommit?.oid ?? null,
+    status: "waiting",
+    reason: "merge command completed but its exact-head effect is not yet observable",
     merge_method: "squash",
-    prepared_head_sha: latestTarget.head_sha ?? null,
-    commit_subject: mergeMessage.subject,
-    summary_lines: mergeMessage.summaryLines,
-    fixup_lines: mergeMessage.fixupLines,
     transient_wait_ms: waitedMs,
     transient_observations: transientObservations,
   };
+}
+
+function automergeReadinessAction(
+  block: string,
+  waitedMs: number,
+  transientObservations: LooseRecord[],
+) {
+  if (isTransientAutomergeBlock(block)) {
+    return automergePendingAction(block, waitedMs, transientObservations);
+  }
+  if (isAutomergeCheckBlock(block)) {
+    return {
+      action: "merge",
+      status: "repair_needed",
+      reason: block,
+      repair_reason: `failed required checks before automerge: ${block.replace(/^checks are not green:\s*/i, "")}`,
+      merge_method: "squash",
+    };
+  }
+  const readinessRepairReason = automergeReadinessRepairReason(block);
+  if (readinessRepairReason) {
+    return {
+      action: "merge",
+      status: "repair_needed",
+      reason: block,
+      repair_reason: readinessRepairReason,
+      merge_method: "squash",
+    };
+  }
+  return { action: "merge", status: "blocked", reason: block, merge_method: "squash" };
+}
+
+function automergePendingAction(
+  reason: string,
+  waitedMs: number,
+  transientObservations: LooseRecord[],
+) {
+  return {
+    action: "merge",
+    status: "waiting",
+    reason,
+    merge_method: "squash",
+    transient_wait_ms: waitedMs,
+    transient_observations: transientObservations,
+  };
+}
+
+function observeExistingAutomergeEffect(command: LooseRecord, view: LooseRecord) {
+  if (!view.mergedAt && String(view.state ?? "").toUpperCase() !== "MERGED") return null;
+  let snapshot: LooseRecord;
+  try {
+    snapshot = fetchAutomergeEffectSnapshot(command.issue_number);
+  } catch (error) {
+    return {
+      action: "merge",
+      status: "waiting",
+      reason: `merged pull request state could not be confirmed from GitHub: ${compactGhError(error)}`,
+      merge_method: "squash",
+    };
+  }
+  const confirmation = confirmAutomergeEffectSnapshot(snapshot, command.expected_head_sha);
+  if (confirmation.block) {
+    return {
+      action: "merge",
+      status: "blocked",
+      reason: confirmation.block,
+      merge_method: "squash",
+    };
+  }
+  if (!confirmation.mergedAt) {
+    return {
+      action: "merge",
+      status: "waiting",
+      reason: "merged pull request state is not confirmed by the REST pull snapshot",
+      merge_method: "squash",
+    };
+  }
+  return {
+    action: "merge",
+    status: "executed",
+    reason: "merge already confirmed for the reviewed head",
+    merged_at: confirmation.mergedAt,
+    merge_commit_sha: confirmation.mergeCommitSha,
+    merge_method: "squash",
+  };
+}
+
+function exactHeadAutomergePendingReason(command: LooseRecord, view: LooseRecord) {
+  const expectedHeadSha = String(command.expected_head_sha ?? "")
+    .trim()
+    .toLowerCase();
+  const currentHeadSha = String(view.headRefOid ?? "")
+    .trim()
+    .toLowerCase();
+  if (!expectedHeadSha || currentHeadSha !== expectedHeadSha) return "";
+  if (view.isInMergeQueue === true) {
+    return `reviewed head ${expectedHeadSha} is already in the merge queue`;
+  }
+  if (view.autoMergeRequest) {
+    return `reviewed head ${expectedHeadSha} already has auto-merge enabled`;
+  }
+  return "";
+}
+
+function fetchAutomergeEffectSnapshot(number: JsonValue) {
+  return ghJson(["api", `repos/${targetRepo}/pulls/${number}`], { attempts: 1 });
+}
+
+function confirmAutomergeEffectSnapshot(snapshot: LooseRecord, expectedHeadSha: JsonValue) {
+  const expected = String(expectedHeadSha ?? "")
+    .trim()
+    .toLowerCase();
+  const observed = String(snapshot.head?.sha ?? "")
+    .trim()
+    .toLowerCase();
+  const mergedAt = String(snapshot.merged_at ?? "").trim() || null;
+  const mergeCommitSha = String(snapshot.merge_commit_sha ?? "").trim() || null;
+  if (!expected || observed !== expected) {
+    return {
+      mergedAt: null,
+      mergeCommitSha: null,
+      pendingReason: "",
+      block: mergedAt
+        ? "merged pull request head does not match the authorized automerge head"
+        : "pull request head changed before the automerge effect could be confirmed",
+    };
+  }
+  if (mergedAt) {
+    return {
+      mergedAt,
+      mergeCommitSha,
+      pendingReason: "",
+      block: "",
+    };
+  }
+  const mergeableState = String(snapshot.mergeable_state ?? "").toLowerCase();
+  const pendingReason = snapshot.auto_merge
+    ? `reviewed head ${expected} has auto-merge pending`
+    : mergeableState === "queued"
+      ? `reviewed head ${expected} is pending in the merge queue`
+      : "";
+  return {
+    mergedAt: null,
+    mergeCommitSha: null,
+    pendingReason,
+    block: "",
+  };
+}
+
+function automergeCommandResponseAmbiguous(attempt: LooseRecord) {
+  return Boolean(
+    attempt.command_error || attempt.command_result?.error || attempt.command_result?.status !== 0,
+  );
+}
+
+function automergeCommandFailure(attempt: LooseRecord) {
+  if (attempt.command_error) return compactGhError(attempt.command_error);
+  const result = attempt.command_result ?? {};
+  return stripAnsi(
+    result.stderr || result.stdout || result.error?.message || "unknown error",
+  ).trim();
 }
 
 function rulesetPolicyReader() {
@@ -3929,7 +4233,7 @@ function writeAutomergeMergeBody(command: LooseRecord, target: LooseRecord, body
   return file;
 }
 
-function validateAutomergeReadiness({ command, view, target }: LooseRecord) {
+function validateAutomergeHardReadiness({ command, view, target }: LooseRecord) {
   if (hasLabel(target, AUTOGENERATED_LABEL))
     return "generated issue implementation PRs require manual merge";
   if (hasLabel(target, AUTOFIX_LABEL))
@@ -3948,10 +4252,26 @@ function validateAutomergeReadiness({ command, view, target }: LooseRecord) {
     markerName: "pass",
   });
   if (headBlock) return headBlock;
-  if (view.mergeable !== "MERGEABLE") return `mergeable state is ${view.mergeable || "unknown"}`;
   const checks = summarizeChecks(view.statusCheckRollup ?? []);
   if (checks.terminalBlockers?.length > 0)
     return `checks are not green: ${checks.terminalBlockers.slice(0, 8).join(", ")}`;
+  if (String(view.reviewDecision ?? "") === "CHANGES_REQUESTED") {
+    return `review decision is ${view.reviewDecision}`;
+  }
+  const changelogBlock = automergeChangelogBlockReason({
+    repo: command.repo,
+    title: view.title,
+    files: view.files,
+  });
+  if (changelogBlock) return changelogBlock;
+  return "";
+}
+
+function validateAutomergeReadiness({ command, view, target }: LooseRecord) {
+  const hardBlock = validateAutomergeHardReadiness({ command, view, target });
+  if (hardBlock) return hardBlock;
+  if (view.mergeable !== "MERGEABLE") return `mergeable state is ${view.mergeable || "unknown"}`;
+  const checks = summarizeChecks(view.statusCheckRollup ?? []);
   if (checks.pending?.length > 0)
     return `checks are still running: ${checks.pending.slice(0, 8).join(", ")}`;
   if (checks.total === 0) return "no PR checks found";
@@ -3962,15 +4282,9 @@ function validateAutomergeReadiness({ command, view, target }: LooseRecord) {
   ) {
     return `merge state status is ${view.mergeStateStatus || "unknown"}`;
   }
-  if (["CHANGES_REQUESTED", "REVIEW_REQUIRED"].includes(String(view.reviewDecision ?? ""))) {
+  if (String(view.reviewDecision ?? "") === "REVIEW_REQUIRED") {
     return `review decision is ${view.reviewDecision}`;
   }
-  const changelogBlock = automergeChangelogBlockReason({
-    repo: command.repo,
-    title: view.title,
-    files: view.files,
-  });
-  if (changelogBlock) return changelogBlock;
   return "";
 }
 
@@ -4371,7 +4685,9 @@ function fetchPullRequestView(number: JsonValue) {
         "commits",
         "deletions",
         "files",
+        "autoMergeRequest",
         "isDraft",
+        "isInMergeQueue",
         "labels",
         "mergeable",
         "mergeCommit",
@@ -4421,7 +4737,9 @@ function fetchPullRequestViewAsync(number: JsonValue) {
         "commits",
         "deletions",
         "files",
+        "autoMergeRequest",
         "isDraft",
+        "isInMergeQueue",
         "labels",
         "mergeable",
         "mergeCommit",
