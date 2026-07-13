@@ -9,6 +9,7 @@ import {
   writeFileSync,
   writeSync,
 } from "node:fs";
+import { StringDecoder } from "node:string_decoder";
 
 export const DEFAULT_CODEX_OUTPUT_FILE_BYTES = 128 * 1024 * 1024;
 export const DEFAULT_CODEX_OUTPUT_TAIL_BYTES = 64 * 1024;
@@ -33,6 +34,7 @@ export interface CodexOutputCapture {
 export interface CodexTextRedactor {
   redactions: Buffer<ArrayBufferLike>[];
   pending: Buffer<ArrayBufferLike>;
+  decoder: StringDecoder;
 }
 
 export function openCodexOutputCapture(
@@ -110,6 +112,7 @@ export function createCodexTextRedactor(redactValues: readonly string[] = []): C
   return {
     redactions: normalizedRedactions(redactValues),
     pending: Buffer.alloc(0),
+    decoder: new StringDecoder("utf8"),
   };
 }
 
@@ -121,7 +124,7 @@ export function redactCodexTextChunk(
   const combined = Buffer.concat([redactor.pending, Buffer.from(value, "utf8")]);
   const redacted = redactAvailableBuffer(combined, redactor.redactions, flush);
   redactor.pending = redacted.pending;
-  return redacted.output.toString("utf8");
+  return flush ? redactor.decoder.end(redacted.output) : redactor.decoder.write(redacted.output);
 }
 
 export function redactCodexOutputLastMessage(
@@ -166,7 +169,9 @@ function availableTailBytes(maxFileBytes: number): number {
 }
 
 function normalizedRedactions(values: readonly string[] | undefined): Buffer[] {
-  return normalizedRedactionStrings(values).map((value) => Buffer.from(value, "utf8"));
+  return normalizedRedactionStrings(values)
+    .map((value) => Buffer.from(value, "utf8"))
+    .sort((left, right) => right.length - left.length);
 }
 
 function normalizedRedactionStrings(values: readonly string[] | undefined): string[] {
