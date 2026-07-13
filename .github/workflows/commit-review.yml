@@ -613,6 +613,7 @@ jobs:
           permission-contents: write
 
       - name: Dispatch commit findings to repair lane
+        id: dispatch-findings
         if: ${{ vars.CLAWSWEEPER_COMMIT_FINDINGS_ENABLED != 'false' }}
         env:
           GH_TOKEN: ${{ steps.clawsweeper-token.outputs.token }}
@@ -656,20 +657,59 @@ jobs:
               --report-repo "${{ github.repository }}"
           done
 
+      - name: Continue commit review range
+        if: ${{ success() && needs.plan.outputs.has_more == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_REPO: ${{ needs.plan.outputs.target_repo }}
+          BEFORE_SHA: ${{ github.event.inputs.before_sha || github.event.client_payload.before_sha || '' }}
+          AFTER_SHA: ${{ github.event.inputs.commit_sha || github.event.client_payload.after_sha || github.event.client_payload.commit_sha || '' }}
+          NEXT_OFFSET: ${{ needs.plan.outputs.next_offset }}
+          CREATE_CHECKS: ${{ needs.plan.outputs.create_checks }}
+          ADDITIONAL_PROMPT: ${{ github.event.inputs.additional_prompt || github.event.client_payload.additional_prompt || '' }}
+        run: |
+          set -euo pipefail
+          node dist/commit-sweeper.js dispatch-continuation \
+            --repository "${{ github.repository }}" \
+            --workflow commit-review.yml \
+            --target-repo "$TARGET_REPO" \
+            --after-sha "$AFTER_SHA" \
+            --before-sha "$BEFORE_SHA" \
+            --commit-offset "$NEXT_OFFSET" \
+            --create-checks "$CREATE_CHECKS" \
+            --additional-prompt "$ADDITIONAL_PROMPT"
+
       - name: Finalize commit publication action ledger
+        id: finalize-publication-action-ledger
         if: ${{ always() && steps.publish-setup-pnpm.outcome == 'success' }}
+        env:
+          CHECKS_REQUESTED: ${{ needs.plan.outputs.create_checks }}
+          CONTINUATION_REQUESTED: ${{ needs.plan.outputs.has_more }}
+          DISPATCH_COUNT: ${{ steps.dispatch-findings.outputs.dispatch_count || '0' }}
+          DISPATCH_OUTCOME: ${{ steps.dispatch-findings.outcome }}
         run: |
           set -euo pipefail
           : "${CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:?setup-action-ledger output root is required}"
           mkdir -p .artifacts
+          allow_empty_args=()
+          allow_empty=false
+          if [ "$DISPATCH_OUTCOME" != "failure" ] &&
+             [ "$DISPATCH_COUNT" = "0" ] &&
+             [ "$CHECKS_REQUESTED" != "true" ] &&
+             [ "$CONTINUATION_REQUESTED" != "true" ]; then
+            allow_empty=true
+            allow_empty_args+=(--allow-empty)
+          fi
           pnpm run --silent repair:action-ledger -- finalize \
             --repair-lane commit-publication \
-            --allow-empty \
+            "${allow_empty_args[@]}" \
             > .artifacts/commit-publication-action-ledger-manifest.json
+          echo "allow_empty=$allow_empty" >> "$GITHUB_OUTPUT"
 
       - name: Publish immutable commit review action ledger
         if: ${{ always() && steps.publish-setup-pnpm.outcome == 'success' }}
         env:
+          ALLOW_EMPTY: ${{ steps.finalize-publication-action-ledger.outputs.allow_empty }}
           EXPECTED_COMMIT_MATRIX: ${{ needs.plan.outputs.matrix }}
           CHECKS_REQUESTED: ${{ needs.plan.outputs.create_checks }}
         run: |
@@ -714,9 +754,9 @@ jobs:
             local run_attempt="$3"
             local source_root="$4"
             local manifest_file="$5"
-            local allow_empty="${6:-}"
+            local allow_empty="${6:-false}"
             local allow_empty_args=()
-            if [ "$allow_empty" = "--allow-empty" ]; then
+            if [ "$allow_empty" = "true" ]; then
               allow_empty_args+=(--allow-empty)
             fi
             test -s "$manifest_file"
@@ -746,7 +786,7 @@ jobs:
             "$GITHUB_RUN_ATTEMPT" \
             "$source_root" \
             .artifacts/commit-publication-action-ledger-manifest.json \
-            --allow-empty
+            "$ALLOW_EMPTY"
           for review_root in "${review_roots[@]}"; do
             artifact_name="$(basename "$review_root")"
             artifact_attempt="${artifact_name##*-}"
@@ -769,10 +809,14 @@ jobs:
           manifest_file=".artifacts/commit-publication-action-ledger-manifest.json"
           import_result_file=".artifacts/commit-publication-action-ledger-import.json"
           test -s "$manifest_file"
+          allow_empty_args=()
+          if [ "$ALLOW_EMPTY" = "true" ]; then
+            allow_empty_args+=(--allow-empty)
+          fi
           pnpm run --silent repair:action-ledger -- publish \
             --repair-lane commit-publication \
             --manifest "$manifest_file" \
-            --allow-empty \
+            "${allow_empty_args[@]}" \
             --source-root "$source_root" \
             --state-root "$CLAWSWEEPER_STATE_DIR" > "$import_result_file"
           jq -e --slurpfile manifest "$manifest_file" \
@@ -781,8 +825,7 @@ jobs:
           jq -r '.paths[]?' "$import_result_file" >> "$event_paths_file"
           sort -u -o "$event_paths_file" "$event_paths_file"
           if [ ! -s "$event_paths_file" ]; then
-            if [ "${{ needs.plan.outputs.planned_count }}" = "0" ] &&
-               [ "$CHECKS_REQUESTED" != "true" ]; then
+            if [ "$ALLOW_EMPTY" = "true" ]; then
               exit 0
             fi
             echo "Commit review action event shards existed but no paths were imported." >&2
@@ -799,25 +842,3 @@ jobs:
           pnpm run repair:publish-main -- \
             --message "chore: append commit review action ledger" \
             "${action_ledger_args[@]}"
-
-      - name: Continue commit review range
-        if: ${{ success() && needs.plan.outputs.has_more == 'true' }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TARGET_REPO: ${{ needs.plan.outputs.target_repo }}
-          BEFORE_SHA: ${{ github.event.inputs.before_sha || github.event.client_payload.before_sha || '' }}
-          AFTER_SHA: ${{ github.event.inputs.commit_sha || github.event.client_payload.after_sha || github.event.client_payload.commit_sha || '' }}
-          NEXT_OFFSET: ${{ needs.plan.outputs.next_offset }}
-          CREATE_CHECKS: ${{ needs.plan.outputs.create_checks }}
-          ADDITIONAL_PROMPT: ${{ github.event.inputs.additional_prompt || github.event.client_payload.additional_prompt || '' }}
-        run: |
-          set -euo pipefail
-          gh workflow run commit-review.yml \
-            --repo "${{ github.repository }}" \
-            -f enabled=true \
-            -f target_repo="$TARGET_REPO" \
-            -f commit_sha="$AFTER_SHA" \
-            -f before_sha="$BEFORE_SHA" \
-            -f commit_offset="$NEXT_OFFSET" \
-            -f create_checks="$CREATE_CHECKS" \
-            -f additional_prompt="$ADDITIONAL_PROMPT"

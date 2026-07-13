@@ -22,6 +22,11 @@ import {
   repairJobUsesClusterLane,
   workerLaneForRepairJobIntent,
 } from "./job-intent.js";
+import {
+  repairSourceRevision,
+  runRepairMutation,
+  type RepairLifecycleInput,
+} from "./repair-action-ledger.js";
 
 const args = parseArgs(process.argv.slice(2));
 const defaultRunner = process.env.CLAWSWEEPER_WORKER_RUNNER ?? "blacksmith-4vcpu-ubuntu-2404";
@@ -114,36 +119,76 @@ while (!failed && index < jobs.length) {
 }
 
 function dispatchJob(relative: JsonValue, position: JsonValue, total: JsonValue) {
-  const result = spawnSync(
-    "gh",
-    [
-      "workflow",
-      "run",
-      workflow,
-      "--repo",
-      repo,
-      ...(ref ? ["--ref", ref] : []),
-      "-f",
-      `job=${relative}`,
-      "-f",
-      `mode=${mode}`,
-      "-f",
-      `runner=${runner}`,
-      "-f",
-      `execution_runner=${executionRunner}`,
-      "-f",
-      `model=${model}`,
-    ],
-    { cwd: repoRoot(), encoding: "utf8", stdio: "pipe" },
-  );
-  if (result.status !== 0) {
+  const jobPath = String(relative);
+  const commandArgs = [
+    "workflow",
+    "run",
+    workflow,
+    "--repo",
+    repo,
+    ...(ref ? ["--ref", ref] : []),
+    "-f",
+    `job=${jobPath}`,
+    "-f",
+    `mode=${mode}`,
+    "-f",
+    `runner=${runner}`,
+    "-f",
+    `execution_runner=${executionRunner}`,
+    "-f",
+    `model=${model}`,
+  ];
+  try {
+    runRepairMutation(dispatchLifecycle(jobPath), {
+      kind: "repair_dispatch",
+      operationName: "repair_dispatch",
+      component: "repair_dispatch",
+      identity: {
+        repository: repo,
+        workflow,
+        ref: ref || null,
+        jobPath,
+        mode,
+        runner,
+        executionRunner,
+        model,
+      },
+      operation: () => {
+        const result = spawnSync("gh", commandArgs, {
+          cwd: repoRoot(),
+          encoding: "utf8",
+          stdio: "pipe",
+        });
+        if (result.status !== 0) {
+          const detail = result.stderr || result.stdout || result.error?.message || "unknown error";
+          throw new Error(`failed to dispatch ${jobPath}: ${detail}`);
+        }
+        return result;
+      },
+    });
+  } catch (error) {
     failed = true;
-    console.error(result.stderr || result.stdout);
-  } else {
-    console.log(
-      `dispatched ${position}/${total} ${relative} (${mode}) on ${runner}; execution on ${executionRunner}`,
-    );
+    console.error(error instanceof Error ? error.message : String(error));
+    return;
   }
+  console.log(
+    `dispatched ${position}/${total} ${relative} (${mode}) on ${runner}; execution on ${executionRunner}`,
+  );
+}
+
+function dispatchLifecycle(jobPath: string): RepairLifecycleInput {
+  const job = parseJob(jobPath);
+  const targetRepo = String(job.frontmatter.repo ?? repo);
+  const issueNumber = Number(job.frontmatter.issue_number ?? job.frontmatter.pr ?? 0);
+  const number = Number.isSafeInteger(issueNumber) && issueNumber > 0 ? issueNumber : null;
+  return {
+    repository: targetRepo,
+    workKey: `repair-dispatch:${targetRepo}:${job.relativePath}`,
+    sourceRevision: repairSourceRevision(job.frontmatter),
+    recordPath: job.relativePath,
+    ...(number ? { number } : {}),
+    subjectKind: number && job.frontmatter.pr ? "pull_request" : number ? "issue" : "workflow",
+  };
 }
 
 function shouldDispatchJob(relative: JsonValue) {

@@ -2,6 +2,7 @@
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import {
+  appendFileSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -1022,19 +1023,44 @@ function dispatchCommitFinding(options: {
       : workflowDispatchArgs(options.dispatch, options.reportRepo, options.workflow).map((arg) =>
           arg === "PLACEHOLDER" ? options.repairRepo : arg,
         );
+  const lifecycle = commitLifecycle(options.dispatch.targetRepo, options.dispatch.sha);
   const maxAttempts = 3;
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    const result = spawnSync("gh", commandArgs, {
-      input:
-        options.mode === "repository_dispatch"
-          ? dispatchPayload(options.dispatch, options.reportRepo)
-          : undefined,
-      encoding: "utf8",
-      env: process.env,
-    });
-    if (result.status === 0) return;
-
-    const error = dispatchFailureError(options, result);
+    let error: Error & { stdout?: string; stderr?: string };
+    try {
+      runCommitMutation(lifecycle, {
+        kind: "commit_finding_dispatch",
+        identity: {
+          repairRepo: options.repairRepo,
+          workflow: options.workflow,
+          mode: options.mode,
+          reportRepo: options.reportRepo,
+          dispatch: options.dispatch,
+        },
+        operation: () => {
+          const result = spawnSync("gh", commandArgs, {
+            input:
+              options.mode === "repository_dispatch"
+                ? dispatchPayload(options.dispatch, options.reportRepo)
+                : undefined,
+            encoding: "utf8",
+            env: process.env,
+          });
+          if (result.status !== 0) throw dispatchFailureError(options, result);
+          return result;
+        },
+      });
+      return;
+    } catch (cause) {
+      const failure = cause as { stdout?: unknown; stderr?: unknown };
+      error =
+        cause instanceof Error
+          ? Object.assign(cause, {
+              stdout: typeof failure.stdout === "string" ? failure.stdout : "",
+              stderr: typeof failure.stderr === "string" ? failure.stderr : "",
+            })
+          : Object.assign(new Error(String(cause)), { stdout: "", stderr: "" });
+    }
     const retryKind = ghRetryKind(error);
     if (attempt >= maxAttempts - 1 || retryKind === "none") throw error;
 
@@ -1049,6 +1075,7 @@ function dispatchCommitFinding(options: {
 function dispatchFindingsCommand(args: Args): void {
   const enabled = argString(args, "enabled", "true");
   if (!boolString(enabled)) {
+    writeCommitPublicationOutput("dispatch_count", "0");
     console.log("commit finding dispatch disabled");
     return;
   }
@@ -1090,10 +1117,12 @@ function dispatchFindingsCommand(args: Args): void {
   }
 
   if (!dispatches.length) {
+    writeCommitPublicationOutput("dispatch_count", "0");
     console.log("No commit finding reports to dispatch.");
     return;
   }
 
+  let dispatchCount = 0;
   for (const dispatch of dispatches) {
     if (dryRun) {
       if (dispatchMode === "repository_dispatch") {
@@ -1112,9 +1141,85 @@ function dispatchFindingsCommand(args: Args): void {
         repairRepo,
         workflow: repairWorkflow,
       });
+      dispatchCount += 1;
       console.log(`dispatched ${dispatch.targetRepo}@${dispatch.sha} to ${repairRepo}`);
     }
   }
+  writeCommitPublicationOutput("dispatch_count", String(dryRun ? 0 : dispatchCount));
+}
+
+function dispatchContinuationCommand(args: Args): void {
+  const repository = argString(
+    args,
+    "repository",
+    process.env.GITHUB_REPOSITORY ?? "openclaw/clawsweeper",
+  );
+  const workflow = argString(args, "workflow", "commit-review.yml");
+  const targetRepo = argString(args, "target_repo", DEFAULT_TARGET_REPO);
+  const afterSha = assertSha(argString(args, "after_sha", argString(args, "commit_sha", "")));
+  const beforeValue = argString(args, "before_sha", "").trim();
+  const beforeSha = beforeValue ? assertSha(beforeValue, "before sha") : "";
+  const commitOffset = argNumber(args, "commit_offset", 0);
+  if (!Number.isSafeInteger(commitOffset) || commitOffset < 0) {
+    throw new Error("Invalid --commit-offset");
+  }
+  const createChecks = argBool(args, "create_checks");
+  const additionalPrompt = argString(args, "additional_prompt", "");
+  const commandArgs = [
+    "workflow",
+    "run",
+    workflow,
+    "--repo",
+    repository,
+    "-f",
+    "enabled=true",
+    "-f",
+    `target_repo=${targetRepo}`,
+    "-f",
+    `commit_sha=${afterSha}`,
+    "-f",
+    `before_sha=${beforeSha}`,
+    "-f",
+    `commit_offset=${commitOffset}`,
+    "-f",
+    `create_checks=${createChecks ? "true" : "false"}`,
+    "-f",
+    `additional_prompt=${additionalPrompt}`,
+  ];
+  runCommitMutation(commitLifecycle(targetRepo, afterSha), {
+    kind: "commit_review_continuation_dispatch",
+    identity: {
+      repository,
+      workflow,
+      targetRepo,
+      afterSha,
+      beforeSha: beforeSha || null,
+      commitOffset,
+      createChecks,
+      additionalPromptSha256: createHash("sha256").update(additionalPrompt).digest("hex"),
+    },
+    operation: () => {
+      const result = spawnSync("gh", commandArgs, {
+        encoding: "utf8",
+        env: process.env,
+      });
+      if (result.status !== 0) {
+        const detail =
+          result.stderr || result.stdout || result.error?.message || "unknown gh error";
+        throw new Error(`failed to dispatch commit review continuation: ${detail}`);
+      }
+      return result;
+    },
+  });
+  console.log(
+    `dispatched commit review continuation for ${targetRepo}@${afterSha} at offset ${commitOffset}`,
+  );
+}
+
+function writeCommitPublicationOutput(name: string, value: string): void {
+  const output = process.env.GITHUB_OUTPUT;
+  if (!output) return;
+  appendFileSync(output, `${name}=${value}\n`, "utf8");
 }
 
 export function main(argv = process.argv.slice(2)): void {
@@ -1127,6 +1232,7 @@ export function main(argv = process.argv.slice(2)): void {
   else if (command === "reports") reportsCommand(args);
   else if (command === "copy-artifacts") copyArtifactsCommand(args);
   else if (command === "dispatch-findings") dispatchFindingsCommand(args);
+  else if (command === "dispatch-continuation") dispatchContinuationCommand(args);
   else if (command === "local-review") localReviewCommand(args);
   else {
     console.error(`Unknown command: ${command}`);

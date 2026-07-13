@@ -52,7 +52,7 @@ test("repair sessions, statuses, and result publication flush immutable receipts
   assert.match(publisher, /recordRepairLifecycleFailureSafely/);
   assert.match(
     publisher,
-    /reviewedResultRevision\([\s\S]*readPublishedSourceContext\(runDir\)[\s\S]*missing one exact reviewed target revision/,
+    /reviewedResultRevision\([\s\S]*readPublishedSourceContext\(clusterPlan\)[\s\S]*missing one exact reviewed target revision/,
   );
   assert.match(
     publisher,
@@ -283,8 +283,32 @@ test("commit review and notification workflows publish their operation receipts"
   assert.match(publisher, /append commit review action ledger/);
   assert.match(
     publisher,
-    /--repair-lane commit-publication[\s\S]*--allow-empty[\s\S]*planned_count \}\}" = "0"[\s\S]*CHECKS_REQUESTED" != "true"[\s\S]*exit 0/,
+    /CONTINUATION_REQUESTED:[\s\S]*DISPATCH_COUNT:[\s\S]*allow_empty=false[\s\S]*DISPATCH_COUNT" = "0"[\s\S]*CHECKS_REQUESTED" != "true"[\s\S]*CONTINUATION_REQUESTED" != "true"[\s\S]*allow_empty_args\+=\(--allow-empty\)/,
   );
+  assert.match(publisher, /node dist\/commit-sweeper\.js dispatch-continuation/);
+  assert.doesNotMatch(publisher, /\n\s+gh workflow run commit-review\.yml/);
+  assert.ok(
+    publisher.indexOf("- name: Dispatch commit findings to repair lane") <
+      publisher.indexOf("- name: Finalize commit publication action ledger"),
+  );
+  assert.ok(
+    publisher.indexOf("- name: Continue commit review range") <
+      publisher.indexOf("- name: Finalize commit publication action ledger"),
+  );
+  assert.ok(
+    publisher.indexOf("- name: Finalize commit publication action ledger") <
+      publisher.indexOf("- name: Publish immutable commit review action ledger"),
+  );
+  const commitSweeper = readText("src/commit-sweeper.ts");
+  const findingDispatch = commitSweeper.slice(
+    commitSweeper.indexOf("function dispatchCommitFinding"),
+    commitSweeper.indexOf("function dispatchFindingsCommand"),
+  );
+  assert.match(findingDispatch, /for \(let attempt = 0; attempt < maxAttempts; attempt\+\+\)/);
+  assert.match(findingDispatch, /runCommitMutation\(lifecycle/);
+  assert.match(findingDispatch, /kind: "commit_finding_dispatch"/);
+  assert.match(commitSweeper, /kind: "commit_review_continuation_dispatch"/);
+  assert.match(commitSweeper, /writeCommitPublicationOutput\("dispatch_count"/);
   for (const workflow of [activity, maintainer]) {
     assert.match(workflow, /setup-action-ledger/);
     assert.match(workflow, /repair:action-ledger -- finalize/);
@@ -316,9 +340,13 @@ test("issue implementation intake finalizes and publishes source-bound status re
   assert.match(workflow, /jq -r '\.paths\[\]\?'/);
   assert.match(workflow, /append issue implementation intake action ledger/);
   assert.ok(
-    workflow.indexOf("Publish immutable issue implementation intake action ledger") <
-      workflow.indexOf("Dispatch repair worker"),
+    workflow.indexOf("Dispatch repair worker") <
+      workflow.indexOf("Finalize issue implementation intake action ledger"),
   );
+  const dispatcher = readText("src/repair/dispatch-jobs.ts");
+  assert.match(dispatcher, /runRepairMutation\(dispatchLifecycle\(jobPath\)/);
+  assert.match(dispatcher, /kind: "repair_dispatch"/);
+  assert.match(dispatcher, /repairSourceRevision\(job\.frontmatter\)/);
 });
 
 test("result and finalizer workflows publish their repair operation receipts", () => {
@@ -344,6 +372,9 @@ test("result and finalizer workflows publish their repair operation receipts", (
   assert.match(results, /CLAWSWEEPER_ACTION_LEDGER_INVOCATION=open-pr-finalizer/);
   assert.match(results, /CLAWSWEEPER_ACTION_LEDGER_INVOCATION=finalizer-results/);
   assert.match(finalizer, /append repair finalizer action ledger/);
+  const finalizerSource = readText("src/repair/finalize-open-prs.ts");
+  assert.match(finalizerSource, /runRepairMutation\(finalizerDispatchLifecycle\(candidate\)/);
+  assert.match(finalizerSource, /operationName: "open_pr_finalizer"/);
 });
 
 test("the shared action ledger finalizer is operation-family agnostic", () => {

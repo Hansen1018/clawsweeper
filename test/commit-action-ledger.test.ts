@@ -15,6 +15,7 @@ import {
   recordCommitWorkflowEvent,
   runCommitMutation,
 } from "../dist/commit-action-ledger.js";
+import { mockGhBinEnv } from "./helpers.ts";
 
 test("commit review terminal success requires requested check publication", () => {
   assert.equal(
@@ -266,6 +267,127 @@ test("commit review check publication completes before the workflow is finalized
   }
 });
 
+test("commit finding dispatch records the concrete request before publication finalization", async () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "commit-dispatch-ledger-")));
+  const outputRoot = path.join(root, "output");
+  const artifactDir = path.join(root, "commit-artifacts", "openclaw-openclaw", "commits");
+  const sha = "b".repeat(40);
+  const reportPath = path.join(artifactDir, `${sha}.md`);
+  const githubOutput = path.join(root, "github-output.txt");
+  const ghLog = path.join(root, "gh.log");
+  const ghPath = mockGh(root, ghLog);
+  fs.mkdirSync(outputRoot);
+  fs.mkdirSync(artifactDir, { recursive: true });
+  fs.writeFileSync(
+    reportPath,
+    `---\nresult: findings\nsha: ${sha}\nrepository: openclaw/openclaw\nhighest_severity: P1\ncheck_conclusion: failure\n---\n`,
+  );
+  const previous = { ...process.env };
+  const env = {
+    ...process.env,
+    ...workflowEnv(root, outputRoot),
+    ...mockGhBinEnv(ghPath, path.dirname(ghPath)),
+    GITHUB_ACTION: "dispatch_findings",
+    GITHUB_JOB: "publish",
+    GITHUB_OUTPUT: githubOutput,
+    MOCK_GH_LOG: ghLog,
+  };
+  Object.assign(process.env, env);
+
+  try {
+    execFileSync(
+      process.execPath,
+      [
+        path.join(process.cwd(), "dist", "commit-sweeper.js"),
+        "dispatch-findings",
+        "--artifact-dir",
+        path.join(root, "commit-artifacts"),
+        "--repair-repo",
+        "openclaw/clawsweeper",
+        "--repair-workflow",
+        "repair-commit-finding-intake.yml",
+        "--dispatch-mode",
+        "workflow_dispatch",
+        "--report-repo",
+        "openclaw/clawsweeper",
+      ],
+      { env, stdio: "pipe" },
+    );
+    await flushWorkflowActionEvents(root);
+
+    assert.match(fs.readFileSync(githubOutput, "utf8"), /^dispatch_count=1$/m);
+    assert.equal(fs.readFileSync(ghLog, "utf8").trim().split("\n").length, 1);
+    const events = readEvents(outputRoot).filter(
+      (event) => event.attributes?.publication_kind === "commit_finding_dispatch",
+    );
+    assert.deepEqual(
+      events.map((event) => event.action.status),
+      ["started", "published"],
+    );
+    assert.ok(events.every((event) => event.subject?.source_revision === sha));
+  } finally {
+    restoreEnv(previous);
+    fs.rmSync(root, { force: true, recursive: true });
+  }
+});
+
+test("commit range continuation dispatch records its own request and outcome", async () => {
+  const root = fs.realpathSync(
+    fs.mkdtempSync(path.join(os.tmpdir(), "commit-continuation-ledger-")),
+  );
+  const outputRoot = path.join(root, "output");
+  const ghLog = path.join(root, "gh.log");
+  const ghPath = mockGh(root, ghLog);
+  const sha = "c".repeat(40);
+  fs.mkdirSync(outputRoot);
+  const previous = { ...process.env };
+  const env = {
+    ...process.env,
+    ...workflowEnv(root, outputRoot),
+    ...mockGhBinEnv(ghPath, path.dirname(ghPath)),
+    GITHUB_ACTION: "continue_commit_review",
+    GITHUB_JOB: "publish",
+    MOCK_GH_LOG: ghLog,
+  };
+  Object.assign(process.env, env);
+
+  try {
+    execFileSync(
+      process.execPath,
+      [
+        path.join(process.cwd(), "dist", "commit-sweeper.js"),
+        "dispatch-continuation",
+        "--repository",
+        "openclaw/clawsweeper",
+        "--target-repo",
+        "openclaw/openclaw",
+        "--after-sha",
+        sha,
+        "--commit-offset",
+        "20",
+        "--create-checks",
+        "true",
+      ],
+      { env, stdio: "pipe" },
+    );
+    await flushWorkflowActionEvents(root);
+
+    const ghArgs = JSON.parse(fs.readFileSync(ghLog, "utf8").trim());
+    assert.deepEqual(ghArgs.slice(0, 4), ["workflow", "run", "commit-review.yml", "--repo"]);
+    const events = readEvents(outputRoot).filter(
+      (event) => event.attributes?.publication_kind === "commit_review_continuation_dispatch",
+    );
+    assert.deepEqual(
+      events.map((event) => event.action.status),
+      ["started", "published"],
+    );
+    assert.ok(events.every((event) => event.subject?.source_revision === sha));
+  } finally {
+    restoreEnv(previous);
+    fs.rmSync(root, { force: true, recursive: true });
+  }
+});
+
 function workflowEnv(root: string, outputRoot: string) {
   return {
     CLAWSWEEPER_ACTION_LEDGER_FORCE: "1",
@@ -284,6 +406,18 @@ function workflowEnv(root: string, outputRoot: string) {
     GITHUB_WORKFLOW_REF: "openclaw/clawsweeper/.github/workflows/commit-review.yml@refs/heads/main",
     GITHUB_RUN_STARTED_AT: "2026-07-12T00:00:00Z",
   };
+}
+
+function mockGh(root: string, logPath: string): string {
+  const binDir = path.join(root, "bin");
+  const ghPath = path.join(binDir, "gh");
+  fs.mkdirSync(binDir, { recursive: true });
+  fs.writeFileSync(
+    ghPath,
+    `#!/usr/bin/env node\nrequire("node:fs").appendFileSync(${JSON.stringify(logPath)}, JSON.stringify(process.argv.slice(2)) + "\\n");\n`,
+  );
+  fs.chmodSync(ghPath, 0o755);
+  return ghPath;
 }
 
 function readEvents(root: string): Record<string, any>[] {

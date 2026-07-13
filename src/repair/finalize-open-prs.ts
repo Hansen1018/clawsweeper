@@ -18,6 +18,11 @@ import { sleepMs } from "./timing.js";
 import { DEFAULT_TARGET_REPO, REPAIR_CLUSTER_WORKFLOW, REVIEW_BOTS } from "./constants.js";
 import { numberEnv } from "./env-utils.js";
 import { compactText, escapeRegExp } from "./text-utils.js";
+import {
+  repairSourceRevision,
+  runRepairMutation,
+  type RepairLifecycleInput,
+} from "./repair-action-ledger.js";
 
 const DEFAULT_HEAD_PREFIX = "clawsweeper/";
 const PASSING_CHECK_CONCLUSIONS = new Set(["SUCCESS", "SKIPPED", "NEUTRAL"]);
@@ -660,7 +665,7 @@ function executeDispatches(candidates: LooseRecord[], dispatchSummary: JsonValue
 }
 
 function dispatchRepair(candidate: LooseRecord) {
-  ghText([
+  const commandArgs = [
     "workflow",
     "run",
     workflow,
@@ -676,7 +681,38 @@ function dispatchRepair(candidate: LooseRecord) {
     `execution_runner=${executionRunner}`,
     "-f",
     `model=${model}`,
-  ]);
+  ];
+  runRepairMutation(finalizerDispatchLifecycle(candidate), {
+    kind: "repair_dispatch",
+    operationName: "open_pr_finalizer",
+    component: "open_pr_finalizer",
+    identity: {
+      repository: repairRepo,
+      workflow,
+      jobPath: candidate.job_path,
+      mode: candidate.mode,
+      runner,
+      executionRunner,
+      model,
+      headSha: candidate.head_sha,
+    },
+    operation: () => ghText(commandArgs),
+  });
+}
+
+function finalizerDispatchLifecycle(candidate: LooseRecord): RepairLifecycleInput {
+  const job = parseJob(String(candidate.job_path));
+  const pr = Number(candidate.pr);
+  return {
+    repository: repo,
+    workKey: `open-pr-finalizer:${repo}#${pr}:${job.relativePath}`,
+    number: pr,
+    sourceRevision:
+      String(candidate.head_sha ?? "").trim() || repairSourceRevision(job.frontmatter),
+    recordPath: job.relativePath,
+    subjectKind: "pull_request",
+    subjectId: `pull-request-${pr}`,
+  };
 }
 
 function readDispatchLedger() {

@@ -231,6 +231,30 @@ jobs:
             --detail "Review complete; no active implementation PR was found. The Codex implementation worker is queued." \
             --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
+      - name: Dispatch repair worker
+        if: ${{ steps.prepare.outputs.should_repair == 'true' }}
+        env:
+          GH_TOKEN: ${{ steps.dispatch-token.outputs.token }}
+          MAX_LIVE_WORKERS: ${{ vars.CLAWSWEEPER_AUTO_IMPLEMENT_MAX_LIVE_WORKERS || '' }}
+          RUNNER: ${{ github.event.inputs.runner || github.event.client_payload.runner || vars.CLAWSWEEPER_WORKER_RUNNER || 'blacksmith-4vcpu-ubuntu-2404' }}
+          EXECUTION_RUNNER: ${{ github.event.inputs.execution_runner || github.event.client_payload.execution_runner || vars.CLAWSWEEPER_EXECUTION_RUNNER || 'blacksmith-16vcpu-ubuntu-2404' }}
+          MODEL: internal
+        run: |
+          set -euo pipefail
+          cap_args=()
+          if [ -n "$MAX_LIVE_WORKERS" ]; then
+            cap_args=(--max-live-workers "$MAX_LIVE_WORKERS")
+          fi
+          git pull --rebase --autostash
+          pnpm run repair:dispatch -- "${{ steps.prepare.outputs.job_path }}" \
+            --mode autonomous \
+            --wait-for-capacity \
+            "${cap_args[@]}" \
+            --runner "$RUNNER" \
+            --execution-runner "$EXECUTION_RUNNER" \
+            --model "$MODEL" \
+            --ref main
+
       - name: Finalize issue implementation intake action ledger
         if: ${{ always() && steps.intake-action-ledger.outcome == 'success' }}
         run: |
@@ -293,27 +317,3 @@ jobs:
             --message "chore: append issue implementation intake action ledger" \
             "${action_ledger_args[@]}" \
             --rebase-strategy normal
-
-      - name: Dispatch repair worker
-        if: ${{ steps.prepare.outputs.should_repair == 'true' }}
-        env:
-          GH_TOKEN: ${{ steps.dispatch-token.outputs.token }}
-          MAX_LIVE_WORKERS: ${{ vars.CLAWSWEEPER_AUTO_IMPLEMENT_MAX_LIVE_WORKERS || '' }}
-          RUNNER: ${{ github.event.inputs.runner || github.event.client_payload.runner || vars.CLAWSWEEPER_WORKER_RUNNER || 'blacksmith-4vcpu-ubuntu-2404' }}
-          EXECUTION_RUNNER: ${{ github.event.inputs.execution_runner || github.event.client_payload.execution_runner || vars.CLAWSWEEPER_EXECUTION_RUNNER || 'blacksmith-16vcpu-ubuntu-2404' }}
-          MODEL: internal
-        run: |
-          set -euo pipefail
-          cap_args=()
-          if [ -n "$MAX_LIVE_WORKERS" ]; then
-            cap_args=(--max-live-workers "$MAX_LIVE_WORKERS")
-          fi
-          git pull --rebase --autostash
-          pnpm run repair:dispatch -- "${{ steps.prepare.outputs.job_path }}" \
-            --mode autonomous \
-            --wait-for-capacity \
-            "${cap_args[@]}" \
-            --runner "$RUNNER" \
-            --execution-runner "$EXECUTION_RUNNER" \
-            --model "$MODEL" \
-            --ref main
