@@ -310,6 +310,10 @@ test("proof lifecycle is created in an isolated trusted job before state credent
   const publishJob = workflow.indexOf("\n  publish-proof-action-ledger:", replayStep);
   const mutateJob = workflow.indexOf("\n  mutate:", publishJob);
   const publishBlock = workflow.slice(publishJob, mutateJob);
+  const validateIsolation = workflow.indexOf(
+    "- name: Provision isolated target validation account",
+    validateJob,
+  );
   const setupLedger = publishBlock.indexOf("uses: ./.github/actions/setup-action-ledger");
   const createProof = publishBlock.indexOf("- name: Create and validate exact staged proof events");
   const stateToken = publishBlock.indexOf("- name: Create proof ledger state token");
@@ -318,6 +322,8 @@ test("proof lifecycle is created in an isolated trusted job before state credent
   );
 
   assert.ok(validateJob >= 0);
+  assert.ok(validateIsolation > validateJob);
+  assert.ok(validateIsolation < replayStep);
   assert.ok(replayStep > validateJob);
   assert.ok(publishJob > replayStep);
   assert.ok(mutateJob > publishJob);
@@ -325,7 +331,7 @@ test("proof lifecycle is created in an isolated trusted job before state credent
   assert.doesNotMatch(workflow.slice(validateJob, publishJob), /repair:action-ledger/);
   assert.match(
     workflow.slice(validateJob, publishJob),
-    /github_output="\$GITHUB_OUTPUT"[\s\S]*GITHUB_\*\|RUNNER_\*\|ACTIONS_\*\|CLAWSWEEPER_ACTION_LEDGER_\*\|CLAWSWEEPER_CRABFLEET_\*[\s\S]*\*_PRIVATE_KEY\|\*_API_KEY[\s\S]*unset "\$name"[\s\S]*repair:execution-handoff -- validate[\s\S]*receipt_sha256=.*jq[\s\S]*>> "\$github_output"/,
+    /Provision isolated target validation account[\s\S]*CLAWSWEEPER_TARGET_VALIDATION_ISOLATION_REQUIRED=1[\s\S]*github_output="\$GITHUB_OUTPUT"[\s\S]*GITHUB_\*\|RUNNER_\*\|ACTIONS_\*\|CLAWSWEEPER_ACTION_LEDGER_\*\|CLAWSWEEPER_CRABFLEET_\*[\s\S]*\*_PRIVATE_KEY\|\*_API_KEY[\s\S]*unset "\$name"[\s\S]*repair:execution-handoff -- validate[\s\S]*receipt_sha256=.*jq[\s\S]*>> "\$github_output"/,
   );
   assert.ok(setupLedger >= 0);
   assert.ok(createProof > setupLedger);

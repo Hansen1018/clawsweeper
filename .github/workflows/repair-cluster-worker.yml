@@ -1094,6 +1094,39 @@ jobs:
         with:
           bun-version: 1.3.14
 
+      - name: Provision isolated target validation account
+        if: ${{ needs.authorize.outputs.checkpoint_recovered != '1' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          validation_user="clawsweeper-validation"
+          validation_home="${RUNNER_TEMP:?}/clawsweeper-target-validation-home"
+          runner_gid="$(id -g)"
+          if ! id "$validation_user" >/dev/null 2>&1; then
+            sudo useradd \
+              --system \
+              --no-user-group \
+              --gid "$runner_gid" \
+              --home-dir "$validation_home" \
+              --shell /usr/sbin/nologin \
+              "$validation_user"
+          fi
+          test "$(id -g "$validation_user")" = "$runner_gid"
+          command -v ip >/dev/null
+          command -v setpriv >/dev/null
+          command -v unshare >/dev/null
+          sudo install -d -o "$validation_user" -g "$runner_gid" -m 700 \
+            "$validation_home" \
+            "$validation_home/.cache" \
+            "$validation_home/.config" \
+            "$validation_home/.local" \
+            "$validation_home/.local/bin" \
+            "$validation_home/.local/share" \
+            "$validation_home/tmp"
+          echo "CLAWSWEEPER_TARGET_VALIDATION_ISOLATION_REQUIRED=1" >> "$GITHUB_ENV"
+          echo "CLAWSWEEPER_TARGET_VALIDATION_USER=$validation_user" >> "$GITHUB_ENV"
+          echo "CLAWSWEEPER_TARGET_VALIDATION_HOME=$validation_home" >> "$GITHUB_ENV"
+
       - name: Resolve sealed execution handoff producer
         id: execution_artifact
         env:

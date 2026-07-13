@@ -143,7 +143,16 @@ type MacosTargetValidationIsolation = {
   user: string;
 };
 
-type TargetValidationIsolation = LinuxTargetValidationIsolation | MacosTargetValidationIsolation;
+type LinuxTestTargetValidationIsolation = {
+  kind: "linux-test";
+  home: string;
+  user: string;
+};
+
+type TargetValidationIsolation =
+  | LinuxTargetValidationIsolation
+  | MacosTargetValidationIsolation
+  | LinuxTestTargetValidationIsolation;
 
 type TargetControlledCommandOptions = CommandRunOptions & {
   cwd: string;
@@ -2218,7 +2227,51 @@ export function targetValidationIsolationFromEnv(): TargetValidationIsolation | 
       user: os.userInfo().username,
     };
   }
-  if (!required && !user && !configuredHome) return null;
+  if (safeTestMode) {
+    // Unit tests exercise real toolchain commands. Keep that direct-run escape
+    // unreachable outside a Node test worker and private temporary storage.
+    if (required || user) {
+      throw new Error(
+        "safe Linux target validation test mode cannot use production user isolation",
+      );
+    }
+    if (process.env.NODE_TEST_CONTEXT !== "child-v8") {
+      throw new Error(
+        "safe Linux target validation test mode is restricted to the Node test runner",
+      );
+    }
+    if (!configuredHome) {
+      throw new Error("safe Linux target validation test mode requires an isolated home");
+    }
+    if (!path.isAbsolute(configuredHome)) {
+      throw new Error("safe Linux target validation home must be absolute");
+    }
+    const home = fs.realpathSync(configuredHome);
+    const temporaryRoot = fs.realpathSync(os.tmpdir());
+    const hostHome = fs.realpathSync(os.homedir());
+    const homeStat = fs.lstatSync(configuredHome);
+    if (
+      !pathIsWithin(temporaryRoot, home) ||
+      pathIsWithin(home, hostHome) ||
+      pathIsWithin(hostHome, home) ||
+      !homeStat.isDirectory() ||
+      homeStat.isSymbolicLink() ||
+      (homeStat.mode & 0o077) !== 0 ||
+      homeStat.uid !== process.getuid?.()
+    ) {
+      throw new Error(
+        "safe Linux target validation home must be private runner-owned temporary storage",
+      );
+    }
+    return {
+      kind: "linux-test",
+      home,
+      user: os.userInfo().username,
+    };
+  }
+  if (!required && !user && !configuredHome) {
+    throw new Error("Linux target validation requires explicit user isolation metadata");
+  }
   if (!user || !configuredHome) {
     throw new Error("target validation isolation requires both a user and isolated home");
   }
@@ -2253,11 +2306,11 @@ export function runTargetControlledCommand(
 ): string {
   const isolation = targetValidationIsolationFromEnv();
   if (!isolation) {
-    if (process.platform !== "linux") {
-      throw new Error(
-        "target-controlled commands require Linux user isolation or explicit safe macOS test mode",
-      );
-    }
+    throw new Error(
+      "target-controlled commands require Linux user isolation or explicit safe test mode",
+    );
+  }
+  if (isolation.kind === "linux-test") {
     return run(command, commandArgs, options);
   }
 

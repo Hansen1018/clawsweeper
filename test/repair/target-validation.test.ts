@@ -42,29 +42,28 @@ import {
 import { mockCommandBinEnv } from "../helpers.ts";
 
 const FAKE_TOOLCHAIN_TIMEOUT_MS = 15_000;
-const macosSafeTestHome =
-  process.platform === "darwin"
-    ? fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-macos-validation-home-")))
-    : null;
+const safeTargetValidationTestHome = ["darwin", "linux"].includes(process.platform)
+  ? fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-validation-test-home-")))
+  : null;
 
 function targetValidationOutputPath(name) {
   return path.join(
-    macosSafeTestHome ?? os.tmpdir(),
+    safeTargetValidationTestHome ?? os.tmpdir(),
     `${name}-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`,
   );
 }
 
-if (macosSafeTestHome) {
-  fs.chmodSync(macosSafeTestHome, 0o700);
+if (safeTargetValidationTestHome) {
+  fs.chmodSync(safeTargetValidationTestHome, 0o700);
   process.env.CLAWSWEEPER_TARGET_VALIDATION_SAFE_TEST_MODE = "1";
-  process.env.CLAWSWEEPER_TARGET_VALIDATION_HOME = macosSafeTestHome;
+  process.env.CLAWSWEEPER_TARGET_VALIDATION_HOME = safeTargetValidationTestHome;
 }
 
 test.after(() => {
-  if (!macosSafeTestHome) return;
+  if (!safeTargetValidationTestHome) return;
   delete process.env.CLAWSWEEPER_TARGET_VALIDATION_SAFE_TEST_MODE;
   delete process.env.CLAWSWEEPER_TARGET_VALIDATION_HOME;
-  fs.rmSync(macosSafeTestHome, { recursive: true, force: true });
+  fs.rmSync(safeTargetValidationTestHome, { recursive: true, force: true });
 });
 
 test("default staged proof entry budget covers a supported OpenClaw install", () => {
@@ -1629,28 +1628,44 @@ test("non-gated target repos replace stale changed gates with git validation", (
   assert.deepEqual(result.available_scripts, ["test"]);
 });
 
-test("repair execution provisions pinned Bun before target validation can invoke it", () => {
+test("every Linux target validation workflow lane provisions pinned Bun and isolation", () => {
   const workflow = fs.readFileSync(".github/workflows/repair-cluster-worker.yml", "utf8");
-  const setupBunIndex = workflow.indexOf("- name: Setup pinned Bun for target validation");
-  const isolationIndex = workflow.indexOf("- name: Provision isolated target validation account");
-  const setupCodexIndex = workflow.indexOf("- uses: ./.github/actions/setup-codex", isolationIndex);
-  const executeFixIndex = workflow.indexOf("- name: Execute credited fix artifact");
+  const executeJobIndex = workflow.indexOf("\n  execute:");
+  const validateJobIndex = workflow.indexOf("\n  validate:");
+  const publishProofJobIndex = workflow.indexOf("\n  publish-proof-action-ledger:");
+  const executeBlock = workflow.slice(executeJobIndex, validateJobIndex);
+  const validateBlock = workflow.slice(validateJobIndex, publishProofJobIndex);
 
-  assert.ok(setupBunIndex >= 0, "expected repair execution workflow to set up Bun");
-  assert.ok(isolationIndex >= 0, "expected repair execution workflow to isolate target validation");
-  assert.ok(setupCodexIndex >= 0, "expected repair execution workflow to set up Codex");
-  assert.ok(executeFixIndex >= 0, "expected repair execution workflow to execute fix artifacts");
-  assert.ok(setupBunIndex < executeFixIndex, "expected Bun setup before repair:execute-fix");
+  for (const [name, block, command] of [
+    ["execute", executeBlock, "repair:execute-fix"],
+    ["validate", validateBlock, "repair:execution-handoff -- validate"],
+  ] as const) {
+    const setupBunIndex = block.indexOf("- name: Setup pinned Bun for target validation");
+    const isolationIndex = block.indexOf("- name: Provision isolated target validation account");
+    const commandIndex = block.indexOf(command);
+    assert.ok(setupBunIndex >= 0, `expected ${name} lane to set up Bun`);
+    assert.ok(isolationIndex > setupBunIndex, `expected ${name} lane to provision isolation`);
+    assert.ok(commandIndex > isolationIndex, `expected ${name} isolation before target validation`);
+    const setupBlock = block.slice(setupBunIndex, commandIndex);
+    assert.match(setupBlock, /uses: oven-sh\/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6/);
+    assert.match(setupBlock, /bun-version: 1\.3\.14/);
+    assert.match(setupBlock, /CLAWSWEEPER_TARGET_VALIDATION_ISOLATION_REQUIRED=1/);
+    assert.match(setupBlock, /CLAWSWEEPER_TARGET_VALIDATION_USER=\$validation_user/);
+    assert.match(setupBlock, /CLAWSWEEPER_TARGET_VALIDATION_HOME=\$validation_home/);
+    assert.match(setupBlock, /command -v unshare/);
+    assert.match(setupBlock, /--no-user-group/);
+  }
+
+  const setupCodexIndex = executeBlock.indexOf("- uses: ./.github/actions/setup-codex");
+  const isolationIndex = executeBlock.indexOf(
+    "- name: Provision isolated target validation account",
+  );
+  const executeFixIndex = executeBlock.indexOf("- name: Execute credited fix artifact");
   assert.ok(isolationIndex < setupCodexIndex, "expected isolation account before Codex setup");
   assert.ok(setupCodexIndex < executeFixIndex, "expected Codex setup before repair:execute-fix");
-
-  const setupBunStep = workflow.slice(setupBunIndex, executeFixIndex);
-  assert.match(setupBunStep, /uses: oven-sh\/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6/);
-  assert.match(setupBunStep, /bun-version: 1\.3\.14/);
-  assert.match(setupBunStep, /CLAWSWEEPER_TARGET_VALIDATION_ISOLATION_REQUIRED=1/);
-  assert.match(setupBunStep, /--no-user-group/);
-  assert.match(setupBunStep, /auth-mode: login/);
-  assert.doesNotMatch(setupBunStep, /auth-mode: proxy/);
+  const setupCodexBlock = executeBlock.slice(setupCodexIndex, executeFixIndex);
+  assert.match(setupCodexBlock, /auth-mode: login/);
+  assert.doesNotMatch(setupCodexBlock, /auth-mode: proxy/);
 
   const action = fs.readFileSync(".github/actions/setup-codex/action.yml", "utf8");
   const stopProxyIndex = action.indexOf("stop-codex-responses-proxy.mjs");
@@ -2085,12 +2100,16 @@ test("bun-based target toolchain hides pnpm-injected npm_config_user_agent from 
     );
     assert.equal(
       env.npm_config_cache,
-      macosSafeTestHome ? path.join(macosSafeTestHome, ".cache", "npm") : "/tmp/npm-cache",
+      safeTargetValidationTestHome
+        ? path.join(safeTargetValidationTestHome, ".cache", "npm")
+        : "/tmp/npm-cache",
       "npm-compatible cache config must pass through to bun children",
     );
     assert.equal(
       env.npm_config_userconfig,
-      macosSafeTestHome ? path.join(macosSafeTestHome, ".npmrc") : "/tmp/npmrc",
+      safeTargetValidationTestHome
+        ? path.join(safeTargetValidationTestHome, ".npmrc")
+        : "/tmp/npmrc",
       "npm-compatible userconfig must pass through to bun children",
     );
     assert.equal(env.npm_execpath, undefined, "npm_execpath must not leak to bun children");
@@ -2107,7 +2126,9 @@ test("bun-based target toolchain hides pnpm-injected npm_config_user_agent from 
     assert.equal(env.npm_package_name, undefined, "npm_package_* must not leak to bun children");
     assert.equal(
       env.PNPM_HOME,
-      macosSafeTestHome ? path.join(macosSafeTestHome, ".local", "share", "pnpm") : undefined,
+      safeTargetValidationTestHome
+        ? path.join(safeTargetValidationTestHome, ".local", "share", "pnpm")
+        : undefined,
       "PNPM_HOME must stay within the isolated home",
     );
     assert.equal(env.PNPM_STORE_PATH, undefined, "PNPM_* variables must not leak to bun children");
@@ -4055,6 +4076,44 @@ test("required target validation isolation fails closed without its account cont
 });
 
 test(
+  "Linux target validation fails closed when isolation metadata is absent",
+  { skip: process.platform !== "linux" },
+  () => {
+    const previous = {
+      required: process.env.CLAWSWEEPER_TARGET_VALIDATION_ISOLATION_REQUIRED,
+      safeTestMode: process.env.CLAWSWEEPER_TARGET_VALIDATION_SAFE_TEST_MODE,
+      user: process.env.CLAWSWEEPER_TARGET_VALIDATION_USER,
+      home: process.env.CLAWSWEEPER_TARGET_VALIDATION_HOME,
+    };
+    delete process.env.CLAWSWEEPER_TARGET_VALIDATION_ISOLATION_REQUIRED;
+    delete process.env.CLAWSWEEPER_TARGET_VALIDATION_SAFE_TEST_MODE;
+    delete process.env.CLAWSWEEPER_TARGET_VALIDATION_USER;
+    delete process.env.CLAWSWEEPER_TARGET_VALIDATION_HOME;
+    try {
+      assert.throws(
+        () => targetValidationIsolationFromEnv(),
+        /Linux target validation requires explicit user isolation metadata/,
+      );
+      assert.throws(
+        () =>
+          runTargetControlledCommand(process.execPath, ["-e", "process.exit(99)"], {
+            cwd: os.tmpdir(),
+            env: targetValidationEnv(),
+            isolateNetwork: true,
+            timeoutMs: 5_000,
+          }),
+        /Linux target validation requires explicit user isolation metadata/,
+      );
+    } finally {
+      restoreEnv("CLAWSWEEPER_TARGET_VALIDATION_ISOLATION_REQUIRED", previous.required);
+      restoreEnv("CLAWSWEEPER_TARGET_VALIDATION_SAFE_TEST_MODE", previous.safeTestMode);
+      restoreEnv("CLAWSWEEPER_TARGET_VALIDATION_USER", previous.user);
+      restoreEnv("CLAWSWEEPER_TARGET_VALIDATION_HOME", previous.home);
+    }
+  },
+);
+
+test(
   "macOS target validation fails closed without safe sandbox mode",
   { skip: process.platform !== "darwin" },
   () => {
@@ -4073,7 +4132,7 @@ test(
             isolateNetwork: true,
             timeoutMs: 5_000,
           }),
-        /require Linux user isolation or explicit safe macOS test mode/,
+        /require Linux user isolation or explicit safe test mode/,
       );
     } finally {
       restoreEnv("CLAWSWEEPER_TARGET_VALIDATION_SAFE_TEST_MODE", previous.safeTestMode);

@@ -2,47 +2,59 @@
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import http from "node:http";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
 
-const serverInfoPath = process.argv[2];
-if (!serverInfoPath) {
-  throw new Error("usage: stop-codex-responses-proxy.mjs <server-info-path>");
+if (isMainModule()) {
+  await stopProxy(process.argv[2]);
 }
 
-const serverInfo = readServerInfo(serverInfoPath);
-if (serverInfo === null) process.exit(0);
+async function stopProxy(serverInfoPath) {
+  if (!serverInfoPath) {
+    throw new Error("usage: stop-codex-responses-proxy.mjs <server-info-path>");
+  }
 
-if (!processIsAlive(serverInfo.pid)) {
-  removeServerInfo(serverInfoPath);
-  process.exit(0);
-}
+  const serverInfo = readServerInfo(serverInfoPath);
+  if (serverInfo === null) process.exit(0);
 
-const command = processCommand(serverInfo.pid);
-if (!isExpectedProxyCommand(command)) {
-  console.warn(
-    `Ignoring stale Codex Responses proxy metadata for unrelated process ${serverInfo.pid}.`,
-  );
-  removeServerInfo(serverInfoPath);
-  process.exit(0);
-}
-
-if (!processOwnsListeningPort(serverInfo.pid, serverInfo.port)) {
   if (!processIsAlive(serverInfo.pid)) {
     removeServerInfo(serverInfoPath);
     process.exit(0);
   }
-  throw new Error(
-    `Codex Responses proxy process ${serverInfo.pid} does not own listening port ${serverInfo.port}`,
-  );
+
+  const command = processCommand(serverInfo.pid);
+  if (!isExpectedProxyCommand(command)) {
+    console.warn(
+      `Ignoring stale Codex Responses proxy metadata for unrelated process ${serverInfo.pid}.`,
+    );
+    removeServerInfo(serverInfoPath);
+    process.exit(0);
+  }
+
+  if (!processOwnsListeningPort(serverInfo.pid, serverInfo.port)) {
+    if (!processIsAlive(serverInfo.pid)) {
+      removeServerInfo(serverInfoPath);
+      process.exit(0);
+    }
+    throw new Error(
+      `Codex Responses proxy process ${serverInfo.pid} does not own listening port ${serverInfo.port}`,
+    );
+  }
+
+  try {
+    await requestShutdown(serverInfo.port);
+  } catch (error) {
+    if (error?.code !== "ECONNREFUSED") throw error;
+  }
+
+  await waitForProxyStop(serverInfo);
+  removeServerInfo(serverInfoPath);
 }
 
-try {
-  await requestShutdown(serverInfo.port);
-} catch (error) {
-  if (error?.code !== "ECONNREFUSED") throw error;
+function isMainModule() {
+  const entrypoint = process.argv[1];
+  return Boolean(entrypoint) && import.meta.url === pathToFileURL(path.resolve(entrypoint)).href;
 }
-
-await waitForProxyStop(serverInfo);
-removeServerInfo(serverInfoPath);
 
 function readServerInfo(filePath) {
   let stat;
@@ -149,10 +161,48 @@ function isExpectedProxyCommand(command) {
   );
 }
 
-function commandTokens(command) {
-  return [...command.matchAll(/"((?:\\.|[^"])*)"|'([^']*)'|([^\s]+)/g)].map(
-    (match) => match[1] ?? match[2] ?? match[3] ?? "",
-  );
+export function commandTokens(command) {
+  const tokens = [];
+  let token = "";
+  let quote = null;
+  let tokenStarted = false;
+
+  for (let index = 0; index < command.length; index += 1) {
+    const character = command[index];
+    if (quote !== null) {
+      if (character === quote) {
+        quote = null;
+        continue;
+      }
+      if (quote === '"' && character === "\\" && index + 1 < command.length) {
+        token += character + command[index + 1];
+        index += 1;
+        continue;
+      }
+      token += character;
+      continue;
+    }
+
+    if (/\s/.test(character)) {
+      if (tokenStarted) {
+        tokens.push(token);
+        token = "";
+        tokenStarted = false;
+      }
+      continue;
+    }
+    if (character === '"' || character === "'") {
+      quote = character;
+      tokenStarted = true;
+      continue;
+    }
+    token += character;
+    tokenStarted = true;
+  }
+
+  if (quote !== null) return [];
+  if (tokenStarted) tokens.push(token);
+  return tokens;
 }
 
 function commandBasename(value = "") {

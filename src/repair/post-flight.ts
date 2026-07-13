@@ -16,8 +16,10 @@ import {
   ghBestEffortWithRetry as ghBestEffort,
   ghErrorText,
   ghJsonWithRetry as ghJson,
+  ghText as ghTextOneShot,
   ghTextWithRetry as ghWithRetry,
 } from "./github-cli.js";
+import { ghRetryKind } from "../github-retry.js";
 import { issueNumberFromRef, parsePullRequestUrl } from "./github-ref.js";
 import { sleepMs } from "./timing.js";
 import {
@@ -60,6 +62,10 @@ const POST_MERGE_CLOSE_ACTIONS = new Set([
 const DEFAULT_IGNORED_CHECKS = ["auto-response", "Labeler", "Stale"];
 const POST_FLIGHT_WAIT_MS = numberEnv("CLAWSWEEPER_POST_FLIGHT_WAIT_MS", 10 * 60 * 1000);
 const POST_FLIGHT_POLL_MS = numberEnv("CLAWSWEEPER_POST_FLIGHT_POLL_MS", 15 * 1000);
+const POST_FLIGHT_MERGE_TIMEOUT_MS = Math.max(
+  1,
+  numberEnv("CLAWSWEEPER_POST_FLIGHT_MERGE_TIMEOUT_MS", 2 * 60 * 1000),
+);
 
 const args = parseArgs(process.argv.slice(2));
 const jobPath = args._[0];
@@ -340,10 +346,21 @@ function finalizeFixPr(action: LooseRecord) {
   if (mutationBlock) return { ...prBase, status: "blocked", reason: mutationBlock };
   try {
     const mergeAttempt = runVerifiedPostFlightPullMutation(parsed.number, () => {
+      const finalPull = fetchPullRequest(result.repo, parsed.number);
       const finalView = fetchPullRequestView(result.repo, parsed.number);
+      const finalReadinessBlock =
+        validateMergePolicy(action, finalPull) ||
+        validateMergeableFixPr({
+          pull: finalPull,
+          view: finalView,
+          preflight: action.merge_preflight,
+          expectedHeadSha: action.commit,
+          validationProofPlan: fixReport.validation_proof_plan,
+        });
+      if (finalReadinessBlock) return { policyBlock: finalReadinessBlock };
       const finalStrictBaseBindingBlock = runtimeStrictBaseBindingBlock({
         repo: result.repo,
-        baseBranch: String(finalView.baseRefName ?? ""),
+        baseBranch: String(finalView.baseRefName ?? finalPull.base?.ref ?? ""),
         policyReadJson: rulesetPolicyReader(),
       });
       if (finalStrictBaseBindingBlock) return { policyBlock: finalStrictBaseBindingBlock };
@@ -352,7 +369,7 @@ function finalizeFixPr(action: LooseRecord) {
         automergeReplacement,
       );
       if (immediateMutationBlock) return { policyBlock: immediateMutationBlock };
-      ghWithRetry(mergeArgs);
+      ghTextOneShot(mergeArgs, { timeoutMs: POST_FLIGHT_MERGE_TIMEOUT_MS });
       return { policyBlock: "" };
     });
     if (mergeAttempt.policyBlock) {
@@ -366,6 +383,16 @@ function finalizeFixPr(action: LooseRecord) {
     }
   } catch (error) {
     const detail = ghErrorText(error);
+    if (ghRetryKind(error) !== "none") {
+      return {
+        ...prBase,
+        status: "blocked",
+        reason: `merge attempt outcome is indeterminate; refusing automatic retry: ${compactText(detail, 500)}`,
+        merge_method: "squash",
+        merge_attempt_indeterminate: true,
+        waited_ms: waitedMs,
+      };
+    }
     if (isRecoverableMergeRace(detail)) {
       const latestView = fetchPullRequestView(result.repo, parsed.number);
       return {

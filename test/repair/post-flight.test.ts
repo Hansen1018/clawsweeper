@@ -574,17 +574,38 @@ test("post-flight rechecks live security immediately before privileged mutations
   );
   assert.match(
     finalizeFixPr,
-    /freshPostFlightMergeMutationBlock\([\s\S]*runVerifiedPostFlightPullMutation\(parsed\.number, \(\) => \{[\s\S]*runtimeStrictBaseBindingBlock\(\{[\s\S]*freshPostFlightMergeMutationBlock\([\s\S]*ghWithRetry\(mergeArgs\)/,
+    /freshPostFlightMergeMutationBlock\([\s\S]*runVerifiedPostFlightPullMutation\(parsed\.number, \(\) => \{[\s\S]*validateMergePolicy\([\s\S]*validateMergeableFixPr\(\{[\s\S]*runtimeStrictBaseBindingBlock\(\{[\s\S]*freshPostFlightMergeMutationBlock\([\s\S]*ghTextOneShot\(mergeArgs/,
   );
   const mergeMutation = finalizeFixPr.slice(
     finalizeFixPr.indexOf("runVerifiedPostFlightPullMutation(parsed.number, () => {"),
   );
-  const finalView = mergeMutation.indexOf("fetchPullRequestView(result.repo, parsed.number)");
-  const strictBase = mergeMutation.indexOf("runtimeStrictBaseBindingBlock(", finalView);
+  const finalPull = mergeMutation.indexOf("fetchPullRequest(result.repo, parsed.number)");
+  const finalView = mergeMutation.indexOf(
+    "fetchPullRequestView(result.repo, parsed.number)",
+    finalPull,
+  );
+  const finalPolicy = mergeMutation.indexOf("validateMergePolicy(action, finalPull)", finalView);
+  const finalReadiness = mergeMutation.indexOf("validateMergeableFixPr({", finalPolicy);
+  const strictBase = mergeMutation.indexOf("runtimeStrictBaseBindingBlock(", finalReadiness);
   const finalSafety = mergeMutation.indexOf("freshPostFlightMergeMutationBlock(", strictBase);
-  const merge = mergeMutation.indexOf("ghWithRetry(mergeArgs)", finalSafety);
+  const merge = mergeMutation.indexOf("ghTextOneShot(mergeArgs", finalSafety);
   assert.ok(
-    finalView >= 0 && strictBase > finalView && finalSafety > strictBase && merge > finalSafety,
+    finalPull >= 0 &&
+      finalView > finalPull &&
+      finalPolicy > finalView &&
+      finalReadiness > finalPolicy &&
+      strictBase > finalReadiness &&
+      finalSafety > strictBase &&
+      merge > finalSafety,
+  );
+  assert.doesNotMatch(mergeMutation.slice(0, merge + 100), /ghWithRetry\(mergeArgs\)/);
+  assert.match(
+    mergeMutation,
+    /ghTextOneShot\(mergeArgs, \{ timeoutMs: POST_FLIGHT_MERGE_TIMEOUT_MS \}\)/,
+  );
+  assert.match(
+    finalizeFixPr,
+    /ghRetryKind\(error\) !== "none"[\s\S]*merge attempt outcome is indeterminate; refusing automatic retry[\s\S]*merge_attempt_indeterminate: true/,
   );
   const finalSafetyHelper = source.slice(
     source.indexOf("function freshPostFlightMergeMutationBlock"),

@@ -14,6 +14,7 @@ export type GhRunOptions = {
   cwd?: string;
   env?: NodeJS.ProcessEnv;
   input?: string;
+  timeoutMs?: number;
 };
 
 export type GhRetryOptions = GhRunOptions & {
@@ -302,6 +303,7 @@ export function ghText(ghArgs: string[], options: GhRunOptions = {}): string {
     input: options.input,
     maxBuffer: 64 * 1024 * 1024,
     stdio: ["ignore", "pipe", "pipe"],
+    timeout: options.timeoutMs,
   });
   return stripAnsi(text).trim();
 }

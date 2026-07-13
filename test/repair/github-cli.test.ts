@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 
 import {
@@ -6,6 +9,7 @@ import {
   collectLimitedPagesAsync,
   collectTailLimitedPages,
   collectTailLimitedPagesAsync,
+  ghText,
   githubLimitedPagePath,
   githubPaginatedPath,
   parseIncludedJsonPage,
@@ -137,4 +141,34 @@ test("included REST responses expose their last page and JSON entries", () => {
       lastPage: 42,
     },
   );
+});
+
+test("one-shot GitHub commands honor their absolute subprocess timeout", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-gh-timeout-"));
+  const commandPath = path.join(root, "hang.cjs");
+  fs.writeFileSync(
+    commandPath,
+    "Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5000);\n",
+  );
+  const startedAt = Date.now();
+  try {
+    assert.throws(
+      () =>
+        ghText(["pr", "merge", "123"], {
+          env: {
+            ...process.env,
+            GH_BIN: process.execPath,
+            GH_BIN_ARGS: JSON.stringify([commandPath]),
+          },
+          timeoutMs: 100,
+        }),
+      (error: NodeJS.ErrnoException) => {
+        assert.equal(error.code, "ETIMEDOUT");
+        return true;
+      },
+    );
+    assert.ok(Date.now() - startedAt < 2_000);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });

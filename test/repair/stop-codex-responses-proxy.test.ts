@@ -4,8 +4,38 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { pathToFileURL } from "node:url";
+
+import { commandTokens } from "../../scripts/stop-codex-responses-proxy.mjs";
 
 const stopScript = path.resolve("scripts/stop-codex-responses-proxy.mjs");
+
+test("proxy command tokenizer preserves quoted executable paths and rejects malformed input", () => {
+  assert.deepEqual(
+    commandTokens('node "C:\\Program Files\\codex-responses-api-proxy\\cli.js" --port 1234'),
+    ["node", "C:\\Program Files\\codex-responses-api-proxy\\cli.js", "--port", "1234"],
+  );
+  assert.deepEqual(commandTokens("node '/tmp/proxy cli.js' --port 1234"), [
+    "node",
+    "/tmp/proxy cli.js",
+    "--port",
+    "1234",
+  ]);
+  assert.deepEqual(commandTokens(`"${String.raw`\!`.repeat(32)}`), []);
+});
+
+test("proxy command tokenizer handles adversarial quoted input in linear time", () => {
+  const source = [
+    `import { commandTokens } from ${JSON.stringify(pathToFileURL(stopScript).href)};`,
+    `const input = '"' + (String.fromCharCode(92) + "!").repeat(250_000);`,
+    "if (commandTokens(input).length !== 0) process.exit(2);",
+  ].join("\n");
+  const probe = spawnSync(process.execPath, ["--input-type=module", "--eval", source], {
+    encoding: "utf8",
+    timeout: 3_000,
+  });
+  assert.equal(probe.status, 0, probe.error?.message ?? probe.stderr);
+});
 
 test("proxy shutdown verifies the expected process and listener before removing metadata", () => {
   const fixture = proxyFixture({ closeOnShutdown: true });
