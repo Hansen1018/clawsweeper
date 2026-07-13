@@ -102,6 +102,10 @@ checkpoint, and status-only commits are intentionally omitted.
   addition, closeout-comment creation, and issue or pull-request close.
   Closeout comments are one-shot on transport uncertainty so reruns reconcile
   the marker instead of risking duplicate user-visible comments.
+- Wrapped apply-throttle status writes, commits, and pushes in the active
+  per-item mutation lifecycle. No-diff heartbeats remain explicit no-ops, while
+  ambiguous state-repository pushes remain unknown without masking the original
+  GitHub retry.
 - Required every mutable `repair:publish-main` call to declare a canonical
   publication receipt, with receipt-free operation limited to path sets wholly
   under immutable `ledger/`. Added workflow guards for setup, finalization,

@@ -2592,19 +2592,19 @@ function maybePublishThrottleHeartbeat(options: {
     if (process.env.CLAWSWEEPER_RUN_URL) {
       statusOptions.runUrl = process.env.CLAWSWEEPER_RUN_URL;
     }
-    writeSweepStatus(statusOptions);
-    run("git", ["add", sweepStatusRelativePath()]);
-    const diff = spawnSync("git", ["diff", "--cached", "--quiet"], { cwd: ROOT });
-    if (diff.status === 0) return;
-    run("git", ["commit", "-m", "chore: update sweep apply throttle status"]);
-    try {
-      run("git", ["push"], { timeoutMs: githubCommandTimeoutMs() });
-    } catch (error) {
-      if (error instanceof GitHubRuntimeBudgetError) throw error;
-      console.error(
-        `Best-effort throttle status push failed: ${error instanceof Error ? error.message : String(error)}`,
-      );
-    }
+    runObservedApplyMutation({
+      identity: `throttle_status_publish:${targetRepo()}:${sha256(detail)}`,
+      operation: () => {
+        writeSweepStatus(statusOptions);
+        run("git", ["add", sweepStatusRelativePath()]);
+        const diff = spawnSync("git", ["diff", "--cached", "--quiet"], { cwd: ROOT });
+        if (diff.status === 0) return false;
+        run("git", ["commit", "-m", "chore: update sweep apply throttle status"]);
+        run("git", ["push"], { timeoutMs: githubCommandTimeoutMs() });
+        return true;
+      },
+      didMutate: (pushed) => pushed,
+    });
   } catch (error) {
     if (error instanceof GitHubRuntimeBudgetError) throw error;
     console.error(

@@ -591,6 +591,19 @@ test("apply mutation receipts bind every GitHub request attempt and preserve no-
   assert.deepEqual(applyPhaseSequenceForTest(6), [2, 3, 4, 5, 6, 7]);
 });
 
+test("apply throttle status publication is a causal mutation receipt", () => {
+  const source = readText("src/clawsweeper.ts");
+  const start = source.indexOf("function maybePublishThrottleHeartbeat");
+  const end = source.indexOf("type GitHubRetryOptions", start);
+  const heartbeat = source.slice(start, end);
+
+  assert.match(heartbeat, /runObservedApplyMutation\(\{/);
+  assert.match(heartbeat, /identity: `throttle_status_publish:/);
+  assert.match(heartbeat, /run\("git", \["push"\]/);
+  assert.match(heartbeat, /didMutate: \(pushed\) => pushed/);
+  assert.doesNotMatch(heartbeat, /Best-effort throttle status push failed/);
+});
+
 test("runtime yields bind the active item and terminal Codex failures preserve retryability", () => {
   assert.deepEqual(
     applyRuntimeBudgetYieldResultsForTest(512, "max runtime reached during coverage proof"),
@@ -756,7 +769,7 @@ test("sweep publishes complete immutable shards for every review and apply produ
     "Import immutable review action events",
     "Publish immutable review action ledger",
     "Publish review artifact action ledger",
-    "Publish selected review comment action ledger",
+    "Publish sweep caller action ledger",
     "Publish failed-review retry action ledger",
     "Publish immutable planning state action ledger",
     "Publish immutable sweep audit state action ledger",
@@ -778,7 +791,7 @@ test("sweep publishes complete immutable shards for every review and apply produ
   assert.match(workflow, /include-hidden-files: true/);
   assert.match(workflow, /--state-root "\$CLAWSWEEPER_STATE_DIR"/);
   assert.match(workflow, /durable_event_path="\$CLAWSWEEPER_STATE_DIR\/\$event_path"/);
-  assert.equal((workflow.match(/publish-action-event-paths/g) ?? []).length, 11);
+  assert.equal((workflow.match(/publish-action-event-paths/g) ?? []).length, 13);
   assert.doesNotMatch(
     workflow,
     /--message "chore: append (?:review|apply).*action ledger"[\s\S]{0,180}--path "ledger\/v1\/events"/,
