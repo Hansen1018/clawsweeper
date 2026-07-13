@@ -124,6 +124,10 @@ test("repair worker jobs upload shards and one credentialed job publishes them",
   assert.match(execute, /Resolve planning action ledger context/);
   assert.match(execute, /Finalize execution repair action ledger/);
   assert.match(execute, /clawsweeper-repair-action-ledger-execute-/);
+  assert.match(
+    execute,
+    /checkpoint_recovered \}\}" = "1"[\s\S]*allow_empty_args\+=\(--allow-empty\)[\s\S]*--repair-lane execute/,
+  );
 
   assert.match(publisher, /name: Publish immutable repair action ledger/);
   assert.match(publisher, /needs:\s+- cluster\s+- execute\s+- mutate/);
@@ -144,6 +148,10 @@ test("repair worker jobs upload shards and one credentialed job publishes them",
   assert.match(publisher, /--repair-lane "\$lane"/);
   assert.match(publisher, /--expected-job "\$job"/);
   assert.match(publisher, /--expected-run-attempt "\$run_attempt"/);
+  assert.match(
+    publisher,
+    /EXECUTE_LEDGER_ALLOW_EMPTY:[\s\S]*allow_empty_args\+=\(--allow-empty\)[\s\S]*verify_lane execute execute "\$EXECUTE_LEDGER_ATTEMPT" "\$EXECUTE_LEDGER_ALLOW_EMPTY"[\s\S]*publish_lane execute execute "\$EXECUTE_LEDGER_ATTEMPT" "\$EXECUTE_LEDGER_ALLOW_EMPTY"/,
+  );
   assert.match(publisher, /publish_lane cluster cluster/);
   assert.match(publisher, /publish_lane execute execute/);
   assert.match(publisher, /publish_lane mutate mutate/);
@@ -295,8 +303,16 @@ test("issue implementation intake finalizes and publishes source-bound status re
   );
   assert.match(workflow, /Finalize issue implementation intake action ledger/);
   assert.match(workflow, /repair:action-ledger -- finalize/);
+  assert.match(
+    workflow,
+    /steps\.prepare\.outcome \}\}" = "success"[\s\S]*steps\.prepare\.outputs\.should_repair \}\}" != "true"[\s\S]*allow_empty_args\+=\(--allow-empty\)[\s\S]*--repair-lane issue-implementation-intake/,
+  );
   assert.match(workflow, /Publish immutable issue implementation intake action ledger/);
   assert.match(workflow, /repair:action-ledger -- publish/);
+  assert.match(
+    workflow,
+    /steps\.prepare\.outputs\.should_repair \}\}" != "true"[\s\S]*exit 0[\s\S]*Issue implementation intake action event shards existed but no paths were imported/,
+  );
   assert.match(workflow, /jq -r '\.paths\[\]\?'/);
   assert.match(workflow, /append issue implementation intake action ledger/);
   assert.ok(

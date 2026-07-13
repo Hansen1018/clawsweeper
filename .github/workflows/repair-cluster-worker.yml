@@ -745,6 +745,7 @@ jobs:
       action_ledger_artifact_id: ${{ steps.upload_action_ledger.outputs.artifact-id }}
       action_ledger_artifact_digest: ${{ steps.upload_action_ledger.outputs.artifact-digest }}
       action_ledger_producer_attempt: ${{ steps.producer_attempt.outputs.value }}
+      action_ledger_allow_empty: ${{ needs.authorize.outputs.checkpoint_recovered == '1' && 'true' || 'false' }}
     env:
       CLAWSWEEPER_ALLOWED_OWNER: ${{ needs.authorize.outputs.target_owner }}
       CLAWSWEEPER_ALLOW_EXECUTE: ${{ needs.cluster.outputs.allow_execute == '1' && '1' || '0' }}
@@ -987,8 +988,13 @@ jobs:
         run: |
           set -euo pipefail
           output_root="${CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:?setup-action-ledger output root is required}"
+          allow_empty_args=()
+          if [ "${{ needs.authorize.outputs.checkpoint_recovered }}" = "1" ]; then
+            allow_empty_args+=(--allow-empty)
+          fi
           pnpm run --silent repair:action-ledger -- finalize \
             --repair-lane execute \
+            "${allow_empty_args[@]}" \
             > "$output_root/repair-action-ledger-manifest.json"
 
       - name: Upload execution repair action ledger
@@ -1950,6 +1956,7 @@ jobs:
           CLUSTER_LEDGER_ATTEMPT: ${{ needs.cluster.outputs.producer_attempt }}
           EXECUTE_LEDGER_ARTIFACT_ID: ${{ needs.execute.outputs.action_ledger_artifact_id }}
           EXECUTE_LEDGER_ATTEMPT: ${{ needs.execute.outputs.action_ledger_producer_attempt }}
+          EXECUTE_LEDGER_ALLOW_EMPTY: ${{ needs.execute.outputs.action_ledger_allow_empty }}
           EXECUTE_JOB_RESULT: ${{ needs.execute.result }}
           MUTATE_LEDGER_ARTIFACT_ID: ${{ needs.mutate.outputs.action_ledger_artifact_id }}
           MUTATE_LEDGER_ATTEMPT: ${{ needs.mutate.outputs.action_ledger_producer_attempt }}
@@ -1967,12 +1974,18 @@ jobs:
             local source_root=".clawsweeper-repair/action-ledger-download/$lane"
             local manifest_file="$source_root/repair-action-ledger-manifest.json"
             local import_result_file=".artifacts/$lane-action-ledger-import.json"
+            local allow_empty="${4:-false}"
+            local allow_empty_args=()
+            if [ "$allow_empty" = "true" ]; then
+              allow_empty_args+=(--allow-empty)
+            fi
             test -s "$manifest_file"
             pnpm run --silent repair:action-ledger -- publish \
               --repair-lane "$lane" \
               --manifest "$manifest_file" \
               --expected-job "$job" \
               --expected-run-attempt "$run_attempt" \
+              "${allow_empty_args[@]}" \
               --source-root "$source_root" \
               --state-root "$CLAWSWEEPER_STATE_DIR" > "$import_result_file"
             jq -e --slurpfile manifest "$manifest_file" \
@@ -2004,12 +2017,18 @@ jobs:
             local run_attempt="$3"
             local source_root=".clawsweeper-repair/action-ledger-download/$lane"
             local manifest_file="$source_root/repair-action-ledger-manifest.json"
+            local allow_empty="${4:-false}"
+            local allow_empty_args=()
+            if [ "$allow_empty" = "true" ]; then
+              allow_empty_args+=(--allow-empty)
+            fi
             test -s "$manifest_file"
             pnpm run --silent repair:action-ledger -- verify \
               --repair-lane "$lane" \
               --manifest "$manifest_file" \
               --expected-job "$job" \
               --expected-run-attempt "$run_attempt" \
+              "${allow_empty_args[@]}" \
               --source-root "$source_root" >/dev/null
           }
           require_lane cluster "${{ needs.cluster.result }}" "$CLUSTER_LEDGER_ARTIFACT_ID" "$CLUSTER_LEDGER_ATTEMPT"
@@ -2017,14 +2036,14 @@ jobs:
           require_lane mutate "$MUTATE_JOB_RESULT" "$MUTATE_LEDGER_ARTIFACT_ID" "$MUTATE_LEDGER_ATTEMPT"
           verify_lane cluster cluster "$CLUSTER_LEDGER_ATTEMPT"
           if [ "$EXECUTE_JOB_RESULT" != "skipped" ]; then
-            verify_lane execute execute "$EXECUTE_LEDGER_ATTEMPT"
+            verify_lane execute execute "$EXECUTE_LEDGER_ATTEMPT" "$EXECUTE_LEDGER_ALLOW_EMPTY"
           fi
           if [ "$MUTATE_JOB_RESULT" != "skipped" ]; then
             verify_lane mutate mutate "$MUTATE_LEDGER_ATTEMPT"
           fi
           publish_lane cluster cluster "$CLUSTER_LEDGER_ATTEMPT"
           if [ "$EXECUTE_JOB_RESULT" != "skipped" ]; then
-            publish_lane execute execute "$EXECUTE_LEDGER_ATTEMPT"
+            publish_lane execute execute "$EXECUTE_LEDGER_ATTEMPT" "$EXECUTE_LEDGER_ALLOW_EMPTY"
           fi
           if [ "$MUTATE_JOB_RESULT" != "skipped" ]; then
             publish_lane mutate mutate "$MUTATE_LEDGER_ATTEMPT"

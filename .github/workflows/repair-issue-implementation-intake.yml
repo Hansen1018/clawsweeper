@@ -237,8 +237,14 @@ jobs:
           set -euo pipefail
           : "${CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:?setup-action-ledger output root is required}"
           mkdir -p .artifacts
+          allow_empty_args=()
+          if [ "${{ steps.prepare.outcome }}" = "success" ] &&
+             [ "${{ steps.prepare.outputs.should_repair }}" != "true" ]; then
+            allow_empty_args+=(--allow-empty)
+          fi
           pnpm run --silent repair:action-ledger -- finalize \
             --repair-lane issue-implementation-intake \
+            "${allow_empty_args[@]}" \
             > .artifacts/issue-implementation-intake-action-ledger-manifest.json
 
       - name: Publish immutable issue implementation intake action ledger
@@ -252,9 +258,15 @@ jobs:
           import_result_file=".artifacts/issue-implementation-intake-action-ledger-import.json"
           mkdir -p .artifacts
           test -s "$manifest_file"
+          allow_empty_args=()
+          if [ "${{ steps.prepare.outcome }}" = "success" ] &&
+             [ "${{ steps.prepare.outputs.should_repair }}" != "true" ]; then
+            allow_empty_args+=(--allow-empty)
+          fi
           pnpm run --silent repair:action-ledger -- publish \
             --repair-lane issue-implementation-intake \
             --manifest "$manifest_file" \
+            "${allow_empty_args[@]}" \
             --source-root "$source_root" \
             --state-root "$CLAWSWEEPER_STATE_DIR" > "$import_result_file"
           jq -e --slurpfile manifest "$manifest_file" \
@@ -262,6 +274,10 @@ jobs:
             "$import_result_file" >/dev/null
           jq -r '.paths[]?' "$import_result_file" | sort -u > "$event_paths_file"
           if [ ! -s "$event_paths_file" ]; then
+            if [ "${{ steps.prepare.outcome }}" = "success" ] &&
+               [ "${{ steps.prepare.outputs.should_repair }}" != "true" ]; then
+              exit 0
+            fi
             echo "Issue implementation intake action event shards existed but no paths were imported." >&2
             exit 1
           fi
