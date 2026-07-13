@@ -20,7 +20,8 @@ export function createReviewedPrActivityCursor(options: {
 }
 
 export function isReviewedPrActivityCursor(value: unknown): value is string {
-  const match = String(value ?? "").match(CURSOR_PATTERN);
+  if (typeof value !== "string") return false;
+  const match = value.match(CURSOR_PATTERN);
   if (!match) return false;
   const count = Number(match[1]);
   return Number.isSafeInteger(count) && count >= 0 && count <= MAX_REVIEWED_PR_ACTIVITY;
