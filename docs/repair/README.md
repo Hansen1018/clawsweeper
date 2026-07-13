@@ -296,16 +296,24 @@ pnpm run repair:import-gitcrawl -- --from-gitcrawl --limit 40 --mode autonomous 
 # keep the normal 40%-of-workers.max cap, currently 51; imported gitcrawl
 # cluster jobs default to lanes.repair.cluster_max_live_runs, currently 2.
 # Use CLAWSWEEPER_MAX_LIVE_WORKERS/--max-live-workers for a one-lane override.
-# With --wait-for-capacity, dispatch can drain a larger file
-# list in capacity-sized waves instead of refusing the whole batch.
-CLAWSWEEPER_MAX_LIVE_WORKERS=51 pnpm run repair:dispatch -- jobs/openclaw/inbox/ordinary-example.md \
+# With --wait-for-capacity, dispatch waits for a slot for one immutable job.
+state_revision="$(git -C "$CLAWSWEEPER_STATE_DIR" rev-parse HEAD)"
+job=jobs/openclaw/inbox/ordinary-example.md
+job_sha256="$(git -C "$CLAWSWEEPER_STATE_DIR" show "${state_revision}:${job}" | sha256sum | cut -d' ' -f1)"
+CLAWSWEEPER_MAX_LIVE_WORKERS=51 pnpm run repair:dispatch -- "$job" \
   --mode autonomous \
+  --state-revision "$state_revision" \
+  --job-sha256 "$job_sha256" \
   --runner blacksmith-4vcpu-ubuntu-2404 \
   --execution-runner blacksmith-16vcpu-ubuntu-2404
 
 # Imported gitcrawl cluster jobs drip-feed by default.
-CLAWSWEEPER_MAX_LIVE_WORKERS=2 pnpm run repair:dispatch -- jobs/openclaw/inbox/cluster-example.md \
+job=jobs/openclaw/inbox/cluster-example.md
+job_sha256="$(git -C "$CLAWSWEEPER_STATE_DIR" show "${state_revision}:${job}" | sha256sum | cut -d' ' -f1)"
+CLAWSWEEPER_MAX_LIVE_WORKERS=2 pnpm run repair:dispatch -- "$job" \
   --mode autonomous \
+  --state-revision "$state_revision" \
+  --job-sha256 "$job_sha256" \
   --runner blacksmith-4vcpu-ubuntu-2404 \
   --execution-runner blacksmith-16vcpu-ubuntu-2404
 

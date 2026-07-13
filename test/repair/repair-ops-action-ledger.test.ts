@@ -520,6 +520,10 @@ test("result and finalizer workflows publish their repair operation receipts", (
   assert.match(results, /CLAWSWEEPER_ACTION_LEDGER_INVOCATION=cluster-results/);
   assert.match(results, /CLAWSWEEPER_ACTION_LEDGER_INVOCATION=open-pr-finalizer/);
   assert.match(results, /CLAWSWEEPER_ACTION_LEDGER_INVOCATION=finalizer-results/);
+  assert.match(results, /Classify trusted worker artifact contract/);
+  assert.match(results, /git merge-base --is-ancestor "\$WORKER_HEAD_SHA"/);
+  assert.match(results, /-S'Seal immutable source job provenance'/);
+  assert.match(results, /--trusted-legacy-worker-head "\$TRUSTED_LEGACY_WORKER_HEAD"/);
   assert.match(finalizer, /append repair finalizer action ledger/);
   assert.match(finalizer, /--receipt-kind open_pr_finalizer_state/);
   const finalizerSource = readText("src/repair/finalize-open-prs.ts");

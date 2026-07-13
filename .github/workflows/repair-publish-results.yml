@@ -44,6 +44,39 @@ jobs:
           token: ${{ steps.app_token.outputs.token }}
           persist-credentials: false
 
+      - name: Classify trusted worker artifact contract
+        id: worker-contract
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          WORKER_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "trusted_legacy_worker_head=" >> "$GITHUB_OUTPUT"
+          if [[ ! "$WORKER_HEAD_SHA" =~ ^[a-f0-9]{40}$ ]]; then
+            echo "::notice title=Untrusted legacy worker::Worker head is not an exact commit."
+            exit 0
+          fi
+          git fetch --no-tags origin "refs/heads/${DEFAULT_BRANCH}:refs/remotes/origin/${DEFAULT_BRANCH}"
+          if ! git cat-file -e "${WORKER_HEAD_SHA}^{commit}" 2>/dev/null ||
+             ! git merge-base --is-ancestor "$WORKER_HEAD_SHA" "refs/remotes/origin/${DEFAULT_BRANCH}"; then
+            echo "::notice title=Untrusted legacy worker::Worker head is not on default-branch history."
+            exit 0
+          fi
+          mapfile -t contract_commits < <(
+            git log --reverse --format=%H \
+              -S'Seal immutable source job provenance' \
+              -- .github/workflows/repair-cluster-worker.yml
+          )
+          contract_commit="${contract_commits[0]:-}"
+          if [ -z "$contract_commit" ]; then
+            echo "::error::Cannot locate the immutable worker artifact contract."
+            exit 1
+          fi
+          if git merge-base --is-ancestor "$WORKER_HEAD_SHA" "${contract_commit}^"; then
+            echo "trusted_legacy_worker_head=$WORKER_HEAD_SHA" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Create state token
         id: state-token
         uses: ./.github/actions/create-state-token
@@ -159,17 +192,23 @@ jobs:
           RUN_URL: ${{ github.event.workflow_run.html_url }}
           HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
           CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          TRUSTED_LEGACY_WORKER_HEAD: ${{ steps.worker-contract.outputs.trusted_legacy_worker_head }}
         run: |
           set -euo pipefail
           git fetch origin main
           git checkout -B main origin/main
+          legacy_worker_args=()
+          if [ -n "$TRUSTED_LEGACY_WORKER_HEAD" ]; then
+            legacy_worker_args+=(--trusted-legacy-worker-head "$TRUSTED_LEGACY_WORKER_HEAD")
+          fi
           CLAWSWEEPER_ACTION_LEDGER_INVOCATION=cluster-results \
             pnpm run repair:publish-result -- artifacts \
             --skip-dashboard \
             --run-id "$RUN_ID" \
             --run-url "$RUN_URL" \
             --head-sha "$HEAD_SHA" \
-            --conclusion "$CONCLUSION"
+            --conclusion "$CONCLUSION" \
+            "${legacy_worker_args[@]}"
           CLAWSWEEPER_ACTION_LEDGER_INVOCATION=open-pr-finalizer \
             pnpm run repair:finalize-open-prs -- --write-report
           CLAWSWEEPER_ACTION_LEDGER_INVOCATION=finalizer-results \

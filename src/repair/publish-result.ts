@@ -58,12 +58,19 @@ const CLOSE_APPLICATOR_ACTIONS = new Set([
 const MERGE_APPLICATOR_ACTIONS = new Set(["merge_candidate", "merge_canonical"]);
 const APPLICATOR_ACTIONS = new Set([...CLOSE_APPLICATOR_ACTIONS, ...MERGE_APPLICATOR_ACTIONS]);
 const POST_FLIGHT_APPLY_ACTIONS = new Set(["finalize_fix_pr", "post_merge_closeout"]);
+const SOURCE_JOB_PATH = /^jobs\/[A-Za-z0-9_.-]+\/(?:[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_.-]+\.md$/;
 const root = repoRoot();
 const archivedClusters = readArchivedClusters(root);
 
 const args = parseArgs(process.argv.slice(2));
 const inputs = args._.length > 0 ? args._ : [path.join(root, ".clawsweeper-repair", "runs")];
 const metadataByRunId = readRunMetadata(args["runs-json"]);
+const trustedLegacyWorkerHeadArg = args["trusted-legacy-worker-head"];
+const trustedLegacyWorkerHead =
+  trustedLegacyWorkerHeadArg === undefined ? null : exactHex(trustedLegacyWorkerHeadArg, 40);
+if (trustedLegacyWorkerHeadArg !== undefined && !trustedLegacyWorkerHead) {
+  throw new Error("--trusted-legacy-worker-head must be an exact lowercase 40-hex commit");
+}
 const published: LooseRecord[] = [];
 
 if (path.resolve(process.argv[1] ?? "") === fileURLToPath(import.meta.url)) {
@@ -121,7 +128,13 @@ function publishResult(resultPath: string) {
   const postFlightReport = readSiblingJson(runDir, "post-flight-report.json") ?? { actions: [] };
   const fixReport = readSiblingJson(runDir, "fix-execution-report.json") ?? { actions: [] };
   const clusterPlan = readSiblingJson(runDir, "cluster-plan.json");
-  const sealedSource = readSealedPublishedSource(runDir, result, clusterPlan, resultPath);
+  const sealedSource = readSealedPublishedSource(
+    runDir,
+    result,
+    clusterPlan,
+    resultPath,
+    trustedLegacyWorkerHead,
+  );
   const sourceContext = sealedSource?.frontmatter ?? null;
   const reviewedTargetRevision = resultPublicationSourceRevision(
     result,
@@ -174,6 +187,8 @@ function publishResult(resultPath: string) {
     source_job: sealedSource?.sourceJob ?? null,
     source_state_revision: sealedSource?.stateRevision ?? null,
     source_job_sha256: sealedSource?.jobSha256 ?? null,
+    source_provenance: sealedSource?.provenance ?? null,
+    source_worker_revision: sealedSource?.workerHeadSha ?? null,
     published_at: new Date().toISOString(),
     canonical: result.canonical ?? null,
     canonical_issue: result.canonical_issue ?? null,
@@ -293,11 +308,14 @@ export function readSealedPublishedSource(
   result: LooseRecord,
   clusterPlan: LooseRecord | null,
   resultPath = "result.json",
+  trustedLegacyWorkerHead: string | null = null,
 ): {
   sourceJob: string;
-  stateRevision: string;
-  jobSha256: string;
-  frontmatter: LooseRecord;
+  stateRevision: string | null;
+  jobSha256: string | null;
+  frontmatter: LooseRecord | null;
+  provenance: "sealed_immutable_job" | "trusted_legacy_worker";
+  workerHeadSha: string | null;
 } | null {
   const plannedSourceJob = String(clusterPlan?.source_job ?? "").trim();
   const identityPath = path.join(runDir, "source-job.json");
@@ -306,6 +324,19 @@ export function readSealedPublishedSource(
   const hasJob = fs.existsSync(sourceJobPath);
   if (!hasIdentity && !hasJob && !plannedSourceJob) {
     return null;
+  }
+  if (!hasIdentity && !hasJob && trustedLegacyWorkerHead) {
+    if (!SOURCE_JOB_PATH.test(plannedSourceJob)) {
+      throw new Error(`trusted legacy source job path is invalid: ${resultPath}`);
+    }
+    return {
+      sourceJob: plannedSourceJob,
+      stateRevision: null,
+      jobSha256: null,
+      frontmatter: null,
+      provenance: "trusted_legacy_worker",
+      workerHeadSha: trustedLegacyWorkerHead,
+    };
   }
   if (!hasIdentity || !hasJob) {
     throw new Error(`repair result is missing sealed source job provenance: ${resultPath}`);
@@ -322,7 +353,7 @@ export function readSealedPublishedSource(
   const jobSha256 = exactHex(identity.job_sha256, 64);
   if (
     identity.schema_version !== 1 ||
-    !/^jobs\/[A-Za-z0-9_.-]+\/(?:[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_.-]+\.md$/.test(sourceJob) ||
+    !SOURCE_JOB_PATH.test(sourceJob) ||
     (plannedSourceJob && plannedSourceJob !== sourceJob) ||
     !stateRevision ||
     !jobSha256
@@ -345,7 +376,14 @@ export function readSealedPublishedSource(
   ) {
     throw new Error(`sealed source job does not match the repair result target: ${resultPath}`);
   }
-  return { sourceJob, stateRevision, jobSha256, frontmatter };
+  return {
+    sourceJob,
+    stateRevision,
+    jobSha256,
+    frontmatter,
+    provenance: "sealed_immutable_job",
+    workerHeadSha: null,
+  };
 }
 
 function exactHex(value: unknown, length: 40 | 64): string | null {

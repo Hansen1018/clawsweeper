@@ -226,6 +226,40 @@ test("result publication rejects mutable or redirected source provenance", () =>
   }
 });
 
+test("result publication accepts only explicitly trusted pre-contract worker provenance", () => {
+  const runDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-legacy-result-"));
+  const sourceJob = "jobs/openclaw/inbox/cluster-42.md";
+  const result = productionResult({});
+  const plan = {
+    repo: "openclaw/openclaw",
+    cluster_id: "repair-pr-42",
+    source_job: sourceJob,
+  };
+  const workerHead = "e".repeat(40);
+  try {
+    assert.throws(
+      () => readSealedPublishedSource(runDir, result, plan),
+      /missing sealed source job provenance/,
+    );
+    assert.deepEqual(readSealedPublishedSource(runDir, result, plan, "result.json", workerHead), {
+      sourceJob,
+      stateRevision: null,
+      jobSha256: null,
+      frontmatter: null,
+      provenance: "trusted_legacy_worker",
+      workerHeadSha: workerHead,
+    });
+
+    fs.writeFileSync(path.join(runDir, "source-job.md"), "partial legacy provenance\n");
+    assert.throws(
+      () => readSealedPublishedSource(runDir, result, plan, "result.json", workerHead),
+      /missing sealed source job provenance/,
+    );
+  } finally {
+    fs.rmSync(runDir, { recursive: true, force: true });
+  }
+});
+
 test("result publisher never reopens mutable live source jobs", () => {
   const publisher = readText("src/repair/publish-result.ts");
   const resolver = publisher.slice(
@@ -233,7 +267,10 @@ test("result publisher never reopens mutable live source jobs", () => {
     publisher.indexOf("function updateDashboard"),
   );
 
-  assert.match(publisher, /readSealedPublishedSource\(runDir, result, clusterPlan, resultPath\)/);
+  assert.match(
+    publisher,
+    /readSealedPublishedSource\([\s\S]*runDir,[\s\S]*result,[\s\S]*clusterPlan,[\s\S]*resultPath,[\s\S]*trustedLegacyWorkerHead/,
+  );
   assert.match(resolver, /path\.join\(runDir, "source-job\.md"\)/);
   assert.match(resolver, /path\.join\(runDir, "source-job\.json"\)/);
   assert.match(resolver, /createHash\("sha256"\)/);

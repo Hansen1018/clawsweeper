@@ -119,10 +119,14 @@ checkpoint, and status-only commits are intentionally omitted.
   requeues, failed-run recovery, open-PR finalization, and conflict self-heal.
   Workers verify the same immutable job again at execution authorization and
   seal its bytes into result artifacts, while active-run matching and dispatch
-  receipts distinguish later job generations. Commit-finding intake also
-  verifies canonical report paths, exact report bytes, and embedded source
-  identity. Deterministic no-op intake and paginated commit-review
-  continuations retain receipt ownership across workflow reruns.
+  receipts distinguish later job generations. Failed-run self-heal refuses
+  dispatch when active-generation discovery is unavailable. Pre-contract
+  workers that finish during rollout remain publishable only when their exact
+  worker commit is verified on default-branch history before the immutable
+  handoff contract, and those records carry explicit legacy provenance.
+  Commit-finding intake also verifies canonical report paths, exact report
+  bytes, and embedded source identity. Deterministic no-op intake and paginated
+  commit-review continuations retain receipt ownership across workflow reruns.
 - Kept valid blocked and generic repair results publishable without invented
   source revisions, rejected ledger-only result fallbacks, derived publication
   receipt provenance from the sealed source job instead of mutable live state,

@@ -257,8 +257,9 @@ function activeRepairJobGenerations() {
   try {
     return listActiveRepairJobGenerations({ repo, workflow });
   } catch (error) {
-    console.warn(`self-heal: cannot list active repair runs: ${ghErrorText(error)}`);
-    return new Map<string, string[]>();
+    throw new Error(
+      `self-heal: cannot verify active repair generations; refusing dispatch: ${ghErrorText(error)}`,
+    );
   }
 }
 

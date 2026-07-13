@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import test from "node:test";
 
 import {
@@ -86,4 +87,24 @@ test("self-heal matches active immutable generations by exact job digest", () =>
 
   assert.deepEqual(active.get(`${JOB}:${oldDigest}`), ["7"]);
   assert.equal(active.has(`${JOB}:${newDigest}`), false);
+});
+
+test("execute-mode self-heal fails closed when active generation discovery fails", () => {
+  assert.throws(
+    () =>
+      activeRepairJobGenerations({
+        fetchWorkflowRuns: () => {
+          throw new Error("GitHub unavailable");
+        },
+      }),
+    /GitHub unavailable/,
+  );
+
+  const source = fs.readFileSync("src/repair/self-heal-failed-runs.ts", "utf8");
+  const discovery = source.slice(
+    source.indexOf("function activeRepairJobGenerations()"),
+    source.indexOf("function dispatchCandidate"),
+  );
+  assert.match(discovery, /cannot verify active repair generations; refusing dispatch/);
+  assert.doesNotMatch(discovery, /return new Map/);
 });

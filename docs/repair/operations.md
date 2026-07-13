@@ -65,7 +65,14 @@ Security/privacy/supply-chain and broad findings are audit-only.
 4. Dispatch plan jobs:
 
    ```bash
-   pnpm run repair:dispatch -- jobs/openclaw/cluster-001.md jobs/openclaw/cluster-002.md --mode plan
+   state_revision="$(git -C "$CLAWSWEEPER_STATE_DIR" rev-parse HEAD)"
+   for job in jobs/openclaw/inbox/cluster-001.md jobs/openclaw/inbox/cluster-002.md; do
+     job_sha256="$(git -C "$CLAWSWEEPER_STATE_DIR" show "${state_revision}:${job}" | sha256sum | cut -d' ' -f1)"
+     pnpm run repair:dispatch -- "$job" \
+       --mode plan \
+       --state-revision "$state_revision" \
+       --job-sha256 "$job_sha256"
+   done
    ```
 
 5. Review artifacts from GitHub Actions.
@@ -105,8 +112,14 @@ fix unless a maintainer explicitly sets `allow_unmerged_fix_close: true`.
 Commit and push the new job file, then dispatch it:
 
 ```bash
-pnpm run repair:validate-job -- jobs/openclaw/inbox/clawsweeper-openclaw-openclaw-123.md
-pnpm run repair:dispatch -- jobs/openclaw/inbox/clawsweeper-openclaw-openclaw-123.md --mode autonomous
+job=jobs/openclaw/inbox/clawsweeper-openclaw-openclaw-123.md
+pnpm run repair:validate-job -- "$job"
+state_revision="$(git -C "$CLAWSWEEPER_STATE_DIR" rev-parse HEAD)"
+job_sha256="$(git -C "$CLAWSWEEPER_STATE_DIR" show "${state_revision}:${job}" | sha256sum | cut -d' ' -f1)"
+pnpm run repair:dispatch -- "$job" \
+  --mode autonomous \
+  --state-revision "$state_revision" \
+  --job-sha256 "$job_sha256"
 ```
 
 To ask for a replacement PR from an existing useful but uneditable source PR,
