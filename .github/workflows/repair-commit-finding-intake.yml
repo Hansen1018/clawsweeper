@@ -19,13 +19,28 @@ on:
         description: "Commit SHA with a ClawSweeper finding"
         required: true
         type: string
+      payload_version:
+        description: "Dispatch payload contract; new producers send 2"
+        required: false
+        default: ""
+        type: string
       report_repo:
         description: "Repository containing the ClawSweeper report"
         required: false
-        default: "openclaw/clawsweeper"
+        default: "openclaw/clawsweeper-state"
         type: string
       report_path:
         description: "Path to the ClawSweeper report"
+        required: false
+        default: ""
+        type: string
+      report_revision:
+        description: "Immutable commit SHA containing the ClawSweeper report"
+        required: false
+        default: ""
+        type: string
+      report_sha256:
+        description: "SHA-256 of the exact ClawSweeper report bytes"
         required: false
         default: ""
         type: string
@@ -123,24 +138,182 @@ jobs:
           token: ${{ steps.state-token.outputs.token }}
           fetch-depth: 1
 
+      - name: Resolve commit finding report handoff
+        id: report-handoff
+        env:
+          PAYLOAD_VERSION: ${{ github.event.inputs.payload_version || github.event.client_payload.payload_version || '' }}
+          TARGET_REPO: ${{ github.event.inputs.target_repo || github.event.client_payload.target_repo || 'openclaw/openclaw' }}
+          COMMIT_SHA: ${{ github.event.inputs.commit_sha || github.event.client_payload.commit_sha }}
+          REPORT_REPO: ${{ github.event.inputs.report_repo || github.event.client_payload.report_repo || 'openclaw/clawsweeper-state' }}
+          REPORT_PATH: ${{ github.event.inputs.report_path || github.event.client_payload.report_path }}
+          REPORT_REVISION: ${{ github.event.inputs.report_revision || github.event.client_payload.report_revision }}
+          REPORT_SHA256: ${{ github.event.inputs.report_sha256 || github.event.client_payload.report_sha256 }}
+          REPORT_URL: ${{ github.event.inputs.report_url || github.event.client_payload.report_url }}
+        run: |
+          set -euo pipefail
+          payload_version="${PAYLOAD_VERSION:-1}"
+          case "$payload_version" in
+            1|2) ;;
+            *)
+              echo "Unsupported commit finding payload version: $payload_version" >&2
+              exit 1
+              ;;
+          esac
+          if ! printf '%s' "$TARGET_REPO" | grep -Eq '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'; then
+            echo "Invalid commit finding target repository: $TARGET_REPO" >&2
+            exit 1
+          fi
+          target_repo="${TARGET_REPO,,}"
+          if ! printf '%s' "$COMMIT_SHA" | grep -Eq '^[a-f0-9]{40}$'; then
+            echo "Invalid commit finding commit SHA: $COMMIT_SHA" >&2
+            exit 1
+          fi
+          expected_report_path="records/${target_repo//\//-}/commits/${COMMIT_SHA}.md"
+          report_path="${REPORT_PATH:-$expected_report_path}"
+          if [ "$report_path" != "$expected_report_path" ]; then
+            echo "Commit finding report path must be $expected_report_path" >&2
+            exit 1
+          fi
+          if { [ -n "$REPORT_REVISION" ] && [ -z "$REPORT_SHA256" ]; } ||
+             { [ -z "$REPORT_REVISION" ] && [ -n "$REPORT_SHA256" ]; }; then
+            echo "report_revision and report_sha256 must be provided together." >&2
+            exit 1
+          fi
+          if [ "$payload_version" = "2" ] &&
+             { [ -z "$REPORT_REVISION" ] || [ -z "$REPORT_SHA256" ]; }; then
+            echo "commit finding payload version 2 requires report_revision and report_sha256." >&2
+            exit 1
+          fi
+
+          report_repo="$REPORT_REPO"
+          report_revision="$REPORT_REVISION"
+          report_sha256="$REPORT_SHA256"
+          report_url="$REPORT_URL"
+          processable=true
+          legacy_unsealed=false
+          if [ -n "$report_revision" ]; then
+            if [ "$report_repo" != "openclaw/clawsweeper-state" ]; then
+              echo "Immutable commit finding reports must use openclaw/clawsweeper-state." >&2
+              exit 1
+            fi
+            if ! printf '%s' "$report_revision" | grep -Eq '^[a-f0-9]{40}$'; then
+              echo "Invalid commit finding report revision: $report_revision" >&2
+              exit 1
+            fi
+            if ! printf '%s' "$report_sha256" | grep -Eq '^[a-f0-9]{64}$'; then
+              echo "Invalid commit finding report SHA-256: $report_sha256" >&2
+              exit 1
+            fi
+          else
+            legacy_unsealed=true
+            canonical_report="$CLAWSWEEPER_STATE_DIR/$report_path"
+            if [ -f "$canonical_report" ]; then
+              report_repo="openclaw/clawsweeper-state"
+              report_revision="$(git -C "$CLAWSWEEPER_STATE_DIR" rev-parse HEAD)"
+              report_sha256="$(sha256sum "$canonical_report" | cut -d' ' -f1)"
+              report_url=""
+              echo "::notice title=Legacy commit finding payload rebound::Pinned $report_path to state revision $report_revision."
+            else
+              processable=false
+              report_repo="openclaw/clawsweeper-state"
+              report_url=""
+              echo "::warning title=Legacy commit finding skipped::No canonical report exists at $report_path; recording a non-repair audit."
+            fi
+          fi
+          {
+            echo "payload_version=$payload_version"
+            echo "processable=$processable"
+            echo "legacy_unsealed=$legacy_unsealed"
+            echo "target_repo=$target_repo"
+            echo "report_repo=$report_repo"
+            echo "report_path=$report_path"
+            echo "report_revision=$report_revision"
+            echo "report_sha256=$report_sha256"
+            echo "report_url=$report_url"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Prepare commit finding intake
         id: prepare
         env:
           GH_TOKEN: ${{ steps.app_token.outputs.token }}
           ENABLED: ${{ github.event.inputs.enabled || github.event.client_payload.enabled || vars.CLAWSWEEPER_COMMIT_FINDING_INTAKE_ENABLED || 'true' }}
-          TARGET_REPO: ${{ github.event.inputs.target_repo || github.event.client_payload.target_repo || 'openclaw/openclaw' }}
+          TARGET_REPO: ${{ steps.report-handoff.outputs.target_repo }}
           COMMIT_SHA: ${{ github.event.inputs.commit_sha || github.event.client_payload.commit_sha }}
-          REPORT_REPO: ${{ github.event.inputs.report_repo || github.event.client_payload.report_repo || 'openclaw/clawsweeper' }}
-          REPORT_PATH: ${{ github.event.inputs.report_path || github.event.client_payload.report_path }}
-          REPORT_URL: ${{ github.event.inputs.report_url || github.event.client_payload.report_url }}
+          REPORT_PROCESSABLE: ${{ steps.report-handoff.outputs.processable }}
+          REPORT_REPO: ${{ steps.report-handoff.outputs.report_repo }}
+          REPORT_PATH: ${{ steps.report-handoff.outputs.report_path }}
+          REPORT_REVISION: ${{ steps.report-handoff.outputs.report_revision }}
+          REPORT_SHA256: ${{ steps.report-handoff.outputs.report_sha256 }}
+          REPORT_URL: ${{ steps.report-handoff.outputs.report_url }}
         run: |
           set -euo pipefail
+          if [ "$REPORT_PROCESSABLE" != "true" ]; then
+            node <<'NODE'
+          const fs = require("node:fs");
+          const path = require("node:path");
+          const targetRepo = process.env.TARGET_REPO;
+          const sha = process.env.COMMIT_SHA;
+          const auditPath = path.join(
+            "results",
+            "commit-findings",
+            targetRepo.replace("/", "-"),
+            `${sha}.md`,
+          );
+          const body = `---
+          repo: ${targetRepo}
+          sha: ${sha}
+          report_repo: ${process.env.REPORT_REPO}
+          report_path: ${process.env.REPORT_PATH}
+          report_revision: unavailable
+          report_sha256: unavailable
+          decision: legacy_report_unsealed
+          prepared_at: ${new Date().toISOString()}
+          ---
+
+          # Commit Finding ${sha.slice(0, 12)}
+
+          - Decision: \`legacy_report_unsealed\`
+          - Reason: delayed legacy dispatch had no immutable report identity and no canonical state report
+          - Job: none
+          - Run dir: none
+          `;
+          fs.mkdirSync(path.dirname(auditPath), { recursive: true });
+          fs.writeFileSync(
+            auditPath,
+            `${body
+              .split("\n")
+              .map((line) => line.replace(/^          /, ""))
+              .join("\n")
+              .trim()}\n`,
+          );
+          const outputs = {
+            status: "legacy_report_unsealed",
+            should_repair: "false",
+            reason:
+              "delayed legacy dispatch had no immutable report identity and no canonical state report",
+            audit_path: auditPath,
+            job_path: "",
+            run_dir: "",
+          };
+          fs.appendFileSync(
+            process.env.GITHUB_OUTPUT,
+            `${Object.entries(outputs)
+              .map(([key, value]) => `${key}=${value}`)
+              .join("\n")}\n`,
+          );
+          NODE
+            exit 0
+          fi
+          : "${REPORT_REVISION:?resolved report_revision is required}"
+          : "${REPORT_SHA256:?resolved report_sha256 is required}"
           args=(
             prepare
             --enabled "$ENABLED"
             --target-repo "$TARGET_REPO"
             --commit-sha "$COMMIT_SHA"
             --report-repo "$REPORT_REPO"
+            --report-revision "$REPORT_REVISION"
+            --report-sha256 "$REPORT_SHA256"
           )
           if [ -n "${REPORT_PATH:-}" ]; then
             args+=(--report-path "$REPORT_PATH")
@@ -191,7 +364,7 @@ jobs:
             --conclusion "${{ steps.execute.outcome == 'success' && 'success' || steps.execute.outcome == 'failure' && 'failure' || 'skipped' }}"
 
       - name: Finalize commit finding audit
-        if: always()
+        if: ${{ always() && steps.report-handoff.outputs.processable == 'true' }}
         run: |
           if [ -n "${{ steps.prepare.outputs.audit_path }}" ]; then
             pnpm run repair:commit-finding-intake -- finalize \
