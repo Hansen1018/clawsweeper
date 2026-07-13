@@ -2507,7 +2507,8 @@ test("commit review workflow settles and reviews from target main", () => {
 
   assert.doesNotMatch(workflow, /clawsweeper_commit_review/);
   assert.match(workflow, /workflow_dispatch:/);
-  assert.match(workflow, /gh workflow run commit-review\.yml/);
+  assert.match(workflow, /node dist\/commit-sweeper\.js dispatch-continuation/);
+  assert.doesNotMatch(workflow, /\n\s+gh workflow run commit-review\.yml/);
   assert.match(workflow, /CLAWSWEEPER_COMMIT_REVIEW_SETTLE_SECONDS \|\| '60'/);
   assert.match(workflow, /sleep "\$SETTLE_SECONDS"/);
   assert.match(workflow, /Check out target main/);
