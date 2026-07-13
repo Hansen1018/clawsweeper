@@ -708,21 +708,16 @@ test("commit review check publication completes before the workflow is finalized
 
 test("commit check publisher owns every privileged check write and installs attested causality", () => {
   const workflow = readText(".github/workflows/commit-review.yml");
-  const review = workflow.slice(workflow.indexOf("\n  review:"), workflow.indexOf("\n  attest:"));
-  const attestor = workflow.slice(
-    workflow.indexOf("\n  attest:"),
-    workflow.indexOf("\n  publish:"),
-  );
+  const review = workflow.slice(workflow.indexOf("\n  review:"), workflow.indexOf("\n  publish:"));
   const publisher = workflow.slice(workflow.indexOf("\n  publish:"));
 
-  assert.doesNotMatch(review, /setup-action-ledger|permission-checks: write|publish-check/);
-  assert.match(attestor, /attest-review/);
-  assert.match(attestor, /Resolve raw commit review artifact/);
-  assert.match(attestor, /--prefix "commit-review-raw-\$\{\{ matrix\.sha \}\}"/);
-  assert.match(attestor, /Upload attested commit review report/);
+  assert.match(review, /setup-action-ledger/);
+  assert.doesNotMatch(review, /permission-checks: write|publish-check|create-state-token/);
+  assert.match(publisher, /Attest current-attempt commit review reports/);
+  assert.match(publisher, /attest-review/);
   assert.match(publisher, /commit-review-action-ledger-causality\.json/);
   assert.match(publisher, /CLAWSWEEPER_COMMIT_ACTION_LEDGER_PRIOR_CONTEXT=/);
-  assert.match(publisher, /--expected-job attest/);
+  assert.match(publisher, /--expected-job review/);
   assert.doesNotMatch(
     publisher,
     /accepted-commit-review-check-shas|skipping duplicate write|completion_reason == "mutation_accepted"/,
