@@ -230,6 +230,21 @@ export function parseRepairRunTitle(
   return { jobPath, dispatchKey, jobSha256 };
 }
 
+export function activeRepairJobGenerations({
+  automergeRunNamePrefix = DEFAULT_AUTOMERGE_REPAIR_RUN_NAME_PREFIX,
+  ...workflowRunOptions
+}: LooseRecord = {}) {
+  const jobs = new Map<string, string[]>();
+  for (const run of listActiveWorkflowRuns(workflowRunOptions)) {
+    const parsed = parseRepairRunTitle(run.displayTitle, automergeRunNamePrefix);
+    if (!parsed?.jobSha256) continue;
+    const key = `${parsed.jobPath}:${parsed.jobSha256}`;
+    const runId = String(run.databaseId ?? "");
+    jobs.set(key, [...(jobs.get(key) ?? []), runId].filter(Boolean));
+  }
+  return jobs;
+}
+
 export function activeRepairWorkflowRunForJob({
   repo = currentProjectRepo(),
   workflow = REPAIR_CLUSTER_WORKFLOW,

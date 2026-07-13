@@ -20,6 +20,7 @@ import {
   immutableJobIdentityKey,
   resolveCurrentStateJobIdentity,
 } from "./immutable-job-handoff.js";
+import { activeRepairJobGenerations as listActiveRepairJobGenerations } from "./live-worker-capacity.js";
 
 const DEFAULT_REPO = currentProjectRepo();
 const DEFAULT_WORKFLOW = REPAIR_CLUSTER_WORKFLOW;
@@ -27,7 +28,6 @@ const DEFAULT_RUNNER = process.env.CLAWSWEEPER_WORKER_RUNNER ?? "blacksmith-4vcp
 const DEFAULT_EXECUTION_RUNNER =
   process.env.CLAWSWEEPER_EXECUTION_RUNNER ?? "blacksmith-16vcpu-ubuntu-2404";
 const QUEUED_STATUSES = new Set(["queued", "requested", "waiting", "pending"]);
-const ACTIVE_STATUSES = new Set([...QUEUED_STATUSES, "in_progress"]);
 
 const args = parseArgs(process.argv.slice(2));
 const repo = String(args.repo ?? DEFAULT_REPO);
@@ -254,24 +254,12 @@ function selectCandidates() {
 }
 
 function activeRepairJobGenerations() {
-  const jobs = new Map<string, string[]>();
-  let runs: LooseRecord[] = [];
   try {
-    runs = listClusterRuns();
+    return listActiveRepairJobGenerations({ repo, workflow });
   } catch (error) {
     console.warn(`self-heal: cannot list active repair runs: ${ghErrorText(error)}`);
-    return jobs;
+    return new Map<string, string[]>();
   }
-
-  for (const run of runs) {
-    if (!ACTIVE_STATUSES.has(String(run.status ?? ""))) continue;
-    const parsed = parseRepairRunTitle(run.displayTitle);
-    if (!parsed?.jobSha256) continue;
-    const runId = String(run.databaseId ?? "");
-    const key = activeJobGenerationKey(parsed.jobPath, parsed.jobSha256);
-    jobs.set(key, [...(jobs.get(key) ?? []), runId].filter(Boolean));
-  }
-  return jobs;
 }
 
 function dispatchCandidate(candidate: LooseRecord) {
