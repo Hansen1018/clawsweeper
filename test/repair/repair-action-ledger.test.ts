@@ -212,6 +212,77 @@ test("observed repair mutations resolve matching unknown outcomes", async () => 
   }
 });
 
+test("observed repair mutation retries resolve the latest unknown request attempt", async () => {
+  const root = fs.realpathSync(
+    fs.mkdtempSync(path.join(os.tmpdir(), "repair-observed-retry-ledger-")),
+  );
+  const outputRoot = path.join(root, "output");
+  fs.mkdirSync(outputRoot);
+  const previous = { ...process.env };
+  Object.assign(process.env, workflowEnv(root, outputRoot));
+  const lifecycle = repairLifecycle();
+  const identity = {
+    repo: "openclaw/openclaw",
+    number: 123,
+    headSha: "a".repeat(40),
+    method: "squash",
+  };
+
+  try {
+    for (const result of ["first", "retry"]) {
+      assert.equal(
+        runRepairMutation(lifecycle, {
+          kind: "post_flight_merge",
+          identity,
+          operation: () => result,
+          outcome: () => "unknown",
+        }),
+        result,
+      );
+      recordRepairMutationObservedSafely(lifecycle, {
+        kind: "post_flight_merge",
+        identity,
+      });
+    }
+    recordRepairLifecycleFailureSafely(lifecycle, {
+      component: "post_flight",
+      error: new Error("later reporting failed"),
+    });
+    await flushRepairActionEvents();
+
+    const events = readEvents(outputRoot);
+    const mutations = events.filter(
+      (event) => event.event_type === ACTION_EVENT_TYPES.repairMutation,
+    );
+    assert.deepEqual(
+      mutations.map((event) => event.attributes?.completion_reason),
+      [
+        "mutation_attempted",
+        "mutation_outcome_unknown",
+        "mutation_observed",
+        "mutation_attempted",
+        "mutation_outcome_unknown",
+        "mutation_observed",
+      ],
+    );
+    assert.equal(
+      new Set(
+        mutations
+          .filter((event) => event.attributes?.completion_reason === "mutation_observed")
+          .map((event) => event.event_id),
+      ).size,
+      2,
+    );
+    const failure = events.find((event) => event.event_type === ACTION_EVENT_TYPES.repairFailed);
+    assert.equal(failure?.attributes?.completion_reason, "mutation_observed");
+    assert.equal(failure?.action.mutation, true);
+    assert.equal(failure?.action.retryable, false);
+  } finally {
+    restoreEnv(previous);
+    fs.rmSync(root, { force: true, recursive: true });
+  }
+});
+
 test("accepted repair retries do not erase prior unknown outcomes", async () => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "repair-retry-ledger-")));
   const outputRoot = path.join(root, "output");

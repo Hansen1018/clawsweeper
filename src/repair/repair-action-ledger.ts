@@ -379,6 +379,8 @@ export function recordRepairMutationObservedSafely(
     const kind = machineText(options.kind, "github_mutation");
     const operation = machineText(options.operationName ?? "repair", "repair");
     const requestSha256 = stableDigest(options.identity);
+    const idempotencyIdentity = repairMutationIdempotencyIdentity(input, options);
+    const requestAttempt = latestRepairRequestAttempt(input, operation, idempotencyIdentity);
     recordRepairLifecycleEvent(input, {
       type: ACTION_EVENT_TYPES.repairMutation,
       status: ACTION_EVENT_STATUSES.executed,
@@ -387,8 +389,8 @@ export function recordRepairMutationObservedSafely(
       retryable: false,
       component: options.component ?? "repair_mutation",
       operation,
-      eventIdentity: { kind, requestSha256, outcome: "observed" },
-      idempotencyIdentity: repairMutationIdempotencyIdentity(input, options),
+      eventIdentity: { kind, requestSha256, requestAttempt, outcome: "observed" },
+      idempotencyIdentity,
       completionReason: "mutation_observed",
       state: "mutation_observed",
     });
@@ -809,16 +811,23 @@ function nextRepairRequestAttempt(
   idempotencyIdentity: unknown,
   context?: RepairActionLedgerContext,
 ): number {
+  return latestRepairRequestAttempt(input, operation, idempotencyIdentity, context) + 1;
+}
+
+function latestRepairRequestAttempt(
+  input: RepairLifecycleInput,
+  operation: string,
+  idempotencyIdentity: unknown,
+  context?: RepairActionLedgerContext,
+): number {
   const idempotencyKeySha256 = actionIdempotencyKey(idempotencyIdentity);
-  return (
-    repairAttemptEvents(input, operation, context).filter(
-      (event) =>
-        event.event_type === ACTION_EVENT_TYPES.repairMutation &&
-        event.action.status === ACTION_EVENT_STATUSES.started &&
-        event.attributes?.state === "mutation_attempted" &&
-        event.idempotency_key_sha256 === idempotencyKeySha256,
-    ).length + 1
-  );
+  return repairAttemptEvents(input, operation, context).filter(
+    (event) =>
+      event.event_type === ACTION_EVENT_TYPES.repairMutation &&
+      event.action.status === ACTION_EVENT_STATUSES.started &&
+      event.attributes?.state === "mutation_attempted" &&
+      event.idempotency_key_sha256 === idempotencyKeySha256,
+  ).length;
 }
 
 function repairMutationState(
