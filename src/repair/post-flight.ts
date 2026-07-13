@@ -36,6 +36,7 @@ import {
 import { isPassedStagedProofBundle } from "./staged-proof-gates.js";
 import { runtimeStrictBaseBindingBlock } from "./strict-base-binding.js";
 import {
+  automergeEffectDefinitelyAbsent,
   expectedSquashCommitMessage,
   squashAutomergeMethodBlock,
   squashMergedMethodBlock,
@@ -1046,10 +1047,7 @@ function claimPostFlightMergeRequest(
       dispatchedClaimEffectAbsent: () => {
         const pull = fetchPullRequest(request.repository, request.number);
         const view = fetchPullRequestView(request.repository, request.number);
-        const merged = confirmMergedPullSnapshot(pull, request.headSha);
-        return (
-          !merged.block && !merged.mergedAt && !exactHeadPendingMergeReason(view, request.headSha)
-        );
+        return automergeEffectDefinitelyAbsent({ pull, view }, request.headSha);
       },
     });
   } catch (error) {

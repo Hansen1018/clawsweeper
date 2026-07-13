@@ -21,6 +21,7 @@ import {
   digestJson,
   publicationReceipt,
 } from "../../dist/repair/prepared-publication.js";
+import { automergeEffectDefinitelyAbsent } from "../../dist/repair/automerge-effect.js";
 
 const repoRoot = process.cwd();
 const MERGE_HEAD_SHA = "a".repeat(40);
@@ -591,6 +592,63 @@ test("post-flight rechecks live security immediately before privileged mutations
   assert.notEqual(commentMutationIndex, -1);
   assert.ok(closeout.indexOf("beforeCommentSecurityBlock") < commentMutationIndex);
   assert.ok(closeout.indexOf("beforeCloseSecurityBlock") < closeout.indexOf('["pr", "close"'));
+});
+
+test("post-flight recovers dispatched merge claims only from exact absent effect snapshots", () => {
+  const source = fs.readFileSync("src/repair/post-flight.ts", "utf8");
+  const mergeClaim = source.slice(
+    source.indexOf("function claimPostFlightMergeRequest"),
+    source.indexOf("function inspectPostFlightMergeClaim"),
+  );
+  assert.match(
+    mergeClaim,
+    /dispatchedClaimEffectAbsent:[\s\S]*automergeEffectDefinitelyAbsent\(\{ pull, view \}, request\.headSha\)/,
+  );
+  const pullRequestViewStart = source.indexOf("function fetchPullRequestView");
+  const pullRequestView = source.slice(
+    pullRequestViewStart,
+    source.indexOf("function findLatestResultPath", pullRequestViewStart),
+  );
+  for (const field of [
+    '"autoMergeRequest"',
+    '"headRefOid"',
+    '"isInMergeQueue"',
+    '"mergedAt"',
+    '"state"',
+  ]) {
+    assert.match(pullRequestView, new RegExp(field));
+  }
+
+  const absent = {
+    pull: { head: { sha: MERGE_HEAD_SHA }, merged_at: null, auto_merge: null },
+    view: {
+      headRefOid: MERGE_HEAD_SHA,
+      mergedAt: null,
+      state: "OPEN",
+      isInMergeQueue: false,
+      autoMergeRequest: null,
+    },
+  };
+  assert.equal(automergeEffectDefinitelyAbsent(absent, MERGE_HEAD_SHA), true);
+
+  for (const observed of [
+    { ...absent, view: { state: "OPEN" } },
+    { ...absent, view: { ...absent.view, headRefOid: "b".repeat(40) } },
+    { ...absent, pull: { ...absent.pull, merged_at: "2026-07-13T08:00:00Z" } },
+    { ...absent, view: { ...absent.view, mergedAt: "2026-07-13T08:00:00Z" } },
+    { ...absent, view: { ...absent.view, state: "MERGED" } },
+    {
+      ...absent,
+      view: {
+        ...absent.view,
+        isInMergeQueue: true,
+        autoMergeRequest: { mergeMethod: "SQUASH" },
+      },
+    },
+    { ...absent, pull: { ...absent.pull, auto_merge: { merge_method: "squash" } } },
+  ]) {
+    assert.equal(automergeEffectDefinitelyAbsent(observed, MERGE_HEAD_SHA), false);
+  }
 });
 
 test("post-flight reconciles one exact-head merge effect across retries and queue state", () => {
