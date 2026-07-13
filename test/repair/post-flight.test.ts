@@ -539,7 +539,11 @@ test("post-flight rechecks live security immediately before privileged mutations
   );
   assert.match(
     finalizeFixPr,
-    /mergeAttempt\.policyBlock[\s\S]*reconcileMergeState\(parsed\.number, action\.commit\)[\s\S]*!confirmation\.mergedAt[\s\S]*retry_recommended: true/,
+    /kind: "post_flight_merge"[\s\S]*ghText\(mergeArgs\)[\s\S]*reconcileMergeState\(parsed\.number, action\.commit\)[\s\S]*outcome:[\s\S]*confirmation\.mergedAt[\s\S]*"accepted"[\s\S]*"unknown"/,
+  );
+  assert.match(
+    finalizeFixPr,
+    /mergeAttempt\.policyBlock[\s\S]*const confirmation = mergeAttempt\.confirmation[\s\S]*!confirmation\.mergedAt[\s\S]*retry_recommended: true/,
   );
   assert.match(
     source,
@@ -587,11 +591,25 @@ test("post-flight reconciles ambiguous merges and retries only after fresh safet
       CLAWSWEEPER_RULESET_GH_TOKEN: "ruleset-verifier",
       CLAWSWEEPER_POST_FLIGHT_MERGE_ATTEMPTS: "3",
       CLAWSWEEPER_POST_FLIGHT_MERGE_RETRY_MAX_WAIT_MS: "0",
+      CLAWSWEEPER_ACTION_LEDGER_FORCE: "1",
+      CLAWSWEEPER_ACTION_LEDGER_ROOT: fixture.ledgerRoot,
+      CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT: fixture.ledgerOutputRoot,
+      CLAWSWEEPER_ACTION_LEDGER_PARTITION_DATE: "2026-07-13",
+      CLAWSWEEPER_ACTION_LEDGER_INVOCATION: "post-flight-verified",
       FAKE_GH_PULL_FILE: fixture.pullPath,
       FAKE_GH_MERGED_FILE: fixture.mergedPath,
       FAKE_GH_MERGE_COUNT_FILE: fixture.mergeCountPath,
       FAKE_GH_COMMENTS_COUNT_FILE: fixture.commentsCountPath,
       FAKE_GH_FAILURE_COMMENTS_FILE: fixture.failureCommentsPath,
+      GITHUB_ACTION: "post_flight",
+      GITHUB_JOB: "mutate",
+      GITHUB_REPOSITORY: "openclaw/clawsweeper",
+      GITHUB_RUN_ATTEMPT: "1",
+      GITHUB_RUN_ID: "521123",
+      GITHUB_SHA: "f".repeat(40),
+      GITHUB_WORKFLOW: "repair cluster worker",
+      GITHUB_WORKFLOW_REF:
+        "openclaw/clawsweeper/.github/workflows/repair-cluster-worker.yml@refs/heads/main",
       ...mockGhBinEnv(fixture.ghPath, fixture.fakeBin),
     };
 
@@ -601,6 +619,10 @@ test("post-flight reconciles ambiguous merges and retries only after fresh safet
     assert.equal(report.actions[0]?.reason, "merge confirmed after ambiguous response");
     assert.equal(report.actions[0]?.merge_attempts, 1);
     assert.equal(fs.readFileSync(fixture.mergeCountPath, "utf8"), "1");
+    assert.deepEqual(mutationReceiptStates(finalizeVerifiedActionLedger(fixture, commonEnv)), [
+      ["started", "mutation_attempted"],
+      ["executed", "mutation_accepted"],
+    ]);
 
     fixture.reset();
     runVerifiedPostFlight(fixture, { ...commonEnv, FAKE_GH_MERGE_MODE: "transient" }, 0);
@@ -643,6 +665,10 @@ test("post-flight reconciles ambiguous merges and retries only after fresh safet
     assert.equal(report.actions[0]?.merge_attempts, 1);
     assert.equal(fs.readFileSync(fixture.mergeCountPath, "utf8"), "1");
     assert.equal(fs.existsSync(fixture.mergedPath), false);
+    assert.deepEqual(mutationReceiptStates(finalizeVerifiedActionLedger(fixture, commonEnv)), [
+      ["started", "mutation_attempted"],
+      ["failed", "mutation_outcome_unknown"],
+    ]);
 
     fixture.reset();
     runVerifiedPostFlight(
@@ -1003,8 +1029,29 @@ function runVerifiedPostFlight(
   return child;
 }
 
+function finalizeVerifiedActionLedger(
+  fixture: ReturnType<typeof createVerifiedMergeFixture>,
+  env: NodeJS.ProcessEnv,
+) {
+  execFileSync(
+    process.execPath,
+    [path.join(repoRoot, "dist/repair/action-ledger-cli.js"), "finalize"],
+    { cwd: repoRoot, env, stdio: "pipe" },
+  );
+  return readActionEvents(fixture.ledgerOutputRoot);
+}
+
+function mutationReceiptStates(events: Record<string, any>[]) {
+  return events
+    .filter((event) => event.event_type === "repair.mutation")
+    .sort((left, right) => left.phase_seq - right.phase_seq)
+    .map((event) => [event.action.status, event.attributes?.completion_reason]);
+}
+
 function createVerifiedMergeFixture() {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-post-flight-verified-"));
+  const root = fs.realpathSync(
+    fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-post-flight-verified-")),
+  );
   const sourceJobPath = path.join(
     repoRoot,
     "jobs",
@@ -1025,6 +1072,8 @@ function createVerifiedMergeFixture() {
   const mergeCountPath = path.join(root, "merge-count.txt");
   const commentsCountPath = path.join(root, "comments-count.txt");
   const failureCommentsPath = path.join(root, "failure-comments.txt");
+  const ledgerRoot = path.join(root, "ledger");
+  const ledgerOutputRoot = path.join(root, "ledger-output");
   const clusterId = "automerge-openclaw-openclaw-123";
   const outputBranch = "clawsweeper/automerge-openclaw-openclaw-123";
 
@@ -1032,6 +1081,8 @@ function createVerifiedMergeFixture() {
   fs.mkdirSync(sourceRunDir, { recursive: true });
   fs.mkdirSync(fakeBin, { recursive: true });
   fs.mkdirSync(targetDir, { recursive: true });
+  fs.mkdirSync(ledgerRoot);
+  fs.mkdirSync(ledgerOutputRoot);
   writeMergeJob(sourceJobPath, 122);
 
   git(targetDir, "init");
@@ -1326,11 +1377,17 @@ function createVerifiedMergeFixture() {
     mergeCountPath,
     commentsCountPath,
     failureCommentsPath,
+    ledgerRoot,
+    ledgerOutputRoot,
     reset() {
       fs.rmSync(mergedPath, { force: true });
       fs.rmSync(mergeCountPath, { force: true });
       fs.rmSync(commentsCountPath, { force: true });
       fs.rmSync(failureCommentsPath, { force: true });
+      fs.rmSync(ledgerRoot, { recursive: true, force: true });
+      fs.rmSync(ledgerOutputRoot, { recursive: true, force: true });
+      fs.mkdirSync(ledgerRoot);
+      fs.mkdirSync(ledgerOutputRoot);
       fs.rmSync(path.join(handoffRoot, "run", "post-flight-report.json"), { force: true });
     },
     cleanup() {

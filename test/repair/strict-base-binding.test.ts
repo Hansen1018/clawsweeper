@@ -338,6 +338,23 @@ test("all repair merge owners repeat the shared strict base guard immediately be
       (match) => match.index,
     );
     const merge = owner.indexOf(mergeCall);
+    if (file === "src/repair/post-flight.ts") {
+      assert.equal(guards.length, 1, `${file} must keep its initial strict base guard`);
+      const helperCall = owner.indexOf("const policyBlock = postFlightMergeRetryBlock({");
+      assert.ok(helperCall > guards[0]!, `${file} does not repeat the shared merge gate`);
+      assert.ok(merge > helperCall, `${file} does not guard the final merge call`);
+      const helperStart = source.indexOf("function postFlightMergeRetryBlock(");
+      const helperEnd = source.indexOf("\nfunction ", helperStart + 1);
+      const helper = source.slice(helperStart, helperEnd);
+      const helperGuard = helper.indexOf("runtimeStrictBaseBindingBlock({");
+      assert.notEqual(helperGuard, -1, `${file} shared merge gate lacks strict base binding`);
+      assert.doesNotMatch(
+        helper.slice(helperGuard),
+        /gh(?:Json|Text|Spawn|WithRetry)\(/,
+        `${file} performs a GitHub call after the final strict base guard`,
+      );
+      continue;
+    }
     assert.equal(guards.length, 2, `${file} must check strict base binding twice`);
     assert.ok(merge > guards[1]!, `${file} does not guard the final merge call`);
     const finalGuard = owner.slice(guards[1]!, merge);

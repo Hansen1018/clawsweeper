@@ -366,7 +366,13 @@ function finalizeFixPr(action: LooseRecord) {
   let mergeAttempts = 0;
   for (;;) {
     mergeAttempts += 1;
-    let mergeAttempt: { policyBlock: string; pull: LooseRecord; view: LooseRecord };
+    let mergeAttempt: {
+      policyBlock: string;
+      pull: LooseRecord;
+      view: LooseRecord;
+      confirmation: ReturnType<typeof reconcileMergeState> | null;
+      ambiguous: boolean;
+    };
     try {
       mergeAttempt = runVerifiedPostFlightPullMutation(parsed.number, () => {
         const finalPull = fetchPullRequest(result.repo, parsed.number);
@@ -377,18 +383,49 @@ function finalizeFixPr(action: LooseRecord) {
           pull: finalPull,
           view: finalView,
         });
-        if (policyBlock) return { policyBlock, pull: finalPull, view: finalView };
-        runPostFlightMutation(
-          "post_flight_merge",
-          {
+        if (policyBlock) {
+          return {
+            policyBlock,
+            pull: finalPull,
+            view: finalView,
+            confirmation: null,
+            ambiguous: false,
+          };
+        }
+        const mutation = runRepairMutation(postFlightLifecycle(null), {
+          kind: "post_flight_merge",
+          identity: {
             repo: result.repo,
             number: parsed.number,
             headSha: action.commit ?? null,
             method: "squash",
           },
-          () => ghText(mergeArgs),
-        );
-        return { policyBlock: "", pull: finalPull, view: finalView };
+          component: "post_flight",
+          operation: () => {
+            try {
+              ghText(mergeArgs);
+            } catch (error) {
+              const confirmation = reconcileMergeState(parsed.number, action.commit);
+              if (confirmation.mergedAt && !confirmation.block) {
+                return { confirmation, ambiguous: true };
+              }
+              throw error;
+            }
+            return {
+              confirmation: reconcileMergeState(parsed.number, action.commit),
+              ambiguous: false,
+            };
+          },
+          outcome: ({ confirmation }) =>
+            confirmation.mergedAt && !confirmation.block ? "accepted" : "unknown",
+        });
+        return {
+          policyBlock: "",
+          pull: mutation.confirmation.pull,
+          view: mutation.confirmation.view,
+          confirmation: mutation.confirmation,
+          ambiguous: mutation.ambiguous,
+        };
       });
     } catch (error) {
       const detail = ghErrorText(error);
@@ -488,7 +525,8 @@ function finalizeFixPr(action: LooseRecord) {
       };
     }
 
-    const confirmation = reconcileMergeState(parsed.number, action.commit);
+    const confirmation = mergeAttempt.confirmation;
+    if (!confirmation) throw new Error("merge confirmation is missing after an unblocked attempt");
     pull = confirmation.pull;
     view = confirmation.view;
     prBase = { ...base, pr: `#${parsed.number}`, title: view.title ?? pull.title ?? null };
@@ -519,7 +557,9 @@ function finalizeFixPr(action: LooseRecord) {
     return {
       ...prBase,
       status: "executed",
-      reason: "merged by ClawSweeper Repair post-flight",
+      reason: mergeAttempt.ambiguous
+        ? "merge confirmed after ambiguous response"
+        : "merged by ClawSweeper Repair post-flight",
       merged_at: confirmation.mergedAt,
       merge_commit_sha: pull.merge_commit_sha ?? view.mergeCommit?.oid ?? null,
       merge_method: "squash",
