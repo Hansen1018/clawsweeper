@@ -93,22 +93,25 @@ checkpoint, and status-only commits are intentionally omitted.
 - Dual-write repair queue, plan, post-flight, publication, failure, CrabFleet
   session, GitHub status-comment, dashboard-delivery, cluster-result,
   aggregate-report, and finalizer transitions into immutable per-attempt action
-  chains in normal and steerable repairs. Separate processes reconstruct
-  monotonic causal parents from canonically validated prior-job shards,
-  publication commands use distinct finalized producer and run identities,
+  chains in normal and steerable repairs. Each process owns a monotonic local
+  chain; cross-job continuity uses stable operation and source identities plus
+  authenticated producer manifests instead of synthetic prior-job parents.
+  Publication commands use distinct finalized producer and run identities,
   imported reservation and completion bindings are published with their event
   shards, secondary receipt-recording and finalization errors preserve the
   primary failure, and selected artifacts that import no paths fail closed.
   Repair receipts bind the sealed target source revision instead of the
   ClawSweeper workflow SHA, issue-implementation intake publishes its status
   receipts before dispatch, and local-only lifecycle steps do not receive the
-  CrabFleet service token. Credential-isolated worker jobs upload finalized
-  shards for one state-authorized collector, while existing state-authorized
-  publishers import their own shards directly. Repair and commit publishers
-  now use the setup-provided canonical output root, bind every artifact to an
-  exact lane, job, run, and attempt manifest, preflight the complete expected
-  producer set before state import, and reject missing, extra, or cross-run
-  shards instead of silently publishing an incomplete ledger.
+  CrabFleet service token. Current cluster and execute jobs upload exact
+  current-attempt shards; the trusted result publisher capability-detects the
+  worker SHA, verifies the exact job inventory and producer identity, and
+  imports those lanes with its own publication lane before result mutation.
+  Legacy in-flight worker heads remain publishable without claiming current
+  ledger support. Commit-review jobs likewise bundle each report and local
+  ledger, bind Codex review-log digests, and require exact-attempt verification
+  and publisher attestation before state or check publication. Existing
+  state-authorized finalizers import their own shards directly.
 - Added exact repair request-boundary receipts for branch, pull request,
   comment, label, review-thread, continuation-dispatch, source-close
   compensation, closeout, merge, self-heal gate, self-heal status-comment,

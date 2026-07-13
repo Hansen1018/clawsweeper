@@ -143,6 +143,7 @@ The cluster worker has two jobs:
    - hydrates the cluster
    - runs Codex in read-only mode
    - reviews the structured result
+   - finalizes and uploads the exact current-attempt cluster action ledger
    - uploads transfer artifacts
 
 2. `execute`
@@ -154,10 +155,18 @@ The cluster worker has two jobs:
    - runs `apply-result`
    - runs `post-flight`
    - labels ClawSweeper targets
+   - finalizes and uploads the exact current-attempt execute action ledger
    - uploads final artifacts
 
 The workflow concurrency group is based on job path and mode, so repeat
 dispatches of the same job queue instead of racing each other.
+
+Neither worker job receives state-repository credentials solely for ledger
+publication. The trusted `repair-publish-results` workflow capability-detects
+the exact worker SHA, verifies every current run, attempt, job, and manifest,
+then imports the cluster and execute lanes with its own publication lane before
+durable result mutation. Legacy in-flight workers that did not advertise this
+topology remain compatible without synthetic receipts.
 
 ## Creating Implementation PRs
 

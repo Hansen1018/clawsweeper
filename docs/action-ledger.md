@@ -139,14 +139,12 @@ confidential-identifier checks as every other durable machine-text field.
   digest. Distinct generated state from the same workflow revision cannot reuse
   a publication receipt, while replaying the same selected bytes remains stable.
 - Every repair Codex subprocess that persists output (initial repair planning,
-  structured-result repair, write preflight, edit, base reconcile, validation
-  fix, `/review`, and review-fix) records a typed attempt lifecycle plus SHA-256
-  evidence for JSONL, stderr, and report artifacts. The action mode and typed
-  attempt bind operation, event, and idempotency identity, so same-numbered
-  actions cannot replay or collide. Final and final-sync attempts use explicit
-  variants rather than coercing display labels back into numbers. A configured
-  preflight skip is the deliberate exception: it launches no subprocess and
-  creates no Codex output.
+  structured-result repair, edit, base reconcile, validation fix, `/review`,
+  and review-fix) records a typed attempt lifecycle plus SHA-256 evidence for
+  JSONL, stderr, and report artifacts. The action mode and typed attempt bind
+  operation, event, and idempotency identity, so same-numbered actions cannot
+  replay or collide. Final and final-sync attempts use explicit variants rather
+  than coercing display labels back into numbers.
 - Failed-run and conflict self-heal record request-bound receipts for temporary
   repository-gate updates, status-comment upserts, immutable job publication,
   and exact-generation worker dispatch. Legacy pre-contract attempts still
@@ -354,30 +352,38 @@ emit this taxonomy. Repair receipts keep the logical work key and sealed
 repaired-source revision stable across retries;
 ClawSweeper's workflow checkout SHA is not target provenance. Workflow run and
 run attempt define the repair execution attempt; job, step, and invocation
-remain producer identity. Each process reconstructs the latest parent and phase
-sequence from the canonical local spool plus prior-job shard artifacts accepted
-by the same bounded path, shard, packing, and topology validator used for state
-imports. Queue, plan, and post-flight events therefore remain one monotonic
-chain without reusing a finalized producer. Session writes record both the
-optional operator-facing CrabFleet transition and the corresponding repair
-phase. GitHub status comments are receipted only after the mutation returns,
-while dashboard delivery records sent, skipped, and failed outcomes. Local
-result, aggregate apply-report, and dashboard writes use `completed`; their
-later immutable shard import is the durable publication boundary.
+remain producer identity. Each process maintains its own monotonic chain from
+the canonical local spool. Cross-job continuity comes from the stable operation
+and source identities plus separately authenticated producer manifests; jobs do
+not splice downloaded shards into a synthetic shared phase sequence. Session
+writes record both the optional operator-facing CrabFleet transition and the
+corresponding repair phase. GitHub status comments are receipted only after the
+mutation returns, while dashboard delivery records sent, skipped, and failed
+outcomes. Local result, aggregate apply-report, review report, Codex log, and
+dashboard writes use `completed`; their later immutable shard import is the
+durable publication boundary.
 
 Credential-isolated repair jobs never receive state-repository credentials just
-to publish receipts. Cluster and mutation jobs finalize local immutable shards
-and upload them as workflow artifacts. Commit-review follows the same boundary:
-the danger-full-access Codex matrix job has no state token, creates its optional
-check-write token only after Codex exits, and leaves state mutation to the
-separate publication job. A dedicated state-authorized collector lists the
-bounded matching artifact set, authenticates each advertised lane
-independently, and durably publishes every valid lane even when a downstream
-job was cancelled before producing an artifact. Missing non-success lanes are
-recorded as absent; malformed, incomplete, or forged advertised lanes still
-fail the collector after valid lanes are preserved. The mutation job downloads
-the cluster shard by its trusted artifact ID and digest only as causal context.
-It does not receive state-repository credentials.
+to publish receipts. The current cluster and execute jobs finalize local
+immutable shards and upload exact current-run, current-attempt artifacts. The
+trusted `repair-publish-results` workflow inspects the worker SHA to detect this
+capability, verifies the exact job inventory and every manifest's repository,
+SHA, workflow, job, run, and attempt, then imports the cluster and execute lanes
+with its own publication lane before mutating durable result state. A current
+worker job that started must advertise exactly one valid lane; a skipped job
+must advertise none. Missing, malformed, incomplete, extra, or forged current
+lanes fail publication before result mutation. Legacy in-flight worker heads
+that predate this topology remain publishable without pretending that they
+emitted current-format ledgers.
+
+Commit review follows the same credential boundary. Each danger-full-access
+Codex matrix job has no state token and uploads one exact current-attempt bundle
+containing its report and local ledger; the ledger binds the Codex review-log
+digests. The trusted publication job verifies the matrix commit, producer SHA,
+job, run, attempt, and report digest, attests the report, and only then imports
+the review lane and performs state or check publication. Optional check-write
+credentials are minted only after Codex exits.
+
 Result and open-PR finalizer workflows already own state credentials, so they
 import and publish their own finalized shards directly. Additional lanes can
 migrate independently without changing the v1 shard format.

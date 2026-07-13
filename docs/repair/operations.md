@@ -313,6 +313,14 @@ Codex JSONL files. Use the dedicated `clawsweeper-codex-debug-*` artifact when
 the full session/log backup is needed. The cap defaults to 8 MiB per copied file
 and is configurable with `CLAWSWEEPER_FIX_DEBUG_MAX_BYTES`.
 
+Cluster and execute jobs also upload exact current-run, current-attempt action
+ledger artifacts. The trusted `repair-publish-results` workflow validates the
+worker SHA capability, expected job inventory, and producer manifests before it
+imports those receipts or mutates durable result state. Commit review uses the
+same boundary: each current-attempt bundle includes the report and local ledger,
+whose events bind Codex review-log digests for publisher verification and
+attestation. Raw redacted logs remain in the separate diagnostic artifact.
+
 If a replacement repair finishes with no diff against the latest base branch,
 the executor records a skipped no-op outcome instead of calling `gh pr create`.
 This avoids failing on GitHub's "No commits between" response when the repair is
