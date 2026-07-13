@@ -84,8 +84,8 @@ test("report-only repair requeues forward a stable dispatch receipt and publish 
     /--source-job-path "\$\{\{ needs\.authorize\.outputs\.source_job_path \}\}"/,
   );
   assert.match(workflow, /--requeue-depth "\$\{\{ inputs\.requeue_depth \}\}"/);
-  assert.match(workflow, /--state-revision "\$\{\{ inputs\.state_revision \}\}"/);
-  assert.match(workflow, /--job-sha256 "\$\{\{ inputs\.job_sha256 \}\}"/);
+  assert.match(workflow, /--state-revision "\$\{\{ needs\.cluster\.outputs\.state_revision \}\}"/);
+  assert.match(workflow, /--job-sha256 "\$\{\{ needs\.cluster\.outputs\.job_sha256 \}\}"/);
   assert.match(workflow, /fetch-depth: 0/);
   assert.match(workflow, /--max-requeue-depth 1/);
 });
