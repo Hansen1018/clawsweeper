@@ -88,9 +88,7 @@ test("review activity cursors fail closed beyond the bounded history", () => {
   assert.equal(createReviewedPrActivityCursor({ reviews: [], inlineComments }), null);
   assert.equal(isReviewedPrActivityCursor({ toString: () => `v1:0:${"a".repeat(64)}` }), false);
   assert.equal(
-    isReviewedPrActivityCursor(
-      `v1:${MAX_REVIEWED_PR_ACTIVITY + 1}:${"a".repeat(64)}`,
-    ),
+    isReviewedPrActivityCursor(`v1:${MAX_REVIEWED_PR_ACTIVITY + 1}:${"a".repeat(64)}`),
     false,
   );
 });

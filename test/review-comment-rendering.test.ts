@@ -33,8 +33,7 @@ function implementedCloseReport(overrides = {}) {
     work_status: "none",
     item_snapshot_hash: "reviewed-snapshot",
     item_source_revision: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-    review_activity_cursor:
-      "v1:0:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    review_activity_cursor: "v1:0:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
     item_created_at: "2026-05-01T00:00:00Z",
     item_updated_at: "2026-05-01T00:00:00Z",
     reproduction_status: "reproduced",
