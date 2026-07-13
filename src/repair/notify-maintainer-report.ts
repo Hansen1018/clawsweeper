@@ -147,11 +147,7 @@ export async function runMaintainerReportNotifier(
     throw error;
   }
   if (!pointer) {
-    recordNotificationPhase(
-      preliminaryNotificationLedgerInput,
-      "skipped",
-      "report_not_found",
-    );
+    recordNotificationPhase(preliminaryNotificationLedgerInput, "skipped", "report_not_found");
     const summary = summaryRow("skipped", 0, 0, "daily report not found", null, null, strict);
     log(JSON.stringify(summary));
     return summary;

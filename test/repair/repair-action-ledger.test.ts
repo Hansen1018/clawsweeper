@@ -181,9 +181,7 @@ test("async receipt write failures do not reclassify successful remote mutations
     assert.equal(events.length, 1);
     assert.equal(events[0]?.attributes?.completion_reason, "mutation_attempted");
     assert.equal(
-      events.some(
-        (event) => event.attributes?.completion_reason === "mutation_outcome_unknown",
-      ),
+      events.some((event) => event.attributes?.completion_reason === "mutation_outcome_unknown"),
       false,
     );
   } finally {

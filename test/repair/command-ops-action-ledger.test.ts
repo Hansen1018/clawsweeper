@@ -75,10 +75,7 @@ test("report-only repair requeues forward a stable dispatch receipt and publish 
     /report-status \\\n\s+\.artifacts\/report-repair-action-ledger-manifest\.json \\\n\s+\.artifacts\/report-repair-action-ledger-import\.json \\\n\s+true/,
   );
   assert.match(publishStep, /command \\\n\s+report-requeue/);
-  assert.match(
-    publishStep,
-    /if \[ ! -s "\$event_paths_file" \]; then[\s\S]*?exit 0[\s\S]*?fi/,
-  );
+  assert.match(publishStep, /if \[ ! -s "\$event_paths_file" \]; then[\s\S]*?exit 0[\s\S]*?fi/);
   assert.match(publishStep, /--message "chore: append report action ledgers"/);
   assert.match(
     workflow,

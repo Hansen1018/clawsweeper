@@ -242,9 +242,7 @@ test("repair manifests exclude command shards from a shared workflow output root
       ),
       false,
     );
-    assert.doesNotThrow(() =>
-      assertRepairActionLedgerManifestSource(outputRoot, repairManifest),
-    );
+    assert.doesNotThrow(() => assertRepairActionLedgerManifestSource(outputRoot, repairManifest));
   } finally {
     restoreEnv(previous);
     fs.rmSync(root, { force: true, recursive: true });
