@@ -164,6 +164,10 @@ import {
 import { runtimeStrictBaseBindingBlock } from "./strict-base-binding.js";
 import { compactText, escapeRegExp } from "./text-utils.js";
 import {
+  createReviewedPrActivityCursor,
+  isReviewedPrActivityCursor,
+} from "../review-activity-cursor.js";
+import {
   flushCommandActionEvents,
   recordCommandClaimed,
   recordCommandClaimRefreshed,
@@ -3756,6 +3760,15 @@ function executeAutomerge(command: LooseRecord): LooseRecord {
       merge_method: "squash",
     };
   }
+  const reviewActivityBlock = trustedAutomergeReviewActivityBlockReason(command);
+  if (reviewActivityBlock) {
+    return {
+      action: "merge",
+      status: reviewActivityBlock.retryable ? "waiting" : "blocked",
+      reason: reviewActivityBlock.reason,
+      merge_method: "squash",
+    };
+  }
   const hardBlock = validateAutomergeHardReadiness({ command, view, target: latestTarget });
   if (hardBlock) {
     return automergeReadinessAction(hardBlock, waitedMs, transientObservations);
@@ -3868,6 +3881,15 @@ function executeAutomerge(command: LooseRecord): LooseRecord {
       merge_method: "squash",
     };
   }
+  const finalReviewActivityBlock = trustedAutomergeReviewActivityBlockReason(command);
+  if (finalReviewActivityBlock) {
+    return {
+      action: "merge",
+      status: finalReviewActivityBlock.retryable ? "waiting" : "blocked",
+      reason: finalReviewActivityBlock.reason,
+      merge_method: "squash",
+    };
+  }
   const finalHardBlock = validateAutomergeHardReadiness({
     command,
     view: finalView,
@@ -3942,6 +3964,15 @@ function executeAutomerge(command: LooseRecord): LooseRecord {
       action: "merge",
       status: claimedReviewLeaseBlock.retryable ? "waiting" : "blocked",
       reason: claimedReviewLeaseBlock.reason,
+      merge_method: "squash",
+    });
+  }
+  const claimedReviewActivityBlock = trustedAutomergeReviewActivityBlockReason(command);
+  if (claimedReviewActivityBlock) {
+    return releaseBeforeDispatch({
+      action: "merge",
+      status: claimedReviewActivityBlock.retryable ? "waiting" : "blocked",
+      reason: claimedReviewActivityBlock.reason,
       merge_method: "squash",
     });
   }
@@ -5138,6 +5169,45 @@ function fetchIssue(number: JsonValue) {
   return ghJson(["api", `repos/${targetRepo}/issues/${number}`], {
     attempts: TARGET_LOOKUP_RETRY_ATTEMPTS,
   });
+}
+
+function trustedAutomergeReviewActivityBlockReason(
+  command: LooseRecord,
+): { reason: string; retryable: boolean } | null {
+  if (command.intent !== "clawsweeper_auto_merge") return null;
+  const expected = String(command.expected_review_activity_cursor ?? "").trim();
+  if (!isReviewedPrActivityCursor(expected)) {
+    return {
+      reason: "trusted ClawSweeper verdict is missing the reviewed PR activity cursor",
+      retryable: false,
+    };
+  }
+  try {
+    const current = createReviewedPrActivityCursor({
+      reviews: ghPaged<unknown>(`repos/${targetRepo}/pulls/${command.issue_number}/reviews`),
+      inlineComments: ghPaged<unknown>(
+        `repos/${targetRepo}/pulls/${command.issue_number}/comments`,
+      ),
+    });
+    if (!current) {
+      return {
+        reason: "pull request review activity exceeds the bounded automerge cursor",
+        retryable: false,
+      };
+    }
+    if (current !== expected) {
+      return {
+        reason: "pull request review activity changed since the trusted ClawSweeper verdict",
+        retryable: false,
+      };
+    }
+    return null;
+  } catch (error) {
+    return {
+      reason: `pull request review activity could not be refreshed: ${compactGhError(error)}`,
+      retryable: true,
+    };
+  }
 }
 
 function fetchIssueAsync(number: JsonValue) {

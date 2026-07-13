@@ -222,6 +222,36 @@ test("automerge fresh attempts reconcile a durable exact-head claim before merge
   );
 });
 
+test("trusted verdict automerge rechecks reviewed PR activity around the merge claim", () => {
+  const source = readText("src/repair/comment-router.ts");
+  const executeAutomerge = source.slice(
+    source.indexOf("function executeAutomerge("),
+    source.indexOf("function automergeReadinessAction("),
+  );
+  const first = executeAutomerge.indexOf(
+    "const reviewActivityBlock = trustedAutomergeReviewActivityBlockReason(command)",
+  );
+  const final = executeAutomerge.indexOf(
+    "const finalReviewActivityBlock = trustedAutomergeReviewActivityBlockReason(command)",
+  );
+  const claim = executeAutomerge.indexOf("claimAutomergeMergeRequest(command)");
+  const claimed = executeAutomerge.indexOf(
+    "const claimedReviewActivityBlock = trustedAutomergeReviewActivityBlockReason(command)",
+  );
+  const merge = executeAutomerge.indexOf("result = runGitHubSpawnMutation(");
+
+  assert.ok(first >= 0);
+  assert.ok(final > first);
+  assert.ok(claim > final);
+  assert.ok(claimed > claim);
+  assert.ok(merge > claimed);
+  assert.match(
+    source,
+    /function trustedAutomergeReviewActivityBlockReason[\s\S]*expected_review_activity_cursor[\s\S]*pulls\/\$\{command\.issue_number\}\/reviews[\s\S]*pulls\/\$\{command\.issue_number\}\/comments/,
+  );
+  assert.match(executeAutomerge, /claimedReviewActivityBlock[\s\S]*releaseBeforeDispatch/);
+});
+
 test("all exact-head merge owners release unused claims and require squash auto-merge", () => {
   const apply = readText("src/repair/apply-result.ts");
   const router = readText("src/repair/comment-router.ts");
