@@ -6,7 +6,21 @@ import path from "node:path";
 import test from "node:test";
 
 import { readValidatedActionEventShardBatch } from "../dist/action-ledger-runtime.js";
+import {
+  proofLaneFailureRetryableForTest,
+  proofMutationRetryableForTest,
+} from "../dist/clawsweeper.js";
 import { readText } from "./helpers.ts";
+
+test("proof mutation receipts preserve retryability for ambiguous outcomes", () => {
+  assert.equal(proofMutationRetryableForTest("accepted"), false);
+  assert.equal(proofMutationRetryableForTest("rejected"), false);
+  assert.equal(proofMutationRetryableForTest("unknown"), true);
+
+  assert.equal(proofLaneFailureRetryableForTest(false, false), true);
+  assert.equal(proofLaneFailureRetryableForTest(true, false), false);
+  assert.equal(proofLaneFailureRetryableForTest(true, true), true);
+});
 
 test("proof commands emit validated stage and report receipts for empty scans", () => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "proof-ledger-")));

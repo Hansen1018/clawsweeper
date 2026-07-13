@@ -28234,7 +28234,9 @@ function finishProofLaneActionLedger(
     phase: ACTION_EVENT_TYPES.proofStage,
     status: failure?.status ?? ACTION_EVENT_STATUSES.completed,
     reasonCode: failure?.reasonCode ?? ACTION_EVENT_REASON_CODES.completed,
-    retryable: failure !== null && !ledger.uncertainMutationObserved,
+    retryable:
+      failure !== null &&
+      proofLaneFailureRetryable(ledger.mutationObserved, ledger.uncertainMutationObserved),
     mutation: ledger.mutationObserved,
     identity: {
       slot: "proof_lane_terminal",
@@ -28266,6 +28268,30 @@ function finishProofLaneActionLedger(
   });
   ledger.lastEventId = event?.event_id ?? ledger.lastEventId;
   ledger.terminal = true;
+}
+
+function proofLaneFailureRetryable(
+  mutationObserved: boolean,
+  uncertainMutationObserved: boolean,
+): boolean {
+  return !mutationObserved || uncertainMutationObserved;
+}
+
+export function proofLaneFailureRetryableForTest(
+  mutationObserved: boolean,
+  uncertainMutationObserved: boolean,
+): boolean {
+  return proofLaneFailureRetryable(mutationObserved, uncertainMutationObserved);
+}
+
+type ProofMutationOutcome = "accepted" | "rejected" | "unknown";
+
+function proofMutationRetryable(outcome: ProofMutationOutcome): boolean {
+  return outcome === "unknown";
+}
+
+export function proofMutationRetryableForTest(outcome: ProofMutationOutcome): boolean {
+  return proofMutationRetryable(outcome);
 }
 
 function proofLaneMutationRunner(
@@ -28320,7 +28346,7 @@ function proofLaneMutationRunner(
       privacy: actionLedgerPrivacy(),
     });
     ledger.lastEventId = attempt?.event_id ?? ledger.lastEventId;
-    const finish = (outcome: "accepted" | "rejected" | "unknown"): void => {
+    const finish = (outcome: ProofMutationOutcome): void => {
       const mutation = outcome !== "rejected";
       const result = recordWorkflowPhaseEvent(ROOT, {
         phase,
@@ -28336,7 +28362,7 @@ function proofLaneMutationRunner(
             : outcome === "rejected"
               ? ACTION_EVENT_REASON_CODES.notApplicable
               : ACTION_EVENT_REASON_CODES.unavailable,
-        retryable: false,
+        retryable: proofMutationRetryable(outcome),
         mutation,
         identity: {
           slot: "proof_mutation_outcome",
