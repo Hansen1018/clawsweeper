@@ -12,6 +12,7 @@ import {
 } from "../dist/action-ledger-runtime.js";
 import {
   commitReviewLifecycleSucceeded,
+  flushCommitActionEvents,
   recordCommitWorkflowEvent,
   runCommitMutation,
 } from "../dist/commit-action-ledger.js";
@@ -167,6 +168,7 @@ test("commit publication preserves its primary failure when receipt recording al
   const originalConsoleError = console.error;
   const receiptErrors: string[] = [];
   Object.assign(process.env, workflowEnv(root, outputRoot));
+  let spoolDirectory = "";
 
   try {
     console.error = (message?: unknown) => receiptErrors.push(String(message));
@@ -179,7 +181,10 @@ test("commit publication preserves its primary failure when receipt recording al
             kind: "commit_check_publication",
             identity: { sha: "b".repeat(40) },
             operation: () => {
-              process.env.GITHUB_REPOSITORY = "invalid";
+              const spoolFile = walk(root).find((file) => file.endsWith(".json"));
+              assert.ok(spoolFile);
+              spoolDirectory = path.dirname(spoolFile);
+              fs.chmodSync(spoolDirectory, 0o500);
               throw primary;
             },
           },
@@ -188,11 +193,96 @@ test("commit publication preserves its primary failure when receipt recording al
     );
     assert.match(receiptErrors.join("\n"), /after the primary failure/);
   } finally {
+    if (spoolDirectory) fs.chmodSync(spoolDirectory, 0o700);
     console.error = originalConsoleError;
     restoreEnv(previous);
     fs.rmSync(root, { force: true, recursive: true });
   }
 });
+
+test("commit mutation receipts preserve their workflow context across environment drift", async () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "commit-context-ledger-")));
+  const outputRoot = path.join(root, "output");
+  fs.mkdirSync(outputRoot);
+  const previous = { ...process.env };
+  Object.assign(process.env, workflowEnv(root, outputRoot));
+  const lifecycle = { repository: "openclaw/openclaw", sha: "b".repeat(40) };
+
+  try {
+    assert.equal(
+      runCommitMutation(lifecycle, {
+        kind: "commit_check_publication",
+        identity: { sha: lifecycle.sha },
+        operation: () => {
+          process.env.GITHUB_REPOSITORY = "not a repository";
+          return "accepted";
+        },
+      }),
+      "accepted",
+    );
+
+    process.env.GITHUB_REPOSITORY = "openclaw/clawsweeper";
+    await flushCommitActionEvents();
+    const events = readEvents(outputRoot);
+    assert.deepEqual(
+      events.map((event) => event.attributes?.completion_reason),
+      ["mutation_attempted", "mutation_accepted"],
+    );
+    assert.equal(
+      events.some((event) => event.attributes?.completion_reason === "mutation_outcome_unknown"),
+      false,
+    );
+  } finally {
+    restoreEnv(previous);
+    fs.rmSync(root, { force: true, recursive: true });
+  }
+});
+
+test(
+  "deferred commit receipt failures finalize the known mutation outcome",
+  { skip: process.platform === "win32" ? "requires POSIX directory permissions" : false },
+  async () => {
+    const root = fs.realpathSync(
+      fs.mkdtempSync(path.join(os.tmpdir(), "commit-deferred-receipt-")),
+    );
+    const outputRoot = path.join(root, "output");
+    fs.mkdirSync(outputRoot);
+    const previous = { ...process.env };
+    Object.assign(process.env, workflowEnv(root, outputRoot));
+    const lifecycle = { repository: "openclaw/openclaw", sha: "b".repeat(40) };
+    let spoolDirectory = "";
+
+    try {
+      assert.throws(
+        () =>
+          runCommitMutation(lifecycle, {
+            kind: "commit_check_publication",
+            identity: { sha: lifecycle.sha },
+            operation: () => {
+              const spoolFile = walk(root).find((file) => file.endsWith(".json"));
+              assert.ok(spoolFile);
+              spoolDirectory = path.dirname(spoolFile);
+              fs.chmodSync(spoolDirectory, 0o500);
+              return "accepted";
+            },
+          }),
+        /EACCES|EPERM|permission/i,
+      );
+
+      fs.chmodSync(spoolDirectory, 0o700);
+      await flushCommitActionEvents();
+      const events = readEvents(outputRoot);
+      assert.deepEqual(
+        events.map((event) => event.attributes?.completion_reason),
+        ["mutation_attempted", "mutation_accepted"],
+      );
+    } finally {
+      if (spoolDirectory) fs.chmodSync(spoolDirectory, 0o700);
+      restoreEnv(previous);
+      fs.rmSync(root, { force: true, recursive: true });
+    }
+  },
+);
 
 test("commit review matrix invocations publish distinct importable shard paths", async () => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "commit-matrix-ledger-")));
