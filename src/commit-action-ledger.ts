@@ -734,14 +734,24 @@ function nextRequestAttempt(
 }
 
 function commitMutationState(input: CommitLifecycleInput): { observed: boolean; unknown: boolean } {
-  let observed = false;
-  let unknown = false;
+  const outcomes = new Map<string, { observed: boolean; unknown: boolean; phaseSeq: number }>();
   for (const event of commitEvents(input)) {
     const reason = String(event.attributes?.completion_reason ?? "");
-    if (reason === "mutation_accepted" || reason === "mutation_outcome_unknown") observed = true;
-    if (reason === "mutation_outcome_unknown") unknown = true;
+    const key = event.idempotency_key_sha256;
+    if (!key) continue;
+    const current = outcomes.get(key) ?? { observed: false, unknown: false, phaseSeq: 0 };
+    if (event.phase_seq < current.phaseSeq) continue;
+    if (reason === "mutation_accepted" || reason === "mutation_observed") {
+      outcomes.set(key, { observed: true, unknown: false, phaseSeq: event.phase_seq });
+    } else if (reason === "mutation_outcome_unknown" && !current.observed) {
+      outcomes.set(key, { observed: false, unknown: true, phaseSeq: event.phase_seq });
+    }
   }
-  return { observed, unknown };
+  const states = [...outcomes.values()];
+  return {
+    observed: states.some((state) => state.observed || state.unknown),
+    unknown: states.some((state) => state.unknown && !state.observed),
+  };
 }
 
 function commitFailureReason(input: CommitLifecycleInput): string {

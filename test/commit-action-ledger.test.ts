@@ -191,6 +191,168 @@ test("commit publication uncertainty is preserved by terminal workflow receipts"
   }
 });
 
+test("commit mutation retry resolves prior uncertainty for the same receipt key", async () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "commit-retry-ledger-")));
+  const outputRoot = path.join(root, "output");
+  fs.mkdirSync(outputRoot);
+  const previous = { ...process.env };
+  Object.assign(process.env, workflowEnv(root, outputRoot));
+  const lifecycle = {
+    repository: "openclaw/openclaw",
+    sha: "b".repeat(40),
+  };
+  const identity = { repo: lifecycle.repository, sha: lifecycle.sha };
+
+  try {
+    assert.throws(
+      () =>
+        runCommitMutation(lifecycle, {
+          kind: "commit_check_publication",
+          identity,
+          operation: () => {
+            throw new Error("response lost after publication");
+          },
+        }),
+      /response lost/,
+    );
+    assert.equal(
+      runCommitMutation(lifecycle, {
+        kind: "commit_check_publication",
+        identity,
+        operation: () => "accepted",
+      }),
+      "accepted",
+    );
+    recordCommitWorkflowEvent(lifecycle, "failed", new Error("later workflow failure"));
+    await flushWorkflowActionEvents(root);
+
+    const events = readEvents(outputRoot).sort((left, right) => left.phase_seq - right.phase_seq);
+    assert.deepEqual(
+      events
+        .filter((event) => event.event_type === ACTION_EVENT_TYPES.publicationLifecycle)
+        .map((event) => event.attributes?.completion_reason),
+      ["mutation_attempted", "mutation_outcome_unknown", "mutation_attempted", "mutation_accepted"],
+    );
+    const failed = events.find(
+      (event) =>
+        event.event_type === ACTION_EVENT_TYPES.workflowAttempt &&
+        event.attributes?.state === "failed",
+    );
+    assert.equal(failed?.action.mutation, true);
+    assert.equal(failed?.action.retryable, false);
+    assert.equal(failed?.attributes?.completion_reason, "mutation_observed");
+  } finally {
+    restoreEnv(previous);
+    fs.rmSync(root, { force: true, recursive: true });
+  }
+});
+
+test("commit mutation observation resolves prior uncertainty for the same receipt key", async () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "commit-observed-ledger-")));
+  const outputRoot = path.join(root, "output");
+  fs.mkdirSync(outputRoot);
+  const previous = { ...process.env };
+  Object.assign(process.env, workflowEnv(root, outputRoot));
+  const lifecycle = {
+    repository: "openclaw/openclaw",
+    sha: "b".repeat(40),
+  };
+  const kind = "commit_check_publication";
+  const identity = { repo: lifecycle.repository, sha: lifecycle.sha };
+  const requestSha256 = createHash("sha256").update(JSON.stringify(identity)).digest("hex");
+  const idempotencyIdentity = {
+    operation: lifecycle,
+    mutation: kind,
+    requestSha256,
+  };
+
+  try {
+    assert.throws(
+      () =>
+        runCommitMutation(lifecycle, {
+          kind,
+          identity,
+          operation: () => {
+            throw new Error("response lost after publication");
+          },
+        }),
+      /response lost/,
+    );
+    recordCommitLifecycleEvent(lifecycle, {
+      type: ACTION_EVENT_TYPES.publicationLifecycle,
+      status: "executed",
+      reasonCode: "already_complete",
+      mutation: true,
+      retryable: false,
+      component: "commit_review",
+      state: "mutation_observed",
+      completionReason: "mutation_observed",
+      publicationKind: kind,
+      eventIdentity: { kind, requestSha256, outcome: "observed" },
+      idempotencyIdentity,
+    });
+    recordCommitWorkflowEvent(lifecycle, "failed", new Error("later workflow failure"));
+    await flushWorkflowActionEvents(root);
+
+    const failed = readEvents(outputRoot).find(
+      (event) =>
+        event.event_type === ACTION_EVENT_TYPES.workflowAttempt &&
+        event.attributes?.state === "failed",
+    );
+    assert.equal(failed?.action.mutation, true);
+    assert.equal(failed?.action.retryable, false);
+    assert.equal(failed?.attributes?.completion_reason, "mutation_observed");
+  } finally {
+    restoreEnv(previous);
+    fs.rmSync(root, { force: true, recursive: true });
+  }
+});
+
+test("commit mutation confirmation does not resolve an unrelated receipt key", async () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "commit-key-ledger-")));
+  const outputRoot = path.join(root, "output");
+  fs.mkdirSync(outputRoot);
+  const previous = { ...process.env };
+  Object.assign(process.env, workflowEnv(root, outputRoot));
+  const lifecycle = {
+    repository: "openclaw/openclaw",
+    sha: "b".repeat(40),
+  };
+
+  try {
+    assert.throws(
+      () =>
+        runCommitMutation(lifecycle, {
+          kind: "commit_check_publication",
+          identity: { repo: lifecycle.repository, sha: lifecycle.sha, channel: "check" },
+          operation: () => {
+            throw new Error("response lost after check publication");
+          },
+        }),
+      /response lost/,
+    );
+    runCommitMutation(lifecycle, {
+      kind: "commit_check_publication",
+      identity: { repo: lifecycle.repository, sha: lifecycle.sha, channel: "summary" },
+      operation: () => undefined,
+    });
+    recordCommitWorkflowEvent(lifecycle, "failed", new Error("later workflow failure"));
+    await flushWorkflowActionEvents(root);
+
+    const failed = readEvents(outputRoot).find(
+      (event) =>
+        event.event_type === ACTION_EVENT_TYPES.workflowAttempt &&
+        event.attributes?.state === "failed",
+    );
+    assert.equal(failed?.action.mutation, true);
+    assert.equal(failed?.action.retryable, true);
+    assert.equal(failed?.attributes?.completion_reason, "mutation_outcome_unknown");
+  } finally {
+    restoreEnv(previous);
+    fs.rmSync(root, { force: true, recursive: true });
+  }
+});
+
 test("commit publication preserves its primary failure when receipt recording also fails", () => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "commit-primary-error-")));
   const outputRoot = path.join(root, "output");
