@@ -16,7 +16,7 @@ test("failed-run self-heal preserves legacy retry budgets and skips removed jobs
     /\(attemptCountsByIdentity\.get\(immutableKey\) \?\? 0\) \+\s+\(legacyAttemptCountsByJob\.get\(sourceJob\) \?\? 0\)/,
   );
   assert.match(source, /reason: "missing_job_file"/);
-  assert.match(source, /if \(!isMissingCurrentStateJob\(error\)\) throw error/);
+  assert.match(source, /if \(!isMissingImmutableJobError\(error\)\) throw error/);
   assert.ok(
     source.indexOf('reason: "missing_job_file"') < source.indexOf("activeJobGenerations.get("),
   );

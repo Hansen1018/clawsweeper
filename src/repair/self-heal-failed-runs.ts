@@ -18,6 +18,7 @@ import { REPAIR_CLUSTER_WORKFLOW } from "./constants.js";
 import { shouldSelfHealRunRecord } from "./self-heal-policy.js";
 import {
   immutableJobIdentityKey,
+  isMissingImmutableJobError,
   resolveCurrentStateJobIdentity,
 } from "./immutable-job-handoff.js";
 import { activeRepairJobGenerations as listActiveRepairJobGenerations } from "./live-worker-capacity.js";
@@ -227,7 +228,7 @@ function selectCandidates() {
       try {
         immutableJob = resolveCurrentStateJobIdentity(sourceJob);
       } catch (error) {
-        if (!isMissingCurrentStateJob(error)) throw error;
+        if (!isMissingImmutableJobError(error)) throw error;
         skippedCandidates.push({
           reason: "missing_job_file",
           run_id: record.run_id ?? null,
@@ -571,11 +572,6 @@ function attemptImmutableJobKey(attempt: LooseRecord): string | null {
 function legacyAttemptJobPath(attempt: LooseRecord): string | null {
   const jobPath = String(attempt.source_job ?? "").trim();
   return /^jobs\/[A-Za-z0-9_.-]+\/inbox\/[A-Za-z0-9_.-]+\.md$/.test(jobPath) ? jobPath : null;
-}
-
-function isMissingCurrentStateJob(error: unknown): boolean {
-  const detail = error instanceof Error ? error.message : String(error);
-  return /immutable job is missing at [^:]+:jobs\/[^/]+\/inbox\/[^/]+\.md$/.test(detail);
 }
 
 function selfHealDispatchLifecycle(candidate: LooseRecord): RepairLifecycleInput {

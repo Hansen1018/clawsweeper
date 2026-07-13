@@ -118,6 +118,13 @@ export function immutableJobIdentityKey({
   ].join(":");
 }
 
+export function isMissingImmutableJobError(error: unknown): boolean {
+  const detail = error instanceof Error ? error.message : String(error);
+  return /^immutable job is missing at [a-f0-9]{40}:jobs\/[A-Za-z0-9_.-]+\/inbox\/[A-Za-z0-9_.-]+\.md(?:\s|:|$)/.test(
+    detail,
+  );
+}
+
 function parseImmutableJob(jobPath: string, bytes: Buffer): ParsedJob {
   const raw = bytes.toString("utf8");
   if (!Buffer.from(raw, "utf8").equals(bytes)) {

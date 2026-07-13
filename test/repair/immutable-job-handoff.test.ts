@@ -7,6 +7,11 @@ import path from "node:path";
 import test from "node:test";
 import { parse } from "yaml";
 
+import {
+  isMissingImmutableJobError,
+  resolveCurrentStateJobIdentity,
+} from "../../dist/repair/immutable-job-handoff.js";
+
 const workerWorkflowPath = ".github/workflows/repair-cluster-worker.yml";
 const commitIntakeWorkflowPath = ".github/workflows/repair-commit-finding-intake.yml";
 const issueIntakeWorkflowPath = ".github/workflows/repair-issue-implementation-intake.yml";
@@ -304,6 +309,25 @@ test("repair operational callers resolve immutable state before dedupe and dispa
     conflict.indexOf("resolveCurrentStateJobIdentity(candidate.job_path)") <
       conflict.indexOf("dispatchRepair(candidate)"),
   );
+});
+
+test("removed immutable jobs are recognized despite appended git diagnostics", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-missing-immutable-job-"));
+  fs.writeFileSync(path.join(root, "README.md"), "state fixture\n");
+  commitImmutableState(root);
+
+  assert.throws(
+    () =>
+      resolveCurrentStateJobIdentity("jobs/openclaw/inbox/deleted.md", {
+        stateRoot: root,
+      }),
+    (error) => {
+      assert.equal(isMissingImmutableJobError(error), true);
+      assert.match(String(error), /fatal: path .* does not exist/);
+      return true;
+    },
+  );
+  assert.equal(isMissingImmutableJobError(new Error("state revision is malformed")), false);
 });
 
 test("create-job refuses dispatch before a published immutable identity exists", () => {
