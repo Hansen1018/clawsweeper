@@ -7,7 +7,7 @@ import {
   ACTION_EVENT_STATUSES,
   ACTION_EVENT_TYPES,
 } from "../action-ledger.js";
-import { githubActionsRunUrl, parseArgs, repoRoot } from "./lib.js";
+import { githubActionsRunUrl, parseArgs, parseJob, repoRoot } from "./lib.js";
 import { readJsonFile as readJson } from "./json-file.js";
 import { escapeRegExp, slug } from "./text-utils.js";
 import { renderClusterReport, writeClosedRecord } from "./publish-cluster-report.js";
@@ -117,7 +117,14 @@ function publishResult(resultPath: string) {
   const postFlightReport = readSiblingJson(runDir, "post-flight-report.json") ?? { actions: [] };
   const fixReport = readSiblingJson(runDir, "fix-execution-report.json") ?? { actions: [] };
   const clusterPlan = readSiblingJson(runDir, "cluster-plan.json");
-  const reviewedTargetRevision = reviewedResultRevision(result, clusterPlan);
+  const reviewedTargetRevision = reviewedResultRevision(
+    result,
+    clusterPlan,
+    readPublishedSourceContext(runDir),
+  );
+  if (!reviewedTargetRevision) {
+    throw new Error(`repair result is missing one exact reviewed target revision: ${resultPath}`);
+  }
   const runId = String(args["run-id"] ?? inferRunId(resultPath) ?? "");
   const metadata = runId ? metadataByRunId.get(runId) : undefined;
   const previousRecord = runId ? readExistingRunRecord(root, runId) : null;
@@ -237,6 +244,11 @@ function publishResult(resultPath: string) {
     fix_counts: report.fix_counts,
     apply_counts: report.apply_counts,
   };
+}
+
+function readPublishedSourceContext(runDir: string): LooseRecord | null {
+  const sourceJobPath = path.resolve(runDir, "..", "job.md");
+  return fs.existsSync(sourceJobPath) ? parseJob(sourceJobPath).frontmatter : null;
 }
 
 function updateDashboard() {

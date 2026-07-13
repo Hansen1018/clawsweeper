@@ -52,6 +52,10 @@ test("repair sessions, statuses, and result publication flush immutable receipts
   assert.match(publisher, /recordRepairLifecycleFailureSafely/);
   assert.match(
     publisher,
+    /reviewedResultRevision\([\s\S]*readPublishedSourceContext\(runDir\)[\s\S]*missing one exact reviewed target revision/,
+  );
+  assert.match(
+    publisher,
     /eventIdentity:\s*\{\s*publicationKind: "cluster_result",\s*runId: runId \|\| clusterId/,
   );
   assert.doesNotMatch(publisher, /recordAggregatePublication\([^)]*,/);
