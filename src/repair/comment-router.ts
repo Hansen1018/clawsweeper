@@ -20,6 +20,7 @@ import {
   automergeAttemptReceiptOutcome,
   automergeCommandFailure,
   automergeCommandResponseAmbiguous,
+  automergeEffectDefinitelyAbsent,
   automergeUnconfirmedFailureDisposition,
   confirmAutomergeEffectSnapshot,
   expectedSquashCommitMessage,
@@ -4541,7 +4542,6 @@ function exactHeadAutomergePendingReason(command: LooseRecord, view: LooseRecord
 
 function fetchAutomergeEffectSnapshot(number: JsonValue) {
   const pull = ghJson(["api", `repos/${targetRepo}/pulls/${number}`], { attempts: 1 });
-  if (pull.merged_at) return { pull, view: {} };
   const view = ghJson(
     [
       "pr",
@@ -4550,7 +4550,7 @@ function fetchAutomergeEffectSnapshot(number: JsonValue) {
       "--repo",
       targetRepo,
       "--json",
-      ["autoMergeRequest", "headRefOid", "isInMergeQueue"].join(","),
+      ["autoMergeRequest", "headRefOid", "isInMergeQueue", "mergedAt", "state"].join(","),
     ],
     { attempts: 1 },
   );
@@ -4615,14 +4615,11 @@ function claimAutomergeMergeRequest(command: LooseRecord): ExactHeadMergeClaimRe
           return trusted ? "accepted" : "unknown";
         },
       }),
-    dispatchedClaimEffectAbsent: () => {
-      const confirmation = confirmAutomergeEffectSnapshot(
+    dispatchedClaimEffectAbsent: () =>
+      automergeEffectDefinitelyAbsent(
         fetchAutomergeEffectSnapshot(request.number),
         request.headSha,
-        { requireSquashMethod: false },
-      );
-      return !confirmation.block && !confirmation.mergedAt && !confirmation.pendingReason;
-    },
+      ),
     recoverClaim: (candidate) =>
       exactHeadMergeClaimRecoveryDecision(candidate, (path) =>
         ghJson(["api", path], {

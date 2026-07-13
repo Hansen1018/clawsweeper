@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { automergeEffectDefinitelyAbsent } from "../../dist/repair/automerge-effect.js";
 import { readText } from "../helpers.ts";
 
 test("comment router records receipts after durable command boundaries", () => {
@@ -93,6 +94,14 @@ test("automerge reconciles command responses inside the merge receipt without ce
     source.indexOf("function executeAutomerge("),
     source.indexOf("function automergeReadinessAction("),
   );
+  const fetchEffectSnapshot = source.slice(
+    source.indexOf("function fetchAutomergeEffectSnapshot("),
+    source.indexOf("function fetchAutomergeSquashCommitProof("),
+  );
+  const claimMergeRequest = source.slice(
+    source.indexOf("function claimAutomergeMergeRequest("),
+    source.indexOf("function inspectAutomergeMergeClaim("),
+  );
 
   assert.match(
     executeAutomerge,
@@ -109,17 +118,19 @@ test("automerge reconciles command responses inside the merge receipt without ce
   );
   assert.doesNotMatch(executeAutomerge, /"merge confirmed after ambiguous response"/);
   assert.match(
-    source,
-    /function fetchAutomergeEffectSnapshot[\s\S]*repos\/\$\{targetRepo\}\/pulls\/\$\{number\}[\s\S]*attempts: 1[\s\S]*"pr",[\s\S]*"view"[\s\S]*"isInMergeQueue"[\s\S]*attempts: 1/,
+    fetchEffectSnapshot,
+    /repos\/\$\{targetRepo\}\/pulls\/\$\{number\}[\s\S]*attempts: 1[\s\S]*"pr",[\s\S]*"view"[\s\S]*"autoMergeRequest"[\s\S]*"headRefOid"[\s\S]*"isInMergeQueue"[\s\S]*"mergedAt"[\s\S]*"state"[\s\S]*attempts: 1/,
   );
+  assert.doesNotMatch(fetchEffectSnapshot, /if \(pull\.merged_at\) return/);
   assert.match(
     source,
     /function fetchAutomergeSquashCommitProof[\s\S]*repos\/\$\{targetRepo\}\/commits\/\$\{mergeCommitSha\}/,
   );
   assert.match(
-    source,
-    /function claimAutomergeMergeRequest[\s\S]*dispatchedClaimEffectAbsent:[\s\S]*requireSquashMethod: false/,
+    claimMergeRequest,
+    /dispatchedClaimEffectAbsent: \(\) =>[\s\S]*automergeEffectDefinitelyAbsent\([\s\S]*fetchAutomergeEffectSnapshot\(request\.number\),[\s\S]*request\.headSha/,
   );
+  assert.doesNotMatch(claimMergeRequest, /confirmAutomergeEffectSnapshot/);
   assert.match(executeAutomerge, /outcome: automergeAttemptReceiptOutcome/);
   assert.match(
     executeAutomerge,
@@ -136,6 +147,32 @@ test("automerge reconciles command responses inside the merge receipt without ce
   assert.match(
     source,
     /const merge = executeAutomerge\(command\);[\s\S]*if \(applyAutomergeResultToCommand\(command, merge\)\) return;/,
+  );
+});
+
+test("automerge claim recovery preserves a GraphQL-observed merge after a stale REST read", () => {
+  const headSha = "a".repeat(40);
+
+  assert.equal(
+    automergeEffectDefinitelyAbsent(
+      {
+        pull: {
+          head: { sha: headSha },
+          merged_at: null,
+          merge_commit_sha: null,
+          auto_merge: null,
+        },
+        view: {
+          headRefOid: headSha,
+          mergedAt: "2026-07-13T21:00:00Z",
+          state: "MERGED",
+          isInMergeQueue: false,
+          autoMergeRequest: null,
+        },
+      },
+      headSha,
+    ),
+    false,
   );
 });
 
