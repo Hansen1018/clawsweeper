@@ -44,14 +44,14 @@ export function guardAutomergeMergeDispatch(options: {
     return rejectDispatchedClaim(dispatch, strictBaseBindingBlock, options.rejectDispatched);
   }
 
-  const finalStateBlock = options.finalStateBlock();
-  if (finalStateBlock) {
-    return rejectDispatchedClaim(dispatch, finalStateBlock, options.rejectDispatched);
-  }
-
   const finalActivityBlock = options.reviewActivityBlock();
   if (finalActivityBlock) {
     return rejectDispatchedClaim(dispatch, finalActivityBlock, options.rejectDispatched);
+  }
+
+  const finalStateBlock = options.finalStateBlock();
+  if (finalStateBlock) {
+    return rejectDispatchedClaim(dispatch, finalStateBlock, options.rejectDispatched);
   }
 
   return { status: "ready", dispatch };

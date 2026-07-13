@@ -195,7 +195,7 @@ test("merge becomes ready only after activity and strict-base checks pass", () =
     },
   });
 
-  assert.deepEqual(calls, ["mark", "activity", "policy", "state", "activity"]);
+  assert.deepEqual(calls, ["mark", "activity", "policy", "activity", "state"]);
   assert.equal(result.status, "ready");
 });
 
@@ -238,7 +238,7 @@ test("review activity arriving during policy refresh retires the dispatched clai
     },
   });
 
-  assert.deepEqual(calls, ["mark", "activity", "policy", "state", "activity", "reject"]);
+  assert.deepEqual(calls, ["mark", "activity", "policy", "activity", "reject"]);
   assert.equal(result.status, "aborted");
   if (result.status !== "aborted") return;
   assert.deepEqual(result.action, {
@@ -279,7 +279,7 @@ test("base retarget arriving during policy refresh retires the dispatched claim"
     },
   });
 
-  assert.deepEqual(calls, ["mark", "activity", "policy", "state", "reject"]);
+  assert.deepEqual(calls, ["mark", "activity", "policy", "activity", "state", "reject"]);
   assert.equal(result.status, "aborted");
   if (result.status !== "aborted") return;
   assert.deepEqual(result.action, {
