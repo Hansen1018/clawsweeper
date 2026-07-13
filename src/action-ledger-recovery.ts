@@ -15,7 +15,11 @@ import {
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 
-import { processIncarnationIdentitySha256, processIsDefunct } from "./action-ledger-files.js";
+import {
+  fsyncDirectory,
+  processIncarnationIdentitySha256,
+  processIsDefunct,
+} from "./action-ledger-files.js";
 import { actionLedgerJson } from "./action-ledger.js";
 
 const MUTATION_RECOVERY_SCHEMA = "clawsweeper.action-ledger-mutation-recovery";
@@ -112,7 +116,7 @@ export function writeMutationRecovery<T>(
       closeSync(temporaryDescriptor);
     }
     renameSync(temporary, target);
-    synchronizeDirectory(directory);
+    fsyncDirectory(directory, "mutation recovery");
   } finally {
     rmSync(temporary, { force: true });
   }
@@ -208,21 +212,20 @@ function prepareMutationRecoveryDirectory(recoveryRoot: string, family: string):
   mkdirSync(root, { recursive: true, mode: 0o700 });
   assertDirectory(root);
   const parent = path.join(root, ".mutation-recovery");
-  if (!existsSync(parent)) mkdirSync(parent, { mode: 0o700 });
-  assertDirectory(parent);
+  ensureMutationRecoveryDirectory(root, parent);
   const directory = mutationRecoveryDirectory(root, family);
-  if (!existsSync(directory)) mkdirSync(directory, { mode: 0o700 });
-  assertDirectory(directory);
+  ensureMutationRecoveryDirectory(parent, directory);
   return directory;
 }
 
-function synchronizeDirectory(directory: string): void {
-  const descriptor = openSync(directory, "r");
+function ensureMutationRecoveryDirectory(parent: string, directory: string): void {
   try {
-    fsyncSync(descriptor);
-  } finally {
-    closeSync(descriptor);
+    mkdirSync(directory, { mode: 0o700 });
+  } catch (error) {
+    if (!isAlreadyExistsError(error)) throw error;
   }
+  assertDirectory(directory);
+  fsyncDirectory(parent, "mutation recovery directory");
 }
 
 function assertMutationRecoveryIdentity(family: string, key: string): void {
@@ -236,6 +239,12 @@ function assertMutationRecoveryFamily(family: string): void {
   if (!MUTATION_RECOVERY_FAMILY_PATTERN.test(family)) {
     throw new Error("mutation recovery family is invalid");
   }
+}
+
+function isAlreadyExistsError(error: unknown): boolean {
+  return (
+    error instanceof Error && "code" in error && (error as NodeJS.ErrnoException).code === "EEXIST"
+  );
 }
 
 function assertDirectory(directory: string): void {

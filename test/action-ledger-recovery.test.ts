@@ -16,6 +16,12 @@ test("mutation recovery writers sync content and its directory around the atomic
   assert.equal(result.targetExists, true);
   assert.deepEqual(result.temporaryEntries, []);
   assert.deepEqual(result.events, [
+    "open:root-directory",
+    "fsync:root-directory",
+    "close:root-directory",
+    "open:recovery-parent-directory",
+    "fsync:recovery-parent-directory",
+    "close:recovery-parent-directory",
     "open:temporary",
     "write:temporary",
     "fsync:temporary",
@@ -35,6 +41,12 @@ test("mutation recovery writers do not rename when syncing staged content fails"
   assert.equal(result.targetExists, false);
   assert.deepEqual(result.temporaryEntries, []);
   assert.deepEqual(result.events, [
+    "open:root-directory",
+    "fsync:root-directory",
+    "close:root-directory",
+    "open:recovery-parent-directory",
+    "fsync:recovery-parent-directory",
+    "close:recovery-parent-directory",
     "open:temporary",
     "write:temporary",
     "fsync:temporary",
@@ -50,6 +62,12 @@ test("mutation recovery writers retain the renamed WAL but fail closed when dire
   assert.equal(result.targetExists, true);
   assert.deepEqual(result.temporaryEntries, []);
   assert.deepEqual(result.events, [
+    "open:root-directory",
+    "fsync:root-directory",
+    "close:root-directory",
+    "open:recovery-parent-directory",
+    "fsync:recovery-parent-directory",
+    "close:recovery-parent-directory",
     "open:temporary",
     "write:temporary",
     "fsync:temporary",
@@ -58,6 +76,38 @@ test("mutation recovery writers retain the renamed WAL but fail closed when dire
     "open:directory",
     "fsync:directory",
     "close:directory",
+    "cleanup:temporary",
+  ]);
+});
+
+test("mutation recovery writers fail before staging when a new family entry is not durable", async () => {
+  const result = await runInstrumentedWriter("fail-recovery-parent-directory-fsync");
+
+  assert.equal(result.outcome, "EIO: recovery-parent-directory fsync failed");
+  assert.equal(result.targetExists, false);
+  assert.deepEqual(result.temporaryEntries, []);
+  assert.deepEqual(result.events, [
+    "open:root-directory",
+    "fsync:root-directory",
+    "close:root-directory",
+    "open:recovery-parent-directory",
+    "fsync:recovery-parent-directory",
+    "close:recovery-parent-directory",
+  ]);
+});
+
+test("mutation recovery writers skip unsupported directory synchronization on Windows", async () => {
+  const result = await runInstrumentedWriter("win32");
+
+  assert.equal(result.outcome, "success");
+  assert.equal(result.targetExists, true);
+  assert.deepEqual(result.temporaryEntries, []);
+  assert.deepEqual(result.events, [
+    "open:temporary",
+    "write:temporary",
+    "fsync:temporary",
+    "close:temporary",
+    "rename",
     "cleanup:temporary",
   ]);
 });
@@ -206,7 +256,12 @@ process.stdout.write(JSON.stringify({ first, second }));
   }
 });
 
-type InstrumentedWriterMode = "success" | "fail-temporary-fsync" | "fail-directory-fsync";
+type InstrumentedWriterMode =
+  | "success"
+  | "fail-temporary-fsync"
+  | "fail-directory-fsync"
+  | "fail-recovery-parent-directory-fsync"
+  | "win32";
 
 type InstrumentedWriterResult = {
   outcome: string;
@@ -231,11 +286,16 @@ import path from "node:path";
 import { syncBuiltinESMExports } from "node:module";
 
 const [root, key, moduleUrl, mode] = process.argv.slice(1);
-const directory = path.join(root, ".mutation-recovery", "repair");
-const target = path.join(directory, \`\${key}.json\`);
-const surrogate = path.join(root, "directory-sync-surrogate");
-const events = [];
-const descriptorKinds = new Map();
+  const directory = path.join(root, ".mutation-recovery", "repair");
+  const recoveryParent = path.dirname(directory);
+  const target = path.join(directory, \`\${key}.json\`);
+  const events = [];
+  const descriptorKinds = new Map();
+  const directoryKinds = new Map([
+    [root, "root-directory"],
+    [recoveryParent, "recovery-parent-directory"],
+    [directory, "directory"],
+  ]);
 const originalOpenSync = fs.openSync;
 const originalWriteFileSync = fs.writeFileSync;
 const originalFsyncSync = fs.fsyncSync;
@@ -243,12 +303,12 @@ const originalCloseSync = fs.closeSync;
 const originalRenameSync = fs.renameSync;
 const originalRmSync = fs.rmSync;
 
-originalWriteFileSync(surrogate, "sync\\n");
 fs.openSync = (filePath, flags, permissions) => {
-  if (String(filePath) === directory) {
-    const descriptor = originalOpenSync(surrogate, "r+");
-    descriptorKinds.set(descriptor, "directory");
-    events.push("open:directory");
+  const directoryKind = directoryKinds.get(String(filePath));
+  if (directoryKind) {
+    const descriptor = originalOpenSync(filePath, flags, permissions);
+    descriptorKinds.set(descriptor, directoryKind);
+    events.push(\`open:\${directoryKind}\`);
     return descriptor;
   }
   const descriptor = originalOpenSync(filePath, flags, permissions);
@@ -290,6 +350,14 @@ fs.rmSync = (filePath, options) => {
 };
 syncBuiltinESMExports();
 
+if (mode === "win32") {
+  const actionLedgerFilesModuleUrl = new URL("./action-ledger-files.js", moduleUrl).href;
+  const { processIncarnationIdentitySha256 } = await import(actionLedgerFilesModuleUrl);
+  if (!processIncarnationIdentitySha256()) {
+    throw new Error("unable to seed process incarnation identity");
+  }
+  Object.defineProperty(process, "platform", { value: "win32" });
+}
 const { writeMutationRecovery } = await import(moduleUrl);
 let outcome = "success";
 try {

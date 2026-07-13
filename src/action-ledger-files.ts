@@ -955,7 +955,7 @@ function validateRelativePath(relativePath: string, label: string): void {
   }
 }
 
-function fsyncDirectory(directory: string, label: string): void {
+export function fsyncDirectory(directory: string, label: string): void {
   if (process.platform === "win32") return;
   const descriptor = fs.openSync(directory, fs.constants.O_RDONLY | DIRECTORY | NO_FOLLOW);
   try {
