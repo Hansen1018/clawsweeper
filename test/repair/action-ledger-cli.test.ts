@@ -19,9 +19,13 @@ test("action-ledger CLI accepts the package-manager argument separator", () => {
 });
 
 test("action-ledger CLI accepts an explicitly empty finalization", () => {
-  const outputRoot = fs.realpathSync(
+  const root = fs.realpathSync(
     fs.mkdtempSync(path.join(os.tmpdir(), "command-action-ledger-empty-")),
   );
+  const spoolRoot = path.join(root, "spool");
+  const outputRoot = path.join(root, "output");
+  fs.mkdirSync(spoolRoot);
+  fs.mkdirSync(outputRoot);
   try {
     const result = spawnSync(
       process.execPath,
@@ -37,6 +41,7 @@ test("action-ledger CLI accepts an explicitly empty finalization", () => {
         env: {
           ...process.env,
           CLAWSWEEPER_ACTION_LEDGER_FORCE: "1",
+          CLAWSWEEPER_ACTION_LEDGER_ROOT: spoolRoot,
           CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT: outputRoot,
         },
       },
@@ -45,7 +50,7 @@ test("action-ledger CLI accepts an explicitly empty finalization", () => {
     assert.equal(result.status, 0, result.stderr);
     assert.equal(result.stdout, "");
   } finally {
-    fs.rmSync(outputRoot, { force: true, recursive: true });
+    fs.rmSync(root, { force: true, recursive: true });
   }
 });
 
