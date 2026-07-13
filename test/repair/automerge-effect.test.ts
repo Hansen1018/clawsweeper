@@ -10,6 +10,7 @@ import {
   ensureExactHeadMergeClaim,
   exactHeadMergeClaimBody,
   exactHeadMergeClaimRecoveryDecision,
+  exactHeadMergeClaimWorkflowRunEnv,
   inspectExactHeadMergeClaim,
   releaseExactHeadMergeClaim,
 } from "../../dist/repair/exact-head-merge-claim.js";
@@ -275,9 +276,56 @@ test("terminal stale claims are retired before a fresh workflow may reacquire", 
   assert.equal(reacquired.claimId, 1503);
 });
 
+test("cross-lane recovery preserves the original claim owner", () => {
+  const comments: Record<string, any>[] = [];
+  let nextId = 1601;
+  const request = (owner: string, runId: number) => ({
+    repository: "openclaw/openclaw",
+    number: 42,
+    headSha,
+    method: "squash" as const,
+    owner,
+    claimant: `${owner}:${runId}:1`,
+    appId: 3306130,
+    appSlug: "clawsweeper",
+  });
+  const io = {
+    listComments: () => comments,
+    createComment: (body: string) => {
+      const comment = {
+        id: nextId++,
+        body,
+        created_at: "2026-07-13T08:00:00Z",
+        performed_via_github_app: { id: 3306130, slug: "clawsweeper" },
+        user: { login: "clawsweeper[bot]" },
+      };
+      comments.push(comment);
+      return comment;
+    },
+  };
+
+  assert.equal(ensureExactHeadMergeClaim(request("comment_router", 7101), io).status, "acquired");
+  const recovered = ensureExactHeadMergeClaim(request("post_flight", 7102), {
+    ...io,
+    recoverClaim: (candidate) => {
+      assert.equal(candidate.owner, "comment_router");
+      return { status: "recoverable" as const, reason: "prior workflow attempt is terminal" };
+    },
+  });
+  assert.equal(recovered.status, "recovered");
+  assert.match(comments[1].body, /owner=comment_router/);
+  assert.match(comments[1].body, /recoverer=post_flight%3A7102%3A1/);
+  assert.equal(
+    inspectExactHeadMergeClaim(request("post_flight", 7102), io.listComments).status,
+    "released",
+  );
+  assert.equal(ensureExactHeadMergeClaim(request("post_flight", 7102), io).status, "acquired");
+});
+
 test("claim recovery requires an aged claim and the exact workflow attempt to be terminal", () => {
   const candidate = {
     claimId: 1501,
+    owner: "comment_router",
     claimant: "comment_router:7001:2",
     createdAt: "2026-07-13T08:00:00Z",
   };
@@ -312,6 +360,25 @@ test("claim recovery requires an aged claim and the exact workflow attempt to be
       Date.parse("2026-07-13T08:01:00Z"),
     ).status,
     "active",
+  );
+});
+
+test("claim recovery reads central workflow state with the central token", () => {
+  assert.deepEqual(
+    exactHeadMergeClaimWorkflowRunEnv({
+      CLAWSWEEPER_WORKFLOW_GH_TOKEN: "central-token",
+      GH_TOKEN: "target-token",
+      GITHUB_TOKEN: "target-token",
+    }),
+    {
+      CLAWSWEEPER_WORKFLOW_GH_TOKEN: "central-token",
+      GH_TOKEN: "central-token",
+      GITHUB_TOKEN: "central-token",
+    },
+  );
+  assert.throws(
+    () => exactHeadMergeClaimWorkflowRunEnv({ GH_TOKEN: "target-token" }),
+    /central workflow read token is required/,
   );
 });
 

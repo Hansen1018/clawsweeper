@@ -27,6 +27,7 @@ import {
   ensureExactHeadMergeClaim,
   exactHeadMergeClaimIdentity,
   exactHeadMergeClaimRecoveryDecision,
+  exactHeadMergeClaimWorkflowRunEnv,
   exactHeadMergeClaimant,
   isTrustedExactHeadMergeClaimComment,
   isTrustedExactHeadMergeClaimRecoveryComment,
@@ -4050,6 +4051,7 @@ function executeAutomerge(command: LooseRecord): LooseRecord {
         status: "existing",
         reason: `merge dispatch started but receipt finalization failed: ${compactGhError(error)}`,
         claimId: mergeClaim.claimId,
+        owner: automergeMergeClaimRequest(command).owner,
         claimant: automergeMergeClaimRequest(command).claimant,
         createdAt: null,
       },
@@ -4298,6 +4300,7 @@ function claimAutomergeMergeRequest(command: LooseRecord): ExactHeadMergeClaimRe
             : {
                 ...exactHeadMergeClaimIdentity(request),
                 claimId: context.claimId,
+                owner: context.owner,
                 claimant: context.claimant,
               },
         operation: () =>
@@ -4318,6 +4321,7 @@ function claimAutomergeMergeRequest(command: LooseRecord): ExactHeadMergeClaimRe
                   comment,
                   request,
                   context.claimId,
+                  context.owner,
                   context.claimant,
                 );
           return trusted ? "accepted" : "unknown";
@@ -4325,7 +4329,10 @@ function claimAutomergeMergeRequest(command: LooseRecord): ExactHeadMergeClaimRe
       }),
     recoverClaim: (candidate) =>
       exactHeadMergeClaimRecoveryDecision(candidate, (path) =>
-        ghJson(["api", path], { attempts: 1 }),
+        ghJson(["api", path], {
+          attempts: 1,
+          env: exactHeadMergeClaimWorkflowRunEnv(),
+        }),
       ),
   });
 }

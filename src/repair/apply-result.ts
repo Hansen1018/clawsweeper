@@ -40,6 +40,7 @@ import {
   ensureExactHeadMergeClaim,
   exactHeadMergeClaimIdentity,
   exactHeadMergeClaimRecoveryDecision,
+  exactHeadMergeClaimWorkflowRunEnv,
   exactHeadMergeClaimant,
   inspectExactHeadMergeClaim,
   isTrustedExactHeadMergeClaimComment,
@@ -1268,6 +1269,7 @@ function claimApplyMergeRequest(repository: string, number: number, headSha: str
             : {
                 ...exactHeadMergeClaimIdentity(request),
                 claimId: context.claimId,
+                owner: context.owner,
                 claimant: context.claimant,
               },
         component: "merge_claim",
@@ -1286,13 +1288,16 @@ function claimApplyMergeRequest(repository: string, number: number, headSha: str
                   comment,
                   request,
                   context.claimId,
+                  context.owner,
                   context.claimant,
                 );
           return trusted ? "accepted" : "unknown";
         },
       }),
     recoverClaim: (candidate) =>
-      exactHeadMergeClaimRecoveryDecision(candidate, (path) => ghJsonOnce(["api", path])),
+      exactHeadMergeClaimRecoveryDecision(candidate, (path) =>
+        ghJsonOnce(["api", path], { env: exactHeadMergeClaimWorkflowRunEnv() }),
+      ),
   });
 }
 

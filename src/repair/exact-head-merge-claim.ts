@@ -31,6 +31,7 @@ export type ExactHeadMergeClaimResult =
       status: "existing";
       reason: string;
       claimId: number;
+      owner: string;
       claimant: string;
       createdAt: string | null;
     }
@@ -52,6 +53,7 @@ export type ExactHeadMergeClaimReleaseResult =
 
 export type ExactHeadMergeClaimRecoveryCandidate = {
   claimId: number;
+  owner: string;
   claimant: string;
   createdAt: string | null;
 };
@@ -63,7 +65,7 @@ export type ExactHeadMergeClaimRecoveryDecision =
 
 type ClaimCommentContext =
   | { kind: "claim" }
-  | { kind: "recovery"; claimId: number; claimant: string };
+  | { kind: "recovery"; claimId: number; owner: string; claimant: string };
 
 type ParsedClaim = ExactHeadMergeClaimIdentity & {
   owner: string;
@@ -147,13 +149,20 @@ export function exactHeadMergeClaimReleaseBody(
 export function exactHeadMergeClaimRecoveryBody(
   request: ExactHeadMergeClaimRequest,
   claimId: number,
+  owner: string,
   claimant: string,
 ): string {
   const normalized = normalizeRequest(request);
   const normalizedClaimId = normalizeCommentId(claimId, "claim");
+  const normalizedOwner = normalizeOwner(owner);
   const normalizedClaimant = normalizeClaimant(claimant);
   return [
-    exactHeadMergeRecoveryMarker(normalized, normalizedClaimId, normalizedClaimant),
+    exactHeadMergeRecoveryMarker(
+      normalized,
+      normalizedClaimId,
+      normalizedOwner,
+      normalizedClaimant,
+    ),
     `ClawSweeper retired stale exact-head squash merge reservation ${normalizedClaimId} for \`${normalized.headSha.slice(0, 12)}\` after its workflow attempt became terminal. A fresh workflow pass must re-read live state before dispatch.`,
   ].join("\n");
 }
@@ -201,10 +210,12 @@ export function isTrustedExactHeadMergeClaimRecoveryComment(
   comment: LooseRecord,
   request: ExactHeadMergeClaimRequest,
   claimId: number,
+  owner: string,
   claimant: string,
 ): boolean {
   const normalized = normalizeRequest(request);
   const normalizedClaimId = normalizeCommentId(claimId, "claim");
+  const normalizedOwner = normalizeOwner(owner);
   const normalizedClaimant = normalizeClaimant(claimant);
   if (!trustedClaimAuthor(comment, normalized)) return false;
   const body = String(comment.body ?? "");
@@ -216,7 +227,7 @@ export function isTrustedExactHeadMergeClaimRecoveryComment(
     recoveries.length === 1 &&
     recoveries[0]!.claimId === normalizedClaimId &&
     sameClaim(recoveries[0]!, normalized) &&
-    recoveries[0]!.owner === normalized.owner &&
+    recoveries[0]!.owner === normalizedOwner &&
     recoveries[0]!.claimant === normalizedClaimant &&
     recoveries[0]!.recoverer === normalized.claimant
   );
@@ -241,6 +252,7 @@ export function ensureExactHeadMergeClaim(
     try {
       recoveryDecision = io.recoverClaim({
         claimId: initial.claimId,
+        owner: initial.owner,
         claimant: initial.claimant,
         createdAt: initial.createdAt,
       });
@@ -263,8 +275,18 @@ export function ensureExactHeadMergeClaim(
     let createError = "";
     try {
       io.createComment(
-        exactHeadMergeClaimRecoveryBody(normalized, initial.claimId, initial.claimant),
-        { kind: "recovery", claimId: initial.claimId, claimant: initial.claimant },
+        exactHeadMergeClaimRecoveryBody(
+          normalized,
+          initial.claimId,
+          initial.owner,
+          initial.claimant,
+        ),
+        {
+          kind: "recovery",
+          claimId: initial.claimId,
+          owner: initial.owner,
+          claimant: initial.claimant,
+        },
       );
     } catch (error) {
       createError = errorText(error);
@@ -275,7 +297,7 @@ export function ensureExactHeadMergeClaim(
       (candidate) =>
         candidate.recovery.claimId === initial.claimId &&
         sameClaim(candidate.recovery, normalized) &&
-        candidate.recovery.owner === normalized.owner &&
+        candidate.recovery.owner === initial.owner &&
         candidate.recovery.claimant === initial.claimant &&
         candidate.recovery.recoverer === normalized.claimant,
     );
@@ -324,6 +346,7 @@ export function ensureExactHeadMergeClaim(
     status: "existing",
     reason: "another verified workflow owns the exact-head merge claim; reconciliation only",
     claimId: winningClaim.id,
+    owner: winningClaim.claim.owner,
     claimant: winningClaim.claim.claimant,
     createdAt: winningClaim.createdAt,
   };
@@ -426,6 +449,7 @@ export function inspectExactHeadMergeClaim(
       status: "existing",
       reason: "exact-head merge request is durably claimed; reconciliation only",
       claimId: active.id,
+      owner: active.claim.owner,
       claimant: active.claim.claimant,
       createdAt: active.createdAt,
     };
@@ -615,9 +639,20 @@ function exactHeadMergeReleaseMarker(request: ExactHeadMergeClaimRequest, claimI
 function exactHeadMergeRecoveryMarker(
   request: ExactHeadMergeClaimRequest,
   claimId: number,
+  owner: string,
   claimant: string,
 ): string {
-  return `<!-- ${RECOVERY_PREFIX} claim=${claimId} repo=${encodeURIComponent(request.repository)} pr=${request.number} head=${request.headSha} method=${request.method} owner=${request.owner} claimant=${encodeURIComponent(claimant)} recoverer=${encodeURIComponent(request.claimant)} -->`;
+  return `<!-- ${RECOVERY_PREFIX} claim=${claimId} repo=${encodeURIComponent(request.repository)} pr=${request.number} head=${request.headSha} method=${request.method} owner=${owner} claimant=${encodeURIComponent(claimant)} recoverer=${encodeURIComponent(request.claimant)} -->`;
+}
+
+export function exactHeadMergeClaimWorkflowRunEnv(
+  env: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  const token = String(env.CLAWSWEEPER_WORKFLOW_GH_TOKEN ?? "").trim();
+  if (!token) {
+    throw new Error("central workflow read token is required for exact-head merge claim recovery");
+  }
+  return { ...env, GH_TOKEN: token, GITHUB_TOKEN: token };
 }
 
 function parseClaimMarkers(body: string): ParsedClaim[] {

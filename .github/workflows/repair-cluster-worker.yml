@@ -1858,6 +1858,7 @@ jobs:
           CLAWSWEEPER_RULESET_APP_SLUG: ${{ steps.ruleset-verifier-token.outputs.app-slug }}
           CLAWSWEEPER_RULESET_INSTALLATION_ID: ${{ steps.ruleset-verifier-token.outputs.installation-id }}
           CLAWSWEEPER_RULESET_GH_TOKEN: ${{ steps.ruleset-verifier-token.outputs.token }}
+          CLAWSWEEPER_WORKFLOW_GH_TOKEN: ${{ github.token }}
           CLAWSWEEPER_ALLOWED_OWNER: ${{ needs.authorize.outputs.target_owner }}
         run: |
           pnpm run repair:post-flight -- \

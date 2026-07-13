@@ -54,6 +54,7 @@ import {
   ensureExactHeadMergeClaim,
   exactHeadMergeClaimIdentity,
   exactHeadMergeClaimRecoveryDecision,
+  exactHeadMergeClaimWorkflowRunEnv,
   exactHeadMergeClaimant,
   isTrustedExactHeadMergeClaimComment,
   isTrustedExactHeadMergeClaimRecoveryComment,
@@ -840,6 +841,7 @@ function claimPostFlightMergeRequest(
               : {
                   ...exactHeadMergeClaimIdentity(request),
                   claimId: context.claimId,
+                  owner: context.owner,
                   claimant: context.claimant,
                 },
           component: "merge_claim",
@@ -861,6 +863,7 @@ function claimPostFlightMergeRequest(
                     comment,
                     request,
                     context.claimId,
+                    context.owner,
                     context.claimant,
                   );
             return trusted ? "accepted" : "unknown";
@@ -868,7 +871,10 @@ function claimPostFlightMergeRequest(
         }),
       recoverClaim: (candidate) =>
         exactHeadMergeClaimRecoveryDecision(candidate, (path) =>
-          ghJson(["api", path], { attempts: 1 }),
+          ghJson(["api", path], {
+            attempts: 1,
+            env: exactHeadMergeClaimWorkflowRunEnv(),
+          }),
         ),
     });
   } catch (error) {

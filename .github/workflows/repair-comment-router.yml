@@ -231,6 +231,7 @@ jobs:
           CLAWSWEEPER_RULESET_INSTALLATION_ID: ${{ steps.ruleset-verifier-token.outputs.installation-id }}
           CLAWSWEEPER_RULESET_GH_TOKEN: ${{ steps.ruleset-verifier-token.outputs.token }}
           CLAWSWEEPER_DISPATCH_TOKEN: ${{ steps.dispatch-token.outputs.token }}
+          CLAWSWEEPER_WORKFLOW_GH_TOKEN: ${{ steps.dispatch-token.outputs.token }}
           CLAWSWEEPER_MUTATION_TOKEN_SOURCE: clawsweeper-app
           CLAWSWEEPER_ALLOW_MERGE: ${{ vars.CLAWSWEEPER_ALLOW_MERGE || '0' }}
           CLAWSWEEPER_ACTION_LEDGER_INVOCATION: initial
@@ -371,6 +372,7 @@ jobs:
           CLAWSWEEPER_RULESET_INSTALLATION_ID: ${{ steps.ruleset-verifier-token.outputs.installation-id }}
           CLAWSWEEPER_RULESET_GH_TOKEN: ${{ steps.ruleset-verifier-token.outputs.token }}
           CLAWSWEEPER_DISPATCH_TOKEN: ${{ steps.dispatch-token.outputs.token }}
+          CLAWSWEEPER_WORKFLOW_GH_TOKEN: ${{ steps.dispatch-token.outputs.token }}
           CLAWSWEEPER_MUTATION_TOKEN_SOURCE: clawsweeper-app
           CLAWSWEEPER_ALLOW_MERGE: ${{ vars.CLAWSWEEPER_ALLOW_MERGE || '0' }}
           CLAWSWEEPER_ACTION_LEDGER_INVOCATION: retry

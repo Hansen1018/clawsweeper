@@ -3471,6 +3471,7 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.target-write-token.outputs.token }}
           TARGET_REPO: ${{ steps.target.outputs.target_repo }}
+          CLAWSWEEPER_WORKFLOW_GH_TOKEN: ${{ github.token }}
           CLAWSWEEPER_PUBLISH_THROTTLE_STATUS: "true"
           CLAWSWEEPER_RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
           CLAWSWEEPER_THROTTLE_STATUS_MIN_WAIT_MS: "60000"
