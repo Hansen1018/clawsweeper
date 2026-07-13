@@ -330,21 +330,20 @@ async function runSpamScanner() {
       },
       privacy: actionLedgerPrivacy(),
     });
-    throw error;
-  } finally {
-    try {
-      await flushWorkflowActionEvents(repoRoot());
-    } catch (flushError) {
-      if (primaryError) {
-        console.error(
-          `[spam-scanner] failed to flush action events after scan failure: ${
-            flushError instanceof Error ? flushError.message : String(flushError)
-          }`,
-        );
-      } else {
-        throw flushError;
-      }
-    }
+  }
+
+  try {
+    await flushWorkflowActionEvents(repoRoot());
+  } catch (flushError) {
+    if (!primaryError) throw flushError;
+    console.error(
+      `[spam-scanner] failed to flush action events after scan failure: ${
+        flushError instanceof Error ? flushError.message : String(flushError)
+      }`,
+    );
+  }
+  if (primaryError) {
+    throw primaryError;
   }
 }
 
