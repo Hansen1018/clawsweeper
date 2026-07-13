@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import type { JsonValue, LooseRecord } from "./json-types.js";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
@@ -40,13 +41,14 @@ const repo = String(args.repo ?? currentProjectRepo());
 const model = String(args.model ?? process.env.CLAWSWEEPER_MODEL ?? "internal");
 const waitForCapacity = Boolean(args["wait-for-capacity"]);
 const ref = args.ref ? String(args.ref) : "";
+const requestedDispatchKey = dispatchKeyArg(args["dispatch-key"] ?? args.dispatch_key);
 const files = args._;
 const activeRepairRunsByPrefix = new Map<string, LooseRecord[]>();
 const jobWorkerLanes = new Map<string, WorkerLane>();
 
 if (files.length === 0) {
   console.error(
-    `usage: node scripts/dispatch-jobs.ts <job.md> [...] [--mode plan|execute|autonomous] [--runner label] [--execution-runner label] [--model model] [--max-live-workers ${AUTOMATION_LIMITS.repair_live_runs.default}] [--wait-for-capacity]`,
+    `usage: node scripts/dispatch-jobs.ts <job.md> [...] [--mode plan|execute|autonomous] [--runner label] [--execution-runner label] [--model model] [--dispatch-key key] [--max-live-workers ${AUTOMATION_LIMITS.repair_live_runs.default}] [--wait-for-capacity]`,
   );
   process.exit(2);
 }
@@ -120,6 +122,7 @@ while (!failed && index < jobs.length) {
 
 function dispatchJob(relative: JsonValue, position: JsonValue, total: JsonValue) {
   const jobPath = String(relative);
+  const dispatchKey = requestedDispatchKey || derivedDispatchKey(jobPath);
   const commandArgs = [
     "workflow",
     "run",
@@ -129,6 +132,8 @@ function dispatchJob(relative: JsonValue, position: JsonValue, total: JsonValue)
     ...(ref ? ["--ref", ref] : []),
     "-f",
     `job=${jobPath}`,
+    "-f",
+    `dispatch_key=${dispatchKey}`,
     "-f",
     `mode=${mode}`,
     "-f",
@@ -152,6 +157,7 @@ function dispatchJob(relative: JsonValue, position: JsonValue, total: JsonValue)
         runner,
         executionRunner,
         model,
+        dispatchKey,
       },
       operation: () => {
         const result = spawnSync("gh", commandArgs, {
@@ -174,6 +180,31 @@ function dispatchJob(relative: JsonValue, position: JsonValue, total: JsonValue)
   console.log(
     `dispatched ${position}/${total} ${relative} (${mode}) on ${runner}; execution on ${executionRunner}`,
   );
+}
+
+function dispatchKeyArg(value: JsonValue | undefined): string {
+  const key = String(value ?? "").trim();
+  if (!key) return "";
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(key)) {
+    throw new Error("dispatch key must be a bounded machine identifier");
+  }
+  return key;
+}
+
+function derivedDispatchKey(jobPath: string): string {
+  const digest = createHash("sha256")
+    .update(
+      JSON.stringify({
+        repository: repo,
+        workflow,
+        ref: ref || null,
+        jobPath,
+        mode,
+      }),
+    )
+    .digest("hex")
+    .slice(0, 24);
+  return `repair-dispatch-${digest}`;
 }
 
 function dispatchLifecycle(jobPath: string): RepairLifecycleInput {

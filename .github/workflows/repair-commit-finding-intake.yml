@@ -111,7 +111,8 @@ jobs:
           fi
           expected_title="Commit finding ${TARGET_REPO}@${COMMIT_SHA} [${DISPATCH_KEY}]"
           owner="$(bash scripts/dispatch-receipt-owner.sh \
-            repair-commit-finding-intake.yml "$expected_title" "$GITHUB_RUN_ID" "Intake commit finding")"
+            repair-commit-finding-intake.yml "$expected_title" "$GITHUB_RUN_ID" \
+            "Intake commit finding" "Dispatch sealed repair worker")"
           if [ "$owner" = "owner" ]; then
             echo "proceed=false" >> "$GITHUB_OUTPUT"
             echo "An older active or successfully executed commit finding dispatch already exists; skipping duplicate intake."
@@ -240,6 +241,7 @@ jobs:
           MAX_LIVE_WORKERS: ${{ vars.CLAWSWEEPER_COMMIT_FINDING_MAX_LIVE_WORKERS || '' }}
           RUNNER: ${{ github.event.inputs.runner || github.event.client_payload.runner || vars.CLAWSWEEPER_WORKER_RUNNER || 'blacksmith-4vcpu-ubuntu-2404' }}
           EXECUTION_RUNNER: ${{ github.event.inputs.execution_runner || github.event.client_payload.execution_runner || vars.CLAWSWEEPER_EXECUTION_RUNNER || 'blacksmith-16vcpu-ubuntu-2404' }}
+          DISPATCH_KEY: ${{ github.event.inputs.dispatch_key || github.event.client_payload.dispatch_key || '' }}
         run: |
           set -euo pipefail
           cap_args=()
@@ -253,6 +255,7 @@ jobs:
             "${cap_args[@]}" \
             --runner "$RUNNER" \
             --execution-runner "$EXECUTION_RUNNER" \
+            --dispatch-key "$DISPATCH_KEY" \
             --model internal \
             --ref main
 

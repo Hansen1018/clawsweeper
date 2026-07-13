@@ -365,6 +365,8 @@ test("issue implementation intake finalizes and publishes source-bound status re
   const dispatcher = readText("src/repair/dispatch-jobs.ts");
   assert.match(dispatcher, /runRepairMutation\(dispatchLifecycle\(jobPath\)/);
   assert.match(dispatcher, /kind: "repair_dispatch"/);
+  assert.match(dispatcher, /`dispatch_key=\$\{dispatchKey\}`/);
+  assert.match(dispatcher, /return `repair-dispatch-\$\{digest\}`/);
   assert.match(dispatcher, /repairSourceRevision\(job\.frontmatter\)/);
 });
 
@@ -406,6 +408,9 @@ test("commit finding and cluster intake publish their dispatch receipts", () => 
         workflow.indexOf(`Finalize ${expected.label} action ledger`),
     );
   }
+  const commitFinding = readText(".github/workflows/repair-commit-finding-intake.yml");
+  assert.match(commitFinding, /--dispatch-key "\$DISPATCH_KEY"/);
+  assert.match(commitFinding, /"Intake commit finding" "Dispatch sealed repair worker"/);
 });
 
 test("result and finalizer workflows publish their repair operation receipts", () => {

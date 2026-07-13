@@ -638,7 +638,7 @@ test("commit finding intake is merge-disabled and carries no verifier credential
   assert.match(source, /name: Deduplicate commit finding dispatch receipt/);
   assert.match(
     source,
-    /dispatch-receipt-owner\.sh \\\n\s+repair-commit-finding-intake\.yml "\$expected_title" "\$GITHUB_RUN_ID" "Intake commit finding"/,
+    /dispatch-receipt-owner\.sh \\\n\s+repair-commit-finding-intake\.yml "\$expected_title" "\$GITHUB_RUN_ID" \\\n\s+"Intake commit finding" "Dispatch sealed repair worker"/,
   );
   assert.match(source, /name: Intake commit finding[\s\S]*needs: receipt/);
   assert.match(source, /needs\.receipt\.outputs\.proceed == 'true'/);

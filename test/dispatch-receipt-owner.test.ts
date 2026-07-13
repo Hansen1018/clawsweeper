@@ -51,13 +51,21 @@ esac
   };
 }
 
-function runGate(options: Parameters<typeof fixtureEnv>[0], requiredJobName = "assist") {
+function runGate(
+  options: Parameters<typeof fixtureEnv>[0],
+  requiredJobName = "assist",
+  requiredStepName = "",
+) {
   const fixture = fixtureEnv(options);
   try {
-    return execFileSync("bash", [SCRIPT, "assist.yml", EXPECTED_TITLE, "200", requiredJobName], {
-      encoding: "utf8",
-      env: fixture.env,
-    }).trim();
+    return execFileSync(
+      "bash",
+      [SCRIPT, "assist.yml", EXPECTED_TITLE, "200", requiredJobName, requiredStepName],
+      {
+        encoding: "utf8",
+        env: fixture.env,
+      },
+    ).trim();
   } finally {
     rmSync(fixture.binDir, { recursive: true, force: true });
   }
@@ -101,6 +109,31 @@ test("dispatch receipt gate keeps a successfully executed worker as owner", () =
       ],
       jobs102: [{ name: "assist", conclusion: "success" }],
     }),
+    "owner",
+  );
+});
+
+test("dispatch receipt gate retains ownership when later finalization fails", () => {
+  assert.equal(
+    runGate(
+      {
+        runs: [
+          { id: 102, display_title: EXPECTED_TITLE, status: "completed", conclusion: "failure" },
+        ],
+        jobs102: [
+          {
+            name: "Intake commit finding",
+            conclusion: "failure",
+            steps: [
+              { name: "Dispatch sealed repair worker", conclusion: "success" },
+              { name: "Finalize commit finding intake action ledger", conclusion: "failure" },
+            ],
+          },
+        ],
+      },
+      "Intake commit finding",
+      "Dispatch sealed repair worker",
+    ),
     "owner",
   );
 });
