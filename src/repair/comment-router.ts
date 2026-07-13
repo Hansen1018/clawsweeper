@@ -2,6 +2,7 @@
 import type { JsonValue, LooseRecord } from "./json-types.js";
 import fs from "node:fs";
 import path from "node:path";
+import { stableJson } from "../stable-json.js";
 import { adaptiveReviewBudgetForPullRequest } from "./adaptive-review-budget.js";
 import { CLOSE_PROTECTED_LABEL_NAMES } from "./exact-review-guard-labels.js";
 import {
@@ -4039,52 +4040,101 @@ function executeAutomerge(command: LooseRecord): LooseRecord {
     preMarkerReviewActivityBlock: ReturnType<typeof trustedAutomergeReviewActivityBlockReason>;
     dispatchedAbortAction: LooseRecord | null;
   } = { preMarkerReviewActivityBlock: null, dispatchedAbortAction: null };
+  let policyVerifiedBaseBranch = "";
+  const readDispatchState = () => {
+    const view = fetchPullRequestView(command.issue_number);
+    return { view, target: latestAutomergeTarget(command, view) };
+  };
+  const dispatchStateBlock = ({
+    view,
+    target,
+  }: {
+    view: LooseRecord;
+    target: LooseRecord;
+  }): { reason: string; retryable: boolean } | null => {
+    const hardBlock = validateAutomergeHardReadiness({ command, view, target });
+    if (hardBlock) return { reason: hardBlock, retryable: false };
+    const pendingReason = exactHeadAutomergePendingReason(command, view);
+    if (pendingReason) return { reason: pendingReason, retryable: true };
+    const readinessBlock = validateAutomergeReadiness({ command, view, target });
+    return readinessBlock
+      ? { reason: readinessBlock, retryable: isTransientAutomergeBlock(readinessBlock) }
+      : null;
+  };
   const liveDispatchStateBlock = (
     verifyStrictBase: boolean,
   ): { reason: string; retryable: boolean } | null => {
-    let dispatchView;
-    let dispatchTarget;
+    let state;
     try {
-      dispatchView = fetchPullRequestView(command.issue_number);
-      dispatchTarget = latestAutomergeTarget(command, dispatchView);
+      state = readDispatchState();
     } catch (error) {
       return {
         reason: `pre-dispatch automerge state could not be refreshed: ${compactGhError(error)}`,
         retryable: true,
       };
     }
-    const hardBlock = validateAutomergeHardReadiness({
-      command,
-      view: dispatchView,
-      target: dispatchTarget,
-    });
-    if (hardBlock) return { reason: hardBlock, retryable: false };
-    const pendingReason = exactHeadAutomergePendingReason(command, dispatchView);
-    if (pendingReason) return { reason: pendingReason, retryable: true };
-    const readinessBlock = validateAutomergeReadiness({
-      command,
-      view: dispatchView,
-      target: dispatchTarget,
-    });
-    if (readinessBlock) {
-      return { reason: readinessBlock, retryable: isTransientAutomergeBlock(readinessBlock) };
-    }
+    const stateBlock = dispatchStateBlock(state);
+    if (stateBlock) return stateBlock;
     if (!verifyStrictBase) return null;
+    const baseBranch = String(
+      state.view.baseRefName ?? state.target.base_ref ?? targetBranch ?? "main",
+    );
     try {
       const strictBaseBlock = runtimeStrictBaseBindingBlock({
         repo: command.repo,
-        baseBranch: String(
-          dispatchView.baseRefName ?? dispatchTarget.base_ref ?? targetBranch ?? "main",
-        ),
+        baseBranch,
         policyReadJson: rulesetPolicyReader(),
       });
-      return strictBaseBlock ? { reason: strictBaseBlock, retryable: false } : null;
+      if (strictBaseBlock) return { reason: strictBaseBlock, retryable: false };
+      policyVerifiedBaseBranch = baseBranch;
+      return null;
     } catch (error) {
       return {
         reason: `pre-dispatch strict-base policy could not be refreshed: ${compactGhError(error)}`,
         retryable: true,
       };
     }
+  };
+  const finalDispatchSafetyBlock = (): {
+    reason: string;
+    retryable: boolean;
+  } | null => {
+    let firstState;
+    let middleState;
+    let finalState;
+    try {
+      firstState = readDispatchState();
+      const firstActivityBlock = trustedAutomergeReviewActivityBlockReason(command);
+      if (firstActivityBlock) return firstActivityBlock;
+      middleState = readDispatchState();
+      const secondActivityBlock = trustedAutomergeReviewActivityBlockReason(command);
+      if (secondActivityBlock) return secondActivityBlock;
+      finalState = readDispatchState();
+    } catch (error) {
+      return {
+        reason: `final pre-dispatch safety snapshot could not be refreshed: ${compactGhError(error)}`,
+        retryable: true,
+      };
+    }
+    const firstDigest = stableJson(firstState);
+    if (firstDigest !== stableJson(middleState) || firstDigest !== stableJson(finalState)) {
+      return {
+        reason: "pull request state changed during final review activity verification",
+        retryable: true,
+      };
+    }
+    const stateBlock = dispatchStateBlock(finalState);
+    if (stateBlock) return stateBlock;
+    const finalBaseBranch = String(
+      finalState.view.baseRefName ?? finalState.target.base_ref ?? targetBranch ?? "main",
+    );
+    if (!policyVerifiedBaseBranch || finalBaseBranch !== policyVerifiedBaseBranch) {
+      return {
+        reason: "pull request base changed after strict-base policy verification",
+        retryable: false,
+      };
+    }
+    return null;
   };
   let result;
   try {
@@ -4121,7 +4171,7 @@ function executeAutomerge(command: LooseRecord): LooseRecord {
               ),
             reviewActivityBlock: () => trustedAutomergeReviewActivityBlockReason(command),
             strictBaseBindingBlock: () => liveDispatchStateBlock(true),
-            finalStateBlock: () => liveDispatchStateBlock(false),
+            finalSafetyBlock: finalDispatchSafetyBlock,
             rejectDispatched: () => rejectAutomergeMergeClaim(command, mergeClaim.claimId),
           });
           if (dispatchGuard.status === "marker_failed") {
@@ -5336,6 +5386,7 @@ function fetchPullRequestView(number: JsonValue) {
         "state",
         "statusCheckRollup",
         "title",
+        "updatedAt",
         "url",
       ].join(","),
     ],
@@ -5388,6 +5439,7 @@ function fetchPullRequestViewAsync(number: JsonValue) {
         "state",
         "statusCheckRollup",
         "title",
+        "updatedAt",
         "url",
       ].join(","),
     ],

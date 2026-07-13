@@ -287,9 +287,7 @@ test("activity and strict-base policy are checked after durable dispatch marking
   const postMarkerStrictBaseCheck = dispatchBoundary.indexOf(
     "strictBaseBindingBlock: () => liveDispatchStateBlock(true)",
   );
-  const finalStateCheck = dispatchBoundary.indexOf(
-    "finalStateBlock: () => liveDispatchStateBlock(false)",
-  );
+  const finalSafetyCheck = dispatchBoundary.indexOf("finalSafetyBlock: finalDispatchSafetyBlock");
   const reject = dispatchBoundary.indexOf("rejectAutomergeMergeClaim(command, mergeClaim.claimId)");
 
   assert.ok(preMarkerActivityCheck >= 0);
@@ -297,11 +295,23 @@ test("activity and strict-base policy are checked after durable dispatch marking
   assert.ok(claimDispatch > guard);
   assert.ok(postMarkerActivityCheck > claimDispatch);
   assert.ok(postMarkerStrictBaseCheck > postMarkerActivityCheck);
-  assert.ok(finalStateCheck > postMarkerStrictBaseCheck);
-  assert.ok(reject > finalStateCheck);
+  assert.ok(finalSafetyCheck > postMarkerStrictBaseCheck);
+  assert.ok(reject > finalSafetyCheck);
+  assert.match(
+    executeAutomerge,
+    /const readDispatchState[\s\S]*fetchPullRequestView\(command\.issue_number\)[\s\S]*latestAutomergeTarget\(/,
+  );
+  assert.match(
+    executeAutomerge,
+    /const dispatchStateBlock[\s\S]*validateAutomergeHardReadiness\([\s\S]*validateAutomergeReadiness\(/,
+  );
   assert.match(
     liveDispatchState,
-    /fetchPullRequestView\(command\.issue_number\)[\s\S]*latestAutomergeTarget\([\s\S]*validateAutomergeHardReadiness\([\s\S]*validateAutomergeReadiness\([\s\S]*runtimeStrictBaseBindingBlock\([\s\S]*policyReadJson: rulesetPolicyReader\(\)/,
+    /readDispatchState\(\)[\s\S]*dispatchStateBlock\(state\)[\s\S]*runtimeStrictBaseBindingBlock\([\s\S]*policyReadJson: rulesetPolicyReader\(\)/,
+  );
+  assert.match(
+    liveDispatchState,
+    /finalDispatchSafetyBlock[\s\S]*readDispatchState\(\)[\s\S]*trustedAutomergeReviewActivityBlockReason\(command\)[\s\S]*readDispatchState\(\)[\s\S]*trustedAutomergeReviewActivityBlockReason\(command\)[\s\S]*readDispatchState\(\)[\s\S]*stableJson\([\s\S]*policyVerifiedBaseBranch/,
   );
   assert.match(executeAutomerge, /knownNoMutation: \(\) => !mergeRequestStarted/);
   assert.match(
