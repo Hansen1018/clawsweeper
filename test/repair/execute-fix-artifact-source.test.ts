@@ -413,7 +413,7 @@ test("repair workflow binds one run through no-credential proof and token-only m
 
   assert.match(
     workflow.slice(workflow.indexOf("\n  cluster:"), authorizeIndex),
-    /Seal immutable source job provenance[\s\S]*Upload worker transfer artifacts[\s\S]*if: \$\{\{ always\(\) && steps\.seal_source_job\.outcome == 'success' && \(inputs\.mode == 'execute' \|\| inputs\.mode == 'autonomous'\) && !inputs\.dry_run \}\}[\s\S]*if-no-files-found: error[\s\S]*retention-days: 90/,
+    /Seal immutable source job provenance[\s\S]*Upload worker transfer artifacts[\s\S]*if: \$\{\{ always\(\) && steps\.seal_source_job\.outcome == 'success' && \(steps\.recovery_inputs\.outputs\.effective_mode == 'execute' \|\| steps\.recovery_inputs\.outputs\.effective_mode == 'autonomous'\) && !inputs\.dry_run \}\}[\s\S]*if-no-files-found: error[\s\S]*retention-days: 90/,
   );
   assert.match(authorize, /repair:execution-handoff -- authorize/);
   assert.match(authorize, /repair:execution-handoff -- restore-authorization/);
