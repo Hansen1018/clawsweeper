@@ -698,6 +698,108 @@ jobs:
         with:
           build-script: build:all
 
+      - name: Authorize commit review artifact attempts
+        id: review-artifact-provenance
+        if: ${{ needs.plan.outputs.planned_count != '0' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          EXPECTED_COMMIT_MATRIX: ${{ needs.plan.outputs.matrix }}
+          CURRENT_ATTEMPT_JOBS: ${{ runner.temp }}/commit-review-publish-jobs.json
+          ARTIFACT_ATTEMPT_POLICY: .artifacts/commit-review-artifact-attempts.json
+        run: |
+          set -euo pipefail
+          mkdir -p .artifacts
+          if ! [[ "$RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]; then
+            echo "Invalid workflow run attempt: $RUN_ATTEMPT" >&2
+            exit 1
+          fi
+          if [ "$RUN_ATTEMPT" = "1" ]; then
+            printf '[]\n' > "$CURRENT_ATTEMPT_JOBS"
+          else
+            gh api --paginate --slurp \
+              "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/attempts/${RUN_ATTEMPT}/jobs?per_page=100" \
+              > "$CURRENT_ATTEMPT_JOBS"
+          fi
+          node --input-type=module <<'NODE'
+          import fs from "node:fs";
+
+          const currentAttempt = Number(process.env.RUN_ATTEMPT);
+          const matrix = JSON.parse(process.env.EXPECTED_COMMIT_MATRIX);
+          if (!Array.isArray(matrix) || matrix.length === 0) {
+            throw new Error("commit review matrix is invalid");
+          }
+          const shas = matrix.map((entry) => String(entry?.sha ?? ""));
+          if (
+            shas.some((sha) => !/^[a-f0-9]{40}$/.test(sha)) ||
+            new Set(shas).size !== shas.length
+          ) {
+            throw new Error("commit review matrix SHAs are invalid");
+          }
+
+          let jobs = [];
+          if (currentAttempt > 1) {
+            const pages = JSON.parse(
+              fs.readFileSync(process.env.CURRENT_ATTEMPT_JOBS, "utf8"),
+            );
+            if (!Array.isArray(pages)) {
+              throw new Error("current workflow attempt job response is invalid");
+            }
+            jobs = pages.flatMap((page) => {
+              if (!page || !Array.isArray(page.jobs)) {
+                throw new Error("current workflow attempt job page is invalid");
+              }
+              return page.jobs;
+            });
+            if (jobs.length === 0) {
+              throw new Error("current workflow attempt has no jobs");
+            }
+            for (const job of jobs) {
+              if (
+                !job ||
+                typeof job.name !== "string" ||
+                Number(job.run_attempt) !== currentAttempt
+              ) {
+                throw new Error("current workflow attempt job provenance is invalid");
+              }
+            }
+            if (jobs.filter((job) => job.name === "Commit reports").length !== 1) {
+              throw new Error("current commit review publication job provenance is ambiguous");
+            }
+          }
+
+          const commits = [...shas].sort().map((sha) => {
+            const reviewJobs = jobs.filter((job) => job.name === `Review commit ${sha}`);
+            const attestJobs = jobs.filter((job) => job.name === `Attest commit ${sha}`);
+            if (reviewJobs.length > 1 || attestJobs.length > 1) {
+              throw new Error(`current commit review job provenance is ambiguous for ${sha}`);
+            }
+            if (reviewJobs.length === 1 && attestJobs.length !== 1) {
+              throw new Error(`current producer attempt has no matching attestor for ${sha}`);
+            }
+            const producerReran = reviewJobs.length === 1;
+            const attestorReran = attestJobs.length === 1;
+            return {
+              sha,
+              requiredAttempt:
+                currentAttempt === 1 || producerReran || attestorReran
+                  ? currentAttempt
+                  : null,
+              producerReran,
+              attestorReran,
+            };
+          });
+          fs.writeFileSync(
+            process.env.ARTIFACT_ATTEMPT_POLICY,
+            `${JSON.stringify({
+              schemaVersion: 1,
+              runAttempt: currentAttempt,
+              commits,
+            })}\n`,
+          );
+          NODE
+
       - name: Resolve commit review artifact cohort
         id: review-artifact-cohort
         if: ${{ needs.plan.outputs.planned_count != '0' }}
@@ -705,6 +807,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           EXPECTED_COMMIT_MATRIX: ${{ needs.plan.outputs.matrix }}
           PLANNED_COUNT: ${{ needs.plan.outputs.planned_count }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          ARTIFACT_ATTEMPT_POLICY: .artifacts/commit-review-artifact-attempts.json
           CLAWSWEEPER_ALLOW_PRIOR_ARTIFACT: "1"
         run: |
           set -euo pipefail
@@ -717,12 +822,70 @@ jobs:
             echo "Commit review matrix count does not match planned_count." >&2
             exit 1
           fi
+          rm -f "$cohort_file"
           pnpm run --silent repair:resolve-run-artifact -- \
-            --repository "${{ github.repository }}" \
-            --run-id "${{ github.run_id }}" \
-            --current-attempt "${{ github.run_attempt }}" \
+            --repository "$GITHUB_REPOSITORY" \
+            --run-id "$RUN_ID" \
+            --current-attempt "$RUN_ATTEMPT" \
             --commit-shas-file "$expected_shas_file" \
             --cohort-file "$cohort_file"
+          node --input-type=module <<'NODE'
+          import fs from "node:fs";
+
+          const currentAttempt = Number(process.env.RUN_ATTEMPT);
+          const expectedShas = fs
+            .readFileSync(".artifacts/expected-commit-review-shas.txt", "utf8")
+            .split("\n")
+            .filter(Boolean);
+          const policy = JSON.parse(
+            fs.readFileSync(process.env.ARTIFACT_ATTEMPT_POLICY, "utf8"),
+          );
+          const cohort = JSON.parse(
+            fs.readFileSync(".artifacts/commit-review-artifact-cohort.json", "utf8"),
+          );
+          if (
+            policy?.schemaVersion !== 1 ||
+            policy.runAttempt !== currentAttempt ||
+            !Array.isArray(policy.commits) ||
+            !Array.isArray(cohort) ||
+            policy.commits.length !== expectedShas.length ||
+            cohort.length !== expectedShas.length
+          ) {
+            throw new Error("commit review artifact attempt policy is invalid");
+          }
+          const policies = new Map(policy.commits.map((entry) => [entry?.sha, entry]));
+          const artifacts = new Map(cohort.map((entry) => [entry?.sha, entry]));
+          if (policies.size !== expectedShas.length || artifacts.size !== expectedShas.length) {
+            throw new Error("commit review artifact attempt binding is ambiguous");
+          }
+          for (const sha of expectedShas) {
+            const entry = policies.get(sha);
+            const artifact = artifacts.get(sha);
+            const requiredAttempt = entry?.requiredAttempt;
+            const producerAttempt = artifact?.producerAttempt;
+            if (
+              entry?.sha !== sha ||
+              artifact?.sha !== sha ||
+              (requiredAttempt !== null &&
+                (!Number.isInteger(requiredAttempt) || requiredAttempt !== currentAttempt)) ||
+              !Number.isInteger(producerAttempt) ||
+              producerAttempt < 1 ||
+              producerAttempt > currentAttempt
+            ) {
+              throw new Error(`commit review artifact attempt binding is invalid for ${sha}`);
+            }
+            if (requiredAttempt !== null && producerAttempt !== requiredAttempt) {
+              throw new Error(
+                `commit review artifact for ${sha} requires attestor attempt ${requiredAttempt}, resolved ${producerAttempt}`,
+              );
+            }
+            if (requiredAttempt === null && producerAttempt >= currentAttempt) {
+              throw new Error(
+                `commit review artifact for ${sha} was not produced by an authorized prior attempt`,
+              );
+            }
+          }
+          NODE
 
       - uses: actions/download-artifact@v8
         if: ${{ needs.plan.outputs.planned_count != '0' }}

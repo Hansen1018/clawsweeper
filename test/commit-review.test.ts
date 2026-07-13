@@ -125,6 +125,98 @@ test("commit review attestation reuses prior reports only when the producer was 
   );
 });
 
+test("commit report publication binds every artifact to its producer and attestor attempt", () => {
+  const workflow = parse(fs.readFileSync(".github/workflows/commit-review.yml", "utf8")) as {
+    jobs: {
+      publish: {
+        steps: Array<{
+          env?: Record<string, string>;
+          id?: string;
+          name?: string;
+          run?: string;
+        }>;
+      };
+    };
+  };
+  const steps = workflow.jobs.publish.steps;
+  const policyIndex = steps.findIndex(
+    (step) => step.name === "Authorize commit review artifact attempts",
+  );
+  const resolveIndex = steps.findIndex(
+    (step) => step.name === "Resolve commit review artifact cohort",
+  );
+  const policy = steps[policyIndex];
+  const resolve = steps[resolveIndex];
+
+  assert.ok(policyIndex >= 0);
+  assert.ok(resolveIndex > policyIndex);
+  assert.equal(policy?.id, "review-artifact-provenance");
+  assert.equal(policy?.env?.RUN_ATTEMPT, "${{ github.run_attempt }}");
+  assert.equal(
+    resolve?.env?.ARTIFACT_ATTEMPT_POLICY,
+    ".artifacts/commit-review-artifact-attempts.json",
+  );
+  assert.match(policy?.run ?? "", /requiredAttempt:/);
+  assert.match(policy?.run ?? "", /producerReran \|\| attestorReran/);
+  assert.match(resolve?.run ?? "", /requires attestor attempt/);
+  assert.match(resolve?.run ?? "", /was not produced by an authorized prior attempt/);
+
+  const sha1 = "a".repeat(40);
+  const sha2 = "b".repeat(40);
+  const staleProducerRerun = runPublishArtifactBinding({
+    policyScript: policy?.run ?? "",
+    resolveScript: resolve?.run ?? "",
+    runAttempt: 2,
+    shas: [sha1],
+    jobs: [
+      workflowJob("Commit reports", 2),
+      workflowJob(`Review commit ${sha1}`, 2),
+      workflowJob(`Attest commit ${sha1}`, 2, "failure"),
+    ],
+    cohort: [commitReviewArtifact(sha1, 1)],
+  });
+  assert.equal(staleProducerRerun.policyStatus, 0, staleProducerRerun.policyStderr);
+  assert.notEqual(staleProducerRerun.resolveStatus, 0);
+  assert.match(staleProducerRerun.resolveStderr, /requires attestor attempt 2, resolved 1/);
+
+  const attestationOnlyRetry = runPublishArtifactBinding({
+    policyScript: policy?.run ?? "",
+    resolveScript: resolve?.run ?? "",
+    runAttempt: 2,
+    shas: [sha1],
+    jobs: [workflowJob("Commit reports", 2), workflowJob(`Attest commit ${sha1}`, 2)],
+    cohort: [commitReviewArtifact(sha1, 2)],
+  });
+  assert.equal(attestationOnlyRetry.policyStatus, 0, attestationOnlyRetry.policyStderr);
+  assert.equal(attestationOnlyRetry.resolveStatus, 0, attestationOnlyRetry.resolveStderr);
+
+  const publishOnlyRetry = runPublishArtifactBinding({
+    policyScript: policy?.run ?? "",
+    resolveScript: resolve?.run ?? "",
+    runAttempt: 2,
+    shas: [sha1],
+    jobs: [workflowJob("Commit reports", 2)],
+    cohort: [commitReviewArtifact(sha1, 1)],
+  });
+  assert.equal(publishOnlyRetry.policyStatus, 0, publishOnlyRetry.policyStderr);
+  assert.equal(publishOnlyRetry.resolveStatus, 0, publishOnlyRetry.resolveStderr);
+
+  const mixedMatrixRetry = runPublishArtifactBinding({
+    policyScript: policy?.run ?? "",
+    resolveScript: resolve?.run ?? "",
+    runAttempt: 2,
+    shas: [sha1, sha2],
+    jobs: [
+      workflowJob("Commit reports", 2),
+      workflowJob(`Review commit ${sha1}`, 2),
+      workflowJob(`Attest commit ${sha1}`, 2),
+    ],
+    cohort: [commitReviewArtifact(sha1, 2), commitReviewArtifact(sha2, 1)],
+  });
+  assert.equal(mixedMatrixRetry.policyStatus, 0, mixedMatrixRetry.policyStderr);
+  assert.equal(mixedMatrixRetry.resolveStatus, 0, mixedMatrixRetry.resolveStderr);
+});
+
 test("commit review materializes private clone data before removing review credentials", () => {
   const workflow = fs.readFileSync(".github/workflows/commit-review.yml", "utf8");
   const review = workflow.slice(workflow.indexOf("\n  review:"), workflow.indexOf("\n  attest:"));
@@ -494,4 +586,126 @@ function runPriorArtifactPolicy(
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
+}
+
+function runPublishArtifactBinding({
+  policyScript,
+  resolveScript,
+  runAttempt,
+  shas,
+  jobs,
+  cohort,
+}: {
+  policyScript: string;
+  resolveScript: string;
+  runAttempt: number;
+  shas: string[];
+  jobs: Array<Record<string, unknown>>;
+  cohort: Array<Record<string, unknown>>;
+}): {
+  policyStatus: number | null;
+  policyStderr: string;
+  resolveStatus: number | null;
+  resolveStderr: string;
+} {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "commit-publish-policy-")));
+  const binDir = path.join(root, "bin");
+  const fixturePath = path.join(root, "jobs.json");
+  const cohortPath = path.join(root, "cohort.json");
+  const outputPath = path.join(root, "github-output");
+  const currentJobsPath = path.join(root, "current-attempt-jobs.json");
+  fs.mkdirSync(binDir);
+  fs.writeFileSync(fixturePath, `${JSON.stringify([{ total_count: jobs.length, jobs }])}\n`);
+  fs.writeFileSync(cohortPath, `${JSON.stringify(cohort)}\n`);
+  fs.writeFileSync(path.join(binDir, "gh"), '#!/bin/sh\ncat "$GH_FIXTURE"\n', { mode: 0o755 });
+  fs.writeFileSync(
+    path.join(binDir, "pnpm"),
+    `#!/usr/bin/env node
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+const cohortIndex = args.indexOf("--cohort-file");
+if (cohortIndex < 0 || !args[cohortIndex + 1]) process.exit(2);
+const cohort = JSON.parse(fs.readFileSync(process.env.COHORT_FIXTURE, "utf8"));
+fs.writeFileSync(args[cohortIndex + 1], JSON.stringify(cohort) + "\\n");
+fs.appendFileSync(
+  process.env.GITHUB_OUTPUT,
+  "ledger_artifact_ids=" + cohort.map((entry) => entry.ledger.id).join(",") + "\\n" +
+    "report_artifact_ids=" + cohort.map((entry) => entry.report.id).join(",") + "\\n",
+);
+`,
+    { mode: 0o755 },
+  );
+
+  const env = {
+    ...process.env,
+    ARTIFACT_ATTEMPT_POLICY: ".artifacts/commit-review-artifact-attempts.json",
+    COHORT_FIXTURE: cohortPath,
+    CURRENT_ATTEMPT_JOBS: currentJobsPath,
+    EXPECTED_COMMIT_MATRIX: JSON.stringify(shas.map((sha) => ({ sha }))),
+    GH_FIXTURE: fixturePath,
+    GH_TOKEN: "fixture-token",
+    GITHUB_OUTPUT: outputPath,
+    GITHUB_REPOSITORY: "openclaw/clawsweeper",
+    PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}`,
+    PLANNED_COUNT: String(shas.length),
+    RUN_ATTEMPT: String(runAttempt),
+    RUN_ID: "4242",
+  };
+
+  try {
+    const policyResult = spawnSync("bash", ["-c", policyScript], {
+      cwd: root,
+      encoding: "utf8",
+      env,
+    });
+    if (policyResult.status !== 0) {
+      return {
+        policyStatus: policyResult.status,
+        policyStderr: policyResult.stderr,
+        resolveStatus: null,
+        resolveStderr: "",
+      };
+    }
+    const resolveResult = spawnSync("bash", ["-c", resolveScript], {
+      cwd: root,
+      encoding: "utf8",
+      env,
+    });
+    return {
+      policyStatus: policyResult.status,
+      policyStderr: policyResult.stderr,
+      resolveStatus: resolveResult.status,
+      resolveStderr: resolveResult.stderr,
+    };
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function workflowJob(
+  name: string,
+  runAttempt: number,
+  conclusion = "success",
+): Record<string, unknown> {
+  return {
+    name,
+    run_attempt: runAttempt,
+    status: "completed",
+    conclusion,
+  };
+}
+
+function commitReviewArtifact(sha: string, producerAttempt: number): Record<string, unknown> {
+  return {
+    sha,
+    producerAttempt,
+    ledger: {
+      id: producerAttempt * 100 + 1,
+      name: `action-ledger-commit-review-${sha}-4242-${producerAttempt}`,
+    },
+    report: {
+      id: producerAttempt * 100 + 2,
+      name: `commit-review-${sha}-4242-${producerAttempt}`,
+    },
+  };
 }
