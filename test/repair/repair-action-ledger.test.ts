@@ -9,7 +9,6 @@ import {
   ACTION_EVENT_REASON_CODES,
   ACTION_EVENT_STATUSES,
   ACTION_EVENT_TYPES,
-  readSpooledActionEvents,
 } from "../../dist/action-ledger.js";
 import {
   flushRepairActionEvents,
@@ -154,7 +153,7 @@ test("repair mutation uncertainty survives later workflow failure", async () => 
   }
 });
 
-test("async receipt write failures do not reclassify successful remote mutations", async () => {
+test("async mutation receipts preserve their workflow context across environment drift", async () => {
   const root = fs.realpathSync(
     fs.mkdtempSync(path.join(os.tmpdir(), "repair-local-receipt-failure-")),
   );
@@ -164,8 +163,8 @@ test("async receipt write failures do not reclassify successful remote mutations
   Object.assign(process.env, workflowEnv(root, outputRoot));
 
   try {
-    await assert.rejects(
-      runRepairMutationAsync(repairLifecycle(), {
+    assert.equal(
+      await runRepairMutationAsync(repairLifecycle(), {
         kind: "branch_push",
         identity: { repo: "openclaw/openclaw", ref: "refs/heads/fix", sha: "a".repeat(40) },
         operation: async () => {
@@ -173,13 +172,15 @@ test("async receipt write failures do not reclassify successful remote mutations
           return "accepted";
         },
       }),
-      /repository/,
+      "accepted",
     );
 
     process.env.GITHUB_REPOSITORY = "openclaw/clawsweeper";
-    const events = readSpooledActionEvents(root, "openclaw/openclaw");
-    assert.equal(events.length, 1);
+    await flushRepairActionEvents();
+    const events = readEvents(outputRoot);
+    assert.equal(events.length, 2);
     assert.equal(events[0]?.attributes?.completion_reason, "mutation_attempted");
+    assert.equal(events[1]?.attributes?.completion_reason, "mutation_accepted");
     assert.equal(
       events.some((event) => event.attributes?.completion_reason === "mutation_outcome_unknown"),
       false,
@@ -189,6 +190,50 @@ test("async receipt write failures do not reclassify successful remote mutations
     fs.rmSync(root, { force: true, recursive: true });
   }
 });
+
+test(
+  "deferred local receipt failures finalize the known mutation outcome",
+  { skip: process.platform === "win32" ? "requires POSIX directory permissions" : false },
+  async () => {
+    const root = fs.realpathSync(
+      fs.mkdtempSync(path.join(os.tmpdir(), "repair-deferred-receipt-")),
+    );
+    const outputRoot = path.join(root, "output");
+    fs.mkdirSync(outputRoot);
+    const previous = { ...process.env };
+    Object.assign(process.env, workflowEnv(root, outputRoot));
+    let spoolDirectory = "";
+
+    try {
+      await assert.rejects(
+        runRepairMutationAsync(repairLifecycle(), {
+          kind: "branch_push",
+          identity: { repo: "openclaw/openclaw", ref: "refs/heads/fix", sha: "b".repeat(40) },
+          operation: async () => {
+            const spoolFile = walk(root).find((file) => file.endsWith(".json"));
+            assert.ok(spoolFile);
+            spoolDirectory = path.dirname(spoolFile);
+            fs.chmodSync(spoolDirectory, 0o500);
+            return "accepted";
+          },
+        }),
+        /EACCES|EPERM|permission/i,
+      );
+
+      fs.chmodSync(spoolDirectory, 0o700);
+      await flushRepairActionEvents();
+      const events = readEvents(outputRoot);
+      assert.deepEqual(
+        events.map((event) => event.attributes?.completion_reason),
+        ["mutation_attempted", "mutation_accepted"],
+      );
+    } finally {
+      if (spoolDirectory) fs.chmodSync(spoolDirectory, 0o700);
+      restoreEnv(previous);
+      fs.rmSync(root, { force: true, recursive: true });
+    }
+  },
+);
 
 test("repair failure mutation truth is scoped to the supplied operation", async () => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "repair-operation-ledger-")));
