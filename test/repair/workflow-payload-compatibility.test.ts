@@ -178,6 +178,7 @@ test("commit finding intake rebinds legacy reports or records a safe skip", () =
       payload_version: "1",
       processable: "true",
       legacy_unsealed: "true",
+      target_repo: targetRepo,
       report_repo: "openclaw/clawsweeper-state",
       report_path: reportPath,
       report_revision: revision,
@@ -250,6 +251,41 @@ test("commit finding intake rebinds legacy reports or records a safe skip", () =
   }
 });
 
+test("commit finding intake canonicalizes mixed-case target repositories", () => {
+  const workflow = readWorkflow(commitFindingWorkflowPath);
+  const resolve = workflowStep(workflow, "intake", "Resolve commit finding report handoff");
+  const prepare = workflowStep(workflow, "intake", "Prepare commit finding intake");
+  const sha = "e".repeat(40);
+  const canonicalRepo = "openclaw/openclaw";
+  const canonicalPath = `records/openclaw-openclaw/commits/${sha}.md`;
+  const env = {
+    PAYLOAD_VERSION: "2",
+    TARGET_REPO: "OpenClaw/OpenClaw",
+    COMMIT_SHA: sha,
+    REPORT_REPO: "openclaw/clawsweeper-state",
+    REPORT_PATH: canonicalPath,
+    REPORT_REVISION: "f".repeat(40),
+    REPORT_SHA256: "a".repeat(64),
+    REPORT_URL: "",
+  };
+
+  const resolved = runStep(resolve.run, env);
+  assert.equal(resolved.status, 0, resolved.stderr);
+  assert.equal(parseOutputs(resolved.outputs).target_repo, canonicalRepo);
+  assert.equal(parseOutputs(resolved.outputs).report_path, canonicalPath);
+  assert.equal(prepare.env?.TARGET_REPO, "${{ steps.report-handoff.outputs.target_repo }}");
+
+  const noncanonical = runStep(resolve.run, {
+    ...env,
+    REPORT_PATH: `records/OpenClaw-OpenClaw/commits/${sha}.md`,
+  });
+  assert.notEqual(noncanonical.status, 0);
+  assert.match(
+    noncanonical.stderr,
+    new RegExp(`Commit finding report path must be ${canonicalPath}`),
+  );
+});
+
 test("current repair and commit finding producers identify payload version 2", () => {
   const dispatcher = fs.readFileSync("src/repair/dispatch-jobs.ts", "utf8");
   const immutableHandoff = fs.readFileSync("src/repair/immutable-job-handoff.ts", "utf8");
@@ -264,7 +300,11 @@ function readWorkflow(file: string): any {
   return parse(fs.readFileSync(file, "utf8"));
 }
 
-function workflowStep(workflow: any, job: string, name: string): { run: string } {
+function workflowStep(
+  workflow: any,
+  job: string,
+  name: string,
+): { env?: Record<string, string>; run: string } {
   const step = workflow.jobs[job].steps.find(
     (candidate: { name?: string }) => candidate.name === name,
   );

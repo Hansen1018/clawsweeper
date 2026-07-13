@@ -225,11 +225,12 @@ jobs:
             echo "Invalid commit finding target repository: $TARGET_REPO" >&2
             exit 1
           fi
+          target_repo="${TARGET_REPO,,}"
           if ! printf '%s' "$COMMIT_SHA" | grep -Eq '^[a-f0-9]{40}$'; then
             echo "Invalid commit finding commit SHA: $COMMIT_SHA" >&2
             exit 1
           fi
-          expected_report_path="records/${TARGET_REPO//\//-}/commits/${COMMIT_SHA}.md"
+          expected_report_path="records/${target_repo//\//-}/commits/${COMMIT_SHA}.md"
           report_path="${REPORT_PATH:-$expected_report_path}"
           if [ "$report_path" != "$expected_report_path" ]; then
             echo "Commit finding report path must be $expected_report_path" >&2
@@ -285,6 +286,7 @@ jobs:
             echo "payload_version=$payload_version"
             echo "processable=$processable"
             echo "legacy_unsealed=$legacy_unsealed"
+            echo "target_repo=$target_repo"
             echo "report_repo=$report_repo"
             echo "report_path=$report_path"
             echo "report_revision=$report_revision"
@@ -297,7 +299,7 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.intake-token.outputs.token }}
           ENABLED: ${{ github.event.inputs.enabled || github.event.client_payload.enabled || vars.CLAWSWEEPER_COMMIT_FINDING_INTAKE_ENABLED || 'true' }}
-          TARGET_REPO: ${{ github.event.inputs.target_repo || github.event.client_payload.target_repo || 'openclaw/openclaw' }}
+          TARGET_REPO: ${{ steps.report-handoff.outputs.target_repo }}
           COMMIT_SHA: ${{ github.event.inputs.commit_sha || github.event.client_payload.commit_sha }}
           REPORT_PROCESSABLE: ${{ steps.report-handoff.outputs.processable }}
           REPORT_REPO: ${{ steps.report-handoff.outputs.report_repo }}
