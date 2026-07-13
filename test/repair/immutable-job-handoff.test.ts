@@ -168,7 +168,17 @@ fs.appendFileSync(process.env.MOCK_GH_LOG, JSON.stringify(args) + "\\n");
   );
 
   try {
-    const dispatch = (includeImmutableReceipt = true) =>
+    const dispatch = ({
+      includeImmutableReceipt = true,
+      runner = "runner-a",
+      executionRunner = "execution-runner-a",
+      model = "model-a",
+    }: {
+      includeImmutableReceipt?: boolean;
+      runner?: string;
+      executionRunner?: string;
+      model?: string;
+    } = {}) =>
       spawnSync(
         process.execPath,
         [
@@ -178,6 +188,12 @@ fs.appendFileSync(process.env.MOCK_GH_LOG, JSON.stringify(args) + "\\n");
           "autonomous",
           "--dispatch-key",
           `commit-${unique}`,
+          "--runner",
+          runner,
+          "--execution-runner",
+          executionRunner,
+          "--model",
+          model,
           ...(includeImmutableReceipt
             ? ["--state-revision", stateRevision, "--job-sha256", jobSha256]
             : []),
@@ -198,13 +214,19 @@ fs.appendFileSync(process.env.MOCK_GH_LOG, JSON.stringify(args) + "\\n");
       );
     const first = dispatch();
     const second = dispatch();
+    const changedRunner = dispatch({ runner: "runner-b" });
+    const changedExecutionRunner = dispatch({ executionRunner: "execution-runner-b" });
+    const changedModel = dispatch({ model: "model-b" });
     jobBytes = `${jobBytes}\nchanged immutable bytes\n`;
     jobSha256 = createHash("sha256").update(jobBytes).digest("hex");
     fs.writeFileSync(jobPath, jobBytes);
     const changed = dispatch();
-    const missingReceipt = dispatch(false);
+    const missingReceipt = dispatch({ includeImmutableReceipt: false });
     assert.equal(first.status, 0, first.stderr);
     assert.equal(second.status, 0, second.stderr);
+    assert.equal(changedRunner.status, 0, changedRunner.stderr);
+    assert.equal(changedExecutionRunner.status, 0, changedExecutionRunner.stderr);
+    assert.equal(changedModel.status, 0, changedModel.stderr);
     assert.equal(changed.status, 0, changed.stderr);
     assert.equal(missingReceipt.status, 1);
     assert.match(missingReceipt.stderr, /required for immutable job handoff/);
@@ -213,17 +235,30 @@ fs.appendFileSync(process.env.MOCK_GH_LOG, JSON.stringify(args) + "\\n");
       .trim()
       .split("\n")
       .map((line) => JSON.parse(line) as string[]);
-    assert.equal(calls.length, 3);
+    assert.equal(calls.length, 6);
     assert.deepEqual(calls[0], calls[1]);
     assert.notDeepEqual(calls[0], calls[2]);
+    assert.notDeepEqual(calls[0], calls[3]);
+    assert.notDeepEqual(calls[0], calls[4]);
+    assert.notDeepEqual(calls[0], calls[5]);
     assert.ok(calls[0]?.includes(`state_revision=${stateRevision}`));
     assert.ok(calls[0]?.includes("payload_version=2"));
-    assert.ok(calls[2]?.includes(`job_sha256=${jobSha256}`));
-    const firstDispatchKey = calls[0]?.find((arg) => arg.startsWith("dispatch_key="));
-    const changedDispatchKey = calls[2]?.find((arg) => arg.startsWith("dispatch_key="));
-    assert.match(firstDispatchKey ?? "", /^dispatch_key=repair-dispatch-[a-f0-9]{24}$/);
-    assert.match(changedDispatchKey ?? "", /^dispatch_key=repair-dispatch-[a-f0-9]{24}$/);
-    assert.notEqual(firstDispatchKey, changedDispatchKey);
+    assert.ok(calls[5]?.includes(`job_sha256=${jobSha256}`));
+    const dispatchKeys = calls.map((call) =>
+      call.find((arg) => arg.startsWith("dispatch_key=")),
+    );
+    for (const dispatchKey of dispatchKeys) {
+      assert.match(dispatchKey ?? "", /^dispatch_key=repair-dispatch-[a-f0-9]{24}$/);
+    }
+    assert.equal(dispatchKeys[0], dispatchKeys[1]);
+    assert.notEqual(dispatchKeys[0], dispatchKeys[2], "runner must bind the dispatch key");
+    assert.notEqual(
+      dispatchKeys[0],
+      dispatchKeys[3],
+      "execution runner must bind the dispatch key",
+    );
+    assert.notEqual(dispatchKeys[0], dispatchKeys[4], "model must bind the dispatch key");
+    assert.notEqual(dispatchKeys[0], dispatchKeys[5], "job bytes must bind the dispatch key");
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
     fs.rmSync(path.join(process.cwd(), "jobs", `fixture-${unique}`), {
