@@ -6,6 +6,7 @@ import path from "node:path";
 import test from "node:test";
 import { pathToFileURL } from "node:url";
 
+import { actionLedgerJson } from "../dist/action-ledger.js";
 import { readMutationRecoveries } from "../dist/action-ledger-recovery.js";
 
 test("mutation recovery readers preserve a live writer staging file", async () => {
@@ -63,27 +64,90 @@ writeMutationRecovery(root, "repair", key, { state: "pending" });
   }
 });
 
-test("mutation recovery readers remove only provably stale staging files", () => {
+test("mutation recovery readers preserve live legacy staging files and remove dead writers", () => {
   const root = fs.realpathSync(
     fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-recovery-stale-")),
   );
   const directory = path.join(root, ".mutation-recovery", "repair");
   fs.mkdirSync(directory, { recursive: true });
   const key = "b".repeat(64);
-  const stale = path.join(
+  const staleCurrent = path.join(
     directory,
     `.${key}.2147483647.${"0".repeat(64)}.1.00000000-0000-4000-8000-000000000000.tmp`,
   );
-  const malformed = path.join(directory, `.${key}.${process.pid}.1.tmp`);
-  fs.writeFileSync(stale, "stale\n");
-  fs.writeFileSync(malformed, "unknown-owner\n");
+  const liveLegacy = path.join(directory, `.${key}.${process.pid}.1.tmp`);
+  const staleLegacy = path.join(directory, `.${key}.2147483647.1.tmp`);
+  fs.writeFileSync(staleCurrent, "stale\n");
+  fs.writeFileSync(liveLegacy, "live\n");
+  fs.writeFileSync(staleLegacy, "stale\n");
 
   try {
-    assert.throws(() => readMutationRecoveries(root, "repair"), /invalid mutation recovery entry/);
-    assert.equal(fs.existsSync(malformed), true);
-    fs.rmSync(malformed);
     assert.deepEqual(readMutationRecoveries(root, "repair"), []);
-    assert.equal(fs.existsSync(stale), false);
+    assert.equal(fs.existsSync(liveLegacy), true);
+    assert.equal(fs.existsSync(staleCurrent), false);
+    assert.equal(fs.existsSync(staleLegacy), false);
+  } finally {
+    fs.rmSync(root, { force: true, recursive: true });
+  }
+});
+
+test("mutation recovery readers tolerate a staging file renamed after directory listing", async () => {
+  const root = fs.realpathSync(
+    fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-recovery-rename-")),
+  );
+  const directory = path.join(root, ".mutation-recovery", "repair");
+  fs.mkdirSync(directory, { recursive: true });
+  const key = "c".repeat(64);
+  const temporary = path.join(directory, `.${key}.${process.pid}.1.tmp`);
+  const target = path.join(directory, `${key}.json`);
+  const content = `${actionLedgerJson({
+    schema: "clawsweeper.action-ledger-mutation-recovery",
+    schema_version: 1,
+    family: "repair",
+    key,
+    payload: { state: "pending" },
+  })}\n`;
+  fs.writeFileSync(temporary, content);
+  const moduleUrl = pathToFileURL(
+    path.join(process.cwd(), "dist", "action-ledger-recovery.js"),
+  ).href;
+  const script = `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+const [root, temporary, target, moduleUrl] = process.argv.slice(1);
+const originalLstatSync = fs.lstatSync;
+let renamed = false;
+fs.lstatSync = (filePath, options) => {
+  if (!renamed && filePath === temporary) {
+    renamed = true;
+    fs.renameSync(temporary, target);
+  }
+  return originalLstatSync(filePath, options);
+};
+syncBuiltinESMExports();
+const { readMutationRecoveries } = await import(moduleUrl);
+const first = readMutationRecoveries(root, "repair");
+const second = readMutationRecoveries(root, "repair");
+process.stdout.write(JSON.stringify({ first, second }));
+`;
+
+  try {
+    const child = spawn(
+      process.execPath,
+      ["--input-type=module", "-e", script, root, temporary, target, moduleUrl],
+      { stdio: ["ignore", "pipe", "pipe"] },
+    );
+    const result = await childResult(child);
+    assert.equal(result.code, 0, result.stderr || result.stdout);
+    const parsed = JSON.parse(result.stdout);
+    assert.deepEqual(parsed.first, []);
+    assert.deepEqual(
+      parsed.second.map((record: { key: string; payload: unknown }) => ({
+        key: record.key,
+        payload: record.payload,
+      })),
+      [{ key, payload: { state: "pending" } }],
+    );
   } finally {
     fs.rmSync(root, { force: true, recursive: true });
   }

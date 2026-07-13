@@ -169,6 +169,11 @@ test("repair worker jobs upload shards and one credentialed job publishes them",
     /if: \$\{\{ always\(\) && needs\.cluster\.result != 'skipped' && needs\.cluster\.outputs\.job_exists == '1' \}\}/,
   );
   assert.match(publisher, /create-state-token/);
+  assert.ok(
+    publisher.indexOf("- uses: ./.github/actions/setup-pnpm") <
+      publisher.indexOf("- name: Create repair action ledger state token"),
+    "repair ledger publisher must build before minting state write credentials",
+  );
   assert.match(
     publisher,
     /artifact-ids: \$\{\{ needs\.cluster\.outputs\.action_ledger_artifact_id \}\}/,

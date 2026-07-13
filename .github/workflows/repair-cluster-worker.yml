@@ -2105,6 +2105,11 @@ jobs:
           filter: blob:none
           persist-credentials: false
 
+      - uses: ./.github/actions/setup-pnpm
+        id: repair-ledger-setup-pnpm
+        with:
+          build-script: build:repair
+
       - name: Create repair action ledger state token
         id: repair-ledger-state-token
         uses: ./.github/actions/create-state-token
@@ -2116,11 +2121,6 @@ jobs:
         with:
           token: ${{ steps.repair-ledger-state-token.outputs.token }}
           fetch-depth: 1
-
-      - uses: ./.github/actions/setup-pnpm
-        id: repair-ledger-setup-pnpm
-        with:
-          build-script: build:repair
 
       - name: Download cluster repair action ledger
         id: download-cluster-ledger

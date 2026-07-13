@@ -23,6 +23,8 @@ const MUTATION_RECOVERY_FAMILY_PATTERN = /^[a-z][a-z0-9_-]{0,63}$/;
 const MUTATION_RECOVERY_KEY_PATTERN = /^[a-f0-9]{64}$/;
 const MUTATION_RECOVERY_TEMP_PATTERN =
   /^\.(?<key>[a-f0-9]{64})\.(?<pid>[1-9][0-9]*)\.(?<incarnation>[a-f0-9]{64})\.(?<createdAt>[0-9]+)\.(?<nonce>[a-f0-9-]{36})\.tmp$/;
+const LEGACY_MUTATION_RECOVERY_TEMP_PATTERN =
+  /^\.(?<key>[a-f0-9]{64})\.(?<pid>[1-9][0-9]*)\.(?<createdAt>[0-9]+)\.tmp$/;
 const WORKFLOW_ENV_KEYS = [
   "CLAWSWEEPER_ACTION_LEDGER_FORCE",
   "CLAWSWEEPER_ACTION_LEDGER_INVOCATION",
@@ -127,11 +129,19 @@ export function readMutationRecoveries<T>(
     const filePath = path.join(directory, entry.name);
     const temporary = MUTATION_RECOVERY_TEMP_PATTERN.exec(entry.name);
     if (temporary?.groups) {
-      assertRecoveryFile(filePath, entry.name);
+      if (!assertRecoveryFileIfPresent(filePath, entry.name)) continue;
       if (
         mutationRecoveryWriterIsStale(Number(temporary.groups.pid), temporary.groups.incarnation!)
       ) {
-        rmSync(filePath);
+        rmSync(filePath, { force: true });
+      }
+      continue;
+    }
+    const legacyTemporary = LEGACY_MUTATION_RECOVERY_TEMP_PATTERN.exec(entry.name);
+    if (legacyTemporary?.groups) {
+      if (!assertRecoveryFileIfPresent(filePath, entry.name)) continue;
+      if (!processIsAlive(Number(legacyTemporary.groups.pid))) {
+        rmSync(filePath, { force: true });
       }
       continue;
     }
@@ -227,6 +237,22 @@ function assertRecoveryFile(filePath: string, name: string) {
     throw new Error(`mutation recovery exceeds ${MUTATION_RECOVERY_MAX_BYTES} bytes: ${name}`);
   }
   return stat;
+}
+
+function assertRecoveryFileIfPresent(filePath: string, name: string): boolean {
+  try {
+    assertRecoveryFile(filePath, name);
+    return true;
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      "code" in error &&
+      (error as NodeJS.ErrnoException).code === "ENOENT"
+    ) {
+      return false;
+    }
+    throw error;
+  }
 }
 
 function mutationRecoveryWriterIsStale(pid: number, expectedIncarnation: string): boolean {

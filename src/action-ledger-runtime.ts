@@ -95,6 +95,7 @@ export const ACTION_EVENT_SHARD_IMPORT_LIMITS = {
   maxEntriesPerDirectory: 512,
   maxDirectories: 512,
   maxFiles: 256,
+  maxTotalEntries: 768,
   maxFileBytes: ACTION_EVENT_SHARD_FILE_LIMITS.maxBytes,
   maxFileLines: 2_048,
   maxFileEvents: ACTION_EVENT_SHARD_FILE_LIMITS.maxEvents,
@@ -243,6 +244,8 @@ type ActionEventLock = {
 };
 
 type ActionEventShardReadBudget = {
+  directories: number;
+  entries: number;
   files: number;
   totalBytes: number;
   totalEvents: number;
@@ -1184,6 +1187,8 @@ export function readValidatedActionEventShardBatch(
     );
   }
   const budget: ActionEventShardReadBudget = {
+    directories: 0,
+    entries: 0,
     files: 0,
     totalBytes: 0,
     totalEvents: 0,
@@ -2577,9 +2582,18 @@ function collectActionEventShardFiles(
   let fileCount = 0;
   const visit = (relativeDirectory: string, depth: number): void => {
     directoryCount += 1;
+    if (sharedBudget) sharedBudget.directories += 1;
     if (directoryCount > ACTION_EVENT_SHARD_IMPORT_LIMITS.maxDirectories) {
       throw new Error(
         `action event shard import exceeds ${ACTION_EVENT_SHARD_IMPORT_LIMITS.maxDirectories} directory limit`,
+      );
+    }
+    if (
+      sharedBudget &&
+      sharedBudget.directories > ACTION_EVENT_SHARD_IMPORT_LIMITS.maxDirectories
+    ) {
+      throw new Error(
+        `action event shard import exceeds ${ACTION_EVENT_SHARD_IMPORT_LIMITS.maxDirectories} aggregate directory limit`,
       );
     }
     const entries = readDirectoryEntriesNoFollow(
@@ -2589,6 +2603,12 @@ function collectActionEventShardFiles(
       ACTION_EVENT_SHARD_IMPORT_LIMITS.maxEntriesPerDirectory,
     );
     for (const entry of entries) {
+      if (sharedBudget) sharedBudget.entries += 1;
+      if (sharedBudget && sharedBudget.entries > ACTION_EVENT_SHARD_IMPORT_LIMITS.maxTotalEntries) {
+        throw new Error(
+          `action event shard import exceeds ${ACTION_EVENT_SHARD_IMPORT_LIMITS.maxTotalEntries} aggregate entry limit`,
+        );
+      }
       const relativePath = path.posix.join(relativeDirectory.replaceAll(path.sep, "/"), entry.name);
       const childDepth = depth + 1;
       if (childDepth > ACTION_EVENT_SHARD_IMPORT_LIMITS.maxDepth) {

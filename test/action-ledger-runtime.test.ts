@@ -4574,6 +4574,40 @@ test("multi-root shard reads enforce aggregate file limits during traversal", ()
   );
 });
 
+test("multi-root shard reads enforce aggregate directory and entry limits", () => {
+  const root = tempRoot();
+  const firstSource = trustedChildRoot(root, "first-source");
+  const secondSource = trustedChildRoot(root, "second-source");
+  const firstDirectory = path.join(firstSource, "ledger", "v1", "events");
+  const secondDirectory = path.join(secondSource, "ledger", "v1", "events");
+  fs.mkdirSync(path.join(firstDirectory, "nested"), { recursive: true });
+  fs.mkdirSync(secondDirectory, { recursive: true });
+  const mutableLimits = ACTION_EVENT_SHARD_IMPORT_LIMITS as unknown as {
+    maxDirectories: number;
+    maxTotalEntries: number;
+  };
+  const originalMaxDirectories = mutableLimits.maxDirectories;
+  const originalMaxTotalEntries = mutableLimits.maxTotalEntries;
+  try {
+    mutableLimits.maxDirectories = 2;
+    assert.throws(
+      () => readValidatedActionEventShardBatch([firstSource, secondSource]),
+      /aggregate directory limit/,
+    );
+
+    mutableLimits.maxDirectories = originalMaxDirectories;
+    mutableLimits.maxTotalEntries = 1;
+    fs.writeFileSync(path.join(secondDirectory, "entry.json"), "{}\n");
+    assert.throws(
+      () => readValidatedActionEventShardBatch([firstSource, secondSource]),
+      /aggregate entry limit/,
+    );
+  } finally {
+    mutableLimits.maxDirectories = originalMaxDirectories;
+    mutableLimits.maxTotalEntries = originalMaxTotalEntries;
+  }
+});
+
 test("multi-root shard reads stop before opening files beyond the aggregate byte budget", () => {
   const root = tempRoot();
   const firstSource = trustedChildRoot(root, "first-source");
