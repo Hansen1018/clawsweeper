@@ -570,11 +570,7 @@ function finalizeFixPr(action: LooseRecord) {
             if (dispatchPolicyBlock) {
               let rejection;
               try {
-                rejection = rejectPostFlightMergeClaim(
-                  parsed.number,
-                  action.commit,
-                  claim.claimId,
-                );
+                rejection = rejectPostFlightMergeClaim(parsed.number, action.commit, claim.claimId);
               } catch (error) {
                 rejection = {
                   status: "unknown" as const,
@@ -646,8 +642,8 @@ function finalizeFixPr(action: LooseRecord) {
             policyBlock
               ? "rejected"
               : (confirmation?.mergedAt || confirmation?.pendingReason) && !confirmation.block
-              ? "accepted"
-              : "unknown",
+                ? "accepted"
+                : "unknown",
         });
         return {
           policyBlock: mutation.policyBlock,

@@ -244,9 +244,7 @@ fs.appendFileSync(process.env.MOCK_GH_LOG, JSON.stringify(args) + "\\n");
     assert.ok(calls[0]?.includes(`state_revision=${stateRevision}`));
     assert.ok(calls[0]?.includes("payload_version=2"));
     assert.ok(calls[5]?.includes(`job_sha256=${jobSha256}`));
-    const dispatchKeys = calls.map((call) =>
-      call.find((arg) => arg.startsWith("dispatch_key=")),
-    );
+    const dispatchKeys = calls.map((call) => call.find((arg) => arg.startsWith("dispatch_key=")));
     for (const dispatchKey of dispatchKeys) {
       assert.match(dispatchKey ?? "", /^dispatch_key=repair-dispatch-[a-f0-9]{24}$/);
     }
