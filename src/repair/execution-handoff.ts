@@ -20,6 +20,7 @@ import {
   authorizedFixArtifact,
   digestJson,
   executionIntentRepairDeltaBaseSha,
+  publicationLifecycleSource,
   publicationReceipt,
   sha256File,
   verifyExecutionIntentIdentity,
@@ -3925,12 +3926,13 @@ function publicationRepairLifecycle(
   intent: ExecutionIntent,
   publication: PreparedPublication,
 ): RepairLifecycleInput {
+  const source = publicationLifecycleSource(intent.source);
   return {
     repository: intent.target_repo,
     workKey: `publication:${publication.identity_sha256}`,
     ...(intent.source.number ? { number: intent.source.number } : {}),
-    sourceRevision: publication.prepared_head_sha,
-    subjectKind: intent.source.kind === "issue" ? "issue" : "pull_request",
+    sourceRevision: source.sourceRevision,
+    subjectKind: source.sourceKind,
   };
 }
 

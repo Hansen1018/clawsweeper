@@ -2,6 +2,7 @@
 import type { JsonValue, LooseRecord } from "./json-types.js";
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   ACTION_EVENT_REASON_CODES,
   ACTION_EVENT_STATUSES,
@@ -64,7 +65,9 @@ const inputs = args._.length > 0 ? args._ : [path.join(root, ".clawsweeper-repai
 const metadataByRunId = readRunMetadata(args["runs-json"]);
 const published: LooseRecord[] = [];
 
-await runPublishResult();
+if (path.resolve(process.argv[1] ?? "") === fileURLToPath(import.meta.url)) {
+  await runPublishResult();
+}
 
 async function runPublishResult() {
   let commandError: unknown = null;
@@ -117,14 +120,13 @@ function publishResult(resultPath: string) {
   const postFlightReport = readSiblingJson(runDir, "post-flight-report.json") ?? { actions: [] };
   const fixReport = readSiblingJson(runDir, "fix-execution-report.json") ?? { actions: [] };
   const clusterPlan = readSiblingJson(runDir, "cluster-plan.json");
-  const reviewedTargetRevision = reviewedResultRevision(
+  const sourceContext = readPublishedSourceContext(clusterPlan);
+  const reviewedTargetRevision = resultPublicationSourceRevision(
     result,
     clusterPlan,
-    readPublishedSourceContext(clusterPlan),
+    sourceContext,
+    resultPath,
   );
-  if (!reviewedTargetRevision) {
-    throw new Error(`repair result is missing one exact reviewed target revision: ${resultPath}`);
-  }
   const runId = String(args["run-id"] ?? inferRunId(resultPath) ?? "");
   const metadata = runId ? metadataByRunId.get(runId) : undefined;
   const previousRecord = runId ? readExistingRunRecord(root, runId) : null;
@@ -244,6 +246,42 @@ function publishResult(resultPath: string) {
     fix_counts: report.fix_counts,
     apply_counts: report.apply_counts,
   };
+}
+
+export function resultPublicationSourceRevision(
+  result: LooseRecord,
+  clusterPlan: LooseRecord | null,
+  sourceContext: LooseRecord | null,
+  resultPath = "result.json",
+): string | null {
+  const revision = reviewedResultRevision(result, clusterPlan, sourceContext);
+  if (revision || !resultPublicationRequiresExactRevision(result, sourceContext)) {
+    return revision;
+  }
+  throw new Error(`repair result is missing one exact reviewed target revision: ${resultPath}`);
+}
+
+function resultPublicationRequiresExactRevision(
+  result: LooseRecord,
+  sourceContext: LooseRecord | null,
+): boolean {
+  if (String(result.canonical_pr ?? "").trim()) return true;
+
+  const source = String(sourceContext?.source ?? "").trim();
+  if (
+    ["clawsweeper_commit", "issue_implementation", "pr-repair-intake", "pr_automerge"].includes(
+      source,
+    )
+  ) {
+    return true;
+  }
+  return [
+    "source_issue_revision_sha256",
+    "expected_head_sha",
+    "commit_sha",
+    "expected_source_revision",
+    "reviewed_sha",
+  ].some((key) => sourceContext?.[key] !== undefined);
 }
 
 function readPublishedSourceContext(clusterPlan: LooseRecord | null): LooseRecord | null {

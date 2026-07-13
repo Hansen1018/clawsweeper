@@ -90,6 +90,27 @@ export type PublicationReceipt = {
   identity_sha256: string;
 };
 
+export type PublicationLifecycleSource = {
+  sourceKind: "pull_request" | "issue" | "commit" | "queue_item";
+  sourceRevision: string | null;
+};
+
+export function publicationLifecycleSource(
+  source: ExecutionSourceIntent,
+): PublicationLifecycleSource {
+  if (source.kind === "pull_request" || source.kind === "commit") {
+    const sourceRevision = String(source.expected_head_sha ?? "").toLowerCase();
+    requireSha(sourceRevision, `${source.kind} source revision`);
+    return { sourceKind: source.kind, sourceRevision };
+  }
+  if (source.kind === "issue") {
+    const sourceRevision = String(source.expected_revision_sha256 ?? "").toLowerCase();
+    requireDigest(sourceRevision, "issue source revision");
+    return { sourceKind: "issue", sourceRevision };
+  }
+  return { sourceKind: "queue_item", sourceRevision: null };
+}
+
 export function executionIntentRepairDeltaBaseSha(intent: ExecutionIntent): string {
   const repairDeltaBaseSha =
     intent.expected_output_sha ??

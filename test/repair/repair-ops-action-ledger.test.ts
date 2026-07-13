@@ -53,10 +53,7 @@ test("repair sessions, statuses, and result publication flush immutable receipts
   assert.match(publisher, /ACTION_EVENT_TYPES\.dashboardLifecycle/);
   assert.match(publisher, /await flushRepairActionEvents\(\)/);
   assert.match(publisher, /recordRepairLifecycleFailureSafely/);
-  assert.match(
-    publisher,
-    /reviewedResultRevision\([\s\S]*readPublishedSourceContext\(clusterPlan\)[\s\S]*missing one exact reviewed target revision/,
-  );
+  assert.match(publisher, /resultPublicationSourceRevision\([\s\S]*sourceContext[\s\S]*resultPath/);
   assert.match(
     publisher,
     /eventIdentity:\s*\{\s*publicationKind: "cluster_result",\s*runId: runId \|\| clusterId,\s*state: "prepared"/,

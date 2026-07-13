@@ -2,6 +2,7 @@ import fs from "node:fs";
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { resultPublicationSourceRevision } from "../../dist/repair/publish-result.js";
 import { reviewedResultRevision } from "../../dist/repair/publish-result-source.js";
 import { readText } from "../helpers.ts";
 
@@ -55,6 +56,58 @@ test("published repair receipts bind issue and commit workflow source revisions"
       commit_sha: "e".repeat(40),
     }),
     "e".repeat(40),
+  );
+});
+
+test("result publication accepts production blocked and generic issue-only results without fake revisions", () => {
+  const blocked = productionResult({
+    status: "blocked",
+    summary: { reason: "manual repair required" },
+    actions: [],
+    needs_human: ["manual repair required"],
+  });
+  assert.equal(
+    resultPublicationSourceRevision(blocked, null, {
+      source: "clawsweeper",
+      job_intent: "repair_cluster",
+    }),
+    null,
+  );
+
+  const issueOnly = productionResult({
+    canonical: "#42",
+    canonical_issue: "#42",
+  });
+  assert.equal(
+    resultPublicationSourceRevision(issueOnly, null, {
+      source: "clawsweeper",
+      job_intent: "repair_cluster",
+    }),
+    null,
+  );
+});
+
+test("result publication keeps exact revision requirements for live source-bound work", () => {
+  const result = productionResult({ canonical: "#42" });
+  for (const source of [
+    { source: "issue_implementation" },
+    { source: "clawsweeper_commit" },
+    { source: "pr-repair-intake" },
+    { source: "pr_automerge" },
+  ]) {
+    assert.throws(
+      () => resultPublicationSourceRevision(result, null, source),
+      /missing one exact reviewed target revision/,
+    );
+  }
+  assert.throws(
+    () =>
+      resultPublicationSourceRevision(
+        productionResult({ status: "blocked", canonical: "#42", canonical_pr: "#42" }),
+        null,
+        { source: "clawsweeper" },
+      ),
+    /missing one exact reviewed target revision/,
   );
 });
 

@@ -48,6 +48,7 @@ import {
   createPreparedPublication,
   digestJson,
   executionIntentRepairDeltaBaseSha,
+  publicationLifecycleSource,
   publicationReceipt,
   type PreparedPublication,
   verifyExecutionIntentIdentity,
@@ -60,6 +61,65 @@ import {
   stagedProofBundle,
   stagedProofPlanArtifact,
 } from "../../dist/repair/staged-proof-gates.js";
+
+test("publication lifecycle provenance follows pull, issue, commit, and generic job sources", () => {
+  const common = {
+    repo: "openclaw/example",
+    number: null,
+    url: null,
+    expected_state: "authorized",
+    expected_revision_sha256: null,
+    expected_head_repo: null,
+    expected_head_ref: null,
+    expected_head_sha: null,
+    expected_base_ref: null,
+    expected_base_sha: null,
+  };
+  assert.deepEqual(
+    publicationLifecycleSource({
+      ...common,
+      kind: "pull_request",
+      number: 42,
+      url: "https://github.com/openclaw/example/pull/42",
+      expected_head_sha: "a".repeat(40),
+    }),
+    { sourceKind: "pull_request", sourceRevision: "a".repeat(40) },
+  );
+  assert.deepEqual(
+    publicationLifecycleSource({
+      ...common,
+      kind: "issue",
+      number: 42,
+      url: "https://github.com/openclaw/example/issues/42",
+      expected_revision_sha256: "b".repeat(64),
+    }),
+    { sourceKind: "issue", sourceRevision: "b".repeat(64) },
+  );
+  assert.deepEqual(
+    publicationLifecycleSource({
+      ...common,
+      kind: "commit",
+      expected_head_sha: "c".repeat(40),
+    }),
+    { sourceKind: "commit", sourceRevision: "c".repeat(40) },
+  );
+  assert.deepEqual(publicationLifecycleSource({ ...common, kind: "job" }), {
+    sourceKind: "queue_item",
+    sourceRevision: null,
+  });
+  assert.throws(
+    () => publicationLifecycleSource({ ...common, kind: "commit" }),
+    /commit source revision must be a full commit SHA/,
+  );
+
+  const handoff = fs.readFileSync("src/repair/execution-handoff.ts", "utf8");
+  const lifecycle = handoff.slice(
+    handoff.indexOf("function publicationRepairLifecycle"),
+    handoff.indexOf("function recordPublicationWorkflowEventSafely"),
+  );
+  assert.match(lifecycle, /publicationLifecycleSource\(intent\.source\)/);
+  assert.doesNotMatch(lifecycle, /publication\.prepared_head_sha/);
+});
 
 test("execution authorization selects one explicit run and seals its immutable identity", () => {
   const fixture = handoffFixture();
