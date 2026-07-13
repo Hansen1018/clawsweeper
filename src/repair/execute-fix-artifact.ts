@@ -114,7 +114,10 @@ import {
   reviewAfterFinalBaseSync,
 } from "./execution-finalization.js";
 import { tryResolveMechanicalRebaseConflicts } from "./mechanical-rebase-conflicts.js";
-import { compactGeneratedBranchHistory } from "./compact-generated-branch.js";
+import {
+  commitGeneratedCheckpointIfNeeded,
+  compactGeneratedBranchHistory,
+} from "./compact-generated-branch.js";
 import { compactText, escapeRegExp } from "./text-utils.js";
 import {
   shouldCloseSupersededSourcePrs,
@@ -2392,6 +2395,7 @@ function editValidatePrepareMerge({
   const firstCheckpoint = commitCheckpointIfNeeded({
     targetDir,
     message: fixArtifact.pr_title,
+    checkpoint: "edit",
     trailers: mode === "replacement" ? coAuthorTrailers(contributorCredits) : [],
   });
   if (firstCheckpoint) {
@@ -2418,6 +2422,7 @@ function editValidatePrepareMerge({
       const checkpoint = commitCheckpointIfNeeded({
         targetDir,
         message: `fix(clawsweeper): address review for ${result.cluster_id} (${reviewAttempt})`,
+        checkpoint: repairReviewCheckpoint(reviewAttempt),
         trailers: mode === "replacement" ? coAuthorTrailers(contributorCredits) : [],
       });
       if (checkpoint) {
@@ -2473,6 +2478,7 @@ function editValidatePrepareMerge({
         const checkpoint = commitCheckpointIfNeeded({
           targetDir,
           message: `fix(clawsweeper): reconcile ${result.cluster_id} with main (1)`,
+          checkpoint: "final-sync:1",
           trailers: mode === "replacement" ? coAuthorTrailers(contributorCredits) : [],
         });
         if (checkpoint) {
@@ -2493,6 +2499,7 @@ function editValidatePrepareMerge({
   const finalCheckpoint = commitCheckpointIfNeeded({
     targetDir,
     message: `fix(clawsweeper): finalize ${result.cluster_id}`,
+    checkpoint: "final",
     trailers: mode === "replacement" ? coAuthorTrailers(contributorCredits) : [],
   });
   if (finalCheckpoint) {
@@ -2534,6 +2541,8 @@ function compactReplacementHistory({
     baseRef: `origin/${baseBranch}`,
     message: fixArtifact.pr_title,
     trailers: coAuthorTrailers(contributorCredits),
+    lifecycle: directRepairLifecycle(null),
+    commitCommand: (args) => runGitNetwork(args, targetDir),
   });
   if (compaction.status === "compacted") {
     checkpointCommits.splice(0, checkpointCommits.length, compaction.commit);
@@ -3641,13 +3650,26 @@ function checkoutRecoverableReplacementBranch({
   return { resumed: false, branch };
 }
 
-function commitCheckpointIfNeeded({ targetDir, message, trailers = [] }: LooseRecord) {
-  if (!run("git", ["status", "--porcelain"], { cwd: targetDir }).trim()) return "";
-  run("git", ["add", "--all"], { cwd: targetDir });
-  const args = ["commit", "-m", message];
-  for (const trailer of uniqueStrings(trailers)) args.push("-m", trailer);
-  runGitNetwork(args, targetDir);
-  return run("git", ["rev-parse", "HEAD"], { cwd: targetDir }).trim();
+function commitCheckpointIfNeeded({ targetDir, message, checkpoint, trailers = [] }: LooseRecord) {
+  return commitGeneratedCheckpointIfNeeded({
+    targetDir,
+    message,
+    checkpoint,
+    trailers: uniqueStrings(trailers),
+    lifecycle: directRepairLifecycle(null),
+    commitCommand: (args) => runGitNetwork(args, targetDir),
+  });
+}
+
+function repairReviewCheckpoint(reviewAttempt: JsonValue) {
+  const attempt = String(reviewAttempt);
+  if (attempt.startsWith("validation-")) {
+    return `validation-fix:${attempt.slice("validation-".length)}`;
+  }
+  if (attempt.endsWith("-final")) {
+    return `final-review-fix:${attempt.slice(0, -"-final".length)}`;
+  }
+  return `review-fix:${attempt}`;
 }
 
 function enforceFinalRepairContract({ fixArtifact, targetDir, baseBranch }: LooseRecord) {
