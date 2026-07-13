@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { pathToFileURL } from "node:url";
 
 test("action-ledger CLI accepts the package-manager argument separator", () => {
   const result = spawnSync(
@@ -155,6 +156,87 @@ test("action-ledger CLI publishes an authenticated empty repair manifest as a no
       completionPaths: [],
       paths: [],
     });
+  } finally {
+    fs.rmSync(root, { force: true, recursive: true });
+  }
+});
+
+test("action-ledger CLI publishes generic workflow shards from the exact producer job", async () => {
+  const { ACTION_EVENT_REASON_CODES, ACTION_EVENT_STATUSES, ACTION_EVENT_TYPES } = await import(
+    pathToFileURL(path.resolve("dist/action-ledger.js")).href
+  );
+  const { flushWorkflowActionEvents, recordWorkflowPhaseEvent } = await import(
+    pathToFileURL(path.resolve("dist/action-ledger-runtime.js")).href
+  );
+  const root = fs.realpathSync(
+    fs.mkdtempSync(path.join(os.tmpdir(), "workflow-action-ledger-publish-")),
+  );
+  const outputRoot = fs.realpathSync(fs.mkdtempSync(path.join(root, "output-")));
+  const stateRoot = fs.realpathSync(fs.mkdtempSync(path.join(root, "state-")));
+  const env = {
+    ...process.env,
+    CLAWSWEEPER_ACTION_LEDGER_FORCE: "1",
+    CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT: outputRoot,
+    GITHUB_ACTION: "scan",
+    GITHUB_JOB: "scan",
+    GITHUB_REPOSITORY: "openclaw/clawsweeper",
+    GITHUB_RUN_ATTEMPT: "2",
+    GITHUB_RUN_ID: "5151",
+    GITHUB_RUN_STARTED_AT: "2026-07-12T12:00:00Z",
+    GITHUB_SHA: "c".repeat(40),
+    GITHUB_WORKFLOW: "spam scanner",
+    GITHUB_WORKFLOW_REF: "openclaw/clawsweeper/.github/workflows/spam-scanner.yml@refs/heads/main",
+  };
+
+  try {
+    recordWorkflowPhaseEvent(
+      root,
+      {
+        phase: ACTION_EVENT_TYPES.reviewBatch,
+        status: ACTION_EVENT_STATUSES.completed,
+        reasonCode: ACTION_EVENT_REASON_CODES.completed,
+        retryable: false,
+        mutation: false,
+        identity: { slot: "scan" },
+        operation: "spam_review",
+        operationIdentity: { repository: "openclaw/openclaw", scan: "hourly" },
+        phaseSeq: 1,
+        component: "spam_scanner",
+        subject: { repository: "openclaw/openclaw", kind: "workflow" },
+      },
+      { env },
+    );
+    const paths = await flushWorkflowActionEvents(root, { env, outputRoot });
+    assert.equal(paths.length, 1);
+
+    const publish = spawnSync(
+      process.execPath,
+      [
+        path.resolve("dist/repair/action-ledger-cli.js"),
+        "publish-workflow",
+        "--expected-producer-job",
+        "scan",
+        "--source-root",
+        outputRoot,
+        "--state-root",
+        stateRoot,
+      ],
+      {
+        encoding: "utf8",
+        env: {
+          ...env,
+          GITHUB_ACTION: "publish",
+          GITHUB_JOB: "publish",
+        },
+      },
+    );
+    assert.equal(publish.status, 0, publish.stderr);
+    const result = JSON.parse(publish.stdout);
+    assert.equal(result.eventPaths.length, 1);
+    assert.ok(result.paths.length >= 5);
+    for (const relativePath of result.paths) {
+      assert.equal(fs.existsSync(path.join(stateRoot, relativePath)), true, relativePath);
+    }
   } finally {
     fs.rmSync(root, { force: true, recursive: true });
   }

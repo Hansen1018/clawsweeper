@@ -37,6 +37,27 @@ if (command === "finalize") {
     const paths = await flushRepairActionEvents();
     console.log(JSON.stringify({ paths }, null, 2));
   }
+} else if (command === "publish-workflow") {
+  const sourceRoot = path.resolve(args.sourceRoot ?? actionLedgerOutputRoot());
+  const stateRoot = path.resolve(args.stateRoot ?? repoRoot());
+  const current = workflowActionProducer("action_event_publisher");
+  const expectedProducerJob = requiredArg(args.expectedProducerJob, "--expected-producer-job");
+  console.log(
+    JSON.stringify(
+      importActionEventShards(sourceRoot, stateRoot, {
+        expectedProducer: {
+          repository: current.repository,
+          sha: current.sha,
+          workflow: current.workflow,
+          job: expectedProducerJob,
+          runId: current.runId,
+          runAttempt: current.runAttempt,
+        },
+      }),
+      null,
+      2,
+    ),
+  );
 } else if (command === "verify" || command === "publish") {
   const sourceRoot = path.resolve(args.sourceRoot ?? actionLedgerOutputRoot());
   if (args.lane) {
@@ -145,7 +166,7 @@ if (command === "finalize") {
   }
 } else {
   throw new Error(
-    "usage: action-ledger-cli.ts <finalize|verify|publish> [--lane name | --repair-lane name] [--allow-empty] [--manifest path] [--expected-repository owner/repo --expected-sha sha --expected-workflow workflow --expected-job job --expected-run-id id --expected-run-attempt attempt] [--source-root path --state-root path] [--commit-report path --expected-commit-repository owner/repo --expected-commit-sha sha]",
+    "usage: action-ledger-cli.ts <finalize|verify|publish|publish-workflow> [--lane name | --repair-lane name] [--allow-empty] [--manifest path] [--expected-repository owner/repo --expected-sha sha --expected-workflow workflow --expected-job job --expected-run-id id --expected-run-attempt attempt] [--expected-producer-job job] [--source-root path --state-root path] [--commit-report path --expected-commit-repository owner/repo --expected-commit-sha sha]",
   );
 }
 
@@ -168,6 +189,7 @@ function parseArgs(argv: readonly string[]) {
     expectedSha?: string;
     expectedWorkflow?: string;
     expectedJob?: string;
+    expectedProducerJob?: string;
     expectedRunId?: string;
     expectedRunAttempt?: number;
     commitReport?: string;
@@ -189,7 +211,9 @@ function parseArgs(argv: readonly string[]) {
     } else if (arg === "--expected-workflow") {
       parsed.expectedWorkflow = requiredValue(argv, ++index, arg);
     } else if (arg === "--expected-job") parsed.expectedJob = requiredValue(argv, ++index, arg);
-    else if (arg === "--expected-run-id") {
+    else if (arg === "--expected-producer-job") {
+      parsed.expectedProducerJob = requiredValue(argv, ++index, arg);
+    } else if (arg === "--expected-run-id") {
       parsed.expectedRunId = requiredValue(argv, ++index, arg);
     } else if (arg === "--commit-report") parsed.commitReport = requiredValue(argv, ++index, arg);
     else if (arg === "--expected-commit-repository") {
