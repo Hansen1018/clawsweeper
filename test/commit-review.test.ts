@@ -74,6 +74,10 @@ test("commit review materializes private clone data before removing review crede
     review.indexOf("      - name: Review commit"),
     review.indexOf("      - name: Upload commit review diagnostic"),
   );
+  const hydrateIdentities = review.slice(
+    review.indexOf("      - name: Hydrate commit identities"),
+    review.indexOf("      - name: Review commit"),
+  );
   const materializeCommit =
     'git -C "$TARGET_NAME" diff --no-ext-diff --binary "$COMMIT_SHA^" "$COMMIT_SHA" >/dev/null';
   const removePromisorCredential =
@@ -82,7 +86,14 @@ test("commit review materializes private clone data before removing review crede
   assert.match(checkout, /TARGET_TOKEN: \$\{\{ steps\.target-read-token\.outputs\.token \}\}/);
   assert.ok(checkout.includes(materializeCommit));
   assert.ok(checkout.indexOf(materializeCommit) < checkout.indexOf(removePromisorCredential));
-  assert.match(reviewCommit, /GH_TOKEN: \$\{\{ steps\.target-read-token\.outputs\.token \}\}/);
+  assert.match(hydrateIdentities, /GH_TOKEN: \$\{\{ steps\.target-read-token\.outputs\.token \}\}/);
+  assert.match(hydrateIdentities, /gh api "repos\/\$TARGET_REPO\/commits\/\$COMMIT_SHA"/);
+  assert.doesNotMatch(reviewCommit, /GH_TOKEN|GITHUB_TOKEN|TARGET_TOKEN/);
+  assert.match(reviewCommit, /--prehydrated-github-metadata/);
+  assert.match(
+    reviewCommit,
+    /--github-author "\$\{\{ steps\.commit-identities\.outputs\.github_author \}\}"/,
+  );
   assert.doesNotMatch(reviewCommit, /COMMIT_SWEEPER_TARGET_GH_TOKEN/);
 });
 
@@ -203,11 +214,9 @@ fs.writeFileSync(outputPath, [
       { mode: 0o755 },
     );
     const ghPath = path.join(binDir, "gh");
-    fs.writeFileSync(
-      ghPath,
-      '#!/bin/sh\n[ "$GH_TOKEN" = "ghs_review-read-token-123456" ] || exit 1\nprintf "hydrated-author\\n"\n',
-      { mode: 0o755 },
-    );
+    fs.writeFileSync(ghPath, '#!/bin/sh\necho "unexpected gh invocation" >&2\nexit 99\n', {
+      mode: 0o755,
+    });
 
     const result = spawnSync(
       process.execPath,
@@ -232,6 +241,11 @@ fs.writeFileSync(outputPath, [
         "--codex-timeout-ms",
         "10000",
         "--require-publishable-report",
+        "--prehydrated-github-metadata",
+        "--github-author",
+        "hydrated-author",
+        "--github-committer",
+        "hydrated-committer",
       ],
       {
         encoding: "utf8",

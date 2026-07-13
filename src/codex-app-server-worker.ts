@@ -7,6 +7,7 @@ import {
   codexOutputTail,
   createCodexTextRedactor,
   openCodexOutputCapture,
+  redactCodexText,
   redactCodexTextChunk,
 } from "./codex-output-capture.js";
 import { spawnCodex, terminateCodexProcessTree, waitForCodexProcessExit } from "./codex-spawn.js";
@@ -421,7 +422,7 @@ async function finish(status: number, signal: NodeJS.Signals | null, error?: Err
     JSON.stringify({
       status,
       signal,
-      ...(error ? { error: serializedError(error) } : {}),
+      ...(error ? { error: serializedError(error, input.redactValues) } : {}),
       stdout: codexOutputTail(stdout),
       stderr: codexOutputTail(stderr),
     }),
@@ -582,10 +583,16 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function serializedError(error: Error): { message: string; code?: string } {
+function serializedError(
+  error: Error,
+  redactValues: readonly string[],
+): {
+  message: string;
+  code?: string;
+} {
   const code = "code" in error ? (error as NodeJS.ErrnoException).code : undefined;
   return {
-    message: error.message,
+    message: redactCodexText(error.message, redactValues),
     ...(typeof code === "string" ? { code } : {}),
   };
 }

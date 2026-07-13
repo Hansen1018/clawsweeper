@@ -4,6 +4,7 @@ import {
   closeCodexOutputCapture,
   codexOutputTail,
   openCodexOutputCapture,
+  redactCodexText,
 } from "./codex-output-capture.js";
 import { spawnCodex, terminateCodexProcessTree } from "./codex-spawn.js";
 
@@ -65,7 +66,7 @@ child.once("close", (status, signal) => {
       status,
       signal,
       ...(timeoutError || spawnError
-        ? { error: serializedError(timeoutError ?? spawnError!) }
+        ? { error: serializedError(timeoutError ?? spawnError!, input.redactValues) }
         : {}),
       stdout: codexOutputTail(stdout),
       stderr: codexOutputTail(stderr),
@@ -85,10 +86,16 @@ for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
   });
 }
 
-function serializedError(error: Error): { message: string; code?: string } {
+function serializedError(
+  error: Error,
+  redactValues: readonly string[],
+): {
+  message: string;
+  code?: string;
+} {
   const code = "code" in error ? (error as NodeJS.ErrnoException).code : undefined;
   return {
-    message: error.message,
+    message: redactCodexText(error.message, redactValues),
     ...(typeof code === "string" ? { code } : {}),
   };
 }

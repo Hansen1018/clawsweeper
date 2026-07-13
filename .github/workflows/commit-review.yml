@@ -474,11 +474,32 @@ jobs:
       - uses: ./clawsweeper/.github/actions/setup-action-ledger
         id: review-action-ledger
 
+      - name: Hydrate commit identities
+        id: commit-identities
+        env:
+          GH_TOKEN: ${{ steps.target-read-token.outputs.token }}
+          TARGET_REPO: ${{ needs.plan.outputs.target_repo }}
+          COMMIT_SHA: ${{ matrix.sha }}
+        run: |
+          set -euo pipefail
+          commit_json="$(gh api "repos/$TARGET_REPO/commits/$COMMIT_SHA" 2>/dev/null || printf '{}')"
+          github_author="$(jq -r '.author.login // ""' <<< "$commit_json")"
+          github_committer="$(jq -r '.committer.login // ""' <<< "$commit_json")"
+          for login in "$github_author" "$github_committer"; do
+            if [ "${#login}" -gt 100 ] || { [ -n "$login" ] && ! printf '%s' "$login" | grep -Eq '^[A-Za-z0-9-]+(\[bot\])?$'; }; then
+              echo "GitHub returned an invalid commit identity." >&2
+              exit 1
+            fi
+          done
+          {
+            echo "github_author=$github_author"
+            echo "github_committer=$github_committer"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Review commit
         id: review-commit
         working-directory: clawsweeper
         env:
-          GH_TOKEN: ${{ steps.target-read-token.outputs.token }}
           COMMIT_SWEEPER_ADDITIONAL_PROMPT: ${{ github.event.inputs.additional_prompt || github.event.client_payload.additional_prompt || '' }}
         run: |
           node dist/commit-sweeper.js review \
@@ -493,6 +514,9 @@ jobs:
             --codex-sandbox read-only \
             --codex-timeout-ms 1800000 \
             --require-publishable-report \
+            --prehydrated-github-metadata \
+            --github-author "${{ steps.commit-identities.outputs.github_author }}" \
+            --github-committer "${{ steps.commit-identities.outputs.github_committer }}" \
             --defer-workflow-completion
 
       - name: Upload commit review diagnostic

@@ -389,6 +389,71 @@ setInterval(() => {}, 1000);
   }
 });
 
+test("Codex process redacts spawn errors before returning them", () => {
+  const root = mkdtempSync(tmpPrefix);
+  const secret = "missing-private-codex-123456";
+  try {
+    const result = runCodexProcess({
+      args: [],
+      cwd: root,
+      env: { ...process.env, CODEX_BIN: join(root, secret) },
+      input: "",
+      timeoutMs: 10_000,
+      redactValues: [secret],
+    });
+
+    assert.ok(result.error);
+    assert.doesNotMatch(result.error.message, new RegExp(secret));
+    assert.match(result.error.message, /\[REDACTED\]/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Codex app-server redacts JSON-RPC errors before returning them", () => {
+  const root = mkdtempSync(tmpPrefix);
+  const binDir = join(root, "node_modules", ".bin");
+  const secret = "rpc-private-token-123456";
+  mkdirSync(binDir, { recursive: true });
+  const codexPath = join(binDir, "codex");
+  writeFileSync(
+    codexPath,
+    `#!/usr/bin/env node
+const readline = require("node:readline");
+const rl = readline.createInterface({ input: process.stdin });
+rl.on("line", (line) => {
+  const message = JSON.parse(line);
+  if (message.method === "initialize") {
+    process.stdout.write(JSON.stringify({
+      id: message.id,
+      error: { code: -32000, message: "request failed for ${secret}" }
+    }) + "\\n");
+  }
+});
+`,
+    { mode: 0o755 },
+  );
+
+  try {
+    const result = runCodexProcess({
+      args: ["exec", "--cd", root, "--sandbox", "read-only", "-"],
+      cwd: root,
+      env: { ...process.env, CODEX_BIN: codexPath },
+      input: "Inspect the checkout.",
+      timeoutMs: 10_000,
+      appServer: { statePath: join(root, "state.json") },
+      redactValues: [secret],
+    });
+
+    assert.equal(result.status, 1);
+    assert.ok(result.error);
+    assert.doesNotMatch(result.error.message, new RegExp(secret));
+    assert.match(result.error.message, /\[REDACTED\]/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("Codex app-server mode persists and resumes a thread", () => {
   const root = mkdtempSync(tmpPrefix);
   const binDir = join(root, "node_modules", ".bin");

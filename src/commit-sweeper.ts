@@ -143,6 +143,15 @@ function personLabel(name: string, githubLogin: string): string {
   return stripEmailIdentity(name) || "unknown";
 }
 
+function prehydratedGitHubLogin(value: string, label: string): string {
+  const login = value.trim();
+  if (!login) return "";
+  if (login.length > 100 || !/^[A-Za-z0-9-]+(?:\[bot\])?$/.test(login)) {
+    throw new Error(`Invalid ${label}: ${value}`);
+  }
+  return login;
+}
+
 export function parseCoAuthors(body: string): string[] {
   const coAuthors: string[] = [];
   for (const match of body.matchAll(/^Co-authored-by:\s*(.+?)\s*$/gim)) {
@@ -534,7 +543,18 @@ function reviewCommand(args: Args): void {
   const deferWorkflowCompletion = argBool(args, "defer_workflow_completion");
   recordCommitWorkflowEvent(lifecycle, "started");
   try {
-    const metadata = commitMetadata(targetDir, targetRepo, sha);
+    const prehydratedGitHubMetadata = argBool(args, "prehydrated_github_metadata");
+    const metadata = commitMetadata(targetDir, targetRepo, sha, prehydratedGitHubMetadata);
+    if (prehydratedGitHubMetadata) {
+      metadata.githubAuthor = prehydratedGitHubLogin(
+        argString(args, "github_author", ""),
+        "GitHub author login",
+      );
+      metadata.githubCommitter = prehydratedGitHubLogin(
+        argString(args, "github_committer", ""),
+        "GitHub committer login",
+      );
+    }
     const baseSha = assertSha(argString(args, "base_sha", metadata.parents[0] ?? ""), "base sha");
     const reportDir = resolve(argString(args, "report_dir", "records"));
     const artifactMode = argBool(args, "artifact_mode");
