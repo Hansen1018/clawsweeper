@@ -1133,7 +1133,8 @@ jobs:
           GUARDED_OPEN: ${{ steps.publish-event-result.outputs.guarded_open }}
           POLICY_NOOP: ${{ steps.publish-event-result.outputs.policy_noop }}
           REQUEUE_LATEST: ${{ steps.publish-event-result.outputs.requeue_latest }}
-          ROUTE_OUTCOME: ${{ steps.queue-exact-verdict-router.outcome }}
+          DIRECT_ROUTE_OUTCOME: ${{ steps.route-synced-verdict.outcome }}
+          DEFERRED_ROUTE_OUTCOME: ${{ steps.queue-deferred-verdict-router.outcome }}
         run: |
           outcome=failure
           if [ "$PRIMARY_JOB_STATUS" = "cancelled" ] || [ "$REVIEW_OUTCOME" = "cancelled" ]; then
@@ -1153,7 +1154,8 @@ jobs:
             { [ "$TERMINAL_MISSING" = "true" ] ||
               [ "$TERMINAL_CLOSED" = "true" ] ||
               [ "$GUARDED_OPEN" = "true" ] ||
-              [ "$ROUTE_OUTCOME" = "success" ]; }; then
+              [ "$DIRECT_ROUTE_OUTCOME" = "success" ] ||
+              [ "$DEFERRED_ROUTE_OUTCOME" = "success" ]; }; then
             outcome=success
           fi
           echo "outcome=$outcome" >> "$GITHUB_OUTPUT"

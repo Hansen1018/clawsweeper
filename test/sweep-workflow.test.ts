@@ -511,6 +511,14 @@ test("exact event publish and routing require a successful fresh review artifact
     eventReviewJob,
     /ROUTE_HANDOFF_OUTCOME: \$\{\{ steps\.queue-deferred-verdict-router\.outcome \}\}/,
   );
+  assert.match(
+    eventReviewJob,
+    /DIRECT_ROUTE_OUTCOME: \$\{\{ steps\.route-synced-verdict\.outcome \}\}/,
+  );
+  assert.match(
+    eventReviewJob,
+    /DEFERRED_ROUTE_OUTCOME: \$\{\{ steps\.queue-deferred-verdict-router\.outcome \}\}/,
+  );
   assert.match(eventReviewJob, /queued an executing target-wide serialized router scan/);
   assert.match(eventReviewJob, /deterministic remain-open guard/);
   assert.match(eventReviewJob, /verified terminal close/);
