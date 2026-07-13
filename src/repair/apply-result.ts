@@ -1891,6 +1891,7 @@ function validateTerminalStatusChecks(checks: LooseRecord[]) {
       if (!PASSING_CHECK_CONCLUSIONS.has(conclusion)) blockers.push(`${name}: ${conclusion}`);
       continue;
     }
+    if (!check.status && PASSING_CHECK_CONCLUSIONS.has(state)) continue;
     const terminalState = status || state;
     if (["COMPLETED", "SUCCESS"].includes(terminalState)) {
       blockers.push(`${name}: UNKNOWN (${terminalState} without conclusion)`);

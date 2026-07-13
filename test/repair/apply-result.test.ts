@@ -1260,6 +1260,29 @@ test("repair apply blocks completed checks without a conclusion before queue sta
   }
 });
 
+test("repair apply accepts legacy successful status contexts before queue state", () => {
+  const fixture = writeMergeApplyFixture({
+    mergeMode: "pending_after_command",
+    pendingKind: "queue",
+    legacyStatusContextSuccess: true,
+  });
+  try {
+    fs.writeFileSync(fixture.mergeCountPath, "1");
+    runMergeApplyResult(fixture);
+
+    const report = readApplyReport(fixture.reportPath);
+    assert.equal(report.actions[0].status, "blocked");
+    assert.equal(
+      report.actions[0].reason,
+      "merge is pending in GitHub's merge queue for the authorized pull request head",
+    );
+    assert.equal(report.actions[0].requeue_required, true);
+    assert.equal(mergeCallCount(fixture.ghLogPath), 0);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
 test("repair apply does not transport-retry an ambiguous merge mutation", () => {
   const fixture = writeMergeApplyFixture({ mergeMode: "ambiguous_unconfirmed" });
   try {
@@ -1750,6 +1773,7 @@ function writeMergeApplyFixture(
     terminalCheckFailure?: boolean;
     terminalCheckFailureAfterCommand?: boolean;
     terminalCheckMissingConclusion?: boolean;
+    legacyStatusContextSuccess?: boolean;
   } = {},
 ): MergeFixture {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-apply-result-merge-"));
@@ -1839,6 +1863,7 @@ function writeMergeApplyFixture(
     terminalCheckFailure: options.terminalCheckFailure ?? false,
     terminalCheckFailureAfterCommand: options.terminalCheckFailureAfterCommand ?? false,
     terminalCheckMissingConclusion: options.terminalCheckMissingConclusion ?? false,
+    legacyStatusContextSuccess: options.legacyStatusContextSuccess ?? false,
     issueCountPath,
   };
   fs.writeFileSync(
@@ -1955,17 +1980,19 @@ if (args[0] === "pr" && args[1] === "view") {
     mergedAt: null,
     reviewDecision: null,
     state: "OPEN",
-    statusCheckRollup: [
-      {
-        name: "test",
-        status: "COMPLETED",
-        conclusion: data.terminalCheckMissingConclusion
-          ? null
-          : terminalCheckFailure
-            ? "FAILURE"
-            : "SUCCESS",
-      },
-    ],
+    statusCheckRollup: data.legacyStatusContextSuccess
+      ? [{ context: "test", state: "SUCCESS" }]
+      : [
+          {
+            name: "test",
+            status: "COMPLETED",
+            conclusion: data.terminalCheckMissingConclusion
+              ? null
+              : terminalCheckFailure
+                ? "FAILURE"
+                : "SUCCESS",
+          },
+        ],
     title: "Exact merge candidate",
     updatedAt: "2026-07-13T07:00:00Z",
     url: "https://github.com/openclaw/openclaw/pull/101",
