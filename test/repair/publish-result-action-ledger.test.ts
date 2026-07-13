@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { reviewedResultRevision } from "../../dist/repair/publish-result-source.js";
+import { readText } from "../helpers.ts";
 
 test("published repair receipts use production-valid result and plan revision fields", () => {
   const result = productionResult({
@@ -72,6 +73,19 @@ test("published repair receipts ignore schema-invalid legacy revision shapes", (
     ),
     null,
   );
+});
+
+test("result publication resolves the source job recorded in the cluster plan", () => {
+  const publisher = readText("src/repair/publish-result.ts");
+  const resolver = publisher.slice(
+    publisher.indexOf("function readPublishedSourceContext"),
+    publisher.indexOf("function updateDashboard"),
+  );
+
+  assert.match(publisher, /readPublishedSourceContext\(clusterPlan\)/);
+  assert.match(resolver, /clusterPlan\?\.source_job/);
+  assert.match(resolver, /path\.resolve\(root, sourceJob\)/);
+  assert.doesNotMatch(resolver, /runDir,\s*"\.\.",\s*"job\.md"/);
 });
 
 function productionResult(overrides: Record<string, unknown>) {

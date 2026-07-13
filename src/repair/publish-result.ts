@@ -120,7 +120,7 @@ function publishResult(resultPath: string) {
   const reviewedTargetRevision = reviewedResultRevision(
     result,
     clusterPlan,
-    readPublishedSourceContext(runDir),
+    readPublishedSourceContext(clusterPlan),
   );
   if (!reviewedTargetRevision) {
     throw new Error(`repair result is missing one exact reviewed target revision: ${resultPath}`);
@@ -246,8 +246,18 @@ function publishResult(resultPath: string) {
   };
 }
 
-function readPublishedSourceContext(runDir: string): LooseRecord | null {
-  const sourceJobPath = path.resolve(runDir, "..", "job.md");
+function readPublishedSourceContext(clusterPlan: LooseRecord | null): LooseRecord | null {
+  const sourceJob = String(clusterPlan?.source_job ?? "").trim();
+  if (!sourceJob) return null;
+  const sourceJobPath = path.resolve(root, sourceJob);
+  const relativeSourceJobPath = path.relative(root, sourceJobPath);
+  if (
+    relativeSourceJobPath === ".." ||
+    relativeSourceJobPath.startsWith(`..${path.sep}`) ||
+    path.isAbsolute(relativeSourceJobPath)
+  ) {
+    return null;
+  }
   return fs.existsSync(sourceJobPath) ? parseJob(sourceJobPath).frontmatter : null;
 }
 
