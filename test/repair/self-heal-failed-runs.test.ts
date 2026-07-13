@@ -407,6 +407,53 @@ test("failed-run self-heal paginates workflow runs before selecting an older gen
   }
 });
 
+test("failed-run self-heal fully scans legacy records without a creation timestamp", () => {
+  const fixture = createSelfHealFixture("legacy-paginated-newer-unresolved");
+  const newerRunId = String(Number(fixture.runId) + 1);
+  const oldCreatedAt = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
+  const now = new Date().toISOString();
+  try {
+    writeRunRecord(fixture.runsDir, fixture.runId, {
+      source_job: fixture.jobPath,
+      source_state_revision: fixture.originalRevision,
+      source_job_sha256: fixture.originalDigest,
+      mode: "plan",
+      published_at: now,
+    });
+    writeLiveRunPages(fixture, {
+      1: Array.from({ length: 100 }, (_, index) => ({
+        id: 930_000 + index,
+        display_title: `unrelated historical run ${index}`,
+        status: "completed",
+        conclusion: "failure",
+        created_at: oldCreatedAt,
+        updated_at: now,
+      })),
+      2: [
+        {
+          id: Number(newerRunId),
+          display_title: `repair cluster ${fixture.jobPath} (${fixture.replacementDigest})`,
+          status: "completed",
+          conclusion: "failure",
+          created_at: oldCreatedAt,
+          updated_at: now,
+          html_url: `https://github.test/actions/runs/${newerRunId}`,
+        },
+      ],
+    });
+
+    const summary = runSelfHeal(fixture);
+    assert.equal(summary.candidates.length, 0);
+    const blocked = summary.skipped_candidates.find((candidate) => candidate.run_id === newerRunId);
+    assert.equal(blocked?.reason, "immutable_provenance_unavailable");
+    assert.equal(blocked?.blocks_older_generations, true);
+    assert.equal(blocked?.blocked_run_id, fixture.runId);
+    assert.match(fs.readFileSync(fixture.commandLogPath, "utf8"), /[?&]page=2(?:\s|$)/);
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
 test("execute-mode self-heal fails closed when live run pagination fails", () => {
   const fixture = createSelfHealFixture("live-run-discovery-failure");
   try {

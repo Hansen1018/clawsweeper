@@ -609,7 +609,7 @@ function liveRunDiscoveryCutoffMs(records: LooseRecord[]): number {
   let cutoffMs = maxAgeCutoffMs;
   for (const record of records) {
     if (recordTimestampMs(record) < maxAgeCutoffMs) continue;
-    const createdAtMs = Date.parse(String(record.workflow_created_at ?? record.published_at ?? ""));
+    const createdAtMs = Date.parse(String(record.workflow_created_at ?? ""));
     if (!Number.isFinite(createdAtMs)) return 0;
     cutoffMs = Math.min(cutoffMs, createdAtMs);
   }
