@@ -377,6 +377,69 @@ test("ambiguous automerge receipts leave the durable command waiting", async () 
   }
 });
 
+test("known pre-dispatch failures record a rejected mutation outcome", async () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "command-predispatch-")));
+  const outputRoot = path.join(root, "output");
+  fs.mkdirSync(outputRoot);
+  const previous = { ...process.env };
+  Object.assign(process.env, {
+    CLAWSWEEPER_ACTION_LEDGER_FORCE: "1",
+    CLAWSWEEPER_ACTION_LEDGER_ROOT: root,
+    CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT: outputRoot,
+    CLAWSWEEPER_ACTION_LEDGER_INVOCATION: "predispatch-rejected",
+    GITHUB_REPOSITORY: "openclaw/clawsweeper",
+    GITHUB_SHA: "8".repeat(40),
+    GITHUB_WORKFLOW: "repair comment router",
+    GITHUB_WORKFLOW_REF:
+      "openclaw/clawsweeper/.github/workflows/repair-comment-router.yml@refs/heads/main",
+    GITHUB_JOB: "route-comments",
+    GITHUB_RUN_ID: "24345",
+    GITHUB_RUN_ATTEMPT: "1",
+    GITHUB_ACTION: "route",
+    GITHUB_RUN_STARTED_AT: "2026-07-13T16:50:00Z",
+    CLAWSWEEPER_CRABFLEET_AGENT_TOKEN: "",
+    CLAWSWEEPER_CRABFLEET_SESSION_ID: "",
+  });
+
+  try {
+    const command = syntheticCommand("f".repeat(40));
+    recordCommandReceived(command);
+    const expected = new Error("review activity changed before merge dispatch");
+    assert.throws(
+      () =>
+        runCommandMutation(command, {
+          kind: "pull_request_merge",
+          identity: {
+            repository: command.repo,
+            number: command.issue_number,
+            expectedHeadSha: command.target.head_sha,
+            method: "squash",
+          },
+          operation: () => {
+            throw expected;
+          },
+          knownNoMutation: (error) => error === expected,
+        }),
+      expected,
+    );
+    await flushCommandActionEvents();
+
+    const events = readEvents(outputRoot);
+    assert.deepEqual(
+      events
+        .filter((event) => event.event_type === "command.mutation")
+        .map((event) => event.attributes.completion_reason),
+      ["mutation_attempted", "mutation_rejected"],
+    );
+  } finally {
+    for (const key of Object.keys(process.env)) {
+      if (!(key in previous)) delete process.env[key];
+    }
+    Object.assign(process.env, previous);
+    fs.rmSync(root, { force: true, recursive: true });
+  }
+});
+
 test("command finalization recovers an interrupted mutation request", async () => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "command-interruption-")));
   const outputRoot = path.join(root, "output");

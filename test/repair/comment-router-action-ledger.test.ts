@@ -98,6 +98,7 @@ test("automerge reconciles command responses inside the merge receipt without ce
     executeAutomerge,
     /result = runGitHubSpawnMutation\([\s\S]*buildAutomergeMergeArgs\([\s\S]*onDispatchStart:[\s\S]*reconcile:/,
   );
+  assert.match(executeAutomerge, /knownNoMutation: \(\) => !mergeRequestStarted/);
   assert.match(
     executeAutomerge,
     /reconcile: \(\{ result: commandResult, error: commandError \}\) => \{[\s\S]*fetchAutomergeEffectSnapshot\(command\.issue_number\)[\s\S]*fetchAutomergeSquashCommitProof\([\s\S]*expectedSquashCommitMessage\(mergeMessage\.subject, mergeMessage\.body\)/,

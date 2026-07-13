@@ -2419,6 +2419,7 @@ type GitHubSpawnMutationReceipt<T> = {
   onDispatchStart?: () => void;
   reconcile: (response: { result: GitHubSpawnResult | null; error: unknown | null }) => T;
   outcome: (result: T) => "accepted" | "rejected" | "unknown";
+  knownNoMutation?: (error: unknown) => boolean;
 };
 
 function runGitHubSpawnMutation(
@@ -2461,6 +2462,7 @@ function runGitHubSpawnMutation<T>(
         return receipt.reconcile({ result, error });
       },
       outcome: receipt.outcome,
+      ...(receipt.knownNoMutation ? { knownNoMutation: receipt.knownNoMutation } : {}),
     });
   }
   return runCommandMutation(command, {
@@ -4092,6 +4094,7 @@ function executeAutomerge(command: LooseRecord): LooseRecord {
         onDispatchStart: () => {
           mergeRequestStarted = true;
         },
+        knownNoMutation: () => !mergeRequestStarted,
         reconcile: ({ result: commandResult, error: commandError }) => {
           try {
             const snapshot = fetchAutomergeEffectSnapshot(command.issue_number);
