@@ -13,6 +13,7 @@ import {
   renderClawSweeperEventMessage,
   runClawSweeperEventNotifier,
 } from "../../dist/repair/notify-events.js";
+import { deliverNotificationAttempt } from "../../dist/repair/notification-action-ledger.js";
 import { flushRepairActionEvents } from "../../dist/repair/repair-action-ledger.js";
 
 test("buildApplyEvent maps ClawSweeper merge, close, and blocked events", () => {
@@ -244,7 +245,7 @@ test("runClawSweeperEventNotifier posts hook payloads and records ledger", async
   assert.equal(ledger.notifications[0].discordTarget, "channel:123");
 });
 
-test("durable claims gate hook delivery by publication workflow attempt", async () => {
+test("durable claims recover only after the publication workflow attempt is terminal", async () => {
   const makeRoot = () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-events-claim-"));
     fs.writeFileSync(
@@ -266,6 +267,7 @@ test("durable claims gate hook delivery by publication workflow attempt", async 
     CLAWSWEEPER_OPENCLAW_HOOK_URL: "https://claw.example/hooks",
     CLAWSWEEPER_OPENCLAW_HOOK_TOKEN: "secret",
     CLAWSWEEPER_DISCORD_TARGET: "channel:123",
+    GITHUB_REPOSITORY: "openclaw/clawsweeper",
     GITHUB_RUN_ID: "5252",
     GITHUB_RUN_ATTEMPT: "1",
   };
@@ -320,8 +322,75 @@ test("durable claims gate hook delivery by publication workflow attempt", async 
       now: () => new Date("2026-05-02T11:00:00Z"),
       log: () => undefined,
     });
-    let staleHookCalls = 0;
-    const staleAttempt = await runClawSweeperEventNotifier(["--run-id", "987"], {
+    let workflowReads = 0;
+    const activeAttempt = await runClawSweeperEventNotifier(["--run-id", "987", "--prepare-only"], {
+      root: staleRoot,
+      env: {
+        ...baseEnv,
+        GITHUB_RUN_ATTEMPT: "2",
+      },
+      fetch: async (input) => {
+        workflowReads += 1;
+        assert.match(String(input), /actions\/runs\/5252\/attempts\/1$/);
+        return Response.json({ id: 5252, run_attempt: 1, status: "in_progress" });
+      },
+      log: () => undefined,
+    });
+    assert.equal(activeAttempt.sent, 0);
+    assert.equal(activeAttempt.skipped, 1);
+    assert.equal(workflowReads, 1);
+    const activeClaim = JSON.parse(
+      fs.readFileSync(path.join(staleRoot, "notifications/clawsweeper-event-ledger.json"), "utf8"),
+    ).notifications[0];
+    assert.equal(activeClaim.claimRunAttempt, "1");
+
+    const recoveredAttempt = await runClawSweeperEventNotifier(
+      ["--run-id", "987", "--prepare-only"],
+      {
+        root: staleRoot,
+        env: {
+          ...baseEnv,
+          GITHUB_RUN_ATTEMPT: "2",
+        },
+        fetch: async (input) => {
+          workflowReads += 1;
+          const url = String(input);
+          if (url.endsWith("/actions/runs/5252/attempts/1")) {
+            return Response.json({ id: 5252, run_attempt: 1, status: "completed" });
+          }
+          assert.match(url, /actions\/runs\/5252\/attempts\/1\/jobs\?/);
+          return Response.json({
+            total_count: 1,
+            jobs: [
+              {
+                run_id: 5252,
+                run_attempt: 1,
+                status: "completed",
+                steps: [
+                  { name: "Commit notification claims", conclusion: "success" },
+                  {
+                    name: "Notify OpenClaw about ClawSweeper events",
+                    conclusion: "skipped",
+                  },
+                ],
+              },
+            ],
+          });
+        },
+        now: () => new Date("2026-05-02T11:02:00Z"),
+        log: () => undefined,
+      },
+    );
+    assert.equal(recoveredAttempt.sent, 0);
+    assert.equal(recoveredAttempt.skipped, 0);
+    const recoveredClaim = JSON.parse(
+      fs.readFileSync(path.join(staleRoot, "notifications/clawsweeper-event-ledger.json"), "utf8"),
+    ).notifications[0];
+    assert.equal(recoveredClaim.deliveryStatus, "hook_claimed");
+    assert.equal(recoveredClaim.claimRunAttempt, "2");
+
+    let recoveredHookCalls = 0;
+    const deliveredRecovery = await runClawSweeperEventNotifier(["--run-id", "987"], {
       root: staleRoot,
       env: {
         ...baseEnv,
@@ -329,22 +398,155 @@ test("durable claims gate hook delivery by publication workflow attempt", async 
         CLAWSWEEPER_EVENT_NOTIFY_REQUIRE_DURABLE_CLAIM: "1",
       },
       fetch: async () => {
-        staleHookCalls += 1;
-        return Response.json({ runId: "must-not-send" });
+        recoveredHookCalls += 1;
+        return Response.json({ runId: "hook-recovered" });
       },
       log: () => undefined,
     });
-    assert.equal(staleAttempt.sent, 0);
-    assert.equal(staleAttempt.skipped, 1);
-    assert.equal(staleHookCalls, 0);
-    const retainedClaim = JSON.parse(
+    assert.equal(deliveredRecovery.sent, 1);
+    assert.equal(deliveredRecovery.skipped, 0);
+    assert.equal(recoveredHookCalls, 1);
+    const deliveredRecoveredClaim = JSON.parse(
       fs.readFileSync(path.join(staleRoot, "notifications/clawsweeper-event-ledger.json"), "utf8"),
     ).notifications[0];
-    assert.equal(retainedClaim.deliveryStatus, "hook_claimed");
-    assert.equal(retainedClaim.claimRunAttempt, "1");
+    assert.equal(deliveredRecoveredClaim.deliveryStatus, "sent");
+    assert.equal(deliveredRecoveredClaim.claimRunAttempt, "2");
   } finally {
     fs.rmSync(ownedRoot, { recursive: true, force: true });
     fs.rmSync(staleRoot, { recursive: true, force: true });
+  }
+});
+
+test("accepted and ambiguous durable receipts prevent notification claim replay", async () => {
+  const deliveries = [
+    { kind: "notification_delivery", destination: "openclaw_hook" },
+    { kind: "status_dashboard_delivery", destination: "status_dashboard" },
+  ] as const;
+  for (const deliveryIdentity of deliveries) {
+    for (const outcome of ["accepted", "unknown"] as const) {
+      const root = fs.realpathSync(
+        fs.mkdtempSync(
+          path.join(
+            os.tmpdir(),
+            `clawsweeper-events-claim-${deliveryIdentity.destination}-${outcome}-`,
+          ),
+        ),
+      );
+      const outputRoot = path.join(root, "action-ledger-output");
+      fs.mkdirSync(outputRoot);
+      fs.writeFileSync(
+        path.join(root, "repair-apply-report.json"),
+        `${JSON.stringify([
+          {
+            repo: "openclaw/openclaw",
+            target: "#123",
+            action: "close_duplicate",
+            status: "executed",
+            run_id: "987",
+            published_at: "2026-05-02T10:00:00Z",
+          },
+        ])}\n`,
+      );
+      const baseEnv = {
+        CLAWSWEEPER_OPENCLAW_HOOK_URL: "https://claw.example/hooks",
+        CLAWSWEEPER_OPENCLAW_HOOK_TOKEN: "secret",
+        CLAWSWEEPER_DISCORD_TARGET: "channel:123",
+        GITHUB_REPOSITORY: "openclaw/clawsweeper",
+        GITHUB_JOB: "notification",
+        GITHUB_RUN_ID: "5252",
+        GITHUB_RUN_ATTEMPT: "1",
+      };
+      const previous = { ...process.env };
+
+      try {
+        await runClawSweeperEventNotifier(["--run-id", "987", "--prepare-only"], {
+          root,
+          env: baseEnv,
+          now: () => new Date("2026-05-02T11:00:00Z"),
+          log: () => undefined,
+        });
+        const claim = JSON.parse(
+          fs.readFileSync(path.join(root, "notifications/clawsweeper-event-ledger.json"), "utf8"),
+        ).notifications[0];
+        Object.assign(process.env, notificationWorkflowEnv(root, outputRoot));
+        const delivery = deliverNotificationAttempt(
+          {
+            repository: claim.repo,
+            key: claim.key,
+            number: 123,
+          },
+          {
+            ...deliveryIdentity,
+            operation: async () => {
+              if (outcome === "unknown") throw new Error("connection reset after dispatch");
+              return { accepted: true };
+            },
+          },
+        );
+        if (outcome === "unknown") {
+          await assert.rejects(delivery, /connection reset after dispatch/);
+        } else {
+          await delivery;
+        }
+        await flushRepairActionEvents();
+        restoreEnv(previous);
+
+        let deliveryCalls = 0;
+        const retry = await runClawSweeperEventNotifier(["--run-id", "987", "--prepare-only"], {
+          root,
+          env: {
+            ...baseEnv,
+            CLAWSWEEPER_STATE_DIR: outputRoot,
+            GITHUB_RUN_ATTEMPT: "2",
+          },
+          fetch: async (input) => {
+            const url = String(input);
+            if (url.endsWith("/actions/runs/5252/attempts/1")) {
+              return Response.json({
+                id: 5252,
+                run_attempt: 1,
+                status: "completed",
+                created_at: "2026-07-12T10:00:00Z",
+              });
+            }
+            if (url.includes("/actions/runs/5252/attempts/1/jobs?")) {
+              return Response.json({
+                total_count: 1,
+                jobs: [
+                  {
+                    run_id: 5252,
+                    run_attempt: 1,
+                    status: "completed",
+                    steps: [
+                      { name: "Commit notification claims", conclusion: "success" },
+                      {
+                        name: "Notify OpenClaw about ClawSweeper events",
+                        conclusion: "success",
+                      },
+                    ],
+                  },
+                ],
+              });
+            }
+            deliveryCalls += 1;
+            return Response.json({ runId: "duplicate" });
+          },
+          log: () => undefined,
+        });
+
+        assert.equal(retry.sent, 0);
+        assert.equal(retry.skipped, 1);
+        assert.equal(deliveryCalls, 0);
+        const retainedClaim = JSON.parse(
+          fs.readFileSync(path.join(root, "notifications/clawsweeper-event-ledger.json"), "utf8"),
+        ).notifications[0];
+        assert.equal(retainedClaim.deliveryStatus, "hook_claimed");
+        assert.equal(retainedClaim.claimRunAttempt, "1");
+      } finally {
+        restoreEnv(previous);
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    }
   }
 });
 

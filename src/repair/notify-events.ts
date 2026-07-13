@@ -3,6 +3,8 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { actionIdempotencyKey, readActionEventShard, type ActionEvent } from "../action-ledger.js";
+import { slugForRepo } from "../repository-profiles.js";
 import type { JsonObject, JsonValue } from "./json-types.js";
 import { asJsonObject } from "./json-types.js";
 import { parseArgs, repoRoot } from "./lib.js";
@@ -21,6 +23,10 @@ import {
   recordNotificationPhaseSafely,
   type NotificationDeliveryIdentity,
 } from "./notification-action-ledger.js";
+import {
+  repairMutationIdempotencyIdentity,
+  type RepairLifecycleInput,
+} from "./repair-action-ledger.js";
 
 type EventSeverity = "info" | "warning" | "error";
 type EventStatus = "sent" | "planned" | "failed" | "skipped";
@@ -29,6 +35,16 @@ type DashboardIngestConfig = {
   url: string;
   token: string;
 };
+type NotificationClaimOwner = {
+  runId: string;
+  runAttempt: string;
+};
+type NotificationClaimRecoveryDecision =
+  | { status: "recoverable"; reason: string }
+  | { status: "active" | "unsafe" | "unknown"; reason: string };
+type NotificationReceiptEvidence =
+  | { status: "none" | "rejected"; reason: string }
+  | { status: "unsafe" | "unknown"; reason: string };
 
 export type ClawSweeperEvent = {
   key: string;
@@ -97,6 +113,20 @@ const CLOSE_ACTIONS = new Set([
   "post_merge_close",
 ]);
 const FIX_OPEN_ACTIONS = new Set(["open_fix_pr", "repair_contributor_branch"]);
+const NOTIFICATION_STEP_NAME = "Notify OpenClaw about ClawSweeper events";
+const CLAIM_COMMIT_STEP_NAME = "Commit notification claims";
+const ACTIVE_WORKFLOW_STATUSES = new Set([
+  "queued",
+  "in_progress",
+  "pending",
+  "waiting",
+  "requested",
+]);
+const UNSAFE_NOTIFICATION_COMPLETION_REASONS = new Set([
+  "mutation_accepted",
+  "mutation_observed",
+  "mutation_outcome_unknown",
+]);
 
 export function normalizeEventLedger(value: JsonValue): ClawSweeperEventLedger {
   const object = asJsonObject(value);
@@ -394,11 +424,68 @@ export async function runClawSweeperEventNotifier(
     const reportActions: JsonObject[] = [...collected.skipped];
     let nextLedger = ledger;
     let prepared = 0;
+    const durableReceiptEvents = new Map<string, ActionEvent[] | Error>();
+    const workflowEvidenceCache = new Map<string, Promise<JsonObject>>();
     const existingNotifications = new Map(ledger.notifications.map((entry) => [entry.key, entry]));
     for (const event of collected.events) {
       const ledgerInput = eventNotificationLedgerInput(event);
       const existing = existingNotifications.get(event.key);
       if (existing) {
+        const ownsDurableClaim =
+          existing.deliveryStatus === "hook_claimed" &&
+          existing.claimRunId === claimOwner?.runId &&
+          existing.claimRunAttempt === claimOwner?.runAttempt;
+        if (existing.deliveryStatus === "hook_claimed" && claimOwner && !ownsDurableClaim) {
+          const decision = await notificationClaimRecoveryDecision({
+            entry: existing,
+            currentOwner: claimOwner,
+            env,
+            readWorkflowJson: (apiPath) => {
+              let request = workflowEvidenceCache.get(apiPath);
+              if (!request) {
+                request = fetchGitHubJsonObject({ fetcher, env, path: apiPath });
+                workflowEvidenceCache.set(apiPath, request);
+              }
+              return request;
+            },
+            readDurableReceiptEvents: (owner, run) => {
+              const receiptKey = `${owner.runId}:${owner.runAttempt}`;
+              let receipts = durableReceiptEvents.get(receiptKey);
+              if (!receipts) {
+                try {
+                  receipts = readDurableNotificationReceiptEvents(root, env, owner, run);
+                } catch (error) {
+                  receipts = error instanceof Error ? error : new Error(String(error));
+                }
+                durableReceiptEvents.set(receiptKey, receipts);
+              }
+              if (receipts instanceof Error) throw receipts;
+              return receipts;
+            },
+          });
+          if (decision.status === "recoverable") {
+            recordNotificationPhase(ledgerInput, "planned", "durable_claim_recovered");
+            const claimedAt = now().toISOString();
+            nextLedger = addEventLedgerEntry(nextLedger, event, {
+              notifiedAt: claimedAt,
+              hookRunId: null,
+              discordTarget: existing.discordTarget ?? config.discordTarget,
+              deliveryStatus: "hook_claimed",
+              claimRunId: claimOwner.runId,
+              claimRunAttempt: claimOwner.runAttempt,
+            });
+            existingNotifications.set(
+              event.key,
+              nextLedger.notifications.find((entry) => entry.key === event.key)!,
+            );
+            reportActions.push(reportRow(event, "planned", decision.reason));
+            prepared += 1;
+            continue;
+          }
+          recordNotificationPhaseSafely(ledgerInput, "skipped", `durable_claim_${decision.status}`);
+          reportActions.push(reportRow(event, "skipped", decision.reason));
+          continue;
+        }
         recordNotificationPhaseSafely(ledgerInput, "skipped", "durable_claim_exists");
         reportActions.push(
           reportRow(
@@ -644,6 +731,368 @@ function requiredClaimOwner(env: NodeJS.ProcessEnv): { runId: string; runAttempt
     throw new Error("durable notification claims require GITHUB_RUN_ID and GITHUB_RUN_ATTEMPT");
   }
   return owner;
+}
+
+async function notificationClaimRecoveryDecision({
+  entry,
+  currentOwner,
+  env,
+  readWorkflowJson,
+  readDurableReceiptEvents,
+}: {
+  entry: ClawSweeperEventLedgerEntry;
+  currentOwner: NotificationClaimOwner;
+  env: NodeJS.ProcessEnv;
+  readWorkflowJson: (apiPath: string) => Promise<JsonObject>;
+  readDurableReceiptEvents: (owner: NotificationClaimOwner, run: JsonObject) => ActionEvent[];
+}): Promise<NotificationClaimRecoveryDecision> {
+  const priorOwner = notificationClaimOwner(entry);
+  if (!priorOwner) {
+    return {
+      status: "unknown",
+      reason: "durable hook claim has no valid workflow attempt owner",
+    };
+  }
+  if (
+    priorOwner.runId === currentOwner.runId &&
+    priorOwner.runAttempt === currentOwner.runAttempt
+  ) {
+    return { status: "active", reason: "current workflow attempt owns the durable hook claim" };
+  }
+
+  const workflowRepository = normalizedWorkflowRepository(env.GITHUB_REPOSITORY);
+  if (!workflowRepository) {
+    return {
+      status: "unknown",
+      reason: "durable hook claim owner cannot be inspected without GITHUB_REPOSITORY",
+    };
+  }
+
+  let run: JsonObject;
+  try {
+    run = await readWorkflowJson(
+      `repos/${workflowRepository}/actions/runs/${priorOwner.runId}/attempts/${priorOwner.runAttempt}`,
+    );
+  } catch (error) {
+    return {
+      status: "unknown",
+      reason: `durable hook claim owner could not be inspected: ${errorText(error)}`,
+    };
+  }
+  if (
+    String(run.id ?? "") !== priorOwner.runId ||
+    String(run.run_attempt ?? "") !== priorOwner.runAttempt
+  ) {
+    return {
+      status: "unknown",
+      reason: "durable hook claim owner response does not match the claimed workflow attempt",
+    };
+  }
+  const runStatus = String(run.status ?? "")
+    .trim()
+    .toLowerCase();
+  if (ACTIVE_WORKFLOW_STATUSES.has(runStatus)) {
+    return {
+      status: "active",
+      reason: `workflow run ${priorOwner.runId} attempt ${priorOwner.runAttempt} still owns the durable hook claim`,
+    };
+  }
+  if (runStatus !== "completed") {
+    return {
+      status: "unknown",
+      reason: `durable hook claim owner has unsupported workflow status ${runStatus || "missing"}`,
+    };
+  }
+
+  let jobsResponse: JsonObject;
+  try {
+    jobsResponse = await readWorkflowJson(
+      `repos/${workflowRepository}/actions/runs/${priorOwner.runId}/attempts/${priorOwner.runAttempt}/jobs?filter=all&per_page=100`,
+    );
+  } catch (error) {
+    return {
+      status: "unknown",
+      reason: `durable hook claim owner jobs could not be inspected: ${errorText(error)}`,
+    };
+  }
+  const jobs = Array.isArray(jobsResponse.jobs)
+    ? jobsResponse.jobs.map(asJsonObject).filter((job) => Object.keys(job).length > 0)
+    : [];
+  const totalCount = Number(jobsResponse.total_count ?? jobs.length);
+  if (!Number.isSafeInteger(totalCount) || totalCount < jobs.length || totalCount > jobs.length) {
+    return {
+      status: "unknown",
+      reason: "durable hook claim owner job evidence is incomplete",
+    };
+  }
+  const ownerJobs = jobs.filter(
+    (job) =>
+      String(job.run_id ?? priorOwner.runId) === priorOwner.runId &&
+      String(job.run_attempt ?? "") === priorOwner.runAttempt &&
+      workflowJobHasStep(job, CLAIM_COMMIT_STEP_NAME),
+  );
+  if (ownerJobs.length === 0) {
+    return {
+      status: "unknown",
+      reason: "durable hook claim owner job could not be identified",
+    };
+  }
+  if (
+    ownerJobs.some(
+      (job) =>
+        String(job.status ?? "")
+          .trim()
+          .toLowerCase() !== "completed",
+    )
+  ) {
+    return {
+      status: "active",
+      reason: `workflow run ${priorOwner.runId} attempt ${priorOwner.runAttempt} still owns the durable hook claim`,
+    };
+  }
+  const notificationSteps = ownerJobs.flatMap((job) =>
+    workflowJobSteps(job).filter((step) => stringOrNull(step.name) === NOTIFICATION_STEP_NAME),
+  );
+  if (notificationSteps.length === 0) {
+    return {
+      status: "unknown",
+      reason: "durable hook claim owner has no notification-step evidence",
+    };
+  }
+  const notificationRan = notificationSteps.some(
+    (step) =>
+      String(step.conclusion ?? "")
+        .trim()
+        .toLowerCase() !== "skipped",
+  );
+  if (!notificationRan) {
+    return {
+      status: "recoverable",
+      reason: `recovered undelivered hook claim from terminal workflow run ${priorOwner.runId} attempt ${priorOwner.runAttempt}`,
+    };
+  }
+
+  let receipts: NotificationReceiptEvidence;
+  try {
+    receipts = notificationReceiptEvidence(
+      entry,
+      priorOwner,
+      readDurableReceiptEvents(priorOwner, run),
+    );
+  } catch (error) {
+    return {
+      status: "unknown",
+      reason: `durable notification receipts could not be inspected: ${errorText(error)}`,
+    };
+  }
+  if (receipts.status === "unsafe" || receipts.status === "unknown") {
+    return { status: receipts.status, reason: receipts.reason };
+  }
+  if (receipts.status !== "rejected") {
+    return {
+      status: "unknown",
+      reason:
+        "prior notification step ran without a durable no-mutation receipt; delivery outcome unknown",
+    };
+  }
+  return {
+    status: "recoverable",
+    reason: `recovered undelivered hook claim from terminal workflow run ${priorOwner.runId} attempt ${priorOwner.runAttempt}`,
+  };
+}
+
+function notificationClaimOwner(entry: ClawSweeperEventLedgerEntry): NotificationClaimOwner | null {
+  const runId = entry.claimRunId?.trim() ?? "";
+  const runAttempt = entry.claimRunAttempt?.trim() ?? "";
+  return /^[1-9][0-9]*$/.test(runId) && /^[1-9][0-9]*$/.test(runAttempt)
+    ? { runId, runAttempt }
+    : null;
+}
+
+function notificationReceiptEvidence(
+  entry: ClawSweeperEventLedgerEntry,
+  owner: NotificationClaimOwner,
+  events: readonly ActionEvent[],
+): NotificationReceiptEvidence {
+  const ledgerInput = eventNotificationLedgerInput(entry);
+  const lifecycle = notificationLifecycleInput(ledgerInput);
+  const idempotencyKeys = new Set(
+    [
+      { kind: "notification_delivery", destination: "openclaw_hook" },
+      { kind: "status_dashboard_delivery", destination: "status_dashboard" },
+    ].map((delivery) =>
+      actionIdempotencyKey(
+        repairMutationIdempotencyIdentity(lifecycle, {
+          kind: delivery.kind,
+          operationName: "notification",
+          identity: { key: ledgerInput.key, destination: delivery.destination },
+        }),
+      ),
+    ),
+  );
+  const matching = events
+    .filter(
+      (event) =>
+        event.subject.repository === ledgerInput.repository &&
+        event.subject.subject_id === lifecycle.subjectId &&
+        event.producer.run_id === owner.runId &&
+        String(event.producer.run_attempt) === owner.runAttempt &&
+        idempotencyKeys.has(event.idempotency_key_sha256),
+    )
+    .sort(
+      (left, right) =>
+        left.phase_seq - right.phase_seq ||
+        left.recorded_at.localeCompare(right.recorded_at) ||
+        left.event_id.localeCompare(right.event_id),
+    );
+  if (matching.length === 0) {
+    return { status: "none", reason: "no durable notification mutation receipt exists" };
+  }
+
+  let attempted = 0;
+  let rejected = 0;
+  for (const event of matching) {
+    const completionReason = String(event.attributes?.completion_reason ?? "");
+    if (UNSAFE_NOTIFICATION_COMPLETION_REASONS.has(completionReason)) {
+      return {
+        status: "unsafe",
+        reason: `durable notification receipt is ${completionReason}; delivery will not be replayed`,
+      };
+    }
+    if (completionReason === "mutation_attempted") attempted += 1;
+    if (completionReason === "mutation_rejected") rejected += 1;
+  }
+  if (attempted > rejected) {
+    return {
+      status: "unsafe",
+      reason:
+        "durable notification receipt has an unresolved mutation attempt; delivery will not be replayed",
+    };
+  }
+  if (rejected > 0) {
+    return {
+      status: "rejected",
+      reason: "durable notification receipts prove no delivery mutation was accepted",
+    };
+  }
+  return {
+    status: "unknown",
+    reason: "durable notification receipts do not prove a safe recovery state",
+  };
+}
+
+function notificationLifecycleInput(
+  input: ReturnType<typeof eventNotificationLedgerInput>,
+): RepairLifecycleInput {
+  return {
+    repository: input.repository,
+    workKey: `notification:${input.key}`,
+    ...("number" in input ? { number: input.number } : {}),
+    subjectKind: "notification",
+    subjectId: `notification-${createHash("sha256").update(input.key).digest("hex").slice(0, 24)}`,
+  };
+}
+
+function readDurableNotificationReceiptEvents(
+  root: string,
+  env: NodeJS.ProcessEnv,
+  owner: NotificationClaimOwner,
+  run: JsonObject,
+): ActionEvent[] {
+  const partitionDate = workflowRunPartitionDate(run);
+  if (!partitionDate) throw new Error("workflow run creation time is invalid");
+  const workflowRepository = normalizedWorkflowRepository(env.GITHUB_REPOSITORY);
+  if (!workflowRepository) throw new Error("GITHUB_REPOSITORY is invalid");
+  const job = String(env.GITHUB_JOB ?? "publish").trim();
+  if (!/^[A-Za-z0-9_.-]+$/.test(job)) throw new Error("GITHUB_JOB is invalid");
+  const [year, month, date] = partitionDate.split("-");
+  const roots = [...new Set([stringOrNull(env.CLAWSWEEPER_STATE_DIR), root].filter(Boolean))]
+    .map((value) => path.resolve(value!))
+    .filter((value) => fs.existsSync(value))
+    .map((value) => fs.realpathSync(value));
+  const byId = new Map<string, ActionEvent>();
+  for (const sourceRoot of roots) {
+    const eventDirectory = path.join(
+      sourceRoot,
+      "ledger",
+      "v1",
+      "events",
+      year!,
+      month!,
+      date!,
+      slugForRepo(workflowRepository),
+      "notification",
+    );
+    if (!fs.existsSync(eventDirectory)) continue;
+    const prefix = `${owner.runId}-${owner.runAttempt}-${job}-`;
+    const files = fs
+      .readdirSync(eventDirectory, { withFileTypes: true })
+      .filter((entry) => entry.name.startsWith(prefix) && entry.name.endsWith(".jsonl"));
+    if (files.length > 32) throw new Error("notification receipt shard count is invalid");
+    for (const file of files) {
+      if (!file.isFile()) throw new Error(`notification receipt shard is not a file: ${file.name}`);
+      for (const event of readActionEventShard(path.join(eventDirectory, file.name))) {
+        const existing = byId.get(event.event_id);
+        if (existing && JSON.stringify(existing) !== JSON.stringify(event)) {
+          throw new Error(`conflicting durable notification receipt ${event.event_id}`);
+        }
+        byId.set(event.event_id, existing ?? event);
+      }
+    }
+  }
+  return [...byId.values()];
+}
+
+function workflowRunPartitionDate(run: JsonObject): string | null {
+  const createdAt = stringOrNull(run.created_at) ?? stringOrNull(run.createdAt);
+  const match = createdAt?.match(/^([0-9]{4})-([0-9]{2})-([0-9]{2})T/);
+  return match ? `${match[1]}-${match[2]}-${match[3]}` : null;
+}
+
+async function fetchGitHubJsonObject({
+  fetcher,
+  env,
+  path: apiPath,
+}: {
+  fetcher: typeof fetch;
+  env: NodeJS.ProcessEnv;
+  path: string;
+}): Promise<JsonObject> {
+  const token =
+    stringOrNull(env.CLAWSWEEPER_WORKFLOW_GH_TOKEN) ??
+    stringOrNull(env.GH_TOKEN) ??
+    stringOrNull(env.GITHUB_TOKEN);
+  const response = await fetcher(`https://api.github.com/${apiPath}`, {
+    headers: {
+      Accept: "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28",
+      "User-Agent": "openclaw-clawsweeper",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
+  });
+  if (!response.ok) {
+    throw new Error(
+      `GitHub API returned ${response.status}: ${(await response.text()).slice(0, 500)}`,
+    );
+  }
+  return asJsonObject(await response.json());
+}
+
+function normalizedWorkflowRepository(value: string | undefined): string | null {
+  const repository = String(value ?? "")
+    .trim()
+    .toLowerCase();
+  return /^[a-z0-9_.-]+\/[a-z0-9_.-]+$/.test(repository) ? repository : null;
+}
+
+function workflowJobSteps(job: JsonObject): JsonObject[] {
+  return Array.isArray(job.steps)
+    ? job.steps.map(asJsonObject).filter((step) => Object.keys(step).length > 0)
+    : [];
+}
+
+function workflowJobHasStep(job: JsonObject, name: string): boolean {
+  return workflowJobSteps(job).some((step) => stringOrNull(step.name) === name);
 }
 
 async function postStatusDashboardEvent({
