@@ -242,15 +242,19 @@ export function containsSensitiveValue(text: string, redactValues: string[]): bo
 
 function redactEncodedSensitiveHeaders(text: string): string {
   let redacted = text;
-  for (const match of encodedSensitiveHeaderMatches(text).sort(
-    (left, right) => right.start - left.start,
-  )) {
-    redacted =
-      redacted.slice(0, match.start) +
-      encodeJsonStringLiteral(match.value, match.depth) +
-      redacted.slice(match.end);
+  while (true) {
+    const matches = encodedSensitiveHeaderMatches(redacted);
+    if (matches.length === 0) return redacted;
+    let next = redacted;
+    for (const match of matches.sort((left, right) => right.start - left.start)) {
+      next =
+        next.slice(0, match.start) +
+        encodeJsonStringLiteral(match.value, match.depth) +
+        next.slice(match.end);
+    }
+    if (next === redacted) return redacted;
+    redacted = next;
   }
-  return redacted;
 }
 
 function encodedSensitiveHeaderMatches(text: string): EncodedSensitiveHeaderMatch[] {

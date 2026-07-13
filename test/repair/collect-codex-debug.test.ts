@@ -310,6 +310,19 @@ test("redactSecrets independently masks repeated headers on one escaped line", (
   assert.equal(containsSensitiveValue(redacted, []), false);
 });
 
+test("redactSecrets rescans enclosing strings after nested header redaction", () => {
+  const input = JSON.stringify({
+    message: `${JSON.stringify({ x: "Cookie: INNER" })} Authorization: Basic OUTER`,
+  });
+
+  assert.equal(containsSensitiveValue(input, []), true);
+  const redacted = redactSecrets(input);
+  assert.deepEqual(JSON.parse(redacted), {
+    message: `${JSON.stringify({ x: "Cookie: [REDACTED]" })} Authorization: [REDACTED]`,
+  });
+  assert.equal(containsSensitiveValue(redacted, []), false);
+});
+
 test("redactSecrets masks named credentials across JSON escape depths", () => {
   const payload = JSON.stringify({
     token: 'historical-secret "quoted" \\tail\nnext',
