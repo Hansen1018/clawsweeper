@@ -22,9 +22,8 @@ test("report-only repair requeues forward a stable dispatch receipt and publish 
   const setupAction = readText(".github/actions/setup-action-ledger/action.yml");
   const source = readText("src/repair/requeue-job.ts");
   const workflow = readText(".github/workflows/repair-cluster-worker.yml");
-  const dispatchIndex = source.indexOf(
-    "dispatchJob(sourceJobPath, mode, dispatchKey, requeueLifecycle, {",
-  );
+  const lifecycleIndex = source.indexOf("const requeueLifecycle: CommandLifecycleInput");
+  const dispatchIndex = source.indexOf("dispatchJob(", lifecycleIndex);
   const receiptIndex = source.indexOf("recordCommandRequeue(requeueLifecycle", dispatchIndex);
   const finalizeStart = workflow.indexOf("- name: Finalize report command action ledger");
   const publishStart = workflow.indexOf("- name: Publish immutable report command action ledger");
@@ -32,6 +31,7 @@ test("report-only repair requeues forward a stable dispatch receipt and publish 
   const finalizeStep = workflow.slice(finalizeStart, publishStart);
   const publishStep = workflow.slice(publishStart, mutateStart);
 
+  assert.ok(lifecycleIndex >= 0);
   assert.ok(dispatchIndex >= 0);
   assert.ok(receiptIndex > dispatchIndex);
   assert.match(source, /deterministicRequeueDispatchKey\(\{/);
@@ -44,6 +44,11 @@ test("report-only repair requeues forward a stable dispatch receipt and publish 
   assert.match(source, /operationKey: `repair-requeue:/);
   assert.match(source, /sourceRevision: authorizationSha256/);
   assert.match(source, /runCommandLifecycleMutation\(lifecycle,/);
+  assert.match(source, /runDeadlineBoundRequeueDispatch\(\{[\s\S]*deadlineAtMs/);
+  assert.match(
+    source.slice(dispatchIndex, receiptIndex),
+    /job_sha256: authorizationSha256,[\s\S]*deadlineAtMs/,
+  );
   assert.match(source, /await flushCommandActionEvents\(\)/);
   assert.match(setupAction, /CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT=\$output_root/);
   assert.match(workflow, /- name: Create report state token/);

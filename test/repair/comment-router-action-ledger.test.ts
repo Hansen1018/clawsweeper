@@ -9,7 +9,7 @@ test("comment router records receipts after durable command boundaries", () => {
   assert.match(source, /rawCommands\.push\(command\);\s+recordCommandReceived\(command\);/);
   assert.match(
     source,
-    /writeLedger\(ledgerPath\(\), ledger\);\s+for \(const command of claimedCommands\) recordCommandClaimed\(command\);/,
+    /writeLedger\(ledgerPath\(\), ledger\);\s+for \(const claimedCommand of claimedCommands\) recordCommandClaimed\(claimedCommand\);/,
   );
   assert.match(
     source,
