@@ -12,6 +12,7 @@ function fixtureEnv(options: {
   jobs101?: unknown[];
   jobs102?: unknown[];
   runs: unknown[];
+  runPages?: unknown[][];
   failJobs?: boolean;
 }) {
   const binDir = mkdtempSync(join(tmpdir(), "dispatch-receipt-owner-"));
@@ -40,9 +41,11 @@ esac
       ...process.env,
       PATH: `${binDir}${delimiter}${process.env.PATH ?? ""}`,
       GITHUB_REPOSITORY: "openclaw/clawsweeper",
-      FAKE_RUNS_JSON: JSON.stringify({ workflow_runs: options.runs }),
-      FAKE_JOBS_101_JSON: JSON.stringify({ jobs: options.jobs101 ?? [] }),
-      FAKE_JOBS_102_JSON: JSON.stringify({ jobs: options.jobs102 ?? [] }),
+      FAKE_RUNS_JSON: JSON.stringify(
+        (options.runPages ?? [options.runs]).map((runs) => ({ workflow_runs: runs })),
+      ),
+      FAKE_JOBS_101_JSON: JSON.stringify([{ jobs: options.jobs101 ?? [] }]),
+      FAKE_JOBS_102_JSON: JSON.stringify([{ jobs: options.jobs102 ?? [] }]),
       FAKE_FAIL_JOBS: options.failJobs ? "1" : "0",
     },
   };
@@ -95,6 +98,32 @@ test("dispatch receipt gate keeps a successfully executed worker as owner", () =
     runGate({
       runs: [
         { id: 102, display_title: EXPECTED_TITLE, status: "completed", conclusion: "success" },
+      ],
+      jobs102: [{ name: "assist", conclusion: "success" }],
+    }),
+    "owner",
+  );
+});
+
+test("dispatch receipt gate finds successful owners beyond the first run page", () => {
+  assert.equal(
+    runGate({
+      runs: [],
+      runPages: [
+        Array.from({ length: 100 }, (_, index) => ({
+          id: 1000 + index,
+          display_title: `unrelated-${index}`,
+          status: "completed",
+          conclusion: "success",
+        })),
+        [
+          {
+            id: 102,
+            display_title: EXPECTED_TITLE,
+            status: "completed",
+            conclusion: "success",
+          },
+        ],
       ],
       jobs102: [{ name: "assist", conclusion: "success" }],
     }),
