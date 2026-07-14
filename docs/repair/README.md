@@ -268,8 +268,9 @@ pnpm run repair:import-gitcrawl-low-signal -- --limit 20 --batch-size 5 --mode a
 pnpm run repair:import-gitcrawl -- --from-gitcrawl --limit 40 --mode autonomous --suffix autonomous-smoke --allow-instant-close --allow-merge --allow-fix-pr --allow-post-merge-close
 
 # Query the Cloudflare crawl-remote service instead of a local DB.
-CLAWSWEEPER_GITCRAWL_CLOUD_URL=https://crawl.example.test \
-CLAWSWEEPER_GITCRAWL_CLOUD_TOKEN=... \
+CLAWSWEEPER_GITCRAWL_CLOUD_URL=https://reports.openclaw.ai/crawl-remote \
+CLAWSWEEPER_GITCRAWL_CLOUD_ACCESS_CLIENT_ID=... \
+CLAWSWEEPER_GITCRAWL_CLOUD_ACCESS_CLIENT_SECRET=... \
 pnpm run repair:import-gitcrawl -- --from-gitcrawl --gitcrawl-provider cloud --limit 1 --mode plan
 
 # Automatic imported-cluster intake runs through repair-cluster-intake.yml.

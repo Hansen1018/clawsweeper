@@ -60,6 +60,8 @@ test("scheduled cluster repair intake supports snapshot-bound providers", () => 
   assert.match(workflow, /local, cloud, or parity evidence provider/);
   assert.match(workflow, /CLAWSWEEPER_CLUSTER_REPAIR_GITCRAWL_PROVIDER/);
   assert.match(workflow, /CLAWSWEEPER_GITCRAWL_CLOUD_URL/);
+  assert.match(workflow, /secrets\.CRAWL_REMOTE_ACCESS_CLIENT_ID/);
+  assert.match(workflow, /secrets\.CRAWL_REMOTE_ACCESS_CLIENT_SECRET/);
   assert.match(workflow, /last_processed_snapshot_id/);
   assert.match(workflow, /last_processed_source_identity_sha256/);
   assert.match(workflow, /last_processed_store_sha256/);
