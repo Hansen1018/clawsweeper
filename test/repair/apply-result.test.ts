@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -8,6 +9,7 @@ import test from "node:test";
 import { mockGhBinEnv } from "../helpers.ts";
 
 const repoRoot = process.cwd();
+const EMPTY_REVIEW_ACTIVITY_CURSOR = `v2:0:${createHash("sha256").update("[]").digest("hex")}`;
 
 test("repair apply blocks PR duplicate close when coverage proof keeps the source open", () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-apply-result-"));
@@ -661,6 +663,56 @@ test("repair apply stops before close when review activity changes after its com
     const report = JSON.parse(fs.readFileSync(paths.reportPath, "utf8"));
     assert.equal(report.actions[0].status, "blocked");
     assert.match(report.actions[0].reason, /review activity changed after repair validation/);
+    assert.equal(hasCommentPostCall(paths.ghLogPath), true);
+    assert.equal(hasPrCloseCall(paths.ghLogPath), false);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("repair apply rejects a concurrent security label after its comment", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-apply-result-"));
+  try {
+    const activityChangePath = path.join(tmp, "activity-changed");
+    const paths = writeApplyFixture(tmp, {
+      action: "close_duplicate",
+      classification: "duplicate",
+      canonical: "#202",
+    });
+    writeFakeGh(paths.binDir, {
+      issues: {
+        101: issue({ number: 101, title: "Add config validation", pullRequest: true }),
+        202: issue({
+          number: 202,
+          title: "Rewrite config validation",
+          pullRequest: true,
+          labels: ["proof: sufficient"],
+        }),
+      },
+      pulls: {
+        101: pull({ number: 101, title: "Add config validation" }),
+        202: pull({ number: 202, title: "Rewrite config validation" }),
+      },
+      comments: {
+        101: [comment("alice", "PR A keeps legacy config behavior intact.")],
+        202: [comment("bob", "PR B carries forward the legacy config behavior.")],
+      },
+      reviewChangePath: activityChangePath,
+      postMutationPulls: {
+        101: { labels: [{ name: "security" }] },
+      },
+      logPath: paths.ghLogPath,
+    });
+    writeFakeCodex(paths.binDir);
+
+    runApplyResult(paths, { proofDecision: "covered" });
+
+    const report = JSON.parse(fs.readFileSync(paths.reportPath, "utf8"));
+    assert.equal(report.actions[0].status, "blocked");
+    assert.match(
+      report.actions[0].reason,
+      /target activity changed concurrently with the ClawSweeper mutation/,
+    );
     assert.equal(hasCommentPostCall(paths.ghLogPath), true);
     assert.equal(hasPrCloseCall(paths.ghLogPath), false);
   } finally {
@@ -1533,6 +1585,7 @@ type FakeGhData = {
   inlineComments?: Record<number, Record<string, unknown>[]>;
   reviewChangePath?: string;
   postMutationReviews?: Record<number, Record<string, unknown>[]>;
+  postMutationPulls?: Record<number, Record<string, unknown>>;
   omitIssueCommentCounts?: number[];
   prViewFailure?: { number: number; message: string };
   afterProofPath?: string;
@@ -1598,6 +1651,8 @@ function writeApplyFixture(
       target: resultAction.target ?? "#101",
       target_kind: resultAction.target_kind ?? "pull_request",
       ...(omitTargetUpdatedAt ? {} : { target_updated_at: "2026-05-25T00:00:00Z" }),
+      review_activity_cursor:
+        resultAction.review_activity_cursor ?? EMPTY_REVIEW_ACTIVITY_CURSOR,
       status: resultAction.status ?? "planned",
       evidence: ["PR B is referenced as the canonical replacement for PR A."],
       idempotency_key:
@@ -1717,12 +1772,25 @@ if (args[0] === "api") {
       const input = args[args.indexOf("--input") + 1];
       const body = JSON.parse(fs.readFileSync(input, "utf8")).body;
       fs.appendFileSync(data.logPath, JSON.stringify({ args: ["comment-body", String(body)] }) + "\\n");
+      fs.writeFileSync(data.logPath + ".posted-" + number, JSON.stringify({ body }));
       if (data.reviewChangePath) fs.writeFileSync(data.reviewChangePath, "changed");
       write({ id: 9000 + number, body });
     } else if (args.includes("--slurp")) {
       write([data.comments[number] || []]);
     } else {
-      const comments = data.comments[number] || [];
+      const comments = [...(data.comments[number] || [])];
+      const postedPath = data.logPath + ".posted-" + number;
+      if (fs.existsSync(postedPath)) {
+        const posted = JSON.parse(fs.readFileSync(postedPath, "utf8"));
+        comments.push({
+          id: 9000 + number,
+          user: { login: "clawsweeper[bot]" },
+          author_association: "CONTRIBUTOR",
+          created_at: "2026-05-25T00:00:01Z",
+          updated_at: "2026-05-25T00:00:01Z",
+          body: posted.body,
+        });
+      }
       const perPage = Number(url.searchParams.get("per_page") || comments.length || 100);
       const page = Number(url.searchParams.get("page") || "1");
       const start = Math.max(0, page - 1) * perPage;
@@ -1803,9 +1871,15 @@ if (args[0] === "api") {
       fs.existsSync(data.afterProofPath) &&
       data.postProofPulls &&
       data.postProofPulls[number];
+    const postMutationPull =
+      data.reviewChangePath &&
+      fs.existsSync(data.reviewChangePath) &&
+      data.postMutationPulls &&
+      data.postMutationPulls[number];
     write({
       ...pull,
       ...(postProofPull ? postProofPull : {}),
+      ...(postMutationPull ? postMutationPull : {}),
     });
     process.exit(0);
   }
@@ -1952,6 +2026,7 @@ function pull(options: { number: number; title: string; mergedAt?: string }) {
 
 function comment(author: string, body: string) {
   return {
+    id: createHash("sha256").update(`${author}\n${body}`).digest("hex").slice(0, 16),
     user: { login: author },
     author_association: "CONTRIBUTOR",
     created_at: "2026-05-24T00:00:00Z",

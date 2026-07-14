@@ -14,6 +14,7 @@ import {
 import { stripAnsi } from "./comment-router-utils.js";
 import {
   ghErrorText,
+  ghJson as ghJsonOneShot,
   ghJsonWithRetry as ghJson,
   ghText as ghOneShot,
   ghTextWithRetry as ghWithRetry,
@@ -36,6 +37,7 @@ import {
   RepairMutationFreshnessError,
   createRepairMutationFreshnessGuard,
   flushRepairMutationActionEvents,
+  repairCreatedCommentChange,
   runRepairMutation,
   type RepairMutationContext,
   type RepairMutationFreshnessGuard,
@@ -105,33 +107,37 @@ const report: LooseRecord = {
   actions: [],
 };
 
-if (!fixReport) {
-  report.actions.push({
-    action: "post_flight",
-    status: "skipped",
-    reason: "no fix-execution-report.json",
-  });
+try {
+  if (!fixReport) {
+    report.actions.push({
+      action: "post_flight",
+      status: "skipped",
+      reason: "no fix-execution-report.json",
+    });
+  } else {
+    for (const action of fixReport.actions ?? []) {
+      if (!FIX_PR_ACTIONS.has(String(action.action ?? ""))) continue;
+      const finalized = finalizeFixPr(action);
+      report.actions.push(finalized);
+      if (finalized.status === "executed") {
+        report.actions.push(...finalizePostMergeCloseouts(action, finalized));
+      }
+    }
+  }
+
+  if (report.actions.length === 0) {
+    report.actions.push({
+      action: "post_flight",
+      status: "skipped",
+      reason: "no ClawSweeper Repair fix PR actions to finalize",
+    });
+  }
+
+  report.closure_authorization = buildClosureAuthorization(report.actions);
   writeReport(report, resultPath);
-  process.exit(0);
+} finally {
+  await flushRepairMutationActionEvents();
 }
-
-for (const action of fixReport.actions ?? []) {
-  if (!FIX_PR_ACTIONS.has(String(action.action ?? ""))) continue;
-  const finalized = finalizeFixPr(action);
-  report.actions.push(finalized);
-}
-
-if (report.actions.length === 0) {
-  report.actions.push({
-    action: "post_flight",
-    status: "skipped",
-    reason: "no ClawSweeper Repair fix PR actions to finalize",
-  });
-}
-
-report.closure_authorization = buildClosureAuthorization(report.actions);
-writeReport(report, resultPath);
-await flushRepairMutationActionEvents();
 
 function buildClosureAuthorization(actions: LooseRecord[]) {
   const mergedFixes = actions
@@ -215,7 +221,6 @@ function finalizeFixPr(action: LooseRecord) {
           expectedUpdatedAt: pull.updated_at ?? view.updatedAt,
           expectedReviewActivityCursor:
             action.review_activity_cursor ?? action.merge_preflight?.review_activity_cursor,
-          readUpdatedAt: () => fetchPullRequest(result.repo, parsed.number).updated_at,
         });
       } catch (error) {
         if (error instanceof RepairMutationFreshnessError) {
@@ -473,7 +478,6 @@ function finalizePostMergeCloseout({
         expectedUpdatedAt: live.updated_at,
         expectedReviewActivityCursor:
           action.review_activity_cursor ?? action.target_review_activity_cursor,
-        readUpdatedAt: () => fetchIssue(result.repo, target).updated_at,
       });
     } catch (error) {
       if (error instanceof RepairMutationFreshnessError) {
@@ -529,28 +533,29 @@ function finalizePostMergeCloseout({
           CLAWSWEEPER_LABEL,
         ]),
       knownNoMutation: isAlreadyExistsError,
-      refreshAfterAcceptedMutation: true,
+      acceptedChange: () => ({ kind: "label_add", label: CLAWSWEEPER_LABEL }),
     });
+    const bodySha256 = createHash("sha256").update(commentBody).digest("hex");
+    const payloadPath = writePayload(`post-flight-comment-${target}`, { body: commentBody });
     runRepairMutation(mutationContext, {
       kind: "comment_create",
       identity: {
         repository: result.repo,
         number: target,
-        bodySha256: createHash("sha256").update(commentBody).digest("hex"),
+        bodySha256,
       },
       freshness,
       operation: () =>
-        ghOneShot([
-          "issue",
-          "comment",
-          String(target),
-          "--repo",
-          result.repo,
-          "--body",
-          commentBody,
+        ghJsonOneShot<unknown>([
+          "api",
+          `repos/${result.repo}/issues/${target}/comments`,
+          "--method",
+          "POST",
+          "--input",
+          payloadPath,
         ]),
       knownNoMutation: isLockedConversationCommentError,
-      refreshAfterAcceptedMutation: true,
+      acceptedChange: (created) => repairCreatedCommentChange(created, bodySha256),
     });
     runRepairMutation(mutationContext, {
       kind: live.pull_request ? "pull_request_close" : "issue_close",
@@ -649,7 +654,7 @@ function labelForClawSweeperReview(
         CLAWSWEEPER_LABEL,
       ]),
     knownNoMutation: isAlreadyExistsError,
-    refreshAfterAcceptedMutation: true,
+    acceptedChange: () => ({ kind: "label_add", label: CLAWSWEEPER_LABEL }),
   });
 }
 
@@ -683,7 +688,6 @@ function ensureLabel(
           String(description),
         ]),
       knownNoMutation: isAlreadyExistsError,
-      refreshAfterAcceptedMutation: true,
     });
   } catch (error) {
     if (isAlreadyExistsError(error)) return;
@@ -980,6 +984,14 @@ function writeReport(report: LooseRecord, resultPath: string) {
   const reportPath = path.join(path.dirname(resultPath), "post-flight-report.json");
   fs.writeFileSync(reportPath, `${JSON.stringify(report, null, 2)}\n`);
   console.log(JSON.stringify(report, null, 2));
+}
+
+function writePayload(name: string, value: JsonValue) {
+  const dir = path.join(repoRoot(), ".clawsweeper-repair", "payloads");
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, `${name}-${Date.now()}.json`);
+  fs.writeFileSync(file, JSON.stringify(value), "utf8");
+  return file;
 }
 
 function normalizeIssueRef(value: JsonValue) {

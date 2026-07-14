@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -8,6 +9,7 @@ import test from "node:test";
 import { mockGhBinEnv } from "../helpers.ts";
 
 const repoRoot = process.cwd();
+const EMPTY_REVIEW_ACTIVITY_CURSOR = `v2:0:${createHash("sha256").update("[]").digest("hex")}`;
 
 test("issue implementation post-flight waits for green PR checks without merging", () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-post-flight-"));
@@ -278,8 +280,8 @@ test("merge post-flight leaves dependency-gated closeouts to the second apply pa
       "  process.stdout.write('[]');",
       "  process.exit(0);",
       "}",
-      "if (args[0] === 'api' && args[1] === 'repos/openclaw/openclaw/issues/123/comments?per_page=100') {",
-      "  process.stdout.write('');",
+      "if (args[0] === 'api' && /^repos\\/openclaw\\/openclaw\\/issues\\/123\\/comments\\?/.test(args[1])) {",
+      "  process.stdout.write('[]');",
       "  process.exit(0);",
       "}",
       "if (args[0] === 'api' && args[1] === 'graphql') {",
@@ -409,8 +411,8 @@ test("post-flight blocks merge when review activity changes after validation", (
       "  process.stdout.write('[]');",
       "  process.exit(0);",
       "}",
-      "if (args[0] === 'api' && args[1] === 'repos/openclaw/openclaw/issues/123/comments?per_page=100') {",
-      "  process.stdout.write('');",
+      "if (args[0] === 'api' && /^repos\\/openclaw\\/openclaw\\/issues\\/123\\/comments\\?/.test(args[1])) {",
+      "  process.stdout.write('[]');",
       "  process.exit(0);",
       "}",
       "if (args[0] === 'api' && args[1] === 'graphql') {",
@@ -669,6 +671,7 @@ function writeMergeReports(
             status: "opened",
             pr_url: "https://github.com/openclaw/openclaw/pull/123",
             branch: "clawsweeper/automerge-openclaw-openclaw-123",
+            review_activity_cursor: EMPTY_REVIEW_ACTIVITY_CURSOR,
             merge_preflight: {
               security_status: "cleared",
               security_evidence: ["no security signal"],

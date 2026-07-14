@@ -15,6 +15,7 @@ import { defaultCloseComment, externalMessageProvenance } from "./external-messa
 import {
   ghErrorText,
   githubLimitedPagePath,
+  ghJson as ghJsonOneShot,
   ghJsonWithRetry as ghJson,
   ghPagedWithRetry as ghPaged,
   ghText as ghOneShot,
@@ -52,6 +53,7 @@ import {
   RepairMutationFreshnessError,
   createRepairMutationFreshnessGuard,
   flushRepairMutationActionEvents,
+  repairCreatedCommentChange,
   runRepairMutation,
   type RepairMutationContext,
   type RepairMutationFreshnessGuard,
@@ -186,49 +188,52 @@ const maintainerCloseRefs = new Set(
     .filter(Boolean),
 );
 
-const { effectiveResult, promotions } = applyPostFlightClosurePromotions(result);
-if (promotions.length > 0) report.closure_promotions = promotions;
-const closurePlan = planRepairClosureResult(effectiveResult);
-if (closurePlan.status === "needs_human") {
-  throw new Error(
-    `refusing apply: ${closurePlan.diagnostics
-      .map((diagnostic) => `closure dependency plan ${diagnostic.code}: ${diagnostic.message}`)
-      .join("; ")}`,
-  );
-}
-report.closure_plan = closurePlan;
-const closureOutcomes = new Map<string, LooseRecord>();
-const applicatorActions = (effectiveResult.actions ?? []).filter(isApplicatorAction);
-for (const action of orderRepairClosureActions(applicatorActions, closurePlan)) {
-  if (!isApplicatorAction(action)) continue;
-  const outcome =
-    blockedClosureDependencyOutcome({
-      result: effectiveResult,
-      action,
-      dryRun,
-      closureOutcomes,
-    }) ??
-    applyAction({
-      job,
-      result: effectiveResult,
-      action,
-      dryRun,
-      allowMissingUpdatedAt,
-    });
-  report.actions.push(outcome);
-  if (action.status === "planned" && CLOSE_ACTIONS.has(String(action.action ?? ""))) {
-    const target = normalizeRepairClosureRef(action.target);
-    if (target) closureOutcomes.set(target, outcome);
+try {
+  const { effectiveResult, promotions } = applyPostFlightClosurePromotions(result);
+  if (promotions.length > 0) report.closure_promotions = promotions;
+  const closurePlan = planRepairClosureResult(effectiveResult);
+  if (closurePlan.status === "needs_human") {
+    throw new Error(
+      `refusing apply: ${closurePlan.diagnostics
+        .map((diagnostic) => `closure dependency plan ${diagnostic.code}: ${diagnostic.message}`)
+        .join("; ")}`,
+    );
   }
-}
+  report.closure_plan = closurePlan;
+  const closureOutcomes = new Map<string, LooseRecord>();
+  const applicatorActions = (effectiveResult.actions ?? []).filter(isApplicatorAction);
+  for (const action of orderRepairClosureActions(applicatorActions, closurePlan)) {
+    if (!isApplicatorAction(action)) continue;
+    const outcome =
+      blockedClosureDependencyOutcome({
+        result: effectiveResult,
+        action,
+        dryRun,
+        closureOutcomes,
+      }) ??
+      applyAction({
+        job,
+        result: effectiveResult,
+        action,
+        dryRun,
+        allowMissingUpdatedAt,
+      });
+    report.actions.push(outcome);
+    if (action.status === "planned" && CLOSE_ACTIONS.has(String(action.action ?? ""))) {
+      const target = normalizeRepairClosureRef(action.target);
+      if (target) closureOutcomes.set(target, outcome);
+    }
+  }
 
-const reportPath =
-  typeof reportPathArg === "string"
-    ? path.resolve(reportPathArg)
-    : path.join(path.dirname(resultPath), "apply-report.json");
-fs.writeFileSync(reportPath, `${JSON.stringify(report, null, 2)}\n`);
-console.log(JSON.stringify(report, null, 2));
-await flushRepairMutationActionEvents();
+  const reportPath =
+    typeof reportPathArg === "string"
+      ? path.resolve(reportPathArg)
+      : path.join(path.dirname(resultPath), "apply-report.json");
+  fs.writeFileSync(reportPath, `${JSON.stringify(report, null, 2)}\n`);
+  console.log(JSON.stringify(report, null, 2));
+} finally {
+  await flushRepairMutationActionEvents();
+}
 
 function findLatestResultPath() {
   const runsRoot = path.join(repoRoot(), ".clawsweeper-repair", "runs");
@@ -613,7 +618,6 @@ function applyCloseAction({
       expectedUpdatedAt,
       expectedReviewActivityCursor:
         action.review_activity_cursor ?? action.target_review_activity_cursor,
-      readUpdatedAt: () => fetchIssue(result.repo, target).updated_at,
     });
     if (!existingComment) {
       postIssueComment(mutationContext, freshness, body);
@@ -724,7 +728,6 @@ function applyMergeAction({
         expectedUpdatedAt,
         expectedReviewActivityCursor:
           action.review_activity_cursor ?? action.target_review_activity_cursor,
-        readUpdatedAt: () => fetchIssue(result.repo, target).updated_at,
       });
     } catch (error) {
       if (error instanceof RepairMutationFreshnessError) {
@@ -982,7 +985,7 @@ function labelForClawSweeperReview(
         CLAWSWEEPER_LABEL,
       ]),
     knownNoMutation: isAlreadyExistsError,
-    refreshAfterAcceptedMutation: true,
+    acceptedChange: () => ({ kind: "label_add", label: CLAWSWEEPER_LABEL }),
   });
 }
 
@@ -1016,7 +1019,6 @@ function ensureLabel(
           String(description),
         ]),
       knownNoMutation: isAlreadyExistsError,
-      refreshAfterAcceptedMutation: true,
     });
   } catch (error) {
     if (isAlreadyExistsError(error)) return;
@@ -1970,16 +1972,17 @@ function postIssueComment(
   body: string,
 ) {
   const payloadPath = writePayload(`comment-${context.number}`, { body });
+  const bodySha256 = createHash("sha256").update(body).digest("hex");
   runRepairMutation(context, {
     kind: "comment_create",
     identity: {
       repository: context.repository,
       number: context.number,
-      bodySha256: createHash("sha256").update(body).digest("hex"),
+      bodySha256,
     },
     freshness,
     operation: () =>
-      ghOneShot([
+      ghJsonOneShot<unknown>([
         "api",
         `repos/${context.repository}/issues/${context.number}/comments`,
         "--method",
@@ -1988,7 +1991,7 @@ function postIssueComment(
         payloadPath,
       ]),
     knownNoMutation: isLockedConversationCommentError,
-    refreshAfterAcceptedMutation: true,
+    acceptedChange: (created) => repairCreatedCommentChange(created, bodySha256),
   });
 }
 
