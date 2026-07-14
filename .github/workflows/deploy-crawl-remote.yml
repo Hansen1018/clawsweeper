@@ -398,7 +398,7 @@ jobs:
           const approvedOperations = [
             {
               name: 'gitcrawl-query-canary-seed.sql',
-              sha256: '9be769bb99e63fc559296f259706a406bc50c7c34ee9bd06f9eeede4a0376c70',
+              sha256: 'd27e559bd5d96f9778b104583293ebaa314fa1b5af35bae268b0a928254263f4',
             },
           ];
           const operationEntries = readdirSync('operations', { withFileTypes: true })
@@ -1098,7 +1098,7 @@ jobs:
           const approvedOperationHashes = new Map([
             [
               'operations/gitcrawl-query-canary-seed.sql',
-              '9be769bb99e63fc559296f259706a406bc50c7c34ee9bd06f9eeede4a0376c70',
+              'd27e559bd5d96f9778b104583293ebaa314fa1b5af35bae268b0a928254263f4',
             ],
           ]);
           const rawManifest = readFileSync(manifestPath, 'utf8');
@@ -2499,7 +2499,7 @@ jobs:
           test ! -L "$seed_sql"
           test "$(
             sha256sum "$seed_sql" | cut -d ' ' -f 1
-          )" = "9be769bb99e63fc559296f259706a406bc50c7c34ee9bd06f9eeede4a0376c70"
+          )" = "d27e559bd5d96f9778b104583293ebaa314fa1b5af35bae268b0a928254263f4"
           deployed_version="$(tr -d '\r\n' < "$DEPLOYED_VERSION_PATH")"
           owned_deployment_id="$(tr -d '\r\n' < "$OWNED_DEPLOYMENT_ID_PATH")"
           test "$deployed_version" != ""
@@ -2551,7 +2551,7 @@ jobs:
           if (
             !Array.isArray(previousGitcrawl?.capabilities) ||
             !previousGitcrawl.capabilities.includes(
-              'gitcrawl.query-canary.permanent.v1',
+              'gitcrawl.query-canary.permanent-runtime.v1',
             ) ||
             deployment?.id !== process.env.OWNED_DEPLOYMENT_ID ||
             deployment?.annotations?.['workers/message'] !== process.env.DEPLOY_MESSAGE ||
@@ -2612,7 +2612,7 @@ jobs:
             deployed_version: process.env.DEPLOYED_VERSION,
             operation: 'gitcrawl-query-canary-seed',
             sql_sha256:
-              '9be769bb99e63fc559296f259706a406bc50c7c34ee9bd06f9eeede4a0376c70',
+              'd27e559bd5d96f9778b104583293ebaa314fa1b5af35bae268b0a928254263f4',
             response_sha256: createHash('sha256').update(responseRaw).digest('hex'),
           };
           writeFileSync(
@@ -2672,7 +2672,7 @@ jobs:
             receipt.target_sha !== process.env.DEPLOY_SHA ||
             receipt.operation !== 'gitcrawl-query-canary-seed' ||
             receipt.sql_sha256 !==
-              '9be769bb99e63fc559296f259706a406bc50c7c34ee9bd06f9eeede4a0376c70' ||
+              'd27e559bd5d96f9778b104583293ebaa314fa1b5af35bae268b0a928254263f4' ||
             !/^[0-9a-f]{64}$/.test(String(receipt.response_sha256 ?? '')) ||
             !uuidPattern.test(String(receipt.deployment_id ?? '')) ||
             !uuidPattern.test(String(receipt.deployed_version ?? ''))

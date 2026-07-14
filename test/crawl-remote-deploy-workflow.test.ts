@@ -993,7 +993,7 @@ test("release artifact is immutable, bounded, canonical, and hash verified", () 
     "a0ebfbb5c40c85df5eaba6772a01a68910fa5f1327d4701d25c5dfde16f77d1a",
     "5c1e92dbf4d51ef62d317e212a0ec8e39df104983656c6416d0c58ef3503744d",
     "3d5afadb62b4343cc88c54a18702aee13b61d1d5a74312a191996833155ab462",
-    "9be769bb99e63fc559296f259706a406bc50c7c34ee9bd06f9eeede4a0376c70",
+    "d27e559bd5d96f9778b104583293ebaa314fa1b5af35bae268b0a928254263f4",
   ]) {
     assert.match(packaging, new RegExp(sha256));
   }
@@ -1660,7 +1660,7 @@ test("deploy reauthorizes exact current main before and after privileged mutatio
   assert.match(canarySeed.run ?? "", /CANARY_ATTEMPT_PATH/);
   assert.match(canarySeed.run ?? "", /CANARY_SEED_RECEIPT_PATH/);
   assert.match(canarySeed.run ?? "", /PREVIOUS_WORKER_CONTRACT_BASELINE/);
-  assert.match(canarySeed.run ?? "", /gitcrawl\.query-canary\.permanent\.v1/);
+  assert.match(canarySeed.run ?? "", /gitcrawl\.query-canary\.permanent-runtime\.v1/);
   assert.match(canarySeed.run ?? "", /CANARY_OPERATION_TIMEOUT_SECONDS \+/);
   assert.match(canarySeed.run ?? "", /WRANGLER_READ_TIMEOUT_SECONDS \* 6/);
   assert.match(productionProof.if ?? "", /steps\.canary-seed\.outcome == 'success'/);
@@ -1729,7 +1729,7 @@ test("privileged mutations use only verified files and prove the selected D1 fen
   assert.match(migration, /pre-migration query failed/);
   assert.match(workerDeploy, /deploy bundle\/index\.js/);
   assert.match(canarySeed, /operations\/gitcrawl-query-canary-seed\.sql/);
-  assert.match(canarySeed, /9be769bb99e63fc559296f259706a406bc50c7c34ee9bd06f9eeede4a0376c70/);
+  assert.match(canarySeed, /d27e559bd5d96f9778b104583293ebaa314fa1b5af35bae268b0a928254263f4/);
   assert.match(canarySeed, /canary-aware rollback Worker and current deployment ownership/);
   assert.match(workerDeploy, /--no-bundle/);
   assert.match(workerDeploy, /--strict/);
@@ -1873,7 +1873,7 @@ exit 97
           {
             app: "gitcrawl",
             capabilities: previousCanarySupport
-              ? ["gitcrawl.query-canary.permanent.v1"]
+              ? ["gitcrawl.query-canary.permanent-runtime.v1"]
               : ["gitcrawl-query-safety-v3"],
           },
         ],
@@ -1904,7 +1904,7 @@ exit 97
       deployment_id: deploymentID,
       deployed_version: deployedVersion,
       operation: "gitcrawl-query-canary-seed",
-      sql_sha256: "9be769bb99e63fc559296f259706a406bc50c7c34ee9bd06f9eeede4a0376c70",
+      sql_sha256: "d27e559bd5d96f9778b104583293ebaa314fa1b5af35bae268b0a928254263f4",
       response_sha256: createHash("sha256").update('[{"success":true}]\n').digest("hex"),
     });
 

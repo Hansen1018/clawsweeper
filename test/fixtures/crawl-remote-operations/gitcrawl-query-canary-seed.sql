@@ -731,3 +731,86 @@ where exists (
   where archive_id = 'gitcrawl/clawsweeper__query_canary'
     and snapshot_id = '9a03e9ec2d365b4f671ce29f1290d19faab979f2e7e01c73088bac6a905f9d36'
 );
+
+insert or ignore into remote_ingest_runs(
+  id,
+  archive_id,
+  app,
+  actor,
+  started_at,
+  completed_at,
+  status,
+  rows_accepted,
+  error
+)
+select
+  'gitcrawl-query-canary-v1',
+  'gitcrawl/clawsweeper__query_canary',
+  'gitcrawl',
+  'clawsweeper-deploy',
+  '2026-07-14T00:00:00.000Z',
+  '2026-07-14T00:02:00.000Z',
+  'complete',
+  28,
+  null
+where exists (
+  select 1
+  from remote_archives
+  where id = 'gitcrawl/clawsweeper__query_canary'
+    and app = 'gitcrawl'
+    and slug = 'clawsweeper__query_canary'
+    and schema_name = 'gitcrawl-cloud-v2'
+    and schema_version = 2
+    and schema_hash = 'gitcrawl-query-canary-v1'
+    and capabilities = '["gitcrawl.threads.search","gitcrawl.clusters.related","gitcrawl.clusters.list","gitcrawl.clusters.members","gitcrawl.pull_requests.review_context","gitcrawl.coverage"]'
+    and last_ingest_at = '2026-07-14T00:02:00.000Z'
+    and last_sync_at = '2026-07-14T00:00:00.000Z'
+    and updated_at = '2026-07-14T00:03:00.000Z'
+)
+  and exists (
+    select 1
+    from gitcrawl_snapshots
+    where archive_id = 'gitcrawl/clawsweeper__query_canary'
+      and snapshot_id = '9a03e9ec2d365b4f671ce29f1290d19faab979f2e7e01c73088bac6a905f9d36'
+      and coverage_complete = 1
+      and mutation_token = 'gitcrawl-query-canary-v1'
+      and activated_at = '2026-07-14T00:02:00.000Z'
+      and hardening_validated_at = '2026-07-14T00:02:00.000Z'
+  )
+  and exists (
+    select 1
+    from gitcrawl_snapshot_provenance
+    where archive_id = 'gitcrawl/clawsweeper__query_canary'
+      and snapshot_id = '9a03e9ec2d365b4f671ce29f1290d19faab979f2e7e01c73088bac6a905f9d36'
+      and binding_mode = 'legacy'
+      and source_sha256 = ''
+  )
+  and (
+    select count(*)
+    from gitcrawl_dataset_coverage
+    where archive_id = 'gitcrawl/clawsweeper__query_canary'
+      and snapshot_id = '9a03e9ec2d365b4f671ce29f1290d19faab979f2e7e01c73088bac6a905f9d36'
+      and complete = 1
+      and mutation_token = 'gitcrawl-query-canary-v1'
+  ) = 9
+  and exists (
+    select 1
+    from gitcrawl_active_snapshots
+    where archive_id = 'gitcrawl/clawsweeper__query_canary'
+      and snapshot_id = '9a03e9ec2d365b4f671ce29f1290d19faab979f2e7e01c73088bac6a905f9d36'
+      and activated_at = '2026-07-14T00:02:00.000Z'
+  )
+  and exists (
+    select 1
+    from gitcrawl_publish_candidates
+    where archive_id = 'gitcrawl/clawsweeper__query_canary'
+      and snapshot_id = '9a03e9ec2d365b4f671ce29f1290d19faab979f2e7e01c73088bac6a905f9d36'
+      and completed_at = '2026-07-14T00:02:00.000Z'
+  )
+  and exists (
+    select 1
+    from gitcrawl_snapshot_cutovers
+    where archive_id = 'gitcrawl/clawsweeper__query_canary'
+      and snapshot_id = '9a03e9ec2d365b4f671ce29f1290d19faab979f2e7e01c73088bac6a905f9d36'
+      and cutover_at = '2026-07-14T00:03:00.000Z'
+  );
