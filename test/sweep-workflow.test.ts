@@ -799,6 +799,21 @@ test("terminal exact-review runs reconcile through a signed isolated backstop", 
   assert.match(client, /"x-clawsweeper-exact-review-signature": signature/);
   assert.doesNotMatch(producer, /create-state-token|setup-state/);
   assert.match(publisher, /create-state-token/);
+  assert.match(
+    producer,
+    /producer_run_attempt: \$\{\{ steps\.finalize-exact-review-action-ledger\.outputs\.producer_run_attempt \}\}/,
+  );
+  assert.match(producer, /producer_run_attempt=\$GITHUB_RUN_ATTEMPT/);
+  assert.match(
+    publisher,
+    /exact-review-action-ledger-reconcile-\$\{\{ github\.run_id \}\}-\$\{\{ needs\.reconcile\.outputs\.producer_run_attempt \}\}/,
+  );
+  assert.match(
+    publisher,
+    /PRODUCER_RUN_ATTEMPT: \$\{\{ needs\.reconcile\.outputs\.producer_run_attempt \}\}/,
+  );
+  assert.match(publisher, /--expected-run-attempt "\$PRODUCER_RUN_ATTEMPT"/);
+  assert.doesNotMatch(publisher, /--expected-run-attempt "\$GITHUB_RUN_ATTEMPT"/);
   assert.match(publisher, /--expected-job reconcile/);
   assert.match(publisher, /publish-action-event-paths/);
 });

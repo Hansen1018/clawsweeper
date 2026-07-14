@@ -26,6 +26,7 @@ jobs:
       contents: read
     outputs:
       action_ledger_ready: ${{ steps.finalize-exact-review-action-ledger.outcome == 'success' }}
+      producer_run_attempt: ${{ steps.finalize-exact-review-action-ledger.outputs.producer_run_attempt }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -67,6 +68,7 @@ jobs:
           pnpm run --silent repair:action-ledger -- finalize \
             --repair-lane exact-review-queue \
             --allow-empty > "$manifest"
+          echo "producer_run_attempt=$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
 
       - name: Upload exact-review reconciliation action ledger
         if: ${{ always() && steps.finalize-exact-review-action-ledger.outcome == 'success' }}
@@ -112,12 +114,15 @@ jobs:
       - name: Download exact-review reconciliation action ledger
         uses: actions/download-artifact@v8
         with:
-          name: exact-review-action-ledger-reconcile-${{ github.run_id }}-${{ github.run_attempt }}
+          name: exact-review-action-ledger-reconcile-${{ github.run_id }}-${{ needs.reconcile.outputs.producer_run_attempt }}
           path: .clawsweeper-repair/exact-review-action-ledger
 
       - name: Publish exact reconciliation producer ledger
+        env:
+          PRODUCER_RUN_ATTEMPT: ${{ needs.reconcile.outputs.producer_run_attempt }}
         run: |
           set -euo pipefail
+          test -n "$PRODUCER_RUN_ATTEMPT"
           source_root=".clawsweeper-repair/exact-review-action-ledger"
           manifest="$source_root/exact-review-action-ledger-manifest.json"
           import_result=".artifacts/exact-review-action-ledger-import.json"
@@ -132,7 +137,7 @@ jobs:
             --expected-workflow exact-review-reconcile.yml \
             --expected-job reconcile \
             --expected-run-id "$GITHUB_RUN_ID" \
-            --expected-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --expected-run-attempt "$PRODUCER_RUN_ATTEMPT" \
             --source-root "$source_root" \
             --state-root "$CLAWSWEEPER_STATE_DIR" > "$import_result"
           if ! jq -e --slurpfile manifest "$manifest" \
