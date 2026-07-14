@@ -718,7 +718,10 @@ test("target fanout keeps a partially dispatched throttled batch replay-unsafe",
       },
     );
     assert.equal(result.status, 1);
-    assert.deepEqual(JSON.parse(readFileSync(cursorPath, "utf8")), { next_cursor: 1 });
+    assert.deepEqual(JSON.parse(readFileSync(cursorPath, "utf8")), {
+      next_cursor: 1,
+      after_repository: "openclaw/a",
+    });
 
     const events = readActionLedgerEvents(outputRoot);
     const firstOutcome = events.find(
@@ -786,7 +789,10 @@ test("target fanout reserves an accepted dispatch before writing its receipt", (
       },
     );
     assert.equal(first.status, 1);
-    assert.deepEqual(JSON.parse(readFileSync(cursorPath, "utf8")), { next_cursor: 1 });
+    assert.deepEqual(JSON.parse(readFileSync(cursorPath, "utf8")), {
+      next_cursor: 1,
+      after_repository: "openclaw/a",
+    });
     assert.deepEqual(readDispatchLog(fixture.logPath), ["openclaw/a"]);
 
     rmSync(join(fixture.root, ".clawsweeper-repair", "action-events"), {
@@ -890,17 +896,211 @@ test("target fanout reruns advance past a durably accepted dispatch without repe
           CLAWSWEEPER_STATE_DIR: stateRoot,
           DISPATCH_LOG_PATH: fixture.logPath,
           GITHUB_RUN_ATTEMPT: "2",
+          TARGET_BRANCH: "renamed",
         },
       },
     );
     assert.equal(second.status, 0, second.stderr);
     assert.deepEqual(readDispatchLog(fixture.logPath), ["openclaw/a"]);
-    assert.deepEqual(JSON.parse(readFileSync(cursorPath, "utf8")), { next_cursor: 1 });
+    assert.deepEqual(JSON.parse(readFileSync(cursorPath, "utf8")), {
+      next_cursor: 1,
+      after_repository: "openclaw/a",
+    });
     assert.ok(
       readActionLedgerEvents(secondOutput).some(
         (event) => event.attributes?.completion_reason === "already_accepted",
       ),
     );
+  } finally {
+    rmSync(fixture.root, { force: true, recursive: true });
+  }
+});
+
+test("target fanout reruns fail closed without current-run durable receipts", () => {
+  const fixture = isolatedFanoutFixture();
+  const cursorPath = join(fixture.root, "results", "target-fanout-cursors", "hot-intake.json");
+  const foreignOutput = join(fixture.root, "foreign-action-ledger-output");
+  const outputRoot = join(fixture.root, "action-ledger-output");
+  const stateRoot = join(fixture.root, "state");
+  for (const directory of [foreignOutput, outputRoot, stateRoot]) {
+    mkdirSync(directory, { recursive: true });
+  }
+
+  try {
+    const foreign = spawnSync(
+      process.execPath,
+      [
+        fixture.scriptPath,
+        "--mode",
+        "hot-intake",
+        "--limit",
+        "1",
+        "--cursor-path",
+        cursorPath,
+        "--repo",
+        "openclaw/clawsweeper",
+        "--owners",
+        "openclaw",
+      ],
+      {
+        cwd: fixture.root,
+        encoding: "utf8",
+        env: {
+          ...fanoutActionLedgerEnv(fixture.ghPath, foreignOutput, "foreign-run"),
+          DISPATCH_LOG_PATH: fixture.logPath,
+        },
+      },
+    );
+    assert.equal(foreign.status, 0, foreign.stderr);
+    importActionEventShards(foreignOutput, stateRoot);
+    rmSync(cursorPath);
+    rmSync(join(fixture.root, ".clawsweeper-repair", "action-events"), {
+      force: true,
+      recursive: true,
+    });
+    writeFileSync(fixture.logPath, "");
+
+    const result = spawnSync(
+      process.execPath,
+      [
+        fixture.scriptPath,
+        "--mode",
+        "hot-intake",
+        "--limit",
+        "1",
+        "--cursor-path",
+        cursorPath,
+        "--repo",
+        "openclaw/clawsweeper",
+        "--owners",
+        "openclaw",
+      ],
+      {
+        cwd: fixture.root,
+        encoding: "utf8",
+        env: {
+          ...fanoutActionLedgerEnv(fixture.ghPath, outputRoot, "7112"),
+          CLAWSWEEPER_STATE_DIR: stateRoot,
+          DISPATCH_LOG_PATH: fixture.logPath,
+          GITHUB_RUN_ATTEMPT: "2",
+        },
+      },
+    );
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /without prior-attempt durable receipts/);
+    assert.deepEqual(readDispatchLog(fixture.logPath), []);
+    assert.equal(existsSync(cursorPath), false);
+  } finally {
+    rmSync(fixture.root, { force: true, recursive: true });
+  }
+});
+
+test("target fanout reruns replay the original batch across inventory insertions", () => {
+  const fixture = isolatedFanoutFixture();
+  const cursorPath = join(fixture.root, "results", "target-fanout-cursors", "hot-intake.json");
+  const firstOutput = join(fixture.root, "first-action-ledger-output");
+  const replayOutput = join(fixture.root, "replay-action-ledger-output");
+  const nextOutput = join(fixture.root, "next-action-ledger-output");
+  const stateRoot = join(fixture.root, "state");
+  for (const directory of [firstOutput, replayOutput, nextOutput, stateRoot]) {
+    mkdirSync(directory, { recursive: true });
+  }
+
+  try {
+    const first = spawnSync(
+      process.execPath,
+      [
+        fixture.scriptPath,
+        "--mode",
+        "hot-intake",
+        "--limit",
+        "2",
+        "--cursor-path",
+        cursorPath,
+        "--repo",
+        "openclaw/clawsweeper",
+        "--owners",
+        "openclaw",
+      ],
+      {
+        cwd: fixture.root,
+        encoding: "utf8",
+        env: {
+          ...fanoutActionLedgerEnv(fixture.ghPath, firstOutput, "7113"),
+          DISPATCH_LOG_PATH: fixture.logPath,
+        },
+      },
+    );
+    assert.equal(first.status, 0, first.stderr);
+    assert.deepEqual(readDispatchLog(fixture.logPath), ["openclaw/a", "openclaw/b"]);
+    importActionEventShards(firstOutput, stateRoot);
+    rmSync(cursorPath);
+    rmSync(join(fixture.root, ".clawsweeper-repair", "action-events"), {
+      force: true,
+      recursive: true,
+    });
+
+    const replay = spawnSync(
+      process.execPath,
+      [
+        fixture.scriptPath,
+        "--mode",
+        "hot-intake",
+        "--limit",
+        "2",
+        "--cursor-path",
+        cursorPath,
+        "--repo",
+        "openclaw/clawsweeper",
+        "--owners",
+        "openclaw",
+      ],
+      {
+        cwd: fixture.root,
+        encoding: "utf8",
+        env: {
+          ...fanoutActionLedgerEnv(fixture.ghPath, replayOutput, "7113"),
+          CLAWSWEEPER_STATE_DIR: stateRoot,
+          DISPATCH_LOG_PATH: fixture.logPath,
+          GITHUB_RUN_ATTEMPT: "2",
+          INSERT_REPOSITORY_BEFORE: "1",
+        },
+      },
+    );
+    assert.equal(replay.status, 0, replay.stderr);
+    assert.deepEqual(readDispatchLog(fixture.logPath), ["openclaw/a", "openclaw/b"]);
+    assert.deepEqual(JSON.parse(readFileSync(cursorPath, "utf8")), {
+      next_cursor: 0,
+      after_repository: "openclaw/b",
+    });
+
+    const next = spawnSync(
+      process.execPath,
+      [
+        fixture.scriptPath,
+        "--mode",
+        "hot-intake",
+        "--limit",
+        "1",
+        "--cursor-path",
+        cursorPath,
+        "--repo",
+        "openclaw/clawsweeper",
+        "--owners",
+        "openclaw",
+      ],
+      {
+        cwd: fixture.root,
+        encoding: "utf8",
+        env: {
+          ...fanoutActionLedgerEnv(fixture.ghPath, nextOutput, "7114"),
+          DISPATCH_LOG_PATH: fixture.logPath,
+          INSERT_REPOSITORY_BEFORE: "1",
+        },
+      },
+    );
+    assert.equal(next.status, 0, next.stderr);
+    assert.deepEqual(readDispatchLog(fixture.logPath), ["openclaw/a", "openclaw/b", "openclaw/00"]);
   } finally {
     rmSync(fixture.root, { force: true, recursive: true });
   }
@@ -976,7 +1176,7 @@ test("target fanout reruns block an outcome-unknown durable dispatch", () => {
       },
     );
     assert.equal(second.status, 1);
-    assert.match(second.stderr, /refusing duplicate target fanout dispatch/);
+    assert.match(second.stderr, /without a complete accepted original batch/);
     assert.deepEqual(readDispatchLog(fixture.logPath), ["openclaw/a"]);
     assert.equal(existsSync(cursorPath), false);
   } finally {
@@ -1073,10 +1273,14 @@ const fs = require("node:fs");
 const path = require("node:path");
 const args = process.argv.slice(2);
 if (args[0] === "repo" && args[1] === "list") {
-  process.stdout.write(JSON.stringify([
-    {nameWithOwner:"openclaw/A",isArchived:false,isDisabled:false,isFork:false,hasIssuesEnabled:true,visibility:"PUBLIC",defaultBranchRef:{name:"main"}},
+  const repositories = [
+    ...(process.env.INSERT_REPOSITORY_BEFORE === "1"
+      ? [{nameWithOwner:"openclaw/00",isArchived:false,isDisabled:false,isFork:false,hasIssuesEnabled:true,visibility:"PUBLIC",defaultBranchRef:{name:"main"}}]
+      : []),
+    {nameWithOwner:"openclaw/A",isArchived:false,isDisabled:false,isFork:false,hasIssuesEnabled:true,visibility:"PUBLIC",defaultBranchRef:{name:process.env.TARGET_BRANCH || "main"}},
     {nameWithOwner:"openclaw/B",isArchived:false,isDisabled:false,isFork:false,hasIssuesEnabled:true,visibility:"PUBLIC",defaultBranchRef:{name:"main"}}
-  ]));
+  ];
+  process.stdout.write(JSON.stringify(repositories));
   process.exit(0);
 }
 if (args[0] === "api" && args[1].endsWith("/dispatches")) {

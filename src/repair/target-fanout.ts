@@ -5,20 +5,29 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import {
+  ACTION_EVENT_SHARD_FILE_LIMITS,
   ACTION_EVENT_REASON_CODES,
   ACTION_EVENT_STATUSES,
   ACTION_EVENT_TYPES,
   actionIdempotencyKey,
+  actionOperationId,
+  readActionEventShardAt,
   readSpooledActionEvents,
   type ActionEvent,
   type ActionEventSubject,
 } from "../action-ledger.js";
+import {
+  prepareSafeReadRoot,
+  prepareSafeReadTarget,
+  readDirectoryEntriesNoFollow,
+  readUtf8FileNoFollow,
+} from "../action-ledger-files.js";
 import { flushWorkflowActionEvents, recordWorkflowPhaseEvent } from "../action-ledger-runtime.js";
 import { resolveCommand } from "../command.js";
 import { ghRetryKind } from "../github-retry.js";
+import { slugForRepo } from "../repository-profiles.js";
 import { ghErrorText } from "./github-cli.js";
 import { parseArgs, repoRoot } from "./lib.js";
-import { readDurableActionEventsByIdempotency } from "./sweep-mutation.js";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -55,6 +64,11 @@ interface SelectionResult {
   total: number;
 }
 
+interface CursorState {
+  nextCursor: number;
+  afterRepository: string | null;
+}
+
 interface FanoutOptions {
   mode: FanoutMode;
   limit: number;
@@ -67,6 +81,7 @@ interface FanoutOptions {
 }
 
 interface FanoutActionLedger {
+  producerComponent: string;
   operationIdentity: {
     repository: string;
     mode: FanoutMode;
@@ -96,6 +111,8 @@ interface FanoutActionLedger {
 
 const DEFAULT_CURSOR_DIR = join(repoRoot(), "results", "target-fanout-cursors");
 const PUBLIC_INVENTORY_TOKEN = "__public__";
+const RUN_EVENT_MAX_FILES = 256;
+const RUN_EVENT_MAX_BYTES = 8 * 1024 * 1024;
 
 export async function runTargetFanout(argv: string[]): Promise<void> {
   const args = parseArgs(argv);
@@ -114,9 +131,10 @@ export async function runTargetFanout(argv: string[]): Promise<void> {
 
   if (args._[0] === "list" || args._[0] === "plan") {
     const repositories = await loadEligibleRepositories(config, options.owners);
+    const cursorState = readCursor(options.cursorPath);
     const selection = selectRepositories(repositories, {
       limit: options.limit,
-      cursor: readCursor(options.cursorPath),
+      cursor: cursorStart(repositories, cursorState),
     });
     const commands = selection.repositories.map((repository) =>
       workflowDispatchArgs(repository, options),
@@ -135,11 +153,23 @@ export async function runTargetFanout(argv: string[]): Promise<void> {
   let primaryError: unknown = null;
   try {
     const repositories = await loadEligibleRepositories(config, options.owners);
-    const currentCursor = readCursor(options.cursorPath);
-    const selection = selectRepositories(repositories, {
-      limit: options.limit,
-      cursor: currentCursor,
-    });
+    const cursorState = readCursor(options.cursorPath);
+    const currentCursor = cursorStart(repositories, cursorState);
+    const runAttempt = positiveRunAttempt();
+    let selection: SelectionResult;
+    try {
+      selection =
+        runAttempt > 1 && !options.dryRun
+          ? recoverAcceptedFanoutSelection(ledger, repositories)
+          : selectRepositories(repositories, {
+              limit: options.limit,
+              cursor: currentCursor,
+            });
+    } catch (error) {
+      ledger.failureCompletionReason = "dispatch_outcome_unknown";
+      ledger.failureRetryable = false;
+      throw error;
+    }
     recordFanoutSelection(ledger, repositories.length, selection.repositories.length);
     const commands = selection.repositories.map((repository) =>
       workflowDispatchArgs(repository, options),
@@ -153,21 +183,35 @@ export async function runTargetFanout(argv: string[]): Promise<void> {
         console.log(`dry-run ${commandArgs.join(" ")}`);
         recordFanoutDispatchSkipped(ledger, repository, options);
       } else {
-        const acceptedCursor =
-          selection.total === 0 ? 0 : normalizeCursor(currentCursor + index + 1, selection.total);
-        recordFanoutDispatch(
-          ledger,
-          repository,
-          options,
-          () => runGh(commandArgs, dispatchEnv()),
-          () => writeFileSyncWithDirs(options.cursorPath, cursorContent(acceptedCursor)),
-        );
+        const acceptedCursor = cursorAfterRepository(repositories, repository.targetRepo);
+        const reserveAccepted = () =>
+          writeFileSyncWithDirs(
+            options.cursorPath,
+            cursorContent(acceptedCursor, repository.targetRepo),
+          );
+        if (runAttempt > 1) {
+          reserveAccepted();
+          recordAcceptedFanoutDispatchReplay(ledger, repository, options);
+        } else {
+          recordFanoutDispatch(
+            ledger,
+            repository,
+            options,
+            () => runGh(commandArgs, dispatchEnv()),
+            reserveAccepted,
+          );
+        }
       }
       dispatched.push(repository.targetRepo);
     }
 
     if (!options.dryRun) {
-      recordFanoutCursorPublication(ledger, options, selection.cursor);
+      recordFanoutCursorPublication(
+        ledger,
+        options,
+        selection.cursor,
+        selection.repositories.at(-1)?.targetRepo ?? null,
+      );
     }
     finishFanoutActionLedger(ledger, { dryRun: options.dryRun });
     process.stdout.write(
@@ -245,6 +289,7 @@ function startFanoutActionLedger(options: FanoutOptions): FanoutActionLedger {
     privacy: fanoutActionLedgerPrivacy(),
   });
   return {
+    producerComponent: start?.producer.component ?? "target_fanout",
     operationIdentity,
     subject,
     queueStartEventId: start?.event_id ?? null,
@@ -307,9 +352,9 @@ function recordFanoutDispatch(
 ): void {
   const request = fanoutDispatchRequestIdentity(repository, options);
   const idempotencyIdentity = fanoutDispatchIdempotencyIdentity(ledger, request);
-  if (fanoutDispatchDecision(ledger, repository, idempotencyIdentity) === "already_accepted") {
+  if (fanoutDispatchDecision(repository, idempotencyIdentity) === "already_accepted") {
     reserveAccepted();
-    recordAcceptedFanoutDispatchReplay(ledger, repository, options, request, idempotencyIdentity);
+    recordAcceptedFanoutDispatchReplay(ledger, repository, options);
     return;
   }
   const subject: ActionEventSubject = {
@@ -437,29 +482,12 @@ function recordFanoutDispatch(
 }
 
 function fanoutDispatchDecision(
-  ledger: FanoutActionLedger,
   repository: SelectedRepository,
   idempotencyIdentity: unknown,
 ): "dispatch" | "already_accepted" {
   const idempotencyKey = actionIdempotencyKey(idempotencyIdentity);
   const localEvents = readSpooledActionEvents(repoRoot(), repository.targetRepo);
-  const runAttempt = positiveRunAttempt();
-  let durableEvents: ActionEvent[] = [];
-  if (runAttempt > 1) {
-    const stateRoot = String(process.env.CLAWSWEEPER_STATE_DIR ?? "").trim();
-    if (!stateRoot) {
-      throw new Error(
-        "target fanout rerun requires hydrated durable action ledger state before dispatch",
-      );
-    }
-    const producerRepository = ledger.operationIdentity.repository;
-    durableEvents = readDurableActionEventsByIdempotency(
-      stateRoot,
-      producerRepository,
-      idempotencyKey,
-    );
-  }
-  const events = [...localEvents, ...durableEvents].filter(
+  const events = localEvents.filter(
     (event) =>
       event.event_type === ACTION_EVENT_TYPES.dispatchLifecycle &&
       event.idempotency_key_sha256 === idempotencyKey,
@@ -488,9 +516,12 @@ function recordAcceptedFanoutDispatchReplay(
   ledger: FanoutActionLedger,
   repository: SelectedRepository,
   options: FanoutOptions,
-  request: ReturnType<typeof fanoutDispatchRequestIdentity>,
-  idempotencyIdentity: unknown,
 ): void {
+  const replayIdentity = {
+    operationIdentity: ledger.operationIdentity,
+    slot: "fanout_dispatch_recovered",
+    targetRepository: repository.targetRepo,
+  };
   const event = recordWorkflowPhaseEvent(repoRoot(), {
     phase: ACTION_EVENT_TYPES.dispatchLifecycle,
     status: ACTION_EVENT_STATUSES.skipped,
@@ -502,13 +533,18 @@ function recordAcceptedFanoutDispatchReplay(
     operationIdentity: ledger.operationIdentity,
     parentEventId: ledger.lastEventId,
     phaseSeq: nextFanoutPhaseSeq(ledger),
-    idempotencyIdentity,
+    idempotencyIdentity: replayIdentity,
     component: "target_fanout",
     subject: {
       repository: repository.targetRepo,
       kind: "repository",
     },
-    evidence: [{ kind: "fanout_dispatch_request", sha256: sha256(JSON.stringify(request)) }],
+    evidence: [
+      {
+        kind: "fanout_dispatch_recovery",
+        sha256: sha256(JSON.stringify(replayIdentity)),
+      },
+    ],
     attributes: {
       completion_reason: "already_accepted",
       dispatch_kind: fanoutDispatchKind(options.mode),
@@ -518,6 +554,164 @@ function recordAcceptedFanoutDispatchReplay(
   });
   ledger.lastEventId = event?.event_id ?? ledger.lastEventId;
   ledger.dispatchedCount += 1;
+}
+
+function recoverAcceptedFanoutSelection(
+  ledger: FanoutActionLedger,
+  repositories: readonly SelectedRepository[],
+): SelectionResult {
+  const stateRoot = String(process.env.CLAWSWEEPER_STATE_DIR ?? "").trim();
+  if (!stateRoot) {
+    throw new Error("target fanout rerun requires hydrated durable action ledger state");
+  }
+  const currentAttempt = positiveRunAttempt();
+  const events = readDurableFanoutRunEvents(
+    stateRoot,
+    ledger.operationIdentity.repository,
+    ledger.producerComponent,
+    githubRunId(),
+    fanoutPartitionDate(),
+  ).filter(
+    (event) =>
+      event.operation_id ===
+        actionOperationId(event.subject.repository, "target_fanout", ledger.operationIdentity) &&
+      event.producer.run_attempt < currentAttempt,
+  );
+  if (events.length === 0) {
+    throw new Error("refusing target fanout rerun without prior-attempt durable receipts");
+  }
+  const originalAttempt = Math.min(...events.map((event) => event.producer.run_attempt));
+  const original = events.filter((event) => event.producer.run_attempt === originalAttempt);
+  const selected = original.find(
+    (event) =>
+      event.event_type === ACTION_EVENT_TYPES.queueLifecycle &&
+      event.action.status === ACTION_EVENT_STATUSES.queued,
+  );
+  const selectedCount = nonNegativeInteger(selected?.attributes?.item_count);
+  const attempts = original.filter(
+    (event) =>
+      event.event_type === ACTION_EVENT_TYPES.dispatchLifecycle &&
+      event.attributes?.completion_reason === "dispatch_attempted",
+  );
+  const accepted = original
+    .filter(
+      (event) =>
+        event.event_type === ACTION_EVENT_TYPES.dispatchLifecycle &&
+        event.attributes?.completion_reason === "mutation_accepted",
+    )
+    .sort((left, right) => left.phase_seq - right.phase_seq);
+  if (selectedCount === 0 && attempts.length === 0 && accepted.length === 0) {
+    return { repositories: [], cursor: 0, total: repositories.length };
+  }
+  const attemptedTargets = attempts.map((event) => event.subject.repository);
+  const targets = accepted.map((event) => event.subject.repository);
+  const attemptedIdentities = new Set(
+    attempts.map((event) => `${event.subject.repository}\n${event.idempotency_key_sha256}`),
+  );
+  const acceptedIdentities = new Set(
+    accepted.map((event) => `${event.subject.repository}\n${event.idempotency_key_sha256}`),
+  );
+  if (
+    selectedCount === null ||
+    selectedCount === 0 ||
+    attempts.length !== selectedCount ||
+    accepted.length !== selectedCount ||
+    new Set(attemptedTargets).size !== selectedCount ||
+    new Set(targets).size !== selectedCount ||
+    attemptedIdentities.size !== selectedCount ||
+    acceptedIdentities.size !== selectedCount ||
+    [...acceptedIdentities].some((identity) => !attemptedIdentities.has(identity))
+  ) {
+    throw new Error(
+      `refusing target fanout rerun without a complete accepted original batch ` +
+        `(selected=${String(selectedCount)}, attempted=${attempts.length}, ` +
+        `accepted=${accepted.length}, attempted_identities=${attemptedIdentities.size}, ` +
+        `accepted_identities=${acceptedIdentities.size})`,
+    );
+  }
+  const recovered = targets.map((targetRepo): SelectedRepository => {
+    const current = repositories.find((repository) => repository.targetRepo === targetRepo);
+    return (
+      current ?? {
+        targetRepo,
+        defaultBranch: "",
+        visibility: "UNKNOWN",
+      }
+    );
+  });
+  const lastRepository = recovered.at(-1)?.targetRepo ?? null;
+  return {
+    repositories: recovered,
+    cursor: lastRepository === null ? 0 : cursorAfterRepository(repositories, lastRepository),
+    total: repositories.length,
+  };
+}
+
+function readDurableFanoutRunEvents(
+  stateRoot: string,
+  repository: string,
+  producerComponent: string,
+  runId: string,
+  partitionDate: string,
+): ActionEvent[] {
+  const root = prepareSafeReadRoot(stateRoot, "durable target fanout action ledger");
+  const [year, month, day] = partitionDate.split("-");
+  const repositoryPath = [
+    "ledger",
+    "v1",
+    "events",
+    year,
+    month,
+    day,
+    slugForRepo(repository),
+    producerComponent,
+  ].join("/");
+  let entries;
+  try {
+    entries = readDirectoryEntriesNoFollow(
+      root,
+      repositoryPath,
+      "durable target fanout run directory",
+      RUN_EVENT_MAX_FILES,
+    );
+  } catch (error) {
+    if (isNotFound(error)) return [];
+    throw error;
+  }
+  const events: ActionEvent[] = [];
+  let files = 0;
+  let bytes = 0;
+  for (const entry of entries) {
+    if (entry.isSymbolicLink() || !entry.isFile()) {
+      throw new Error(`refusing unsafe durable target fanout entry: ${entry.name}`);
+    }
+    if (!entry.name.startsWith(`${runId}-`) || !entry.name.endsWith(".jsonl")) {
+      continue;
+    }
+    files += 1;
+    if (files > RUN_EVENT_MAX_FILES) {
+      throw new Error("durable target fanout run exceeds the shard file limit");
+    }
+    const relativePath = `${repositoryPath}/${entry.name}`;
+    const content = readUtf8FileNoFollow(
+      prepareSafeReadTarget(root, relativePath, "durable target fanout shard"),
+      ACTION_EVENT_SHARD_FILE_LIMITS.maxBytes,
+    );
+    bytes += Buffer.byteLength(content);
+    if (bytes > RUN_EVENT_MAX_BYTES) {
+      throw new Error("durable target fanout run exceeds the aggregate byte limit");
+    }
+    events.push(
+      ...readActionEventShardAt(root, relativePath).filter(
+        (event) =>
+          event.producer.repository === repository &&
+          event.producer.run_id === runId &&
+          event.producer.job === "target-fanout" &&
+          event.producer.component === producerComponent,
+      ),
+    );
+  }
+  return events;
 }
 
 function recordFanoutDispatchSkipped(
@@ -563,8 +757,9 @@ function recordFanoutCursorPublication(
   ledger: FanoutActionLedger,
   options: FanoutOptions,
   cursor: number,
+  afterRepository: string | null,
 ): void {
-  const content = cursorContent(cursor);
+  const content = cursorContent(cursor, afterRepository);
   const cursorSha256 = sha256(content);
   const idempotencyIdentity = {
     operationIdentity: ledger.operationIdentity,
@@ -743,10 +938,11 @@ function fanoutDispatchIdempotencyIdentity(
   ledger: FanoutActionLedger,
   request: ReturnType<typeof fanoutDispatchRequestIdentity>,
 ) {
+  const { targetBranch: _targetBranch, ...stableRequest } = request;
   return {
     operationIdentity: ledger.operationIdentity,
     slot: "fanout_dispatch",
-    request,
+    request: stableRequest,
   };
 }
 
@@ -774,8 +970,15 @@ function fanoutCycleStartedAt(): string {
   return value || "1970-01-01T00:00:00Z";
 }
 
-function cursorContent(cursor: number): string {
-  return `${JSON.stringify({ next_cursor: cursor }, null, 2)}\n`;
+function cursorContent(cursor: number, afterRepository: string | null): string {
+  return `${JSON.stringify(
+    {
+      next_cursor: cursor,
+      ...(afterRepository ? { after_repository: afterRepository } : {}),
+    },
+    null,
+    2,
+  )}\n`;
 }
 
 function sha256(value: string): string {
@@ -953,13 +1156,20 @@ function workflowDispatchArgs(repository: SelectedRepository, options: FanoutOpt
   return args;
 }
 
-function readCursor(cursorPath: string): number {
-  if (!existsSync(cursorPath)) return 0;
+function readCursor(cursorPath: string): CursorState {
+  if (!existsSync(cursorPath)) return { nextCursor: 0, afterRepository: null };
   const parsed = JSON.parse(readFileSync(cursorPath, "utf8")) as unknown;
   const cursor = record(parsed, "cursor");
-  return typeof cursor.next_cursor === "number" && Number.isInteger(cursor.next_cursor)
-    ? cursor.next_cursor
-    : 0;
+  const nextCursor =
+    typeof cursor.next_cursor === "number" && Number.isInteger(cursor.next_cursor)
+      ? cursor.next_cursor
+      : 0;
+  const afterRepository =
+    typeof cursor.after_repository === "string" &&
+    /^[^/\s]+\/[^/\s]+$/.test(cursor.after_repository)
+      ? cursor.after_repository.toLowerCase()
+      : null;
+  return { nextCursor, afterRepository };
 }
 
 function writeFileSyncWithDirs(filePath: string, content: string): void {
@@ -1028,6 +1238,56 @@ function positiveRunAttempt(): number {
     throw new Error("GITHUB_RUN_ATTEMPT must be a positive integer");
   }
   return value;
+}
+
+function githubRunId(): string {
+  const value = String(process.env.GITHUB_RUN_ID ?? "").trim();
+  if (!/^[A-Za-z0-9_.-]{1,64}$/.test(value)) {
+    throw new Error("GITHUB_RUN_ID must be a bounded machine identifier");
+  }
+  return value;
+}
+
+function fanoutPartitionDate(): string {
+  const value = String(process.env.GITHUB_RUN_STARTED_AT ?? "").trim();
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp)) {
+    throw new Error("GITHUB_RUN_STARTED_AT must be a valid timestamp");
+  }
+  return new Date(timestamp).toISOString().slice(0, 10);
+}
+
+function cursorStart(repositories: readonly SelectedRepository[], cursor: CursorState): number {
+  if (cursor.afterRepository) {
+    return cursorAfterRepository(repositories, cursor.afterRepository);
+  }
+  return repositories.length === 0 ? 0 : normalizeCursor(cursor.nextCursor, repositories.length);
+}
+
+function cursorAfterRepository(
+  repositories: readonly SelectedRepository[],
+  repository: string,
+): number {
+  if (repositories.length === 0) return 0;
+  const exact = repositories.findIndex((candidate) => candidate.targetRepo === repository);
+  if (exact >= 0) return (exact + 1) % repositories.length;
+  const successor = repositories.findIndex(
+    (candidate) => candidate.targetRepo.localeCompare(repository) > 0,
+  );
+  return successor >= 0 ? successor : 0;
+}
+
+function nonNegativeInteger(value: unknown): number | null {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+function isNotFound(error: unknown): boolean {
+  return (
+    error !== null &&
+    typeof error === "object" &&
+    "code" in error &&
+    (error as NodeJS.ErrnoException).code === "ENOENT"
+  );
 }
 
 function normalizeCursor(cursor: number, length: number): number {
