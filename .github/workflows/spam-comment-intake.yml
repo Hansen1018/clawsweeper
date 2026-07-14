@@ -5,7 +5,7 @@ on:
     types: [clawsweeper_spam_comment_intake]
 
 permissions:
-  actions: write
+  actions: read
   contents: read
 
 env:

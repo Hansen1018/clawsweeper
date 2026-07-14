@@ -11,7 +11,7 @@ import {
   type ActionEventReasonCode,
   type ActionEventSubject,
 } from "../action-ledger.js";
-import { flushWorkflowActionEvents, recordWorkflowPhaseEvent } from "../action-ledger-runtime.js";
+import { recordWorkflowPhaseEvent } from "../action-ledger-runtime.js";
 import type { JsonObject, JsonValue } from "./json-types.js";
 import { asJsonObject } from "./json-types.js";
 import { parseArgs, repoRoot } from "./lib.js";
@@ -60,6 +60,7 @@ const MAX_REPORT_BYTES = 64 * 1024;
 
 type SpamCommentIntakeLedger = {
   root: string;
+  actionLedgerRoot: string;
   env: NodeJS.ProcessEnv;
   now: () => Date;
   operationIdentity: {
@@ -236,21 +237,6 @@ export async function runSpamCommentIntake(
     }
   }
 
-  let receiptFinalizationError: unknown = null;
-  try {
-    await flushWorkflowActionEvents(root, { env });
-  } catch (error) {
-    receiptFinalizationError = error;
-  }
-  if (receiptFinalizationError) {
-    if (primaryError || finalSummary.status === "failed") {
-      log(
-        `[spam-comment-intake] failed to finalize action receipts after the primary failure: ${errorText(receiptFinalizationError)}`,
-      );
-    } else {
-      throw receiptFinalizationError;
-    }
-  }
   if (primaryError) throw primaryError;
   return finalSummary;
 }
@@ -373,7 +359,7 @@ async function dispatchSpamScanner({
   };
   const evidence = [{ kind: "repository_dispatch_request", sha256: requestSha256 }];
   const attempt = recordWorkflowPhaseEvent(
-    ledger.root,
+    ledger.actionLedgerRoot,
     {
       phase: ACTION_EVENT_TYPES.dispatchLifecycle,
       status: ACTION_EVENT_STATUSES.started,
@@ -595,6 +581,8 @@ function startIntakeLedger({
   decision: SpamCommentIntakeDecision | null;
 }): SpamCommentIntakeLedger {
   const operationIdentity = intakeOperationIdentity(eventName, dispatchRepo, decision);
+  const actionLedgerRoot = env.CLAWSWEEPER_ACTION_LEDGER_ROOT?.trim() || root;
+  fs.mkdirSync(actionLedgerRoot, { recursive: true });
   const subject: ActionEventSubject = {
     repository: decision?.target_repo?.trim().toLowerCase() || dispatchRepo.trim().toLowerCase(),
     kind: "notification",
@@ -605,7 +593,7 @@ function startIntakeLedger({
   };
   const startedAt = now();
   const start = recordWorkflowPhaseEvent(
-    root,
+    actionLedgerRoot,
     {
       phase: ACTION_EVENT_TYPES.reviewBatch,
       status: ACTION_EVENT_STATUSES.started,
@@ -632,6 +620,7 @@ function startIntakeLedger({
   );
   return {
     root,
+    actionLedgerRoot,
     env,
     now,
     operationIdentity,
@@ -651,7 +640,7 @@ function recordClassification(
 ): void {
   const accepted = decision?.accepted === true;
   const event = recordWorkflowPhaseEvent(
-    ledger.root,
+    ledger.actionLedgerRoot,
     {
       phase: ACTION_EVENT_TYPES.reviewItem,
       status: accepted ? ACTION_EVENT_STATUSES.classified : ACTION_EVENT_STATUSES.skipped,
@@ -714,7 +703,7 @@ function recordDispatchOutcome(
   options: DispatchOutcomeOptions,
 ): void {
   const event = recordWorkflowPhaseEvent(
-    ledger.root,
+    ledger.actionLedgerRoot,
     {
       phase: ACTION_EVENT_TYPES.dispatchLifecycle,
       status:
@@ -773,7 +762,7 @@ function recordIntakeTerminal(
 ): void {
   if (ledger.terminal) return;
   const event = recordWorkflowPhaseEvent(
-    ledger.root,
+    ledger.actionLedgerRoot,
     {
       phase: ACTION_EVENT_TYPES.reviewBatch,
       status:

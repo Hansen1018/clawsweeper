@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -333,7 +334,7 @@ test("spam comment intake keeps ambiguous HTTP dispatch outcomes unknown and rep
   }
 });
 
-test("spam comment intake preserves dispatch failures when receipt finalization also fails", async () => {
+test("spam comment intake leaves failed receipts in the spool when output is unavailable", async () => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-spam-intake-")));
   const eventPath = path.join(root, "event.json");
   const outputRoot = path.join(root, "action-ledger-output");
@@ -354,11 +355,11 @@ test("spam comment intake preserves dispatch failures when receipt finalization 
       }),
       (error) => error === primary,
     );
-    assert.ok(
-      logs.some((message) =>
-        message.includes("failed to finalize action receipts after the primary failure"),
-      ),
+    assert.equal(
+      logs.some((message) => message.includes("failed to finalize action receipts")),
+      false,
     );
+    assert.ok(spooledActionEventFiles(root).length > 0);
   } finally {
     fs.rmSync(root, { force: true, recursive: true });
   }
@@ -373,13 +374,14 @@ test("spam comment intake treats ambiguous HTTP failures as unknown", () => {
 
 test("spam comment intake workflow publishes only exact current-attempt shards", () => {
   const workflow = fs.readFileSync(".github/workflows/spam-comment-intake.yml", "utf8");
+  const combinedWorkflow = fs.readFileSync(".github/workflows/github-activity.yml", "utf8");
   const producer = workflow.slice(
     workflow.indexOf("\n  intake:"),
     workflow.indexOf("\n  publish-ledger:"),
   );
   const publisher = workflow.slice(workflow.indexOf("\n  publish-ledger:"));
 
-  assert.match(workflow, /permissions:\n\s+actions: write\n\s+contents: read/);
+  assert.match(workflow, /permissions:\n\s+actions: read\n\s+contents: read/);
   assert.match(producer, /persist-credentials: false/);
   assert.match(producer, /uses: \.\/\.github\/actions\/setup-action-ledger/);
   assert.match(producer, /actions\/upload-artifact@v7/);
@@ -416,6 +418,42 @@ test("spam comment intake workflow publishes only exact current-attempt shards",
     publisher.indexOf("- name: Import immutable spam comment intake action ledger") <
       publisher.indexOf("- name: Publish immutable spam comment intake action ledger"),
   );
+  assert.equal(
+    combinedWorkflow.match(
+      /CLAWSWEEPER_ACTION_LEDGER_ROOT: \$\{\{ runner\.temp \}\}\/clawsweeper-spam-comment-intake\/\$\{\{ github\.run_id \}\}\/\$\{\{ github\.run_attempt \}\}\/spool/g,
+    )?.length,
+    2,
+  );
+});
+
+test("spam comment intake leaves standalone receipts for workflow manifest finalization", async () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-spam-intake-")));
+  const eventPath = path.join(root, "event.json");
+  const outputRoot = path.join(root, "action-ledger-output");
+  fs.mkdirSync(outputRoot);
+  fs.writeFileSync(eventPath, `${JSON.stringify(spamActivity())}\n`);
+  const env = actionLedgerEnv(eventPath, outputRoot, "8106");
+
+  try {
+    const summary = await runSpamCommentIntake(["--write-report"], {
+      root,
+      log: () => undefined,
+      env,
+      fetch: async () => new Response(null, { status: 204 }),
+    });
+    assert.equal(summary.status, "ok");
+    assert.ok(spooledActionEventFiles(root).length > 0);
+    assert.equal(readLedgerEvents(outputRoot).length, 0);
+
+    const manifest = finalizeSpamActionLedger({
+      ...env,
+      CLAWSWEEPER_ACTION_LEDGER_ROOT: root,
+    });
+    assert.ok(manifest.event_paths.length > 0);
+    assert.equal(ledgerShardFiles(outputRoot).length, manifest.event_paths.length);
+  } finally {
+    fs.rmSync(root, { force: true, recursive: true });
+  }
 });
 
 type LedgerEvent = {
@@ -449,19 +487,26 @@ async function runLedgerIntake(options: {
 }> {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-spam-intake-")));
   const eventPath = path.join(root, "event.json");
+  const spoolRoot = path.join(root, "action-ledger-spool");
   const outputRoot = path.join(root, "action-ledger-output");
+  fs.mkdirSync(spoolRoot);
   fs.mkdirSync(outputRoot);
   fs.writeFileSync(eventPath, `${JSON.stringify(spamActivity())}\n`);
+  const env = actionLedgerEnv(eventPath, outputRoot, options.runId, spoolRoot);
 
   const invocation = runSpamCommentIntake(["--write-report"], {
     root,
     log: () => undefined,
-    env: actionLedgerEnv(eventPath, outputRoot, options.runId),
+    env,
     fetch: options.fetch,
     now: () => new Date("2026-07-13T12:00:00Z"),
   });
   if (options.expectError) await assert.rejects(invocation, options.expectError);
   else assert.equal((await invocation).status, "ok");
+  assert.ok(spooledActionEventFiles(spoolRoot).length > 0);
+  assert.equal(readLedgerEvents(outputRoot).length, 0);
+  const manifest = finalizeSpamActionLedger(env);
+  assert.ok(manifest.event_paths.length > 0);
 
   return {
     root,
@@ -470,13 +515,19 @@ async function runLedgerIntake(options: {
   };
 }
 
-function actionLedgerEnv(eventPath: string, outputRoot: string, runId: string): NodeJS.ProcessEnv {
+function actionLedgerEnv(
+  eventPath: string,
+  outputRoot: string,
+  runId: string,
+  actionLedgerRoot?: string,
+): NodeJS.ProcessEnv {
   return {
     GITHUB_EVENT_PATH: eventPath,
     GITHUB_EVENT_NAME: "repository_dispatch",
     GH_TOKEN: "intake-token-marker",
     CLAWSWEEPER_ACTION_LEDGER_FORCE: "1",
     CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT: outputRoot,
+    ...(actionLedgerRoot ? { CLAWSWEEPER_ACTION_LEDGER_ROOT: actionLedgerRoot } : {}),
     GITHUB_ACTION: "dispatch_exact_spam_scan",
     GITHUB_JOB: "intake",
     GITHUB_REPOSITORY: "openclaw/clawsweeper",
@@ -490,9 +541,33 @@ function actionLedgerEnv(eventPath: string, outputRoot: string, runId: string): 
   };
 }
 
+function finalizeSpamActionLedger(env: NodeJS.ProcessEnv): { event_paths: string[] } {
+  const result = spawnSync(
+    process.execPath,
+    [
+      path.resolve("dist/repair/action-ledger-cli.js"),
+      "finalize",
+      "--repair-lane",
+      "spam-comment-intake",
+    ],
+    {
+      encoding: "utf8",
+      env: { ...process.env, ...env },
+    },
+  );
+  assert.equal(result.status, 0, result.stderr);
+  return JSON.parse(result.stdout) as { event_paths: string[] };
+}
+
+function spooledActionEventFiles(root: string): string[] {
+  const eventRoot = path.join(root, ".clawsweeper-repair", "action-events");
+  return fs.existsSync(eventRoot)
+    ? recursiveFiles(eventRoot).filter((file) => file.endsWith(".json"))
+    : [];
+}
+
 function readLedgerEvents(outputRoot: string): LedgerEvent[] {
-  return recursiveFiles(outputRoot)
-    .filter((file) => file.endsWith(".jsonl"))
+  return ledgerShardFiles(outputRoot)
     .flatMap((file) =>
       fs
         .readFileSync(file, "utf8")
@@ -502,6 +577,10 @@ function readLedgerEvents(outputRoot: string): LedgerEvent[] {
         .map((line) => JSON.parse(line) as LedgerEvent),
     )
     .sort((left, right) => left.phase_seq - right.phase_seq);
+}
+
+function ledgerShardFiles(outputRoot: string): string[] {
+  return recursiveFiles(outputRoot).filter((file) => file.endsWith(".jsonl"));
 }
 
 function ledgerContents(outputRoot: string): string {
