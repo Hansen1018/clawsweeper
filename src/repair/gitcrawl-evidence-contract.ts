@@ -105,6 +105,7 @@ export interface GitcrawlQuerySource {
 }
 
 export type GitcrawlCoverageRow = {
+  snapshot_id: string;
   dataset: GitcrawlDataset;
   row_count: number;
   eligible_count: number;
@@ -532,6 +533,10 @@ function canonicalValue(value: unknown, depth = 0): unknown {
   }
   if (Array.isArray(value)) return value.map((child) => canonicalValue(child, depth + 1));
   if (typeof value === "object") {
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) {
+      throw new Error("canonical JSON rejects non-plain objects");
+    }
     return Object.fromEntries(
       Object.entries(value as Record<string, unknown>)
         .filter(([, child]) => child !== undefined)

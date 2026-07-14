@@ -99,6 +99,8 @@ export function buildGitcrawlEvidencePacket(input: {
     edges: boundedLimit(input.maxEdges, DEFAULT_EVIDENCE_PACKET_MAX_EDGES),
     bytes: boundedLimit(input.maxBytes, DEFAULT_EVIDENCE_PACKET_MAX_BYTES),
   };
+  const generatedAt = input.generatedAt ?? new Date().toISOString();
+  parseRfc3339Timestamp(generatedAt, "Gitcrawl evidence packet generated_at");
   validatePacketBindings({
     provider: input.provider,
     repository: input.repository,
@@ -134,7 +136,7 @@ export function buildGitcrawlEvidencePacket(input: {
     snapshot_id: input.snapshotId,
     ...(input.paritySnapshotId === undefined ? {} : { parity_snapshot_id: input.paritySnapshotId }),
     query_version: GITCRAWL_QUERY_VERSION,
-    generated_at: input.generatedAt ?? new Date().toISOString(),
+    generated_at: generatedAt,
     required_coverage: [...(input.requiredCoverage ?? GITCRAWL_DATASETS)].sort(
       compareCanonicalText,
     ),
@@ -182,6 +184,7 @@ export function verifyGitcrawlEvidencePacket(
   if (packet.query_version !== GITCRAWL_QUERY_VERSION) {
     throw new Error(`unsupported Gitcrawl packet query version: ${packet.query_version}`);
   }
+  parseRfc3339Timestamp(packet.generated_at, "Gitcrawl evidence packet generated_at");
   assertPacketCardinality(packet);
   validatePacketBindings({
     provider: packet.provider,
@@ -406,6 +409,9 @@ function validatePacketBindings(input: {
   let generation = "";
   for (const row of input.coverage) {
     assertPersistedCoverageRow(row);
+    if (row.snapshot_id !== input.snapshotId) {
+      throw new Error(`Gitcrawl evidence packet mixes coverage snapshots for ${row.dataset}`);
+    }
     if (datasets.has(row.dataset)) {
       throw new Error(`Gitcrawl evidence packet repeats coverage for ${row.dataset}`);
     }
@@ -441,6 +447,7 @@ function assertPersistedCoverageRow(row: GitcrawlCoverageRow): void {
   if (!GITCRAWL_DATASETS.includes(row.dataset)) {
     throw new Error(`Gitcrawl evidence packet contains unknown coverage ${String(row.dataset)}`);
   }
+  assertSnapshotId(row.snapshot_id);
   for (const field of ["row_count", "eligible_count", "covered_count"] as const) {
     if (!Number.isSafeInteger(row[field]) || row[field] < 0) {
       throw new Error(

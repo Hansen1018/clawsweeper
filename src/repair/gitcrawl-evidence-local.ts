@@ -545,15 +545,32 @@ export class LocalGitcrawlQuerySource implements GitcrawlQuerySource {
       this.repoId,
     );
     rows.push(
-      metric("repositories", repoCount, repoCount, repoCount, this.sourceSyncAt, generatedAt),
+      metric(
+        this.snapshotId,
+        "repositories",
+        repoCount,
+        repoCount,
+        repoCount,
+        this.sourceSyncAt,
+        generatedAt,
+      ),
     );
     rows.push(
-      metric("threads", threadCount, threadCount, threadCount, this.sourceSyncAt, generatedAt),
+      metric(
+        this.snapshotId,
+        "threads",
+        threadCount,
+        threadCount,
+        threadCount,
+        this.sourceSyncAt,
+        generatedAt,
+      ),
     );
 
     const revisions = this.threadChildCoverage("thread_revisions", "");
     rows.push(
       metric(
+        this.snapshotId,
         "thread_revisions",
         revisions.rows,
         threadCount,
@@ -568,6 +585,7 @@ export class LocalGitcrawlQuerySource implements GitcrawlQuerySource {
     );
     rows.push(
       metric(
+        this.snapshotId,
         "thread_fingerprints",
         fingerprints.rows,
         threadCount,
@@ -579,6 +597,7 @@ export class LocalGitcrawlQuerySource implements GitcrawlQuerySource {
     const summaries = this.threadRevisionChildCoverage("thread_key_summaries", "");
     rows.push(
       metric(
+        this.snapshotId,
         "thread_key_summaries",
         summaries.rows,
         threadCount,
@@ -631,6 +650,7 @@ export class LocalGitcrawlQuerySource implements GitcrawlQuerySource {
         : 0;
     rows.push(
       metric(
+        this.snapshotId,
         "cluster_groups",
         clusterRows,
         clusterEligible,
@@ -675,6 +695,7 @@ export class LocalGitcrawlQuerySource implements GitcrawlQuerySource {
         : 0;
     rows.push(
       metric(
+        this.snapshotId,
         "cluster_memberships",
         membershipRows,
         membershipEligible,
@@ -715,6 +736,7 @@ export class LocalGitcrawlQuerySource implements GitcrawlQuerySource {
         : 0;
     rows.push(
       metric(
+        this.snapshotId,
         "pull_request_details",
         prRows,
         prEligible,
@@ -788,6 +810,7 @@ export class LocalGitcrawlQuerySource implements GitcrawlQuerySource {
           )
         : 0;
     const fileCoverage = metric(
+      this.snapshotId,
       "pull_request_files",
       fileRows,
       fileEligible,
@@ -1128,6 +1151,7 @@ export class LocalGitcrawlQuerySource implements GitcrawlQuerySource {
 }
 
 function metric(
+  snapshotId: string,
   dataset: GitcrawlCoverageRow["dataset"],
   rowCount: number,
   eligibleCount: number,
@@ -1136,6 +1160,7 @@ function metric(
   generatedAt: string,
 ): GitcrawlCoverageRow {
   return {
+    snapshot_id: snapshotId,
     dataset,
     row_count: rowCount,
     eligible_count: eligibleCount,

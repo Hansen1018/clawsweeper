@@ -880,7 +880,7 @@ async function initializeSession(
   if (options.expectedSnapshotId && state.snapshotId !== options.expectedSnapshotId) {
     throw new Error("Gitcrawl source did not return the expected snapshot");
   }
-  const coverage = rows.map(normalizeCoverageRow);
+  const coverage = rows.map((row) => normalizeCoverageRow(row, state.snapshotId));
   assertCoverage(coverage);
   if (coverage.some((row) => row.dataset_generated_at !== state.datasetGeneratedAt)) {
     throw new Error("Gitcrawl coverage mixes dataset generations");
@@ -1062,12 +1062,16 @@ function bindEnvelope(
   }
 }
 
-function normalizeCoverageRow(row: Record<string, unknown>): GitcrawlCoverageRow {
+function normalizeCoverageRow(
+  row: Record<string, unknown>,
+  snapshotId: string,
+): GitcrawlCoverageRow {
   const dataset = String(row.dataset ?? "");
   if (!GITCRAWL_DATASETS.includes(dataset as GitcrawlCoverageRow["dataset"])) {
     throw new Error(`Gitcrawl coverage returned unknown dataset ${dataset}`);
   }
   const normalized = {
+    snapshot_id: snapshotId,
     dataset: dataset as GitcrawlCoverageRow["dataset"],
     row_count: safeNonNegative(row.row_count, `${dataset} row_count`),
     eligible_count: safeNonNegative(row.eligible_count, `${dataset} eligible_count`),

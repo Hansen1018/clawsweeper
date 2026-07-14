@@ -346,6 +346,65 @@ test("query evidence fails closed on source, relation, review, and packet drift"
     );
   });
 
+  await t.test("claims reject non-JSON object values", () => {
+    const base = {
+      provider: "cloud" as const,
+      repository,
+      snapshotId,
+      queryName: "gitcrawl.coverage" as const,
+      queryArgs: {},
+      subject: `${repository}#dataset:threads`,
+    };
+    assert.throws(
+      () => createGitcrawlEvidenceClaim({ ...base, data: { observed_at: new Date(generatedAt) } }),
+      /canonical JSON rejects non-plain objects/,
+    );
+  });
+
+  await t.test("packet coverage is bound to its snapshot", () => {
+    const coverage = completeCoverage();
+    coverage[0]!.snapshot_id = "d".repeat(64);
+    assert.throws(
+      () =>
+        buildGitcrawlEvidencePacket({
+          provider: "cloud",
+          repository,
+          snapshotId,
+          coverage,
+          claims: [],
+          generatedAt,
+        }),
+      /mixes coverage snapshots/,
+    );
+  });
+
+  await t.test("packet generation is an RFC 3339 timestamp", () => {
+    assert.throws(
+      () =>
+        buildGitcrawlEvidencePacket({
+          provider: "cloud",
+          repository,
+          snapshotId,
+          coverage: completeCoverage(),
+          claims: [],
+          generatedAt: "not-a-timestamp",
+        }),
+      /packet generated_at is invalid/,
+    );
+    const packet = buildGitcrawlEvidencePacket({
+      provider: "cloud",
+      repository,
+      snapshotId,
+      coverage: completeCoverage(),
+      claims: [],
+      generatedAt,
+    });
+    packet.generated_at = "not-a-timestamp";
+    const { sha256: _sha256, ...unsigned } = packet;
+    packet.sha256 = sha256Canonical(unsigned);
+    assert.throws(() => verifyGitcrawlEvidencePacket(packet), /packet generated_at is invalid/);
+  });
+
   await t.test("packet repository is relabeled", async () => {
     const adapter = await adapterFor({ "gitcrawl.clusters.list": [clusterRow()] });
     const claim = (await adapter.listClusters()).claims[0]!;
@@ -955,6 +1014,7 @@ function orderRows(
 
 function completeCoverage(): GitcrawlCoverageRow[] {
   return GITCRAWL_DATASETS.map((dataset) => ({
+    snapshot_id: snapshotId,
     dataset,
     row_count: 1,
     eligible_count: 1,
