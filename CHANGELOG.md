@@ -9,6 +9,8 @@ checkpoint, and status-only commits are intentionally omitted.
 
 ### Added
 
+- Added a fail-closed, read-only Gitcrawl evidence core for six snapshot-bound
+  local, cloud, and parity queries with digest-bound claims and graph packets.
 - Added end-to-end exact-review handoff health with phase ages, delayed/stalled claim classification, and a phase-aware operator rail on the live dashboard.
 - Added a maintainer-only two-runner workflow that builds a hash-bound
   crawl-remote release artifact without production credentials, then requires
