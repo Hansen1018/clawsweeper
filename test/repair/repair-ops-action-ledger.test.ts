@@ -375,6 +375,9 @@ test("commit review and notification workflows publish their operation receipts"
   };
   const activitySteps = activityWorkflow.jobs.notify.steps;
   const spamIntake = activitySteps.find((step) => step.name === "Dispatch spam scan candidate");
+  const spamFinalizer = activitySteps.find(
+    (step) => step.name === "Finalize spam comment intake action ledger",
+  );
   const activityFinalizer = activitySteps.find(
     (step) => step.name === "Finalize GitHub activity notification action ledger",
   );
@@ -390,10 +393,20 @@ test("commit review and notification workflows publish their operation receipts"
     spamIntake.env?.CLAWSWEEPER_ACTION_LEDGER_ROOT ?? "",
     /clawsweeper-spam-comment-intake/,
   );
+  assert.ok(spamFinalizer?.id);
+  assert.match(spamFinalizer?.run ?? "", /--repair-lane spam-comment-intake/);
   assert.ok(activityFinalizer?.id);
   assert.match(
     activityPublisher?.if ?? "",
     new RegExp(`steps\\.${activityFinalizer.id}\\.outcome == 'success'`),
+  );
+  assert.match(
+    activityPublisher?.if ?? "",
+    new RegExp(`steps\\.${spamFinalizer.id}\\.outcome == 'success'`),
+  );
+  assert.match(
+    activityPublisher?.run ?? "",
+    /publish_ledger[\s\S]*spam-comment-intake[\s\S]*publish_ledger[\s\S]*github-activity/,
   );
   assert.match(publisher, /Verify current-attempt commit review bundles/);
   assert.match(publisher, /merge-multiple: false/);

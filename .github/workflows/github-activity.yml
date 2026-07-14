@@ -167,6 +167,7 @@ jobs:
           token: ${{ steps.notification-state-token.outputs.token }}
 
       - name: Dispatch spam scan candidate
+        id: spam-comment-intake
         if: steps.core-budget.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -175,6 +176,20 @@ jobs:
         run: |
           set -euo pipefail
           pnpm run repair:spam-comment-intake -- --write-report
+
+      - name: Finalize spam comment intake action ledger
+        id: finalize-spam-comment-intake-action-ledger
+        if: ${{ always() && steps.setup-pnpm.outcome == 'success' }}
+        env:
+          CLAWSWEEPER_ACTION_LEDGER_ROOT: ${{ runner.temp }}/clawsweeper-spam-comment-intake/${{ github.run_id }}/${{ github.run_attempt }}/spool
+          CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT: ${{ runner.temp }}/clawsweeper-spam-comment-intake/${{ github.run_id }}/${{ github.run_attempt }}/output
+        run: |
+          set -euo pipefail
+          mkdir -p .artifacts
+          pnpm run --silent repair:action-ledger -- finalize \
+            --repair-lane spam-comment-intake \
+            --allow-empty \
+            > .artifacts/spam-comment-intake-action-ledger-manifest.json
 
       - name: Feed activity to OpenClaw
         if: steps.core-budget.outputs.skip != 'true'
@@ -200,26 +215,43 @@ jobs:
             > .artifacts/github-activity-action-ledger-manifest.json
 
       - name: Publish immutable GitHub activity notification action ledger
-        if: ${{ always() && steps.setup-pnpm.outcome == 'success' && steps.finalize-github-activity-notification-action-ledger.outcome == 'success' }}
+        if: ${{ always() && steps.setup-pnpm.outcome == 'success' && steps.finalize-spam-comment-intake-action-ledger.outcome == 'success' && steps.finalize-github-activity-notification-action-ledger.outcome == 'success' }}
+        env:
+          SPAM_ACTION_LEDGER_OUTPUT_ROOT: ${{ runner.temp }}/clawsweeper-spam-comment-intake/${{ github.run_id }}/${{ github.run_attempt }}/output
         run: |
           set -euo pipefail
           test -n "${CLAWSWEEPER_STATE_DIR:-}"
-          source_root="${CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:?setup-action-ledger output root is required}"
-          manifest_file=".artifacts/github-activity-action-ledger-manifest.json"
           paths_file=".artifacts/github-activity-action-ledger-paths.txt"
-          import_result_file=".artifacts/github-activity-action-ledger-import.json"
           mkdir -p .artifacts
-          test -s "$manifest_file"
-          pnpm run --silent repair:action-ledger -- publish \
-            --repair-lane github-activity \
-            --manifest "$manifest_file" \
-            --allow-empty \
-            --source-root "$source_root" \
-            --state-root "$CLAWSWEEPER_STATE_DIR" > "$import_result_file"
-          jq -e --slurpfile manifest "$manifest_file" \
-            '.eventPaths == $manifest[0].event_paths' \
-            "$import_result_file" >/dev/null
-          jq -r '.paths[]?' "$import_result_file" | sort -u > "$paths_file"
+          : > "$paths_file"
+          publish_ledger() {
+            local lane="$1"
+            local manifest_file="$2"
+            local source_root="$3"
+            local import_result_file="$4"
+            test -s "$manifest_file"
+            pnpm run --silent repair:action-ledger -- publish \
+              --repair-lane "$lane" \
+              --manifest "$manifest_file" \
+              --allow-empty \
+              --source-root "$source_root" \
+              --state-root "$CLAWSWEEPER_STATE_DIR" > "$import_result_file"
+            jq -e --slurpfile manifest "$manifest_file" \
+              '.eventPaths == $manifest[0].event_paths' \
+              "$import_result_file" >/dev/null
+            jq -r '.paths[]?' "$import_result_file" >> "$paths_file"
+          }
+          publish_ledger \
+            spam-comment-intake \
+            .artifacts/spam-comment-intake-action-ledger-manifest.json \
+            "${SPAM_ACTION_LEDGER_OUTPUT_ROOT:?spam action ledger output root is required}" \
+            .artifacts/spam-comment-intake-action-ledger-import.json
+          publish_ledger \
+            github-activity \
+            .artifacts/github-activity-action-ledger-manifest.json \
+            "${CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:?setup-action-ledger output root is required}" \
+            .artifacts/github-activity-action-ledger-import.json
+          sort -u -o "$paths_file" "$paths_file"
           if [ ! -s "$paths_file" ]; then
             exit 0
           fi
