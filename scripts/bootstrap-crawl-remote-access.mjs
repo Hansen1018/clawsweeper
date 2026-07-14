@@ -22,6 +22,14 @@ export const BOOTSTRAP_CONTRACT = Object.freeze({
 
 const ACCESS_CREDENTIAL_SLOTS = Object.freeze(["blue", "green"]);
 const DEPLOY_CONSUMER_CONTRACT = Object.freeze({
+  checkoutStepName: "Checkout crawl-remote Access resolver",
+  checkoutUses: "actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0",
+  checkoutWith: {
+    "fetch-depth": "1",
+    "persist-credentials": "false",
+    "sparse-checkout": "scripts/resolve-crawl-remote-access-credentials.mjs",
+    "sparse-checkout-cone-mode": "false",
+  },
   command: "node scripts/resolve-crawl-remote-access-credentials.mjs",
   job: "deploy",
   path: ".github/workflows/deploy-crawl-remote.yml",
@@ -214,6 +222,23 @@ export function assertCrawlRemoteDeployConsumerContract(source) {
   ) {
     throw new Error("crawl-remote deploy credential resolver has an unsafe step contract");
   }
+  const resolverIndex = deploySteps.indexOf(resolver);
+  const checkout = deploySteps[resolverIndex - 1];
+  if (
+    checkout?.name !== DEPLOY_CONSUMER_CONTRACT.checkoutStepName ||
+    checkout.fields.get("uses") !== DEPLOY_CONSUMER_CONTRACT.checkoutUses ||
+    checkout.fields.has("if") ||
+    checkout.fields.has("continue-on-error")
+  ) {
+    throw new Error(
+      "crawl-remote deploy credential resolver requires its pinned sparse checkout immediately before it",
+    );
+  }
+  for (const [name, value] of Object.entries(DEPLOY_CONSUMER_CONTRACT.checkoutWith)) {
+    if (checkout.configuration.get(name) !== value) {
+      throw new Error(`crawl-remote deploy resolver checkout has invalid ${name}`);
+    }
+  }
   for (const [name, value] of Object.entries(DEPLOY_CONSUMER_CONTRACT.requiredEnvironment)) {
     if (resolver.environment.get(name) !== value) {
       throw new Error(`crawl-remote deploy credential resolver has invalid ${name} binding`);
@@ -225,7 +250,6 @@ export function assertCrawlRemoteDeployConsumerContract(source) {
   if (executableLines.length !== 1 || executableLines[0] !== DEPLOY_CONSUMER_CONTRACT.command) {
     throw new Error("crawl-remote deploy credential resolver does not invoke the tested artifact");
   }
-  const resolverIndex = deploySteps.indexOf(resolver);
   const credentialConsumers = deploySteps
     .map((step, index) => ({
       index,
@@ -246,6 +270,22 @@ export function assertCrawlRemoteDeployConsumerContract(source) {
     throw new Error(
       "crawl-remote deploy credential consumers must run after the generation-slot resolver",
     );
+  }
+  const hasAccessOverride =
+    deploySteps.some(
+      (step) =>
+        step.environment.has("CF_ACCESS_CLIENT_ID") ||
+        step.environment.has("CF_ACCESS_CLIENT_SECRET"),
+    ) ||
+    deploySteps.some((step) =>
+      step.run
+        .map((line) => line.trim())
+        .filter((line) => line.length > 0 && !line.startsWith("#"))
+        .some((line) => /(?:^|\s)(?:export\s+)?CF_ACCESS_CLIENT_(?:ID|SECRET)=/.test(line)),
+    ) ||
+    /^ {6}CF_ACCESS_CLIENT_(?:ID|SECRET):/m.test(source);
+  if (hasAccessOverride) {
+    throw new Error("crawl-remote deploy consumers must not override resolved Access credentials");
   }
   const legacyReferences = DEPLOY_CONSUMER_CONTRACT.forbiddenReferences.filter((reference) =>
     source.includes(reference),
@@ -307,6 +347,7 @@ function parseWorkflowJobSteps(source, expectedJob) {
 function parseWorkflowStep(lines, name) {
   const fields = new Map();
   const environment = new Map();
+  const configuration = new Map();
   const run = [];
   let block = null;
   for (const line of lines.slice(1)) {
@@ -317,6 +358,8 @@ function parseWorkflowStep(lines, name) {
       block = null;
       if (key === "env" && rawValue.length === 0) {
         block = "env";
+      } else if (key === "with" && rawValue.length === 0) {
+        block = "with";
       } else if (key === "run" && /^[|>][+-]?$/.test(rawValue)) {
         block = "run";
       } else {
@@ -332,11 +375,19 @@ function parseWorkflowStep(lines, name) {
       environment.set(environmentMatch[1], parseYamlScalar(environmentMatch[2]));
       continue;
     }
+    if (block === "with") {
+      const configurationMatch = /^          ([A-Za-z0-9_-]+):\s*(.+?)\s*$/.exec(line);
+      if (!configurationMatch) {
+        throw new Error(`crawl-remote deploy resolver has invalid with syntax: ${line.trim()}`);
+      }
+      configuration.set(configurationMatch[1], parseYamlScalar(configurationMatch[2]));
+      continue;
+    }
     if (block === "run" && line.startsWith("          ")) {
       run.push(line.slice(10));
     }
   }
-  return { name, fields, environment, run };
+  return { name, fields, environment, configuration, run };
 }
 
 function parseYamlScalar(value) {

@@ -6,14 +6,17 @@ Cloudflare token to the deploy workflow.
 
 The workflow is intentionally inert until the separately owned deploy consumer
 adds an unconditional `Resolve crawl-remote Access credentials` step to its
-protected `deploy` job. That step must bind the generation marker and all four
-slot secrets, then invoke the tested
+protected `deploy` job. A pinned sparse checkout containing the resolver must
+immediately precede that step. The resolver step binds the generation marker
+and all four slot secrets, then invokes the tested
 `scripts/resolve-crawl-remote-access-credentials.mjs` artifact. The bootstrap
 parses that exact step contract before minting privileged GitHub tokens and
 again before any Cloudflare or GitHub mutation. Comments, unrelated
 declarations, conditional steps, and legacy unversioned secret references do
-not satisfy the gate. Until the consumer change lands, every dispatch fails
-closed before privileged work.
+not satisfy the gate. Downstream consumers must inherit the resolver's
+`GITHUB_ENV` values; fixed-slot `CF_ACCESS_CLIENT_ID` or
+`CF_ACCESS_CLIENT_SECRET` overrides are rejected. Until the consumer change
+lands, every dispatch fails closed before privileged work.
 
 ## First bootstrap
 

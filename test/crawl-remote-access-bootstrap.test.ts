@@ -189,28 +189,48 @@ test("deploy consumer gate rejects comment-only claims and accepts a structural 
     /requires exactly one "Resolve crawl-remote Access credentials" step/,
   );
 
-  assert.doesNotThrow(() =>
-    assertCrawlRemoteDeployConsumerContract(
-      [
-        "jobs:",
-        "  deploy:",
-        "    steps:",
-        "      - name: Resolve crawl-remote Access credentials",
-        "        id: crawl-remote-access-credentials",
-        "        env:",
-        "          CRAWL_REMOTE_ACCESS_CREDENTIAL_GENERATION: ${{ vars.CRAWL_REMOTE_ACCESS_CREDENTIAL_GENERATION }}",
-        "          CRAWL_REMOTE_ACCESS_BLUE_CLIENT_ID: ${{ secrets.CRAWL_REMOTE_ACCESS_BLUE_CLIENT_ID }}",
-        "          CRAWL_REMOTE_ACCESS_BLUE_CLIENT_SECRET: ${{ secrets.CRAWL_REMOTE_ACCESS_BLUE_CLIENT_SECRET }}",
-        "          CRAWL_REMOTE_ACCESS_GREEN_CLIENT_ID: ${{ secrets.CRAWL_REMOTE_ACCESS_GREEN_CLIENT_ID }}",
-        "          CRAWL_REMOTE_ACCESS_GREEN_CLIENT_SECRET: ${{ secrets.CRAWL_REMOTE_ACCESS_GREEN_CLIENT_SECRET }}",
-        "        run: |",
-        "          node scripts/resolve-crawl-remote-access-credentials.mjs",
-        "      - name: Validate protected production proof credentials",
-        "        run: |",
-        '          test -n "$CF_ACCESS_CLIENT_ID"',
-        '          test -n "$CF_ACCESS_CLIENT_SECRET"',
-      ].join("\n"),
-    ),
+  const validSource = [
+    "jobs:",
+    "  deploy:",
+    "    steps:",
+    "      - name: Checkout crawl-remote Access resolver",
+    "        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0",
+    "        with:",
+    "          fetch-depth: 1",
+    "          persist-credentials: false",
+    "          sparse-checkout: scripts/resolve-crawl-remote-access-credentials.mjs",
+    "          sparse-checkout-cone-mode: false",
+    "      - name: Resolve crawl-remote Access credentials",
+    "        id: crawl-remote-access-credentials",
+    "        env:",
+    "          CRAWL_REMOTE_ACCESS_CREDENTIAL_GENERATION: ${{ vars.CRAWL_REMOTE_ACCESS_CREDENTIAL_GENERATION }}",
+    "          CRAWL_REMOTE_ACCESS_BLUE_CLIENT_ID: ${{ secrets.CRAWL_REMOTE_ACCESS_BLUE_CLIENT_ID }}",
+    "          CRAWL_REMOTE_ACCESS_BLUE_CLIENT_SECRET: ${{ secrets.CRAWL_REMOTE_ACCESS_BLUE_CLIENT_SECRET }}",
+    "          CRAWL_REMOTE_ACCESS_GREEN_CLIENT_ID: ${{ secrets.CRAWL_REMOTE_ACCESS_GREEN_CLIENT_ID }}",
+    "          CRAWL_REMOTE_ACCESS_GREEN_CLIENT_SECRET: ${{ secrets.CRAWL_REMOTE_ACCESS_GREEN_CLIENT_SECRET }}",
+    "        run: |",
+    "          node scripts/resolve-crawl-remote-access-credentials.mjs",
+    "      - name: Validate protected production proof credentials",
+    "        run: |",
+    '          test -n "$CF_ACCESS_CLIENT_ID"',
+    '          test -n "$CF_ACCESS_CLIENT_SECRET"',
+  ].join("\n");
+  assert.doesNotThrow(() => assertCrawlRemoteDeployConsumerContract(validSource));
+  assert.throws(
+    () =>
+      assertCrawlRemoteDeployConsumerContract(
+        validSource.replace(
+          "      - name: Validate protected production proof credentials\n        run: |",
+          [
+            "      - name: Validate protected production proof credentials",
+            "        env:",
+            "          CF_ACCESS_CLIENT_ID: ${{ secrets.CRAWL_REMOTE_ACCESS_BLUE_CLIENT_ID }}",
+            "          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CRAWL_REMOTE_ACCESS_BLUE_CLIENT_SECRET }}",
+            "        run: |",
+          ].join("\n"),
+        ),
+      ),
+    /must not override resolved Access credentials/,
   );
 });
 
