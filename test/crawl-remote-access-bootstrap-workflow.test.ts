@@ -127,6 +127,6 @@ test("operator docs preserve the dormant consumer and no-deploy boundaries", () 
     docs,
     /Comments, unrelated\s+declarations, unnamed intervening steps, extra checkout or resolver controls/,
   );
-  assert.match(docs, /fails\s+closed before\s+privileged work/);
+  assert.match(docs, /fails\s+closed before\s+privileged\s+work/);
   assert.match(docs, /never prints returned service credentials/);
 });

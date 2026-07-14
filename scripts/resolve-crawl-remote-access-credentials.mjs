@@ -29,19 +29,18 @@ function requiredSingleLineValue(value, name) {
   return value;
 }
 
-function writeGitHubEnvironment(path, credentials) {
-  const outputPath = requiredSingleLineValue(path, "GITHUB_ENV");
+function writeGitHubOutputs(path, credentials) {
+  const outputPath = requiredSingleLineValue(path, "GITHUB_OUTPUT");
   appendFileSync(
     outputPath,
-    `CF_ACCESS_CLIENT_ID=${credentials.clientId}\n` +
-      `CF_ACCESS_CLIENT_SECRET=${credentials.clientSecret}\n`,
+    `client_id=${credentials.clientId}\n` + `client_secret=${credentials.clientSecret}\n`,
     "utf8",
   );
 }
 
 function main() {
   const credentials = resolveCrawlRemoteAccessCredentials(process.env);
-  writeGitHubEnvironment(process.env.GITHUB_ENV, credentials);
+  writeGitHubOutputs(process.env.GITHUB_OUTPUT, credentials);
   console.log(`selected crawl-remote Access ${credentials.slot} credential generation`);
 }
 

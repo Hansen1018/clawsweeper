@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -57,9 +57,10 @@ test("slot resolver rejects malformed markers and incomplete selected pairs", ()
   );
 });
 
-test("slot resolver writes selected credentials only to the GitHub environment file", () => {
+test("slot resolver writes selected credentials only to step outputs", () => {
   const directory = mkdtempSync(join(tmpdir(), "crawl-remote-access-resolver-"));
   const githubEnvironment = join(directory, "github-env");
+  const githubOutput = join(directory, "github-output");
   try {
     const result = spawnSync("node", ["scripts/resolve-crawl-remote-access-credentials.mjs"], {
       cwd: process.cwd(),
@@ -75,14 +76,15 @@ test("slot resolver writes selected credentials only to the GitHub environment f
         CRAWL_REMOTE_ACCESS_GREEN_CLIENT_ID: "fixture-green-id",
         CRAWL_REMOTE_ACCESS_GREEN_CLIENT_SECRET: "fixture-green-credential",
         GITHUB_ENV: githubEnvironment,
+        GITHUB_OUTPUT: githubOutput,
       },
     });
     assert.equal(result.status, 0, result.stderr);
     assert.equal(
-      readFileSync(githubEnvironment, "utf8"),
-      "CF_ACCESS_CLIENT_ID=fixture-green-id\n" +
-        "CF_ACCESS_CLIENT_SECRET=fixture-green-credential\n",
+      readFileSync(githubOutput, "utf8"),
+      "client_id=fixture-green-id\n" + "client_secret=fixture-green-credential\n",
     );
+    assert.equal(existsSync(githubEnvironment), false);
     assert.doesNotMatch(result.stdout + result.stderr, /fixture-green-(id|credential)/);
   } finally {
     rmSync(directory, { recursive: true, force: true });

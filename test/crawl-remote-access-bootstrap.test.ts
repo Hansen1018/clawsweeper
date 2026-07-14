@@ -226,6 +226,9 @@ test("deploy consumer gate rejects comment-only claims and accepts a structural 
     "        run: |",
     "          node scripts/resolve-crawl-remote-access-credentials.mjs",
     "      - name: Validate protected production proof credentials",
+    "        env:",
+    "          CF_ACCESS_CLIENT_ID: ${{ steps.crawl-remote-access-credentials.outputs.client_id }}",
+    "          CF_ACCESS_CLIENT_SECRET: ${{ steps.crawl-remote-access-credentials.outputs.client_secret }}",
     "        run: |",
     '          test -n "$CF_ACCESS_CLIENT_ID"',
     '          test -n "$CF_ACCESS_CLIENT_SECRET"',
@@ -313,17 +316,43 @@ test("deploy consumer gate rejects comment-only claims and accepts a structural 
     () =>
       assertCrawlRemoteDeployConsumerContract(
         validSource.replace(
-          "      - name: Validate protected production proof credentials\n        run: |",
+          "${{ steps.crawl-remote-access-credentials.outputs.client_id }}",
+          "${{ secrets.CRAWL_REMOTE_ACCESS_BLUE_CLIENT_ID }}",
+        ),
+      ),
+    /must reference CRAWL_REMOTE_ACCESS_BLUE_CLIENT_ID only in the resolver/,
+  );
+  assert.throws(
+    () =>
+      assertCrawlRemoteDeployConsumerContract(
+        validSource.replace(
+          "      - name: Validate protected production proof credentials",
           [
-            "      - name: Validate protected production proof credentials",
+            "      - name: Unrelated direct slot access",
             "        env:",
-            "          CF_ACCESS_CLIENT_ID: ${{ secrets.CRAWL_REMOTE_ACCESS_BLUE_CLIENT_ID }}",
-            "          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CRAWL_REMOTE_ACCESS_BLUE_CLIENT_SECRET }}",
-            "        run: |",
+            "          UNRELATED_SECRET: ${{ secrets.CRAWL_REMOTE_ACCESS_GREEN_CLIENT_SECRET }}",
+            "        run: echo unrelated",
+            "      - name: Validate protected production proof credentials",
           ].join("\n"),
         ),
       ),
-    /must not override resolved Access credentials/,
+    /must reference CRAWL_REMOTE_ACCESS_GREEN_CLIENT_SECRET only in the resolver/,
+  );
+  assert.throws(
+    () =>
+      assertCrawlRemoteDeployConsumerContract(
+        validSource.replace(
+          "      - name: Validate protected production proof credentials",
+          [
+            "      - name: Unrelated resolver output access",
+            "        env:",
+            "          UNRELATED_SECRET: ${{ steps.crawl-remote-access-credentials.outputs.client_secret }}",
+            "        run: echo unrelated",
+            "      - name: Validate protected production proof credentials",
+          ].join("\n"),
+        ),
+      ),
+    /resolver outputs must be scoped to credential consumers/,
   );
 });
 

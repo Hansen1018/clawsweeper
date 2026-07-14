@@ -14,10 +14,11 @@ parses that exact step contract before minting privileged GitHub tokens and
 again before any Cloudflare or GitHub mutation. Comments, unrelated
 declarations, unnamed intervening steps, extra checkout or resolver controls,
 conditional steps, and legacy unversioned secret references do not satisfy the
-gate. Downstream consumers must inherit the resolver's `GITHUB_ENV` values;
-fixed-slot `CF_ACCESS_CLIENT_ID` or `CF_ACCESS_CLIENT_SECRET` overrides are
-rejected. Until the consumer change lands, every dispatch fails closed before
-privileged work.
+gate. Each downstream credential consumer must bind the resolver's step-scoped
+`client_id` and `client_secret` outputs. Direct slot-secret references, extra
+resolver-output references, and fixed-slot credential overrides are rejected.
+Until the consumer change lands, every dispatch fails closed before privileged
+work.
 
 The deploy job must keep its reviewed no-profile Bash default, and both the job
 and resolver step must bind `BASH_ENV`, `ENV`, and `NODE_OPTIONS` to empty

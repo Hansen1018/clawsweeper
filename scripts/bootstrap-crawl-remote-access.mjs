@@ -38,6 +38,10 @@ const DEPLOY_CONSUMER_CONTRACT = Object.freeze({
   },
   job: "deploy",
   jobShell: "bash --noprofile --norc -euo pipefail {0}",
+  consumerEnvironment: {
+    CF_ACCESS_CLIENT_ID: "${{ steps.crawl-remote-access-credentials.outputs.client_id }}",
+    CF_ACCESS_CLIENT_SECRET: "${{ steps.crawl-remote-access-credentials.outputs.client_secret }}",
+  },
   path: ".github/workflows/deploy-crawl-remote.yml",
   stepId: "crawl-remote-access-credentials",
   stepName: "Resolve crawl-remote Access credentials",
@@ -280,6 +284,19 @@ export function assertCrawlRemoteDeployConsumerContract(source) {
       throw new Error(`crawl-remote deploy credential resolver has invalid ${name} binding`);
     }
   }
+  const protectedBindings = Object.keys(DEPLOY_CONSUMER_CONTRACT.requiredEnvironment).filter(
+    (name) => name.startsWith("CRAWL_REMOTE_ACCESS_"),
+  );
+  const normalizedSource = source.replace(/\r\n?/g, "\n");
+  if (!normalizedSource.includes(resolver.source)) {
+    throw new Error("crawl-remote deploy credential resolver source cannot be isolated");
+  }
+  const sourceOutsideResolver = normalizedSource.replace(resolver.source, "").toUpperCase();
+  for (const name of protectedBindings) {
+    if (sourceOutsideResolver.includes(name)) {
+      throw new Error(`crawl-remote deploy consumer must reference ${name} only in the resolver`);
+    }
+  }
   const executableLines = resolver.run
     .map((line) => line.trim())
     .filter((line) => line.length > 0 && !line.startsWith("#"));
@@ -289,6 +306,7 @@ export function assertCrawlRemoteDeployConsumerContract(source) {
   const credentialConsumers = deploySteps
     .map((step, index) => ({
       index,
+      step,
       source: step.run
         .map((line) => line.trim())
         .filter((line) => line.length > 0 && !line.startsWith("#"))
@@ -307,12 +325,33 @@ export function assertCrawlRemoteDeployConsumerContract(source) {
       "crawl-remote deploy credential consumers must run after the generation-slot resolver",
     );
   }
+  for (const { step } of credentialConsumers) {
+    for (const [name, value] of Object.entries(DEPLOY_CONSUMER_CONTRACT.consumerEnvironment)) {
+      if (step.environment.get(name) !== value) {
+        throw new Error(
+          `crawl-remote deploy credential consumer has invalid ${name} resolver-output binding`,
+        );
+      }
+    }
+  }
+  for (const value of Object.values(DEPLOY_CONSUMER_CONTRACT.consumerEnvironment)) {
+    if (countOccurrences(source, value) !== credentialConsumers.length) {
+      throw new Error(
+        "crawl-remote deploy resolver outputs must be scoped to credential consumers",
+      );
+    }
+  }
   const hasAccessOverride =
-    deploySteps.some(
-      (step) =>
+    jobEnvironment.has("CF_ACCESS_CLIENT_ID") ||
+    jobEnvironment.has("CF_ACCESS_CLIENT_SECRET") ||
+    deploySteps.some((step) => {
+      const hasAccessEnvironment =
         step.environment.has("CF_ACCESS_CLIENT_ID") ||
-        step.environment.has("CF_ACCESS_CLIENT_SECRET"),
-    ) ||
+        step.environment.has("CF_ACCESS_CLIENT_SECRET");
+      return (
+        hasAccessEnvironment && !credentialConsumers.some((consumer) => consumer.step === step)
+      );
+    }) ||
     deploySteps.some((step) =>
       step.run
         .map((line) => line.trim())
@@ -331,6 +370,17 @@ export function assertCrawlRemoteDeployConsumerContract(source) {
       "crawl-remote deploy consumer retains legacy unversioned references: " +
         legacyReferences.join(", "),
     );
+  }
+}
+
+function countOccurrences(source, value) {
+  let count = 0;
+  let offset = 0;
+  while (true) {
+    const index = source.indexOf(value, offset);
+    if (index < 0) return count;
+    count += 1;
+    offset = index + value.length;
   }
 }
 
@@ -525,7 +575,7 @@ function parseWorkflowStep(lines, firstEntry) {
     }
     throw new Error(`crawl-remote deploy workflow has invalid step syntax: ${line.trim()}`);
   }
-  return { name, fields, environment, configuration, run };
+  return { name, fields, environment, configuration, run, source: lines.join("\n") };
 }
 
 function parseYamlScalar(value) {
