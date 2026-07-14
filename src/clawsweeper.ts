@@ -25655,12 +25655,12 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
       sourceChanged: boolean;
       reason: string;
     } | null => {
-      if (
-        item.kind !== "pull_request" ||
-        !expectedReviewActivityCursor ||
-        expectedReviewActivityCursor === "unknown"
-      ) {
-        return null;
+      if (item.kind !== "pull_request") return null;
+      if (!expectedReviewActivityCursor || expectedReviewActivityCursor === "unknown") {
+        return {
+          sourceChanged: false,
+          reason: "stored pull request review activity cursor is missing; fresh review required",
+        };
       }
       if (!isReviewedPrActivityCursor(expectedReviewActivityCursor)) {
         return {

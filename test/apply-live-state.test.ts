@@ -179,6 +179,74 @@ test("apply-decisions rejects recorded PR review activity drift before mutations
   }
 });
 
+test("apply-decisions fails closed when reviewed PR activity exceeds the cursor bound", () => {
+  const root = mkdtempSync(tmpPrefix);
+  const overflowCursor = createReviewedPrActivityCursor({
+    reviews: [],
+    inlineComments: Array.from({ length: 1_001 }, (_, id) => ({ id })),
+  });
+  assert.equal(overflowCursor, null);
+
+  try {
+    const itemsDir = join(root, "items");
+    const closedDir = join(root, "closed");
+    const plansDir = join(root, "plans");
+    const reportPath = join(root, "apply-report.json");
+    const mutationLogPath = join(root, "mutations.log");
+    mkdirSync(itemsDir, { recursive: true });
+    mkdirSync(plansDir, { recursive: true });
+    const synced = reportWithSyncedReviewComment(
+      implementedCloseReport({
+        repository: "openclaw/openclaw",
+        number: 321,
+        type: "pull_request",
+        title: "High activity PR",
+        url: "https://github.com/openclaw/openclaw/pull/321",
+        author: "reporter",
+        author_association: "CONTRIBUTOR",
+        labels: JSON.stringify([]),
+        pull_head_sha: "head-sha",
+        review_activity_cursor: "unknown",
+      }),
+      321,
+      "implemented_on_main",
+    );
+    writeFileSync(join(itemsDir, "321.md"), synced.report, "utf8");
+
+    withMockGh(
+      root,
+      promotionGhMock({
+        number: 321,
+        title: "High activity PR",
+        labels: [],
+        comment: synced.comment,
+        itemUpdatedAtAfterLabelSyncLogPath: mutationLogPath,
+      }),
+      () => {
+        runApplyDecisionsForTest({
+          targetRepo: "openclaw/openclaw",
+          itemsDir,
+          closedDir,
+          plansDir,
+          reportPath,
+        });
+      },
+    );
+
+    assert.deepEqual(JSON.parse(readText(reportPath)), [
+      {
+        number: 321,
+        action: "kept_open",
+        reason: "stored pull request review activity cursor is missing; fresh review required",
+      },
+    ]);
+    assert.equal(existsSync(mutationLogPath), false);
+    assert.match(readText(join(itemsDir, "321.md")), /^action_taken: proposed_close$/m);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("apply-decisions archives records deleted after review instead of failing the run", () => {
   const root = mkdtempSync(tmpPrefix);
   try {
