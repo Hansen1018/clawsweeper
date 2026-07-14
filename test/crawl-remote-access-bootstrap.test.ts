@@ -64,6 +64,7 @@ function createGitHubFixture({
   const lists: Array<{ repository: string; environment?: string }> = [];
   const variableReads: Array<{ repository: string; environment?: string; name: string }> = [];
   const writes: Array<{ kind: "secret" | "variable"; name: string; repository: string }> = [];
+  const mainChecks: number[] = [];
   const secretNames = new Map<string, Set<string>>();
   const variableValues = new Map<string, string>();
   if (activeTokenId) {
@@ -84,7 +85,11 @@ function createGitHubFixture({
     variableReads,
     variableValues,
     writes,
+    mainChecks,
     client: {
+      async assertCurrentMain() {
+        mainChecks.push(mainChecks.length + 1);
+      },
       async listSecretNames(target: { repository: string; environment?: string }) {
         lists.push(target);
         return new Set(secretNames.get(targetKey(target)) ?? []);
@@ -192,6 +197,13 @@ test("deploy consumer gate rejects comment-only claims and accepts a structural 
   const validSource = [
     "jobs:",
     "  deploy:",
+    "    defaults:",
+    "      run:",
+    "        shell: bash --noprofile --norc -euo pipefail {0}",
+    "    env:",
+    '      BASH_ENV: ""',
+    '      ENV: ""',
+    '      NODE_OPTIONS: ""',
     "    steps:",
     "      - name: Checkout crawl-remote Access resolver",
     "        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0",
@@ -203,11 +215,14 @@ test("deploy consumer gate rejects comment-only claims and accepts a structural 
     "      - name: Resolve crawl-remote Access credentials",
     "        id: crawl-remote-access-credentials",
     "        env:",
+    '          BASH_ENV: ""',
     "          CRAWL_REMOTE_ACCESS_CREDENTIAL_GENERATION: ${{ vars.CRAWL_REMOTE_ACCESS_CREDENTIAL_GENERATION }}",
     "          CRAWL_REMOTE_ACCESS_BLUE_CLIENT_ID: ${{ secrets.CRAWL_REMOTE_ACCESS_BLUE_CLIENT_ID }}",
     "          CRAWL_REMOTE_ACCESS_BLUE_CLIENT_SECRET: ${{ secrets.CRAWL_REMOTE_ACCESS_BLUE_CLIENT_SECRET }}",
     "          CRAWL_REMOTE_ACCESS_GREEN_CLIENT_ID: ${{ secrets.CRAWL_REMOTE_ACCESS_GREEN_CLIENT_ID }}",
     "          CRAWL_REMOTE_ACCESS_GREEN_CLIENT_SECRET: ${{ secrets.CRAWL_REMOTE_ACCESS_GREEN_CLIENT_SECRET }}",
+    '          ENV: ""',
+    '          NODE_OPTIONS: ""',
     "        run: |",
     "          node scripts/resolve-crawl-remote-access-credentials.mjs",
     "      - name: Validate protected production proof credentials",
@@ -236,7 +251,7 @@ test("deploy consumer gate rejects comment-only claims and accepts a structural 
         validSource.replace(
           "          CRAWL_REMOTE_ACCESS_CREDENTIAL_GENERATION:",
           [
-            '          NODE_OPTIONS: "--import ./unreviewed.mjs"',
+            "          NODE_PATH: ./unreviewed",
             "          CRAWL_REMOTE_ACCESS_CREDENTIAL_GENERATION:",
           ].join("\n"),
         ),
@@ -252,6 +267,33 @@ test("deploy consumer gate rejects comment-only claims and accepts a structural 
         ),
       ),
     /invalid step syntax/,
+  );
+  assert.throws(
+    () =>
+      assertCrawlRemoteDeployConsumerContract(
+        validSource.replace('      NODE_OPTIONS: ""', '      NODE_OPTIONS: "--import ./bad.mjs"'),
+      ),
+    /unsafe inherited NODE_OPTIONS binding/,
+  );
+  assert.throws(
+    () =>
+      assertCrawlRemoteDeployConsumerContract(
+        validSource.replace(
+          "        shell: bash --noprofile --norc -euo pipefail {0}",
+          "        shell: bash",
+        ),
+      ),
+    /unsafe inherited run controls/,
+  );
+  assert.throws(
+    () =>
+      assertCrawlRemoteDeployConsumerContract(
+        validSource.replace(
+          '          NODE_OPTIONS: ""',
+          ['          NODE_OPTIONS: "--import ./bad.mjs"', '          NODE_OPTIONS: ""'].join("\n"),
+        ),
+      ),
+    /duplicate step env field: NODE_OPTIONS/,
   );
   assert.throws(
     () =>
@@ -337,6 +379,7 @@ test("first bootstrap creates one service-auth policy and writes every destinati
 
   assert.equal(result.createdServiceToken, true);
   assert.equal(result.rotatedServiceToken, false);
+  assert.equal(github.mainChecks.length, 1);
   assert.deepEqual(
     cloudflare.events.find((event) => event.event === "create-token"),
     {
@@ -552,6 +595,7 @@ test("rotation authorizes both tokens until all GitHub credentials are replaced"
 
   assert.equal(result.rotatedServiceToken, true);
   assert.equal(result.resumedServiceTokenRotation, false);
+  assert.equal(github.mainChecks.length, 2);
   const policies = cloudflare.events.filter((event) => event.event === "ensure-policy");
   assert.deepEqual(
     policies.map((policy) => policy.tokenIds),
@@ -576,6 +620,84 @@ test("rotation authorizes both tokens until all GitHub credentials are replaced"
     event: "delete-token",
     tokenId: "token-old",
   });
+});
+
+test("main drift blocks initial mutation and old-token revocation", async () => {
+  const initialCloudflare = createCloudflareFixture();
+  const initialGitHub = createGitHubFixture();
+  initialGitHub.client.assertCurrentMain = async () => {
+    initialGitHub.mainChecks.push(1);
+    throw new Error("ClawSweeper main advanced during crawl-remote Access bootstrap");
+  };
+
+  await assert.rejects(
+    bootstrapCrawlRemoteAccess(
+      {
+        publisherEnabled: "0",
+        rotateServiceToken: false,
+        rotationLabel: "456-1",
+        runtimeProvider: "local",
+        workersApiToken: "fixture-workers-credential",
+      },
+      {
+        cloudflare: initialCloudflare.client,
+        github: initialGitHub.client,
+        logger: quietLogger,
+      },
+    ),
+    /main advanced/,
+  );
+  assert.equal(initialGitHub.mainChecks.length, 1);
+  assert.deepEqual(
+    initialCloudflare.events.map((event) => event.event),
+    ["list-tokens", "inspect-app"],
+  );
+
+  const rotationCloudflare = createCloudflareFixture({
+    tokens: [{ id: "token-old", name: BOOTSTRAP_CONTRACT.accessServiceTokenName }],
+    application: {
+      id: "app-existing",
+      name: BOOTSTRAP_CONTRACT.accessAppName,
+      domain: BOOTSTRAP_CONTRACT.accessDomain,
+    },
+    policy: { id: "policy-existing" },
+  });
+  const rotationGitHub = createGitHubFixture({ activeTokenId: "token-old" });
+  rotationGitHub.client.assertCurrentMain = async () => {
+    rotationGitHub.mainChecks.push(rotationGitHub.mainChecks.length + 1);
+    if (rotationGitHub.mainChecks.length === 2) {
+      throw new Error("ClawSweeper main advanced during crawl-remote Access bootstrap");
+    }
+  };
+
+  await assert.rejects(
+    bootstrapCrawlRemoteAccess(
+      {
+        publisherEnabled: "0",
+        rotateServiceToken: true,
+        rotationLabel: "456-2",
+        runtimeProvider: "local",
+        workersApiToken: "fixture-workers-credential",
+      },
+      {
+        cloudflare: rotationCloudflare.client,
+        github: rotationGitHub.client,
+        logger: quietLogger,
+      },
+    ),
+    /main advanced/,
+  );
+  assert.equal(rotationGitHub.mainChecks.length, 2);
+  assert.deepEqual(
+    rotationCloudflare.events
+      .filter((event) => event.event === "ensure-policy")
+      .map((event) => event.tokenIds),
+    [["token-old", "token-new"]],
+  );
+  assert.equal(
+    rotationCloudflare.events.some((event) => event.event === "delete-token"),
+    false,
+  );
 });
 
 test("rotation keeps active markers and the old token when an inactive pair write fails", async () => {
@@ -890,7 +1012,11 @@ test("GitHub client routes repository tokens and sends secret values only over s
     options: { input: string; env: NodeJS.ProcessEnv };
   }> = [];
   const requests: Array<{ url: string; authorization: string | null }> = [];
+  const expectedMainSha = "1".repeat(40);
+  let returnedMainSha = expectedMainSha;
   const client = createGitHubClient({
+    expectedMainSha,
+    mainReadToken: "fixture-main-read-credential",
     tokensByRepository: {
       [BOOTSTRAP_CONTRACT.clawsweeperRepository]: "fixture-clawsweeper-credential",
       [BOOTSTRAP_CONTRACT.gitcrawlStoreRepository]: "fixture-store-credential",
@@ -900,6 +1026,9 @@ test("GitHub client routes repository tokens and sends secret values only over s
         url: String(url),
         authorization: new Headers(init?.headers).get("authorization"),
       });
+      if (String(url).endsWith("/repos/openclaw/clawsweeper/commits/main")) {
+        return Response.json({ sha: returnedMainSha });
+      }
       if (String(url).includes("/variables/")) {
         return Response.json({ message: "not found" }, { status: 404 });
       }
@@ -915,6 +1044,7 @@ test("GitHub client routes repository tokens and sends secret values only over s
     },
   });
 
+  await client.assertCurrentMain();
   const clawsweeperNames = await client.listSecretNames({
     repository: BOOTSTRAP_CONTRACT.clawsweeperRepository,
   });
@@ -931,11 +1061,14 @@ test("GitHub client routes repository tokens and sends secret values only over s
   assert.deepEqual(
     requests.map((request) => request.authorization),
     [
+      "Bearer fixture-main-read-credential",
       "Bearer fixture-clawsweeper-credential",
       "Bearer fixture-store-credential",
       "Bearer fixture-store-credential",
     ],
   );
+  returnedMainSha = "2".repeat(40);
+  await assert.rejects(client.assertCurrentMain(), /main advanced/);
   await client.setSecret({
     repository: BOOTSTRAP_CONTRACT.clawsweeperRepository,
     name: "FIXTURE_SECRET",
@@ -970,6 +1103,7 @@ test("GitHub client routes repository tokens and sends secret values only over s
     assert.equal(command.options.env.OPENCLAW_CLOUDFLARE_CONFIG_API_TOKEN, undefined);
     assert.equal(command.options.env.OPENCLAW_CLOUDFLARE_WORKERS_API_TOKEN, undefined);
     assert.equal(command.options.env.CLAWSWEEPER_BOOTSTRAP_GH_TOKEN, undefined);
+    assert.equal(command.options.env.CLAWSWEEPER_MAIN_READ_GH_TOKEN, undefined);
     assert.equal(command.options.env.GITCRAWL_STORE_BOOTSTRAP_GH_TOKEN, undefined);
   }
   assert.doesNotMatch(commands[0]?.args.join(" ") ?? "", /fixture-secret-value/);

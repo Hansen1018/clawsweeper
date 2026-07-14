@@ -66,6 +66,16 @@ jobs:
       - name: Verify generation-slot consumer contract
         run: node scripts/bootstrap-crawl-remote-access.mjs --check-consumer-contract
 
+      - name: Reauthorize current main before token minting
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          current_main_sha="$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq '.sha')"
+          if [[ "$GITHUB_SHA" != "$current_main_sha" ]]; then
+            echo "::error::ClawSweeper main advanced after consumer-contract verification."
+            exit 1
+          fi
+
       - name: Create ClawSweeper bootstrap token
         id: clawsweeper-admin-token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
@@ -95,6 +105,7 @@ jobs:
       - name: Bootstrap crawl-remote Access
         env:
           CLAWSWEEPER_BOOTSTRAP_GH_TOKEN: ${{ steps.clawsweeper-admin-token.outputs.token }}
+          CLAWSWEEPER_MAIN_READ_GH_TOKEN: ${{ github.token }}
           GITCRAWL_STORE_BOOTSTRAP_GH_TOKEN: ${{ steps.gitcrawl-store-admin-token.outputs.token }}
           OPENCLAW_CLOUDFLARE_CONFIG_API_TOKEN: ${{ secrets.OPENCLAW_CLOUDFLARE_CONFIG_API_TOKEN }}
           OPENCLAW_CLOUDFLARE_WORKERS_API_TOKEN: ${{ secrets.OPENCLAW_CLOUDFLARE_WORKERS_API_TOKEN }}

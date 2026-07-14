@@ -31,11 +31,18 @@ const DEPLOY_CONSUMER_CONTRACT = Object.freeze({
     "sparse-checkout-cone-mode": "false",
   },
   command: "node scripts/resolve-crawl-remote-access-credentials.mjs",
+  inheritedEnvironment: {
+    BASH_ENV: "",
+    ENV: "",
+    NODE_OPTIONS: "",
+  },
   job: "deploy",
+  jobShell: "bash --noprofile --norc -euo pipefail {0}",
   path: ".github/workflows/deploy-crawl-remote.yml",
   stepId: "crawl-remote-access-credentials",
   stepName: "Resolve crawl-remote Access credentials",
   requiredEnvironment: {
+    BASH_ENV: "",
     CRAWL_REMOTE_ACCESS_CREDENTIAL_GENERATION:
       "${{ vars.CRAWL_REMOTE_ACCESS_CREDENTIAL_GENERATION }}",
     CRAWL_REMOTE_ACCESS_BLUE_CLIENT_ID: "${{ secrets.CRAWL_REMOTE_ACCESS_BLUE_CLIENT_ID }}",
@@ -43,6 +50,8 @@ const DEPLOY_CONSUMER_CONTRACT = Object.freeze({
     CRAWL_REMOTE_ACCESS_GREEN_CLIENT_ID: "${{ secrets.CRAWL_REMOTE_ACCESS_GREEN_CLIENT_ID }}",
     CRAWL_REMOTE_ACCESS_GREEN_CLIENT_SECRET:
       "${{ secrets.CRAWL_REMOTE_ACCESS_GREEN_CLIENT_SECRET }}",
+    ENV: "",
+    NODE_OPTIONS: "",
   },
   forbiddenReferences: [
     "secrets.CRAWL_REMOTE_ACCESS_CLIENT_ID",
@@ -121,6 +130,8 @@ export async function bootstrapCrawlRemoteAccess(options, dependencies) {
     activeToken = matchingTokens[0];
   }
 
+  await github.assertCurrentMain();
+
   if (!activeToken) {
     oldTokens = matchingTokens;
     const tokenName =
@@ -164,6 +175,7 @@ export async function bootstrapCrawlRemoteAccess(options, dependencies) {
   });
 
   if (oldTokenIds.length > 0) {
+    await github.assertCurrentMain();
     if (createdCredentials) {
       configuredPolicy = await cloudflare.ensureAccessPolicy({
         applicationId: application.id,
@@ -204,7 +216,13 @@ export function assertCrawlRemoteDeployConsumerContract(source) {
   if (typeof source !== "string") {
     throw new Error("crawl-remote deploy consumer source is unavailable");
   }
-  const deploySteps = parseWorkflowJobSteps(source, DEPLOY_CONSUMER_CONTRACT.job);
+  const {
+    steps: deploySteps,
+    jobEnvironment,
+    jobRunDefaults,
+    hasWorkflowDefaults,
+    hasWorkflowEnvironment,
+  } = parseWorkflowJobSteps(source, DEPLOY_CONSUMER_CONTRACT.job);
   const matchingSteps = deploySteps.filter(
     (step) => step.name === DEPLOY_CONSUMER_CONTRACT.stepName,
   );
@@ -222,6 +240,21 @@ export function assertCrawlRemoteDeployConsumerContract(source) {
     resolver.environment.size !== Object.keys(DEPLOY_CONSUMER_CONTRACT.requiredEnvironment).length
   ) {
     throw new Error("crawl-remote deploy credential resolver has an unsafe step contract");
+  }
+  if (
+    hasWorkflowDefaults ||
+    hasWorkflowEnvironment ||
+    jobRunDefaults.size !== 1 ||
+    jobRunDefaults.get("shell") !== DEPLOY_CONSUMER_CONTRACT.jobShell
+  ) {
+    throw new Error("crawl-remote deploy credential resolver has unsafe inherited run controls");
+  }
+  for (const [name, value] of Object.entries(DEPLOY_CONSUMER_CONTRACT.inheritedEnvironment)) {
+    if (jobEnvironment.get(name) !== value) {
+      throw new Error(
+        `crawl-remote deploy credential resolver has unsafe inherited ${name} binding`,
+      );
+    }
   }
   const resolverIndex = deploySteps.indexOf(resolver);
   const checkout = deploySteps[resolverIndex - 1];
@@ -311,6 +344,10 @@ function parseWorkflowJobSteps(source, expectedJob) {
     throw new Error("crawl-remote deploy workflow has no jobs mapping");
   }
   const jobsIndex = jobsIndexes[0];
+  const hasWorkflowDefaults = lines.some((line) =>
+    /^(?:"defaults"|'defaults'|defaults):(?:\s|$)/.test(line),
+  );
+  const hasWorkflowEnvironment = lines.some((line) => /^(?:"env"|'env'|env):(?:\s|$)/.test(line));
   const jobIndexes = lines.flatMap((line, index) =>
     index > jobsIndex && line === `  ${expectedJob}:` ? [index] : [],
   );
@@ -332,6 +369,8 @@ function parseWorkflowJobSteps(source, expectedJob) {
     throw new Error(`crawl-remote deploy ${expectedJob} job must have exactly one steps sequence`);
   }
   const stepsIndex = stepsIndexes[0];
+  const jobEnvironment = parseJobMapping(lines, jobStart, stepsIndex, "env");
+  const jobRunDefaults = parseJobRunDefaults(lines, jobStart, stepsIndex);
 
   const steps = [];
   for (let index = stepsIndex + 1; index < jobEnd; index += 1) {
@@ -352,7 +391,64 @@ function parseWorkflowJobSteps(source, expectedJob) {
     steps.push(parseWorkflowStep(lines.slice(index, stepEnd), stepMatch[1]));
     index = stepEnd - 1;
   }
-  return steps;
+  return {
+    steps,
+    jobEnvironment,
+    jobRunDefaults,
+    hasWorkflowDefaults,
+    hasWorkflowEnvironment,
+  };
+}
+
+function parseJobMapping(lines, jobStart, stepsIndex, key) {
+  const header = `    ${key}:`;
+  const indexes = lines.flatMap((line, index) =>
+    index > jobStart && index < stepsIndex && line === header ? [index] : [],
+  );
+  if (indexes.length !== 1) {
+    return new Map();
+  }
+  const values = new Map();
+  for (let index = indexes[0] + 1; index < stepsIndex; index += 1) {
+    const line = lines[index];
+    if (/^\s*$/.test(line) || /^\s*#/.test(line)) continue;
+    if (/^    [A-Za-z0-9_-]+:\s*$/.test(line)) break;
+    const match = /^      ([A-Za-z_][A-Za-z0-9_]*):\s*(.*?)\s*$/.exec(line);
+    if (!match || values.has(match[1])) {
+      throw new Error(`crawl-remote deploy workflow has invalid inherited ${key} syntax`);
+    }
+    values.set(match[1], parseYamlScalar(match[2]));
+  }
+  return values;
+}
+
+function parseJobRunDefaults(lines, jobStart, stepsIndex) {
+  const indexes = lines.flatMap((line, index) =>
+    index > jobStart && index < stepsIndex && line === "    defaults:" ? [index] : [],
+  );
+  if (indexes.length !== 1) {
+    return new Map();
+  }
+  const values = new Map();
+  let foundRun = false;
+  for (let index = indexes[0] + 1; index < stepsIndex; index += 1) {
+    const line = lines[index];
+    if (/^\s*$/.test(line) || /^\s*#/.test(line)) continue;
+    if (/^    [A-Za-z0-9_-]+:\s*$/.test(line)) break;
+    if (line === "      run:") {
+      if (foundRun) {
+        throw new Error("crawl-remote deploy workflow has duplicate inherited run defaults");
+      }
+      foundRun = true;
+      continue;
+    }
+    const match = /^        ([A-Za-z0-9_-]+):\s*(.*?)\s*$/.exec(line);
+    if (!foundRun || !match || values.has(match[1])) {
+      throw new Error("crawl-remote deploy workflow has invalid inherited run defaults");
+    }
+    values.set(match[1], parseYamlScalar(match[2]));
+  }
+  return foundRun ? values : new Map();
 }
 
 function parseWorkflowStep(lines, firstEntry) {
@@ -361,9 +457,14 @@ function parseWorkflowStep(lines, firstEntry) {
   const environment = new Map();
   const configuration = new Map();
   const run = [];
+  const stepKeys = new Set();
   let block = null;
 
   const setField = (key, rawValue) => {
+    if (stepKeys.has(key)) {
+      throw new Error(`crawl-remote deploy workflow has duplicate step field: ${key}`);
+    }
+    stepKeys.add(key);
     block = null;
     if (key === "name") {
       name = parseYamlScalar(rawValue);
@@ -397,6 +498,11 @@ function parseWorkflowStep(lines, firstEntry) {
       if (!environmentMatch) {
         throw new Error(`crawl-remote deploy resolver has invalid env syntax: ${line.trim()}`);
       }
+      if (environment.has(environmentMatch[1])) {
+        throw new Error(
+          `crawl-remote deploy workflow has duplicate step env field: ${environmentMatch[1]}`,
+        );
+      }
       environment.set(environmentMatch[1], parseYamlScalar(environmentMatch[2]));
       continue;
     }
@@ -404,6 +510,11 @@ function parseWorkflowStep(lines, firstEntry) {
       const configurationMatch = /^          ([A-Za-z0-9_-]+):\s*(.+?)\s*$/.exec(line);
       if (!configurationMatch) {
         throw new Error(`crawl-remote deploy resolver has invalid with syntax: ${line.trim()}`);
+      }
+      if (configuration.has(configurationMatch[1])) {
+        throw new Error(
+          `crawl-remote deploy workflow has duplicate step with field: ${configurationMatch[1]}`,
+        );
       }
       configuration.set(configurationMatch[1], parseYamlScalar(configurationMatch[2]));
       continue;
@@ -731,10 +842,16 @@ export function createCloudflareClient({
 
 export function createGitHubClient({
   tokensByRepository,
+  mainReadToken,
+  expectedMainSha,
   fetchImpl = fetch,
   apiBase = "https://api.github.com",
   runGh = defaultRunGh,
 }) {
+  assertSecretValue(mainReadToken, "ClawSweeper main-read GitHub token");
+  if (typeof expectedMainSha !== "string" || !/^[0-9a-f]{40}$/.test(expectedMainSha)) {
+    throw new Error("GITHUB_SHA must be a full lowercase commit SHA");
+  }
   const repositoryTokens = new Map();
   for (const repository of [
     BOOTSTRAP_CONTRACT.clawsweeperRepository,
@@ -773,6 +890,25 @@ export function createGitHubClient({
   }
 
   return {
+    async assertCurrentMain() {
+      const path = `/repos/${BOOTSTRAP_CONTRACT.clawsweeperRepository}/commits/main`;
+      const response = await fetchImpl(`${apiBase}${path}`, {
+        headers: {
+          accept: "application/vnd.github+json",
+          authorization: `Bearer ${mainReadToken}`,
+          "x-github-api-version": "2022-11-28",
+        },
+        redirect: "error",
+      });
+      if (!response.ok) {
+        throw new Error(`GitHub GET ${path} failed with HTTP ${response.status}`);
+      }
+      const payload = await response.json();
+      if (payload?.sha !== expectedMainSha) {
+        throw new Error("ClawSweeper main advanced during crawl-remote Access bootstrap");
+      }
+    },
+
     async listSecretNames({ repository, environment }) {
       const prefix = `/repos/${repository}`;
       const path = environment
@@ -826,6 +962,7 @@ async function runGhCommand({ args, input, token, runGh }) {
   delete childEnvironment.OPENCLAW_CLOUDFLARE_CONFIG_API_TOKEN;
   delete childEnvironment.OPENCLAW_CLOUDFLARE_WORKERS_API_TOKEN;
   delete childEnvironment.CLAWSWEEPER_BOOTSTRAP_GH_TOKEN;
+  delete childEnvironment.CLAWSWEEPER_MAIN_READ_GH_TOKEN;
   delete childEnvironment.GITCRAWL_STORE_BOOTSTRAP_GH_TOKEN;
   delete childEnvironment.GH_TOKEN;
   const result = await runGh(args, {
@@ -1110,6 +1247,8 @@ async function main() {
     token: process.env.OPENCLAW_CLOUDFLARE_CONFIG_API_TOKEN,
   });
   const github = createGitHubClient({
+    expectedMainSha: process.env.GITHUB_SHA,
+    mainReadToken: process.env.CLAWSWEEPER_MAIN_READ_GH_TOKEN,
     tokensByRepository: {
       [BOOTSTRAP_CONTRACT.clawsweeperRepository]: process.env.CLAWSWEEPER_BOOTSTRAP_GH_TOKEN,
       [BOOTSTRAP_CONTRACT.gitcrawlStoreRepository]: process.env.GITCRAWL_STORE_BOOTSTRAP_GH_TOKEN,

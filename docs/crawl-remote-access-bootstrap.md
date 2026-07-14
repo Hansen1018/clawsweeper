@@ -19,6 +19,12 @@ fixed-slot `CF_ACCESS_CLIENT_ID` or `CF_ACCESS_CLIENT_SECRET` overrides are
 rejected. Until the consumer change lands, every dispatch fails closed before
 privileged work.
 
+The deploy job must keep its reviewed no-profile Bash default, and both the job
+and resolver step must bind `BASH_ENV`, `ENV`, and `NODE_OPTIONS` to empty
+values. The bootstrap rechecks the live ClawSweeper `main` SHA before token
+minting, immediately before its first mutation, and again before narrowing
+Access policy or revoking an old service token.
+
 ## First bootstrap
 
 After the generation-slot deploy consumer lands, dispatch the workflow from

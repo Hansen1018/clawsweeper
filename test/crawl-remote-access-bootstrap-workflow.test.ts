@@ -23,6 +23,10 @@ test("manual workflow keeps bootstrap separate from deployment authority", () =>
   const consumerContract = job.steps.find(
     (candidate: { name?: string }) => candidate.name === "Verify generation-slot consumer contract",
   );
+  const preTokenAuthorization = job.steps.find(
+    (candidate: { name?: string }) =>
+      candidate.name === "Reauthorize current main before token minting",
+  );
 
   assert.deepEqual(Object.keys(workflow.on), ["workflow_dispatch"]);
   assert.deepEqual(Object.keys(workflow.on.workflow_dispatch.inputs), [
@@ -53,6 +57,7 @@ test("manual workflow keeps bootstrap separate from deployment authority", () =>
     bootstrap.env.CLAWSWEEPER_BOOTSTRAP_GH_TOKEN,
     "${{ steps.clawsweeper-admin-token.outputs.token }}",
   );
+  assert.equal(bootstrap.env.CLAWSWEEPER_MAIN_READ_GH_TOKEN, "${{ github.token }}");
   assert.equal(
     bootstrap.env.GITCRAWL_STORE_BOOTSTRAP_GH_TOKEN,
     "${{ steps.gitcrawl-store-admin-token.outputs.token }}",
@@ -68,6 +73,10 @@ test("manual workflow keeps bootstrap separate from deployment authority", () =>
     "node scripts/bootstrap-crawl-remote-access.mjs --check-consumer-contract",
   );
   assert.ok(job.steps.indexOf(consumerContract) < job.steps.indexOf(clawsweeperToken));
+  assert.ok(job.steps.indexOf(consumerContract) < job.steps.indexOf(preTokenAuthorization));
+  assert.ok(job.steps.indexOf(preTokenAuthorization) < job.steps.indexOf(clawsweeperToken));
+  assert.equal(preTokenAuthorization.env.GH_TOKEN, "${{ github.token }}");
+  assert.match(preTokenAuthorization.run, /GITHUB_SHA.*current_main_sha/s);
   assert.equal(consumerContract.env, undefined);
   assert.equal(
     clawsweeperToken.uses,
