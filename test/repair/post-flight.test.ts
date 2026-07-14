@@ -267,10 +267,15 @@ test("merge post-flight leaves dependency-gated closeouts to the second apply pa
       "  process.stdout.write(JSON.stringify({",
       "    number: 123, state: merged ? 'closed' : 'open', title: 'fix(ui): preserve source config',",
       "    draft: false, labels: [], base: { ref: 'main' },",
+      "    updated_at: '2026-05-24T00:40:00Z',",
       "    merged_at: merged ? '2026-05-24T00:42:00Z' : null,",
       "    merge_commit_sha: merged ? 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' : null,",
       "    head: { sha: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' },",
       "  }));",
+      "  process.exit(0);",
+      "}",
+      "if (args[0] === 'api' && /^repos\\/openclaw\\/openclaw\\/pulls\\/123\\/(reviews|comments)\\?/.test(args[1])) {",
+      "  process.stdout.write('[]');",
       "  process.exit(0);",
       "}",
       "if (args[0] === 'api' && args[1] === 'repos/openclaw/openclaw/issues/123/comments?per_page=100') {",
@@ -357,6 +362,103 @@ test("merge post-flight leaves dependency-gated closeouts to the second apply pa
       ],
     });
     assert.equal(fs.readFileSync(viewCountPath, "utf8"), "2");
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("post-flight blocks merge when review activity changes after validation", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-post-flight-"));
+  const fakeBin = path.join(tmp, "bin");
+  const jobPath = path.join(tmp, "job.md");
+  const runDir = path.join(tmp, "run");
+  const resultPath = path.join(runDir, "result.json");
+  const reportPath = path.join(runDir, "post-flight-report.json");
+  const reviewCountPath = path.join(tmp, "review-count.txt");
+  const mergeFlagPath = path.join(tmp, "merged.txt");
+
+  fs.mkdirSync(fakeBin, { recursive: true });
+  fs.mkdirSync(runDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(fakeBin, "gh"),
+    [
+      "#!/usr/bin/env node",
+      "const fs = require('node:fs');",
+      "const args = process.argv.slice(2);",
+      "if (args[0] === 'api' && args[1] === 'repos/openclaw/openclaw/pulls/123') {",
+      "  process.stdout.write(JSON.stringify({",
+      "    number: 123, state: 'open', title: 'fix(ui): preserve source config',",
+      "    draft: false, labels: [], base: { ref: 'main' }, merged_at: null,",
+      "    updated_at: '2026-05-24T00:40:00Z',",
+      "    head: { sha: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' },",
+      "  }));",
+      "  process.exit(0);",
+      "}",
+      "if (args[0] === 'api' && /^repos\\/openclaw\\/openclaw\\/pulls\\/123\\/reviews\\?/.test(args[1])) {",
+      "  const path = process.env.FAKE_GH_REVIEW_COUNT_FILE;",
+      "  const count = fs.existsSync(path) ? Number(fs.readFileSync(path, 'utf8')) : 0;",
+      "  fs.writeFileSync(path, String(count + 1));",
+      "  process.stdout.write(JSON.stringify(count < 2 ? [] : [{",
+      "    id: 77, user: { login: 'maintainer' }, state: 'COMMENTED',",
+      "    body: 'Hold merge', submitted_at: '2026-05-24T00:40:01Z',",
+      "    commit_id: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',",
+      "  }]));",
+      "  process.exit(0);",
+      "}",
+      "if (args[0] === 'api' && /^repos\\/openclaw\\/openclaw\\/pulls\\/123\\/comments\\?/.test(args[1])) {",
+      "  process.stdout.write('[]');",
+      "  process.exit(0);",
+      "}",
+      "if (args[0] === 'api' && args[1] === 'repos/openclaw/openclaw/issues/123/comments?per_page=100') {",
+      "  process.stdout.write('');",
+      "  process.exit(0);",
+      "}",
+      "if (args[0] === 'api' && args[1] === 'graphql') {",
+      "  process.stdout.write(JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: { pageInfo: { hasNextPage: false }, nodes: [] } } } } }));",
+      "  process.exit(0);",
+      "}",
+      "if (args[0] === 'pr' && args[1] === 'view') {",
+      "  process.stdout.write(JSON.stringify({",
+      "    baseRefName: 'main', isDraft: false, mergeable: 'MERGEABLE',",
+      "    mergeStateStatus: 'CLEAN', reviewDecision: null, state: 'OPEN',",
+      "    statusCheckRollup: [], title: 'fix(ui): preserve source config',",
+      "    updatedAt: '2026-05-24T00:40:00Z',",
+      "    url: 'https://github.com/openclaw/openclaw/pull/123',",
+      "  }));",
+      "  process.exit(0);",
+      "}",
+      "if (args[0] === 'pr' && args[1] === 'merge') {",
+      "  fs.writeFileSync(process.env.FAKE_GH_MERGED_FILE, '1');",
+      "  process.exit(0);",
+      "}",
+      "process.stderr.write(`unexpected gh args: ${args.join(' ')}\\n`);",
+      "process.exit(1);",
+    ].join("\n"),
+    { mode: 0o755 },
+  );
+
+  writeMergeJob(jobPath);
+  writeMergeReports(runDir, resultPath);
+
+  try {
+    execFileSync(process.execPath, ["dist/repair/post-flight.js", jobPath, resultPath], {
+      cwd: repoRoot,
+      env: {
+        ...process.env,
+        CLAWSWEEPER_ALLOW_EXECUTE: "1",
+        CLAWSWEEPER_ALLOWED_OWNER: "openclaw",
+        CLAWSWEEPER_ALLOW_MERGE: "1",
+        FAKE_GH_MERGED_FILE: mergeFlagPath,
+        FAKE_GH_REVIEW_COUNT_FILE: reviewCountPath,
+        ...mockGhBinEnv(path.join(fakeBin, "gh"), fakeBin),
+      },
+      stdio: "pipe",
+    });
+
+    const report = JSON.parse(fs.readFileSync(reportPath, "utf8"));
+    assert.equal(report.actions[0]?.status, "blocked");
+    assert.match(report.actions[0]?.reason, /review activity changed after repair validation/);
+    assert.equal(fs.existsSync(mergeFlagPath), false);
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }

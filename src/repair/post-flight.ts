@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import type { JsonValue, LooseRecord } from "./json-types.js";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import {
@@ -12,12 +13,13 @@ import {
 } from "./lib.js";
 import { stripAnsi } from "./comment-router-utils.js";
 import {
-  ghBestEffortWithRetry as ghBestEffort,
   ghErrorText,
   ghJsonWithRetry as ghJson,
+  ghText as ghOneShot,
   ghTextWithRetry as ghWithRetry,
 } from "./github-cli.js";
-import { parsePullRequestUrl } from "./github-ref.js";
+import { issueNumberFromRef, parsePullRequestUrl } from "./github-ref.js";
+import { isLockedConversationCommentError } from "../github-retry.js";
 import { sleepMs } from "./timing.js";
 import {
   CLAWSWEEPER_LABEL,
@@ -30,6 +32,14 @@ import {
   buildRepairSquashMergeMessage,
   writeRepairSquashMergeBody,
 } from "./repair-merge-message.js";
+import {
+  RepairMutationFreshnessError,
+  createRepairMutationFreshnessGuard,
+  flushRepairMutationActionEvents,
+  runRepairMutation,
+  type RepairMutationContext,
+  type RepairMutationFreshnessGuard,
+} from "./repair-mutation-safety.js";
 import { compactText as compactPlainText } from "./text-utils.js";
 
 const PASSING_CHECK_CONCLUSIONS = new Set(["SUCCESS", "SKIPPED", "NEUTRAL"]);
@@ -121,6 +131,7 @@ if (report.actions.length === 0) {
 
 report.closure_authorization = buildClosureAuthorization(report.actions);
 writeReport(report, resultPath);
+await flushRepairMutationActionEvents();
 
 function buildClosureAuthorization(actions: LooseRecord[]) {
   const mergedFixes = actions
@@ -174,6 +185,7 @@ function finalizeFixPr(action: LooseRecord) {
   let view;
   let prBase;
   let mergeBlock = "";
+  let freshness: RepairMutationFreshnessGuard | null = null;
   let waitedMs = 0;
   for (;;) {
     pull = fetchPullRequest(result.repo, parsed.number);
@@ -192,6 +204,25 @@ function finalizeFixPr(action: LooseRecord) {
         merge_commit_sha: pull.merge_commit_sha ?? view.mergeCommit?.oid ?? null,
         waited_ms: waitedMs,
       };
+    }
+
+    if (!dryRun) {
+      try {
+        freshness = createRepairMutationFreshnessGuard({
+          repository: result.repo,
+          number: parsed.number,
+          targetKind: "pull_request",
+          expectedUpdatedAt: pull.updated_at ?? view.updatedAt,
+          expectedReviewActivityCursor:
+            action.review_activity_cursor ?? action.merge_preflight?.review_activity_cursor,
+          readUpdatedAt: () => fetchPullRequest(result.repo, parsed.number).updated_at,
+        });
+      } catch (error) {
+        if (error instanceof RepairMutationFreshnessError) {
+          return postFlightFreshnessBlock(prBase, error, waitedMs);
+        }
+        throw error;
+      }
     }
 
     mergeBlock = validateMergeableFixPr({ pull, view, preflight: action.merge_preflight });
@@ -221,9 +252,23 @@ function finalizeFixPr(action: LooseRecord) {
       waited_ms: waitedMs,
     };
   }
+  if (!freshness) throw new Error("post-flight merge mutation guard was not initialized");
+  const mutationContext = postFlightMutationContext({
+    action,
+    number: parsed.number,
+    targetKind: "pull_request",
+    sourceRevision: pull.head?.sha ?? result.reviewed_sha ?? result.head_sha,
+  });
 
   if (process.env.CLAWSWEEPER_ALLOW_MERGE !== "1") {
-    labelForClawSweeperReview(result.repo, parsed.number);
+    try {
+      labelForClawSweeperReview(mutationContext, freshness);
+    } catch (error) {
+      if (error instanceof RepairMutationFreshnessError) {
+        return postFlightFreshnessBlock(prBase, error, waitedMs);
+      }
+      throw error;
+    }
     return {
       ...prBase,
       status: "blocked",
@@ -255,8 +300,24 @@ function finalizeFixPr(action: LooseRecord) {
   ];
   if (pull.head?.sha) mergeArgs.push("--match-head-commit", String(pull.head.sha));
   try {
-    ghWithRetry(mergeArgs);
+    runRepairMutation(mutationContext, {
+      kind: "pull_request_merge",
+      identity: {
+        repository: result.repo,
+        number: parsed.number,
+        headSha: pull.head?.sha ?? null,
+        method: "squash",
+        subjectSha256: createHash("sha256").update(mergeMessage.subject).digest("hex"),
+        bodySha256: createHash("sha256").update(mergeMessage.body).digest("hex"),
+      },
+      freshness,
+      operation: () => ghOneShot(mergeArgs),
+      knownNoMutation: isRecoverableMergeRaceError,
+    });
   } catch (error) {
+    if (error instanceof RepairMutationFreshnessError) {
+      return postFlightFreshnessBlock(prBase, error, waitedMs);
+    }
     const detail = ghErrorText(error);
     if (isRecoverableMergeRace(detail)) {
       const latestView = fetchPullRequestView(result.repo, parsed.number);
@@ -341,6 +402,195 @@ function finalizeIssueImplementationPr({ base, parsed }: LooseRecord) {
   }
 }
 
+function finalizePostMergeCloseouts(fixAction: LooseRecord, finalized: LooseRecord) {
+  const fixPr = parsePullRequestUrl(fixAction.pr_url ?? fixAction.target);
+  if (!fixPr) return [];
+  const fixRef = `#${fixPr.number}`;
+  const fixUrl = `https://github.com/${result.repo}/pull/${fixPr.number}`;
+  const closeouts: JsonValue[] = [];
+  for (const action of result.actions ?? []) {
+    const actionName = String(action.action ?? "");
+    if (!POST_MERGE_CLOSE_ACTIONS.has(actionName)) continue;
+    if (!["blocked", "planned"].includes(String(action.status ?? ""))) continue;
+    const target = normalizeIssueRef(action.target);
+    if (!target || target === fixPr.number) continue;
+    const candidateFix = normalizeIssueRef(
+      action.candidate_fix ?? action.fixed_by ?? action.fix_candidate,
+    );
+    if (candidateFix !== fixPr.number) continue;
+    closeouts.push(
+      finalizePostMergeCloseout({ action, actionName, target, fixRef, fixUrl, finalized }),
+    );
+  }
+  return closeouts;
+}
+
+function finalizePostMergeCloseout({
+  action,
+  actionName,
+  target,
+  fixRef,
+  fixUrl,
+  finalized,
+}: LooseRecord) {
+  const base = {
+    action: "post_merge_closeout",
+    source_action: actionName,
+    target: `#${target}`,
+    canonical: action.canonical ?? undefined,
+    candidate_fix: fixRef,
+    fix_pr: fixUrl,
+  };
+  const live = fetchIssue(result.repo, target);
+  if (live.state !== "open") {
+    return {
+      ...base,
+      status: live.state === "closed" ? "executed" : "skipped",
+      reason:
+        live.state === "closed"
+          ? "target already closed after canonical fix merged"
+          : `target is ${live.state}`,
+      live_state: live.state,
+      merge_commit_sha: finalized.merge_commit_sha ?? null,
+    };
+  }
+  let mutationContext: RepairMutationContext | null = null;
+  let freshness: RepairMutationFreshnessGuard | null = null;
+  if (!dryRun) {
+    try {
+      mutationContext = postFlightMutationContext({
+        action,
+        number: target,
+        targetKind: live.pull_request ? "pull_request" : "issue",
+        operationKey: `${actionName}:${fixRef}:${finalized.merge_commit_sha ?? "unknown"}`,
+        sourceRevision:
+          finalized.merge_commit_sha ?? action.commit ?? result.reviewed_sha ?? result.head_sha,
+      });
+      freshness = createRepairMutationFreshnessGuard({
+        repository: result.repo,
+        number: target,
+        targetKind: live.pull_request ? "pull_request" : "issue",
+        expectedUpdatedAt: live.updated_at,
+        expectedReviewActivityCursor:
+          action.review_activity_cursor ?? action.target_review_activity_cursor,
+        readUpdatedAt: () => fetchIssue(result.repo, target).updated_at,
+      });
+    } catch (error) {
+      if (error instanceof RepairMutationFreshnessError) {
+        return postMergeCloseoutFreshnessBlock(base, finalized, error);
+      }
+      throw error;
+    }
+  }
+  if (hasLiveSecuritySignal(target, live.labels ?? [])) {
+    return {
+      ...base,
+      status: "blocked",
+      reason: "security-sensitive target requires central security triage",
+    };
+  }
+  if (dryRun) {
+    return {
+      ...base,
+      status: "planned",
+      reason: "dry run",
+      merge_commit_sha: finalized.merge_commit_sha ?? null,
+    };
+  }
+  if (!mutationContext || !freshness) {
+    throw new Error("post-flight closeout mutation guard was not initialized");
+  }
+
+  const commentBody = postMergeCloseoutComment({
+    actionName,
+    fixUrl,
+    provenance: externalMessageProvenance({
+      reviewedSha:
+        finalized.merge_commit_sha ?? action.commit ?? result.reviewed_sha ?? result.head_sha,
+    }),
+  });
+  try {
+    runRepairMutation(mutationContext, {
+      kind: "label_add",
+      identity: {
+        repository: result.repo,
+        number: target,
+        label: CLAWSWEEPER_LABEL,
+      },
+      freshness,
+      operation: () =>
+        ghOneShot([
+          "issue",
+          "edit",
+          String(target),
+          "--repo",
+          result.repo,
+          "--add-label",
+          CLAWSWEEPER_LABEL,
+        ]),
+      knownNoMutation: isAlreadyExistsError,
+      refreshAfterAcceptedMutation: true,
+    });
+    runRepairMutation(mutationContext, {
+      kind: "comment_create",
+      identity: {
+        repository: result.repo,
+        number: target,
+        bodySha256: createHash("sha256").update(commentBody).digest("hex"),
+      },
+      freshness,
+      operation: () =>
+        ghOneShot([
+          "issue",
+          "comment",
+          String(target),
+          "--repo",
+          result.repo,
+          "--body",
+          commentBody,
+        ]),
+      knownNoMutation: isLockedConversationCommentError,
+      refreshAfterAcceptedMutation: true,
+    });
+    runRepairMutation(mutationContext, {
+      kind: live.pull_request ? "pull_request_close" : "issue_close",
+      identity: {
+        repository: result.repo,
+        number: target,
+        stateReason: live.pull_request ? null : "completed",
+      },
+      freshness,
+      operation: () =>
+        live.pull_request
+          ? ghOneShot(["pr", "close", String(target), "--repo", result.repo])
+          : ghOneShot([
+              "issue",
+              "close",
+              String(target),
+              "--repo",
+              result.repo,
+              "--reason",
+              "completed",
+            ]),
+      knownNoMutation: isLockedConversationCommentError,
+    });
+  } catch (error) {
+    if (error instanceof RepairMutationFreshnessError) {
+      return postMergeCloseoutFreshnessBlock(base, finalized, error);
+    }
+    throw error;
+  }
+  const after = fetchIssue(result.repo, target);
+  return {
+    ...base,
+    status: after.state === "closed" ? "executed" : "blocked",
+    reason:
+      after.state === "closed" ? "closed after canonical fix merged" : `target is ${after.state}`,
+    live_state: after.state,
+    merge_commit_sha: finalized.merge_commit_sha ?? null,
+  };
+}
+
 function validateMergePolicy(action: LooseRecord, pull: LooseRecord) {
   if (isAutomergeReplacementMerge(action, pull)) return "";
   if (!job.frontmatter.allowed_actions.includes("merge")) return "job does not allow merge";
@@ -369,19 +619,75 @@ function hasLabel(labels: LooseRecord[], wanted: string) {
   );
 }
 
-function labelForClawSweeperReview(repo: string, number: JsonValue) {
-  ensureLabel(repo, CLAWSWEEPER_LABEL, CLAWSWEEPER_LABEL_COLOR, CLAWSWEEPER_LABEL_DESCRIPTION);
-  ghBestEffort(["issue", "edit", String(number), "--repo", repo, "--add-label", CLAWSWEEPER_LABEL]);
+function labelForClawSweeperReview(
+  context: RepairMutationContext,
+  freshness: RepairMutationFreshnessGuard,
+) {
+  ensureLabel(
+    context,
+    freshness,
+    CLAWSWEEPER_LABEL,
+    CLAWSWEEPER_LABEL_COLOR,
+    CLAWSWEEPER_LABEL_DESCRIPTION,
+  );
+  runRepairMutation(context, {
+    kind: "label_add",
+    identity: {
+      repository: context.repository,
+      number: context.number,
+      label: CLAWSWEEPER_LABEL,
+    },
+    freshness,
+    operation: () =>
+      ghOneShot([
+        "issue",
+        "edit",
+        String(context.number),
+        "--repo",
+        context.repository,
+        "--add-label",
+        CLAWSWEEPER_LABEL,
+      ]),
+    knownNoMutation: isAlreadyExistsError,
+    refreshAfterAcceptedMutation: true,
+  });
 }
 
-function ensureLabel(repo: string, name: string, color: JsonValue, description: JsonValue) {
+function ensureLabel(
+  context: RepairMutationContext,
+  freshness: RepairMutationFreshnessGuard,
+  name: string,
+  color: JsonValue,
+  description: JsonValue,
+) {
   try {
-    ghWithRetry(
-      ["label", "create", name, "--repo", repo, "--color", color, "--description", description],
-      2,
-    );
+    runRepairMutation(context, {
+      kind: "label_create",
+      identity: {
+        repository: context.repository,
+        label: name,
+        color: String(color),
+        descriptionSha256: createHash("sha256").update(String(description)).digest("hex"),
+      },
+      freshness,
+      operation: () =>
+        ghOneShot([
+          "label",
+          "create",
+          name,
+          "--repo",
+          context.repository,
+          "--color",
+          String(color),
+          "--description",
+          String(description),
+        ]),
+      knownNoMutation: isAlreadyExistsError,
+      refreshAfterAcceptedMutation: true,
+    });
   } catch (error) {
-    if (!/already exists/i.test(ghErrorText(error))) return;
+    if (isAlreadyExistsError(error)) return;
+    throw error;
   }
 }
 
@@ -676,6 +982,62 @@ function writeReport(report: LooseRecord, resultPath: string) {
   console.log(JSON.stringify(report, null, 2));
 }
 
+function normalizeIssueRef(value: JsonValue) {
+  return issueNumberFromRef(value);
+}
+
+function postFlightMutationContext({
+  action,
+  number,
+  targetKind,
+  operationKey,
+  sourceRevision,
+}: LooseRecord): RepairMutationContext {
+  const targetNumber = Number(number);
+  if (!Number.isSafeInteger(targetNumber) || targetNumber <= 0) {
+    throw new Error("post-flight mutation target number is invalid");
+  }
+  return {
+    phase: "post_flight",
+    repository: String(result.repo),
+    clusterId: String(result.cluster_id),
+    number: targetNumber,
+    targetKind: targetKind === "pull_request" ? "pull_request" : "issue",
+    operationKey: String(
+      operationKey ?? action.idempotency_key ?? action.pr_url ?? action.target ?? targetNumber,
+    ),
+    sourceRevision: String(sourceRevision ?? result.reviewed_sha ?? result.head_sha ?? "") || null,
+  };
+}
+
+function postFlightFreshnessBlock(
+  base: LooseRecord,
+  error: RepairMutationFreshnessError,
+  waitedMs: number,
+) {
+  return {
+    ...base,
+    status: "blocked",
+    reason: error.message,
+    ...(error.retryable ? { retry_recommended: true } : {}),
+    waited_ms: waitedMs,
+  };
+}
+
+function postMergeCloseoutFreshnessBlock(
+  base: LooseRecord,
+  finalized: LooseRecord,
+  error: RepairMutationFreshnessError,
+) {
+  return {
+    ...base,
+    status: "blocked",
+    reason: error.message,
+    ...(error.retryable ? { retry_recommended: true } : {}),
+    merge_commit_sha: finalized.merge_commit_sha ?? null,
+  };
+}
+
 function compactText(text: string, maxLength: number) {
   return compactPlainText(stripAnsi(text), maxLength);
 }
@@ -684,4 +1046,12 @@ function isRecoverableMergeRace(message: string) {
   return /pull request has merge conflicts|merge conflict|base branch was modified|head branch was modified|not mergeable/i.test(
     String(message ?? ""),
   );
+}
+
+function isRecoverableMergeRaceError(error: unknown) {
+  return isRecoverableMergeRace(ghErrorText(error));
+}
+
+function isAlreadyExistsError(error: unknown) {
+  return /\balready exists\b|\bHTTP\s*422\b/i.test(ghErrorText(error));
 }
