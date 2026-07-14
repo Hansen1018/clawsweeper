@@ -794,11 +794,11 @@ test("commit check publisher owns every privileged check write and installs atte
   );
   assert.match(
     publisher,
-    /Publish commit checks[\s\S]*publish-check[\s\S]*--continue-workflow[\s\S]*finish-review[\s\S]*--check-outcome success[\s\S]*--checks-requested true/,
+    /Publish commit checks[\s\S]*id: publish-checks[\s\S]*publish-check[\s\S]*--continue-workflow/,
   );
   assert.match(
     publisher,
-    /Finalize commit reviews without checks[\s\S]*finish-review[\s\S]*--check-outcome skipped[\s\S]*--checks-requested false/,
+    /Finalize commit review lifecycles[\s\S]*always\(\)[\s\S]*steps\.verify-review-bundles\.outcome == 'success'[\s\S]*ATTEST_OUTCOME:[\s\S]*PUBLISH_CHECKS_OUTCOME:[\s\S]*PUBLISH_REPORTS_OUTCOME:[\s\S]*finish-review[\s\S]*--review-outcome "\$review_outcome"[\s\S]*--check-outcome "\$check_outcome"[\s\S]*--checks-requested "\$CHECKS_REQUESTED"/,
   );
   assert.doesNotMatch(publisher, /finish-review[\s\S]{0,400}--start-workflow/);
   assert.ok(

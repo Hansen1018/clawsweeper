@@ -598,6 +598,7 @@ jobs:
           run-id: ${{ github.run_id }}
 
       - name: Verify current-attempt commit review bundles
+        id: verify-review-bundles
         if: ${{ needs.plan.outputs.planned_count != '0' }}
         env:
           EXPECTED_COMMIT_MATRIX: ${{ needs.plan.outputs.matrix }}
@@ -682,6 +683,7 @@ jobs:
             >> "$GITHUB_ENV"
 
       - name: Attest current-attempt commit review reports
+        id: attest-reports
         if: ${{ needs.plan.outputs.planned_count != '0' }}
         env:
           EXPECTED_TARGET_REPO: ${{ needs.plan.outputs.target_repo }}
@@ -764,6 +766,7 @@ jobs:
           permission-checks: write
 
       - name: Publish commit checks
+        id: publish-checks
         if: ${{ needs.plan.outputs.create_checks == 'true' }}
         env:
           GH_TOKEN: ${{ steps.target-checks-token.outputs.token }}
@@ -781,29 +784,40 @@ jobs:
               --report-repo openclaw/clawsweeper-state \
               --report-revision "${{ steps.publish-reports.outputs.state_revision }}" \
               --continue-workflow
-            node dist/commit-sweeper.js finish-review \
-              --target-repo "${{ needs.plan.outputs.target_repo }}" \
-              --commit-sha "$sha" \
-              --report-path "$report_path" \
-              --review-outcome success \
-              --check-outcome success \
-              --checks-requested true
           done
 
-      - name: Finalize commit reviews without checks
-        if: ${{ needs.plan.outputs.planned_count != '0' && needs.plan.outputs.create_checks != 'true' }}
+      - name: Finalize commit review lifecycles
+        if: ${{ always() && needs.plan.outputs.planned_count != '0' && steps.publish-setup-pnpm.outcome == 'success' && steps.verify-review-bundles.outcome == 'success' }}
+        env:
+          ATTEST_OUTCOME: ${{ steps.attest-reports.outcome }}
+          CHECKS_REQUESTED: ${{ needs.plan.outputs.create_checks }}
+          PUBLISH_CHECKS_OUTCOME: ${{ steps.publish-checks.outcome }}
+          PUBLISH_REPORTS_OUTCOME: ${{ steps.publish-reports.outcome }}
         run: |
           set -euo pipefail
-          find commit-artifacts -name '*.md' -print0 | while IFS= read -r -d '' report_path; do
-            sha="$(basename "$report_path" .md)"
+          review_outcome=success
+          if [ "$ATTEST_OUTCOME" != "success" ] ||
+             [ "$PUBLISH_REPORTS_OUTCOME" != "success" ]; then
+            review_outcome=failure
+          fi
+          check_outcome=skipped
+          if [ "$CHECKS_REQUESTED" = "true" ]; then
+            case "$PUBLISH_CHECKS_OUTCOME" in
+              success|failure|cancelled) check_outcome="$PUBLISH_CHECKS_OUTCOME" ;;
+              *) check_outcome=skipped ;;
+            esac
+          fi
+          while IFS= read -r sha; do
+            report_path="$(find commit-artifacts -type f -name "${sha}.md" -print -quit)"
             node dist/commit-sweeper.js finish-review \
               --target-repo "${{ needs.plan.outputs.target_repo }}" \
               --commit-sha "$sha" \
               --report-path "$report_path" \
-              --review-outcome success \
-              --check-outcome skipped \
-              --checks-requested false
-          done
+              --review-outcome "$review_outcome" \
+              --check-outcome "$check_outcome" \
+              --checks-requested "$CHECKS_REQUESTED" \
+              --error-kind "publisher:attest=$ATTEST_OUTCOME,reports=$PUBLISH_REPORTS_OUTCOME,checks=$PUBLISH_CHECKS_OUTCOME"
+          done < .artifacts/expected-commit-review-shas.txt
 
       - name: Continue commit review range
         if: ${{ success() && needs.plan.outputs.has_more == 'true' }}
