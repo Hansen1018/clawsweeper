@@ -679,11 +679,19 @@ export class LocalGitcrawlQuerySource implements GitcrawlQuerySource {
       clusterTable,
       columnExists(this.db, clusterTable, "updated_at") ? "updated_at" : "created_at",
     );
-    const currentSchema =
+    const clusterRunSupport =
       this.portable &&
       tableExists(this.db, "cluster_runs") &&
+      columnExists(this.db, "cluster_runs", "started_at") &&
       columnExists(this.db, "cluster_runs", "finished_at") &&
       columnExists(this.db, "cluster_memberships", "last_seen_run_id");
+    const portableExportedAt = this.portableMetadata("exported_at");
+    const portableGenerationSupport =
+      this.portable &&
+      !clusterRunSupport &&
+      portableExportedAt !== "" &&
+      columnExists(this.db, "cluster_memberships", "last_seen_run_id");
+    const currentSchema = clusterRunSupport || portableGenerationSupport;
     if (!currentSchema) {
       return [
         metric(
@@ -709,17 +717,28 @@ export class LocalGitcrawlQuerySource implements GitcrawlQuerySource {
       ];
     }
 
-    const latestRun = this.db
-      .prepare(
-        `select id, finished_at
-         from cluster_runs
-         where repo_id = ? and status in ('success', 'completed') and finished_at is not null
-         order by id desc
-         limit 1`,
-      )
-      .get(this.repoId);
+    const latestRun = clusterRunSupport
+      ? this.db
+          .prepare(
+            `select id, started_at, finished_at
+             from cluster_runs
+             where repo_id = ? and status in ('success', 'completed') and finished_at is not null
+             order by id desc
+             limit 1`,
+          )
+          .get(this.repoId)
+      : this.db
+          .prepare(
+            `select max(cm.last_seen_run_id) as id
+             from cluster_memberships cm
+             join cluster_groups c on c.id = cm.cluster_id
+             where c.repo_id = ? and c.status = 'active' and cm.state = 'active'`,
+          )
+          .get(this.repoId);
     const latestRunId = Number(latestRun?.id ?? 0);
-    const latestRunAt = String(latestRun?.finished_at ?? "");
+    const latestRunAt = clusterRunSupport
+      ? String(latestRun?.finished_at ?? "")
+      : portableExportedAt;
     const hasLatestRun =
       Number.isSafeInteger(latestRunId) &&
       latestRunId > 0 &&
@@ -1096,7 +1115,23 @@ export class LocalGitcrawlQuerySource implements GitcrawlQuerySource {
       ),
       this.repositoryTableMax("pull_request_details", "fetched_at"),
       this.repositoryTableMax("pull_request_files", "fetched_at"),
+      this.portableMetadata("exported_at"),
     );
+  }
+
+  private portableMetadata(key: string): string {
+    if (
+      !this.portable ||
+      !tableExists(this.db, "portable_metadata") ||
+      !columnExists(this.db, "portable_metadata", "key") ||
+      !columnExists(this.db, "portable_metadata", "value")
+    ) {
+      return "";
+    }
+    const value = this.db
+      .prepare("select value from portable_metadata where key = ?")
+      .get(key)?.value;
+    return typeof value === "string" ? value : "";
   }
 
   private enrichmentSelects(alias: string): string {
@@ -1576,6 +1611,12 @@ function localSourceSyncAt(db: DatabaseSync, repoId: number, repository: string)
   }
   const reconciled = completeOpenReconciliationAt(db, repoId);
   if (reconciled) candidates.push(reconciled);
+  if (candidates.length === 0 && tableExists(db, "portable_metadata")) {
+    const exportedAt = db
+      .prepare("select value from portable_metadata where key = 'exported_at'")
+      .get()?.value;
+    if (typeof exportedAt === "string") candidates.push(exportedAt);
+  }
   return latestTimestamp(...candidates);
 }
 

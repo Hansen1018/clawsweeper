@@ -1069,6 +1069,38 @@ test("local coverage rejects active clusters without valid memberships", async (
   }
 });
 
+test("local portable cluster coverage binds to exported metadata", async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-query-portable-"));
+  const dbPath = path.join(directory, "gitcrawl.db");
+  seedLocalDatabase(dbPath);
+  const db = new DatabaseSync(dbPath);
+  db.exec(`
+    drop table cluster_runs;
+    drop table sync_runs;
+  `);
+  db.close();
+  const source = await LocalGitcrawlQuerySource.open({
+    dbPath,
+    repository,
+    allowLegacy: false,
+  });
+  const adapter = await GitcrawlEvidenceAdapter.fromSources({
+    repository,
+    provider: "local",
+    primarySource: source,
+    now: () => now,
+  });
+  try {
+    assert.equal((await adapter.listClusters()).rows[0]?.id, 7);
+    assert.equal((await adapter.clusterMembers(7)).rows[0]?.number, 42);
+    assert.equal(adapter.provenance.source_sync_at, generatedAt);
+    assert.equal(adapter.provenance.dataset_generated_at, generatedAt);
+  } finally {
+    await adapter.close();
+    fs.rmSync(directory, { force: true, recursive: true });
+  }
+});
+
 test("local cluster coverage requires the latest successful run", async (t) => {
   for (const scenario of ["missing", "stale", "predates-source"] as const) {
     await t.test(scenario, async () => {
