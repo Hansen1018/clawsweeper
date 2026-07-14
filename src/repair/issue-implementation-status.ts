@@ -11,7 +11,7 @@ import {
 import { DEFAULT_TRUSTED_BOTS } from "./config.js";
 import { repoSlug } from "./comment-router-core.js";
 import { isAllowedMutationActor, writePayload } from "./comment-router-utils.js";
-import { ghJson, ghJsonWithRetry, ghPagedWithRetry, ghText } from "./github-cli.js";
+import { ghErrorText, ghJson, ghJsonWithRetry, ghPagedWithRetry, ghText } from "./github-cli.js";
 import type { JsonValue, LooseRecord } from "./json-types.js";
 import { parseArgs, parseJob, repoRoot } from "./lib.js";
 import {
@@ -190,6 +190,8 @@ async function main() {
         body,
       },
       component: "issue_implementation_status",
+      operationName: "status",
+      knownNoMutation: isDefinitiveGitHubCommentRejection,
       operation: mutateComment,
     });
   mutateCommentWithReceipt();
@@ -485,6 +487,12 @@ class DashboardIngestError extends Error {
 
 export function dashboardFailureOutcome(error: unknown): RepairMutationOutcome {
   return error instanceof DashboardIngestError ? error.mutationOutcome : "unknown";
+}
+
+export function isDefinitiveGitHubCommentRejection(error: unknown): boolean {
+  return /\b(?:HTTP|status(?: code)?)\s*:?\s*(?:400|401|403|404|405|406|407|410|411|413|414|415|416|417|421|422|426|428|431|451)\b/i.test(
+    ghErrorText(error),
+  );
 }
 
 function eventTypeForState(state: string) {

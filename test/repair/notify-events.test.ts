@@ -417,7 +417,7 @@ test("durable claims recover only after the publication workflow attempt is term
   }
 });
 
-test("accepted and ambiguous durable receipts prevent notification claim replay", async () => {
+test("accepted hook receipts recover a checkpoint while unsafe receipts prevent replay", async () => {
   const deliveries = [
     { kind: "notification_delivery", destination: "openclaw_hook" },
     { kind: "status_dashboard_delivery", destination: "status_dashboard" },
@@ -535,18 +535,173 @@ test("accepted and ambiguous durable receipts prevent notification claim replay"
         });
 
         assert.equal(retry.sent, 0);
-        assert.equal(retry.skipped, 1);
+        const recoversHookCheckpoint =
+          deliveryIdentity.destination === "openclaw_hook" && outcome === "accepted";
+        assert.equal(retry.skipped, recoversHookCheckpoint ? 0 : 1);
         assert.equal(deliveryCalls, 0);
         const retainedClaim = JSON.parse(
           fs.readFileSync(path.join(root, "notifications/clawsweeper-event-ledger.json"), "utf8"),
         ).notifications[0];
-        assert.equal(retainedClaim.deliveryStatus, "hook_claimed");
-        assert.equal(retainedClaim.claimRunAttempt, "1");
+        assert.equal(
+          retainedClaim.deliveryStatus,
+          recoversHookCheckpoint ? "hook_accepted" : "hook_claimed",
+        );
+        assert.equal(retainedClaim.claimRunAttempt, recoversHookCheckpoint ? "2" : "1");
       } finally {
         restoreEnv(previous);
         fs.rmSync(root, { recursive: true, force: true });
       }
     }
+  }
+});
+
+test("dashboard retries recover an accepted hook receipt after an ambiguous dashboard failure", async () => {
+  const root = fs.realpathSync(
+    fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-events-dashboard-recovery-")),
+  );
+  const outputRoot = path.join(root, "action-ledger-output");
+  fs.mkdirSync(outputRoot);
+  fs.writeFileSync(
+    path.join(root, "repair-apply-report.json"),
+    `${JSON.stringify([
+      {
+        repo: "openclaw/openclaw",
+        target: "#123",
+        action: "close_duplicate",
+        status: "executed",
+        run_id: "987",
+        published_at: "2026-05-02T10:00:00Z",
+      },
+    ])}\n`,
+  );
+  const baseEnv = {
+    CLAWSWEEPER_OPENCLAW_HOOK_URL: "https://claw.example/hooks",
+    CLAWSWEEPER_OPENCLAW_HOOK_TOKEN: "secret",
+    CLAWSWEEPER_DISCORD_TARGET: "channel:123",
+    GITHUB_REPOSITORY: "openclaw/clawsweeper",
+    GITHUB_JOB: "notification",
+    GITHUB_RUN_ID: "5252",
+    GITHUB_RUN_ATTEMPT: "1",
+  };
+  const previous = { ...process.env };
+
+  try {
+    await runClawSweeperEventNotifier(["--run-id", "987", "--prepare-only"], {
+      root,
+      env: baseEnv,
+      now: () => new Date("2026-05-02T11:00:00Z"),
+      log: () => undefined,
+    });
+    const claim = JSON.parse(
+      fs.readFileSync(path.join(root, "notifications/clawsweeper-event-ledger.json"), "utf8"),
+    ).notifications[0];
+
+    Object.assign(process.env, notificationWorkflowEnv(root, outputRoot));
+    await deliverNotificationAttempt(
+      { repository: claim.repo, key: claim.key, number: 123 },
+      {
+        kind: "notification_delivery",
+        destination: "openclaw_hook",
+        operation: async () => ({ runId: "hook-accepted" }),
+      },
+    );
+    await assert.rejects(
+      deliverNotificationAttempt(
+        { repository: claim.repo, key: claim.key, number: 123 },
+        {
+          kind: "status_dashboard_delivery",
+          destination: "status_dashboard",
+          operation: async () => {
+            throw new Error("dashboard response lost after dispatch");
+          },
+        },
+      ),
+      /dashboard response lost after dispatch/,
+    );
+    await flushRepairActionEvents();
+    restoreEnv(previous);
+
+    const recovered = await runClawSweeperEventNotifier(["--run-id", "987", "--prepare-only"], {
+      root,
+      env: {
+        ...baseEnv,
+        CLAWSWEEPER_STATE_DIR: outputRoot,
+        GITHUB_RUN_ATTEMPT: "2",
+      },
+      fetch: async (input) => {
+        const url = String(input);
+        if (url.endsWith("/actions/runs/5252/attempts/1")) {
+          return Response.json({
+            id: 5252,
+            run_attempt: 1,
+            status: "completed",
+            created_at: "2026-07-12T10:00:00Z",
+          });
+        }
+        assert.match(url, /actions\/runs\/5252\/attempts\/1\/jobs\?/);
+        return Response.json({
+          total_count: 1,
+          jobs: [
+            {
+              run_id: 5252,
+              run_attempt: 1,
+              status: "completed",
+              steps: [
+                { name: "Commit notification claims", conclusion: "success" },
+                {
+                  name: "Notify OpenClaw about ClawSweeper events",
+                  conclusion: "failure",
+                },
+              ],
+            },
+          ],
+        });
+      },
+      now: () => new Date("2026-05-02T11:02:00Z"),
+      log: () => undefined,
+    });
+
+    assert.equal(recovered.skipped, 0);
+    const checkpoint = JSON.parse(
+      fs.readFileSync(path.join(root, "notifications/clawsweeper-event-ledger.json"), "utf8"),
+    ).notifications[0];
+    assert.equal(checkpoint.deliveryStatus, "hook_accepted");
+    assert.equal(checkpoint.claimRunAttempt, "2");
+
+    let hookCalls = 0;
+    let dashboardCalls = 0;
+    const completed = await runClawSweeperEventNotifier(["--run-id", "987"], {
+      root,
+      env: {
+        ...baseEnv,
+        GITHUB_RUN_ATTEMPT: "2",
+        CLAWSWEEPER_EVENT_NOTIFY_REQUIRE_DURABLE_CLAIM: "1",
+        CLAWSWEEPER_STATUS_INGEST_URL: "https://status.example/api/events",
+        CLAWSWEEPER_STATUS_INGEST_TOKEN: "status-secret",
+      },
+      fetch: async (input) => {
+        if (String(input).startsWith("https://status.example/")) {
+          dashboardCalls += 1;
+          return Response.json({ ok: true });
+        }
+        hookCalls += 1;
+        return Response.json({ runId: "duplicate-hook" });
+      },
+      now: () => new Date("2026-05-02T11:05:00Z"),
+      log: () => undefined,
+    });
+
+    assert.equal(completed.sent, 1);
+    assert.equal(hookCalls, 0);
+    assert.equal(dashboardCalls, 1);
+    const ledger = JSON.parse(
+      fs.readFileSync(path.join(root, "notifications/clawsweeper-event-ledger.json"), "utf8"),
+    ).notifications[0];
+    assert.equal(ledger.deliveryStatus, "sent");
+    assert.equal(ledger.claimRunAttempt, "2");
+  } finally {
+    restoreEnv(previous);
+    fs.rmSync(root, { recursive: true, force: true });
   }
 });
 

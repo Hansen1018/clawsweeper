@@ -41,9 +41,10 @@ type NotificationClaimOwner = {
 };
 type NotificationClaimRecoveryDecision =
   | { status: "recoverable"; reason: string }
+  | { status: "hook_accepted"; reason: string }
   | { status: "active" | "unsafe" | "unknown"; reason: string };
 type NotificationReceiptEvidence =
-  | { status: "none" | "rejected"; reason: string }
+  | { status: "none" | "accepted" | "rejected"; reason: string }
   | { status: "unsafe" | "unknown"; reason: string };
 
 export type ClawSweeperEvent = {
@@ -121,11 +122,6 @@ const ACTIVE_WORKFLOW_STATUSES = new Set([
   "pending",
   "waiting",
   "requested",
-]);
-const UNSAFE_NOTIFICATION_COMPLETION_REASONS = new Set([
-  "mutation_accepted",
-  "mutation_observed",
-  "mutation_outcome_unknown",
 ]);
 const NOTIFICATION_RECEIPT_PRODUCER_PATTERN = /^notification\.[A-Za-z0-9_.-]+\.[A-Za-z0-9_.-]+$/;
 const MAX_NOTIFICATION_RECEIPT_PRODUCERS = 32;
@@ -466,14 +462,21 @@ export async function runClawSweeperEventNotifier(
               return receipts;
             },
           });
-          if (decision.status === "recoverable") {
-            recordNotificationPhase(ledgerInput, "planned", "durable_claim_recovered");
+          if (decision.status === "recoverable" || decision.status === "hook_accepted") {
+            recordNotificationPhase(
+              ledgerInput,
+              "planned",
+              decision.status === "hook_accepted"
+                ? "durable_hook_checkpoint_recovered"
+                : "durable_claim_recovered",
+            );
             const claimedAt = now().toISOString();
             nextLedger = addEventLedgerEntry(nextLedger, event, {
               notifiedAt: claimedAt,
-              hookRunId: null,
+              hookRunId: decision.status === "hook_accepted" ? existing.hookRunId : null,
               discordTarget: existing.discordTarget ?? config.discordTarget,
-              deliveryStatus: "hook_claimed",
+              deliveryStatus:
+                decision.status === "hook_accepted" ? "hook_accepted" : "hook_claimed",
               claimRunId: claimOwner.runId,
               claimRunAttempt: claimOwner.runAttempt,
             });
@@ -875,27 +878,48 @@ async function notificationClaimRecoveryDecision({
     };
   }
 
-  let receipts: NotificationReceiptEvidence;
+  let receiptEvents: ActionEvent[];
   try {
-    receipts = notificationReceiptEvidence(
-      entry,
-      priorOwner,
-      readDurableReceiptEvents(priorOwner, run),
-    );
+    receiptEvents = readDurableReceiptEvents(priorOwner, run);
   } catch (error) {
     return {
       status: "unknown",
       reason: `durable notification receipts could not be inspected: ${errorText(error)}`,
     };
   }
-  if (receipts.status === "unsafe" || receipts.status === "unknown") {
-    return { status: receipts.status, reason: receipts.reason };
+
+  const hookReceipts = notificationReceiptEvidence(entry, priorOwner, receiptEvents, {
+    kind: "notification_delivery",
+    destination: "openclaw_hook",
+  });
+  const dashboardReceipts = notificationReceiptEvidence(entry, priorOwner, receiptEvents, {
+    kind: "status_dashboard_delivery",
+    destination: "status_dashboard",
+  });
+  if (hookReceipts.status === "unsafe" || hookReceipts.status === "unknown") {
+    return { status: hookReceipts.status, reason: hookReceipts.reason };
   }
-  if (receipts.status !== "rejected") {
+
+  if (hookReceipts.status === "accepted") {
+    return {
+      status: "hook_accepted",
+      reason: `recovered accepted OpenClaw hook checkpoint from terminal workflow run ${priorOwner.runId} attempt ${priorOwner.runAttempt}; status dashboard receipt is ${dashboardReceipts.status}`,
+    };
+  }
+  if (dashboardReceipts.status === "unsafe" || dashboardReceipts.status === "unknown") {
+    return { status: dashboardReceipts.status, reason: dashboardReceipts.reason };
+  }
+  if (dashboardReceipts.status === "accepted") {
+    return {
+      status: "unsafe",
+      reason: "durable status dashboard receipt was accepted without an accepted hook receipt",
+    };
+  }
+  if (hookReceipts.status !== "rejected") {
     return {
       status: "unknown",
       reason:
-        "prior notification step ran without a durable no-mutation receipt; delivery outcome unknown",
+        "prior notification step ran without a durable OpenClaw hook receipt; delivery outcome unknown",
     };
   }
   return {
@@ -916,22 +940,16 @@ function notificationReceiptEvidence(
   entry: ClawSweeperEventLedgerEntry,
   owner: NotificationClaimOwner,
   events: readonly ActionEvent[],
+  delivery: NotificationDeliveryIdentity,
 ): NotificationReceiptEvidence {
   const ledgerInput = eventNotificationLedgerInput(entry);
   const lifecycle = notificationLifecycleInput(ledgerInput);
-  const idempotencyKeys = new Set(
-    [
-      { kind: "notification_delivery", destination: "openclaw_hook" },
-      { kind: "status_dashboard_delivery", destination: "status_dashboard" },
-    ].map((delivery) =>
-      actionIdempotencyKey(
-        repairMutationIdempotencyIdentity(lifecycle, {
-          kind: delivery.kind,
-          operationName: "notification",
-          identity: { key: ledgerInput.key, destination: delivery.destination },
-        }),
-      ),
-    ),
+  const idempotencyKey = actionIdempotencyKey(
+    repairMutationIdempotencyIdentity(lifecycle, {
+      kind: delivery.kind,
+      operationName: "notification",
+      identity: { key: ledgerInput.key, destination: delivery.destination },
+    }),
   );
   const matching = events
     .filter(
@@ -940,7 +958,7 @@ function notificationReceiptEvidence(
         event.subject.subject_id === lifecycle.subjectId &&
         event.producer.run_id === owner.runId &&
         String(event.producer.run_attempt) === owner.runAttempt &&
-        idempotencyKeys.has(event.idempotency_key_sha256),
+        event.idempotency_key_sha256 === idempotencyKey,
     )
     .sort(
       (left, right) =>
@@ -953,34 +971,45 @@ function notificationReceiptEvidence(
   }
 
   let attempted = 0;
+  let accepted = 0;
   let rejected = 0;
+  let unknown = 0;
   for (const event of matching) {
     const completionReason = String(event.attributes?.completion_reason ?? "");
-    if (UNSAFE_NOTIFICATION_COMPLETION_REASONS.has(completionReason)) {
-      return {
-        status: "unsafe",
-        reason: `durable notification receipt is ${completionReason}; delivery will not be replayed`,
-      };
-    }
     if (completionReason === "mutation_attempted") attempted += 1;
+    if (completionReason === "mutation_accepted" || completionReason === "mutation_observed") {
+      accepted += 1;
+    }
     if (completionReason === "mutation_rejected") rejected += 1;
+    if (completionReason === "mutation_outcome_unknown") unknown += 1;
   }
-  if (attempted > rejected) {
+  if (attempted > accepted + rejected + unknown) {
     return {
       status: "unsafe",
-      reason:
-        "durable notification receipt has an unresolved mutation attempt; delivery will not be replayed",
+      reason: `durable ${delivery.destination} receipt has an unresolved mutation attempt; delivery will not be replayed`,
+    };
+  }
+  if (unknown > 0) {
+    return {
+      status: "unsafe",
+      reason: `durable ${delivery.destination} receipt is mutation_outcome_unknown; delivery will not be replayed`,
+    };
+  }
+  if (accepted > 0) {
+    return {
+      status: "accepted",
+      reason: `durable ${delivery.destination} receipts prove delivery mutation was accepted`,
     };
   }
   if (rejected > 0) {
     return {
       status: "rejected",
-      reason: "durable notification receipts prove no delivery mutation was accepted",
+      reason: `durable ${delivery.destination} receipts prove no delivery mutation was accepted`,
     };
   }
   return {
     status: "unknown",
-    reason: "durable notification receipts do not prove a safe recovery state",
+    reason: `durable ${delivery.destination} receipts do not prove a safe recovery state`,
   };
 }
 
