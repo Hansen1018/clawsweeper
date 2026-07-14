@@ -898,6 +898,29 @@ jobs:
             --paths-file "$event_paths_file" \
             --message "chore: append execute-fix action ledger"
 
+      - name: Renew state token for post-flight
+        id: state_post_flight_token
+        if: ${{ always() && steps.check_job.outputs.job_exists == '1' && steps.self_heal_head.outputs.matched != 'false' }}
+        uses: ./.github/actions/create-state-token
+        with:
+          client-id: ${{ env.CLAWSWEEPER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
+
+      - name: Rebind state checkout credentials
+        id: state_post_flight_credentials
+        if: ${{ always() && steps.state_post_flight_token.outcome == 'success' }}
+        env:
+          STATE_TOKEN: ${{ steps.state_post_flight_token.outputs.token }}
+        run: |
+          set -euo pipefail
+          : "${CLAWSWEEPER_STATE_DIR:?state checkout is required}"
+          : "${STATE_TOKEN:?fresh state token is required}"
+          auth="$(printf 'x-access-token:%s' "$STATE_TOKEN" | base64 | tr -d '\n')"
+          echo "::add-mask::$auth"
+          git -C "$CLAWSWEEPER_STATE_DIR" config --local --replace-all \
+            http.https://github.com/.extraheader "AUTHORIZATION: basic $auth"
+          git -C "$CLAWSWEEPER_STATE_DIR" ls-remote --exit-code origin refs/heads/state >/dev/null
+
       - name: Renew target write token for post-flight
         id: target_post_flight_token
         if: ${{ always() && steps.check_job.outputs.job_exists == '1' && steps.self_heal_head.outputs.matched != 'false' }}
@@ -913,7 +936,7 @@ jobs:
           permission-workflows: write
 
       - name: Publish deferred fix outcome
-        if: ${{ always() && steps.check_job.outputs.job_exists == '1' && steps.self_heal_head.outputs.matched != 'false' && env.CLAWSWEEPER_ALLOW_EXECUTE == '1' }}
+        if: ${{ always() && steps.state_post_flight_credentials.outcome == 'success' && steps.check_job.outputs.job_exists == '1' && steps.self_heal_head.outputs.matched != 'false' && env.CLAWSWEEPER_ALLOW_EXECUTE == '1' }}
         env:
           GH_TOKEN: ${{ steps.target_post_flight_token.outputs.token }}
           CLAWSWEEPER_ALLOWED_OWNER: ${{ steps.target.outputs.target_owner }}
@@ -924,7 +947,7 @@ jobs:
         run: pnpm run repair:action-session -- update --state running --phase post_flight --summary "Codex changes validated; applying GitHub post-flight gates"
 
       - name: Apply safe closure actions
-        if: ${{ steps.check_job.outputs.job_exists == '1' && steps.self_heal_head.outputs.matched != 'false' && env.CLAWSWEEPER_ALLOW_EXECUTE == '1' }}
+        if: ${{ steps.state_post_flight_credentials.outcome == 'success' && steps.check_job.outputs.job_exists == '1' && steps.self_heal_head.outputs.matched != 'false' && env.CLAWSWEEPER_ALLOW_EXECUTE == '1' }}
         env:
           GH_TOKEN: ${{ steps.target_post_flight_token.outputs.token }}
           CLAWSWEEPER_ALLOWED_OWNER: ${{ steps.target.outputs.target_owner }}
@@ -932,14 +955,14 @@ jobs:
 
       - name: Post-flight finalize fix PRs
         id: post_flight
-        if: ${{ steps.check_job.outputs.job_exists == '1' && steps.self_heal_head.outputs.matched != 'false' && env.CLAWSWEEPER_ALLOW_EXECUTE == '1' && env.CLAWSWEEPER_ALLOW_FIX_PR == '1' }}
+        if: ${{ steps.state_post_flight_credentials.outcome == 'success' && steps.check_job.outputs.job_exists == '1' && steps.self_heal_head.outputs.matched != 'false' && env.CLAWSWEEPER_ALLOW_EXECUTE == '1' && env.CLAWSWEEPER_ALLOW_FIX_PR == '1' }}
         env:
           GH_TOKEN: ${{ steps.target_post_flight_token.outputs.token }}
           CLAWSWEEPER_ALLOWED_OWNER: ${{ steps.target.outputs.target_owner }}
         run: pnpm run repair:post-flight -- "${{ inputs.job }}" --latest
 
       - name: Apply post-flight closeouts
-        if: ${{ steps.check_job.outputs.job_exists == '1' && steps.self_heal_head.outputs.matched != 'false' && env.CLAWSWEEPER_ALLOW_EXECUTE == '1' }}
+        if: ${{ steps.state_post_flight_credentials.outcome == 'success' && steps.check_job.outputs.job_exists == '1' && steps.self_heal_head.outputs.matched != 'false' && env.CLAWSWEEPER_ALLOW_EXECUTE == '1' }}
         env:
           GH_TOKEN: ${{ steps.target_post_flight_token.outputs.token }}
           CLAWSWEEPER_ALLOWED_OWNER: ${{ steps.target.outputs.target_owner }}
@@ -1094,7 +1117,7 @@ jobs:
             > .artifacts/repair-requeue-action-ledger-manifest.json
 
       - name: Publish immutable repair requeue action ledger
-        if: ${{ always() && steps.execute-setup-pnpm.outcome == 'success' && steps.repair-requeue-ledger.outcome == 'success' && steps.repair_requeue.outputs.count != '' && steps.repair_requeue.outputs.count != '0' }}
+        if: ${{ always() && steps.state_post_flight_credentials.outcome == 'success' && steps.execute-setup-pnpm.outcome == 'success' && steps.repair-requeue-ledger.outcome == 'success' && steps.repair_requeue.outputs.count != '' && steps.repair_requeue.outputs.count != '0' }}
         run: |
           set -euo pipefail
           test -n "${CLAWSWEEPER_STATE_DIR:-}"

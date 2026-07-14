@@ -83,7 +83,7 @@ test("direct repair requeues forward a stable dispatch receipt and publish it", 
   );
   assert.match(
     publishStep,
-    /if: \$\{\{ always\(\) && steps\.execute-setup-pnpm\.outcome == 'success' && steps\.repair-requeue-ledger\.outcome == 'success' && steps\.repair_requeue\.outputs\.count != '' && steps\.repair_requeue\.outputs\.count != '0' \}\}/,
+    /if: \$\{\{ always\(\) && steps\.state_post_flight_credentials\.outcome == 'success' && steps\.execute-setup-pnpm\.outcome == 'success' && steps\.repair-requeue-ledger\.outcome == 'success' && steps\.repair_requeue\.outputs\.count != '' && steps\.repair_requeue\.outputs\.count != '0' \}\}/,
   );
   assertCommandFinalizerUsesCanonicalRoot(finalizeStep);
   assertCommandPublisherUsesCanonicalRoot(publishStep);

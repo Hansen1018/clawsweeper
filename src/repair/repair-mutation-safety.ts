@@ -1,4 +1,4 @@
-import type { ActionEvent } from "../action-ledger.js";
+import { actionIdempotencyKey, type ActionEvent } from "../action-ledger.js";
 import {
   ReviewedPrActivityChangedDuringReadError,
   isReviewedPrActivityCursor,
@@ -43,6 +43,10 @@ export type RepairMutationFreshnessGuard = {
   acceptOwnedMutation: (mutationKind: string, change: RepairMutationOwnedChange) => void;
 };
 
+export type RepairMutationBoundaryGuard = {
+  assertFresh: (mutationKind: string) => void;
+};
+
 type RepairMutationFreshnessOptions = {
   repository: string;
   number: number;
@@ -57,6 +61,7 @@ type RepairMutationOptions<T> = {
   kind: string;
   identity: unknown;
   freshness: RepairMutationFreshnessGuard;
+  boundaryGuards?: readonly RepairMutationBoundaryGuard[];
   operation: () => T;
   knownNoMutation?: (error: unknown) => boolean;
   outcome?: (result: T) => RepairMutationOutcome;
@@ -140,8 +145,8 @@ export function createRepairMutationFreshnessGuard(
 
   return {
     assertFresh(mutationKind: string) {
-      const current = readRequiredTargetActivity(readTargetActivity, mutationKind);
-      if (!sameRepairTargetActivity(current, expectedTargetActivity)) {
+      const beforeReview = readRequiredTargetActivity(readTargetActivity, mutationKind);
+      if (!sameRepairTargetActivity(beforeReview, expectedTargetActivity)) {
         throw new RepairMutationFreshnessError(
           mutationKind,
           "target activity changed after repair validation",
@@ -149,10 +154,18 @@ export function createRepairMutationFreshnessGuard(
         );
       }
       assertReviewActivityFresh(mutationKind);
+      const afterReview = readRequiredTargetActivity(readTargetActivity, mutationKind);
+      if (!sameRepairTargetActivity(afterReview, expectedTargetActivity)) {
+        throw new RepairMutationFreshnessError(
+          mutationKind,
+          "target activity changed while review activity was being refreshed",
+          false,
+        );
+      }
     },
     acceptOwnedMutation(mutationKind: string, change: RepairMutationOwnedChange) {
-      const current = readRequiredTargetActivity(readTargetActivity, mutationKind);
-      if (!repairTargetActivityMatchesOwnedChange(expectedTargetActivity, current, change)) {
+      const beforeReview = readRequiredTargetActivity(readTargetActivity, mutationKind);
+      if (!repairTargetActivityMatchesOwnedChange(expectedTargetActivity, beforeReview, change)) {
         throw new RepairMutationFreshnessError(
           mutationKind,
           "target activity changed concurrently with the ClawSweeper mutation",
@@ -160,7 +173,47 @@ export function createRepairMutationFreshnessGuard(
         );
       }
       assertReviewActivityFresh(mutationKind);
-      expectedTargetActivity = current;
+      const afterReview = readRequiredTargetActivity(readTargetActivity, mutationKind);
+      if (!sameRepairTargetActivity(afterReview, beforeReview)) {
+        throw new RepairMutationFreshnessError(
+          mutationKind,
+          "target activity changed while owned mutation activity was being accepted",
+          false,
+        );
+      }
+      expectedTargetActivity = afterReview;
+    },
+  };
+}
+
+export function createRepairMutationBoundaryGuard(options: {
+  expectedState: unknown;
+  readState: () => unknown;
+  changedReason: string;
+  readFailureReason: string;
+  retryableOnChange?: boolean;
+  retryableOnReadFailure?: boolean;
+}): RepairMutationBoundaryGuard {
+  const expectedDigest = actionIdempotencyKey(options.expectedState);
+  return {
+    assertFresh(mutationKind: string) {
+      let currentState: unknown;
+      try {
+        currentState = options.readState();
+      } catch {
+        throw new RepairMutationFreshnessError(
+          mutationKind,
+          options.readFailureReason,
+          options.retryableOnReadFailure ?? true,
+        );
+      }
+      if (actionIdempotencyKey(currentState) !== expectedDigest) {
+        throw new RepairMutationFreshnessError(
+          mutationKind,
+          options.changedReason,
+          options.retryableOnChange ?? false,
+        );
+      }
     },
   };
 }
@@ -171,7 +224,7 @@ export function runRepairMutation<T>(
 ): T {
   ensureRepairMutationActionLedger();
   const kind = machineState(options.kind, "github_mutation");
-  options.freshness.assertFresh(kind);
+  assertRepairMutationBoundary(options, kind);
   const mutationIdentity = repairMutationReceiptIdentity(context, kind, options.identity);
   const attempt = recordRepairMutationReceipt(context, {
     kind,
@@ -180,7 +233,7 @@ export function runRepairMutation<T>(
   });
 
   try {
-    options.freshness.assertFresh(kind);
+    assertRepairMutationBoundary(options, kind);
   } catch (error) {
     recordRepairMutationOutcome(context, mutationIdentity, kind, "rejected", attempt);
     throw error;
@@ -213,6 +266,14 @@ export function runRepairMutation<T>(
   if (outcome === "rejected") throw new Error(`GitHub rejected ${kind} before mutation`);
   if (acceptedChange) options.freshness.acceptOwnedMutation(kind, acceptedChange);
   return result;
+}
+
+function assertRepairMutationBoundary<T>(
+  options: RepairMutationOptions<T>,
+  mutationKind: string,
+): void {
+  options.freshness.assertFresh(mutationKind);
+  for (const guard of options.boundaryGuards ?? []) guard.assertFresh(mutationKind);
 }
 
 export async function flushRepairMutationActionEvents(): Promise<string[]> {

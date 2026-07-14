@@ -51,13 +51,16 @@ import {
 } from "./closure-result-plan.js";
 import {
   RepairMutationFreshnessError,
+  createRepairMutationBoundaryGuard,
   createRepairMutationFreshnessGuard,
   flushRepairMutationActionEvents,
   repairCreatedCommentChange,
   runRepairMutation,
+  type RepairMutationBoundaryGuard,
   type RepairMutationContext,
   type RepairMutationFreshnessGuard,
 } from "./repair-mutation-safety.js";
+import { repairRequiredCheckRollupSnapshot } from "./repair-mutation-checks.js";
 import { resolveRepairMutationReviewActivityCursor } from "./repair-mutation-review-baseline.js";
 
 const MAINTAINER_AUTHOR_ASSOCIATIONS = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
@@ -111,6 +114,34 @@ type PrCloseCoverageProofValidation =
 type PrCloseCoverageProofBlock = {
   reason: string;
   requeue_required?: true;
+};
+
+type PrCloseCoverageAuthorizationSnapshot = {
+  coveringRef: number;
+  issue: {
+    state: string;
+    updatedAt: string | null;
+    locked: boolean;
+    labels: string[];
+  };
+  pull: {
+    state: string;
+    updatedAt: string | null;
+    mergedAt: string | null;
+    draft: boolean;
+    headSha: string | null;
+    baseRef: string | null;
+  };
+  view: {
+    state: string;
+    updatedAt: string | null;
+    baseRefName: string | null;
+    isDraft: boolean;
+    mergeable: string | null;
+    mergeStateStatus: string | null;
+    reviewDecision: string | null;
+    requiredChecks: ReturnType<typeof repairRequiredCheckRollupSnapshot>;
+  };
 };
 
 const args = parseArgs(process.argv.slice(2));
@@ -566,18 +597,38 @@ function applyCloseAction({
       live_state: live.state,
     };
   }
+  let coveringAuthorizationSnapshot: PrCloseCoverageAuthorizationSnapshot | null = null;
   if (proofValidation?.status === "covered") {
-    const postProofCoveringFreshnessBlock = validatePrCloseCoverageCoveringFreshness({
+    const coveringAuthorization = validatePrCloseCoverageCoveringAuthorization({
       result,
       coveringRef: proofValidation.coveringRef,
       coveringUpdatedAt: proofValidation.coveringUpdatedAt,
     });
-    if (postProofCoveringFreshnessBlock) {
+    if ("reason" in coveringAuthorization) {
       return {
         ...base,
         status: "blocked",
-        reason: postProofCoveringFreshnessBlock,
-        requeue_required: true,
+        ...coveringAuthorization,
+        live_state: live.state,
+        live_updated_at: live.updated_at,
+      };
+    }
+    coveringAuthorizationSnapshot = coveringAuthorization.snapshot;
+  } else {
+    const postProofCoveringSafetyBlock = validatePrCloseCoverageCoveringRefSafety({
+      result,
+      actionName,
+      target,
+      live,
+      canonical,
+      candidateFix,
+      classification,
+    });
+    if (postProofCoveringSafetyBlock) {
+      return {
+        ...base,
+        status: "blocked",
+        ...postProofCoveringSafetyBlock,
         live_state: live.state,
         live_updated_at: live.updated_at,
       };
@@ -636,10 +687,29 @@ function applyCloseAction({
         allowedVerdicts: REVIEW_BASELINE_VERDICTS,
       }),
     });
+    const coveringBoundaryGuard = coveringAuthorizationSnapshot
+      ? createRepairMutationBoundaryGuard({
+          expectedState: coveringAuthorizationSnapshot,
+          readState: () =>
+            readPrCloseCoverageAuthorizationSnapshot({
+              result,
+              coveringRef: coveringAuthorizationSnapshot!.coveringRef,
+            }).snapshot,
+          changedReason: `linked canonical PR #${coveringAuthorizationSnapshot.coveringRef} changed after coverage proof`,
+          readFailureReason: `linked canonical PR #${coveringAuthorizationSnapshot.coveringRef} authorization could not be refreshed`,
+          retryableOnChange: true,
+        })
+      : null;
     if (!existingComment) {
       postIssueComment(mutationContext, freshness, body);
     }
-    closeIssueOrPullRequest(mutationContext, freshness, classification);
+    closeIssueOrPullRequest(
+      mutationContext,
+      freshness,
+      classification,
+      coveringBoundaryGuard ? [coveringBoundaryGuard] : [],
+      coveringAuthorizationSnapshot ? sha256(JSON.stringify(coveringAuthorizationSnapshot)) : null,
+    );
   } catch (error) {
     if (error instanceof RepairMutationFreshnessError) {
       return repairFreshnessBlock(base, live, error);
@@ -800,6 +870,7 @@ function applyMergeAction({
     };
   }
   const mergePreflight = findMergePreflight(result, target);
+  const requiredChecks = repairRequiredCheckRollupSnapshot(view.statusCheckRollup ?? []);
 
   if (process.env.CLAWSWEEPER_ALLOW_MERGE !== "1") {
     if (!dryRun && mutationContext && freshness) {
@@ -857,6 +928,16 @@ function applyMergeAction({
     bodyFile,
   ];
   if (pullRequest.head?.sha) mergeArgs.push("--match-head-commit", String(pullRequest.head.sha));
+  const requiredChecksGuard = createRepairMutationBoundaryGuard({
+    expectedState: requiredChecks,
+    readState: () =>
+      repairRequiredCheckRollupSnapshot(
+        fetchPullRequestView(result.repo, target).statusCheckRollup ?? [],
+      ),
+    changedReason: "required check rollup changed after merge preflight",
+    readFailureReason: "required check rollup could not be refreshed",
+    retryableOnChange: true,
+  });
   try {
     runRepairMutation(mutationContext, {
       kind: "pull_request_merge",
@@ -865,10 +946,12 @@ function applyMergeAction({
         number: target,
         headSha: pullRequest.head?.sha ?? null,
         method: "squash",
+        requiredChecksSha256: sha256(JSON.stringify(requiredChecks)),
         subjectSha256: createHash("sha256").update(mergeMessage.subject).digest("hex"),
         bodySha256: createHash("sha256").update(mergeMessage.body).digest("hex"),
       },
       freshness,
+      boundaryGuards: [requiredChecksGuard],
       operation: () => ghOneShot(mergeArgs),
       knownNoMutation: isLockedConversationCommentError,
     });
@@ -1269,20 +1352,39 @@ function prCloseCoverageProofFailureIsTerminal(error: unknown): boolean {
   return /\b(?:issue|pull) not found: #\d+\b/i.test(text) || /\bHTTP 404\b/i.test(text);
 }
 
-function validatePrCloseCoverageCoveringFreshness({
+function validatePrCloseCoverageCoveringAuthorization({
   result,
   coveringRef,
   coveringUpdatedAt,
-}: LooseRecord): string {
+}: LooseRecord): { snapshot: PrCloseCoverageAuthorizationSnapshot } | PrCloseCoverageProofBlock {
   const expectedUpdatedAt = stringOrNull(coveringUpdatedAt);
-  if (!expectedUpdatedAt) return "";
 
   try {
-    const liveUpdatedAt = prCloseCoverageCoveringUpdatedAt(result.repo, coveringRef);
-    if (liveUpdatedAt === expectedUpdatedAt) return "";
-    return `linked canonical PR #${coveringRef} changed after coverage proof`;
+    const authorization = readPrCloseCoverageAuthorizationSnapshot({ result, coveringRef });
+    const liveUpdatedAt =
+      authorization.snapshot.pull.updatedAt ?? authorization.snapshot.issue.updatedAt;
+    if (expectedUpdatedAt && liveUpdatedAt !== expectedUpdatedAt) {
+      return {
+        reason: `linked canonical PR #${coveringRef} changed after coverage proof`,
+        requeue_required: true,
+      };
+    }
+    if (!prCloseCoverageProofCandidateCanClose(authorization.covering)) {
+      return {
+        reason: `PR close coverage proof requires an open or merged covering pull request; #${coveringRef} is ${authorization.covering.state}`,
+      };
+    }
+    const safetyBlock = validatePrCloseCoverageCoveringSafety({
+      result,
+      coveringRef,
+      coveringIssue: authorization.issue,
+      covering: authorization.covering,
+      coveringPullRequest: authorization.pull,
+      coveringView: authorization.view,
+    });
+    return safetyBlock ? { reason: safetyBlock } : { snapshot: authorization.snapshot };
   } catch (error) {
-    return prCloseCoverageProofFailureReason(error);
+    return prCloseCoverageProofFailureBlock(error);
   }
 }
 
@@ -1326,23 +1428,17 @@ function prCloseCoverageProofFailureReason(error: unknown): string {
   return `PR close coverage proof failed: ${error instanceof Error ? error.message : String(error)}`;
 }
 
-function prCloseCoverageCoveringUpdatedAt(repo: string, number: JsonValue): string | null {
-  const pull = fetchPullRequest(repo, number);
-  const pullUpdatedAt = stringOrNull(pull.updated_at ?? pull.updatedAt);
-  if (pullUpdatedAt) return pullUpdatedAt;
-  const issue = fetchIssue(repo, number);
-  return stringOrNull(issue.updated_at ?? issue.updatedAt);
-}
-
 function validatePrCloseCoverageCoveringSafety({
   result,
   coveringRef,
   coveringIssue,
   covering,
+  coveringPullRequest,
+  coveringView,
 }: LooseRecord): string {
   if (covering.mergedAt) return "";
-  const pullRequest = fetchPullRequest(result.repo, coveringRef);
-  const view = fetchPullRequestView(result.repo, coveringRef);
+  const pullRequest = coveringPullRequest ?? fetchPullRequest(result.repo, coveringRef);
+  const view = coveringView ?? fetchPullRequestView(result.repo, coveringRef);
   const mergeBlock = validateMergeablePullRequest({
     pullRequest,
     view,
@@ -1370,6 +1466,55 @@ function validatePrCloseCoverageCoveringSafety({
     return `linked canonical PR #${coveringRef} has no positive real behavior proof`;
   }
   return "";
+}
+
+function readPrCloseCoverageAuthorizationSnapshot({ result, coveringRef }: LooseRecord): {
+  snapshot: PrCloseCoverageAuthorizationSnapshot;
+  issue: LooseRecord;
+  pull: LooseRecord;
+  view: LooseRecord;
+  covering: Pick<PrCloseCoverageProofPullRequestView, "state" | "mergedAt">;
+} {
+  const number = Number(coveringRef);
+  if (!Number.isSafeInteger(number) || number <= 0) {
+    throw new Error("covering PR reference is invalid");
+  }
+  const issue = fetchIssue(result.repo, number);
+  if (!issue.pull_request) throw new Error(`issue not found: #${number}`);
+  const pull = fetchPullRequest(result.repo, number);
+  const view = fetchPullRequestView(result.repo, number);
+  const covering = {
+    state: stringFromUnknown(pull.state) || stringFromUnknown(issue.state) || "unknown",
+    mergedAt: stringOrNull(pull.merged_at ?? pull.mergedAt ?? view.mergedAt),
+  };
+  const snapshot: PrCloseCoverageAuthorizationSnapshot = {
+    coveringRef: number,
+    issue: {
+      state: stringFromUnknown(issue.state).toLowerCase(),
+      updatedAt: stringOrNull(issue.updated_at ?? issue.updatedAt),
+      locked: issue.locked === true,
+      labels: labelNames(issue.labels).map(normalizeLabelName).sort(),
+    },
+    pull: {
+      state: stringFromUnknown(pull.state).toLowerCase(),
+      updatedAt: stringOrNull(pull.updated_at ?? pull.updatedAt),
+      mergedAt: covering.mergedAt,
+      draft: pull.draft === true,
+      headSha: stringOrNull(pull.head?.sha),
+      baseRef: stringOrNull(pull.base?.ref),
+    },
+    view: {
+      state: stringFromUnknown(view.state).toLowerCase(),
+      updatedAt: stringOrNull(view.updatedAt ?? view.updated_at),
+      baseRefName: stringOrNull(view.baseRefName ?? view.base_ref_name),
+      isDraft: view.isDraft === true,
+      mergeable: stringOrNull(view.mergeable),
+      mergeStateStatus: stringOrNull(view.mergeStateStatus ?? view.merge_state_status),
+      reviewDecision: stringOrNull(view.reviewDecision ?? view.review_decision),
+      requiredChecks: repairRequiredCheckRollupSnapshot(view.statusCheckRollup ?? []),
+    },
+  };
+  return { snapshot, issue, pull, view, covering };
 }
 
 function formatCoveringPullRequestBlock(coveringRef: JsonValue, reason: string): string {
@@ -2052,6 +2197,8 @@ function closeIssueOrPullRequest(
   context: RepairMutationContext,
   freshness: RepairMutationFreshnessGuard,
   classification: JsonValue,
+  boundaryGuards: readonly RepairMutationBoundaryGuard[] = [],
+  authorizationSha256: string | null = null,
 ) {
   if (context.targetKind === "pull_request") {
     runRepairMutation(context, {
@@ -2060,8 +2207,10 @@ function closeIssueOrPullRequest(
         repository: context.repository,
         number: context.number,
         classification: String(classification),
+        authorizationSha256,
       },
       freshness,
+      boundaryGuards,
       operation: () =>
         ghOneShot(["pr", "close", String(context.number), "--repo", context.repository]),
       knownNoMutation: isLockedConversationCommentError,
@@ -2079,8 +2228,10 @@ function closeIssueOrPullRequest(
       repository: context.repository,
       number: context.number,
       stateReason,
+      authorizationSha256,
     },
     freshness,
+    boundaryGuards,
     operation: () =>
       ghOneShot([
         "api",

@@ -10,6 +10,7 @@ import { readAllSpooledActionEvents } from "../../dist/action-ledger.js";
 import {
   RepairMutationFreshnessError,
   RepairMutationOutcomeUnknownError,
+  createRepairMutationBoundaryGuard,
   createRepairMutationFreshnessGuard,
   repairCreatedCommentChange,
   runRepairMutation,
@@ -275,7 +276,7 @@ test("repair freshness rechecks after the attempt receipt and before the request
       expectedUpdatedAt: "2026-07-14T10:00:00Z",
       expectedReviewActivityCursor: EMPTY_REVIEW_ACTIVITY_CURSOR,
       readTargetActivity: () =>
-        targetActivity(reads++ < 2 ? "2026-07-14T10:00:00Z" : "2026-07-14T10:01:00Z"),
+        targetActivity(reads++ < 4 ? "2026-07-14T10:00:00Z" : "2026-07-14T10:01:00Z"),
       readReviewActivityCursor: () => EMPTY_REVIEW_ACTIVITY_CURSOR,
     });
 
@@ -302,6 +303,142 @@ test("repair freshness rechecks after the attempt receipt and before the request
       RepairMutationFreshnessError,
     );
     assert.equal(called, false);
+    assert.deepEqual(
+      readAllSpooledActionEvents(root)
+        .sort((left, right) => left.phase_seq - right.phase_seq)
+        .map((event) => [event.action.status, event.attributes?.completion_reason]),
+      [
+        ["started", "mutation_attempted"],
+        ["skipped", "mutation_rejected"],
+      ],
+    );
+  } finally {
+    restoreEnv(previous);
+    fs.rmSync(root, { force: true, recursive: true });
+  }
+});
+
+test("repair freshness rereads target activity after review pagination", () => {
+  let activity = targetActivity();
+  const freshness = createRepairMutationFreshnessGuard({
+    repository: "openclaw/openclaw",
+    number: 123,
+    targetKind: "pull_request",
+    expectedUpdatedAt: activity.updatedAt,
+    expectedReviewActivityCursor: EMPTY_REVIEW_ACTIVITY_CURSOR,
+    readTargetActivity: () => activity,
+    readReviewActivityCursor: () => {
+      activity = {
+        ...targetActivity("2026-07-14T10:01:00Z"),
+        labels: ["security"],
+      };
+      return EMPTY_REVIEW_ACTIVITY_CURSOR;
+    },
+  });
+
+  assert.throws(
+    () => freshness.assertFresh("pull_request_close"),
+    /target activity changed while review activity was being refreshed/,
+  );
+});
+
+test("owned mutation acceptance advances only after the post-review target reread", () => {
+  const bodySha256 = createHash("sha256").update("ClawSweeper closeout").digest("hex");
+  const baseline = targetActivity();
+  const ownedActivity = {
+    ...targetActivity("2026-07-14T10:01:00Z"),
+    comments: [
+      {
+        id: "9001",
+        author: "clawsweeper[bot]",
+        authorAssociation: "CONTRIBUTOR",
+        createdAt: "2026-07-14T10:01:00Z",
+        updatedAt: "2026-07-14T10:01:00Z",
+        bodySha256,
+        metadataSha256: "c".repeat(64),
+      },
+    ],
+  };
+  let activity = baseline;
+  let injectConcurrentChange = true;
+  const freshness = createRepairMutationFreshnessGuard({
+    repository: "openclaw/openclaw",
+    number: 123,
+    targetKind: "pull_request",
+    expectedUpdatedAt: baseline.updatedAt,
+    expectedReviewActivityCursor: EMPTY_REVIEW_ACTIVITY_CURSOR,
+    readTargetActivity: () => activity,
+    readReviewActivityCursor: () => {
+      if (injectConcurrentChange) {
+        activity = {
+          ...ownedActivity,
+          labels: ["security"],
+        };
+      }
+      return EMPTY_REVIEW_ACTIVITY_CURSOR;
+    },
+  });
+  activity = ownedActivity;
+  const change = {
+    kind: "comment_create" as const,
+    commentId: "9001",
+    bodySha256,
+  };
+
+  assert.throws(
+    () => freshness.acceptOwnedMutation("comment_create", change),
+    /target activity changed while owned mutation activity was being accepted/,
+  );
+
+  injectConcurrentChange = false;
+  activity = ownedActivity;
+  assert.doesNotThrow(() => freshness.acceptOwnedMutation("comment_create", change));
+});
+
+test("repair boundary guards reject drift after the attempt receipt", () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "repair-boundary-guard-")));
+  const previous = { ...process.env };
+  Object.assign(process.env, repairActionLedgerEnv(root));
+
+  try {
+    let boundaryReads = 0;
+    const freshness = createRepairMutationFreshnessGuard({
+      repository: "openclaw/openclaw",
+      number: 123,
+      targetKind: "issue",
+      expectedUpdatedAt: "2026-07-14T10:00:00Z",
+      readTargetActivity: () => targetActivity(),
+    });
+    const requiredChecks = createRepairMutationBoundaryGuard({
+      expectedState: { checks: ["green"] },
+      readState: () => ({ checks: [boundaryReads++ === 0 ? "green" : "failed"] }),
+      changedReason: "required check rollup changed after merge preflight",
+      readFailureReason: "required check rollup could not be refreshed",
+      retryableOnChange: true,
+    });
+
+    assert.throws(
+      () =>
+        runRepairMutation(
+          {
+            phase: "apply_result",
+            repository: "openclaw/openclaw",
+            clusterId: "repair-openclaw-openclaw-123",
+            number: 123,
+            targetKind: "issue",
+            operationKey: "repair-required-check-boundary",
+          },
+          {
+            kind: "pull_request_merge",
+            identity: { repository: "openclaw/openclaw", number: 123 },
+            freshness,
+            boundaryGuards: [requiredChecks],
+            operation: () => assert.fail("merge request must not run"),
+          },
+        ),
+      /required check rollup changed after merge preflight/,
+    );
+    assert.equal(boundaryReads, 2);
     assert.deepEqual(
       readAllSpooledActionEvents(root)
         .sort((left, right) => left.phase_seq - right.phase_seq)
@@ -618,6 +755,57 @@ test("repair executors route authoritative GitHub writes through the mutation bo
   assert.match(postFlightSource, /resolveRepairMutationReviewActivityCursor/);
   assert.match(applySource, /finally \{\s+await flushRepairMutationActionEvents\(\)/);
   assert.match(postFlightSource, /finally \{\s+await flushRepairMutationActionEvents\(\)/);
+});
+
+test("repair worker renews and rebinds state credentials before post-flight publication", () => {
+  const workflow = fs.readFileSync(".github/workflows/repair-cluster-worker.yml", "utf8");
+  const executeIndex = workflow.indexOf("- name: Execute credited fix artifact");
+  const stateTokenIndex = workflow.indexOf("- name: Renew state token for post-flight");
+  const rebindIndex = workflow.indexOf("- name: Rebind state checkout credentials");
+  const deferredIndex = workflow.indexOf("- name: Publish deferred fix outcome");
+  const applyIndex = workflow.indexOf("- name: Apply safe closure actions");
+  const postFlightIndex = workflow.indexOf("- name: Post-flight finalize fix PRs");
+  const closeoutIndex = workflow.indexOf("- name: Apply post-flight closeouts");
+
+  for (const index of [
+    executeIndex,
+    stateTokenIndex,
+    rebindIndex,
+    deferredIndex,
+    applyIndex,
+    postFlightIndex,
+    closeoutIndex,
+  ]) {
+    assert.notEqual(index, -1);
+  }
+  assert.ok(executeIndex < stateTokenIndex);
+  assert.ok(stateTokenIndex < rebindIndex);
+  assert.ok(rebindIndex < deferredIndex);
+  assert.ok(rebindIndex < applyIndex);
+  assert.ok(rebindIndex < postFlightIndex);
+  assert.ok(rebindIndex < closeoutIndex);
+
+  const rebindBlock = workflow.slice(rebindIndex, deferredIndex);
+  assert.match(
+    rebindBlock,
+    /STATE_TOKEN: \$\{\{ steps\.state_post_flight_token\.outputs\.token \}\}/,
+  );
+  assert.match(
+    rebindBlock,
+    /git -C "\$CLAWSWEEPER_STATE_DIR" config --local --replace-all[\s\S]*http\.https:\/\/github\.com\/\.extraheader/,
+  );
+  assert.match(
+    rebindBlock,
+    /git -C "\$CLAWSWEEPER_STATE_DIR" ls-remote --exit-code origin refs\/heads\/state/,
+  );
+
+  for (const stepIndex of [deferredIndex, applyIndex, postFlightIndex, closeoutIndex]) {
+    const stepHeader = workflow.slice(
+      stepIndex,
+      workflow.indexOf("\n      - name:", stepIndex + 1),
+    );
+    assert.match(stepHeader, /steps\.state_post_flight_credentials\.outcome == 'success'/);
+  }
 });
 
 function targetActivity(updatedAt = "2026-07-14T10:00:00Z") {

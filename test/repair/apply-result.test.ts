@@ -750,6 +750,57 @@ test("repair apply stops before close when review activity changes after its com
   }
 });
 
+test("repair apply binds coverage closes to the covering PR after its closeout comment", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-apply-result-"));
+  try {
+    const coveringChangePath = path.join(tmp, "covering-changed");
+    const paths = writeApplyFixture(tmp, {
+      action: "close_duplicate",
+      classification: "duplicate",
+      canonical: "#202",
+    });
+    writeFakeGh(paths.binDir, {
+      issues: {
+        101: issue({ number: 101, title: "Add config validation", pullRequest: true }),
+        202: issue({
+          number: 202,
+          title: "Rewrite config validation",
+          pullRequest: true,
+          labels: ["proof: sufficient"],
+        }),
+      },
+      pulls: {
+        101: pull({ number: 101, title: "Add config validation" }),
+        202: pull({ number: 202, title: "Rewrite config validation" }),
+      },
+      comments: {
+        101: [comment("alice", "PR A keeps legacy config behavior intact.")],
+        202: [comment("bob", "PR B carries forward the legacy config behavior.")],
+      },
+      reviewChangePath: coveringChangePath,
+      postMutationPulls: {
+        202: {
+          updated_at: "2026-05-25T00:05:00Z",
+          body: "Covering behavior changed after the closeout comment.",
+        },
+      },
+      logPath: paths.ghLogPath,
+    });
+    writeFakeCodex(paths.binDir);
+
+    runApplyResult(paths, { proofDecision: "covered" });
+
+    const report = JSON.parse(fs.readFileSync(paths.reportPath, "utf8"));
+    assert.equal(report.actions[0].status, "blocked");
+    assert.match(report.actions[0].reason, /linked canonical PR #202 changed after coverage proof/);
+    assert.equal(report.actions[0].requeue_required, true);
+    assert.equal(hasCommentPostCall(paths.ghLogPath), true);
+    assert.equal(hasPrCloseCall(paths.ghLogPath), false);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
 test("repair apply rejects a concurrent security label after its comment", () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-apply-result-"));
   try {
@@ -1641,6 +1692,63 @@ test("repair second apply does not infer fix-first authorization from prose", ()
   }
 });
 
+test("repair apply blocks merge when required checks fail after preflight", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-apply-result-"));
+  try {
+    const paths = writeApplyMergeFixture(tmp);
+    writeFakeGh(paths.binDir, {
+      issues: {
+        101: issue({ number: 101, title: "Fix config validation", pullRequest: true }),
+      },
+      pulls: {
+        101: pull({ number: 101, title: "Fix config validation" }),
+      },
+      comments: { 101: [] },
+      prViews: {
+        101: [
+          {
+            statusCheckRollup: [{ name: "pnpm check", status: "COMPLETED", conclusion: "SUCCESS" }],
+          },
+          {
+            statusCheckRollup: [{ name: "pnpm check", status: "COMPLETED", conclusion: "SUCCESS" }],
+          },
+          {
+            statusCheckRollup: [{ name: "pnpm check", status: "COMPLETED", conclusion: "FAILURE" }],
+          },
+        ],
+      },
+      logPath: paths.ghLogPath,
+    });
+
+    execFileSync(
+      process.execPath,
+      ["dist/repair/apply-result.js", paths.jobPath, paths.resultPath],
+      {
+        cwd: repoRoot,
+        env: {
+          ...process.env,
+          CLAWSWEEPER_ALLOW_EXECUTE: "1",
+          CLAWSWEEPER_ALLOW_MERGE: "1",
+          CLAWSWEEPER_ALLOWED_OWNER: "openclaw",
+          CLAWSWEEPER_GH_RETRY_ATTEMPTS: "1",
+          GH_TOKEN: "write-token",
+          ...mockGhBinEnv(path.join(paths.binDir, "gh.js")),
+          PATH: `${paths.binDir}${path.delimiter}${process.env.PATH ?? ""}`,
+        },
+        stdio: "pipe",
+      },
+    );
+
+    const report = JSON.parse(fs.readFileSync(paths.reportPath, "utf8"));
+    assert.equal(report.actions[0].status, "blocked");
+    assert.match(report.actions[0].reason, /required check rollup changed after merge preflight/);
+    assert.equal(report.actions[0].requeue_required, true);
+    assert.equal(hasPrMergeCall(paths.ghLogPath), false);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
 for (const prerequisite of [
   { name: "blocked", omitTargetUpdatedAt: true, state: "open", expectedStatus: "blocked" },
   { name: "skipped", omitTargetUpdatedAt: false, state: "closed", expectedStatus: "skipped" },
@@ -1730,6 +1838,7 @@ type FakeGhData = {
   postProofIssueUpdates?: Record<number, string>;
   postProofPulls?: Record<number, Record<string, unknown>>;
   postProofPrViewFailure?: { number: number; message: string };
+  prViews?: Record<number, Record<string, unknown>[]>;
   logPath: string;
 };
 
@@ -1788,8 +1897,7 @@ function writeApplyFixture(
       target: resultAction.target ?? "#101",
       target_kind: resultAction.target_kind ?? "pull_request",
       ...(omitTargetUpdatedAt ? {} : { target_updated_at: "2026-05-25T00:00:00Z" }),
-      review_activity_cursor:
-        resultAction.review_activity_cursor ?? EMPTY_REVIEW_ACTIVITY_CURSOR,
+      review_activity_cursor: resultAction.review_activity_cursor ?? EMPTY_REVIEW_ACTIVITY_CURSOR,
       status: resultAction.status ?? "planned",
       evidence: ["PR B is referenced as the canonical replacement for PR A."],
       idempotency_key:
@@ -1839,6 +1947,84 @@ function enableFixFirstMerges(jobPath: string): void {
     .replace("allow_instant_close: true", "allow_instant_close: true\nallow_merge: true")
     .replace("require_fix_before_close: false", "require_fix_before_close: true");
   fs.writeFileSync(jobPath, job);
+}
+
+function writeApplyMergeFixture(tmp: string): ApplyFixturePaths {
+  const binDir = path.join(tmp, "bin");
+  const runDir = path.join(tmp, "run");
+  const jobPath = path.join(tmp, "job.md");
+  const resultPath = path.join(runDir, "result.json");
+  const reportPath = path.join(runDir, "apply-report.json");
+  const ghLogPath = path.join(tmp, "gh.log");
+  fs.mkdirSync(binDir, { recursive: true });
+  fs.mkdirSync(runDir, { recursive: true });
+  fs.writeFileSync(
+    jobPath,
+    [
+      "---",
+      "repo: openclaw/openclaw",
+      "cluster_id: repair-pr-merge-boundary",
+      "mode: autonomous",
+      "allowed_actions:",
+      "  - comment",
+      "  - label",
+      "  - merge",
+      "blocked_actions: []",
+      "canonical:",
+      "  - '#101'",
+      "candidates:",
+      "  - '#101'",
+      "cluster_refs:",
+      "  - '#101'",
+      "allow_merge: true",
+      "security_policy: central_security_only",
+      "security_sensitive: false",
+      "---",
+      "Repair merge job.",
+      "",
+    ].join("\n"),
+  );
+  fs.writeFileSync(
+    resultPath,
+    JSON.stringify(
+      {
+        repo: "openclaw/openclaw",
+        cluster_id: "repair-pr-merge-boundary",
+        mode: "autonomous",
+        actions: [
+          {
+            action: "merge_canonical",
+            target: "#101",
+            target_kind: "pull_request",
+            target_updated_at: "2026-05-25T00:00:00Z",
+            status: "planned",
+            idempotency_key: "merge-boundary-101",
+          },
+        ],
+        merge_preflight: [
+          {
+            target: "#101",
+            security_status: "cleared",
+            security_evidence: ["no security signal"],
+            comments_status: "resolved",
+            comments_evidence: ["no unresolved review comments"],
+            bot_comments_status: "resolved",
+            bot_comments_evidence: ["no unresolved bot comments"],
+            validation_commands: ["pnpm test"],
+            codex_review: {
+              command: "/review",
+              status: "passed",
+              findings_addressed: true,
+              evidence: ["Codex review passed"],
+            },
+          },
+        ],
+      },
+      null,
+      2,
+    ),
+  );
+  return { binDir, jobPath, resultPath, reportPath, ghLogPath };
 }
 
 function runApplyResult(
@@ -2031,6 +2217,11 @@ if (args[0] === "pr" && args[1] === "close") {
   process.exit(0);
 }
 
+if (args[0] === "pr" && args[1] === "merge") {
+  write({ merged: Number(args[2]) });
+  process.exit(0);
+}
+
 if (args[0] === "pr" && args[1] === "view") {
   const number = Number(args[2]);
   const postProofPrViewFailure =
@@ -2045,6 +2236,14 @@ if (args[0] === "pr" && args[1] === "view") {
     process.exit(1);
   }
   const pull = data.pulls[number];
+  const viewSequence = (data.prViews && data.prViews[number]) || [];
+  const viewCountPath = data.logPath + ".view-" + number;
+  const viewCount = fs.existsSync(viewCountPath)
+    ? Number(fs.readFileSync(viewCountPath, "utf8"))
+    : 0;
+  fs.writeFileSync(viewCountPath, String(viewCount + 1));
+  const viewOverride =
+    viewSequence.length > 0 ? viewSequence[Math.min(viewCount, viewSequence.length - 1)] : {};
   write({
     baseRefName: "main",
     isDraft: false,
@@ -2058,6 +2257,7 @@ if (args[0] === "pr" && args[1] === "view") {
     title: pull.title,
     updatedAt: pull.updated_at,
     url: pull.html_url,
+    ...viewOverride,
   });
   process.exit(0);
 }
@@ -2195,6 +2395,10 @@ function issueCloseTargets(logPath: string): string[] {
         /\/issues\/\d+$/.test(call.args[1] ?? ""),
     )
     .map((call) => call.args[1]?.match(/\/issues\/(\d+)$/)?.[1] ?? "");
+}
+
+function hasPrMergeCall(logPath: string): boolean {
+  return ghCalls(logPath).some((call) => call.args[0] === "pr" && call.args[1] === "merge");
 }
 
 function hasCommentPostCall(logPath: string): boolean {

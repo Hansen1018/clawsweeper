@@ -35,6 +35,7 @@ import {
 } from "./repair-merge-message.js";
 import {
   RepairMutationFreshnessError,
+  createRepairMutationBoundaryGuard,
   createRepairMutationFreshnessGuard,
   flushRepairMutationActionEvents,
   repairCreatedCommentChange,
@@ -43,6 +44,7 @@ import {
   type RepairMutationFreshnessGuard,
 } from "./repair-mutation-safety.js";
 import { resolveRepairMutationReviewActivityCursor } from "./repair-mutation-review-baseline.js";
+import { repairRequiredCheckRollupSnapshot } from "./repair-mutation-checks.js";
 import { compactText as compactPlainText } from "./text-utils.js";
 
 const PASSING_CHECK_CONCLUSIONS = new Set(["SUCCESS", "SKIPPED", "NEUTRAL"]);
@@ -336,6 +338,21 @@ function finalizeFixPr(action: LooseRecord) {
     bodyFile,
   ];
   if (pull.head?.sha) mergeArgs.push("--match-head-commit", String(pull.head.sha));
+  const requiredChecks = shouldRequirePrChecks()
+    ? postFlightRequiredCheckRollupSnapshot(view.statusCheckRollup ?? [])
+    : null;
+  const requiredChecksGuard = requiredChecks
+    ? createRepairMutationBoundaryGuard({
+        expectedState: requiredChecks,
+        readState: () =>
+          postFlightRequiredCheckRollupSnapshot(
+            fetchPullRequestView(result.repo, parsed.number).statusCheckRollup ?? [],
+          ),
+        changedReason: "required check rollup changed after merge preflight",
+        readFailureReason: "required check rollup could not be refreshed",
+        retryableOnChange: true,
+      })
+    : null;
   try {
     runRepairMutation(mutationContext, {
       kind: "pull_request_merge",
@@ -344,10 +361,14 @@ function finalizeFixPr(action: LooseRecord) {
         number: parsed.number,
         headSha: pull.head?.sha ?? null,
         method: "squash",
+        requiredChecksSha256: requiredChecks
+          ? createHash("sha256").update(JSON.stringify(requiredChecks)).digest("hex")
+          : null,
         subjectSha256: createHash("sha256").update(mergeMessage.subject).digest("hex"),
         bodySha256: createHash("sha256").update(mergeMessage.body).digest("hex"),
       },
       freshness,
+      boundaryGuards: requiredChecksGuard ? [requiredChecksGuard] : [],
       operation: () => ghOneShot(mergeArgs),
       knownNoMutation: isRecoverableMergeRaceError,
     });
@@ -892,6 +913,13 @@ function latestCheckRuns(checks: LooseRecord[]) {
     if (!previous || checkTimestamp(check) >= checkTimestamp(previous)) byKey.set(key, check);
   }
   return [...byKey.values()];
+}
+
+function postFlightRequiredCheckRollupSnapshot(checks: LooseRecord[]) {
+  const ignored = ignoredCheckNames();
+  return repairRequiredCheckRollupSnapshot(
+    latestCheckRuns(checks).filter((check) => !isIgnoredStatusCheck(check, ignored)),
+  );
 }
 
 function checkIdentity(check: LooseRecord) {
