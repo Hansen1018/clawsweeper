@@ -6,7 +6,10 @@ import { execFileSync } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 
-import { GitcrawlEvidenceAdapter } from "../../dist/repair/gitcrawl-evidence-adapter.js";
+import {
+  GitcrawlEvidenceAdapter,
+  gitcrawlEvidenceOptionsFromArgs,
+} from "../../dist/repair/gitcrawl-evidence-adapter.js";
 import { CloudGitcrawlQuerySource } from "../../dist/repair/gitcrawl-evidence-cloud.js";
 import {
   GITCRAWL_DATASETS,
@@ -114,6 +117,25 @@ test("six-query adapter binds read-only evidence into verified claims and graph 
   assert(packet.graph.edges.some((edge) => edge.predicate === "member_of"));
   await adapter.close();
   assert.equal(source.closeCount, 1);
+});
+
+test("cloud adapter options treat an empty archive variable as unset", () => {
+  const previous = process.env.CLAWSWEEPER_GITCRAWL_CLOUD_ARCHIVE;
+  process.env.CLAWSWEEPER_GITCRAWL_CLOUD_ARCHIVE = "";
+  try {
+    const options = gitcrawlEvidenceOptionsFromArgs({
+      repository,
+      repoRoot: process.cwd(),
+      args: {
+        "gitcrawl-provider": "cloud",
+        "cloud-url": "https://crawl.example.test",
+      },
+    });
+    assert.equal(options.cloudArchive, archive);
+  } finally {
+    if (previous === undefined) delete process.env.CLAWSWEEPER_GITCRAWL_CLOUD_ARCHIVE;
+    else process.env.CLAWSWEEPER_GITCRAWL_CLOUD_ARCHIVE = previous;
+  }
 });
 
 test("query evidence fails closed on source, relation, review, and packet drift", async (t) => {

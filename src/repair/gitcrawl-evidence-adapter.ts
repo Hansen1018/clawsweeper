@@ -813,12 +813,11 @@ export function gitcrawlEvidenceOptionsFromArgs(input: {
   if (provider !== "local") {
     options.cloudUrl = String(
       input.args["cloud-url"] ?? process.env.CLAWSWEEPER_GITCRAWL_CLOUD_URL ?? "",
-    );
-    options.cloudArchive = String(
-      input.args["cloud-archive"] ??
-        process.env.CLAWSWEEPER_GITCRAWL_CLOUD_ARCHIVE ??
-        `gitcrawl/${input.repository.replace("/", "__")}`,
-    );
+    ).trim();
+    options.cloudArchive =
+      String(
+        input.args["cloud-archive"] ?? process.env.CLAWSWEEPER_GITCRAWL_CLOUD_ARCHIVE ?? "",
+      ).trim() || `gitcrawl/${input.repository.replace("/", "__")}`;
     const cloudCredential = process.env.CLAWSWEEPER_GITCRAWL_CLOUD_TOKEN ?? "";
     const accessCredential = process.env.CLAWSWEEPER_GITCRAWL_CLOUD_ACCESS_CLIENT_SECRET ?? "";
     options.cloudToken = cloudCredential;
