@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   BOOTSTRAP_CONTRACT,
   bootstrapCrawlRemoteAccess,
+  credentialGenerationMarker,
   createCloudflareClient,
   createGitHubClient,
 } from "../scripts/bootstrap-crawl-remote-access.mjs";
@@ -19,34 +20,90 @@ interface SecretTarget {
 
 interface VariableTarget extends SecretTarget {}
 
-function createGitHubFixture({ completeAccessSecrets = false } = {}) {
+const credentialTargets = [
+  {
+    repository: BOOTSTRAP_CONTRACT.clawsweeperRepository,
+    environment: BOOTSTRAP_CONTRACT.productionEnvironment,
+    prefix: "CRAWL_REMOTE_ACCESS",
+    generationVariable: "CRAWL_REMOTE_ACCESS_CREDENTIAL_GENERATION",
+  },
+  {
+    repository: BOOTSTRAP_CONTRACT.clawsweeperRepository,
+    prefix: "CLAWSWEEPER_GITCRAWL_CLOUD_ACCESS",
+    generationVariable: "CLAWSWEEPER_GITCRAWL_CLOUD_ACCESS_CREDENTIAL_GENERATION",
+  },
+  {
+    repository: BOOTSTRAP_CONTRACT.gitcrawlStoreRepository,
+    prefix: "GITCRAWL_CLOUD_ACCESS",
+    generationVariable: "GITCRAWL_CLOUD_ACCESS_CREDENTIAL_GENERATION",
+  },
+] as const;
+
+function targetKey(target: { repository: string; environment?: string }) {
+  return `${target.repository}:${target.environment ?? "repository"}`;
+}
+
+function credentialNames(prefix: string, slot: "blue" | "green") {
+  const slotName = slot.toUpperCase();
+  return {
+    clientId: `${prefix}_${slotName}_CLIENT_ID`,
+    clientSecret: `${prefix}_${slotName}_CLIENT_SECRET`,
+  };
+}
+
+function createGitHubFixture({
+  activeTokenId,
+  activeSlot = "blue",
+}: {
+  activeTokenId?: string;
+  activeSlot?: "blue" | "green";
+} = {}) {
   const secrets: SecretTarget[] = [];
   const variables: VariableTarget[] = [];
   const lists: Array<{ repository: string; environment?: string }> = [];
+  const variableReads: Array<{ repository: string; environment?: string; name: string }> = [];
+  const writes: Array<{ kind: "secret" | "variable"; name: string; repository: string }> = [];
+  const secretNames = new Map<string, Set<string>>();
+  const variableValues = new Map<string, string>();
+  if (activeTokenId) {
+    for (const target of credentialTargets) {
+      const names = credentialNames(target.prefix, activeSlot);
+      secretNames.set(targetKey(target), new Set([names.clientId, names.clientSecret]));
+      variableValues.set(
+        `${targetKey(target)}:${target.generationVariable}`,
+        credentialGenerationMarker(activeTokenId, activeSlot),
+      );
+    }
+  }
   return {
     secrets,
     variables,
     lists,
+    secretNames,
+    variableReads,
+    variableValues,
+    writes,
     client: {
       async listSecretNames(target: { repository: string; environment?: string }) {
         lists.push(target);
-        if (!completeAccessSecrets) return new Set<string>();
-        if (target.environment === BOOTSTRAP_CONTRACT.productionEnvironment) {
-          return new Set(["CRAWL_REMOTE_ACCESS_CLIENT_ID", "CRAWL_REMOTE_ACCESS_CLIENT_SECRET"]);
-        }
-        if (target.repository === BOOTSTRAP_CONTRACT.clawsweeperRepository) {
-          return new Set([
-            "CLAWSWEEPER_GITCRAWL_CLOUD_ACCESS_CLIENT_ID",
-            "CLAWSWEEPER_GITCRAWL_CLOUD_ACCESS_CLIENT_SECRET",
-          ]);
-        }
-        return new Set(["GITCRAWL_CLOUD_ACCESS_CLIENT_ID", "GITCRAWL_CLOUD_ACCESS_CLIENT_SECRET"]);
+        return new Set(secretNames.get(targetKey(target)) ?? []);
+      },
+      async getVariable(target: { repository: string; environment?: string; name: string }) {
+        variableReads.push(target);
+        return variableValues.get(`${targetKey(target)}:${target.name}`) ?? null;
       },
       async setSecret(target: SecretTarget) {
         secrets.push(target);
+        writes.push({ kind: "secret", name: target.name, repository: target.repository });
+        const key = targetKey(target);
+        const names = secretNames.get(key) ?? new Set<string>();
+        names.add(target.name);
+        secretNames.set(key, names);
       },
       async setVariable(target: VariableTarget) {
         variables.push(target);
+        writes.push({ kind: "variable", name: target.name, repository: target.repository });
+        variableValues.set(`${targetKey(target)}:${target.name}`, target.value);
       },
     },
   };
@@ -145,7 +202,37 @@ test("first bootstrap creates one service-auth policy and writes every destinati
   assert.equal(policies.length, 1);
   assert.deepEqual(policies[0]?.tokenIds, ["token-new"]);
   assert.equal(github.secrets.length, 7);
-  assert.equal(github.variables.length, 11);
+  assert.equal(github.variables.length, 14);
+  for (const target of credentialTargets) {
+    const names = credentialNames(target.prefix, "blue");
+    assert.ok(
+      github.secrets.some(
+        (secret) =>
+          secret.repository === target.repository &&
+          secret.environment === target.environment &&
+          secret.name === names.clientId,
+      ),
+    );
+    assert.ok(
+      github.secrets.some(
+        (secret) =>
+          secret.repository === target.repository &&
+          secret.environment === target.environment &&
+          secret.name === names.clientSecret,
+      ),
+    );
+    assert.equal(
+      variableValue(github.variables, target.generationVariable, target.repository),
+      credentialGenerationMarker("token-new", "blue"),
+    );
+  }
+  const firstMarkerWrite = github.writes.findIndex(
+    (write) => write.kind === "variable" && write.name.endsWith("_CREDENTIAL_GENERATION"),
+  );
+  const lastAccessSecretWrite = github.writes.findLastIndex(
+    (write) => write.kind === "secret" && write.name.includes("_ACCESS_"),
+  );
+  assert.ok(firstMarkerWrite > lastAccessSecretWrite);
   assert.equal(
     variableValue(
       github.variables,
@@ -181,7 +268,7 @@ test("first bootstrap creates one service-auth policy and writes every destinati
   assert.doesNotMatch(logs.join("\n"), /fixture-(workers|client)/);
 });
 
-test("existing token with missing GitHub slots fails before Cloudflare mutation", async () => {
+test("existing token without matching credential generations fails before Cloudflare mutation", async () => {
   const cloudflare = createCloudflareFixture({
     tokens: [{ id: "token-old", name: BOOTSTRAP_CONTRACT.accessServiceTokenName }],
   });
@@ -198,7 +285,34 @@ test("existing token with missing GitHub slots fails before Cloudflare mutation"
       },
       { cloudflare: cloudflare.client, github: github.client, logger: quietLogger },
     ),
-    /existing crawl-remote Access service token secret cannot be recovered.*explicit rotation/,
+    /credentials are not bound to the selected service token.*explicit rotation/,
+  );
+  assert.deepEqual(
+    cloudflare.events.map((event) => event.event),
+    ["list-tokens"],
+  );
+  assert.equal(github.secrets.length, 0);
+  assert.equal(github.variables.length, 0);
+});
+
+test("populated slots bound to a stale token still require explicit rotation", async () => {
+  const cloudflare = createCloudflareFixture({
+    tokens: [{ id: "token-current", name: BOOTSTRAP_CONTRACT.accessServiceTokenName }],
+  });
+  const github = createGitHubFixture({ activeTokenId: "token-deleted" });
+
+  await assert.rejects(
+    bootstrapCrawlRemoteAccess(
+      {
+        publisherEnabled: "0",
+        rotateServiceToken: false,
+        rotationLabel: "123-1",
+        runtimeProvider: "local",
+        workersApiToken: "fixture-workers-credential",
+      },
+      { cloudflare: cloudflare.client, github: github.client, logger: quietLogger },
+    ),
+    /credentials are not bound to the selected service token.*explicit rotation/,
   );
   assert.deepEqual(
     cloudflare.events.map((event) => event.event),
@@ -218,7 +332,7 @@ test("complete existing bootstrap reconciles without rewriting Access secrets", 
     },
     policy: { id: "policy-existing" },
   });
-  const github = createGitHubFixture({ completeAccessSecrets: true });
+  const github = createGitHubFixture({ activeTokenId: "token-old" });
 
   const result = await bootstrapCrawlRemoteAccess(
     {
@@ -233,7 +347,9 @@ test("complete existing bootstrap reconciles without rewriting Access secrets", 
 
   assert.equal(result.createdServiceToken, false);
   assert.equal(result.rotatedServiceToken, false);
+  assert.equal(result.resumedServiceTokenRotation, false);
   assert.equal(github.lists.length, 3);
+  assert.equal(github.variableReads.length, 3);
   assert.deepEqual(
     github.secrets.map((secret) => secret.name),
     ["CRAWL_REMOTE_PRODUCTION_CLOUDFLARE_API_TOKEN"],
@@ -274,7 +390,7 @@ test("rotation authorizes both tokens until all GitHub credentials are replaced"
     },
     policy: { id: "policy-existing" },
   });
-  const github = createGitHubFixture();
+  const github = createGitHubFixture({ activeTokenId: "token-old" });
 
   const result = await bootstrapCrawlRemoteAccess(
     {
@@ -288,12 +404,22 @@ test("rotation authorizes both tokens until all GitHub credentials are replaced"
   );
 
   assert.equal(result.rotatedServiceToken, true);
+  assert.equal(result.resumedServiceTokenRotation, false);
   const policies = cloudflare.events.filter((event) => event.event === "ensure-policy");
   assert.deepEqual(
     policies.map((policy) => policy.tokenIds),
     [["token-old", "token-new"], ["token-new"]],
   );
   assert.equal(github.secrets.length, 7);
+  for (const target of credentialTargets) {
+    const names = credentialNames(target.prefix, "green");
+    assert.ok(github.secrets.some((secret) => secret.name === names.clientId));
+    assert.ok(github.secrets.some((secret) => secret.name === names.clientSecret));
+    assert.equal(
+      variableValue(github.variables, target.generationVariable, target.repository),
+      credentialGenerationMarker("token-new", "green"),
+    );
+  }
   const deleteIndex = cloudflare.events.findIndex((event) => event.event === "delete-token");
   const finalPolicyIndex = cloudflare.events.findLastIndex(
     (event) => event.event === "ensure-policy",
@@ -305,7 +431,7 @@ test("rotation authorizes both tokens until all GitHub credentials are replaced"
   });
 });
 
-test("rotation keeps the old token authorized when GitHub publication fails", async () => {
+test("rotation keeps active markers and the old token when an inactive pair write fails", async () => {
   const cloudflare = createCloudflareFixture({
     tokens: [{ id: "token-old", name: BOOTSTRAP_CONTRACT.accessServiceTokenName }],
     application: {
@@ -315,10 +441,11 @@ test("rotation keeps the old token authorized when GitHub publication fails", as
     },
     policy: { id: "policy-existing" },
   });
-  const github = createGitHubFixture();
+  const github = createGitHubFixture({ activeTokenId: "token-old" });
   github.client.setSecret = async (target: SecretTarget) => {
     github.secrets.push(target);
-    if (target.name === "CLAWSWEEPER_GITCRAWL_CLOUD_ACCESS_CLIENT_ID") {
+    github.writes.push({ kind: "secret", name: target.name, repository: target.repository });
+    if (target.name === "CLAWSWEEPER_GITCRAWL_CLOUD_ACCESS_GREEN_CLIENT_SECRET") {
       throw new Error("injected GitHub write failure");
     }
   };
@@ -345,6 +472,68 @@ test("rotation keeps the old token authorized when GitHub publication fails", as
   assert.equal(
     cloudflare.events.some((event) => event.event === "delete-token"),
     false,
+  );
+  assert.equal(
+    github.variables.some((variable) => variable.name.endsWith("_CREDENTIAL_GENERATION")),
+    false,
+  );
+  for (const target of credentialTargets) {
+    assert.equal(
+      github.variableValues.get(`${targetKey(target)}:${target.generationVariable}`),
+      credentialGenerationMarker("token-old", "blue"),
+    );
+  }
+});
+
+test("explicit rotation resumes finalization when every marker binds one managed token", async () => {
+  const cloudflare = createCloudflareFixture({
+    tokens: [
+      { id: "token-old", name: BOOTSTRAP_CONTRACT.accessServiceTokenName },
+      {
+        id: "token-new",
+        name: `${BOOTSTRAP_CONTRACT.accessServiceTokenName} rotation 456-1`,
+      },
+    ],
+    application: {
+      id: "app-existing",
+      name: BOOTSTRAP_CONTRACT.accessAppName,
+      domain: BOOTSTRAP_CONTRACT.accessDomain,
+    },
+    policy: { id: "policy-existing" },
+  });
+  const github = createGitHubFixture({ activeTokenId: "token-new", activeSlot: "green" });
+
+  const result = await bootstrapCrawlRemoteAccess(
+    {
+      publisherEnabled: "0",
+      rotateServiceToken: true,
+      rotationLabel: "456-2",
+      runtimeProvider: "local",
+      workersApiToken: "fixture-workers-credential",
+    },
+    { cloudflare: cloudflare.client, github: github.client, logger: quietLogger },
+  );
+
+  assert.equal(result.createdServiceToken, false);
+  assert.equal(result.rotatedServiceToken, true);
+  assert.equal(result.resumedServiceTokenRotation, true);
+  assert.equal(
+    cloudflare.events.some((event) => event.event === "create-token"),
+    false,
+  );
+  assert.deepEqual(
+    cloudflare.events
+      .filter((event) => event.event === "ensure-policy")
+      .map((event) => event.tokenIds),
+    [["token-new"]],
+  );
+  assert.deepEqual(
+    cloudflare.events.filter((event) => event.event === "delete-token"),
+    [{ event: "delete-token", tokenId: "token-old" }],
+  );
+  assert.deepEqual(
+    github.secrets.map((secret) => secret.name),
+    ["CRAWL_REMOTE_PRODUCTION_CLOUDFLARE_API_TOKEN"],
   );
 });
 

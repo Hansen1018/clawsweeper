@@ -19,22 +19,26 @@ export const BOOTSTRAP_CONTRACT = Object.freeze({
   productionEnvironment: "crawl-remote-production",
 });
 
-const ACCESS_SECRET_TARGETS = Object.freeze([
+const ACCESS_CREDENTIAL_SLOTS = Object.freeze(["blue", "green"]);
+const ACCESS_CREDENTIAL_TARGETS = Object.freeze([
   {
+    label: "crawl-remote-production",
     repository: BOOTSTRAP_CONTRACT.clawsweeperRepository,
     environment: BOOTSTRAP_CONTRACT.productionEnvironment,
-    names: ["CRAWL_REMOTE_ACCESS_CLIENT_ID", "CRAWL_REMOTE_ACCESS_CLIENT_SECRET"],
+    secretPrefix: "CRAWL_REMOTE_ACCESS",
+    generationVariable: "CRAWL_REMOTE_ACCESS_CREDENTIAL_GENERATION",
   },
   {
+    label: "ClawSweeper runtime",
     repository: BOOTSTRAP_CONTRACT.clawsweeperRepository,
-    names: [
-      "CLAWSWEEPER_GITCRAWL_CLOUD_ACCESS_CLIENT_ID",
-      "CLAWSWEEPER_GITCRAWL_CLOUD_ACCESS_CLIENT_SECRET",
-    ],
+    secretPrefix: "CLAWSWEEPER_GITCRAWL_CLOUD_ACCESS",
+    generationVariable: "CLAWSWEEPER_GITCRAWL_CLOUD_ACCESS_CREDENTIAL_GENERATION",
   },
   {
+    label: "gitcrawl-store publisher",
     repository: BOOTSTRAP_CONTRACT.gitcrawlStoreRepository,
-    names: ["GITCRAWL_CLOUD_ACCESS_CLIENT_ID", "GITCRAWL_CLOUD_ACCESS_CLIENT_SECRET"],
+    secretPrefix: "GITCRAWL_CLOUD_ACCESS",
+    generationVariable: "GITCRAWL_CLOUD_ACCESS_CREDENTIAL_GENERATION",
   },
 ]);
 
@@ -54,23 +58,37 @@ export async function bootstrapCrawlRemoteAccess(options, dependencies) {
     );
   }
 
-  if (matchingTokens.length > 0 && !rotateServiceToken) {
-    const missingLocations = await missingAccessSecretLocations(github);
-    if (missingLocations.length > 0) {
-      throw new Error(
-        "the existing crawl-remote Access service token secret cannot be recovered; " +
-          `missing GitHub secret slots: ${missingLocations.join(", ")}; ` +
-          "rerun with explicit rotation",
-      );
-    }
+  const credentialStates = await inspectAccessCredentialStates(github);
+  if (matchingTokens.length === 1 && !rotateServiceToken) {
+    assertCredentialStatesBoundToToken(credentialStates, matchingTokens[0]);
   }
 
   const applicationState = await cloudflare.inspectAccessApplication();
-  const oldTokens = matchingTokens;
-  let activeToken = matchingTokens[0] ?? null;
+  let oldTokens = [];
+  let activeToken = null;
   let createdCredentials = null;
+  let resumedRotation = false;
 
-  if (!activeToken || rotateServiceToken) {
+  if (rotateServiceToken && matchingTokens.length > 1) {
+    const boundTokens = matchingTokens.filter((token) =>
+      credentialStates.every((state) => credentialStateBindsToken(state, token)),
+    );
+    if (boundTokens.length > 1) {
+      throw new Error("multiple managed service tokens match the active credential generation");
+    }
+    if (boundTokens.length === 1) {
+      activeToken = boundTokens[0];
+      oldTokens = matchingTokens.filter((token) => token.id !== activeToken.id);
+      resumedRotation = true;
+    }
+  }
+
+  if (!activeToken && matchingTokens.length === 1 && !rotateServiceToken) {
+    activeToken = matchingTokens[0];
+  }
+
+  if (!activeToken) {
+    oldTokens = matchingTokens;
     const tokenName =
       oldTokens.length === 0
         ? BOOTSTRAP_CONTRACT.accessServiceTokenName
@@ -96,20 +114,29 @@ export async function bootstrapCrawlRemoteAccess(options, dependencies) {
     tokenIds: transitionalTokenIds,
   });
 
+  if (createdCredentials) {
+    await publishAccessCredentials({
+      github,
+      accessCredentials: createdCredentials,
+      credentialStates,
+    });
+  }
+
   await writeGitHubConfiguration({
     github,
     workersApiToken: options.workersApiToken,
-    accessCredentials: createdCredentials,
     runtimeProvider,
     publisherEnabled,
   });
 
-  if (createdCredentials && oldTokenIds.length > 0) {
-    configuredPolicy = await cloudflare.ensureAccessPolicy({
-      applicationId: application.id,
-      existingPolicy: configuredPolicy,
-      tokenIds: [activeToken.id],
-    });
+  if (oldTokenIds.length > 0) {
+    if (createdCredentials) {
+      configuredPolicy = await cloudflare.ensureAccessPolicy({
+        applicationId: application.id,
+        existingPolicy: configuredPolicy,
+        tokenIds: [activeToken.id],
+      });
+    }
     for (const token of oldTokens) {
       await cloudflare.deleteServiceToken(token.id);
     }
@@ -118,7 +145,9 @@ export async function bootstrapCrawlRemoteAccess(options, dependencies) {
   logger.log(
     createdCredentials
       ? `configured crawl-remote Access with a ${oldTokens.length > 0 ? "rotated" : "new"} service token`
-      : "reconciled crawl-remote Access without rotating its service token",
+      : resumedRotation
+        ? "completed an interrupted crawl-remote Access service-token rotation"
+        : "reconciled crawl-remote Access without rotating its service token",
   );
   logger.log(
     `configured protected deployment inputs, ClawSweeper ${runtimeProvider} intake, ` +
@@ -129,34 +158,81 @@ export async function bootstrapCrawlRemoteAccess(options, dependencies) {
     accessApplicationId: application.id,
     accessServiceTokenId: activeToken.id,
     createdServiceToken: createdCredentials !== null,
-    rotatedServiceToken: createdCredentials !== null && oldTokens.length > 0,
+    rotatedServiceToken: oldTokens.length > 0,
+    resumedServiceTokenRotation: resumedRotation,
     runtimeProvider,
     publisherEnabled,
     accessPolicyId: configuredPolicy.id,
   };
 }
 
-async function missingAccessSecretLocations(github) {
-  const missing = [];
-  for (const target of ACCESS_SECRET_TARGETS) {
-    const names = await github.listSecretNames(target);
-    for (const name of target.names) {
-      if (!names.has(name)) {
-        missing.push(
-          target.environment
-            ? `${target.repository}:${target.environment}/${name}`
-            : `${target.repository}/${name}`,
-        );
-      }
-    }
+async function inspectAccessCredentialStates(github) {
+  return Promise.all(
+    ACCESS_CREDENTIAL_TARGETS.map(async (target) => ({
+      target,
+      marker: parseCredentialGenerationMarker(
+        await github.getVariable({
+          repository: target.repository,
+          environment: target.environment,
+          name: target.generationVariable,
+        }),
+      ),
+      secretNames: await github.listSecretNames(target),
+    })),
+  );
+}
+
+function assertCredentialStatesBoundToToken(states, token) {
+  const invalidTargets = states
+    .filter((state) => !credentialStateBindsToken(state, token))
+    .map((state) => state.target.label);
+  if (invalidTargets.length > 0) {
+    throw new Error(
+      "the existing crawl-remote Access credentials are not bound to the selected service " +
+        `token for: ${invalidTargets.join(", ")}; rerun with explicit rotation`,
+    );
   }
-  return missing;
+}
+
+async function publishAccessCredentials({ github, accessCredentials, credentialStates }) {
+  const prepared = credentialStates.map((state) => {
+    const slot = inactiveCredentialSlot(state.marker?.slot);
+    const names = credentialSecretNames(state.target, slot);
+    return {
+      ...state,
+      markerValue: credentialGenerationMarker(accessCredentials.id, slot),
+      names,
+    };
+  });
+
+  for (const state of prepared) {
+    await github.setSecret({
+      repository: state.target.repository,
+      environment: state.target.environment,
+      name: state.names.clientId,
+      value: accessCredentials.client_id,
+    });
+    await github.setSecret({
+      repository: state.target.repository,
+      environment: state.target.environment,
+      name: state.names.clientSecret,
+      value: accessCredentials.client_secret,
+    });
+  }
+
+  for (const state of prepared) {
+    await github.setVariable({
+      repository: state.target.repository,
+      environment: state.target.environment,
+      name: state.target.generationVariable,
+      value: state.markerValue,
+    });
+  }
 }
 
 async function writeGitHubConfiguration({
   github,
   workersApiToken,
-  accessCredentials,
   runtimeProvider,
   publisherEnabled,
 }) {
@@ -172,18 +248,6 @@ async function writeGitHubConfiguration({
     name: "CRAWL_REMOTE_PRODUCTION_CLOUDFLARE_API_TOKEN",
     value: workersApiToken,
   });
-  if (accessCredentials) {
-    await github.setSecret({
-      ...environmentTarget,
-      name: "CRAWL_REMOTE_ACCESS_CLIENT_ID",
-      value: accessCredentials.client_id,
-    });
-    await github.setSecret({
-      ...environmentTarget,
-      name: "CRAWL_REMOTE_ACCESS_CLIENT_SECRET",
-      value: accessCredentials.client_secret,
-    });
-  }
   await github.setVariable({
     ...environmentTarget,
     name: "CRAWL_REMOTE_DEPLOY_AUTHORITY",
@@ -201,18 +265,6 @@ async function writeGitHubConfiguration({
   });
 
   const clawsweeperTarget = { repository: BOOTSTRAP_CONTRACT.clawsweeperRepository };
-  if (accessCredentials) {
-    await github.setSecret({
-      ...clawsweeperTarget,
-      name: "CLAWSWEEPER_GITCRAWL_CLOUD_ACCESS_CLIENT_ID",
-      value: accessCredentials.client_id,
-    });
-    await github.setSecret({
-      ...clawsweeperTarget,
-      name: "CLAWSWEEPER_GITCRAWL_CLOUD_ACCESS_CLIENT_SECRET",
-      value: accessCredentials.client_secret,
-    });
-  }
   await github.setVariable({
     ...clawsweeperTarget,
     name: "CLAWSWEEPER_GITCRAWL_PROVIDER",
@@ -230,18 +282,6 @@ async function writeGitHubConfiguration({
   });
 
   const storeTarget = { repository: BOOTSTRAP_CONTRACT.gitcrawlStoreRepository };
-  if (accessCredentials) {
-    await github.setSecret({
-      ...storeTarget,
-      name: "GITCRAWL_CLOUD_ACCESS_CLIENT_ID",
-      value: accessCredentials.client_id,
-    });
-    await github.setSecret({
-      ...storeTarget,
-      name: "GITCRAWL_CLOUD_ACCESS_CLIENT_SECRET",
-      value: accessCredentials.client_secret,
-    });
-  }
   for (const [name, value] of [
     ["GITCRAWL_CLOUD_PUBLISH_ENABLED", publisherEnabled],
     ["GITCRAWL_CLOUD_STAGE_ONLY", "1"],
@@ -423,7 +463,7 @@ export function createGitHubClient({
 }) {
   assertSecretValue(token, "GH_TOKEN");
 
-  async function get(path) {
+  async function get(path, { allowNotFound = false } = {}) {
     const response = await fetchImpl(`${apiBase}${path}`, {
       headers: {
         accept: "application/vnd.github+json",
@@ -432,6 +472,9 @@ export function createGitHubClient({
       },
       redirect: "error",
     });
+    if (allowNotFound && response.status === 404) {
+      return null;
+    }
     if (!response.ok) {
       throw new Error(`GitHub GET ${path} failed with HTTP ${response.status}`);
     }
@@ -454,6 +497,19 @@ export function createGitHubClient({
         throw new Error(`GitHub GET ${path} returned an invalid or truncated secret list`);
       }
       return new Set(payload.secrets.map((secret) => secret?.name).filter(Boolean));
+    },
+
+    async getVariable({ repository, environment, name }) {
+      const prefix = `/repos/${repository}`;
+      const path = environment
+        ? `${prefix}/environments/${encodeURIComponent(environment)}/variables/${encodeURIComponent(name)}`
+        : `${prefix}/actions/variables/${encodeURIComponent(name)}`;
+      const payload = await get(path, { allowNotFound: true });
+      if (payload === null) return null;
+      if (payload?.name !== name || !isNonEmptyString(payload?.value)) {
+        throw new Error(`GitHub GET ${path} returned an invalid variable`);
+      }
+      return payload.value;
     },
 
     async setSecret({ repository, environment, name, value }) {
@@ -577,6 +633,47 @@ function normalizeExactPolicyIncludes(includes) {
     tokenIds.push(entry.service_token.token_id);
   }
   return tokenIds.sort().map((tokenId) => ({ service_token: { token_id: tokenId } }));
+}
+
+export function credentialGenerationMarker(tokenId, slot) {
+  if (!isNonEmptyString(tokenId) || !ACCESS_CREDENTIAL_SLOTS.includes(slot)) {
+    throw new Error("credential generation requires a valid token ID and slot");
+  }
+  const generation = createHash("sha256").update(tokenId).digest("hex");
+  return `v1:${slot}:${generation}`;
+}
+
+function parseCredentialGenerationMarker(value) {
+  if (typeof value !== "string") return null;
+  const match = /^v1:(blue|green):([0-9a-f]{64})$/.exec(value);
+  if (!match) return null;
+  return { slot: match[1], generation: match[2] };
+}
+
+function credentialStateBindsToken(state, token) {
+  const marker = state.marker;
+  if (!marker || !isNonEmptyString(token?.id)) return false;
+  const expectedMarker = parseCredentialGenerationMarker(
+    credentialGenerationMarker(token.id, marker.slot),
+  );
+  const names = credentialSecretNames(state.target, marker.slot);
+  return (
+    marker.generation === expectedMarker.generation &&
+    state.secretNames.has(names.clientId) &&
+    state.secretNames.has(names.clientSecret)
+  );
+}
+
+function inactiveCredentialSlot(activeSlot) {
+  return activeSlot === "blue" ? "green" : "blue";
+}
+
+function credentialSecretNames(target, slot) {
+  const slotName = slot.toUpperCase();
+  return {
+    clientId: `${target.secretPrefix}_${slotName}_CLIENT_ID`,
+    clientSecret: `${target.secretPrefix}_${slotName}_CLIENT_SECRET`,
+  };
 }
 
 function isManagedServiceToken(token) {

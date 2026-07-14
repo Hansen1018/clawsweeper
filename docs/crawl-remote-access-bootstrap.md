@@ -15,11 +15,16 @@ Dispatch the workflow from current `main` with:
 
 The workflow creates the path-specific Access application for
 `reports.openclaw.ai/crawl-remote/*`, attaches one Service Auth policy, and
-writes the one-time service credentials to:
+writes the one-time service credentials into blue/green slots at:
 
 - the `crawl-remote-production` environment in `openclaw/clawsweeper`
 - the ClawSweeper repository Gitcrawl runtime secrets
 - the `openclaw/gitcrawl-store` publisher secrets
+
+Each destination has two client-ID/secret slots and one non-secret generation
+variable. The marker has the form `v1:<slot>:<sha256-service-token-id>`. A
+consumer resolves both values from the marked slot; the bootstrap never
+publishes an unversioned mixed pair.
 
 It also writes the protected deployment authority, proof mode, Workers token
 hash, cloud endpoint/archive, and conservative rollout variables. The initial
@@ -29,14 +34,18 @@ disabled.
 ## Reconciliation and rotation
 
 A repeat run without rotation reconciles the application, policy, variables,
-and production Workers token when every Access secret slot already exists.
-GitHub does not reveal stored secret values, so a missing slot makes the run
-fail before Cloudflare mutation.
+and production Workers token only when every active slot exists and every
+generation marker hashes to the selected Cloudflare service-token ID. Missing,
+malformed, or stale markers fail before Cloudflare mutation because GitHub does
+not reveal stored secret values.
 
 Use `rotate service token` only when replacing credentials. Rotation temporarily
-allows both old and new token IDs, updates every GitHub destination, narrows the
-policy to the new token, and then deletes the old token. If credential
-publication fails, the old token remains authorized.
+allows every old and new token ID, writes both values into each inactive slot,
+then switches the three generation markers. Only after all markers switch does
+it narrow the policy and delete old tokens. A pair-write failure changes no
+marker; a marker-write failure can leave consumers on different generations,
+but every selected generation remains authorized. A later explicit rotation
+either finishes a fully published generation or supersedes a partial one.
 
 After crawl-remote deployment and staged archive proof:
 
@@ -62,3 +71,8 @@ are passed to `gh secret set` over standard input so encryption happens locally
 before the API request. The installed ClawSweeper GitHub App must grant
 environment, Actions secret, and Actions variable administration on both
 repositories.
+
+This workflow provisions the slot contract only. Existing deploy or Gitcrawl
+consumers must not be activated against it until their separately reviewed
+owner reads the generation marker and selects the matching slot. There is no
+unversioned deploy fallback.
