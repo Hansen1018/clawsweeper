@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { scryptSync } from "node:crypto";
 import test from "node:test";
 import {
   BOOTSTRAP_CONTRACT,
   assertCrawlRemoteDeployConsumerContract,
   bootstrapCrawlRemoteAccess,
+  createWorkersTokenFingerprint,
   credentialGenerationMarker,
   createCloudflareClient,
   createGitHubClient,
@@ -320,6 +321,43 @@ test("rotation requires an exact bare CLI switch", () => {
   }
 });
 
+test("Workers token fingerprints use salted scrypt and verify without exposing the token", () => {
+  const fingerprint = createWorkersTokenFingerprint(
+    "fixture-workers-credential",
+    Buffer.from("00112233445566778899aabbccddeeff", "hex"),
+  );
+  assert.match(fingerprint, /^scrypt-v1:00112233445566778899aabbccddeeff:[0-9a-f]{64}$/);
+
+  const verified = spawnSync(
+    process.execPath,
+    ["scripts/verify-crawl-remote-token-fingerprint.mjs"],
+    {
+      encoding: "utf8",
+      env: {
+        CLOUDFLARE_API_TOKEN: "fixture-workers-credential",
+        CLOUDFLARE_TOKEN_FINGERPRINT: fingerprint,
+      },
+    },
+  );
+  assert.equal(verified.status, 0, verified.stderr);
+  assert.equal(verified.stdout, "");
+  assert.equal(verified.stderr, "");
+
+  const rejected = spawnSync(
+    process.execPath,
+    ["scripts/verify-crawl-remote-token-fingerprint.mjs"],
+    {
+      encoding: "utf8",
+      env: {
+        CLOUDFLARE_API_TOKEN: "wrong-fixture-credential",
+        CLOUDFLARE_TOKEN_FINGERPRINT: fingerprint,
+      },
+    },
+  );
+  assert.equal(rejected.status, 1);
+  assert.doesNotMatch(rejected.stderr, /fixture-workers-credential/);
+});
+
 test("bootstrap CLI rejects valued rotation switches before any contract or API work", () => {
   for (const value of ["false", "0"]) {
     const result = spawnSync(
@@ -452,13 +490,23 @@ test("first bootstrap creates one service-auth policy and writes every destinati
   assert.ok(firstMarkerWrite > intakeDisableWrite);
   assert.ok(firstMarkerWrite > publisherDisableWrite);
   assert.ok(cloudProviderWrite > intakeDisableWrite);
+  const workersTokenFingerprint = variableValue(
+    github.variables,
+    "CRAWL_REMOTE_CLOUDFLARE_TOKEN_FINGERPRINT",
+    BOOTSTRAP_CONTRACT.clawsweeperRepository,
+  );
+  const fingerprintMatch = /^scrypt-v1:([0-9a-f]{32}):([0-9a-f]{64})$/.exec(
+    workersTokenFingerprint,
+  );
+  assert.ok(fingerprintMatch);
   assert.equal(
-    variableValue(
-      github.variables,
-      "CRAWL_REMOTE_CLOUDFLARE_TOKEN_SHA256",
-      BOOTSTRAP_CONTRACT.clawsweeperRepository,
-    ),
-    createHash("sha256").update("fixture-workers-credential").digest("hex"),
+    scryptSync("fixture-workers-credential", Buffer.from(fingerprintMatch[1], "hex"), 32, {
+      N: 16_384,
+      r: 8,
+      p: 1,
+      maxmem: 64 * 1024 * 1024,
+    }).toString("hex"),
+    fingerprintMatch[2],
   );
   assert.equal(
     variableValue(

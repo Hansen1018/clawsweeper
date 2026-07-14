@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes, scryptSync } from "node:crypto";
 import { readFileSync } from "node:fs";
 import process from "node:process";
 import { pathToFileURL } from "node:url";
@@ -459,7 +459,7 @@ async function disableGitcrawlConsumers(github) {
 
 async function writeGitHubConfiguration({ github, workersApiToken, runtimeProvider }) {
   assertSecretValue(workersApiToken, "OPENCLAW_CLOUDFLARE_WORKERS_API_TOKEN");
-  const workersTokenHash = createHash("sha256").update(workersApiToken).digest("hex");
+  const workersTokenFingerprint = createWorkersTokenFingerprint(workersApiToken);
   const environmentTarget = {
     repository: BOOTSTRAP_CONTRACT.clawsweeperRepository,
     environment: BOOTSTRAP_CONTRACT.productionEnvironment,
@@ -482,8 +482,8 @@ async function writeGitHubConfiguration({ github, workersApiToken, runtimeProvid
   });
   await github.setVariable({
     ...environmentTarget,
-    name: "CRAWL_REMOTE_CLOUDFLARE_TOKEN_SHA256",
-    value: workersTokenHash,
+    name: "CRAWL_REMOTE_CLOUDFLARE_TOKEN_FINGERPRINT",
+    value: workersTokenFingerprint,
   });
 
   const clawsweeperTarget = { repository: BOOTSTRAP_CONTRACT.clawsweeperRepository };
@@ -907,6 +907,20 @@ export function credentialGenerationMarker(tokenId, slot) {
   }
   const generation = createHash("sha256").update(tokenId).digest("hex");
   return `v1:${slot}:${generation}`;
+}
+
+export function createWorkersTokenFingerprint(token, salt = randomBytes(16)) {
+  assertSecretValue(token, "Cloudflare Workers API token");
+  if (!Buffer.isBuffer(salt) || salt.length !== 16) {
+    throw new Error("Cloudflare Workers token fingerprint salt must be 16 bytes");
+  }
+  const digest = scryptSync(token, salt, 32, {
+    N: 16_384,
+    r: 8,
+    p: 1,
+    maxmem: 64 * 1024 * 1024,
+  });
+  return `scrypt-v1:${salt.toString("hex")}:${digest.toString("hex")}`;
 }
 
 function parseCredentialGenerationMarker(value) {

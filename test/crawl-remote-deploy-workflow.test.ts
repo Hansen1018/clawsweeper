@@ -14,6 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { parse } from "yaml";
+import { createWorkersTokenFingerprint } from "../scripts/bootstrap-crawl-remote-access.mjs";
 
 const workflowPath = ".github/workflows/deploy-crawl-remote.yml";
 const ciWorkflowPath = ".github/workflows/ci.yml";
@@ -143,7 +144,7 @@ test("crawl-remote release is maintainer-bound across two fresh runners", () => 
     url: "https://crawl-remote.services-91b.workers.dev",
   });
   assert.equal(deploy.env.DEPLOY_AUTHORITY, undefined);
-  assert.equal(deploy.env.CLOUDFLARE_TOKEN_SHA256, undefined);
+  assert.equal(deploy.env.CLOUDFLARE_TOKEN_FINGERPRINT, undefined);
   assert.equal(deploy.env.CUSTOM_ROUTE_PROOF, undefined);
   assert.equal(deploy.env.SOURCE_REPOSITORY, "${{ github.repository }}");
   assert.equal(deploy.env.WORKFLOW_SHA, "${{ github.sha }}");
@@ -289,7 +290,7 @@ test("protected deploy audits exact environment-owned authority inputs", () => {
   };
   const validVariables = [
     { name: "CRAWL_REMOTE_DEPLOY_AUTHORITY" },
-    { name: "CRAWL_REMOTE_CLOUDFLARE_TOKEN_SHA256" },
+    { name: "CRAWL_REMOTE_CLOUDFLARE_TOKEN_FINGERPRINT" },
     { name: "CRAWL_REMOTE_CUSTOM_ROUTE_PROOF" },
   ];
   const validSecrets = [
@@ -1351,7 +1352,10 @@ test("protected deploy never executes target lifecycle code", () => {
   assert.equal(checkout.uses, "actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0");
   assert.equal(checkout.with?.repository, "openclaw/clawsweeper");
   assert.equal(checkout.with?.ref, "${{ github.sha }}");
-  assert.equal(checkout.with?.["sparse-checkout"], ".github/deploy/crawl-remote-toolchain");
+  assert.equal(
+    checkout.with?.["sparse-checkout"],
+    ".github/deploy/crawl-remote-toolchain\nscripts/verify-crawl-remote-token-fingerprint.mjs\n",
+  );
   assert.equal(checkout.with?.["sparse-checkout-cone-mode"], false);
   assert.equal(checkout.with?.["persist-credentials"], false);
   assert.equal(checkout.with?.["fetch-depth"], 1);
@@ -1424,10 +1428,13 @@ test("deploy uses the committed exact Node and Wrangler toolchain before credent
       "${{ secrets.CRAWL_REMOTE_PRODUCTION_CLOUDFLARE_API_TOKEN }}",
     );
     assert.equal(
-      credentialStep.env?.CLOUDFLARE_TOKEN_SHA256,
-      "${{ vars.CRAWL_REMOTE_CLOUDFLARE_TOKEN_SHA256 }}",
+      credentialStep.env?.CLOUDFLARE_TOKEN_FINGERPRINT,
+      "${{ vars.CRAWL_REMOTE_CLOUDFLARE_TOKEN_FINGERPRINT }}",
     );
-    assert.match(credentialStep.run ?? "", /CLOUDFLARE_TOKEN_SHA256.*sha256sum/s);
+    assert.match(
+      credentialStep.run ?? "",
+      /node scripts\/verify-crawl-remote-token-fingerprint\.mjs/,
+    );
   }
   assert.doesNotMatch(source, /OPENCLAW_CLOUDFLARE_WORKERS_API_TOKEN/);
   assert.doesNotMatch(source, /secrets\.CRAWL_REMOTE_CLOUDFLARE_API_TOKEN/);
@@ -1786,7 +1793,10 @@ test("deployment ownership recovers a mutation after the deploy command reports 
   const deploymentID = "44444444-4444-4444-8444-444444444444";
   const deployMessage = "clawsweeper run 123/1 main " + mergedCrawlRemoteMain;
   const token = "production-token";
-  const tokenSHA = createHash("sha256").update(token).digest("hex");
+  const tokenFingerprint = createWorkersTokenFingerprint(
+    token,
+    Buffer.from("00112233445566778899aabbccddeeff", "hex"),
+  );
 
   mkdirSync(binRoot, { recursive: true });
   writeFileSync(
@@ -1827,7 +1837,7 @@ exit 97
         env: {
           ...process.env,
           CLOUDFLARE_API_TOKEN: token,
-          CLOUDFLARE_TOKEN_SHA256: tokenSHA,
+          CLOUDFLARE_TOKEN_FINGERPRINT: tokenFingerprint,
           CURRENT_DEPLOYMENT_JSON: JSON.stringify({
             id: deploymentID,
             annotations: { "workers/message": currentMessage },
@@ -1982,7 +1992,10 @@ test("rollback restores an owned split and rejects foreign annotation or identit
   const foreignDeploymentID = "55555555-5555-4555-8555-555555555555";
   const deployMessage = "clawsweeper run 123/1 main " + mergedCrawlRemoteMain;
   const token = "production-token";
-  const tokenSHA = createHash("sha256").update(token).digest("hex");
+  const tokenFingerprint = createWorkersTokenFingerprint(
+    token,
+    Buffer.from("00112233445566778899aabbccddeeff", "hex"),
+  );
 
   mkdirSync(binRoot, { recursive: true });
   writeFileSync(
@@ -2032,7 +2045,7 @@ exit 97
         env: {
           ...process.env,
           CLOUDFLARE_API_TOKEN: token,
-          CLOUDFLARE_TOKEN_SHA256: tokenSHA,
+          CLOUDFLARE_TOKEN_FINGERPRINT: tokenFingerprint,
           CURRENT_DEPLOYMENT_JSON: JSON.stringify({
             id: currentDeploymentID,
             annotations: { "workers/message": currentMessage },
@@ -2112,7 +2125,10 @@ test("late ownership recovery fences rollback after transient status failure", (
   const foreignDeploymentID = "55555555-5555-4555-8555-555555555555";
   const deployMessage = "clawsweeper run 123/1 main " + mergedCrawlRemoteMain;
   const token = "production-token";
-  const tokenSHA = createHash("sha256").update(token).digest("hex");
+  const tokenFingerprint = createWorkersTokenFingerprint(
+    token,
+    Buffer.from("00112233445566778899aabbccddeeff", "hex"),
+  );
 
   mkdirSync(binRoot, { recursive: true });
   writeFileSync(
@@ -2181,7 +2197,7 @@ exit 97
         env: {
           ...process.env,
           CLOUDFLARE_API_TOKEN: token,
-          CLOUDFLARE_TOKEN_SHA256: tokenSHA,
+          CLOUDFLARE_TOKEN_FINGERPRINT: tokenFingerprint,
           CURRENT_DEPLOYMENT_JSON: JSON.stringify({
             id: deploymentID,
             annotations: { "workers/message": currentMessage },

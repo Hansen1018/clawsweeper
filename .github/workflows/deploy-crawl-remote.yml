@@ -617,7 +617,7 @@ jobs:
           const secretNames = new Set(secrets.map((entry) => entry?.name));
           for (const name of [
             'CRAWL_REMOTE_DEPLOY_AUTHORITY',
-            'CRAWL_REMOTE_CLOUDFLARE_TOKEN_SHA256',
+            'CRAWL_REMOTE_CLOUDFLARE_TOKEN_FINGERPRINT',
             'CRAWL_REMOTE_CUSTOM_ROUTE_PROOF',
           ]) {
             if (!variableNames.has(name)) {
@@ -951,7 +951,9 @@ jobs:
         with:
           repository: openclaw/clawsweeper
           ref: ${{ github.sha }}
-          sparse-checkout: .github/deploy/crawl-remote-toolchain
+          sparse-checkout: |
+            .github/deploy/crawl-remote-toolchain
+            scripts/verify-crawl-remote-token-fingerprint.mjs
           sparse-checkout-cone-mode: false
           fetch-depth: 1
           persist-credentials: false
@@ -1363,7 +1365,7 @@ jobs:
         env:
           APPLIED_MIGRATIONS_RESPONSE: ${{ runner.temp }}/crawl-remote-applied-migrations.json
           CLOUDFLARE_API_TOKEN: ${{ secrets.CRAWL_REMOTE_PRODUCTION_CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_TOKEN_SHA256: ${{ vars.CRAWL_REMOTE_CLOUDFLARE_TOKEN_SHA256 }}
+          CLOUDFLARE_TOKEN_FINGERPRINT: ${{ vars.CRAWL_REMOTE_CLOUDFLARE_TOKEN_FINGERPRINT }}
           CONSUMED_RECEIPT_PATH: ${{ runner.temp }}/${{ needs.preflight.outputs.receipt_name }}.consumed
           FENCE_RESPONSE: ${{ runner.temp }}/crawl-remote-observation-fence.json
           PENDING_MIGRATIONS_PATH: ${{ runner.temp }}/crawl-remote-compatible-pending-migrations.json
@@ -1377,7 +1379,7 @@ jobs:
         run: |
           unset BASH_ENV ENV CDPATH GLOBIGNORE NODE_OPTIONS
           test -n "$CLOUDFLARE_API_TOKEN"
-          test "$CLOUDFLARE_TOKEN_SHA256" = "$(printf '%s' "$CLOUDFLARE_API_TOKEN" | sha256sum | cut -d ' ' -f 1)"
+          node scripts/verify-crawl-remote-token-fingerprint.mjs
           wrangler="$TOOLCHAIN_ROOT/node_modules/.bin/wrangler"
           test "$(
             timeout --foreground --signal=TERM --kill-after=5s \
@@ -2073,7 +2075,7 @@ jobs:
         continue-on-error: true
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CRAWL_REMOTE_PRODUCTION_CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_TOKEN_SHA256: ${{ vars.CRAWL_REMOTE_CLOUDFLARE_TOKEN_SHA256 }}
+          CLOUDFLARE_TOKEN_FINGERPRINT: ${{ vars.CRAWL_REMOTE_CLOUDFLARE_TOKEN_FINGERPRINT }}
           CONSUMED_RECEIPT_PATH: ${{ runner.temp }}/${{ needs.preflight.outputs.receipt_name }}.consumed
           DEPLOY_OUTPUT_PATH: ${{ runner.temp }}/crawl-remote-deploy-output.ndjson
           PENDING_MIGRATIONS_PATH: ${{ runner.temp }}/crawl-remote-compatible-pending-migrations.json
@@ -2084,7 +2086,7 @@ jobs:
         run: |
           unset BASH_ENV ENV CDPATH GLOBIGNORE NODE_OPTIONS
           test -n "$CLOUDFLARE_API_TOKEN"
-          test "$CLOUDFLARE_TOKEN_SHA256" = "$(printf '%s' "$CLOUDFLARE_API_TOKEN" | sha256sum | cut -d ' ' -f 1)"
+          node scripts/verify-crawl-remote-token-fingerprint.mjs
           test -f "$CONSUMED_RECEIPT_PATH"
           test -f "$PENDING_MIGRATIONS_PATH"
           test -f "$PREVIOUS_VERSION_PATH"
@@ -2155,7 +2157,7 @@ jobs:
         continue-on-error: true
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CRAWL_REMOTE_PRODUCTION_CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_TOKEN_SHA256: ${{ vars.CRAWL_REMOTE_CLOUDFLARE_TOKEN_SHA256 }}
+          CLOUDFLARE_TOKEN_FINGERPRINT: ${{ vars.CRAWL_REMOTE_CLOUDFLARE_TOKEN_FINGERPRINT }}
           CURRENT_DEPLOYMENT_RESPONSE: ${{ runner.temp }}/crawl-remote-current-deployment.json
           DEPLOYED_VERSION_PATH: ${{ runner.temp }}/crawl-remote-deployed-version.txt
           OWNED_DEPLOYMENT_ID_PATH: ${{ runner.temp }}/crawl-remote-owned-deployment-id.txt
@@ -2165,7 +2167,7 @@ jobs:
         run: |
           unset BASH_ENV ENV CDPATH GLOBIGNORE NODE_OPTIONS
           test -n "$CLOUDFLARE_API_TOKEN"
-          test "$CLOUDFLARE_TOKEN_SHA256" = "$(printf '%s' "$CLOUDFLARE_API_TOKEN" | sha256sum | cut -d ' ' -f 1)"
+          node scripts/verify-crawl-remote-token-fingerprint.mjs
           test -f "$PREVIOUS_VERSION_PATH"
           test ! -e "$CURRENT_DEPLOYMENT_RESPONSE"
           test ! -e "$DEPLOYED_VERSION_PATH"
@@ -2671,7 +2673,7 @@ jobs:
         continue-on-error: true
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CRAWL_REMOTE_PRODUCTION_CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_TOKEN_SHA256: ${{ vars.CRAWL_REMOTE_CLOUDFLARE_TOKEN_SHA256 }}
+          CLOUDFLARE_TOKEN_FINGERPRINT: ${{ vars.CRAWL_REMOTE_CLOUDFLARE_TOKEN_FINGERPRINT }}
           DEPLOYED_VERSION_PATH: ${{ runner.temp }}/crawl-remote-deployed-version.txt
           OWNED_DEPLOYMENT_ID_PATH: ${{ runner.temp }}/crawl-remote-owned-deployment-id.txt
           PREVIOUS_VERSION_PATH: ${{ runner.temp }}/crawl-remote-previous-version.txt
@@ -2680,7 +2682,7 @@ jobs:
         run: |
           unset BASH_ENV ENV CDPATH GLOBIGNORE NODE_OPTIONS
           test -n "$CLOUDFLARE_API_TOKEN"
-          test "$CLOUDFLARE_TOKEN_SHA256" = "$(printf '%s' "$CLOUDFLARE_API_TOKEN" | sha256sum | cut -d ' ' -f 1)"
+          node scripts/verify-crawl-remote-token-fingerprint.mjs
           test -f "$PREVIOUS_VERSION_PATH"
 
           node --input-type=module <<'RECOVER_DEPLOYMENT_NODE'
@@ -2898,7 +2900,7 @@ jobs:
           }}
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CRAWL_REMOTE_PRODUCTION_CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_TOKEN_SHA256: ${{ vars.CRAWL_REMOTE_CLOUDFLARE_TOKEN_SHA256 }}
+          CLOUDFLARE_TOKEN_FINGERPRINT: ${{ vars.CRAWL_REMOTE_CLOUDFLARE_TOKEN_FINGERPRINT }}
           CURRENT_DEPLOYMENT_RESPONSE: ${{ runner.temp }}/crawl-remote-current-deployment-before-rollback.json
           DEPLOYED_VERSION_PATH: ${{ runner.temp }}/crawl-remote-deployed-version.txt
           OWNED_DEPLOYMENT_ID_PATH: ${{ runner.temp }}/crawl-remote-owned-deployment-id.txt
@@ -2908,7 +2910,7 @@ jobs:
         run: |
           unset BASH_ENV ENV CDPATH GLOBIGNORE NODE_OPTIONS
           test -n "$CLOUDFLARE_API_TOKEN"
-          test "$CLOUDFLARE_TOKEN_SHA256" = "$(printf '%s' "$CLOUDFLARE_API_TOKEN" | sha256sum | cut -d ' ' -f 1)"
+          node scripts/verify-crawl-remote-token-fingerprint.mjs
           test -f "$DEPLOYED_VERSION_PATH"
           test -f "$OWNED_DEPLOYMENT_ID_PATH"
           test -f "$PREVIOUS_VERSION_PATH"

@@ -64,7 +64,10 @@ test("production crawl-remote checkout is pinned to the audited v7 commit", () =
   assert.equal(deployCheckout?.uses, `actions/checkout@${checkoutV7Commit}`);
   assert.equal(deployCheckout?.with?.repository, "openclaw/clawsweeper");
   assert.equal(deployCheckout?.with?.ref, "${{ github.sha }}");
-  assert.equal(deployCheckout?.with?.["sparse-checkout"], ".github/deploy/crawl-remote-toolchain");
+  assert.equal(
+    deployCheckout?.with?.["sparse-checkout"],
+    ".github/deploy/crawl-remote-toolchain\nscripts/verify-crawl-remote-token-fingerprint.mjs\n",
+  );
   assert.equal(deployCheckout?.with?.["persist-credentials"], false);
 });
 

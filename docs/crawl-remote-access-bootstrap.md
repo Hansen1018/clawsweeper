@@ -63,8 +63,8 @@ variable. The marker has the form `v1:<slot>:<sha256-service-token-id>`. A
 consumer resolves both values from the marked slot; the bootstrap never
 publishes an unversioned mixed pair.
 
-It also writes the protected deployment authority, proof mode, Workers token
-hash, cloud endpoint/archive, and conservative rollout variables. The initial
+It also writes the protected deployment authority, proof mode, a salted scrypt
+Workers token fingerprint, cloud endpoint/archive, and conservative rollout variables. The initial
 settings stage ClawSweeper on the cloud provider while keeping scheduled cluster
 repair intake and cloud publication disabled.
 
