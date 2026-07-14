@@ -168,9 +168,11 @@ test("repair result publication rejects untrusted worker heads before minting wr
   assert.match(classification, /git cat-file -e "\$\{WORKER_HEAD_SHA\}:\$\{CAPABILITIES_PATH\}"/);
   assert.match(classification, /git cat-file blob "\$\{WORKER_HEAD_SHA\}:\$\{CAPABILITIES_PATH\}"/);
   assert.match(classification, /\.schema == "clawsweeper\.repair-worker-capabilities"/);
-  assert.match(classification, /\.sealed_source[\s\S]*Unsupported worker capabilities/);
+  assert.match(
+    classification,
+    /\.sealed_source == true and \.action_ledger == true[\s\S]*Unsupported worker capabilities/,
+  );
   assert.match(classification, /worker_ledgers_required=0/);
-  assert.match(classification, /jq -r '\.action_ledger'/);
   assert.match(classification, /worker_ledgers_required=1/);
   assert.doesNotMatch(classification, /classify_contract|CONTRACT_SHA|git log|git show|grep -F/);
   const capabilities = JSON.parse(readText(".github/repair-worker-capabilities.json"));
@@ -234,10 +236,17 @@ test("repair result publication requires ledgers for every post-contract worker"
       trusted_legacy_worker_head: legacyHead,
       worker_ledgers_required: "0",
     });
-    assert.deepEqual(classifyWorker(repo, classify.run, sealedSourceContract), {
-      trusted_legacy_worker_head: "",
-      worker_ledgers_required: "0",
-    });
+    assert.throws(
+      () => classifyWorker(repo, classify.run, sealedSourceContract),
+      (error: unknown) => {
+        const output = error as { stderr?: string; stdout?: string };
+        assert.match(
+          `${String(output.stdout ?? "")}\n${String(output.stderr ?? "")}`,
+          /Unsupported worker capabilities/,
+        );
+        return true;
+      },
+    );
     assert.deepEqual(classifyWorker(repo, classify.run, actionLedgerContract), {
       trusted_legacy_worker_head: "",
       worker_ledgers_required: "1",

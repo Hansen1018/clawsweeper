@@ -434,6 +434,8 @@ expired, incomplete, extra, or forged required lanes fail publication. Legacy
 worker heads without the versioned `.github/repair-worker-capabilities.json`
 tree marker remain explicitly marked as legacy. Tree capabilities survive
 squash and rebase landing, unlike feature-branch commit boundaries.
+Once the marker exists, both sealed-source and action-ledger capabilities are
+mandatory; a marker cannot opt a worker back into receipt-free legacy behavior.
 
 Commit review uses the same credential separation. Each Codex matrix invocation
 uploads one producer-attempt bundle containing its report and local ledger. The

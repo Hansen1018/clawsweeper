@@ -171,7 +171,10 @@ test("repair worker jobs upload current-attempt ledgers for the trusted publishe
   assert.match(publisher, /CAPABILITIES_PATH: \$\{\{ env\.WORKER_CAPABILITIES_PATH \}\}/);
   assert.match(publisher, /git cat-file blob "\$\{WORKER_HEAD_SHA\}:\$\{CAPABILITIES_PATH\}"/);
   assert.match(publisher, /\.schema == "clawsweeper\.repair-worker-capabilities"/);
-  assert.match(publisher, /\.action_ledger[\s\S]*worker_ledgers_required=1/);
+  assert.match(
+    publisher,
+    /\.sealed_source == true and \.action_ledger == true[\s\S]*worker_ledgers_required=1/,
+  );
   assert.doesNotMatch(publisher, /worker_workflow=|grep -Fq/);
   assert.ok(
     publisher.indexOf("- name: Verify current worker action ledgers") <

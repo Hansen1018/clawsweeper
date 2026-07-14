@@ -73,13 +73,12 @@ jobs:
             echo "::error title=Invalid worker capabilities::Worker capability marker is malformed."
             exit 1
           fi
-          if [ "$(jq -r '.sealed_source' "$capabilities_file")" != "true" ]; then
-            echo "::error title=Unsupported worker capabilities::Worker does not seal its source contract."
+          if ! jq -e '.sealed_source == true and .action_ledger == true' \
+            "$capabilities_file" >/dev/null; then
+            echo "::error title=Unsupported worker capabilities::Worker marker must require sealed source and action ledgers."
             exit 1
           fi
-          if [ "$(jq -r '.action_ledger' "$capabilities_file")" = "true" ]; then
-            echo "worker_ledgers_required=1" >> "$GITHUB_OUTPUT"
-          fi
+          echo "worker_ledgers_required=1" >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub App token
         id: app_token
