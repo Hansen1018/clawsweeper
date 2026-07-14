@@ -2307,6 +2307,13 @@ test("prepared workflow events persist their validated input snapshot", () => {
   evidence[0]!.reportPath = "results/reviews/changed.json";
   attributes.queue_depth = 99;
 
+  assert.throws(() => {
+    prepared.event!.producer.component = "mutated";
+  }, /read only|readonly|Cannot assign/);
+  assert.throws(() => {
+    prepared.event!.action.status = "failed";
+  }, /read only|readonly|Cannot assign/);
+
   const committed = prepared.commit();
   assert.deepEqual(committed, prepared.event);
   assert.deepEqual(readAllSpooledActionEvents(root), [prepared.event]);

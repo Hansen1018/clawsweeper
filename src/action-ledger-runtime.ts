@@ -339,7 +339,7 @@ export function prepareWorkflowActionEvent(
   const eventInputSnapshot = structuredClone(eventInput);
   const recordedAt = options.now ? options.now() : new Date();
   const writeOptions = { now: () => recordedAt };
-  const candidate = createActionEvent(eventInputSnapshot, writeOptions);
+  const candidate = freezeActionEvent(createActionEvent(eventInputSnapshot, writeOptions));
   const partitionDate = workflowPartitionDate(env);
   let committed: ActionEvent | undefined;
   let committing = false;
@@ -367,6 +367,21 @@ export function prepareWorkflowActionEvent(
       }
     },
   };
+}
+
+function freezeActionEvent(event: ActionEvent): ActionEvent {
+  const pending: object[] = [event];
+  const seen = new Set<object>();
+  while (pending.length > 0) {
+    const current = pending.pop()!;
+    if (seen.has(current)) continue;
+    seen.add(current);
+    for (const value of Object.values(current)) {
+      if (value !== null && typeof value === "object") pending.push(value);
+    }
+    Object.freeze(current);
+  }
+  return event;
 }
 
 export function recordWorkflowPhaseEvent(
