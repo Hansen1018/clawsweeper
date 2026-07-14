@@ -548,7 +548,13 @@ test("first bootstrap creates one service-auth policy and writes every destinati
   const cloudProviderWrite = github.writes.findIndex(
     (write) => write.kind === "variable" && write.name === "CLAWSWEEPER_GITCRAWL_PROVIDER",
   );
+  const publisherDisableWrite = github.writes.findIndex(
+    (write) => write.kind === "variable" && write.name === "GITCRAWL_CLOUD_PUBLISH_ENABLED",
+  );
   assert.ok(intakeDisableWrite >= 0);
+  assert.ok(publisherDisableWrite >= 0);
+  assert.ok(firstMarkerWrite > intakeDisableWrite);
+  assert.ok(firstMarkerWrite > publisherDisableWrite);
   assert.ok(cloudProviderWrite > intakeDisableWrite);
   assert.equal(
     variableValue(
@@ -591,6 +597,44 @@ test("first bootstrap creates one service-auth policy and writes every destinati
     "1",
   );
   assert.doesNotMatch(logs.join("\n"), /fixture-(workers|client)/);
+});
+
+test("kill switches are verified before Cloudflare or credential publication", async () => {
+  const cloudflare = createCloudflareFixture();
+  const github = createGitHubFixture();
+  const originalGetVariable = github.client.getVariable;
+  github.client.getVariable = async (target: {
+    repository: string;
+    environment?: string;
+    name: string;
+  }) => {
+    if (target.name === "GITCRAWL_CLOUD_PUBLISH_ENABLED") return "1";
+    return originalGetVariable(target);
+  };
+
+  await assert.rejects(
+    bootstrapCrawlRemoteAccess(
+      {
+        publisherEnabled: "0",
+        rotateServiceToken: false,
+        rotationLabel: "123-1",
+        runtimeProvider: "cloud",
+        workersApiToken: "fixture-workers-credential",
+      },
+      { cloudflare: cloudflare.client, github: github.client, logger: quietLogger },
+    ),
+    /GITCRAWL_CLOUD_PUBLISH_ENABLED did not remain disabled/,
+  );
+
+  assert.deepEqual(
+    cloudflare.events.map((event) => event.event),
+    ["list-tokens", "inspect-app"],
+  );
+  assert.equal(
+    github.variables.some((variable) => variable.name.endsWith("_CREDENTIAL_GENERATION")),
+    false,
+  );
+  assert.equal(github.secrets.length, 0);
 });
 
 test("existing token without matching credential generations fails before Cloudflare mutation", async () => {
@@ -674,7 +718,7 @@ test("complete existing bootstrap reconciles without rewriting Access secrets", 
   assert.equal(result.rotatedServiceToken, false);
   assert.equal(result.resumedServiceTokenRotation, false);
   assert.equal(github.lists.length, 3);
-  assert.equal(github.variableReads.length, 3);
+  assert.equal(github.variableReads.length, 5);
   assert.deepEqual(
     github.secrets.map((secret) => secret.name),
     ["CRAWL_REMOTE_PRODUCTION_CLOUDFLARE_API_TOKEN"],
@@ -763,6 +807,72 @@ test("rotation authorizes both tokens until all GitHub credentials are replaced"
     event: "delete-token",
     tokenId: "token-old",
   });
+});
+
+test("renamed marker-bound tokens require rotation and remain authorized until cutover", async () => {
+  const renamedToken = { id: "token-renamed", name: "renamed outside bootstrap" };
+  const blockedCloudflare = createCloudflareFixture({ tokens: [renamedToken] });
+  const blockedGitHub = createGitHubFixture({ activeTokenId: renamedToken.id });
+
+  await assert.rejects(
+    bootstrapCrawlRemoteAccess(
+      {
+        publisherEnabled: "0",
+        rotateServiceToken: false,
+        rotationLabel: "456-1",
+        runtimeProvider: "cloud",
+        workersApiToken: "fixture-workers-credential",
+      },
+      {
+        cloudflare: blockedCloudflare.client,
+        github: blockedGitHub.client,
+        logger: quietLogger,
+      },
+    ),
+    /marker-bound.*no longer has its managed name.*explicit rotation/,
+  );
+  assert.deepEqual(
+    blockedCloudflare.events.map((event) => event.event),
+    ["list-tokens"],
+  );
+  assert.equal(blockedGitHub.variables.length, 0);
+
+  const rotationCloudflare = createCloudflareFixture({
+    tokens: [renamedToken],
+    application: {
+      id: "app-existing",
+      name: BOOTSTRAP_CONTRACT.accessAppName,
+      domain: BOOTSTRAP_CONTRACT.accessDomain,
+    },
+    policy: { id: "policy-existing" },
+  });
+  const rotationGitHub = createGitHubFixture({ activeTokenId: renamedToken.id });
+  const result = await bootstrapCrawlRemoteAccess(
+    {
+      publisherEnabled: "0",
+      rotateServiceToken: true,
+      rotationLabel: "456-2",
+      runtimeProvider: "cloud",
+      workersApiToken: "fixture-workers-credential",
+    },
+    {
+      cloudflare: rotationCloudflare.client,
+      github: rotationGitHub.client,
+      logger: quietLogger,
+    },
+  );
+
+  assert.equal(result.accessServiceTokenId, "token-new");
+  assert.deepEqual(
+    rotationCloudflare.events
+      .filter((event) => event.event === "ensure-policy")
+      .map((event) => event.tokenIds),
+    [["token-renamed", "token-new"], ["token-new"]],
+  );
+  assert.deepEqual(
+    rotationCloudflare.events.filter((event) => event.event === "delete-token"),
+    [{ event: "delete-token", tokenId: "token-renamed" }],
+  );
 });
 
 test("main drift blocks initial mutation and old-token revocation", async () => {

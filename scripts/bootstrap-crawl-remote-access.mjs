@@ -21,6 +21,16 @@ export const BOOTSTRAP_CONTRACT = Object.freeze({
 });
 
 const ACCESS_CREDENTIAL_SLOTS = Object.freeze(["blue", "green"]);
+const GITCRAWL_CONSUMER_KILL_SWITCHES = Object.freeze([
+  {
+    repository: BOOTSTRAP_CONTRACT.gitcrawlStoreRepository,
+    name: "GITCRAWL_CLOUD_PUBLISH_ENABLED",
+  },
+  {
+    repository: BOOTSTRAP_CONTRACT.clawsweeperRepository,
+    name: "CLAWSWEEPER_FEATURE_CLUSTER_REPAIR_ENABLED",
+  },
+]);
 const DEPLOY_CONSUMER_CONTRACT = Object.freeze({
   checkoutStepName: "Checkout crawl-remote Access resolver",
   checkoutUses: "actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0",
@@ -103,19 +113,26 @@ export async function bootstrapCrawlRemoteAccess(options, dependencies) {
   const github = dependencies.github;
   const logger = dependencies.logger ?? console;
 
-  const matchingTokens = (await cloudflare.listServiceTokens()).filter(isManagedServiceToken);
-  if (matchingTokens.length > 1 && !rotateServiceToken) {
+  const serviceTokens = await cloudflare.listServiceTokens();
+  const managedTokens = serviceTokens.filter(isManagedServiceToken);
+  if (managedTokens.length > 1 && !rotateServiceToken) {
     throw new Error(
       "multiple managed crawl-remote Access service tokens exist; rerun with explicit rotation",
     );
   }
 
   const credentialStates = await inspectAccessCredentialStates(github);
-  const markerSelectedTokens = matchingTokens.filter((token) =>
+  const markerSelectedTokens = serviceTokens.filter((token) =>
     credentialStates.some((state) => credentialStateBindsToken(state, token)),
   );
-  if (matchingTokens.length === 1 && !rotateServiceToken) {
-    assertCredentialStatesBoundToToken(credentialStates, matchingTokens[0]);
+  if (!rotateServiceToken && markerSelectedTokens.some((token) => !isManagedServiceToken(token))) {
+    throw new Error(
+      "a marker-bound crawl-remote Access service token no longer has its managed name; " +
+        "rerun with explicit rotation",
+    );
+  }
+  if (managedTokens.length === 1 && !rotateServiceToken) {
+    assertCredentialStatesBoundToToken(credentialStates, managedTokens[0]);
   }
 
   const applicationState = await cloudflare.inspectAccessApplication();
@@ -125,8 +142,8 @@ export async function bootstrapCrawlRemoteAccess(options, dependencies) {
   let resumedRotation = false;
   let authorizedOldTokens = [];
 
-  if (rotateServiceToken && matchingTokens.length > 1) {
-    const boundTokens = matchingTokens.filter((token) =>
+  if (rotateServiceToken && managedTokens.length > 1) {
+    const boundTokens = managedTokens.filter((token) =>
       credentialStates.every((state) => credentialStateBindsToken(state, token)),
     );
     if (boundTokens.length > 1) {
@@ -134,7 +151,7 @@ export async function bootstrapCrawlRemoteAccess(options, dependencies) {
     }
     if (boundTokens.length === 1) {
       const boundToken = boundTokens[0];
-      const remainingTokens = matchingTokens.filter((token) => token.id !== boundToken.id);
+      const remainingTokens = managedTokens.filter((token) => token.id !== boundToken.id);
       if (isStrictlyNewestManagedServiceToken(boundToken, remainingTokens)) {
         activeToken = boundToken;
         oldTokens = remainingTokens;
@@ -143,14 +160,15 @@ export async function bootstrapCrawlRemoteAccess(options, dependencies) {
     }
   }
 
-  if (!activeToken && matchingTokens.length === 1 && !rotateServiceToken) {
-    activeToken = matchingTokens[0];
+  if (!activeToken && managedTokens.length === 1 && !rotateServiceToken) {
+    activeToken = managedTokens[0];
   }
 
   await github.assertCurrentMain();
+  await disableGitcrawlConsumers(github);
 
   if (!activeToken) {
-    oldTokens = matchingTokens;
+    oldTokens = uniqueServiceTokens([...managedTokens, ...markerSelectedTokens]);
     authorizedOldTokens = markerSelectedTokens;
     const tokenName =
       oldTokens.length === 0
@@ -189,7 +207,6 @@ export async function bootstrapCrawlRemoteAccess(options, dependencies) {
     github,
     workersApiToken: options.workersApiToken,
     runtimeProvider,
-    publisherEnabled,
   });
 
   if (oldTokenIds.length > 0) {
@@ -756,12 +773,19 @@ async function publishAccessCredentials({ github, accessCredentials, credentialS
   }
 }
 
-async function writeGitHubConfiguration({
-  github,
-  workersApiToken,
-  runtimeProvider,
-  publisherEnabled,
-}) {
+async function disableGitcrawlConsumers(github) {
+  for (const target of GITCRAWL_CONSUMER_KILL_SWITCHES) {
+    await github.setVariable({ ...target, value: "0" });
+  }
+  for (const target of GITCRAWL_CONSUMER_KILL_SWITCHES) {
+    const value = await github.getVariable(target);
+    if (value !== "0") {
+      throw new Error(`${target.name} did not remain disabled after bootstrap write`);
+    }
+  }
+}
+
+async function writeGitHubConfiguration({ github, workersApiToken, runtimeProvider }) {
   assertSecretValue(workersApiToken, "OPENCLAW_CLOUDFLARE_WORKERS_API_TOKEN");
   const workersTokenHash = createHash("sha256").update(workersApiToken).digest("hex");
   const environmentTarget = {
@@ -793,11 +817,6 @@ async function writeGitHubConfiguration({
   const clawsweeperTarget = { repository: BOOTSTRAP_CONTRACT.clawsweeperRepository };
   await github.setVariable({
     ...clawsweeperTarget,
-    name: "CLAWSWEEPER_FEATURE_CLUSTER_REPAIR_ENABLED",
-    value: "0",
-  });
-  await github.setVariable({
-    ...clawsweeperTarget,
     name: "CLAWSWEEPER_GITCRAWL_PROVIDER",
     value: runtimeProvider,
   });
@@ -814,7 +833,6 @@ async function writeGitHubConfiguration({
 
   const storeTarget = { repository: BOOTSTRAP_CONTRACT.gitcrawlStoreRepository };
   for (const [name, value] of [
-    ["GITCRAWL_CLOUD_PUBLISH_ENABLED", publisherEnabled],
     ["GITCRAWL_CLOUD_STAGE_ONLY", "1"],
     ["GITCRAWL_CLOUD_OBSERVATION_ORDER", "0"],
     ["GITCRAWL_CLOUD_ENDPOINT", BOOTSTRAP_CONTRACT.cloudEndpoint],
@@ -1250,6 +1268,16 @@ function credentialSecretNames(target, slot) {
     clientId: `${target.secretPrefix}_${slotName}_CLIENT_ID`,
     clientSecret: `${target.secretPrefix}_${slotName}_CLIENT_SECRET`,
   };
+}
+
+function uniqueServiceTokens(tokens) {
+  const byId = new Map();
+  for (const token of tokens) {
+    if (isNonEmptyString(token?.id)) {
+      byId.set(token.id, token);
+    }
+  }
+  return [...byId.values()];
 }
 
 function isManagedServiceToken(token) {
