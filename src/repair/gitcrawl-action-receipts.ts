@@ -14,6 +14,7 @@ import {
   type PreparedWorkflowActionEvent,
   type WorkflowActionEventOptions,
 } from "../action-ledger-runtime.js";
+import { normalizeRepo } from "../repository-profiles.js";
 import {
   GITCRAWL_QUERY_CONTRACT_VERSION,
   GITCRAWL_QUERY_NAMES,
@@ -146,7 +147,8 @@ export function prepareGitcrawlActionReceipt(
   input: GitcrawlActionReceiptInput,
   options: WorkflowActionEventOptions = {},
 ): PreparedWorkflowActionEvent {
-  const event = gitcrawlReceiptEvent(input, options.env ?? process.env);
+  const canonicalInput = canonicalGitcrawlReceiptInput(input);
+  const event = gitcrawlReceiptEvent(canonicalInput, options.env ?? process.env);
   return prepareWorkflowPhaseEvent(
     root,
     {
@@ -157,10 +159,10 @@ export function prepareGitcrawlActionReceipt(
       mutation: false,
       identity: event.identity,
       operation: "gitcrawl_receipt",
-      operationIdentity: gitcrawlOperationIdentity(input),
+      operationIdentity: gitcrawlOperationIdentity(canonicalInput),
       phaseSeq: event.phaseSeq,
       component: "gitcrawl_receipts",
-      subject: gitcrawlReceiptSubject(input),
+      subject: gitcrawlReceiptSubject(canonicalInput),
       evidence: event.evidence,
       attributes: event.attributes,
       privacy: {
@@ -178,7 +180,8 @@ export function recordGitcrawlActionReceipt(
   input: GitcrawlActionReceiptInput,
   options: WorkflowActionEventOptions = {},
 ): ActionEvent | null {
-  const event = gitcrawlReceiptEvent(input, options.env ?? process.env);
+  const canonicalInput = canonicalGitcrawlReceiptInput(input);
+  const event = gitcrawlReceiptEvent(canonicalInput, options.env ?? process.env);
   return recordWorkflowPhaseEvent(
     root,
     {
@@ -189,10 +192,10 @@ export function recordGitcrawlActionReceipt(
       mutation: false,
       identity: event.identity,
       operation: "gitcrawl_receipt",
-      operationIdentity: gitcrawlOperationIdentity(input),
+      operationIdentity: gitcrawlOperationIdentity(canonicalInput),
       phaseSeq: event.phaseSeq,
       component: "gitcrawl_receipts",
-      subject: gitcrawlReceiptSubject(input),
+      subject: gitcrawlReceiptSubject(canonicalInput),
       evidence: event.evidence,
       attributes: event.attributes,
       privacy: {
@@ -278,7 +281,7 @@ function gitcrawlReceiptEvent(
       status: ACTION_EVENT_STATUSES.completed,
       reasonCode: ACTION_EVENT_REASON_CODES.selected,
       retryable: false,
-      identity: { receipt: "snapshot", selectionSha256 },
+      identity: { receipt: "snapshot" },
       phaseSeq: input.phaseSeq ?? 1,
       evidence: [
         ...snapshotEvidence,
@@ -327,7 +330,6 @@ function gitcrawlReceiptEvent(
       identity: {
         receipt: "query",
         queryName: input.queryName,
-        bindingSha256,
       },
       phaseSeq: input.phaseSeq ?? 10 + GITCRAWL_QUERY_NAMES.indexOf(input.queryName),
       evidence: [
@@ -372,7 +374,6 @@ function gitcrawlReceiptEvent(
         identity: {
           receipt: "binding",
           binding: "coverage",
-          coverageSha256: input.coverageSha256,
         },
         phaseSeq: input.phaseSeq ?? 100,
         evidence: [
@@ -418,7 +419,6 @@ function gitcrawlReceiptEvent(
       identity: {
         receipt: "binding",
         binding: "parity",
-        paritySha256: input.paritySha256,
       },
       phaseSeq: input.phaseSeq ?? 101,
       evidence: [
@@ -485,6 +485,15 @@ function gitcrawlOperationIdentity(input: GitcrawlActionReceiptInput): Record<st
       ? {}
       : { paritySnapshotSha256: snapshotIdentifierSha256(input.paritySnapshotId) }),
   };
+}
+
+function canonicalGitcrawlReceiptInput(
+  input: GitcrawlActionReceiptInput,
+): GitcrawlActionReceiptInput {
+  return {
+    ...input,
+    repository: normalizeRepo(input.repository),
+  } as GitcrawlActionReceiptInput;
 }
 
 function gitcrawlSnapshotEvidence(

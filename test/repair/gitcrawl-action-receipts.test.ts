@@ -201,6 +201,25 @@ test("Gitcrawl receipt identities are canonical before hashing and persistence",
     prepared.event?.attributes?.capability,
     [...GITCRAWL_QUERY_NAMES, "gitcrawl.snapshot.provenance.v1"].sort(),
   );
+  const mixedCase = prepareGitcrawlActionReceipt(
+    root,
+    {
+      receipt: "snapshot",
+      repository: "OpenClaw/OpenClaw",
+      provider: "cloud",
+      snapshotId,
+      capabilities: [
+        ...GITCRAWL_QUERY_NAMES,
+        ` ${GITCRAWL_QUERY_NAMES[0]} `,
+        " gitcrawl.snapshot.provenance.v1 ",
+      ],
+      coverageSha256,
+      coverageDatasetCount: 9,
+      coverageComplete: true,
+    },
+    { env, now: () => now },
+  );
+  assert.deepEqual(mixedCase.event, prepared.event);
   assert.throws(
     () =>
       recordGitcrawlActionReceipt(
@@ -219,6 +238,131 @@ test("Gitcrawl receipt identities are canonical before hashing and persistence",
       ),
     /surrounding whitespace/,
   );
+});
+
+test("Gitcrawl success receipt slots reject contradictory outcomes", () => {
+  const cases: Array<{
+    first: Parameters<typeof recordGitcrawlActionReceipt>[1];
+    second: Parameters<typeof recordGitcrawlActionReceipt>[1];
+  }> = [
+    {
+      first: {
+        receipt: "snapshot",
+        repository,
+        provider: "cloud",
+        snapshotId,
+        capabilities: GITCRAWL_QUERY_NAMES,
+        coverageSha256,
+        coverageDatasetCount: 9,
+        coverageComplete: true,
+      },
+      second: {
+        receipt: "snapshot",
+        repository,
+        provider: "cloud",
+        snapshotId,
+        capabilities: [...GITCRAWL_QUERY_NAMES, "gitcrawl.snapshot.provenance.v1"],
+        coverageSha256: sha256Canonical({ coverage: "changed" }),
+        coverageDatasetCount: 10,
+        coverageComplete: true,
+      },
+    },
+    {
+      first: {
+        receipt: "query",
+        repository,
+        provider: "cloud",
+        snapshotId,
+        queryName: "gitcrawl.coverage",
+        queryArgsSha256: sha256Canonical({ args: "same" }),
+        resultSha256: sha256Canonical({ result: "first" }),
+        rowCount: 1,
+        claimCount: 1,
+        coverageComplete: true,
+      },
+      second: {
+        receipt: "query",
+        repository,
+        provider: "cloud",
+        snapshotId,
+        queryName: "gitcrawl.coverage",
+        queryArgsSha256: sha256Canonical({ args: "same" }),
+        resultSha256: sha256Canonical({ result: "second" }),
+        rowCount: 2,
+        claimCount: 2,
+        coverageComplete: true,
+      },
+    },
+    {
+      first: {
+        receipt: "binding",
+        binding: "coverage",
+        repository,
+        provider: "cloud",
+        snapshotId,
+        coverageSha256,
+        datasetCount: 9,
+        rowCount: 90,
+        eligibleCount: 80,
+        coveredCount: 80,
+        complete: true,
+      },
+      second: {
+        receipt: "binding",
+        binding: "coverage",
+        repository,
+        provider: "cloud",
+        snapshotId,
+        coverageSha256: sha256Canonical({ coverage: "changed" }),
+        datasetCount: 10,
+        rowCount: 100,
+        eligibleCount: 90,
+        coveredCount: 90,
+        complete: true,
+      },
+    },
+    {
+      first: {
+        receipt: "binding",
+        binding: "parity",
+        repository,
+        provider: "parity",
+        snapshotId,
+        paritySnapshotId,
+        paritySha256: sha256Canonical({ parity: "first" }),
+        queryCount: GITCRAWL_QUERY_NAMES.length,
+        primaryCount: 20,
+        parityCount: 20,
+        matched: true,
+      },
+      second: {
+        receipt: "binding",
+        binding: "parity",
+        repository,
+        provider: "parity",
+        snapshotId,
+        paritySnapshotId,
+        paritySha256: sha256Canonical({ parity: "second" }),
+        queryCount: GITCRAWL_QUERY_NAMES.length,
+        primaryCount: 21,
+        parityCount: 21,
+        matched: true,
+      },
+    },
+  ];
+
+  for (const [index, receiptCase] of cases.entries()) {
+    const caseRoot = trustedChildRoot(tempRoot(), `case-${index}`);
+    recordGitcrawlActionReceipt(caseRoot, receiptCase.first, { env, now: () => now });
+    assert.throws(
+      () =>
+        recordGitcrawlActionReceipt(caseRoot, receiptCase.second, {
+          env,
+          now: () => now,
+        }),
+      /action event conflict/,
+    );
+  }
 });
 
 test("Gitcrawl binding receipts prove complete coverage and matched parity", () => {
