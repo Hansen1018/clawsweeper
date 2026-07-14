@@ -168,19 +168,26 @@ test("repair worker jobs upload current-attempt ledgers for the trusted publishe
     publisher,
     /import_worker_lane execute execute "\$EXECUTE_JOB_RESULT" "\$EXECUTE_JOB_ATTEMPT" true/,
   );
-  assert.match(
-    publisher,
-    /ACTION_LEDGER_CONTRACT_SHA: \$\{\{ env\.WORKER_ACTION_LEDGER_CONTRACT_SHA \}\}/,
-  );
-  assert.match(publisher, /action_ledger_contract="\$\(classify_contract/);
-  assert.match(
-    publisher,
-    /if \[ "\$action_ledger_contract" = "required" \]; then[\s\S]*worker_ledgers_required=1/,
-  );
+  assert.match(publisher, /CAPABILITIES_PATH: \$\{\{ env\.WORKER_CAPABILITIES_PATH \}\}/);
+  assert.match(publisher, /git cat-file blob "\$\{WORKER_HEAD_SHA\}:\$\{CAPABILITIES_PATH\}"/);
+  assert.match(publisher, /\.schema == "clawsweeper\.repair-worker-capabilities"/);
+  assert.match(publisher, /\.action_ledger[\s\S]*worker_ledgers_required=1/);
   assert.doesNotMatch(publisher, /worker_workflow=|grep -Fq/);
   assert.ok(
     publisher.indexOf("- name: Verify current worker action ledgers") <
+      publisher.indexOf("- name: Publish verified worker action ledgers"),
+  );
+  assert.ok(
+    publisher.indexOf("- name: Publish verified worker action ledgers") <
       publisher.indexOf("- name: Publish result ledger"),
+  );
+  assert.match(
+    publisher,
+    /Publish verified worker action ledgers[\s\S]*repair:publish-main[\s\S]*ready=1/,
+  );
+  assert.match(
+    publisher,
+    /Publish result ledger\n[\s\S]*steps\.publish-worker-action-ledgers\.outputs\.ready == '1'/,
   );
   assert.doesNotMatch(
     worker,
@@ -315,7 +322,8 @@ test("commit review and notification workflows publish their operation receipts"
   );
   assert.match(review, /setup-action-ledger/);
   assert.match(review, /CLAWSWEEPER_ACTION_LEDGER_INVOCATION: commit-\$\{\{ matrix\.sha \}\}/);
-  assert.doesNotMatch(review, /--defer-workflow-completion/);
+  assert.match(review, /--defer-workflow-completion/);
+  assert.match(review, /--preserve-open-workflows/);
   assert.doesNotMatch(review, /publish-check|permission-checks: write|finish-review/);
   assert.doesNotMatch(review, /create-state-token|setup-state|CLAWSWEEPER_STATE_DIR/);
   assert.match(
@@ -640,9 +648,9 @@ test("result and finalizer workflows publish their repair operation receipts", (
   assert.match(results, /CLAWSWEEPER_ACTION_LEDGER_INVOCATION=open-pr-finalizer/);
   assert.match(results, /CLAWSWEEPER_ACTION_LEDGER_INVOCATION=finalizer-results/);
   assert.match(results, /Classify trusted worker capabilities/);
-  assert.match(results, /WORKER_SEALED_SOURCE_CONTRACT_SHA/);
-  assert.match(results, /WORKER_ACTION_LEDGER_CONTRACT_SHA/);
-  assert.match(results, /classify_contract/);
+  assert.match(results, /WORKER_CAPABILITIES_PATH/);
+  assert.match(results, /clawsweeper\.repair-worker-capabilities/);
+  assert.match(results, /git cat-file blob/);
   assert.doesNotMatch(results, /git log --reverse|grep -Fq/);
   assert.match(results, /worker_ledgers_required=0/);
   assert.match(results, /worker_ledgers_required=1/);

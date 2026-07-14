@@ -15,8 +15,7 @@ permissions:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
   CLAWSWEEPER_APP_CLIENT_ID: Iv23liOECG0slfuhz093
-  WORKER_SEALED_SOURCE_CONTRACT_SHA: 8d28bcf61b97284f9d0ee247881302186339ccfd
-  WORKER_ACTION_LEDGER_CONTRACT_SHA: 8eed7833147ec4b25682bb090b6e7172a6dbbb26
+  WORKER_CAPABILITIES_PATH: .github/repair-worker-capabilities.json
 
 concurrency:
   group: clawsweeper-repair-publish-results
@@ -40,8 +39,7 @@ jobs:
         env:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           WORKER_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
-          SEALED_SOURCE_CONTRACT_SHA: ${{ env.WORKER_SEALED_SOURCE_CONTRACT_SHA }}
-          ACTION_LEDGER_CONTRACT_SHA: ${{ env.WORKER_ACTION_LEDGER_CONTRACT_SHA }}
+          CAPABILITIES_PATH: ${{ env.WORKER_CAPABILITIES_PATH }}
         shell: bash
         run: |
           set -euo pipefail
@@ -58,33 +56,28 @@ jobs:
             exit 1
           fi
 
-          classify_contract() {
-            local contract_sha="$1"
-            local contract_name="$2"
-            if [[ ! "$contract_sha" =~ ^[a-f0-9]{40}$ ]] ||
-               ! git cat-file -e "${contract_sha}^{commit}" 2>/dev/null ||
-               ! git merge-base --is-ancestor "$contract_sha" "refs/remotes/origin/${DEFAULT_BRANCH}"; then
-              echo "::error title=Invalid worker contract::${contract_name} contract boundary is not reachable from the default branch."
-              return 1
-            fi
-            if git merge-base --is-ancestor "$contract_sha" "$WORKER_HEAD_SHA"; then
-              printf 'required\n'
-              return
-            fi
-            if git merge-base --is-ancestor "$WORKER_HEAD_SHA" "$contract_sha"; then
-              printf 'legacy\n'
-              return
-            fi
-            echo "::error title=Ambiguous worker contract::Worker head is not comparable with the ${contract_name} contract boundary." >&2
-            return 1
-          }
-
-          sealed_source_contract="$(classify_contract "$SEALED_SOURCE_CONTRACT_SHA" "sealed source")"
-          if [ "$sealed_source_contract" = "legacy" ]; then
+          if ! git cat-file -e "${WORKER_HEAD_SHA}:${CAPABILITIES_PATH}" 2>/dev/null; then
             echo "trusted_legacy_worker_head=$WORKER_HEAD_SHA" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
-          action_ledger_contract="$(classify_contract "$ACTION_LEDGER_CONTRACT_SHA" "worker action ledger")"
-          if [ "$action_ledger_contract" = "required" ]; then
+          capabilities_file="$RUNNER_TEMP/clawsweeper-repair-worker-capabilities.json"
+          git cat-file blob "${WORKER_HEAD_SHA}:${CAPABILITIES_PATH}" > "$capabilities_file"
+          if ! jq -e '
+            type == "object" and
+            keys == ["action_ledger", "schema", "schema_version", "sealed_source"] and
+            .schema == "clawsweeper.repair-worker-capabilities" and
+            .schema_version == 1 and
+            (.sealed_source | type) == "boolean" and
+            (.action_ledger | type) == "boolean"
+          ' "$capabilities_file" >/dev/null; then
+            echo "::error title=Invalid worker capabilities::Worker capability marker is malformed."
+            exit 1
+          fi
+          if [ "$(jq -r '.sealed_source' "$capabilities_file")" != "true" ]; then
+            echo "::error title=Unsupported worker capabilities::Worker does not seal its source contract."
+            exit 1
+          fi
+          if [ "$(jq -r '.action_ledger' "$capabilities_file")" = "true" ]; then
             echo "worker_ledgers_required=1" >> "$GITHUB_OUTPUT"
           fi
 
@@ -377,13 +370,97 @@ jobs:
           pnpm run repair:review-results -- "${result_paths[@]}"
           echo "has_artifacts=1" >> "$GITHUB_OUTPUT"
 
+      - name: Publish verified worker action ledgers
+        id: publish-worker-action-ledgers
+        env:
+          WORKER_LEDGERS_REQUIRED: ${{ steps.worker-contract.outputs.worker_ledgers_required }}
+          WORKER_LEDGER_OUTCOME: ${{ steps.worker-ledgers.outcome }}
+          WORKER_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          WORKER_RUN_ID: ${{ github.event.workflow_run.id }}
+          CLUSTER_JOB_RESULT: ${{ steps.result-artifact.outputs.cluster_job_result }}
+          CLUSTER_JOB_ATTEMPT: ${{ steps.result-artifact.outputs.cluster_job_attempt }}
+          EXECUTE_JOB_RESULT: ${{ steps.result-artifact.outputs.execute_job_result }}
+          EXECUTE_JOB_ATTEMPT: ${{ steps.result-artifact.outputs.execute_job_attempt }}
+        run: |
+          set -euo pipefail
+          if [ "$WORKER_LEDGERS_REQUIRED" != "1" ]; then
+            echo "ready=1" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$WORKER_LEDGER_OUTCOME" != "success" ]; then
+            echo "Required worker action ledgers were not verified." >&2
+            exit 1
+          fi
+          test -n "${CLAWSWEEPER_STATE_DIR:-}"
+          event_paths_file="$RUNNER_TEMP/clawsweeper-repair-worker-action-ledger-paths.txt"
+          : > "$event_paths_file"
+          import_worker_lane() {
+            local lane="$1"
+            local job="$2"
+            local job_result="$3"
+            local producer_attempt="$4"
+            local allow_empty="${5:-false}"
+            if [ "$job_result" = "skipped" ]; then
+              return
+            fi
+            local worker_root=".clawsweeper-repair/action-ledger-download/$lane"
+            local worker_manifest="$worker_root/repair-action-ledger-manifest.json"
+            local worker_import="$RUNNER_TEMP/$lane-action-ledger-import.json"
+            local allow_empty_args=()
+            if [ "$allow_empty" = "true" ]; then
+              allow_empty_args+=(--allow-empty)
+            fi
+            pnpm run --silent repair:action-ledger -- publish \
+              --repair-lane "$lane" \
+              --manifest "$worker_manifest" \
+              --expected-repository "$GITHUB_REPOSITORY" \
+              --expected-sha "$WORKER_HEAD_SHA" \
+              --expected-workflow repair-cluster-worker.yml \
+              --expected-job "$job" \
+              --expected-run-id "$WORKER_RUN_ID" \
+              --expected-run-attempt "$producer_attempt" \
+              "${allow_empty_args[@]}" \
+              --source-root "$worker_root" \
+              --state-root "$CLAWSWEEPER_STATE_DIR" > "$worker_import"
+            jq -e --slurpfile manifest "$worker_manifest" \
+              '.eventPaths == $manifest[0].event_paths' \
+              "$worker_import" >/dev/null
+            jq -r '.paths[]?' "$worker_import" >> "$event_paths_file"
+          }
+          import_worker_lane cluster cluster "$CLUSTER_JOB_RESULT" "$CLUSTER_JOB_ATTEMPT" true
+          import_worker_lane execute execute "$EXECUTE_JOB_RESULT" "$EXECUTE_JOB_ATTEMPT" true
+          sort -u -o "$event_paths_file" "$event_paths_file"
+          if [ -s "$event_paths_file" ]; then
+            action_ledger_args=()
+            copied_paths=()
+            cleanup_copied_paths() {
+              for copied_path in "${copied_paths[@]}"; do
+                rm -f -- "$copied_path"
+              done
+            }
+            trap cleanup_copied_paths EXIT
+            while IFS= read -r event_path; do
+              durable_event_path="$CLAWSWEEPER_STATE_DIR/$event_path"
+              test -f "$durable_event_path"
+              mkdir -p "$(dirname "$event_path")"
+              cp "$durable_event_path" "$event_path"
+              copied_paths+=("$event_path")
+              action_ledger_args+=(--path "$event_path")
+            done < "$event_paths_file"
+            pnpm run repair:publish-main -- \
+              --message "chore: append repair worker action ledger" \
+              "${action_ledger_args[@]}" \
+              --rebase-strategy normal
+          fi
+          echo "ready=1" >> "$GITHUB_OUTPUT"
+
       # This workflow_run job executes trusted main-branch code only; artifacts
       # from worker runs are downloaded as data and handled by repair publishers.
       # codeql[actions/untrusted-checkout/critical]
       # lgtm[actions/untrusted-checkout/critical]
       - name: Publish result ledger
         id: publish-result-ledger
-        if: ${{ steps.download.outputs.has_artifacts == '1' }}
+        if: ${{ steps.download.outputs.has_artifacts == '1' && steps.publish-worker-action-ledgers.outputs.ready == '1' }}
         env:
           GH_TOKEN: ${{ steps.app_token.outputs.token }}
           RUN_ID: ${{ github.event.workflow_run.id }}
@@ -428,7 +505,7 @@ jobs:
       # codeql[actions/untrusted-checkout/critical]
       # lgtm[actions/untrusted-checkout/critical]
       - name: Prepare durable notification claims
-        if: ${{ steps.download.outputs.has_artifacts == '1' }}
+        if: ${{ steps.download.outputs.has_artifacts == '1' && steps.publish-worker-action-ledgers.outputs.ready == '1' }}
         env:
           GH_TOKEN: ${{ steps.app_token.outputs.token }}
           RUN_ID: ${{ github.event.workflow_run.id }}
@@ -451,7 +528,7 @@ jobs:
       # codeql[actions/untrusted-checkout/critical]
       # lgtm[actions/untrusted-checkout/critical]
       - name: Commit notification claims
-        if: ${{ steps.download.outputs.has_artifacts == '1' }}
+        if: ${{ steps.download.outputs.has_artifacts == '1' && steps.publish-worker-action-ledgers.outputs.ready == '1' }}
         env:
           GH_TOKEN: ${{ steps.app_token.outputs.token }}
         run: |
@@ -472,7 +549,7 @@ jobs:
       # codeql[actions/untrusted-checkout/critical]
       # lgtm[actions/untrusted-checkout/critical]
       - name: Notify OpenClaw about ClawSweeper events
-        if: ${{ steps.download.outputs.has_artifacts == '1' }}
+        if: ${{ steps.download.outputs.has_artifacts == '1' && steps.publish-worker-action-ledgers.outputs.ready == '1' }}
         env:
           GH_TOKEN: ${{ steps.app_token.outputs.token }}
           RUN_ID: ${{ github.event.workflow_run.id }}
@@ -495,7 +572,7 @@ jobs:
       # codeql[actions/untrusted-checkout/critical]
       # lgtm[actions/untrusted-checkout/critical]
       - name: Commit notification receipts
-        if: ${{ always() && steps.download.outputs.has_artifacts == '1' && steps.app_token.outcome == 'success' }}
+        if: ${{ always() && steps.download.outputs.has_artifacts == '1' && steps.publish-worker-action-ledgers.outputs.ready == '1' && steps.app_token.outcome == 'success' }}
         env:
           GH_TOKEN: ${{ steps.app_token.outputs.token }}
         run: |
@@ -515,7 +592,7 @@ jobs:
       # codeql[actions/untrusted-checkout/critical]
       # lgtm[actions/untrusted-checkout/critical]
       - name: Commit result ledger
-        if: ${{ always() && steps.download.outputs.has_artifacts == '1' && steps.publish-result-ledger.outcome == 'success' && steps.app_token.outcome == 'success' }}
+        if: ${{ always() && steps.download.outputs.has_artifacts == '1' && steps.publish-worker-action-ledgers.outputs.ready == '1' && steps.publish-result-ledger.outcome == 'success' && steps.app_token.outcome == 'success' }}
         env:
           GH_TOKEN: ${{ steps.app_token.outputs.token }}
         run: |
@@ -555,13 +632,6 @@ jobs:
         if: ${{ always() && steps.setup-pnpm.outcome == 'success' }}
         env:
           ALLOW_EMPTY: ${{ steps.finalize-publication-action-ledger.outputs.allow_empty }}
-          WORKER_LEDGER_OUTCOME: ${{ steps.worker-ledgers.outcome }}
-          WORKER_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
-          WORKER_RUN_ID: ${{ github.event.workflow_run.id }}
-          CLUSTER_JOB_RESULT: ${{ steps.result-artifact.outputs.cluster_job_result }}
-          CLUSTER_JOB_ATTEMPT: ${{ steps.result-artifact.outputs.cluster_job_attempt }}
-          EXECUTE_JOB_RESULT: ${{ steps.result-artifact.outputs.execute_job_result }}
-          EXECUTE_JOB_ATTEMPT: ${{ steps.result-artifact.outputs.execute_job_attempt }}
         run: |
           set -euo pipefail
           test -n "${CLAWSWEEPER_STATE_DIR:-}"
@@ -571,43 +641,6 @@ jobs:
           import_result_file=".artifacts/repair-publication-action-ledger-import.json"
           test -s "$manifest_file"
           : > "$event_paths_file"
-          import_worker_lane() {
-            local lane="$1"
-            local job="$2"
-            local job_result="$3"
-            local producer_attempt="$4"
-            local allow_empty="${5:-false}"
-            if [ "$job_result" = "skipped" ]; then
-              return
-            fi
-            local worker_root=".clawsweeper-repair/action-ledger-download/$lane"
-            local worker_manifest="$worker_root/repair-action-ledger-manifest.json"
-            local worker_import=".artifacts/$lane-action-ledger-import.json"
-            local allow_empty_args=()
-            if [ "$allow_empty" = "true" ]; then
-              allow_empty_args+=(--allow-empty)
-            fi
-            pnpm run --silent repair:action-ledger -- publish \
-              --repair-lane "$lane" \
-              --manifest "$worker_manifest" \
-              --expected-repository "$GITHUB_REPOSITORY" \
-              --expected-sha "$WORKER_HEAD_SHA" \
-              --expected-workflow repair-cluster-worker.yml \
-              --expected-job "$job" \
-              --expected-run-id "$WORKER_RUN_ID" \
-              --expected-run-attempt "$producer_attempt" \
-              "${allow_empty_args[@]}" \
-              --source-root "$worker_root" \
-              --state-root "$CLAWSWEEPER_STATE_DIR" > "$worker_import"
-            jq -e --slurpfile manifest "$worker_manifest" \
-              '.eventPaths == $manifest[0].event_paths' \
-              "$worker_import" >/dev/null
-            jq -r '.paths[]?' "$worker_import" >> "$event_paths_file"
-          }
-          if [ "$WORKER_LEDGER_OUTCOME" = "success" ]; then
-            import_worker_lane cluster cluster "$CLUSTER_JOB_RESULT" "$CLUSTER_JOB_ATTEMPT" true
-            import_worker_lane execute execute "$EXECUTE_JOB_RESULT" "$EXECUTE_JOB_ATTEMPT" true
-          fi
           allow_empty_args=()
           if [ "$ALLOW_EMPTY" = "true" ]; then
             allow_empty_args+=(--allow-empty)

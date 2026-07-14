@@ -431,7 +431,9 @@ ran. The publisher then requires the matching producer-attempt ledger for each
 selected job, verifies repository, SHA, workflow, job, run, and attempt, and
 imports the cohort before mutating durable result state. Missing, ambiguous,
 expired, incomplete, extra, or forged required lanes fail publication. Legacy
-worker heads predating the contract remain explicitly marked as legacy.
+worker heads without the versioned `.github/repair-worker-capabilities.json`
+tree marker remain explicitly marked as legacy. Tree capabilities survive
+squash and rebase landing, unlike feature-branch commit boundaries.
 
 Commit review uses the same credential separation. Each Codex matrix invocation
 uploads one producer-attempt bundle containing its report and local ledger. The
