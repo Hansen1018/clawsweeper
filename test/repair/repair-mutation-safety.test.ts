@@ -138,8 +138,8 @@ test("repair mutation receipts commit the attempt before the request and the out
     CLAWSWEEPER_GIT_USER_NAME: "ClawSweeper Test",
     CLAWSWEEPER_GIT_USER_EMAIL: "clawsweeper-test@example.invalid",
   });
-  delete process.env.CLAWSWEEPER_REPAIR_MUTATION_LEDGER_READY;
-  delete process.env.CLAWSWEEPER_REPAIR_MUTATION_LEDGER_DURABLE;
+  delete process.env.CLAWSWEEPER_INTERNAL_REPAIR_MUTATION_LEDGER_READY;
+  delete process.env.CLAWSWEEPER_INTERNAL_REPAIR_MUTATION_LEDGER_DURABLE;
 
   try {
     process.chdir(sourceRoot);
@@ -397,6 +397,7 @@ test("repair review baselines reuse only state records reviewed before the repai
 
 test("repair review baselines accept only trusted exact-head post-repair verdicts", () => {
   const reviewedCursor = `v2:2:${"c".repeat(64)}`;
+  const laterCursor = `v2:3:${"d".repeat(64)}`;
   const expectedHeadSha = "a".repeat(40);
   const comments = [
     {
@@ -407,6 +408,10 @@ test("repair review baselines accept only trusted exact-head post-repair verdict
       user: { login: "openclaw-clawsweeper[bot]" },
       body: `<!-- clawsweeper-verdict:pass item=123 sha=${expectedHeadSha} updated_at=2026-07-14T10:00:00Z reviewed_at=2020-01-01T00:01:00Z review_activity_cursor=${reviewedCursor} -->`,
     },
+    {
+      user: { login: "openclaw-clawsweeper[bot]" },
+      body: `<!-- clawsweeper-verdict:pass item=123 sha=${expectedHeadSha} updated_at=2026-07-14T10:00:00Z reviewed_at=2026-07-14T10:03:00Z review_activity_cursor=${laterCursor} -->`,
+    },
   ];
 
   assert.equal(
@@ -416,6 +421,7 @@ test("repair review baselines accept only trusted exact-head post-repair verdict
       targetKind: "pull_request",
       expectedUpdatedAt: "2026-07-14T10:00:00Z",
       expectedHeadSha,
+      reviewedBefore: "2026-07-14T10:02:00Z",
       readIssueComments: () => comments,
     }),
     reviewedCursor,
@@ -427,6 +433,7 @@ test("repair review baselines accept only trusted exact-head post-repair verdict
       targetKind: "pull_request",
       expectedUpdatedAt: "2026-07-14T10:00:00Z",
       expectedHeadSha: "d".repeat(40),
+      reviewedBefore: "2026-07-14T10:02:00Z",
       readIssueComments: () => comments,
     }),
     null,
@@ -438,6 +445,7 @@ test("repair review baselines accept only trusted exact-head post-repair verdict
       targetKind: "pull_request",
       expectedUpdatedAt: "2026-07-14T10:00:01Z",
       expectedHeadSha,
+      reviewedBefore: "2026-07-14T10:02:00Z",
       readIssueComments: () => comments,
     }),
     null,
@@ -599,6 +607,7 @@ test("repair executors route authoritative GitHub writes through the mutation bo
   assert.match(safetySource, /reviewed pull request activity cursor is unavailable/);
   assert.match(reviewBaselineSource, /item_updated_at/);
   assert.match(reviewBaselineSource, /reviewedAt > options\.reviewedBefore/);
+  assert.match(reviewBaselineSource, /candidate\.reviewedAt <= reviewedBefore/);
   assert.match(reviewBaselineSource, /attributes\.updated_at !== expectedUpdatedAt/);
   assert.match(reviewBaselineSource, /allowedVerdicts/);
   assert.match(activitySource, /requestedReviewers/);

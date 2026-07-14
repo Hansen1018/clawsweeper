@@ -114,7 +114,12 @@ function trustedRepairReviewActivityCursor(
 ): string | null {
   const expectedHeadSha = stringValue(options.expectedHeadSha);
   const expectedUpdatedAt = stringValue(options.expectedUpdatedAt);
-  if (!/^[a-f0-9]{40}$/i.test(expectedHeadSha) || timestamp(expectedUpdatedAt) === null)
+  const reviewedBefore = timestamp(options.reviewedBefore);
+  if (
+    !/^[a-f0-9]{40}$/i.test(expectedHeadSha) ||
+    timestamp(expectedUpdatedAt) === null ||
+    reviewedBefore === null
+  )
     return null;
   const allowedVerdicts = new Set(
     (options.allowedVerdicts ?? ["pass"]).map((value) => value.trim().toLowerCase()),
@@ -143,7 +148,7 @@ function trustedRepairReviewActivityCursor(
         reviewedAt: number;
       } => Boolean(candidate),
     )
-    .filter((candidate) => candidate.reviewedAt <= Date.now())
+    .filter((candidate) => candidate.reviewedAt <= reviewedBefore)
     .sort((left, right) => right.reviewedAt - left.reviewedAt);
   return candidates.find((candidate) => candidate.cursor)?.cursor ?? null;
 

@@ -82,8 +82,8 @@ export function ensureRepairMutationActionLedger(): void {
   process.env.CLAWSWEEPER_ACTION_LEDGER_FORCE = "1";
   process.env.CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT = fs.realpathSync(outputRoot);
   process.env.GITHUB_RUN_STARTED_AT = runStartedAt;
-  process.env.CLAWSWEEPER_REPAIR_MUTATION_LEDGER_DURABLE = "1";
-  process.env.CLAWSWEEPER_REPAIR_MUTATION_LEDGER_READY = "1";
+  process.env.CLAWSWEEPER_INTERNAL_REPAIR_MUTATION_LEDGER_DURABLE = "1";
+  process.env.CLAWSWEEPER_INTERNAL_REPAIR_MUTATION_LEDGER_READY = "1";
 }
 
 export function repairMutationReceiptIdentity(
@@ -279,14 +279,14 @@ function repairMutationActionLedgerRoot(): string {
 function repairMutationActionLedgerReady(): boolean {
   if (process.env.GITHUB_ACTIONS !== "true") return workflowActionEventsEnabled();
   return (
-    process.env.CLAWSWEEPER_REPAIR_MUTATION_LEDGER_READY === "1" &&
+    process.env.CLAWSWEEPER_INTERNAL_REPAIR_MUTATION_LEDGER_READY === "1" &&
     workflowActionEventsEnabled() &&
     repairMutationDurableReceiptsEnabled()
   );
 }
 
 function repairMutationDurableReceiptsEnabled(): boolean {
-  return process.env.CLAWSWEEPER_REPAIR_MUTATION_LEDGER_DURABLE === "1";
+  return process.env.CLAWSWEEPER_INTERNAL_REPAIR_MUTATION_LEDGER_DURABLE === "1";
 }
 
 function repairMutationTestProcess(): boolean {
