@@ -177,6 +177,117 @@ test("prepared Gitcrawl receipts do not persist until committed", () => {
   assert.equal(JSON.stringify(committed).includes("gitcrawl.changed"), false);
 });
 
+test("Gitcrawl receipt identities are canonical before hashing and persistence", () => {
+  const root = tempRoot();
+  const prepared = prepareGitcrawlActionReceipt(
+    root,
+    {
+      receipt: "snapshot",
+      repository,
+      provider: "cloud",
+      snapshotId,
+      capabilities: [
+        ...GITCRAWL_QUERY_NAMES,
+        ` ${GITCRAWL_QUERY_NAMES[0]} `,
+        " gitcrawl.snapshot.provenance.v1 ",
+      ],
+      coverageSha256,
+      coverageDatasetCount: 9,
+      coverageComplete: true,
+    },
+    { env, now: () => now },
+  );
+  assert.deepEqual(
+    prepared.event?.attributes?.capability,
+    [...GITCRAWL_QUERY_NAMES, "gitcrawl.snapshot.provenance.v1"].sort(),
+  );
+  assert.throws(
+    () =>
+      recordGitcrawlActionReceipt(
+        root,
+        {
+          receipt: "snapshot",
+          repository,
+          provider: "cloud",
+          snapshotId: ` ${snapshotId}`,
+          capabilities: GITCRAWL_QUERY_NAMES,
+          coverageSha256,
+          coverageDatasetCount: 9,
+          coverageComplete: true,
+        },
+        { env, now: () => now },
+      ),
+    /surrounding whitespace/,
+  );
+});
+
+test("Gitcrawl binding receipts prove complete coverage and matched parity", () => {
+  const root = tempRoot();
+  assert.throws(
+    () =>
+      recordGitcrawlActionReceipt(
+        root,
+        {
+          receipt: "binding",
+          binding: "coverage",
+          repository,
+          provider: "cloud",
+          snapshotId,
+          coverageSha256,
+          datasetCount: 9,
+          rowCount: 90,
+          eligibleCount: 80,
+          coveredCount: 79,
+          complete: true,
+        },
+        { env, now: () => now },
+      ),
+    /complete coverage must cover every eligible item/,
+  );
+  assert.throws(
+    () =>
+      recordGitcrawlActionReceipt(
+        root,
+        {
+          receipt: "binding",
+          binding: "parity",
+          repository,
+          provider: "parity",
+          snapshotId,
+          paritySnapshotId,
+          paritySha256: sha256Canonical({ parity: "matched" }),
+          queryCount: GITCRAWL_QUERY_NAMES.length - 1,
+          primaryCount: 20,
+          parityCount: 20,
+          matched: true,
+        },
+        { env, now: () => now },
+      ),
+    /matched parity requires all queries and equal result counts/,
+  );
+  assert.throws(
+    () =>
+      recordGitcrawlActionReceipt(
+        root,
+        {
+          receipt: "binding",
+          binding: "parity",
+          repository,
+          provider: "parity",
+          snapshotId,
+          paritySnapshotId,
+          paritySha256: sha256Canonical({ parity: "matched" }),
+          queryCount: GITCRAWL_QUERY_NAMES.length,
+          primaryCount: 20,
+          parityCount: 19,
+          matched: true,
+        },
+        { env, now: () => now },
+      ),
+    /matched parity requires all queries and equal result counts/,
+  );
+});
+
 test("Gitcrawl failure receipts retain only a class and digest", async () => {
   const root = tempRoot();
   const outputRoot = trustedChildRoot(root, "state");

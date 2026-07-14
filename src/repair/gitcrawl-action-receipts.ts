@@ -253,6 +253,7 @@ function gitcrawlReceiptEvent(
   assertProvider(input.provider);
   assertReceiptVariant(input);
   assertParityTopology(input);
+  assertCanonicalSnapshotIds(input);
   const runEvidence = workflowRunEvidence(env);
   if (input.receipt === "snapshot") {
     const capabilities = normalizedCapabilities(input.capabilities);
@@ -357,6 +358,9 @@ function gitcrawlReceiptEvent(
       if (coveredCount > eligibleCount) {
         throw new Error("Gitcrawl receipt covered count exceeds eligible count");
       }
+      if (input.complete && coveredCount !== eligibleCount) {
+        throw new Error("Gitcrawl receipt complete coverage must cover every eligible item");
+      }
       const ratio = eligibleCount === 0 ? 1 : coveredCount / eligibleCount;
       return {
         phase: ACTION_EVENT_PHASE_TYPES.gitcrawlBinding,
@@ -393,6 +397,17 @@ function gitcrawlReceiptEvent(
       throw new Error("Gitcrawl parity receipts require the parity provider");
     }
     assertSha256(input.paritySha256, "Gitcrawl receipt parity sha256");
+    const queryCount = nonNegativeCount(input.queryCount, "parity query count");
+    const primaryCount = nonNegativeCount(input.primaryCount, "parity primary count");
+    const parityCount = nonNegativeCount(input.parityCount, "parity comparison count");
+    if (
+      input.matched &&
+      (queryCount !== GITCRAWL_QUERY_NAMES.length || primaryCount !== parityCount)
+    ) {
+      throw new Error(
+        "Gitcrawl receipt matched parity requires all queries and equal result counts",
+      );
+    }
     return {
       phase: ACTION_EVENT_PHASE_TYPES.gitcrawlBinding,
       status: input.matched ? ACTION_EVENT_STATUSES.validated : ACTION_EVENT_STATUSES.failed,
@@ -415,9 +430,9 @@ function gitcrawlReceiptEvent(
         provider: input.provider,
         validation_kind: "parity",
         query_version: GITCRAWL_QUERY_CONTRACT_VERSION,
-        item_count: nonNegativeCount(input.queryCount, "parity query count"),
-        result_count: nonNegativeCount(input.primaryCount, "parity primary count"),
-        validation_count: nonNegativeCount(input.parityCount, "parity comparison count"),
+        item_count: queryCount,
+        result_count: primaryCount,
+        validation_count: parityCount,
         coverage_complete: input.matched,
       },
     };
@@ -531,13 +546,13 @@ function normalizedCapabilities(capabilities: readonly string[]): string[] {
   ) {
     throw new Error("Gitcrawl receipt capabilities must be strings");
   }
-  const normalized = [...new Set(capabilities)].sort();
+  const normalized = [...new Set(capabilities.map((capability) => capability.trim()))].sort();
   if (normalized.length > GITCRAWL_ACTION_RECEIPT_LIMITS.maxCapabilities) {
     throw new Error(
       `Gitcrawl receipt capabilities exceed ${GITCRAWL_ACTION_RECEIPT_LIMITS.maxCapabilities} entries`,
     );
   }
-  if (normalized.some((capability) => !capability.trim())) {
+  if (normalized.some((capability) => !capability)) {
     throw new Error("Gitcrawl receipt capability is empty");
   }
   return normalized;
@@ -636,6 +651,16 @@ function assertParityTopology(input: GitcrawlActionReceiptInput): void {
     input.paritySnapshotId === undefined
   ) {
     throw new Error("Gitcrawl parity receipts require a parity snapshot");
+  }
+}
+
+function assertCanonicalSnapshotIds(input: GitcrawlActionReceiptInput): void {
+  for (const snapshotId of [input.snapshotId, input.paritySnapshotId]) {
+    if (snapshotId === undefined) continue;
+    assertSnapshotId(snapshotId);
+    if (snapshotId !== snapshotId.trim()) {
+      throw new Error("Gitcrawl receipt snapshot id must not contain surrounding whitespace");
+    }
   }
 }
 
