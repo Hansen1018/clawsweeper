@@ -3652,7 +3652,7 @@ test("cleanup-stuck projection rejection is scoped to the affected spool root", 
   const independentEnv = workflowEnv({
     CLAWSWEEPER_CRABFLEET_AGENT_TOKEN: "agent-token",
     CLAWSWEEPER_CRABFLEET_SESSION_ID: "session-1",
-    CLAWSWEEPER_CRABFLEET_TIMEOUT_MS: "1000",
+    CLAWSWEEPER_CRABFLEET_TIMEOUT_MS: "60000",
   });
   const cleanupResolvers: Array<() => void> = [];
   const blockedFetch = (async () =>
