@@ -1416,7 +1416,9 @@ test("policy sanitization removes hidden instructions before scoring or claims",
 test("search and review evidence must agree on one thread safety projection", async () => {
   const adapter = await adapterFor({
     "gitcrawl.threads.search": [memberRow()],
-    "gitcrawl.pull_requests.review_context": [reviewContextRow({ body: "Different review body" })],
+    "gitcrawl.pull_requests.review_context": [
+      reviewContextRow({ body: "Different review body", thread_id: 43 }),
+    ],
   });
   await adapter.searchOpenPullRequests();
   await assert.rejects(adapter.reviewContext(42), /search and review safety projections diverge/);

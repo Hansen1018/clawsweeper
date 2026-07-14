@@ -223,7 +223,7 @@ export class GitcrawlEvidenceAdapter {
   private readonly pageSize: number;
   private readonly maxPages: number;
   private readonly clusterMemberCounts = new Map<number, number>();
-  private readonly threadSafetyProjections = new Map<number, GitcrawlThreadEvidence>();
+  private readonly threadSafetyProjections = new Map<string, GitcrawlThreadEvidence>();
   private closePromise: Promise<void> | undefined;
 
   private constructor(input: {
@@ -746,11 +746,12 @@ export class GitcrawlEvidenceAdapter {
 
   private rememberThreadSafetyProjections(rows: GitcrawlThreadEvidence[]): void {
     for (const row of rows) {
-      const previous = this.threadSafetyProjections.get(row.threadId);
+      const identity = threadSubject(this.repository, row.kind, row.number);
+      const previous = this.threadSafetyProjections.get(identity);
       if (previous !== undefined) {
         assertGitcrawlThreadSafetyProjectionMatches(previous, row);
       } else {
-        this.threadSafetyProjections.set(row.threadId, row);
+        this.threadSafetyProjections.set(identity, row);
       }
     }
   }
