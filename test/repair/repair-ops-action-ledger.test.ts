@@ -169,7 +169,8 @@ test("repair worker jobs upload current-attempt ledgers for the trusted publishe
     /import_worker_lane execute execute "\$EXECUTE_JOB_RESULT" "\$EXECUTE_JOB_ATTEMPT" true/,
   );
   assert.match(publisher, /CAPABILITIES_PATH: \$\{\{ env\.WORKER_CAPABILITIES_PATH \}\}/);
-  assert.match(publisher, /git cat-file blob "\$\{WORKER_HEAD_SHA\}:\$\{CAPABILITIES_PATH\}"/);
+  assert.match(publisher, /git ls-tree --full-tree "\$WORKER_HEAD_SHA"/);
+  assert.match(publisher, /if ! git cat-file blob "\$marker_oid"/);
   assert.match(publisher, /\.schema == "clawsweeper\.repair-worker-capabilities"/);
   assert.match(
     publisher,

@@ -56,12 +56,26 @@ jobs:
             exit 1
           fi
 
-          if ! git cat-file -e "${WORKER_HEAD_SHA}:${CAPABILITIES_PATH}" 2>/dev/null; then
+          marker_entry="$(git ls-tree --full-tree "$WORKER_HEAD_SHA" -- "$CAPABILITIES_PATH")"
+          if [ -z "$marker_entry" ]; then
             echo "trusted_legacy_worker_head=$WORKER_HEAD_SHA" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          marker_metadata="${marker_entry%%$'\t'*}"
+          marker_path="${marker_entry#*$'\t'}"
+          read -r marker_mode marker_type marker_oid <<< "$marker_metadata"
+          if [ "$marker_path" != "$CAPABILITIES_PATH" ] ||
+             [ "$marker_type" != "blob" ] ||
+             [[ ! "$marker_oid" =~ ^[a-f0-9]{40}$ ]] ||
+             { [ "$marker_mode" != "100644" ] && [ "$marker_mode" != "100755" ]; }; then
+            echo "::error title=Invalid worker capabilities::Worker capability marker is not a regular blob."
+            exit 1
+          fi
           capabilities_file="$RUNNER_TEMP/clawsweeper-repair-worker-capabilities.json"
-          git cat-file blob "${WORKER_HEAD_SHA}:${CAPABILITIES_PATH}" > "$capabilities_file"
+          if ! git cat-file blob "$marker_oid" > "$capabilities_file"; then
+            echo "::error title=Unreadable worker capabilities::Worker capability marker could not be read."
+            exit 1
+          fi
           if ! jq -e '
             type == "object" and
             keys == ["action_ledger", "schema", "schema_version", "sealed_source"] and

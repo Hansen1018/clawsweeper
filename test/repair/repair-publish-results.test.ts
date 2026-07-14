@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -48,6 +48,7 @@ function classifyWorker(
   repo: string,
   script: string,
   workerHeadSha: string,
+  env: NodeJS.ProcessEnv = {},
 ): Record<string, string> {
   const output = path.join(repo, `classification-${workerHeadSha}.txt`);
   writeFileSync(output, "");
@@ -55,6 +56,7 @@ function classifyWorker(
     cwd: repo,
     env: {
       ...process.env,
+      ...env,
       DEFAULT_BRANCH: "main",
       WORKER_HEAD_SHA: workerHeadSha,
       CAPABILITIES_PATH: ".github/repair-worker-capabilities.json",
@@ -165,8 +167,12 @@ test("repair result publication rejects untrusted worker heads before minting wr
     /if \[\[ ! "\$WORKER_HEAD_SHA" =~ \^\[a-f0-9\]\{40\}\$ \]\]; then[\s\S]*exit 1/,
   );
   assert.match(classification, /! git merge-base --is-ancestor "\$WORKER_HEAD_SHA"[\s\S]*exit 1/);
-  assert.match(classification, /git cat-file -e "\$\{WORKER_HEAD_SHA\}:\$\{CAPABILITIES_PATH\}"/);
-  assert.match(classification, /git cat-file blob "\$\{WORKER_HEAD_SHA\}:\$\{CAPABILITIES_PATH\}"/);
+  assert.match(
+    classification,
+    /git ls-tree --full-tree "\$WORKER_HEAD_SHA" -- "\$CAPABILITIES_PATH"/,
+  );
+  assert.match(classification, /if ! git cat-file blob "\$marker_oid"/);
+  assert.match(classification, /Unreadable worker capabilities/);
   assert.match(classification, /\.schema == "clawsweeper\.repair-worker-capabilities"/);
   assert.match(
     classification,
@@ -259,6 +265,35 @@ test("repair result publication requires ledgers for every post-contract worker"
       trusted_legacy_worker_head: "",
       worker_ledgers_required: "1",
     });
+
+    const bin = path.join(root, "bin");
+    const gitBinary = execFileSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).trim();
+    mkdirSync(bin);
+    writeFileSync(
+      path.join(bin, "git"),
+      `#!/usr/bin/env bash
+if [ "$1" = "cat-file" ] && [ "$2" = "blob" ]; then
+  exit 71
+fi
+exec "$REAL_GIT" "$@"
+`,
+    );
+    chmodSync(path.join(bin, "git"), 0o755);
+    assert.throws(
+      () =>
+        classifyWorker(repo, classify.run, actionLedgerContract, {
+          PATH: `${bin}:${process.env.PATH ?? ""}`,
+          REAL_GIT: gitBinary,
+        }),
+      (error: unknown) => {
+        const output = error as { stderr?: string; stdout?: string };
+        assert.match(
+          `${String(output.stdout ?? "")}\n${String(output.stderr ?? "")}`,
+          /Unreadable worker capabilities/,
+        );
+        return true;
+      },
+    );
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
