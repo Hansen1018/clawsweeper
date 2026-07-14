@@ -3527,6 +3527,7 @@ test("production semantic validator requires workers.dev and the Access route", 
         cutover_at: generatedAt,
       },
       stats: {
+        release_sha: releaseSha,
         contract_version: contractVersion,
         repository: canaryRepository,
         archive: canaryArchive,
@@ -3729,6 +3730,35 @@ test("production semantic validator requires workers.dev and the Access route", 
       validate("dormant", "dormant", {}, { queryContractVersion: "legacy-v1" }).status,
       0,
     );
+    const predecessorQueryRelease = queryEnvelope("gitcrawl.threads.search");
+    (predecessorQueryRelease.stats as Record<string, unknown>).release_sha = "b".repeat(40);
+    const predecessorQueryResult = validate(
+      "dormant",
+      "dormant",
+      {},
+      {
+        queryResponses: {
+          "gitcrawl.threads.search": predecessorQueryRelease,
+        },
+      },
+    );
+    assert.notEqual(predecessorQueryResult.status, 0);
+    assert.match(
+      predecessorQueryResult.stderr,
+      /did not complete safe read-only Gitcrawl query gitcrawl\.threads\.search/,
+    );
+    const predecessorLiveRelease = liveCoverageEnvelope();
+    (predecessorLiveRelease.stats as Record<string, unknown>).release_sha = "b".repeat(40);
+    const predecessorLiveResult = validate(
+      "dormant",
+      "dormant",
+      {},
+      {
+        liveCoverageResponse: predecessorLiveRelease,
+      },
+    );
+    assert.notEqual(predecessorLiveResult.status, 0);
+    assert.match(predecessorLiveResult.stderr, /did not prove fresh live Gitcrawl coverage/);
     for (const queryName of requiredQueryNames) {
       const empty = queryEnvelope(queryName);
       empty.columns = [];

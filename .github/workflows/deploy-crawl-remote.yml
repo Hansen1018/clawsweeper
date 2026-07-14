@@ -3136,6 +3136,7 @@ jobs:
                   const snapshotId = stats?.snapshot_id;
                   if (
                     !isRecord(stats) ||
+                    stats.release_sha !== expectedSha ||
                     stats.contract_version !== 'gitcrawl-query-safety-v3' ||
                     stats.repository !== canaryRepository ||
                     stats.archive !== canaryArchive ||
@@ -3434,6 +3435,7 @@ jobs:
                 }
                 if (
                   !isRecord(liveStats) ||
+                  liveStats.release_sha !== expectedSha ||
                   liveStats.contract_version !== 'gitcrawl-query-safety-v3' ||
                   liveStats.repository !== 'openclaw/openclaw' ||
                   liveStats.archive !== 'gitcrawl/openclaw__openclaw' ||
