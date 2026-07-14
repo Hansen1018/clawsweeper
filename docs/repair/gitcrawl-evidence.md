@@ -92,7 +92,8 @@ The query core rejects:
 - cloud/local parity drift;
 - active clusters without valid active memberships, or cluster members from
   another cluster or incomplete declared membership;
-- duplicate related threads reached through multiple shared clusters;
+- conflicting or replayed related rows; duplicate threads reached through
+  multiple shared clusters are deduplicated by canonical thread identity;
 - related rows bound to another source or to themselves;
 - unknown issue or pull-request thread kinds;
 - search rows that are not open pull requests or violate requested ordering;
