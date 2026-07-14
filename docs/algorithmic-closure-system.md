@@ -56,20 +56,22 @@ covers code meaning. Exact content identity is the final fallback.
 
 ### Identity Pipeline
 
-1. Build a structural digest from the item, human discussion, reviews, review
-   threads, checks, labels, linked items, target state, and release state.
-2. Build a semantic digest from complete supported patches, file modes,
-   syntax, and behavior-affecting directives.
-3. Bind both digests to policy, model, repository, base, head, and review
+1. Run the structural probe from lightweight GitHub state. A matching structural
+   record can avoid full hydration.
+2. Otherwise acquire the normal durable review lease and hydrate the complete
+   review context.
+3. Build a semantic digest from complete supported patches, file modes, syntax,
+   and behavior-affecting directives. Build exact content identity as the
+   fallback.
+4. Bind the identities to policy, model, repository, base, head, and review
    activity.
-4. Acquire the normal durable review lease.
 5. Repeat the cheap live probes under the lease.
 6. Reuse only a completed keep-open verdict when every required identity still
    matches.
 
 Semantic reuse is `O(P)` in changed patch bytes plus parser cost. It avoids the
-much larger cost of full GitHub hydration and a model review. Any incomplete
-input falls back to a fresh review.
+much larger cost of a model review. Any incomplete input falls back to a fresh
+review.
 
 ### Compiler AST And Tree-sitter
 
@@ -244,7 +246,8 @@ The durable review lifecycle should be enough to answer:
 
 The decisive safety check happens immediately before the external request.
 
-Every mutation path follows the same compare-and-set shape:
+While layer 5 remains in rollout, the following sequence is the target contract
+for every mutation path:
 
 1. capture reviewed target state and bounded review activity;
 2. prepare an immutable action and idempotency identity;
