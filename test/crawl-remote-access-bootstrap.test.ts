@@ -241,6 +241,16 @@ test("deploy consumer gate rejects comment-only claims and accepts a structural 
     () =>
       assertCrawlRemoteDeployConsumerContract(
         validSource.replace(
+          "jobs:",
+          ['"e\\u006ev":', '  NODE_OPTIONS: "--import ./bad.mjs"', "jobs:"].join("\n"),
+        ),
+      ),
+    /must use canonical unescaped mapping keys/,
+  );
+  assert.throws(
+    () =>
+      assertCrawlRemoteDeployConsumerContract(
+        validSource.replace(
           "      - name: Verify crawl-remote Access credentials\n        env:",
           [
             "      - name: Verify crawl-remote Access credentials",

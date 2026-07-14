@@ -458,6 +458,9 @@ function parseWorkflowJobSteps(source, expectedJob) {
   if (lines.some((line) => line.includes("\t"))) {
     throw new Error("crawl-remote deploy workflow must not contain tab indentation");
   }
+  if (lines.some(hasEscapedDoubleQuotedMappingKey)) {
+    throw new Error("crawl-remote deploy workflow must use canonical unescaped mapping keys");
+  }
   const jobsIndexes = lines.flatMap((line, index) => (line === "jobs:" ? [index] : []));
   if (jobsIndexes.length !== 1) {
     throw new Error("crawl-remote deploy workflow has no jobs mapping");
@@ -535,6 +538,27 @@ function parseWorkflowJobSteps(source, expectedJob) {
     hasWorkflowDefaults,
     hasWorkflowEnvironment,
   };
+}
+
+function hasEscapedDoubleQuotedMappingKey(line) {
+  let index = 0;
+  while (line[index] === " ") index += 1;
+  if (line.startsWith("- ", index)) index += 2;
+  if (line[index] !== '"') return false;
+  index += 1;
+  let escaped = false;
+  while (index < line.length) {
+    if (line[index] === "\\") {
+      escaped = true;
+      index += 2;
+      continue;
+    }
+    if (line[index] === '"') {
+      return escaped && /^\s*:/.test(line.slice(index + 1));
+    }
+    index += 1;
+  }
+  return false;
 }
 
 function parseJobMapping(lines, jobStart, stepsIndex, key) {
