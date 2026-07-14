@@ -280,6 +280,9 @@
         "cached": {
           "$ref": "#/$defs/booleanOrArray"
         },
+        "capability": {
+          "$ref": "#/$defs/machineTextOrArray"
+        },
         "candidate_count": {
           "$ref": "#/$defs/nonNegativeIntegerOrArray"
         },
@@ -312,6 +315,9 @@
         },
         "failed_count": {
           "$ref": "#/$defs/nonNegativeIntegerOrArray"
+        },
+        "failure_class": {
+          "$ref": "#/$defs/machineTextOrArray"
         },
         "final_attempt": {
           "$ref": "#/$defs/booleanOrArray"
@@ -349,6 +355,9 @@
         "processed_count": {
           "$ref": "#/$defs/nonNegativeIntegerOrArray"
         },
+        "provider": {
+          "$ref": "#/$defs/machineTextOrArray"
+        },
         "publication_kind": {
           "$ref": "#/$defs/machineTextOrArray"
         },
@@ -359,6 +368,9 @@
           "$ref": "#/$defs/nonNegativeIntegerOrArray"
         },
         "queue_kind": {
+          "$ref": "#/$defs/machineTextOrArray"
+        },
+        "query_name": {
           "$ref": "#/$defs/machineTextOrArray"
         },
         "query_version": {
