@@ -126,7 +126,9 @@ test("operator docs preserve the dormant consumer and no-deploy boundaries", () 
   assert.match(docs, /`CLAWSWEEPER_FEATURE_CLUSTER_REPAIR_ENABLED=0`/);
   assert.match(docs, /does not activate scheduled\s+actionable intake or publication/);
   assert.match(docs, /GITCRAWL_CLOUD_STAGE_ONLY=1/);
-  assert.match(docs, /temporarily\s+allows every old and new token ID/);
+  assert.match(docs, /marker-selected existing token IDs plus the newly minted token ID/);
+  assert.match(docs, /node scripts\/resolve-crawl-remote-access-credentials\.mjs --verify-access/);
+  assert.match(docs, /writes and reads back both\s+Gitcrawl kill switches/);
   assert.match(docs, /generation marker and selects the matching slot/);
   assert.match(
     docs,

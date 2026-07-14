@@ -14,17 +14,23 @@ parses that exact step contract before minting privileged GitHub tokens and
 again before any Cloudflare or GitHub mutation. Comments, unrelated
 declarations, unnamed intervening steps, extra checkout or resolver controls,
 conditional steps, and legacy unversioned secret references do not satisfy the
-gate. Each downstream credential consumer must bind the resolver's step-scoped
-`client_id` and `client_secret` outputs. Direct slot-secret references, extra
-resolver-output references, and fixed-slot credential overrides are rejected.
-Until the consumer change lands, every dispatch fails closed before privileged
-work.
+gate. Each downstream credential consumer must be an unconditional `Verify
+crawl-remote Access credentials` step that binds the resolver's step-scoped
+`client_id` and `client_secret` outputs and directly invokes
+`node scripts/resolve-crawl-remote-access-credentials.mjs --verify-access`.
+That helper sends both Access headers to the canonical `/health` and
+`/v1/contract` endpoints and verifies one consistent release. Direct slot-secret
+references, extra resolver-output references, shell wrappers, and fixed-slot
+credential overrides are rejected. Until the consumer change lands, every
+dispatch fails closed before privileged work.
 
 The deploy job must keep its reviewed no-profile Bash default, and both the job
 and resolver step must bind `BASH_ENV`, `ENV`, and `NODE_OPTIONS` to empty
 values. The bootstrap rechecks the live ClawSweeper `main` SHA before token
 minting, immediately before its first mutation, and again before narrowing
-Access policy or revoking an old service token.
+Access policy or revoking an old service token. It writes and reads back both
+Gitcrawl kill switches before creating a token, changing Access policy, or
+publishing any credential generation.
 
 Bootstrap and production deploy runs share one non-cancelling concurrency group,
 so rotation cannot revoke a credential held by an in-flight deploy. During
@@ -67,14 +73,16 @@ malformed, or stale markers fail before Cloudflare mutation because GitHub does
 not reveal stored secret values.
 
 Use `rotate service token` only when replacing credentials. Rotation temporarily
-allows every old and new token ID, writes both values into each inactive slot,
-then switches the three generation markers. Only after all markers switch does
-it narrow the policy and delete old tokens. A pair-write failure changes no
-marker; a marker-write failure can leave consumers on different generations,
-but every selected generation remains authorized. A later explicit rotation
-finishes a fully published generation only when its managed generation label is
-strictly newer than every leftover token. Otherwise it mints a fresh generation
-and supersedes every ambiguous partial token.
+allows marker-selected existing token IDs plus the newly minted token ID, writes
+both values into each inactive slot, then switches the three generation markers.
+Only after all markers switch does it narrow the policy and delete old tokens. A
+pair-write failure changes no marker; a marker-write failure can leave consumers
+on different generations, but every selected generation remains authorized. A
+renamed marker-bound token requires explicit rotation and remains in the
+transitional policy until cutover. A later explicit rotation finishes a fully
+published generation only when its managed generation label is strictly newer
+than every leftover token. Otherwise it mints a fresh generation and supersedes
+every ambiguous partial token.
 
 This workflow always keeps `CLAWSWEEPER_GITCRAWL_PROVIDER=cloud`,
 `CLAWSWEEPER_FEATURE_CLUSTER_REPAIR_ENABLED=0`,
