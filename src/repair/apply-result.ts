@@ -2038,23 +2038,6 @@ function clusterPlanPullHeadSha(number: number): string | null {
   return null;
 }
 
-function normalizeClassification(action: LooseRecord) {
-  const raw = String(
-    action.classification ?? action.close_reason ?? action.reason ?? "",
-  ).toLowerCase();
-  if (raw.includes("low_signal") || raw.includes("low-signal") || raw.includes("low signal"))
-    return "low_signal";
-  if (raw.includes("fixed") || raw.includes("candidate")) return "fixed_by_candidate";
-  if (raw.includes("superseded") || raw.includes("supersede")) return "superseded";
-  if (raw.includes("duplicate") || raw.includes("dupe")) return "duplicate";
-  if (action.action === "close_fixed_by_candidate") return "fixed_by_candidate";
-  if (action.action === "close_low_signal") return "low_signal";
-  if (action.action === "close_superseded") return "superseded";
-  if (action.action === "close_duplicate") return "duplicate";
-  if (action.action === "post_merge_close") return "fixed_by_candidate";
-  return raw;
-}
-
 function defaultIdempotencyKey(
   clusterId: string,
   target: LooseRecord,
