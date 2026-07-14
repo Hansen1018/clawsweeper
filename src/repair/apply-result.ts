@@ -34,6 +34,10 @@ import {
   writeRepairSquashMergeBody,
 } from "./repair-merge-message.js";
 import {
+  isRecoverableRepairMergeRace,
+  isRecoverableRepairMergeRaceError,
+} from "./repair-merge-race.js";
+import {
   compactPrCloseCoverageProofComment,
   compactPrCloseCoverageProofText,
   prCloseCoverageProofCandidateCanClose,
@@ -953,7 +957,8 @@ function applyMergeAction({
       freshness,
       boundaryGuards: [requiredChecksGuard],
       operation: () => ghOneShot(mergeArgs),
-      knownNoMutation: isLockedConversationCommentError,
+      knownNoMutation: (error) =>
+        isLockedConversationCommentError(error) || isRecoverableRepairMergeRaceError(error),
     });
   } catch (error) {
     if (error instanceof RepairMutationFreshnessError) {
@@ -962,6 +967,22 @@ function applyMergeAction({
     if (isLockedConversationCommentError(error)) {
       return {
         ...lockedConversationSkip(base, live, { terminalWriteError: true }),
+        merge_method: "squash",
+      };
+    }
+    const detail = ghErrorText(error);
+    if (isRecoverableRepairMergeRace(detail)) {
+      const latestView = fetchPullRequestView(result.repo, target);
+      return {
+        ...base,
+        status: "blocked",
+        reason: `merge attempt needs branch refresh: ${detail.replace(/\s+/g, " ").trim().slice(0, 500)}`,
+        live_state: live.state,
+        live_updated_at: live.updated_at,
+        mergeable: latestView.mergeable ?? null,
+        merge_state_status: latestView.mergeStateStatus ?? null,
+        review_decision: latestView.reviewDecision ?? null,
+        requeue_required: true,
         merge_method: "squash",
       };
     }

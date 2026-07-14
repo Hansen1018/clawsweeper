@@ -1796,6 +1796,51 @@ for (const prerequisite of [
   });
 }
 
+test("repair apply requeues a merge rejected after guarded preflight", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-apply-result-"));
+  try {
+    const paths = writeApplyMergeFixture(tmp);
+    writeFakeGh(paths.binDir, {
+      issues: {
+        101: issue({ number: 101, title: "Fix config validation", pullRequest: true }),
+      },
+      pulls: {
+        101: pull({ number: 101, title: "Fix config validation" }),
+      },
+      comments: { 101: [] },
+      mergeFailure: "GraphQL: Head branch was modified. Review and try the merge again.",
+      logPath: paths.ghLogPath,
+    });
+
+    execFileSync(
+      process.execPath,
+      ["dist/repair/apply-result.js", paths.jobPath, paths.resultPath],
+      {
+        cwd: repoRoot,
+        env: {
+          ...process.env,
+          CLAWSWEEPER_ALLOW_EXECUTE: "1",
+          CLAWSWEEPER_ALLOW_MERGE: "1",
+          CLAWSWEEPER_ALLOWED_OWNER: "openclaw",
+          CLAWSWEEPER_GH_RETRY_ATTEMPTS: "1",
+          GH_TOKEN: "write-token",
+          ...mockGhBinEnv(path.join(paths.binDir, "gh.js")),
+          PATH: `${paths.binDir}${path.delimiter}${process.env.PATH ?? ""}`,
+        },
+        stdio: "pipe",
+      },
+    );
+
+    const report = JSON.parse(fs.readFileSync(paths.reportPath, "utf8"));
+    assert.equal(report.actions[0].status, "blocked");
+    assert.match(report.actions[0].reason, /merge attempt needs branch refresh/);
+    assert.equal(report.actions[0].requeue_required, true);
+    assert.equal(hasPrMergeCall(paths.ghLogPath), true);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
 type ApplyFixturePaths = {
   binDir: string;
   jobPath: string;
@@ -1839,6 +1884,7 @@ type FakeGhData = {
   postProofPulls?: Record<number, Record<string, unknown>>;
   postProofPrViewFailure?: { number: number; message: string };
   prViews?: Record<number, Record<string, unknown>[]>;
+  mergeFailure?: string;
   logPath: string;
 };
 
@@ -2218,6 +2264,10 @@ if (args[0] === "pr" && args[1] === "close") {
 }
 
 if (args[0] === "pr" && args[1] === "merge") {
+  if (data.mergeFailure) {
+    process.stderr.write(data.mergeFailure + "\\n");
+    process.exit(1);
+  }
   write({ merged: Number(args[2]) });
   process.exit(0);
 }

@@ -683,6 +683,126 @@ test("post-flight blocks merge when required checks fail after preflight", () =>
   }
 });
 
+test("post-flight treats a locked post-merge comment rejection as a terminal skip", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-post-flight-"));
+  const fakeBin = path.join(tmp, "bin");
+  const jobPath = path.join(tmp, "job.md");
+  const runDir = path.join(tmp, "run");
+  const resultPath = path.join(runDir, "result.json");
+  const reportPath = path.join(runDir, "post-flight-report.json");
+  const labelFlagPath = path.join(tmp, "labeled.txt");
+  const closeFlagPath = path.join(tmp, "closed.txt");
+
+  fs.mkdirSync(fakeBin, { recursive: true });
+  fs.mkdirSync(runDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(fakeBin, "gh"),
+    [
+      "#!/usr/bin/env node",
+      "const fs = require('node:fs');",
+      "const args = process.argv.slice(2);",
+      "const apiPath = args[0] === 'api' && args[1] === '-i' ? args[2] : args[1];",
+      "function writeJson(value) { process.stdout.write(JSON.stringify(value)); }",
+      "function writePage(value) {",
+      "  if (args[1] === '-i') process.stdout.write(`HTTP/2 200\\r\\n\\r\\n${JSON.stringify(value)}`);",
+      "  else writeJson(value);",
+      "}",
+      "if (args[0] === 'api' && apiPath === 'repos/openclaw/openclaw/pulls/123') {",
+      "  writeJson({",
+      "    number: 123, state: 'closed', title: 'fix(ui): preserve source config',",
+      "    draft: false, labels: [], base: { ref: 'main' },",
+      "    updated_at: '2026-05-24T00:40:00Z',",
+      "    merged_at: '2026-05-24T00:42:00Z',",
+      "    merge_commit_sha: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',",
+      "    head: { sha: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' },",
+      "  });",
+      "  process.exit(0);",
+      "}",
+      "if (args[0] === 'pr' && args[1] === 'view' && args[2] === '123') {",
+      "  writeJson({",
+      "    baseRefName: 'main', isDraft: false, mergeable: 'MERGEABLE',",
+      "    mergeStateStatus: 'CLEAN', mergedAt: '2026-05-24T00:42:00Z',",
+      "    mergeCommit: { oid: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' },",
+      "    reviewDecision: null, state: 'MERGED', statusCheckRollup: [],",
+      "    title: 'fix(ui): preserve source config',",
+      "  });",
+      "  process.exit(0);",
+      "}",
+      "if (args[0] === 'api' && apiPath === 'repos/openclaw/openclaw/issues/456') {",
+      "  writeJson({",
+      "    number: 456, state: 'open', title: 'Original bug', body: 'Still open.',",
+      "    updated_at: '2026-05-24T00:40:00Z', locked: false,",
+      "    labels: fs.existsSync(process.env.FAKE_GH_LABEL_FILE) ? [{ name: 'clawsweeper' }] : [],",
+      "  });",
+      "  process.exit(0);",
+      "}",
+      "if (args[0] === 'api' && /^repos\\/openclaw\\/openclaw\\/issues\\/456\\/comments(?:\\?|$)/.test(apiPath || '')) {",
+      "  if (args.includes('--method') && args.includes('POST')) {",
+      "    process.stderr.write('HTTP 403: issue is locked and cannot receive comments\\n');",
+      "    process.exit(1);",
+      "  }",
+      "  if (args.includes('--jq')) process.stdout.write('');",
+      "  else writePage([]);",
+      "  process.exit(0);",
+      "}",
+      "if (args[0] === 'issue' && args[1] === 'edit' && args[2] === '456') {",
+      "  fs.writeFileSync(process.env.FAKE_GH_LABEL_FILE, '1');",
+      "  process.exit(0);",
+      "}",
+      "if (args[0] === 'issue' && args[1] === 'close' && args[2] === '456') {",
+      "  fs.writeFileSync(process.env.FAKE_GH_CLOSE_FILE, '1');",
+      "  process.exit(0);",
+      "}",
+      "process.stderr.write(`unexpected gh args: ${args.join(' ')}\\n`);",
+      "process.exit(1);",
+    ].join("\n"),
+    { mode: 0o755 },
+  );
+
+  writeMergeJob(jobPath);
+  writeMergeReports(runDir, resultPath, {
+    resultActions: [
+      {
+        action: "close_fixed_by_candidate",
+        target: "#456",
+        target_kind: "issue",
+        target_updated_at: "2026-05-24T00:40:00Z",
+        candidate_fix: "#123",
+        status: "planned",
+        idempotency_key: "post-merge-close-456",
+      },
+    ],
+  });
+
+  try {
+    execFileSync(process.execPath, ["dist/repair/post-flight.js", jobPath, resultPath], {
+      cwd: repoRoot,
+      env: {
+        ...process.env,
+        CLAWSWEEPER_ALLOW_EXECUTE: "1",
+        CLAWSWEEPER_ALLOWED_OWNER: "openclaw",
+        CLAWSWEEPER_ALLOW_MERGE: "1",
+        FAKE_GH_LABEL_FILE: labelFlagPath,
+        FAKE_GH_CLOSE_FILE: closeFlagPath,
+        ...mockGhBinEnv(path.join(fakeBin, "gh"), fakeBin),
+      },
+      stdio: "pipe",
+    });
+
+    const report = JSON.parse(fs.readFileSync(reportPath, "utf8"));
+    assert.equal(report.actions[0]?.status, "executed");
+    assert.equal(report.actions[1]?.action, "post_merge_closeout");
+    assert.equal(report.actions[1]?.status, "skipped");
+    assert.equal(report.actions[1]?.reason, "target is locked; GitHub rejected the write");
+    assert.equal(report.actions[1]?.live_state, "open");
+    assert.equal(report.actions[1]?.merge_commit_sha, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    assert.equal(fs.existsSync(labelFlagPath), true);
+    assert.equal(fs.existsSync(closeFlagPath), false);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
 test("post-flight keeps no-timestamp pending duplicate checks visible", () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-post-flight-"));
   const fakeBin = path.join(tmp, "bin");
@@ -863,9 +983,15 @@ function writeIssueImplementationReports(runDir: string, resultPath: string) {
 function writeMergeReports(
   runDir: string,
   resultPath: string,
-  actions: Record<string, unknown>[] = [],
-  options: { action?: string; commit?: string } = {},
+  actionsOrOptions:
+    | Record<string, unknown>[]
+    | { action?: string; commit?: string; resultActions?: unknown[] } = [],
+  explicitOptions: { action?: string; commit?: string; resultActions?: unknown[] } = {},
 ) {
+  const options = Array.isArray(actionsOrOptions) ? explicitOptions : actionsOrOptions;
+  const actions = Array.isArray(actionsOrOptions)
+    ? actionsOrOptions
+    : (actionsOrOptions.resultActions ?? []);
   fs.writeFileSync(
     resultPath,
     JSON.stringify(

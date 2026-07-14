@@ -21,6 +21,7 @@ import {
 } from "./github-cli.js";
 import { issueNumberFromRef, parsePullRequestUrl } from "./github-ref.js";
 import { isLockedConversationCommentError } from "../github-retry.js";
+import { lockedConversationSkip } from "./apply-locks.js";
 import { sleepMs } from "./timing.js";
 import {
   CLAWSWEEPER_LABEL,
@@ -33,6 +34,10 @@ import {
   buildRepairSquashMergeMessage,
   writeRepairSquashMergeBody,
 } from "./repair-merge-message.js";
+import {
+  isRecoverableRepairMergeRace,
+  isRecoverableRepairMergeRaceError,
+} from "./repair-merge-race.js";
 import {
   RepairMutationFreshnessError,
   createRepairMutationBoundaryGuard,
@@ -370,14 +375,14 @@ function finalizeFixPr(action: LooseRecord) {
       freshness,
       boundaryGuards: requiredChecksGuard ? [requiredChecksGuard] : [],
       operation: () => ghOneShot(mergeArgs),
-      knownNoMutation: isRecoverableMergeRaceError,
+      knownNoMutation: isRecoverableRepairMergeRaceError,
     });
   } catch (error) {
     if (error instanceof RepairMutationFreshnessError) {
       return postFlightFreshnessBlock(prBase, error, waitedMs);
     }
     const detail = ghErrorText(error);
-    if (isRecoverableMergeRace(detail)) {
+    if (isRecoverableRepairMergeRace(detail)) {
       const latestView = fetchPullRequestView(result.repo, parsed.number);
       return {
         ...prBase,
@@ -663,6 +668,12 @@ function finalizePostMergeCloseout({
   } catch (error) {
     if (error instanceof RepairMutationFreshnessError) {
       return postMergeCloseoutFreshnessBlock(base, finalized, error);
+    }
+    if (isLockedConversationCommentError(error)) {
+      return {
+        ...lockedConversationSkip(base, live, { terminalWriteError: true }),
+        merge_commit_sha: finalized.merge_commit_sha ?? null,
+      };
     }
     throw error;
   }
@@ -1151,16 +1162,6 @@ function postMergeCloseoutFreshnessBlock(
 
 function compactText(text: string, maxLength: number) {
   return compactPlainText(stripAnsi(text), maxLength);
-}
-
-function isRecoverableMergeRace(message: string) {
-  return /pull request has merge conflicts|merge conflict|base branch was modified|head branch was modified|not mergeable/i.test(
-    String(message ?? ""),
-  );
-}
-
-function isRecoverableMergeRaceError(error: unknown) {
-  return isRecoverableMergeRace(ghErrorText(error));
 }
 
 function isAlreadyExistsError(error: unknown) {
