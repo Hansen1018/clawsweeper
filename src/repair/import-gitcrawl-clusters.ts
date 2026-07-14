@@ -1,11 +1,15 @@
 #!/usr/bin/env node
 import type { JsonValue, LooseRecord } from "./json-types.js";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
-import { execFileSync } from "node:child_process";
 import { hasSecuritySignalText, parseArgs, repoRoot } from "./lib.js";
 import { renderJobIntentFrontmatter } from "./job-intent.js";
+import {
+  GitcrawlEvidenceAdapter,
+  gitcrawlEvidenceOptionsFromArgs,
+  type GitcrawlClusterEvidence,
+  type GitcrawlThreadEvidence,
+} from "./gitcrawl-evidence-adapter.js";
 
 const args = parseArgs(process.argv.slice(2));
 const repo = String(args.repo ?? "openclaw/openclaw");
@@ -17,7 +21,15 @@ if (!["plan", "execute", "autonomous"].includes(mode)) {
 const outDir = path.resolve(
   String(args.out ?? path.join(repoRoot(), "jobs", repo.split("/")[0] ?? "unknown", "inbox")),
 );
-const dbPath = resolveGitcrawlDbPath(repo, typeof args.db === "string" ? args.db : undefined);
+const evidenceOptions = gitcrawlEvidenceOptionsFromArgs({
+  repository: repo,
+  repoRoot: repoRoot(),
+  args,
+});
+const provenanceOut =
+  typeof args["provenance-out"] === "string"
+    ? path.resolve(String(args["provenance-out"]))
+    : undefined;
 const suffix = typeof args.suffix === "string" ? args.suffix : "";
 const allowInstantClose = booleanArg("allow-instant-close", false);
 const editEnabledByDefault = mode === "autonomous" || mode === "execute";
@@ -36,395 +48,288 @@ const minOpenMembers = numberArg("min-open-members", 1);
 const skipClosedPercent = percentArg("skip-closed-percent", 75);
 let clusterIds = args._.map((value: string) => Number(value)).filter(Boolean);
 const selectingFromGitcrawl = clusterIds.length === 0 && fromGitcrawl;
-const clusterSource = detectClusterSource();
 
-if (selectingFromGitcrawl) {
-  clusterIds = selectClusterIds();
+const adapter = await GitcrawlEvidenceAdapter.open(evidenceOptions);
+try {
+  await importClusters();
+} finally {
+  await adapter.close();
 }
 
-if (clusterIds.length === 0) {
-  if (selectingFromGitcrawl && allowEmpty) {
-    console.error("no eligible gitcrawl clusters found");
-    process.exit(0);
-  }
-  console.error(
-    "usage: node scripts/import-gitcrawl-clusters.ts <cluster-id> [...] [--from-gitcrawl] [--allow-empty] [--limit N] [--min-size N] [--min-open-members N] [--skip-closed-percent N] [--repo owner/repo] [--db path] [--out dir] [--mode plan|autonomous] [--suffix name] [--allow-instant-close] [--allow-merge true|false] [--allow-fix-pr true|false] [--allow-post-merge-close true|false]",
-  );
-  process.exit(2);
-}
-function gitcrawlStoreDbFileName(repoFullName: string): string {
-  return `${repoFullName
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9_.-]+/g, "__")}.sync.db`;
-}
-
-function resolveGitcrawlDbPath(repoFullName: string, explicitDb?: string): string {
-  const configured = explicitDb?.trim() || process.env.CLAWSWEEPER_GITCRAWL_DB?.trim();
-  if (configured) return path.resolve(configured);
-  const storeDbFileName = gitcrawlStoreDbFileName(repoFullName);
-  const candidates = [
-    path.join(repoRoot(), "..", "gitcrawl-store", "data", storeDbFileName),
-    path.join(
-      os.homedir(),
-      ".config",
-      "gitcrawl",
-      "stores",
-      "gitcrawl-store",
-      "data",
-      storeDbFileName,
-    ),
-    path.join(os.homedir(), ".config", "gitcrawl", "gitcrawl.db"),
-  ];
-  return candidates.find((candidate) => fs.existsSync(candidate)) ?? candidates.at(-1)!;
-}
-
-fs.mkdirSync(outDir, { recursive: true });
-
-const existingClusterIds = skipExisting ? existingGitcrawlClusterIds(outDir) : new Set();
-const existingMemberRefs = skipExisting ? existingGitcrawlMemberRefs(outDir, suffix) : new Map();
-const prefetchedMembers = selectingFromGitcrawl ? prefetchMembers(clusterIds) : null;
-let createdCount = 0;
-
-for (const clusterId of clusterIds) {
-  if (selectingFromGitcrawl && createdCount >= limit) break;
-  if (existingClusterIds.has(clusterId)) {
-    console.error(`skip existing cluster: ${clusterId}`);
-    continue;
+async function importClusters() {
+  const clusterResult = await adapter.listClusters({
+    status: "active",
+    minSize: selectingFromGitcrawl ? minSize : 1,
+  });
+  const clustersById = new Map(clusterResult.rows.map((cluster) => [cluster.id, cluster]));
+  if (selectingFromGitcrawl) {
+    clusterIds = clusterResult.rows.map((cluster) => cluster.id);
   }
 
-  const members = prefetchedMembers?.get(clusterId) ?? sqliteJson(memberSql(clusterId));
-
-  if (members.length === 0) {
-    console.error(`cluster not found: ${clusterId}`);
-    continue;
-  }
-  const overlappingRefs = members
-    .map((member: JsonValue) => Number(member.number))
-    .filter((number: string) => existingMemberRefs.has(number));
-  if (overlappingRefs.length > 0) {
-    const examples = overlappingRefs
-      .slice(0, 4)
-      .map((number: string) => `#${number}`)
-      .join(", ");
-    const existingFiles = [
-      ...new Set(overlappingRefs.flatMap((number: string) => existingMemberRefs.get(number) ?? [])),
-    ];
+  if (clusterIds.length === 0) {
+    if (selectingFromGitcrawl && allowEmpty) {
+      writeProvenance([]);
+      console.error("no eligible gitcrawl clusters found");
+      return;
+    }
     console.error(
-      `skip existing member overlap cluster: ${clusterId} ${members[0].representative_title ?? ""} (${examples}${overlappingRefs.length > 4 ? ", ..." : ""}; ${existingFiles.slice(0, 2).join(", ")})`,
+      "usage: node scripts/import-gitcrawl-clusters.ts <cluster-id> [...] [--from-gitcrawl] [--gitcrawl-provider local|cloud|parity] [--cloud-url URL] [--cloud-archive NAME] [--snapshot-id ID] [--provenance-out path] [--allow-empty] [--limit N] [--min-size N] [--min-open-members N] [--skip-closed-percent N] [--repo owner/repo] [--db path] [--out dir] [--mode plan|autonomous] [--suffix name] [--allow-instant-close] [--allow-merge true|false] [--allow-fix-pr true|false] [--allow-post-merge-close true|false]",
     );
-    continue;
+    process.exitCode = 2;
+    return;
   }
 
-  const securitySensitiveMembers = members.filter((member: JsonValue) =>
-    hasSecuritySignalText(member.title, member.body, safeJson(member.labels_json)),
-  );
-  const securitySensitive = securitySensitiveMembers.length > 0;
-  if (securitySensitive && skipSecurity) {
-    const refs = securitySensitiveMembers
-      .map((member: JsonValue) => `#${member.number}`)
-      .join(", ");
-    console.error(
-      `skip security-sensitive cluster: ${clusterId} ${members[0].representative_title ?? ""} (${refs})`,
-    );
-    continue;
-  }
-  if (skipFeatureRequests && isProductFeatureRequest(members[0].representative_title)) {
-    console.error(
-      `skip product feature-request cluster: ${clusterId} ${members[0].representative_title ?? ""}`,
-    );
-    continue;
-  }
+  fs.mkdirSync(outDir, { recursive: true });
+  const existingClusterIds = skipExisting ? existingGitcrawlClusterIds(outDir) : new Set();
+  const existingMemberRefs = skipExisting ? existingGitcrawlMemberRefs(outDir, suffix) : new Map();
+  const generated: string[] = [];
+  let createdCount = 0;
 
-  const first = members[0];
-  const representative = {
-    number: first.representative_number,
-    kind: first.representative_kind,
-    state: first.representative_state,
-    title: first.representative_title,
+  for (const clusterId of clusterIds) {
+    if (selectingFromGitcrawl && createdCount >= limit) break;
+    if (existingClusterIds.has(clusterId)) {
+      console.error(`skip existing cluster: ${clusterId}`);
+      continue;
+    }
+
+    const cluster = clustersById.get(clusterId);
+    if (!cluster) {
+      console.error(`cluster not found or inactive: ${clusterId}`);
+      continue;
+    }
+    const memberResult = await adapter.clusterMembers(clusterId);
+    const members = memberResult.rows.map((member) => legacyMember(cluster, member));
+
+    if (members.length === 0) {
+      console.error(`cluster not found: ${clusterId}`);
+      continue;
+    }
+    const overlappingRefs = members
+      .map((member: JsonValue) => Number(member.number))
+      .filter((number: number) => existingMemberRefs.has(number));
+    if (overlappingRefs.length > 0) {
+      const examples = overlappingRefs
+        .slice(0, 4)
+        .map((number: number) => `#${number}`)
+        .join(", ");
+      const existingFiles = [
+        ...new Set(
+          overlappingRefs.flatMap((number: number) => existingMemberRefs.get(number) ?? []),
+        ),
+      ];
+      console.error(
+        `skip existing member overlap cluster: ${clusterId} ${members[0].representative_title ?? ""} (${examples}${overlappingRefs.length > 4 ? ", ..." : ""}; ${existingFiles.slice(0, 2).join(", ")})`,
+      );
+      continue;
+    }
+
+    const securitySensitiveMembers = members.filter((member: JsonValue) =>
+      hasSecuritySignalText(member.title, member.body, safeJson(member.labels_json)),
+    );
+    const securitySensitive = securitySensitiveMembers.length > 0;
+    if (securitySensitive && skipSecurity) {
+      const refs = securitySensitiveMembers
+        .map((member: JsonValue) => `#${member.number}`)
+        .join(", ");
+      console.error(
+        `skip security-sensitive cluster: ${clusterId} ${members[0].representative_title ?? ""} (${refs})`,
+      );
+      continue;
+    }
+    if (skipFeatureRequests && isProductFeatureRequest(members[0].representative_title)) {
+      console.error(
+        `skip product feature-request cluster: ${clusterId} ${members[0].representative_title ?? ""}`,
+      );
+      continue;
+    }
+
+    const first = members[0];
+    const representative = {
+      number: first.representative_number,
+      kind: first.representative_kind,
+      state: first.representative_state,
+      title: first.representative_title,
+    };
+    const openMembers = members.filter((member: JsonValue) => member.state === "open");
+    const closedMembers = members.filter((member: JsonValue) => member.state !== "open");
+    if (openMembers.length === 0) {
+      console.error(`skip closed-only cluster: ${clusterId} ${representative.title ?? ""}`);
+      continue;
+    }
+    const closedPercent = Math.floor((closedMembers.length * 100) / members.length);
+    if (closedPercent >= skipClosedPercent) {
+      console.error(
+        `skip mostly-closed cluster: ${clusterId} ${representative.title ?? ""} (${closedPercent}% closed >= ${skipClosedPercent}%)`,
+      );
+      continue;
+    }
+    if (openMembers.length < minOpenMembers) {
+      console.error(
+        `skip low-open cluster: ${clusterId} ${representative.title ?? ""} (${openMembers.length} open < ${minOpenMembers})`,
+      );
+      continue;
+    }
+    const issueCount = members.filter((member: JsonValue) => member.kind === "issue").length;
+    const pullRequestCount = members.filter(
+      (member: JsonValue) => member.kind === "pull_request",
+    ).length;
+    const latestUpdatedAt = members
+      .map((member: JsonValue) => member.updated_at)
+      .sort()
+      .at(-1);
+    const slug = slugify(representative.title || `cluster-${clusterId}`);
+    const fileStem = suffix
+      ? `gitcrawl-${clusterId}-${slugify(suffix)}`
+      : `gitcrawl-${clusterId}-${slug}`;
+    const filePath = path.join(outDir, `${fileStem}.md`);
+    const clusterSlug = suffix
+      ? `gitcrawl-${clusterId}-${slugify(suffix)}`
+      : `gitcrawl-${clusterId}-${slug}`;
+    const canonical = representative.number ? [`#${representative.number}`] : [];
+
+    const markdown = [
+      "---",
+      `repo: ${repo}`,
+      `cluster_id: ${clusterSlug}`,
+      `mode: ${mode}`,
+      renderJobIntentFrontmatter("repair_cluster"),
+      "allowed_actions:",
+      "  - comment",
+      "  - label",
+      "  - close",
+      ...(allowMerge ? ["  - merge"] : []),
+      ...(allowFixPr ? ["  - fix", "  - raise_pr"] : []),
+      "blocked_actions:",
+      "  - force_push",
+      "  - bypass_checks",
+      ...(allowMerge ? [] : ["  - merge"]),
+      ...(allowFixPr ? [] : ["  - fix", "  - raise_pr"]),
+      "require_human_for:",
+      "  - security_sensitive",
+      "  - failing_checks",
+      "  - conflicting_prs",
+      "  - unclear_canonical",
+      "  - broad_code_delta",
+      "canonical:",
+      ...yamlList(canonical),
+      "candidates:",
+      ...yamlList(openMembers.map((member: JsonValue) => `#${member.number}`)),
+      "cluster_refs:",
+      ...yamlList(members.map((member: JsonValue) => `#${member.number}`)),
+      "security_policy: central_security_only",
+      "security_sensitive: false",
+      `gitcrawl_provider: ${quoteYaml(adapter.provider)}`,
+      `gitcrawl_snapshot_id: ${quoteYaml(adapter.snapshotId)}`,
+      `gitcrawl_source_identity_sha256: ${quoteYaml(adapter.provenance.identity_sha256)}`,
+      ...(adapter.paritySnapshotId
+        ? [`gitcrawl_parity_snapshot_id: ${quoteYaml(adapter.paritySnapshotId)}`]
+        : []),
+      ...(mode === "autonomous" || mode === "execute"
+        ? [
+            `allow_instant_close: ${allowInstantClose ? "true" : "false"}`,
+            `allow_fix_pr: ${allowFixPr ? "true" : "false"}`,
+            `allow_merge: ${allowMerge ? "true" : "false"}`,
+            `allow_post_merge_close: ${allowPostMergeClose ? "true" : "false"}`,
+            `require_fix_before_close: ${allowFixPr || allowMerge ? "true" : "false"}`,
+          ]
+        : []),
+      `canonical_hint: ${quoteYaml(canonicalHint(representative))}`,
+      `notes: ${quoteYaml(jobNotes(clusterId, securitySensitiveMembers))}`,
+      "---",
+      "",
+      `# Gitcrawl Cluster ${clusterId}`,
+      "",
+      `Generated from ${adapter.provider} Gitcrawl snapshot \`${adapter.snapshotId}\` cluster ${clusterId} for \`${repo}\`.`,
+      "",
+      "Display title:",
+      "",
+      `> ${representative.title || "Untitled representative"}`,
+      "",
+      "Cluster shape from gitcrawl:",
+      "",
+      `- total members: ${members.length}`,
+      `- issues: ${issueCount}`,
+      `- pull requests: ${pullRequestCount}`,
+      `- open candidates in snapshot: ${openMembers.length}`,
+      `- representative: #${representative.number}, currently ${representative.state} in snapshot`,
+      `- latest member update: ${latestUpdatedAt}`,
+      "",
+      "## Goal",
+      "",
+      goalText(mode),
+      "",
+      "## Member Inventory",
+      "",
+      "Closed context refs:",
+      "",
+      ...bulletList(closedMembers),
+      "",
+      "Open candidates:",
+      "",
+      ...bulletList(openMembers),
+      "",
+    ].join("\n");
+
+    fs.writeFileSync(filePath, markdown);
+    for (const member of members) {
+      const number = Number(member.number);
+      if (!Number.isSafeInteger(number)) continue;
+      const files = existingMemberRefs.get(number) ?? [];
+      files.push(path.relative(repoRoot(), filePath));
+      existingMemberRefs.set(number, files);
+    }
+    createdCount += 1;
+    const generatedPath = path.relative(repoRoot(), filePath);
+    generated.push(generatedPath);
+    console.log(generatedPath);
+  }
+  writeProvenance(generated);
+}
+
+function legacyMember(
+  cluster: GitcrawlClusterEvidence,
+  member: GitcrawlThreadEvidence,
+): LooseRecord {
+  return {
+    cluster_id: cluster.id,
+    member_count: cluster.memberCount,
+    cluster_created_at: cluster.createdAt,
+    closed_at_local: cluster.closedAt || null,
+    close_reason_local: cluster.status,
+    representative_number: cluster.representative.number,
+    representative_kind: cluster.representative.kind,
+    representative_state: cluster.representative.state,
+    representative_title: cluster.representative.title,
+    number: member.number,
+    kind: member.kind,
+    state: member.state,
+    title: member.title,
+    body: member.body,
+    labels_json: JSON.stringify(member.labels ?? []),
+    updated_at: member.updatedAt,
   };
-  const openMembers = members.filter((member: JsonValue) => member.state === "open");
-  const closedMembers = members.filter((member: JsonValue) => member.state !== "open");
-  if (openMembers.length === 0) {
-    console.error(`skip closed-only cluster: ${clusterId} ${representative.title ?? ""}`);
-    continue;
-  }
-  const closedPercent = Math.floor((closedMembers.length * 100) / members.length);
-  if (closedPercent >= skipClosedPercent) {
-    console.error(
-      `skip mostly-closed cluster: ${clusterId} ${representative.title ?? ""} (${closedPercent}% closed >= ${skipClosedPercent}%)`,
-    );
-    continue;
-  }
-  if (openMembers.length < minOpenMembers) {
-    console.error(
-      `skip low-open cluster: ${clusterId} ${representative.title ?? ""} (${openMembers.length} open < ${minOpenMembers})`,
-    );
-    continue;
-  }
-  const issueCount = members.filter((member: JsonValue) => member.kind === "issue").length;
-  const pullRequestCount = members.filter(
-    (member: JsonValue) => member.kind === "pull_request",
-  ).length;
-  const latestUpdatedAt = members
-    .map((member: JsonValue) => member.updated_at)
-    .sort()
-    .at(-1);
-  const slug = slugify(representative.title || `cluster-${clusterId}`);
-  const fileStem = suffix
-    ? `gitcrawl-${clusterId}-${slugify(suffix)}`
-    : `gitcrawl-${clusterId}-${slug}`;
-  const filePath = path.join(outDir, `${fileStem}.md`);
-  const clusterSlug = suffix
-    ? `gitcrawl-${clusterId}-${slugify(suffix)}`
-    : `gitcrawl-${clusterId}-${slug}`;
-  const canonical = representative.number ? [`#${representative.number}`] : [];
-
-  const markdown = [
-    "---",
-    `repo: ${repo}`,
-    `cluster_id: ${clusterSlug}`,
-    `mode: ${mode}`,
-    renderJobIntentFrontmatter("repair_cluster"),
-    "allowed_actions:",
-    "  - comment",
-    "  - label",
-    "  - close",
-    ...(allowMerge ? ["  - merge"] : []),
-    ...(allowFixPr ? ["  - fix", "  - raise_pr"] : []),
-    "blocked_actions:",
-    "  - force_push",
-    "  - bypass_checks",
-    ...(allowMerge ? [] : ["  - merge"]),
-    ...(allowFixPr ? [] : ["  - fix", "  - raise_pr"]),
-    "require_human_for:",
-    "  - security_sensitive",
-    "  - failing_checks",
-    "  - conflicting_prs",
-    "  - unclear_canonical",
-    "  - broad_code_delta",
-    "canonical:",
-    ...yamlList(canonical),
-    "candidates:",
-    ...yamlList(openMembers.map((member: JsonValue) => `#${member.number}`)),
-    "cluster_refs:",
-    ...yamlList(members.map((member: JsonValue) => `#${member.number}`)),
-    "security_policy: central_security_only",
-    "security_sensitive: false",
-    ...(mode === "autonomous" || mode === "execute"
-      ? [
-          `allow_instant_close: ${allowInstantClose ? "true" : "false"}`,
-          `allow_fix_pr: ${allowFixPr ? "true" : "false"}`,
-          `allow_merge: ${allowMerge ? "true" : "false"}`,
-          `allow_post_merge_close: ${allowPostMergeClose ? "true" : "false"}`,
-          `require_fix_before_close: ${allowFixPr || allowMerge ? "true" : "false"}`,
-        ]
-      : []),
-    `canonical_hint: ${quoteYaml(canonicalHint(representative))}`,
-    `notes: ${quoteYaml(jobNotes(clusterId, securitySensitiveMembers))}`,
-    "---",
-    "",
-    `# Gitcrawl Cluster ${clusterId}`,
-    "",
-    `Generated from local gitcrawl run cluster ${clusterId} for \`${repo}\`.`,
-    "",
-    "Display title:",
-    "",
-    `> ${representative.title || "Untitled representative"}`,
-    "",
-    "Cluster shape from gitcrawl:",
-    "",
-    `- total members: ${members.length}`,
-    `- issues: ${issueCount}`,
-    `- pull requests: ${pullRequestCount}`,
-    `- open candidates in local store: ${openMembers.length}`,
-    `- representative: #${representative.number}, currently ${representative.state} in local store`,
-    `- latest member update: ${latestUpdatedAt}`,
-    "",
-    "## Goal",
-    "",
-    goalText(mode),
-    "",
-    "## Member Inventory",
-    "",
-    "Closed context refs:",
-    "",
-    ...bulletList(closedMembers),
-    "",
-    "Open candidates:",
-    "",
-    ...bulletList(openMembers),
-    "",
-  ].join("\n");
-
-  fs.writeFileSync(filePath, markdown);
-  for (const member of members) {
-    const number = Number(member.number);
-    if (!Number.isSafeInteger(number)) continue;
-    const files = existingMemberRefs.get(number) ?? [];
-    files.push(path.relative(repoRoot(), filePath));
-    existingMemberRefs.set(number, files);
-  }
-  createdCount += 1;
-  console.log(path.relative(repoRoot(), filePath));
 }
 
-function selectClusterIds() {
-  if (clusterSource === "portable") {
-    return sqliteJson(`
-      select
-        cg.id,
-        count(*) as member_count,
-        sum(case when t.state = 'open' then 1 else 0 end) as open_count,
-        sum(case when t.state != 'open' then 1 else 0 end) as closed_count
-      from cluster_groups cg
-      join cluster_memberships cm on cm.cluster_id = cg.id and cm.state = 'active'
-      join threads t on t.id = cm.thread_id
-      where cg.status = 'active'
-      group by cg.id
-      having member_count >= ${sqlNumber(minSize)}
-        and open_count >= ${sqlNumber(minOpenMembers)}
-        and ((closed_count * 100) / member_count) < ${sqlNumber(skipClosedPercent)}
-      order by member_count desc, cg.id asc
-    `)
-      .map((row: JsonValue) => Number(row.id))
-      .filter(Boolean);
-  }
-  return sqliteJson(`
-    select
-      c.id,
-      count(*) as member_count,
-      sum(case when t.state = 'open' then 1 else 0 end) as open_count,
-      sum(case when t.state != 'open' then 1 else 0 end) as closed_count
-    from clusters c
-    join cluster_members cm on cm.cluster_id = c.id
-    join threads t on t.id = cm.thread_id
-    where c.closed_at_local is null
-    group by c.id
-    having member_count >= ${sqlNumber(minSize)}
-      and open_count >= ${sqlNumber(minOpenMembers)}
-      and ((closed_count * 100) / member_count) < ${sqlNumber(skipClosedPercent)}
-    order by member_count desc, c.id asc
-  `)
-    .map((row: JsonValue) => Number(row.id))
-    .filter(Boolean);
-}
-
-function memberSql(clusterId: JsonValue) {
-  return memberSqlForClusterIds([clusterId]);
-}
-
-function memberSqlForClusterIds(clusterIds: JsonValue[]) {
-  const idList = clusterIds.map(sqlNumber).join(",");
-  if (clusterSource === "portable") {
-    return `
-      select
-        cg.id as cluster_id,
-        (
-          select count(*)
-          from cluster_memberships cm_count
-          where cm_count.cluster_id = cg.id
-            and cm_count.state = 'active'
-        ) as member_count,
-        cg.created_at as cluster_created_at,
-        cg.closed_at as closed_at_local,
-        cg.status as close_reason_local,
-        rt.number as representative_number,
-        rt.kind as representative_kind,
-        rt.state as representative_state,
-        rt.title as representative_title,
-        t.number,
-        t.kind,
-        t.state,
-        t.title,
-        t.body_excerpt as body,
-        t.labels_json,
-        t.updated_at
-      from cluster_groups cg
-      join cluster_memberships cm on cm.cluster_id = cg.id and cm.state = 'active'
-      join threads t on t.id = cm.thread_id
-      left join threads rt on rt.id = cg.representative_thread_id
-      where cg.id in (${idList})
-      order by cg.id, t.number;
-    `;
-  }
-  return `
-    select
-      c.id as cluster_id,
-      c.member_count,
-      c.created_at as cluster_created_at,
-      c.closed_at_local,
-      c.close_reason_local,
-      rt.number as representative_number,
-      rt.kind as representative_kind,
-      rt.state as representative_state,
-      rt.title as representative_title,
-      t.number,
-      t.kind,
-      t.state,
-      t.title,
-      t.body,
-      t.labels_json,
-      t.updated_at
-    from clusters c
-    join cluster_members cm on cm.cluster_id = c.id
-    join threads t on t.id = cm.thread_id
-    left join threads rt on rt.id = c.representative_thread_id
-    where c.id in (${idList})
-    order by c.id, t.number;
-  `;
-}
-
-function prefetchMembers(clusterIds: JsonValue[]) {
-  const rows = sqliteJson(memberSqlForClusterIds(clusterIds));
-  const byCluster = new Map();
-  for (const row of rows) {
-    const id = Number(row.cluster_id);
-    const members = byCluster.get(id) ?? [];
-    members.push(row);
-    byCluster.set(id, members);
-  }
-  return byCluster;
-}
-
-function sqliteJson(sql: JsonValue) {
-  const output = execFileSync("sqlite3", ["-json", dbPath, sql], {
-    cwd: repoRoot(),
-    encoding: "utf8",
-    maxBuffer: 256 * 1024 * 1024,
-  }).trim();
-  return JSON.parse(output || "[]");
-}
-
-function sqliteScalar(sql: string) {
-  const output = execFileSync("sqlite3", [dbPath, sql], {
-    cwd: repoRoot(),
-    encoding: "utf8",
-    maxBuffer: 1024 * 1024,
-  }).trim();
-  return output;
-}
-
-function detectClusterSource() {
-  const legacyRows =
-    Number(
-      sqliteScalar(
-        "select count(*) from sqlite_master where type = 'table' and name = 'clusters';",
-      ),
-    ) > 0
-      ? Number(sqliteScalar("select count(*) from clusters;"))
-      : 0;
-  if (legacyRows > 0) return "legacy";
-  const portableRows =
-    Number(
-      sqliteScalar(
-        "select count(*) from sqlite_master where type = 'table' and name = 'cluster_groups';",
-      ),
-    ) > 0
-      ? Number(sqliteScalar("select count(*) from cluster_groups;"))
-      : 0;
-  if (portableRows > 0) return "portable";
-  return "legacy";
+function writeProvenance(generated: string[]) {
+  if (!provenanceOut) return;
+  fs.mkdirSync(path.dirname(provenanceOut), { recursive: true });
+  fs.writeFileSync(
+    provenanceOut,
+    `${JSON.stringify(
+      {
+        schema: "clawsweeper-gitcrawl-cluster-import-v1",
+        repository: repo,
+        provider: adapter.provider,
+        snapshot_id: adapter.snapshotId,
+        parity_snapshot_id: adapter.paritySnapshotId ?? null,
+        source: adapter.provenance,
+        selected_cluster_ids: clusterIds,
+        generated,
+      },
+      null,
+      2,
+    )}\n`,
+  );
 }
 
 function numberArg(name: string, fallback: JsonValue) {
@@ -448,13 +353,6 @@ function booleanArg(name: string, fallback: JsonValue) {
   if (value === true || value === "true") return true;
   if (value === false || value === "false") return false;
   throw new Error(`--${name} must be true or false`);
-}
-
-function sqlNumber(value: JsonValue) {
-  if (!Number.isSafeInteger(value)) {
-    throw new Error(`unsafe cluster id: ${value}`);
-  }
-  return String(value);
 }
 
 function safeJson(value: JsonValue) {
@@ -529,7 +427,7 @@ function goalText(mode: string) {
 }
 
 function jobNotes(clusterId: string, securitySensitiveMembers: JsonValue) {
-  const base = `Generated from gitcrawl run cluster ${clusterId} on ${new Date().toISOString().slice(0, 10)}.`;
+  const base = `Generated from ${adapter.provider} Gitcrawl snapshot ${adapter.snapshotId} cluster ${clusterId} on ${new Date().toISOString().slice(0, 10)}.`;
   if (securitySensitiveMembers.length === 0) return base;
   return `${base} Security-sensitive refs ${securitySensitiveMembers.map((member: JsonValue) => `#${member.number}`).join(", ")} must be routed with route_security and must not block unrelated non-security work.`;
 }
