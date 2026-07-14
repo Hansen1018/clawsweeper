@@ -244,7 +244,6 @@ jobs:
 
       - uses: ./.github/actions/setup-action-ledger
         id: exact-review-action-ledger
-        continue-on-error: true
 
       - uses: ./.github/actions/setup-pnpm
         id: exact-review-pnpm
@@ -252,6 +251,7 @@ jobs:
           build-script: build:repair
 
       - name: Enqueue legacy event through the durable control plane
+        if: ${{ steps.exact-review-action-ledger.outcome == 'success' && steps.exact-review-pnpm.outcome == 'success' }}
         env:
           CLAWSWEEPER_ACTION_LEDGER_ROOT: ${{ steps.exact-review-action-ledger.outputs.output-root || runner.temp }}/exact-review-queue-spool
           CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT: ${{ steps.exact-review-action-ledger.outputs.output-root || runner.temp }}/exact-review-queue-output
@@ -309,7 +309,6 @@ jobs:
 
       - uses: ./.github/actions/setup-action-ledger
         id: exact-review-action-ledger
-        continue-on-error: true
 
       - uses: ./.github/actions/setup-pnpm
         id: setup-pnpm
@@ -318,6 +317,7 @@ jobs:
 
       - name: Claim exact-review queue lease
         id: claim-exact-review-queue
+        if: ${{ steps.exact-review-action-ledger.outcome == 'success' && steps.setup-pnpm.outcome == 'success' }}
         env:
           CLAWSWEEPER_ACTION_LEDGER_ROOT: ${{ steps.exact-review-action-ledger.outputs.output-root || runner.temp }}/exact-review-queue-spool
           CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT: ${{ steps.exact-review-action-ledger.outputs.output-root || runner.temp }}/exact-review-queue-output

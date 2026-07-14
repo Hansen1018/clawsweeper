@@ -493,6 +493,21 @@ test("exact-review workflows isolate state credentials and publish exact manifes
   assert.match(legacy, /exact-review-action-ledger-cli\.js enqueue/);
   assert.match(event, /exact-review-action-ledger-cli\.js claim/);
   assert.match(event, /exact-review-action-ledger-cli\.js complete/);
+  for (const [producer, setupPnpmId, mutationName] of [
+    [legacy, "exact-review-pnpm", "Enqueue legacy event through the durable control plane"],
+    [event, "setup-pnpm", "Claim exact-review queue lease"],
+  ] as const) {
+    assert.doesNotMatch(
+      producer,
+      /uses: \.\/\.github\/actions\/setup-action-ledger\s+id: exact-review-action-ledger\s+continue-on-error: true/,
+    );
+    assert.match(
+      producer,
+      new RegExp(
+        `${escapeRegExp(mutationName)}[\\s\\S]*?if: \\$\\{\\{ steps\\.exact-review-action-ledger\\.outcome == 'success' && steps\\.${setupPnpmId}\\.outcome == 'success' \\}\\}`,
+      ),
+    );
+  }
   assert.match(reconcileProducer, /exact-review-action-ledger-cli\.js reconcile/);
   assert.match(reconcileProducer, /actions\/checkout@v7\s+with:\s+ref: \$\{\{ github\.sha \}\}/);
   assert.match(
@@ -551,13 +566,16 @@ test("exact-review workflows isolate state credentials and publish exact manifes
     /Publish exact event action ledger[\s\S]*--source-root "\$CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT"/,
   );
 
-  for (const trustedPublisher of [publisher, reconcilePublisher]) {
+  for (const [trustedPublisher, expectedRunAttempt] of [
+    [publisher, "GITHUB_RUN_ATTEMPT"],
+    [reconcilePublisher, "PRODUCER_RUN_ATTEMPT"],
+  ] as const) {
     assert.match(trustedPublisher, /create-state-token/);
     assert.match(trustedPublisher, /repair:action-ledger -- publish/);
     assert.match(trustedPublisher, /--expected-repository "\$GITHUB_REPOSITORY"/);
     assert.match(trustedPublisher, /--expected-sha "\$GITHUB_SHA"/);
     assert.match(trustedPublisher, /--expected-run-id "\$GITHUB_RUN_ID"/);
-    assert.match(trustedPublisher, /--expected-run-attempt "\$GITHUB_RUN_ATTEMPT"/);
+    assert.match(trustedPublisher, new RegExp(`--expected-run-attempt "\\$${expectedRunAttempt}"`));
     assert.match(trustedPublisher, /publish-action-event-paths/);
     assert.doesNotMatch(trustedPublisher, /github\.event\.client_payload/);
   }
