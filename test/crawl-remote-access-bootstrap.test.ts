@@ -228,28 +228,30 @@ test("deploy consumer gate rejects comment-only claims and accepts a structural 
     '          NODE_OPTIONS: ""',
     "        run: |",
     "          node scripts/resolve-crawl-remote-access-credentials.mjs",
-    "      - name: Validate protected production proof credentials",
+    "      - name: Verify crawl-remote Access credentials",
     "        env:",
     "          CF_ACCESS_CLIENT_ID: ${{ steps.crawl-remote-access-credentials.outputs.client_id }}",
     "          CF_ACCESS_CLIENT_SECRET: ${{ steps.crawl-remote-access-credentials.outputs.client_secret }}",
+    "          CRAWL_REMOTE_ACCESS_PROBE_URL: https://reports.openclaw.ai/crawl-remote",
     "        run: |",
-    '          test -n "$CF_ACCESS_CLIENT_ID"',
-    '          test -n "$CF_ACCESS_CLIENT_SECRET"',
+    "          node scripts/resolve-crawl-remote-access-credentials.mjs --verify-access",
   ].join("\n");
   assert.doesNotThrow(() => assertCrawlRemoteDeployConsumerContract(validSource));
-  assert.doesNotThrow(() =>
-    assertCrawlRemoteDeployConsumerContract(
-      validSource.replace(
-        "      - name: Validate protected production proof credentials\n        env:",
-        [
-          "      - name: Validate protected production proof credentials",
-          "        if: >-",
-          "          github.event_name == 'workflow_dispatch' &&",
-          "          github.run_attempt == 1",
-          "        env:",
-        ].join("\n"),
+  assert.throws(
+    () =>
+      assertCrawlRemoteDeployConsumerContract(
+        validSource.replace(
+          "      - name: Verify crawl-remote Access credentials\n        env:",
+          [
+            "      - name: Verify crawl-remote Access credentials",
+            "        if: >-",
+            "          github.event_name == 'workflow_dispatch' &&",
+            "          github.run_attempt == 1",
+            "        env:",
+          ].join("\n"),
+        ),
       ),
-    ),
+    /must use the exact Access verification helper/,
   );
   assert.throws(
     () =>
@@ -387,13 +389,13 @@ test("deploy consumer gate rejects comment-only claims and accepts a structural 
     () =>
       assertCrawlRemoteDeployConsumerContract(
         validSource.replace(
-          "      - name: Validate protected production proof credentials",
+          "      - name: Verify crawl-remote Access credentials",
           [
             "      - name: Unrelated direct slot access",
             "        env:",
             "          UNRELATED_SECRET: ${{ secrets.CRAWL_REMOTE_ACCESS_GREEN_CLIENT_SECRET }}",
             "        run: echo unrelated",
-            "      - name: Validate protected production proof credentials",
+            "      - name: Verify crawl-remote Access credentials",
           ].join("\n"),
         ),
       ),
@@ -403,47 +405,70 @@ test("deploy consumer gate rejects comment-only claims and accepts a structural 
     () =>
       assertCrawlRemoteDeployConsumerContract(
         validSource.replace(
-          "      - name: Validate protected production proof credentials",
+          "      - name: Verify crawl-remote Access credentials",
           [
             "      - name: Unrelated resolver output access",
             "        env:",
             "          UNRELATED_SECRET: ${{ steps.crawl-remote-access-credentials.outputs.client_secret }}",
             "        run: echo unrelated",
-            "      - name: Validate protected production proof credentials",
+            "      - name: Verify crawl-remote Access credentials",
           ].join("\n"),
         ),
       ),
-    /resolver outputs must be scoped to credential consumers/,
+    /must use the exact Access verification helper/,
   );
   assert.throws(
     () =>
       assertCrawlRemoteDeployConsumerContract(
         validSource.replace(
-          "      - name: Validate protected production proof credentials",
+          "      - name: Verify crawl-remote Access credentials",
           [
             "      - name: Alternate resolver output access",
             "        env:",
             "          UNRELATED_SECRET: ${{ steps['crawl-remote-access-credentials'].outputs['client_secret'] }}",
             "        run: echo unrelated",
-            "      - name: Validate protected production proof credentials",
+            "      - name: Verify crawl-remote Access credentials",
           ].join("\n"),
         ),
       ),
-    /resolver outputs must use only allowlisted consumer bindings/,
+    /must use the exact Access verification helper/,
   );
   assert.throws(
     () =>
       assertCrawlRemoteDeployConsumerContract(
         validSource.replace(
-          "      - name: Validate protected production proof credentials",
+          "      - name: Verify crawl-remote Access credentials",
           [
             "      - name: Legacy credential audit",
             "        run: echo CRAWL_REMOTE_ACCESS_CLIENT_ID CRAWL_REMOTE_ACCESS_CLIENT_SECRET",
-            "      - name: Validate protected production proof credentials",
+            "      - name: Verify crawl-remote Access credentials",
           ].join("\n"),
         ),
       ),
     /legacy unversioned references/,
+  );
+  assert.throws(
+    () =>
+      assertCrawlRemoteDeployConsumerContract(
+        validSource.replace(
+          "          node scripts/resolve-crawl-remote-access-credentials.mjs --verify-access",
+          "          : # $CF_ACCESS_CLIENT_ID $CF_ACCESS_CLIENT_SECRET",
+        ),
+      ),
+    /must use the exact Access verification helper/,
+  );
+  assert.throws(
+    () =>
+      assertCrawlRemoteDeployConsumerContract(
+        validSource.replace(
+          "          node scripts/resolve-crawl-remote-access-credentials.mjs --verify-access",
+          [
+            "          printf -v CF_ACCESS_CLIENT_ID unreviewed",
+            "          node scripts/resolve-crawl-remote-access-credentials.mjs --verify-access",
+          ].join("\n"),
+        ),
+      ),
+    /must use the exact Access verification helper/,
   );
 });
 

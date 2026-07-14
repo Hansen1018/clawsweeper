@@ -41,6 +41,7 @@ const DEPLOY_CONSUMER_CONTRACT = Object.freeze({
     "sparse-checkout-cone-mode": "false",
   },
   command: "node scripts/resolve-crawl-remote-access-credentials.mjs",
+  consumerCommand: "node scripts/resolve-crawl-remote-access-credentials.mjs --verify-access",
   inheritedEnvironment: {
     BASH_ENV: "",
     ENV: "",
@@ -63,7 +64,9 @@ const DEPLOY_CONSUMER_CONTRACT = Object.freeze({
   consumerEnvironment: {
     CF_ACCESS_CLIENT_ID: "${{ steps.crawl-remote-access-credentials.outputs.client_id }}",
     CF_ACCESS_CLIENT_SECRET: "${{ steps.crawl-remote-access-credentials.outputs.client_secret }}",
+    CRAWL_REMOTE_ACCESS_PROBE_URL: BOOTSTRAP_CONTRACT.cloudEndpoint,
   },
+  consumerStepName: "Verify crawl-remote Access credentials",
   path: ".github/workflows/deploy-crawl-remote.yml",
   stepId: "crawl-remote-access-credentials",
   stepName: "Resolve crawl-remote Access credentials",
@@ -349,38 +352,24 @@ export function assertCrawlRemoteDeployConsumerContract(source) {
   if (executableLines.length !== 1 || executableLines[0] !== DEPLOY_CONSUMER_CONTRACT.command) {
     throw new Error("crawl-remote deploy credential resolver does not invoke the tested artifact");
   }
-  const credentialConsumers = deploySteps
-    .map((step, index) => ({
-      index,
-      step,
-      source: step.run
-        .map((line) => line.trim())
-        .filter((line) => line.length > 0 && !line.startsWith("#"))
-        .join("\n"),
-    }))
-    .filter(
-      ({ source: runSource }) =>
-        runSource.includes("$CF_ACCESS_CLIENT_ID") &&
-        runSource.includes("$CF_ACCESS_CLIENT_SECRET"),
-    );
+  const credentialConsumerCandidates = deploySteps
+    .map((step, index) => ({ index, step }))
+    .filter(({ step }) => containsResolverOutputReference(step.source));
+  const credentialConsumers = credentialConsumerCandidates.filter(({ step }) =>
+    isExactCredentialConsumer(step),
+  );
   if (
     credentialConsumers.length === 0 ||
+    credentialConsumers.length !== credentialConsumerCandidates.length ||
     credentialConsumers.some(({ index }) => index <= resolverIndex)
   ) {
     throw new Error(
-      "crawl-remote deploy credential consumers must run after the generation-slot resolver",
+      "crawl-remote deploy credential consumers must use the exact Access verification helper " +
+        "after the generation-slot resolver",
     );
   }
-  for (const { step } of credentialConsumers) {
-    for (const [name, value] of Object.entries(DEPLOY_CONSUMER_CONTRACT.consumerEnvironment)) {
-      if (step.environment.get(name) !== value) {
-        throw new Error(
-          `crawl-remote deploy credential consumer has invalid ${name} resolver-output binding`,
-        );
-      }
-    }
-  }
-  for (const value of Object.values(DEPLOY_CONSUMER_CONTRACT.consumerEnvironment)) {
+  for (const [name, value] of Object.entries(DEPLOY_CONSUMER_CONTRACT.consumerEnvironment)) {
+    if (!name.startsWith("CF_ACCESS_CLIENT_")) continue;
     if (countOccurrences(source, value) !== credentialConsumers.length) {
       throw new Error(
         "crawl-remote deploy resolver outputs must be scoped to credential consumers",
@@ -410,14 +399,7 @@ export function assertCrawlRemoteDeployConsumerContract(source) {
       return (
         hasAccessEnvironment && !credentialConsumers.some((consumer) => consumer.step === step)
       );
-    }) ||
-    deploySteps.some((step) =>
-      step.run
-        .map((line) => line.trim())
-        .filter((line) => line.length > 0 && !line.startsWith("#"))
-        .some((line) => /(?:^|\s)(?:export\s+)?CF_ACCESS_CLIENT_(?:ID|SECRET)=/.test(line)),
-    ) ||
-    /^ {6}CF_ACCESS_CLIENT_(?:ID|SECRET):/m.test(source);
+    });
   if (hasAccessOverride) {
     throw new Error("crawl-remote deploy consumers must not override resolved Access credentials");
   }
@@ -430,6 +412,25 @@ export function assertCrawlRemoteDeployConsumerContract(source) {
         legacyReferences.join(", "),
     );
   }
+}
+
+function isExactCredentialConsumer(step) {
+  const executableLines = step.run
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0 && !line.startsWith("#"));
+  if (
+    step.name !== DEPLOY_CONSUMER_CONTRACT.consumerStepName ||
+    step.fields.size !== 0 ||
+    step.configuration.size !== 0 ||
+    step.environment.size !== Object.keys(DEPLOY_CONSUMER_CONTRACT.consumerEnvironment).length ||
+    executableLines.length !== 1 ||
+    executableLines[0] !== DEPLOY_CONSUMER_CONTRACT.consumerCommand
+  ) {
+    return false;
+  }
+  return Object.entries(DEPLOY_CONSUMER_CONTRACT.consumerEnvironment).every(
+    ([name, value]) => step.environment.get(name) === value,
+  );
 }
 
 function countOccurrences(source, value) {
