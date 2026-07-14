@@ -271,6 +271,45 @@ test("Gitcrawl failure classification and receipt bounds fail closed", () => {
       ),
     /query arguments sha256/,
   );
+  assert.throws(
+    () =>
+      recordGitcrawlActionReceipt(
+        root,
+        {
+          receipt: "query",
+          repository,
+          provider: "parity",
+          snapshotId,
+          paritySnapshotId,
+          queryName: "gitcrawl.coverage",
+          queryArgsSha256: sha256Canonical({ args: "safe" }),
+          resultSha256: sha256Canonical({ result: "safe" }),
+          rowCount: 1,
+          claimCount: 1,
+          coverageComplete: true,
+        },
+        { env, now: () => now },
+      ),
+    /parity digest does not match/,
+  );
+  assert.throws(
+    () =>
+      recordGitcrawlActionReceipt(
+        root,
+        {
+          receipt: "snapshot",
+          repository,
+          provider: "invalid",
+          snapshotId,
+          capabilities: GITCRAWL_QUERY_NAMES,
+          coverageSha256,
+          coverageDatasetCount: 9,
+          coverageComplete: true,
+        } as never,
+        { env, now: () => now },
+      ),
+    /unsupported Gitcrawl receipt provider/,
+  );
 });
 
 function tempRoot(): string {

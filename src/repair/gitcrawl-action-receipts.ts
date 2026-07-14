@@ -250,9 +250,17 @@ function gitcrawlReceiptEvent(
   env: NodeJS.ProcessEnv,
 ): GitcrawlReceiptEvent {
   assertRepository(input.repository);
+  assertProvider(input.provider);
+  assertReceiptVariant(input);
+  assertParityTopology(input);
   const runEvidence = workflowRunEvidence(env);
   if (input.receipt === "snapshot") {
     const capabilities = normalizedCapabilities(input.capabilities);
+    for (const queryName of GITCRAWL_QUERY_NAMES) {
+      if (!capabilities.includes(queryName)) {
+        throw new Error(`Gitcrawl receipt snapshot is missing capability ${queryName}`);
+      }
+    }
     assertSha256(input.coverageSha256, "Gitcrawl receipt coverage sha256");
     const snapshotEvidence = gitcrawlSnapshotEvidence(input.snapshotId, input.paritySnapshotId);
     const selectionSha256 = sha256Canonical({
@@ -293,6 +301,9 @@ function gitcrawlReceiptEvent(
     assertSha256(input.resultSha256, "Gitcrawl receipt result sha256");
     if (input.parityResultSha256 !== undefined) {
       assertSha256(input.parityResultSha256, "Gitcrawl receipt parity result sha256");
+    }
+    if ((input.provider === "parity") !== (input.parityResultSha256 !== undefined)) {
+      throw new Error("Gitcrawl query receipt parity digest does not match its provider");
     }
     const bindingSha256 = sha256Canonical({
       provider: input.provider,
@@ -514,6 +525,12 @@ function workflowRunEvidence(env: NodeJS.ProcessEnv): ActionEventEvidence[] {
 }
 
 function normalizedCapabilities(capabilities: readonly string[]): string[] {
+  if (
+    !Array.isArray(capabilities) ||
+    capabilities.some((capability) => typeof capability !== "string")
+  ) {
+    throw new Error("Gitcrawl receipt capabilities must be strings");
+  }
   const normalized = [...new Set(capabilities)].sort();
   if (normalized.length > GITCRAWL_ACTION_RECEIPT_LIMITS.maxCapabilities) {
     throw new Error(
@@ -573,6 +590,52 @@ function errorText(error: unknown): string {
 function assertQueryName(queryName: GitcrawlQueryName): void {
   if (!GITCRAWL_QUERY_NAMES.includes(queryName)) {
     throw new Error(`unsupported Gitcrawl query receipt: ${queryName}`);
+  }
+}
+
+function assertProvider(provider: GitcrawlProvider): void {
+  if (provider !== "local" && provider !== "cloud" && provider !== "parity") {
+    throw new Error(`unsupported Gitcrawl receipt provider: ${String(provider)}`);
+  }
+}
+
+function assertReceiptVariant(input: GitcrawlActionReceiptInput): void {
+  const value = input as unknown as {
+    receipt?: unknown;
+    binding?: unknown;
+    phase?: unknown;
+  };
+  if (
+    value.receipt !== "snapshot" &&
+    value.receipt !== "query" &&
+    value.receipt !== "binding" &&
+    value.receipt !== "failure"
+  ) {
+    throw new Error(`unsupported Gitcrawl action receipt: ${String(value.receipt)}`);
+  }
+  if (value.receipt === "binding" && value.binding !== "coverage" && value.binding !== "parity") {
+    throw new Error(`unsupported Gitcrawl binding receipt: ${String(value.binding)}`);
+  }
+  if (
+    value.receipt === "failure" &&
+    value.phase !== "snapshot" &&
+    value.phase !== "query" &&
+    value.phase !== "binding"
+  ) {
+    throw new Error(`unsupported Gitcrawl failure receipt phase: ${String(value.phase)}`);
+  }
+}
+
+function assertParityTopology(input: GitcrawlActionReceiptInput): void {
+  if (input.provider !== "parity" && input.paritySnapshotId !== undefined) {
+    throw new Error("Gitcrawl non-parity receipts cannot include a parity snapshot");
+  }
+  if (
+    input.provider === "parity" &&
+    input.receipt !== "failure" &&
+    input.paritySnapshotId === undefined
+  ) {
+    throw new Error("Gitcrawl parity receipts require a parity snapshot");
   }
 }
 
