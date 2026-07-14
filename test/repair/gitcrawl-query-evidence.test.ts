@@ -130,6 +130,22 @@ test("query evidence fails closed on source, relation, review, and packet drift"
     await adapter.close();
   });
 
+  await t.test("coverage rows use another snapshot", async () => {
+    const coverage = completeCoverage();
+    coverage[0]!.snapshot_id = "d".repeat(64);
+    const source = new FixtureSource({ coverage });
+    await assert.rejects(
+      GitcrawlEvidenceAdapter.fromSources({
+        repository,
+        provider: "cloud",
+        primarySource: source,
+        now: () => now,
+      }),
+      /coverage returned mismatched snapshot/,
+    );
+    assert.equal(source.closeCount, 1);
+  });
+
   await t.test("source initialization surfaces cleanup failures", async () => {
     const source = new FixtureSource({
       closeError: new Error("fixture close failed"),
@@ -1296,6 +1312,7 @@ class FixtureSource implements GitcrawlQuerySource {
   closeCount = 0;
 
   private readonly rows: Partial<Record<GitcrawlQueryRequest["name"], Record<string, unknown>[]>>;
+  private readonly coverage: GitcrawlCoverageRow[];
   private readonly snapshotForQuery: (request: GitcrawlQueryRequest) => string;
   private readonly overlapSecondPageFor: GitcrawlQueryRequest["name"] | undefined;
   private readonly closeError: Error | undefined;
@@ -1304,6 +1321,7 @@ class FixtureSource implements GitcrawlQuerySource {
     options: {
       provider?: "local" | "cloud";
       rows?: Partial<Record<GitcrawlQueryRequest["name"], Record<string, unknown>[]>>;
+      coverage?: GitcrawlCoverageRow[];
       snapshotForQuery?: (request: GitcrawlQueryRequest) => string;
       overlapSecondPageFor?: GitcrawlQueryRequest["name"];
       closeError?: Error;
@@ -1311,6 +1329,7 @@ class FixtureSource implements GitcrawlQuerySource {
   ) {
     this.provider = options.provider ?? "cloud";
     this.rows = options.rows ?? {};
+    this.coverage = options.coverage ?? completeCoverage();
     this.snapshotForQuery = options.snapshotForQuery ?? (() => snapshotId);
     this.overlapSecondPageFor = options.overlapSecondPageFor;
     this.closeError = options.closeError;
@@ -1319,7 +1338,7 @@ class FixtureSource implements GitcrawlQuerySource {
   async query(request: GitcrawlQueryRequest): Promise<GitcrawlQueryEnvelope> {
     this.requests.push(request);
     const rows =
-      request.name === "gitcrawl.coverage" ? completeCoverage() : (this.rows[request.name] ?? []);
+      request.name === "gitcrawl.coverage" ? this.coverage : (this.rows[request.name] ?? []);
     const requestedOffset = request.cursor ? Number(request.cursor) : 0;
     const offset =
       request.name === this.overlapSecondPageFor && requestedOffset > 0

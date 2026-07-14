@@ -1083,6 +1083,11 @@ function normalizeCoverageRow(
   row: Record<string, unknown>,
   snapshotId: string,
 ): GitcrawlCoverageRow {
+  if (row.snapshot_id !== snapshotId) {
+    throw new Error(
+      `Gitcrawl coverage returned mismatched snapshot for ${String(row.dataset ?? "")}`,
+    );
+  }
   const dataset = String(row.dataset ?? "");
   if (!GITCRAWL_DATASETS.includes(dataset as GitcrawlCoverageRow["dataset"])) {
     throw new Error(`Gitcrawl coverage returned unknown dataset ${dataset}`);
