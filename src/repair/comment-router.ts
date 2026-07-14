@@ -3970,9 +3970,9 @@ function executeAutomerge(command: LooseRecord): LooseRecord {
   let dispatchedClaimMutationAt = mergeClaim.lastClaimMutationAt;
   let squashCommitProof: SquashMergeCommitProof | undefined;
   const dispatchBoundaryState: {
-    preMarkerReviewActivityBlock: ReturnType<typeof trustedAutomergeReviewActivityBlockReason>;
+    preMarkerAuthorizationBlock: ReturnType<typeof trustedAutomergeAuthorizationBlockReason>;
     dispatchedAbortAction: LooseRecord | null;
-  } = { preMarkerReviewActivityBlock: null, dispatchedAbortAction: null };
+  } = { preMarkerAuthorizationBlock: null, dispatchedAbortAction: null };
   let verifiedBaseBranch = "";
   const readDispatchState = () => {
     const view = fetchPullRequestView(command.issue_number);
@@ -4020,15 +4020,15 @@ function executeAutomerge(command: LooseRecord): LooseRecord {
     let finalState;
     try {
       firstState = readDispatchState();
-      const firstActivityBlock = trustedAutomergeReviewActivityBlockReason(command);
-      if (firstActivityBlock) return firstActivityBlock;
+      const firstAuthorizationBlock = trustedAutomergeAuthorizationBlockReason(command);
+      if (firstAuthorizationBlock) return firstAuthorizationBlock;
       middleState = readDispatchState();
       const middleBaseBranch = String(
         middleState.view.baseRefName ?? middleState.target.base_ref ?? targetBranch ?? "main",
       );
       verifiedBaseBranch = middleBaseBranch;
-      const secondActivityBlock = trustedAutomergeReviewActivityBlockReason(command);
-      if (secondActivityBlock) return secondActivityBlock;
+      const secondAuthorizationBlock = trustedAutomergeAuthorizationBlockReason(command);
+      if (secondAuthorizationBlock) return secondAuthorizationBlock;
       finalState = readDispatchState();
     } catch (error) {
       return {
@@ -4057,11 +4057,11 @@ function executeAutomerge(command: LooseRecord): LooseRecord {
     let postPolicyState;
     let terminalState;
     try {
-      const postPolicyActivityBlock = trustedAutomergeReviewActivityBlockReason(command);
-      if (postPolicyActivityBlock) return postPolicyActivityBlock;
+      const postPolicyAuthorizationBlock = trustedAutomergeAuthorizationBlockReason(command);
+      if (postPolicyAuthorizationBlock) return postPolicyAuthorizationBlock;
       postPolicyState = readDispatchState();
-      const terminalActivityBlock = trustedAutomergeReviewActivityBlockReason(command);
-      if (terminalActivityBlock) return terminalActivityBlock;
+      const terminalAuthorizationBlock = trustedAutomergeAuthorizationBlockReason(command);
+      if (terminalAuthorizationBlock) return terminalAuthorizationBlock;
       terminalState = readDispatchState();
     } catch (error) {
       return {
@@ -4099,10 +4099,10 @@ function executeAutomerge(command: LooseRecord): LooseRecord {
       {},
       {
         beforeDispatch: () => {
-          dispatchBoundaryState.preMarkerReviewActivityBlock =
-            trustedAutomergeReviewActivityBlockReason(command);
-          if (dispatchBoundaryState.preMarkerReviewActivityBlock) {
-            throw new Error(dispatchBoundaryState.preMarkerReviewActivityBlock.reason);
+          dispatchBoundaryState.preMarkerAuthorizationBlock =
+            trustedAutomergeAuthorizationBlockReason(command);
+          if (dispatchBoundaryState.preMarkerAuthorizationBlock) {
+            throw new Error(dispatchBoundaryState.preMarkerAuthorizationBlock.reason);
           }
           const dispatchGuard = guardAutomergeMergeDispatch({
             markDispatched: () =>
@@ -4111,7 +4111,7 @@ function executeAutomerge(command: LooseRecord): LooseRecord {
                 mergeClaim.claimId,
                 expectedSquashCommitMessage(mergeMessage.subject, mergeMessage.body),
               ),
-            reviewActivityBlock: () => trustedAutomergeReviewActivityBlockReason(command),
+            reviewActivityBlock: () => trustedAutomergeAuthorizationBlockReason(command),
             dispatchStateBlock: liveDispatchStateBlock,
             finalSafetyBlock: finalDispatchSafetyBlock,
             rejectDispatched: () => rejectAutomergeMergeClaim(command, mergeClaim.claimId),
@@ -4172,16 +4172,16 @@ function executeAutomerge(command: LooseRecord): LooseRecord {
       if (dispatchBoundaryState.dispatchedAbortAction) {
         return dispatchBoundaryState.dispatchedAbortAction;
       }
-      const dispatchReviewActivityBlock = dispatchBoundaryState.preMarkerReviewActivityBlock;
+      const dispatchAuthorizationBlock = dispatchBoundaryState.preMarkerAuthorizationBlock;
       return releaseBeforeDispatch({
         action: "merge",
-        status: dispatchReviewActivityBlock
-          ? dispatchReviewActivityBlock.retryable
+        status: dispatchAuthorizationBlock
+          ? dispatchAuthorizationBlock.retryable
             ? "waiting"
             : "blocked"
           : "waiting",
         reason:
-          dispatchReviewActivityBlock?.reason ??
+          dispatchAuthorizationBlock?.reason ??
           `merge ledger failed before dispatch: ${compactGhError(error)}`,
         merge_method: "squash",
         transient_wait_ms: waitedMs,
@@ -5278,6 +5278,15 @@ function trustedAutomergeReviewActivityBlockReason(
       retryable: true,
     };
   }
+}
+
+function trustedAutomergeAuthorizationBlockReason(
+  command: LooseRecord,
+): ReviewLeaseGuardBlock | null {
+  return (
+    trustedAutomationReviewLeaseBlockReason(command) ??
+    trustedAutomergeReviewActivityBlockReason(command)
+  );
 }
 
 function fetchIssueAsync(number: JsonValue) {

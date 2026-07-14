@@ -337,12 +337,12 @@ test("activity and live state are checked after durable dispatch marking", () =>
     executeAutomerge.indexOf("return reconcileClaimedAutomergeRequest(", preDispatchCatch),
   );
   const preMarkerActivityCheck = dispatchBoundary.indexOf(
-    "trustedAutomergeReviewActivityBlockReason(command)",
+    "trustedAutomergeAuthorizationBlockReason(command)",
   );
   const guard = dispatchBoundary.indexOf("guardAutomergeMergeDispatch({");
   const claimDispatch = dispatchBoundary.indexOf("markDispatched: () =>");
   const postMarkerActivityCheck = dispatchBoundary.indexOf(
-    "reviewActivityBlock: () => trustedAutomergeReviewActivityBlockReason(command)",
+    "reviewActivityBlock: () => trustedAutomergeAuthorizationBlockReason(command)",
   );
   const postMarkerStateCheck = dispatchBoundary.indexOf(
     "dispatchStateBlock: liveDispatchStateBlock",
@@ -371,20 +371,24 @@ test("activity and live state are checked after durable dispatch marking", () =>
   );
   assert.match(
     liveDispatchState,
-    /finalDispatchSafetyBlock[\s\S]*readDispatchState\(\)[\s\S]*trustedAutomergeReviewActivityBlockReason\(command\)[\s\S]*readDispatchState\(\)[\s\S]*trustedAutomergeReviewActivityBlockReason\(command\)[\s\S]*readDispatchState\(\)[\s\S]*stableJson\([\s\S]*verifiedBaseBranch/,
+    /finalDispatchSafetyBlock[\s\S]*readDispatchState\(\)[\s\S]*trustedAutomergeAuthorizationBlockReason\(command\)[\s\S]*readDispatchState\(\)[\s\S]*trustedAutomergeAuthorizationBlockReason\(command\)[\s\S]*readDispatchState\(\)[\s\S]*stableJson\([\s\S]*verifiedBaseBranch/,
   );
   assert.match(
     liveDispatchState,
-    /firstState = readDispatchState\(\)[\s\S]*middleState = readDispatchState\(\)[\s\S]*verifiedBaseBranch = middleBaseBranch[\s\S]*finalState = readDispatchState\(\)[\s\S]*trustedAutomergeReviewActivityBlockReason\(command\)[\s\S]*postPolicyState = readDispatchState\(\)[\s\S]*trustedAutomergeReviewActivityBlockReason\(command\)[\s\S]*terminalState = readDispatchState\(\)/,
+    /firstState = readDispatchState\(\)[\s\S]*middleState = readDispatchState\(\)[\s\S]*verifiedBaseBranch = middleBaseBranch[\s\S]*finalState = readDispatchState\(\)[\s\S]*trustedAutomergeAuthorizationBlockReason\(command\)[\s\S]*postPolicyState = readDispatchState\(\)[\s\S]*trustedAutomergeAuthorizationBlockReason\(command\)[\s\S]*terminalState = readDispatchState\(\)/,
   );
   assert.match(executeAutomerge, /knownNoMutation: \(\) => !mergeRequestStarted/);
   assert.match(
     executeAutomerge,
-    /const dispatchBoundaryState: \{[\s\S]*preMarkerReviewActivityBlock:[\s\S]*dispatchedAbortAction: LooseRecord \| null;[\s\S]*\}/,
+    /const dispatchBoundaryState: \{[\s\S]*preMarkerAuthorizationBlock:[\s\S]*dispatchedAbortAction: LooseRecord \| null;[\s\S]*\}/,
   );
   assert.match(
     preDispatchFailure,
-    /if \(dispatchBoundaryState\.dispatchedAbortAction\) \{[\s\S]*return dispatchBoundaryState\.dispatchedAbortAction;[\s\S]*const dispatchReviewActivityBlock = dispatchBoundaryState\.preMarkerReviewActivityBlock;[\s\S]*releaseBeforeDispatch/,
+    /if \(dispatchBoundaryState\.dispatchedAbortAction\) \{[\s\S]*return dispatchBoundaryState\.dispatchedAbortAction;[\s\S]*const dispatchAuthorizationBlock = dispatchBoundaryState\.preMarkerAuthorizationBlock;[\s\S]*releaseBeforeDispatch/,
+  );
+  assert.match(
+    source,
+    /function trustedAutomergeAuthorizationBlockReason[\s\S]*trustedAutomationReviewLeaseBlockReason\(command\)[\s\S]*trustedAutomergeReviewActivityBlockReason\(command\)/,
   );
   assert.match(
     source,
