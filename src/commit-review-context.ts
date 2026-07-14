@@ -10,6 +10,7 @@ const MAX_CHECKS = 40;
 const MAX_STATUSES = 40;
 const MAX_WORKFLOW_RUNS = 20;
 const MAX_LIMITATIONS = 20;
+const BYTE_BUDGET_LIMITATION_PREFIX = "GitHub context byte budget";
 
 export interface CommitReviewGitHubContext {
   schema_version: 1;
@@ -348,21 +349,19 @@ export function hydrateCommitReviewGitHubContext(options: {
     })
     .filter((run) => run.id > 0);
 
-  return validateCommitReviewGitHubContext(
-    {
-      schema_version: CONTEXT_SCHEMA_VERSION,
-      repository: options.targetRepo,
-      commit_sha: options.sha,
-      github_author: githubLogin(record(commit.author).login),
-      github_committer: githubLogin(record(commit.committer).login),
-      references,
-      checks,
-      statuses,
-      workflow_runs: workflowRuns,
-      limitations: [...new Set(limitations)].slice(0, MAX_LIMITATIONS),
-    },
-    options,
-  );
+  const context: CommitReviewGitHubContext = {
+    schema_version: CONTEXT_SCHEMA_VERSION,
+    repository: options.targetRepo,
+    commit_sha: options.sha,
+    github_author: githubLogin(record(commit.author).login),
+    github_committer: githubLogin(record(commit.committer).login),
+    references,
+    checks,
+    statuses,
+    workflow_runs: workflowRuns,
+    limitations: [...new Set(limitations)].slice(0, MAX_LIMITATIONS),
+  };
+  return validateCommitReviewGitHubContext(fitCommitReviewGitHubContext(context), options);
 }
 
 export function writeCommitReviewGitHubContext(
@@ -370,10 +369,83 @@ export function writeCommitReviewGitHubContext(
   context: CommitReviewGitHubContext,
 ): void {
   const content = `${JSON.stringify(context, null, 2)}\n`;
-  if (Buffer.byteLength(content) > CONTEXT_MAX_BYTES) {
+  if (Buffer.byteLength(content, "utf8") > CONTEXT_MAX_BYTES) {
     throw new Error(`commit review GitHub context exceeds ${CONTEXT_MAX_BYTES} bytes`);
   }
   writeFileSync(path, content, { encoding: "utf8", mode: 0o600 });
+}
+
+function fitCommitReviewGitHubContext(
+  source: CommitReviewGitHubContext,
+): CommitReviewGitHubContext {
+  if (commitReviewGitHubContextBytes(source) <= CONTEXT_MAX_BYTES) return source;
+
+  const context: CommitReviewGitHubContext = {
+    ...source,
+    references: source.references.map((reference) => ({
+      ...reference,
+      labels: [...reference.labels],
+    })),
+    checks: [...source.checks],
+    statuses: [...source.statuses],
+    workflow_runs: [...source.workflow_runs],
+    limitations: source.limitations.filter(
+      (limitation) => !limitation.startsWith(BYTE_BUDGET_LIMITATION_PREFIX),
+    ),
+  };
+  const trimmedExcerpts = new Set<number>();
+  let omittedReferences = 0;
+  let omittedChecks = 0;
+  let omittedStatuses = 0;
+  let omittedWorkflowRuns = 0;
+
+  const updateLimitation = (): void => {
+    const limitation =
+      `${BYTE_BUDGET_LIMITATION_PREFIX} truncated ${trimmedExcerpts.size} linked item ` +
+      `excerpts and omitted ${omittedReferences} linked items, ${omittedChecks} checks, ` +
+      `${omittedStatuses} statuses, and ${omittedWorkflowRuns} workflow runs`;
+    context.limitations = [
+      limitation,
+      ...source.limitations.filter((entry) => !entry.startsWith(BYTE_BUDGET_LIMITATION_PREFIX)),
+    ].slice(0, MAX_LIMITATIONS);
+  };
+  const fits = (): boolean => {
+    updateLimitation();
+    return commitReviewGitHubContextBytes(context) <= CONTEXT_MAX_BYTES;
+  };
+
+  for (const excerptLimit of [1000, 250, 0]) {
+    for (let index = context.references.length - 1; index >= 0 && !fits(); index -= 1) {
+      const reference = context.references[index];
+      if (!reference || reference.body_excerpt.length <= excerptLimit) continue;
+      reference.body_excerpt =
+        excerptLimit === 0 ? "" : truncateText(reference.body_excerpt, excerptLimit);
+      trimmedExcerpts.add(reference.number);
+    }
+  }
+
+  while (!fits()) {
+    if (context.workflow_runs.length > 0) {
+      context.workflow_runs.pop();
+      omittedWorkflowRuns += 1;
+    } else if (context.statuses.length > 0) {
+      context.statuses.pop();
+      omittedStatuses += 1;
+    } else if (context.checks.length > 0) {
+      context.checks.pop();
+      omittedChecks += 1;
+    } else if (context.references.length > 0) {
+      context.references.pop();
+      omittedReferences += 1;
+    } else {
+      throw new Error(`commit review GitHub context exceeds ${CONTEXT_MAX_BYTES} bytes`);
+    }
+  }
+  return context;
+}
+
+function commitReviewGitHubContextBytes(context: CommitReviewGitHubContext): number {
+  return Buffer.byteLength(`${JSON.stringify(context, null, 2)}\n`, "utf8");
 }
 
 export function readCommitReviewGitHubContext(

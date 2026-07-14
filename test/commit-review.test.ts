@@ -237,6 +237,116 @@ process.stdout.write(JSON.stringify(value));
   }
 });
 
+test("commit review hydration fits maximum-shaped references inside the byte budget", () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "commit-review-budget-")));
+  const targetDir = path.join(root, "target");
+  const binDir = path.join(root, "bin");
+  const contextPath = path.join(root, "context.json");
+  fs.mkdirSync(targetDir);
+  fs.mkdirSync(binDir);
+
+  try {
+    git(targetDir, "init", "-q");
+    git(targetDir, "config", "user.name", "Test Author");
+    git(targetDir, "config", "user.email", "test@example.com");
+    git(targetDir, "config", "commit.gpgsign", "false");
+    fs.writeFileSync(path.join(targetDir, "review.txt"), "bounded context\n");
+    git(targetDir, "add", "review.txt");
+    git(targetDir, "commit", "-q", "-m", "bounded context");
+    const sha = git(targetDir, "rev-parse", "HEAD");
+
+    const ghPath = path.join(binDir, "gh.js");
+    fs.writeFileSync(
+      ghPath,
+      `#!/usr/bin/env node
+const apiPath = process.argv[3] || "";
+const itemMatch = apiPath.match(/\\/(?:issues|pulls)\\/(\\d+)$/);
+const maxUrl = (number) =>
+  "https://github.com/openclaw/clawsweeper/pull/" + number + "/" + "u".repeat(1900);
+let value;
+if (/\\/commits\\/[0-9a-f]{40}$/.test(apiPath)) {
+  value = { author: { login: "hydrated-author" }, committer: { login: "hydrated-committer" } };
+} else if (/\\/commits\\/[0-9a-f]{40}\\/pulls\\?/.test(apiPath)) {
+  value = Array.from({ length: 12 }, (_, index) => ({ number: index + 1 }));
+} else if (/\\/issues\\/\\d+$/.test(apiPath) && itemMatch) {
+  const number = Number(itemMatch[1]);
+  value = {
+    number,
+    title: "t".repeat(500),
+    state: "open",
+    html_url: maxUrl(number),
+    user: { login: "reporter" },
+    labels: Array.from({ length: 20 }, () => ({ name: "l".repeat(100) })),
+    body: "b".repeat(3000),
+    comments: 1,
+    pull_request: { url: "https://api.github.com/pulls/" + number }
+  };
+} else if (/\\/pulls\\/\\d+$/.test(apiPath) && itemMatch) {
+  value = {
+    draft: false,
+    merged: false,
+    base: { ref: "b".repeat(255) },
+    head: { ref: "h".repeat(255) }
+  };
+} else if (/\\/check-runs\\?/.test(apiPath)) {
+  value = { check_runs: [] };
+} else if (/\\/status$/.test(apiPath)) {
+  value = { statuses: [] };
+} else if (/\\/actions\\/runs\\?/.test(apiPath)) {
+  value = { workflow_runs: [] };
+} else {
+  process.stderr.write("unexpected gh path: " + apiPath);
+  process.exit(3);
+}
+process.stdout.write(JSON.stringify(value));
+`,
+      { mode: 0o755 },
+    );
+
+    const result = spawnSync(
+      process.execPath,
+      [
+        CLI,
+        "hydrate-github-context",
+        "--target-repo",
+        "openclaw/clawsweeper",
+        "--target-dir",
+        targetDir,
+        "--commit-sha",
+        sha,
+        "--output",
+        contextPath,
+      ],
+      {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          GH_BIN: process.execPath,
+          GH_BIN_ARGS: JSON.stringify([ghPath]),
+          GH_TOKEN: "context-token",
+        },
+      },
+    );
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.ok(fs.statSync(contextPath).size <= 64 * 1024);
+    const context = JSON.parse(fs.readFileSync(contextPath, "utf8")) as {
+      references: Array<{ body_excerpt: string }>;
+      limitations: string[];
+    };
+    assert.ok(context.references.length > 0);
+    assert.ok(
+      context.references.length < 12 ||
+        context.references.some((reference) => reference.body_excerpt.length < 3000),
+    );
+    assert.ok(
+      context.limitations.some((limitation) => limitation.startsWith("GitHub context byte budget")),
+    );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("commit review retains only content-safe diagnostics", () => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "commit-review-stream-")));
   const targetDir = path.join(root, "target");
