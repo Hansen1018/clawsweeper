@@ -1,0 +1,96 @@
+name: Bootstrap crawl-remote Access
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: "Type: bootstrap crawl-remote access"
+        required: true
+        type: string
+      rotate_service_token:
+        description: "Replace an existing crawl-remote Access service token"
+        required: true
+        default: false
+        type: boolean
+      runtime_provider:
+        description: "ClawSweeper Gitcrawl intake provider after reconciliation"
+        required: true
+        default: local
+        type: choice
+        options:
+          - local
+          - parity
+          - cloud
+      publisher_enabled:
+        description: "Enable staged gitcrawl-store cloud publication"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bootstrap-crawl-remote-access
+  cancel-in-progress: false
+
+jobs:
+  bootstrap:
+    name: Reconcile Cloudflare Access and GitHub configuration
+    if: >-
+      ${{
+        github.actor == 'vincentkoc' &&
+        github.actor_id == '25068' &&
+        github.triggering_actor == 'vincentkoc' &&
+        github.run_attempt == 1 &&
+        github.ref == 'refs/heads/main' &&
+        inputs.confirmation == 'bootstrap crawl-remote access'
+      }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out trusted bootstrap
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Reauthorize current ClawSweeper main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          current_main_sha="$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq '.sha')"
+          if [[ ! "$current_main_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::ClawSweeper main did not resolve to a full commit SHA."
+            exit 1
+          fi
+          if [[ "$GITHUB_SHA" != "$current_main_sha" ]]; then
+            echo "::error::The dispatched bootstrap is no longer current ClawSweeper main."
+            exit 1
+          fi
+
+      - name: Bootstrap crawl-remote Access
+        env:
+          OPENCLAW_CLOUDFLARE_CONFIG_API_TOKEN: ${{ secrets.OPENCLAW_CLOUDFLARE_CONFIG_API_TOKEN }}
+          OPENCLAW_CLOUDFLARE_WORKERS_API_TOKEN: ${{ secrets.OPENCLAW_CLOUDFLARE_WORKERS_API_TOKEN }}
+          OPENCLAW_GH_TOKEN: ${{ secrets.OPENCLAW_GH_TOKEN }}
+          PUBLISHER_ENABLED: ${{ inputs.publisher_enabled && '1' || '0' }}
+          ROTATE_SERVICE_TOKEN: ${{ inputs.rotate_service_token && '1' || '0' }}
+          RUNTIME_PROVIDER: ${{ inputs.runtime_provider }}
+        run: |
+          corepack enable
+          args=(
+            --confirm "bootstrap crawl-remote access"
+            --publisher-enabled "$PUBLISHER_ENABLED"
+            --rotation-label "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+            --runtime-provider "$RUNTIME_PROVIDER"
+          )
+          if [[ "$ROTATE_SERVICE_TOKEN" == "1" ]]; then
+            args+=(--rotate-service-token)
+          fi
+          pnpm run --silent bootstrap:crawl-remote-access -- "${args[@]}"
