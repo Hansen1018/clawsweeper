@@ -306,6 +306,7 @@ jobs:
           rmSync(artifactRoot, { recursive: true, force: true });
           mkdirSync(join(artifactRoot, 'bundle'), { recursive: true });
           mkdirSync(join(artifactRoot, 'migrations'), { recursive: true });
+          mkdirSync(join(artifactRoot, 'operations'), { recursive: true });
 
           const bundleEntries = readdirSync(bundleDir, { withFileTypes: true });
           const allowedBundleEntries = new Set(['README.md', 'index.js', 'index.js.map']);
@@ -394,10 +395,46 @@ jobs:
             copyFileSync(source, join(artifactRoot, 'migrations', basename(entry.name)));
           }
 
+          const approvedOperations = [
+            {
+              name: 'gitcrawl-query-canary-seed.sql',
+              sha256: '9be769bb99e63fc559296f259706a406bc50c7c34ee9bd06f9eeede4a0376c70',
+            },
+          ];
+          const operationEntries = readdirSync('operations', { withFileTypes: true })
+            .sort((a, b) => a.name.localeCompare(b.name));
+          if (operationEntries.length !== approvedOperations.length) {
+            throw new Error('release artifact operations do not match the reviewed operation set');
+          }
+          for (const [index, entry] of operationEntries.entries()) {
+            const approved = approvedOperations[index];
+            if (
+              !entry.isFile() ||
+              entry.isSymbolicLink() ||
+              !approved ||
+              entry.name !== approved.name
+            ) {
+              throw new Error(`operation ${entry.name} is not in the reviewed operation set`);
+            }
+            const source = join('operations', entry.name);
+            const stat = assertRegularFile(source, `operation ${entry.name}`);
+            if (stat.size < 1 || stat.size > 1024 * 1024) {
+              throw new Error(`operation ${entry.name} is empty or exceeds 1 MiB`);
+            }
+            const operationSHA256 = createHash('sha256')
+              .update(readFileSync(source))
+              .digest('hex');
+            if (operationSHA256 !== approved.sha256) {
+              throw new Error(`operation ${entry.name} differs from its reviewed content`);
+            }
+            copyFileSync(source, join(artifactRoot, 'operations', basename(entry.name)));
+          }
+
           const payloadPaths = [
             'bundle/index.js',
             'wrangler.json',
             ...migrationEntries.map((entry) => `migrations/${entry.name}`),
+            ...operationEntries.map((entry) => `operations/${entry.name}`),
           ].sort();
           const files = payloadPaths.map((path) => {
             const content = readFileSync(join(artifactRoot, path));
@@ -452,7 +489,7 @@ jobs:
         inputs.confirmation == 'deploy crawl-remote production'
       }}
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 45
     environment:
       name: crawl-remote-production
       url: https://crawl-remote.services-91b.workers.dev
@@ -462,10 +499,11 @@ jobs:
     env:
       ARTIFACT_NAME: ${{ needs.preflight.outputs.artifact_name }}
       BASH_ENV: ""
+      CANARY_OPERATION_TIMEOUT_SECONDS: "60"
       CI: "true"
       CLAWSWEEPER_APP_CLIENT_ID: Iv23liOECG0slfuhz093
       CLOUDFLARE_ACCOUNT_ID: 91b59577e757131d68d55a471fe32aca
-      D1_MUTATION_MIN_REMAINING_SECONDS: "1440"
+      D1_MUTATION_MIN_REMAINING_SECONDS: "1620"
       DEPLOYMENT_RECOVERY_TIMEOUT_SECONDS: "120"
       DEPLOYMENT_STATUS_ATTEMPTS: "60"
       DEPLOYMENT_STATUS_DELAY_SECONDS: "5"
@@ -485,7 +523,7 @@ jobs:
       TARGET_REPOSITORY: openclaw/crawl-remote
       TOOLCHAIN_ROOT: ${{ github.workspace }}/.github/deploy/crawl-remote-toolchain
       WORKFLOW_SHA: ${{ github.sha }}
-      WORKER_MUTATION_MIN_REMAINING_SECONDS: "1020"
+      WORKER_MUTATION_MIN_REMAINING_SECONDS: "1200"
       WORKERS_DEV_URL: https://crawl-remote.services-91b.workers.dev
       WRANGLER_DEPLOY_TIMEOUT_SECONDS: "180"
       WRANGLER_READ_TIMEOUT_SECONDS: "30"
@@ -500,7 +538,7 @@ jobs:
             echo "::error::could not resolve the protected deployment start time."
             exit 1
           fi
-          deadline="$((started_at + 35 * 60))"
+          deadline="$((started_at + 40 * 60))"
           printf 'DEPLOY_JOB_DEADLINE_EPOCH=%s\n' "$deadline" >> "$GITHUB_ENV"
 
       - name: Create protected-environment audit token
@@ -1057,6 +1095,12 @@ jobs:
           }
 
           const manifestPath = join(releaseRoot, 'manifest.json');
+          const approvedOperationHashes = new Map([
+            [
+              'operations/gitcrawl-query-canary-seed.sql',
+              '9be769bb99e63fc559296f259706a406bc50c7c34ee9bd06f9eeede4a0376c70',
+            ],
+          ]);
           const rawManifest = readFileSync(manifestPath, 'utf8');
           if (Buffer.byteLength(rawManifest) > 128 * 1024) {
             throw new Error('release manifest exceeds 128 KiB');
@@ -1103,12 +1147,17 @@ jobs:
               (
                 file.path !== 'bundle/index.js' &&
                 file.path !== 'wrangler.json' &&
-                !/^migrations\/[0-9]{4}_[a-z0-9_]+\.sql$/.test(file.path)
+                !/^migrations\/[0-9]{4}_[a-z0-9_]+\.sql$/.test(file.path) &&
+                !approvedOperationHashes.has(file.path)
               ) ||
               !/^[0-9a-f]{64}$/.test(file.sha256) ||
               !Number.isSafeInteger(file.bytes) ||
               file.bytes < 1 ||
-              declaredPaths.has(file.path)
+              declaredPaths.has(file.path) ||
+              (
+                approvedOperationHashes.has(file.path) &&
+                approvedOperationHashes.get(file.path) !== file.sha256
+              )
             ) {
               throw new Error(`invalid release manifest path: ${String(file.path)}`);
             }
@@ -1131,7 +1180,8 @@ jobs:
           if (
             canonicalFiles[0]?.path !== 'bundle/index.js' ||
             !declaredPaths.has('wrangler.json') ||
-            !canonicalFiles.some((file) => file.path.startsWith('migrations/'))
+            !canonicalFiles.some((file) => file.path.startsWith('migrations/')) ||
+            [...approvedOperationHashes.keys()].some((path) => !declaredPaths.has(path))
           ) {
             throw new Error('release manifest is missing required payload files');
           }
@@ -2412,8 +2462,8 @@ jobs:
             exit 1
           fi
 
-      - name: Poll exact production release
-        id: production-proof
+      - name: Seed hidden Gitcrawl production canary
+        id: canary-seed
         if: >-
           ${{
             steps.worker-deploy.outcome == 'success' &&
@@ -2424,9 +2474,172 @@ jobs:
           }}
         continue-on-error: true
         env:
+          CANARY_ATTEMPT_PATH: ${{ runner.temp }}/crawl-remote-query-canary-seed-attempted.json
+          CANARY_SEED_RECEIPT_PATH: ${{ runner.temp }}/crawl-remote-query-canary-seed-receipt.json
+          CANARY_SEED_RESPONSE: ${{ runner.temp }}/crawl-remote-query-canary-seed-response.json
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CRAWL_REMOTE_PRODUCTION_CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_TOKEN_SHA256: ${{ vars.CRAWL_REMOTE_CLOUDFLARE_TOKEN_SHA256 }}
+          CURRENT_DEPLOYMENT_RESPONSE: ${{ runner.temp }}/crawl-remote-deployment-before-canary-seed.json
+          DEPLOYED_VERSION_PATH: ${{ runner.temp }}/crawl-remote-deployed-version.txt
+          OWNED_DEPLOYMENT_ID_PATH: ${{ runner.temp }}/crawl-remote-owned-deployment-id.txt
+          PREVIOUS_WORKER_CONTRACT_BASELINE: ${{ runner.temp }}/crawl-remote-previous-contract-before-migration.json
+          RELEASE_ROOT: ${{ runner.temp }}/crawl-remote-release
+        run: |
+          unset BASH_ENV ENV CDPATH GLOBIGNORE NODE_OPTIONS
+          test -n "$CLOUDFLARE_API_TOKEN"
+          test "$CLOUDFLARE_TOKEN_SHA256" = "$(printf '%s' "$CLOUDFLARE_API_TOKEN" | sha256sum | cut -d ' ' -f 1)"
+          test -f "$DEPLOYED_VERSION_PATH"
+          test -f "$OWNED_DEPLOYMENT_ID_PATH"
+          test -f "$PREVIOUS_WORKER_CONTRACT_BASELINE"
+          test "$(wc -c < "$PREVIOUS_WORKER_CONTRACT_BASELINE")" -le 1048576
+          test ! -e "$CANARY_ATTEMPT_PATH"
+          test ! -e "$CANARY_SEED_RECEIPT_PATH"
+          seed_sql="$RELEASE_ROOT/operations/gitcrawl-query-canary-seed.sql"
+          test -f "$seed_sql"
+          test ! -L "$seed_sql"
+          test "$(
+            sha256sum "$seed_sql" | cut -d ' ' -f 1
+          )" = "9be769bb99e63fc559296f259706a406bc50c7c34ee9bd06f9eeede4a0376c70"
+          deployed_version="$(tr -d '\r\n' < "$DEPLOYED_VERSION_PATH")"
+          owned_deployment_id="$(tr -d '\r\n' < "$OWNED_DEPLOYMENT_ID_PATH")"
+          test "$deployed_version" != ""
+          test "$owned_deployment_id" != ""
+          wrangler="$TOOLCHAIN_ROOT/node_modules/.bin/wrangler"
+          test "$(
+            timeout --foreground --signal=TERM --kill-after=5s \
+              "${WRANGLER_READ_TIMEOUT_SECONDS}s" \
+              "$wrangler" --version
+          )" = "$WRANGLER_VERSION"
+
+          now="$(date +%s)"
+          remaining="$((DEPLOY_JOB_DEADLINE_EPOCH - now))"
+          required_remaining="$((
+            CANARY_OPERATION_TIMEOUT_SECONDS +
+            WRANGLER_READ_TIMEOUT_SECONDS * 6 +
+            WRANGLER_ROLLBACK_TIMEOUT_SECONDS +
+            180 +
+            120
+          ))"
+          if (( remaining < required_remaining )); then
+            echo "::error::refusing query canary seed because proof and rollback no longer fit in the protected deadline."
+            exit 1
+          fi
+
+          timeout --foreground --signal=TERM --kill-after=5s \
+            "${WRANGLER_READ_TIMEOUT_SECONDS}s" \
+            "$wrangler" deployments status \
+            --name crawl-remote \
+            --json \
+            --cwd "$RELEASE_ROOT" \
+            --config wrangler.json \
+            > "$CURRENT_DEPLOYMENT_RESPONSE"
+          test "$(wc -c < "$CURRENT_DEPLOYMENT_RESPONSE")" -le 1048576
+
+          DEPLOYED_VERSION="$deployed_version" OWNED_DEPLOYMENT_ID="$owned_deployment_id" node --input-type=module <<'CANARY_SEED_FENCE_NODE'
+          import { readFileSync, writeFileSync } from 'node:fs';
+
+          const deployment = JSON.parse(
+            readFileSync(process.env.CURRENT_DEPLOYMENT_RESPONSE, 'utf8'),
+          );
+          const previousContract = JSON.parse(
+            readFileSync(process.env.PREVIOUS_WORKER_CONTRACT_BASELINE, 'utf8'),
+          );
+          const versions = deployment?.versions;
+          const previousGitcrawl = Array.isArray(previousContract?.apps)
+            ? previousContract.apps.find((app) => app?.app === 'gitcrawl')
+            : undefined;
+          if (
+            !Array.isArray(previousGitcrawl?.capabilities) ||
+            !previousGitcrawl.capabilities.includes(
+              'gitcrawl.query-canary.permanent.v1',
+            ) ||
+            deployment?.id !== process.env.OWNED_DEPLOYMENT_ID ||
+            deployment?.annotations?.['workers/message'] !== process.env.DEPLOY_MESSAGE ||
+            !Array.isArray(versions) ||
+            versions.length !== 1 ||
+            versions[0]?.version_id !== process.env.DEPLOYED_VERSION ||
+            versions[0]?.percentage !== 100
+          ) {
+            throw new Error(
+              'refusing permanent query canary seed without a canary-aware rollback Worker and current deployment ownership',
+            );
+          }
+          writeFileSync(
+            process.env.CANARY_ATTEMPT_PATH,
+            `${JSON.stringify(
+              {
+                schema_version: 1,
+                target_sha: process.env.DEPLOY_SHA,
+                deployment_id: process.env.OWNED_DEPLOYMENT_ID,
+                deployed_version: process.env.DEPLOYED_VERSION,
+              },
+              null,
+              2,
+            )}\n`,
+            { flag: 'wx', mode: 0o600 },
+          );
+          CANARY_SEED_FENCE_NODE
+
+          timeout --foreground --signal=TERM --kill-after=5s \
+            "${CANARY_OPERATION_TIMEOUT_SECONDS}s" \
+            "$wrangler" d1 execute crawl-remote \
+            --remote \
+            --json \
+            --cwd "$RELEASE_ROOT" \
+            --config wrangler.json \
+            --file operations/gitcrawl-query-canary-seed.sql \
+            > "$CANARY_SEED_RESPONSE"
+          test "$(wc -c < "$CANARY_SEED_RESPONSE")" -le 1048576
+
+          DEPLOYED_VERSION="$deployed_version" OWNED_DEPLOYMENT_ID="$owned_deployment_id" node --input-type=module <<'CANARY_SEED_RECEIPT_NODE'
+          import { createHash } from 'node:crypto';
+          import { readFileSync, writeFileSync } from 'node:fs';
+
+          const responseRaw = readFileSync(process.env.CANARY_SEED_RESPONSE, 'utf8');
+          const response = JSON.parse(responseRaw);
+          if (
+            !Array.isArray(response) ||
+            response.length < 1 ||
+            response.length > 64 ||
+            response.some((entry) => entry?.success !== true)
+          ) {
+            throw new Error('query canary seed did not complete every D1 statement');
+          }
+          const receipt = {
+            schema_version: 1,
+            target_sha: process.env.DEPLOY_SHA,
+            deployment_id: process.env.OWNED_DEPLOYMENT_ID,
+            deployed_version: process.env.DEPLOYED_VERSION,
+            operation: 'gitcrawl-query-canary-seed',
+            sql_sha256:
+              '9be769bb99e63fc559296f259706a406bc50c7c34ee9bd06f9eeede4a0376c70',
+            response_sha256: createHash('sha256').update(responseRaw).digest('hex'),
+          };
+          writeFileSync(
+            process.env.CANARY_SEED_RECEIPT_PATH,
+            `${JSON.stringify(receipt, null, 2)}\n`,
+            { flag: 'wx', mode: 0o600 },
+          );
+          CANARY_SEED_RECEIPT_NODE
+
+      - name: Poll exact production release
+        id: production-proof
+        if: >-
+          ${{
+            steps.worker-deploy.outcome == 'success' &&
+            steps.deployment-state.outcome == 'success' &&
+            steps.deployment-state.outputs.mutation_owned == 'true' &&
+            steps.deploy-receipt.outcome == 'success' &&
+            steps.post-deploy-main.outcome == 'success' &&
+            steps.canary-seed.outcome == 'success'
+          }}
+        continue-on-error: true
+        env:
+          CANARY_SEED_RECEIPT_PATH: ${{ runner.temp }}/crawl-remote-query-canary-seed-receipt.json
           CF_ACCESS_CLIENT_ID: ${{ secrets.CRAWL_REMOTE_ACCESS_CLIENT_ID }}
           CF_ACCESS_CLIENT_SECRET: ${{ secrets.CRAWL_REMOTE_ACCESS_CLIENT_SECRET }}
           CUSTOM_ROUTE_PROOF: ${{ vars.CRAWL_REMOTE_CUSTOM_ROUTE_PROOF }}
+          PRODUCTION_ROUTE_ARCHIVES_RESPONSE: ${{ runner.temp }}/crawl-remote-production-route-archives.json
           PRODUCTION_ROUTE_CONTRACT_RESPONSE: ${{ runner.temp }}/crawl-remote-production-route-contract.json
           PRODUCTION_ROUTE_HEALTH_RESPONSE: ${{ runner.temp }}/crawl-remote-production-route-health.json
           PRODUCTION_ROUTE_QUERY_RESPONSE_DIR: ${{ runner.temp }}/crawl-remote-production-route-queries
@@ -2434,6 +2647,39 @@ jobs:
           WORKERS_DEV_HEALTH_RESPONSE: ${{ runner.temp }}/crawl-remote-workers-dev-health.json
         run: |
           unset BASH_ENV ENV CDPATH GLOBIGNORE NODE_OPTIONS
+          test -f "$CANARY_SEED_RECEIPT_PATH"
+          test "$(wc -c < "$CANARY_SEED_RECEIPT_PATH")" -le 4096
+          node --input-type=module <<'CANARY_SEED_RECEIPT_PROOF_NODE'
+          import { readFileSync } from 'node:fs';
+
+          const receipt = JSON.parse(
+            readFileSync(process.env.CANARY_SEED_RECEIPT_PATH, 'utf8'),
+          );
+          const uuidPattern =
+            /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+          const expectedKeys = [
+            'deployed_version',
+            'deployment_id',
+            'operation',
+            'response_sha256',
+            'schema_version',
+            'sql_sha256',
+            'target_sha',
+          ];
+          if (
+            JSON.stringify(Object.keys(receipt).sort()) !== JSON.stringify(expectedKeys) ||
+            receipt.schema_version !== 1 ||
+            receipt.target_sha !== process.env.DEPLOY_SHA ||
+            receipt.operation !== 'gitcrawl-query-canary-seed' ||
+            receipt.sql_sha256 !==
+              '9be769bb99e63fc559296f259706a406bc50c7c34ee9bd06f9eeede4a0376c70' ||
+            !/^[0-9a-f]{64}$/.test(String(receipt.response_sha256 ?? '')) ||
+            !uuidPattern.test(String(receipt.deployment_id ?? '')) ||
+            !uuidPattern.test(String(receipt.deployed_version ?? ''))
+          ) {
+            throw new Error('query canary seed receipt is invalid');
+          }
+          CANARY_SEED_RECEIPT_PROOF_NODE
           deadline=$((SECONDS + 180))
           attempt=0
 
@@ -2564,12 +2810,14 @@ jobs:
             rm -f \
               "$WORKERS_DEV_HEALTH_RESPONSE" \
               "$WORKERS_DEV_CONTRACT_RESPONSE" \
+              "$PRODUCTION_ROUTE_ARCHIVES_RESPONSE" \
               "$PRODUCTION_ROUTE_HEALTH_RESPONSE" \
               "$PRODUCTION_ROUTE_CONTRACT_RESPONSE"
             if fetch_endpoint "$WORKERS_DEV_URL/health" "$WORKERS_DEV_HEALTH_RESPONSE" &&
               fetch_endpoint "$WORKERS_DEV_URL/v1/contract" "$WORKERS_DEV_CONTRACT_RESPONSE" &&
               fetch_endpoint "$PRODUCTION_ROUTE_URL/health" "$PRODUCTION_ROUTE_HEALTH_RESPONSE" "access-service-token" &&
               fetch_endpoint "$PRODUCTION_ROUTE_URL/v1/contract" "$PRODUCTION_ROUTE_CONTRACT_RESPONSE" "access-service-token" &&
+              fetch_endpoint "$PRODUCTION_ROUTE_URL/v1/archives" "$PRODUCTION_ROUTE_ARCHIVES_RESPONSE" "access-service-token" &&
               fetch_gitcrawl_queries &&
               node --input-type=module <<'NODE'
           import { readFileSync } from 'node:fs';
@@ -2601,6 +2849,7 @@ jobs:
                 label: 'production route',
                 healthPath: process.env.PRODUCTION_ROUTE_HEALTH_RESPONSE,
                 contractPath: process.env.PRODUCTION_ROUTE_CONTRACT_RESPONSE,
+                archivesPath: process.env.PRODUCTION_ROUTE_ARCHIVES_RESPONSE,
                 queryResponseDir: process.env.PRODUCTION_ROUTE_QUERY_RESPONSE_DIR,
               },
             ];
@@ -2608,7 +2857,13 @@ jobs:
               throw new Error('custom-route proof mode is invalid');
             }
 
-            function validateEndpoint({ label, healthPath, contractPath, queryResponseDir }) {
+            function validateEndpoint({
+              label,
+              healthPath,
+              contractPath,
+              archivesPath,
+              queryResponseDir,
+            }) {
               const health = JSON.parse(readFileSync(healthPath, 'utf8'));
               if (health.ok !== true || health.release_sha !== expectedSha) {
                 throw new Error(`${label} health response does not identify the approved release`);
@@ -2641,6 +2896,13 @@ jobs:
               }
               if (!gitcrawl.capabilities.includes('gitcrawl-query-safety-v3')) {
                 throw new Error(`${label} contract is missing the Gitcrawl query safety capability`);
+              }
+              if (
+                !gitcrawl.capabilities.includes(
+                  'gitcrawl.query-canary.permanent.v1',
+                )
+              ) {
+                throw new Error(`${label} contract is missing permanent query canary support`);
               }
               if (!Array.isArray(gitcrawl.queries)) {
                 throw new Error(`${label} Gitcrawl queries are malformed`);
@@ -2705,6 +2967,20 @@ jobs:
                 )
               ) {
                 throw new Error(`${label} contract is missing the read-only POST query route`);
+              }
+              if (archivesPath) {
+                const archiveListing = JSON.parse(readFileSync(archivesPath, 'utf8'));
+                if (
+                  !Array.isArray(archiveListing?.archives) ||
+                  archiveListing.archives.some(
+                    (archive) =>
+                      !archive ||
+                      typeof archive !== 'object' ||
+                      archive.id === 'gitcrawl/clawsweeper__query_canary',
+                  )
+                ) {
+                  throw new Error(`${label} exposed the hidden Gitcrawl query canary`);
+                }
               }
               if (queryResponseDir) {
                 const isRecord = (value) =>
@@ -2873,7 +3149,7 @@ jobs:
                     values.length === 0 ||
                     !isRecord(snapshot) ||
                     snapshot.id !== snapshotId ||
-                    snapshot.source_sha256 !== canarySnapshotId ||
+                    snapshot.source_sha256 !== '' ||
                     typeof snapshot.schema_name !== 'string' ||
                     !snapshot.schema_name.trim() ||
                     !Number.isSafeInteger(snapshot.schema_version) ||
@@ -3526,6 +3802,7 @@ jobs:
               steps.worker-deploy.outcome != 'success' ||
               steps.deploy-receipt.outcome != 'success' ||
               steps.post-deploy-main.outcome != 'success' ||
+              steps.canary-seed.outcome != 'success' ||
               steps.production-proof.outcome != 'success' ||
               steps.final-main.outcome != 'success'
             )
@@ -3661,6 +3938,7 @@ jobs:
       - name: Require successful release and proof
         if: ${{ always() }}
         env:
+          CANARY_SEED_OUTCOME: ${{ steps.canary-seed.outcome }}
           DEPLOYMENT_STATE_OUTCOME: ${{ steps.deployment-state.outcome }}
           DEPLOY_RECEIPT_OUTCOME: ${{ steps.deploy-receipt.outcome }}
           FINAL_MAIN_OUTCOME: ${{ steps.final-main.outcome }}
@@ -3680,10 +3958,11 @@ jobs:
             "$MUTATION_OWNED" == "true" &&
             "$DEPLOY_RECEIPT_OUTCOME" == "success" &&
             "$POST_DEPLOY_MAIN_OUTCOME" == "success" &&
+            "$CANARY_SEED_OUTCOME" == "success" &&
             "$PRODUCTION_PROOF_OUTCOME" == "success" &&
             "$FINAL_MAIN_OUTCOME" == "success"
           ]]; then
             exit 0
           fi
-          echo "::error::crawl-remote release failed or lost authorization; deployment state: $DEPLOYMENT_STATE_OUTCOME/$MUTATION_OWNED; ownership recovery: $OWNERSHIP_RECOVERY_OUTCOME/$RECOVERED_MUTATION_OWNED; deploy receipt: $DEPLOY_RECEIPT_OUTCOME; final main authorization: $FINAL_MAIN_OUTCOME; previous Worker probe: $PREVIOUS_WORKER_PROBE_OUTCOME; Worker rollback outcome: $ROLLBACK_OUTCOME. D1 migrations are not rolled back."
+          echo "::error::crawl-remote release failed or lost authorization; deployment state: $DEPLOYMENT_STATE_OUTCOME/$MUTATION_OWNED; ownership recovery: $OWNERSHIP_RECOVERY_OUTCOME/$RECOVERED_MUTATION_OWNED; deploy receipt: $DEPLOY_RECEIPT_OUTCOME; permanent canary seed: $CANARY_SEED_OUTCOME; final main authorization: $FINAL_MAIN_OUTCOME; previous Worker probe: $PREVIOUS_WORKER_PROBE_OUTCOME; Worker rollback outcome: $ROLLBACK_OUTCOME. D1 migrations and the permanent query canary are not rolled back."
           exit 1

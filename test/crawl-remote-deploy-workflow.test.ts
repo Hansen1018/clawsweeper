@@ -24,6 +24,10 @@ const source = readFileSync(workflowPath, "utf8");
 const workflow = parse(source);
 const ciSource = readFileSync(ciWorkflowPath, "utf8");
 const ciWorkflow = parse(ciSource);
+const canarySeedSQL = readFileSync(
+  "test/fixtures/crawl-remote-operations/gitcrawl-query-canary-seed.sql",
+  "utf8",
+);
 const preflight = workflow.jobs.preflight;
 const deploy = workflow.jobs.deploy;
 
@@ -129,6 +133,7 @@ test("crawl-remote release is maintainer-bound across two fresh runners", () => 
   assert.equal(preflight.environment, undefined);
   assert.equal(deploy.needs, "preflight");
   assert.deepEqual(deploy.permissions, { contents: "read" });
+  assert.equal(deploy["timeout-minutes"], 45);
   assert.match(deploy.if, /needs\.preflight\.result == 'success'/);
   assert.equal(
     deploy.env.OBSERVATION_ORDER_STATE,
@@ -152,11 +157,12 @@ test("crawl-remote release is maintainer-bound across two fresh runners", () => 
   assert.equal(deploy.env.DEPLOYMENT_STATUS_ATTEMPTS, "60");
   assert.equal(deploy.env.DEPLOYMENT_STATUS_DELAY_SECONDS, "5");
   assert.equal(deploy.env.DEPLOYMENT_STATUS_TIMEOUT_SECONDS, "120");
-  assert.equal(deploy.env.D1_MUTATION_MIN_REMAINING_SECONDS, "1440");
-  assert.equal(deploy.env.WORKER_MUTATION_MIN_REMAINING_SECONDS, "1020");
+  assert.equal(deploy.env.CANARY_OPERATION_TIMEOUT_SECONDS, "60");
+  assert.equal(deploy.env.D1_MUTATION_MIN_REMAINING_SECONDS, "1620");
+  assert.equal(deploy.env.WORKER_MUTATION_MIN_REMAINING_SECONDS, "1200");
   assert.equal(deploy.env.DEPLOYMENT_RECOVERY_TIMEOUT_SECONDS, "120");
   assert.ok(
-    35 * 60 - Number(deploy.env.D1_MUTATION_MIN_REMAINING_SECONDS) >= 11 * 60,
+    40 * 60 - Number(deploy.env.D1_MUTATION_MIN_REMAINING_SECONDS) >= 11 * 60,
     "protected setup must retain at least eleven minutes before the D1 cutoff",
   );
   assert.ok(
@@ -173,12 +179,14 @@ test("crawl-remote release is maintainer-bound across two fresh runners", () => 
   const ownershipTimeout = Number(deploy.env.DEPLOYMENT_STATUS_TIMEOUT_SECONDS);
   const recoveryTimeout = Number(deploy.env.DEPLOYMENT_RECOVERY_TIMEOUT_SECONDS);
   const rollbackTimeout = Number(deploy.env.WRANGLER_ROLLBACK_TIMEOUT_SECONDS);
+  const canaryOperationTimeout = Number(deploy.env.CANARY_OPERATION_TIMEOUT_SECONDS);
   const proofTimeout = 180;
   const boundedWranglerAndProofSeconds =
-    readTimeout * 7 +
+    readTimeout * 8 +
     mutationTimeout * 2 +
     ownershipTimeout +
     recoveryTimeout +
+    canaryOperationTimeout +
     proofTimeout +
     (readTimeout * 3 + rollbackTimeout);
   assert.ok(
@@ -204,7 +212,7 @@ test("crawl-remote release is maintainer-bound across two fresh runners", () => 
   assert.equal(steps(deploy).indexOf(token), 6);
   assert.equal(steps(deploy).indexOf(canonicalAuthority), 7);
   assert.equal(steps(deploy).indexOf(checkout), 8);
-  assert.match(deadline.run ?? "", /started_at \+ 35 \* 60/);
+  assert.match(deadline.run ?? "", /started_at \+ 40 \* 60/);
   assert.match(deadline.run ?? "", /DEPLOY_JOB_DEADLINE_EPOCH/);
   assert.equal(
     environmentToken.uses,
@@ -253,7 +261,7 @@ test("crawl-remote release is maintainer-bound across two fresh runners", () => 
   assert.equal(canonicalAuthority.env?.GH_TOKEN, "${{ steps.target-token.outputs.token }}");
   assert.equal(canonicalAuthority.env?.CLOUDFLARE_API_TOKEN, undefined);
   assert.equal(preflight["timeout-minutes"], 25);
-  assert.equal(deploy["timeout-minutes"], 40);
+  assert.equal(deploy["timeout-minutes"], 45);
 });
 
 test("protected deploy audits exact environment-owned authority inputs", () => {
@@ -949,6 +957,7 @@ test("release artifact is immutable, bounded, canonical, and hash verified", () 
   assert.match(packaging, /bundle\/index\.js/);
   assert.match(packaging, /wrangler\.json/);
   assert.match(packaging, /migrations\/\$\{entry\.name\}/);
+  assert.match(packaging, /operations\/\$\{entry\.name\}/);
   assert.match(packaging, /createHash\('sha256'\)/);
   assert.match(packaging, /target_sha: targetSha/);
   assert.match(packaging, /artifact_name: artifactName/);
@@ -973,6 +982,8 @@ test("release artifact is immutable, bounded, canonical, and hash verified", () 
   assert.match(packaging, /migrationEntries\.length !== approvedMigrations\.length/);
   assert.match(packaging, /migration \$\{entry\.name\} differs from its reviewed content/);
   assert.match(packaging, /release artifact migrations do not match the reviewed migration set/);
+  assert.match(packaging, /approvedOperations/);
+  assert.match(packaging, /release artifact operations do not match the reviewed operation set/);
   for (const sha256 of [
     "bfb2ee56d01c7547a644f48b5c493cb9d971646ce331acc10c6bfd78d9b7d066",
     "f984199bef0406ce91724e9ac83a97f41928b1560a51974deb841596f1e403e2",
@@ -982,6 +993,7 @@ test("release artifact is immutable, bounded, canonical, and hash verified", () 
     "a0ebfbb5c40c85df5eaba6772a01a68910fa5f1327d4701d25c5dfde16f77d1a",
     "5c1e92dbf4d51ef62d317e212a0ec8e39df104983656c6416d0c58ef3503744d",
     "3d5afadb62b4343cc88c54a18702aee13b61d1d5a74312a191996833155ab462",
+    "9be769bb99e63fc559296f259706a406bc50c7c34ee9bd06f9eeede4a0376c70",
   ]) {
     assert.match(packaging, new RegExp(sha256));
   }
@@ -1014,6 +1026,8 @@ test("release artifact is immutable, bounded, canonical, and hash verified", () 
   assert.match(verify, /bundle\/index\.js/);
   assert.match(verify, /wrangler\.json/);
   assert.match(verify, /\^migrations\\\/\[0-9\]\{4\}/);
+  assert.match(verify, /approvedOperationHashes/);
+  assert.match(verify, /operations\/gitcrawl-query-canary-seed\.sql/);
   assert.match(verify, /deployment Wrangler config has unsafe execution fields/);
   assert.match(verify, /config\.limits.*cpu_ms: 300000/s);
   assert.match(verify, /config\.vars\?\.CRAWL_REMOTE_RELEASE_SHA/);
@@ -1062,6 +1076,8 @@ test("release packaging accepts Wrangler metadata and rejects unsupported output
   for (const [name, contents] of fixtureMigrations) {
     writeFileSync(join(directory, "migrations", name), contents);
   }
+  mkdirSync(join(directory, "operations"), { recursive: true });
+  writeFileSync(join(directory, "operations", "gitcrawl-query-canary-seed.sql"), canarySeedSQL);
   writeFileSync(
     join(directory, "wrangler.jsonc"),
     JSON.stringify({
@@ -1153,6 +1169,36 @@ test("release packaging accepts Wrangler metadata and rejects unsupported output
       fixtureMigrations[6][1],
     );
 
+    rmSync(join(directory, "operations", "gitcrawl-query-canary-seed.sql"));
+    const missingOperation = packageBundle();
+    assert.notEqual(missingOperation.status, 0);
+    assert.match(
+      missingOperation.stdout + missingOperation.stderr,
+      /release artifact operations do not match the reviewed operation set/,
+    );
+    writeFileSync(join(directory, "operations", "gitcrawl-query-canary-seed.sql"), canarySeedSQL);
+
+    writeFileSync(
+      join(directory, "operations", "gitcrawl-query-canary-seed.sql"),
+      `${canarySeedSQL}\n-- tampered\n`,
+    );
+    const alteredOperation = packageBundle();
+    assert.notEqual(alteredOperation.status, 0);
+    assert.match(
+      alteredOperation.stdout + alteredOperation.stderr,
+      /operation gitcrawl-query-canary-seed\.sql differs from its reviewed content/,
+    );
+    writeFileSync(join(directory, "operations", "gitcrawl-query-canary-seed.sql"), canarySeedSQL);
+
+    writeFileSync(join(directory, "operations", "unexpected.sql"), "select 1;\n");
+    const extraOperation = packageBundle();
+    assert.notEqual(extraOperation.status, 0);
+    assert.match(
+      extraOperation.stdout + extraOperation.stderr,
+      /release artifact operations do not match the reviewed operation set/,
+    );
+    rmSync(join(directory, "operations", "unexpected.sql"));
+
     const extraModule = packageBundle(() => {
       writeFileSync(join(bundleDir, "module.wasm"), "unsupported module\n");
     });
@@ -1217,6 +1263,7 @@ test("artifact verifier rejects tampering, extras, cross-state reuse, and oversi
     const root = join(directory, label);
     mkdirSync(join(root, "bundle"), { recursive: true });
     mkdirSync(join(root, "migrations"), { recursive: true });
+    mkdirSync(join(root, "operations"), { recursive: true });
 
     const config = `${JSON.stringify(
       {
@@ -1253,6 +1300,7 @@ test("artifact verifier rejects tampering, extras, cross-state reuse, and oversi
     const payloads = new Map<string, Buffer>([
       ["bundle/index.js", bundle],
       ["migrations/0001_test.sql", Buffer.from(migration)],
+      ["operations/gitcrawl-query-canary-seed.sql", Buffer.from(canarySeedSQL)],
       ["wrangler.json", Buffer.from(config)],
     ]);
     for (const [path, content] of payloads) {
@@ -1318,9 +1366,24 @@ test("artifact verifier rejects tampering, extras, cross-state reuse, and oversi
     writeFileSync(join(tampered.root, "bundle", "index.js"), "tampered\n");
     assert.notEqual(validate(tampered).status, 0);
 
+    const tamperedSeed = fixture("tampered-seed");
+    writeFileSync(
+      join(tamperedSeed.root, "operations", "gitcrawl-query-canary-seed.sql"),
+      `${canarySeedSQL}\n-- tampered\n`,
+    );
+    assert.notEqual(validate(tamperedSeed).status, 0);
+
+    const missingSeed = fixture("missing-seed");
+    rmSync(join(missingSeed.root, "operations", "gitcrawl-query-canary-seed.sql"));
+    assert.notEqual(validate(missingSeed).status, 0);
+
     const extra = fixture("extra");
     writeFileSync(join(extra.root, "unexpected.txt"), "unexpected\n");
     assert.notEqual(validate(extra).status, 0);
+
+    const extraOperation = fixture("extra-operation");
+    writeFileSync(join(extraOperation.root, "operations", "unexpected.sql"), "select 1;\n");
+    assert.notEqual(validate(extraOperation).status, 0);
 
     assert.notEqual(validate(fixture("cross-state"), "active").status, 0);
     assert.notEqual(validate(fixture("cross-snapshot-state"), "dormant", "active").status, 0);
@@ -1341,7 +1404,7 @@ test("protected deploy never executes target lifecycle code", () => {
   assert.doesNotMatch(deployRuns, /\bnpx\b/);
   assert.doesNotMatch(deployRuns, /\$RELEASE_ROOT\/package\.json|src\/index/);
   assert.doesNotMatch(deployRuns, /(?:^|\n)\s*source\s|\beval\b|bash -c|sh -c/);
-  assert.equal(deployRuns.match(/\$TOOLCHAIN_ROOT\/node_modules\/\.bin\/wrangler/g)?.length, 3);
+  assert.equal(deployRuns.match(/\$TOOLCHAIN_ROOT\/node_modules\/\.bin\/wrangler/g)?.length, 4);
   assert.equal(deployRuns.match(/\.\/node_modules\/\.bin\/wrangler/g)?.length, 1);
   assert.equal(
     steps(deploy).filter((candidate) => candidate.uses?.startsWith("actions/checkout@")).length,
@@ -1413,6 +1476,7 @@ test("deploy uses the committed exact Node and Wrangler toolchain before credent
       "Apply and verify D1 migrations",
       "Deploy verified Worker bundle",
       "Resolve Worker deployment ownership",
+      "Seed hidden Gitcrawl production canary",
       "Recover unresolved Worker deployment ownership",
       "Roll back failed Worker release",
     ],
@@ -1433,7 +1497,7 @@ test("deploy uses the committed exact Node and Wrangler toolchain before credent
   assert.doesNotMatch(source, /secrets\.CRAWL_REMOTE_CLOUDFLARE_API_TOKEN/);
   assert.doesNotMatch(source, /\|\|\s*secrets\./);
   assert.doesNotMatch(source, /CRAWL_REMOTE_CUSTOM_ROUTE_PROOF\s*\|\|/);
-  assert.equal(source.match(/CRAWL_REMOTE_PRODUCTION_CLOUDFLARE_API_TOKEN/g)?.length, 6);
+  assert.equal(source.match(/CRAWL_REMOTE_PRODUCTION_CLOUDFLARE_API_TOKEN/g)?.length, 7);
 });
 
 test("networked CI installs the pinned Wrangler lock and exercises its dry-run outside pnpm check", () => {
@@ -1522,8 +1586,10 @@ test("deploy reauthorizes exact current main before and after privileged mutatio
   const deploymentState = step(deploy, "Resolve Worker deployment ownership");
   const deployReceipt = step(deploy, "Validate Worker deploy receipt");
   const reauthorizeAfterWorker = step(deploy, "Reauthorize current main after Worker deploy");
+  const canarySeed = step(deploy, "Seed hidden Gitcrawl production canary");
   const productionProof = step(deploy, "Poll exact production release");
   const reauthorizeAfterProof = step(deploy, "Reauthorize current main after production proof");
+  const ownershipRecovery = step(deploy, "Recover unresolved Worker deployment ownership");
   for (const reauthorize of [
     reauthorizeBeforeD1,
     reauthorizeBeforeWorker,
@@ -1557,10 +1623,18 @@ test("deploy reauthorizes exact current main before and after privileged mutatio
     steps(deploy).indexOf(deployReceipt) + 1,
     steps(deploy).indexOf(reauthorizeAfterWorker),
   );
-  assert.ok(steps(deploy).indexOf(reauthorizeAfterWorker) < steps(deploy).indexOf(productionProof));
+  assert.equal(
+    steps(deploy).indexOf(reauthorizeAfterWorker) + 1,
+    steps(deploy).indexOf(canarySeed),
+  );
+  assert.equal(steps(deploy).indexOf(canarySeed) + 1, steps(deploy).indexOf(productionProof));
   assert.equal(
     steps(deploy).indexOf(productionProof) + 1,
     steps(deploy).indexOf(reauthorizeAfterProof),
+  );
+  assert.equal(
+    steps(deploy).indexOf(reauthorizeAfterProof) + 1,
+    steps(deploy).indexOf(ownershipRecovery),
   );
   assert.match(migration.run ?? "", /test ! -e "\$CONSUMED_RECEIPT_PATH"/);
   assert.match(migration.run ?? "", /mv -- "\$RECEIPT_PATH" "\$CONSUMED_RECEIPT_PATH"/);
@@ -1578,6 +1652,19 @@ test("deploy reauthorizes exact current main before and after privileged mutatio
   assert.equal(deploymentState["continue-on-error"], true);
   assert.equal(deployReceipt["continue-on-error"], true);
   assert.equal(reauthorizeAfterWorker["continue-on-error"], true);
+  assert.equal(canarySeed.id, "canary-seed");
+  assert.equal(canarySeed["continue-on-error"], true);
+  assert.match(canarySeed.if ?? "", /steps\.post-deploy-main\.outcome == 'success'/);
+  assert.match(canarySeed.run ?? "", /deployments status/);
+  assert.match(canarySeed.run ?? "", /gitcrawl-query-canary-seed\.sql/);
+  assert.match(canarySeed.run ?? "", /CANARY_ATTEMPT_PATH/);
+  assert.match(canarySeed.run ?? "", /CANARY_SEED_RECEIPT_PATH/);
+  assert.match(canarySeed.run ?? "", /PREVIOUS_WORKER_CONTRACT_BASELINE/);
+  assert.match(canarySeed.run ?? "", /gitcrawl\.query-canary\.permanent\.v1/);
+  assert.match(canarySeed.run ?? "", /CANARY_OPERATION_TIMEOUT_SECONDS \+/);
+  assert.match(canarySeed.run ?? "", /WRANGLER_READ_TIMEOUT_SECONDS \* 6/);
+  assert.match(productionProof.if ?? "", /steps\.canary-seed\.outcome == 'success'/);
+  assert.match(productionProof.run ?? "", /query canary seed receipt is invalid/);
   assert.equal(reauthorizeAfterProof.id, "final-main");
   assert.equal(reauthorizeAfterProof["continue-on-error"], true);
   assert.equal(reauthorizeAfterProof.if, "${{ steps.production-proof.outcome == 'success' }}");
@@ -1592,6 +1679,7 @@ test("deploy reauthorizes exact current main before and after privileged mutatio
 test("privileged mutations use only verified files and prove the selected D1 fence state", () => {
   const migration = step(deploy, "Apply and verify D1 migrations").run ?? "";
   const workerDeploy = step(deploy, "Deploy verified Worker bundle").run ?? "";
+  const canarySeed = step(deploy, "Seed hidden Gitcrawl production canary").run ?? "";
   assert.match(migration, /\$TOOLCHAIN_ROOT\/node_modules\/\.bin\/wrangler/);
   assert.match(migration, /deployments status/);
   assert.match(migration, /versions\.length !== 1/);
@@ -1640,6 +1728,9 @@ test("privileged mutations use only verified files and prove the selected D1 fen
   assert.match(migration, /state !== 'dormant'/);
   assert.match(migration, /pre-migration query failed/);
   assert.match(workerDeploy, /deploy bundle\/index\.js/);
+  assert.match(canarySeed, /operations\/gitcrawl-query-canary-seed\.sql/);
+  assert.match(canarySeed, /9be769bb99e63fc559296f259706a406bc50c7c34ee9bd06f9eeede4a0376c70/);
+  assert.match(canarySeed, /canary-aware rollback Worker and current deployment ownership/);
   assert.match(workerDeploy, /--no-bundle/);
   assert.match(workerDeploy, /--strict/);
   assert.match(workerDeploy, /--var "CRAWL_REMOTE_RELEASE_SHA:\$DEPLOY_SHA"/);
@@ -1673,11 +1764,191 @@ test("privileged mutations use only verified files and prove the selected D1 fen
   assert.ok(migration.indexOf("D1_MUTATION_MIN_REMAINING_SECONDS") < migrationIndex);
 });
 
+test("permanent query canary seed is rollback-aware, receipted, and deadline bounded", () => {
+  const seed = step(deploy, "Seed hidden Gitcrawl production canary");
+  const directory = mkdtempSync(join(tmpdir(), "crawl-remote-query-canary-"));
+  const releaseRoot = join(directory, "release");
+  const operationsRoot = join(releaseRoot, "operations");
+  const toolchainRoot = join(directory, "toolchain");
+  const binRoot = join(toolchainRoot, "node_modules", ".bin");
+  const wranglerPath = join(binRoot, "wrangler");
+  const deployedVersionPath = join(directory, "deployed-version.txt");
+  const ownedDeploymentIDPath = join(directory, "owned-deployment-id.txt");
+  const currentDeploymentPath = join(directory, "current-deployment.json");
+  const attemptPath = join(directory, "seed-attempted.json");
+  const seedResponsePath = join(directory, "seed-response.json");
+  const seedReceiptPath = join(directory, "seed-receipt.json");
+  const previousContractPath = join(directory, "previous-contract.json");
+  const wranglerLogPath = join(directory, "wrangler.log");
+  const deployedVersion = "22222222-2222-4222-8222-222222222222";
+  const deploymentID = "44444444-4444-4444-8444-444444444444";
+  const deployMessage = "clawsweeper run 123/1 main " + mergedCrawlRemoteMain;
+  const token = "production-token";
+  const tokenSHA = createHash("sha256").update(token).digest("hex");
+
+  mkdirSync(operationsRoot, { recursive: true });
+  mkdirSync(binRoot, { recursive: true });
+  writeFileSync(join(operationsRoot, "gitcrawl-query-canary-seed.sql"), canarySeedSQL);
+  writeFileSync(deployedVersionPath, `${deployedVersion}\n`);
+  writeFileSync(ownedDeploymentIDPath, `${deploymentID}\n`);
+  writeFileSync(
+    wranglerPath,
+    `#!/bin/sh
+printf '%s\\n' "$*" >> "$WRANGLER_LOG_PATH"
+if test "$1" = "--version"; then
+  printf '%s\\n' "$WRANGLER_VERSION"
+  exit 0
+fi
+if test "$1 $2" = "deployments status"; then
+  printf '%s\\n' "$CURRENT_DEPLOYMENT_JSON"
+  exit 0
+fi
+if test "$1 $2" = "d1 execute"; then
+  case "$*" in
+    *"--file operations/gitcrawl-query-canary-seed.sql"*)
+      if test "$WRANGLER_MODE" = "seed-failure"; then
+        printf '%s\\n' '[{"success":false}]'
+      else
+        printf '%s\\n' '[{"success":true}]'
+      fi
+      exit 0
+      ;;
+  esac
+fi
+exit 97
+`,
+  );
+  chmodSync(wranglerPath, 0o755);
+
+  const commonEnv = {
+    ...process.env,
+    CANARY_ATTEMPT_PATH: attemptPath,
+    CANARY_OPERATION_TIMEOUT_SECONDS: "5",
+    CANARY_SEED_RECEIPT_PATH: seedReceiptPath,
+    CANARY_SEED_RESPONSE: seedResponsePath,
+    CLOUDFLARE_API_TOKEN: token,
+    CLOUDFLARE_TOKEN_SHA256: tokenSHA,
+    CURRENT_DEPLOYMENT_RESPONSE: currentDeploymentPath,
+    DEPLOYED_VERSION_PATH: deployedVersionPath,
+    DEPLOY_MESSAGE: deployMessage,
+    DEPLOY_SHA: mergedCrawlRemoteMain,
+    OWNED_DEPLOYMENT_ID_PATH: ownedDeploymentIDPath,
+    PREVIOUS_WORKER_CONTRACT_BASELINE: previousContractPath,
+    RELEASE_ROOT: releaseRoot,
+    TOOLCHAIN_ROOT: toolchainRoot,
+    WRANGLER_LOG_PATH: wranglerLogPath,
+    WRANGLER_READ_TIMEOUT_SECONDS: "5",
+    WRANGLER_ROLLBACK_TIMEOUT_SECONDS: "5",
+    WRANGLER_VERSION: "4.107.1",
+  };
+
+  function resetMutationState() {
+    for (const path of [
+      attemptPath,
+      currentDeploymentPath,
+      seedResponsePath,
+      seedReceiptPath,
+      previousContractPath,
+      wranglerLogPath,
+    ]) {
+      rmSync(path, { force: true });
+    }
+  }
+
+  function runSeed({
+    currentMessage = deployMessage,
+    deadlineOffsetSeconds = 3600,
+    previousCanarySupport = true,
+    mode = "success",
+  }: {
+    currentMessage?: string;
+    deadlineOffsetSeconds?: number;
+    previousCanarySupport?: boolean;
+    mode?: "success" | "seed-failure";
+  } = {}) {
+    writeFileSync(
+      previousContractPath,
+      JSON.stringify({
+        apps: [
+          {
+            app: "gitcrawl",
+            capabilities: previousCanarySupport
+              ? ["gitcrawl.query-canary.permanent.v1"]
+              : ["gitcrawl-query-safety-v3"],
+          },
+        ],
+      }),
+    );
+    return spawnSync("bash", ["--noprofile", "--norc", "-euo", "pipefail", "-c", seed.run ?? ""], {
+      encoding: "utf8",
+      env: {
+        ...commonEnv,
+        CURRENT_DEPLOYMENT_JSON: JSON.stringify({
+          id: deploymentID,
+          annotations: { "workers/message": currentMessage },
+          versions: [{ percentage: 100, version_id: deployedVersion }],
+        }),
+        DEPLOY_JOB_DEADLINE_EPOCH: String(Math.floor(Date.now() / 1000) + deadlineOffsetSeconds),
+        WRANGLER_MODE: mode,
+      },
+    });
+  }
+
+  try {
+    const success = runSeed();
+    assert.equal(success.status, 0, success.stdout + success.stderr);
+    assert.equal(JSON.parse(readFileSync(attemptPath, "utf8")).deployment_id, deploymentID);
+    assert.deepEqual(JSON.parse(readFileSync(seedReceiptPath, "utf8")), {
+      schema_version: 1,
+      target_sha: mergedCrawlRemoteMain,
+      deployment_id: deploymentID,
+      deployed_version: deployedVersion,
+      operation: "gitcrawl-query-canary-seed",
+      sql_sha256: "9be769bb99e63fc559296f259706a406bc50c7c34ee9bd06f9eeede4a0376c70",
+      response_sha256: createHash("sha256").update('[{"success":true}]\n').digest("hex"),
+    });
+
+    resetMutationState();
+    const foreignOwner = runSeed({ currentMessage: "another deployment" });
+    assert.notEqual(foreignOwner.status, 0);
+    assert.equal(existsSync(attemptPath), false);
+    assert.match(
+      foreignOwner.stdout + foreignOwner.stderr,
+      /canary-aware rollback Worker and current deployment ownership/,
+    );
+
+    resetMutationState();
+    const outOfTime = runSeed({ deadlineOffsetSeconds: 60 });
+    assert.notEqual(outOfTime.status, 0);
+    assert.equal(existsSync(attemptPath), false);
+    assert.match(outOfTime.stdout + outOfTime.stderr, /proof and rollback no longer fit/);
+
+    resetMutationState();
+    const unsafeRollback = runSeed({ previousCanarySupport: false });
+    assert.notEqual(unsafeRollback.status, 0);
+    assert.equal(existsSync(attemptPath), false);
+    assert.match(
+      unsafeRollback.stdout + unsafeRollback.stderr,
+      /canary-aware rollback Worker and current deployment ownership/,
+    );
+
+    resetMutationState();
+    const ambiguousSeed = runSeed({ mode: "seed-failure" });
+    assert.notEqual(ambiguousSeed.status, 0);
+    assert.equal(existsSync(attemptPath), true);
+    assert.equal(existsSync(seedReceiptPath), false);
+    assert.match(readFileSync(wranglerLogPath, "utf8"), /gitcrawl-query-canary-seed\.sql/);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("failed Worker release rolls back only the exact previously stable Worker version", () => {
   const workerDeploy = step(deploy, "Deploy verified Worker bundle");
   const deploymentState = step(deploy, "Resolve Worker deployment ownership");
   const deployReceipt = step(deploy, "Validate Worker deploy receipt");
   const postDeployMain = step(deploy, "Reauthorize current main after Worker deploy");
+  const canarySeed = step(deploy, "Seed hidden Gitcrawl production canary");
   const proof = step(deploy, "Poll exact production release");
   const finalMain = step(deploy, "Reauthorize current main after production proof");
   const ownershipRecovery = step(deploy, "Recover unresolved Worker deployment ownership");
@@ -1689,6 +1960,7 @@ test("failed Worker release rolls back only the exact previously stable Worker v
   assert.equal(deploymentState.id, "deployment-state");
   assert.equal(deployReceipt.id, "deploy-receipt");
   assert.equal(postDeployMain.id, "post-deploy-main");
+  assert.equal(canarySeed.id, "canary-seed");
   assert.equal(proof.id, "production-proof");
   assert.equal(finalMain.id, "final-main");
   assert.equal(proof["continue-on-error"], true);
@@ -1713,6 +1985,7 @@ test("failed Worker release rolls back only the exact previously stable Worker v
   assert.match(rollback.if ?? "", /steps\.worker-deploy\.outcome != 'success'/);
   assert.match(rollback.if ?? "", /steps\.deploy-receipt\.outcome != 'success'/);
   assert.match(rollback.if ?? "", /steps\.post-deploy-main\.outcome != 'success'/);
+  assert.match(rollback.if ?? "", /steps\.canary-seed\.outcome != 'success'/);
   assert.match(rollback.if ?? "", /steps\.production-proof\.outcome != 'success'/);
   assert.match(rollback.if ?? "", /steps\.final-main\.outcome != 'success'/);
   assert.match(workerDeploy.run ?? "", /WRANGLER_OUTPUT_FILE_PATH="\$DEPLOY_OUTPUT_PATH"/);
@@ -1748,13 +2021,15 @@ test("failed Worker release rolls back only the exact previously stable Worker v
   assert.match(run, /versions\[0\]\?\.percentage !== 100/);
   assert.match(run, /D1 migrations remain applied/);
   assert.equal(finalGate.if, "${{ always() }}");
-  assert.match(finalGate.run ?? "", /D1 migrations are not rolled back/);
+  assert.match(finalGate.run ?? "", /permanent query canary are not rolled back/);
   assert.match(finalGate.run ?? "", /WORKER_DEPLOY_OUTCOME.*DEPLOYMENT_STATE_OUTCOME/s);
   assert.match(finalGate.run ?? "", /MUTATION_OWNED.*DEPLOY_RECEIPT_OUTCOME/s);
   assert.match(finalGate.run ?? "", /DEPLOY_RECEIPT_OUTCOME.*POST_DEPLOY_MAIN_OUTCOME/s);
+  assert.match(finalGate.run ?? "", /CANARY_SEED_OUTCOME.*success/s);
   assert.match(finalGate.run ?? "", /PRODUCTION_PROOF_OUTCOME.*success/s);
   assert.match(finalGate.run ?? "", /FINAL_MAIN_OUTCOME.*success/s);
   assert.equal(finalGate.env?.FINAL_MAIN_OUTCOME, "${{ steps.final-main.outcome }}");
+  assert.equal(finalGate.env?.CANARY_SEED_OUTCOME, "${{ steps.canary-seed.outcome }}");
   assert.equal(
     finalGate.env?.OWNERSHIP_RECOVERY_OUTCOME,
     "${{ steps.ownership-recovery.outcome }}",
@@ -2909,6 +3184,9 @@ test("production proof polls semantic state and binds both responses to the rele
   assert.match(run, /\$WORKERS_DEV_URL\/v1\/contract/);
   assert.match(run, /\$PRODUCTION_ROUTE_URL\/health/);
   assert.match(run, /\$PRODUCTION_ROUTE_URL\/v1\/contract/);
+  assert.match(run, /\$PRODUCTION_ROUTE_URL\/v1\/archives/);
+  assert.match(run, /PRODUCTION_ROUTE_ARCHIVES_RESPONSE/);
+  assert.match(run, /exposed the hidden Gitcrawl query canary/);
   assert.match(
     run,
     /\$PRODUCTION_ROUTE_URL\/v1\/apps\/gitcrawl\/archives\/\$canary_route_archive\/query/,
@@ -2918,6 +3196,8 @@ test("production proof polls semantic state and binds both responses to the rele
   assert.match(run, /live-coverage\.json/);
   assert.match(run, /"POST"/);
   assert.match(run, /gitcrawl-query-safety-v3/);
+  assert.match(run, /gitcrawl\.query-canary\.permanent\.v1/);
+  assert.match(run, /missing permanent query canary support/);
   assert.match(run, /read-only POST query route/);
   assert.match(run, /safe read-only Gitcrawl query/);
   assert.match(run, /CF-Access-Client-Id/);
@@ -2978,6 +3258,7 @@ test("production semantic validator requires workers.dev and the Access route", 
   const workersDevContractPath = join(directory, "workers-dev-contract.json");
   const productionRouteHealthPath = join(directory, "production-route-health.json");
   const productionRouteContractPath = join(directory, "production-route-contract.json");
+  const productionRouteArchivesPath = join(directory, "production-route-archives.json");
   const productionRouteQueryDirectory = join(directory, "production-route-queries");
   const releaseSha = mergedCrawlRemoteMain;
   const observationCapability = "gitcrawl.observation-order.v1";
@@ -3010,6 +3291,7 @@ test("production semantic validator requires workers.dev and the Access route", 
     queryContractVersion?: string;
     queryResponses?: Partial<Record<RequiredQueryName, Record<string, unknown> | null>>;
     liveCoverageResponse?: Record<string, unknown> | null;
+    archives?: unknown;
   }
 
   const proofNow = "2026-07-14T12:00:00.000Z";
@@ -3229,7 +3511,7 @@ test("production semantic validator requires workers.dev and the Access route", 
       values,
       snapshot: {
         id: canarySnapshotId,
-        source_sha256: canarySnapshotId,
+        source_sha256: "",
         schema_name: "gitcrawl-portable",
         schema_version: 1,
         schema_hash: "schema-v1",
@@ -3284,6 +3566,7 @@ test("production semantic validator requires workers.dev and the Access route", 
   ) {
     const defaultCapabilities = [
       querySafetyCapability,
+      "gitcrawl.query-canary.permanent.v1",
       ...(observationState === "active" ? [observationCapability] : []),
       ...(snapshotState === "active" ? [snapshotProvenanceCapability] : []),
     ];
@@ -3325,6 +3608,14 @@ test("production semantic validator requires workers.dev and the Access route", 
     }
     writeEndpoint(workersDevHealthPath, workersDevContractPath, workersDev);
     writeEndpoint(productionRouteHealthPath, productionRouteContractPath, productionRoute);
+    writeFileSync(
+      productionRouteArchivesPath,
+      JSON.stringify({
+        archives: Object.hasOwn(productionRoute, "archives")
+          ? productionRoute.archives
+          : [{ id: "gitcrawl/openclaw__openclaw" }],
+      }),
+    );
     rmSync(productionRouteQueryDirectory, { recursive: true, force: true });
     mkdirSync(productionRouteQueryDirectory, { recursive: true });
     for (const queryName of requiredQueryNames) {
@@ -3356,6 +3647,7 @@ test("production semantic validator requires workers.dev and the Access route", 
         CUSTOM_ROUTE_PROOF: customRouteProof,
         DEPLOY_SHA: releaseSha,
         OBSERVATION_ORDER_STATE: observationState,
+        PRODUCTION_ROUTE_ARCHIVES_RESPONSE: productionRouteArchivesPath,
         PRODUCTION_ROUTE_CONTRACT_RESPONSE: productionRouteContractPath,
         PRODUCTION_ROUTE_HEALTH_RESPONSE: productionRouteHealthPath,
         PRODUCTION_ROUTE_QUERY_RESPONSE_DIR: productionRouteQueryDirectory,
@@ -3373,6 +3665,17 @@ test("production semantic validator requires workers.dev and the Access route", 
     assert.notEqual(validate("dormant", "dormant", { healthSha: "b".repeat(40) }).status, 0);
     assert.notEqual(validate("dormant", "dormant", {}, { contractSha: "b".repeat(40) }).status, 0);
     assert.equal(validate("dormant", "dormant", {}, {}).status, 0);
+    const exposedCanary = validate(
+      "dormant",
+      "dormant",
+      {},
+      {
+        archives: [{ id: canaryArchive }],
+      },
+    );
+    assert.notEqual(exposedCanary.status, 0);
+    assert.match(exposedCanary.stderr, /exposed the hidden Gitcrawl query canary/);
+    assert.notEqual(validate("dormant", "dormant", {}, { archives: null }).status, 0);
     assert.notEqual(validate("active", "dormant", { capabilities: [] }).status, 0);
     assert.notEqual(validate("dormant", "active", { capabilities: [] }).status, 0);
     assert.notEqual(
