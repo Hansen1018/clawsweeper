@@ -24,6 +24,7 @@ test("label tagging uses retrying GitHub helpers", () => {
   assert.match(source, /runLabelMutationWithRetry\([\s\S]*kind: "repository_label_create"/);
   assert.match(source, /for \(let attempt = 1; attempt <= attempts; attempt \+= 1\)/);
   assert.match(source, /return runRepairMutation\(lifecycle,/);
+  assert.match(source, /if \(attempt >= attempts \|\| retryKind === "none"\) throw error;/);
   assert.doesNotMatch(source, /ghTextWithRetry/);
 });
 
@@ -133,6 +134,48 @@ test("definite add-label rejection is recorded without claiming a mutation", () 
   }
 });
 
+test("secondary-rate-limit rejection records no mutation before retrying successfully", () => {
+  const fixture = createFixture();
+  try {
+    const result = runTag(fixture, {
+      invocation: "secondary-rate-limit",
+      labelExists: true,
+      addFailure: "gh: You have exceeded a secondary rate limit. (HTTP 403)",
+      retryAttempts: 2,
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const report = JSON.parse(fs.readFileSync(fixture.reportPath, "utf8"));
+    assert.equal(report.targets[0].status, "labeled");
+
+    finalizeLedger(fixture, "secondary-rate-limit");
+    const mutations = readEvents(fixture.outputRoot).filter(
+      (event) =>
+        event.event_type === "repair.mutation" &&
+        event.producer.component.startsWith("tag_clawsweeper_targets.") &&
+        event.subject.kind === "pull_request",
+    );
+    assert.deepEqual(
+      mutations.map((event) => [
+        event.attributes.completion_reason,
+        event.action.status,
+        event.action.mutation,
+        event.action.retryable,
+      ]),
+      [
+        ["mutation_attempted", "started", false, true],
+        ["mutation_rejected", "skipped", false, false],
+        ["mutation_attempted", "started", false, true],
+        ["mutation_accepted", "executed", true, false],
+      ],
+    );
+    assert.equal(new Set(mutations.map((event) => event.idempotency_key_sha256)).size, 1);
+    const state = JSON.parse(fs.readFileSync(fixture.statePath, "utf8"));
+    assert.equal(state.addCount, 2);
+  } finally {
+    fs.rmSync(fixture.root, { force: true, recursive: true });
+  }
+});
+
 type Fixture = ReturnType<typeof createFixture>;
 
 function createFixture() {
@@ -167,6 +210,7 @@ function runTag(
     labelExists: boolean;
     itemHasLabel?: boolean;
     addFailure?: string;
+    retryAttempts?: number;
   },
 ) {
   const state = fs.existsSync(fixture.statePath)
@@ -198,7 +242,7 @@ function runTag(
         CLAWSWEEPER_ACTION_LEDGER_INVOCATION: options.invocation,
         CLAWSWEEPER_ACTION_LEDGER_PARTITION_DATE: "2026-07-13",
         CLAWSWEEPER_ALLOW_EXECUTE: "1",
-        CLAWSWEEPER_GH_RETRY_ATTEMPTS: "1",
+        CLAWSWEEPER_GH_RETRY_ATTEMPTS: String(options.retryAttempts ?? 1),
         FAKE_GH_STATE: fixture.statePath,
         GITHUB_ACTION: "tag-labels",
         GITHUB_JOB: "cluster",
@@ -209,9 +253,18 @@ function runTag(
         GITHUB_WORKFLOW: "repair cluster worker",
         GITHUB_WORKFLOW_REF:
           "openclaw/clawsweeper/.github/workflows/repair-cluster-worker.yml@refs/heads/main",
+        ...(options.retryAttempts && options.retryAttempts > 1
+          ? { NODE_OPTIONS: `--require=${writeNoWaitPreload(fixture.root)}` }
+          : {}),
       },
     },
   );
+}
+
+function writeNoWaitPreload(root: string): string {
+  const preloadPath = path.join(root, "no-wait.cjs");
+  fs.writeFileSync(preloadPath, `Atomics.wait = () => "timed-out";\n`);
+  return preloadPath;
 }
 
 function finalizeLedger(fixture: Fixture, invocation: string) {

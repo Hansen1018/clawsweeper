@@ -512,6 +512,246 @@ test("target fanout closes a failed request attempt without advancing the cursor
   }
 });
 
+test("target fanout records definitive dispatch rejection without claiming mutation", () => {
+  const fixture = isolatedFanoutFixture();
+  const cursorPath = join(fixture.root, "results", "target-fanout-cursors", "hot-intake.json");
+  const outputRoot = join(fixture.root, "action-ledger-output");
+  mkdirSync(outputRoot, { recursive: true });
+
+  try {
+    const result = spawnSync(
+      process.execPath,
+      [
+        fixture.scriptPath,
+        "--mode",
+        "hot-intake",
+        "--limit",
+        "1",
+        "--cursor-path",
+        cursorPath,
+        "--repo",
+        "openclaw/clawsweeper",
+        "--owners",
+        "openclaw",
+      ],
+      {
+        cwd: fixture.root,
+        encoding: "utf8",
+        env: {
+          ...fanoutActionLedgerEnv(fixture.ghPath, outputRoot, "7103"),
+          FAIL_DISPATCH: "rejected",
+        },
+      },
+    );
+    assert.equal(result.status, 1);
+    assert.equal(existsSync(cursorPath), false);
+
+    const events = readActionLedgerEvents(outputRoot);
+    const attempt = events.find(
+      (event) => event.event_type === "dispatch.lifecycle" && event.action.status === "started",
+    );
+    const outcome = events.find(
+      (event) => event.event_type === "dispatch.lifecycle" && event.action.status === "skipped",
+    );
+    assert.ok(attempt);
+    assert.ok(outcome);
+    assert.equal(outcome.parent_event_id, attempt.event_id);
+    assert.equal(outcome.idempotency_key_sha256, attempt.idempotency_key_sha256);
+    assert.equal(outcome.attributes?.completion_reason, "mutation_rejected");
+    assert.equal(outcome.action.mutation, false);
+    assert.equal(outcome.action.retryable, false);
+
+    const terminal = events.at(-1);
+    assert.equal(terminal?.event_type, "queue.lifecycle");
+    assert.equal(terminal?.action.status, "failed");
+    assert.equal(terminal?.action.retryable, false);
+    assert.equal(terminal?.action.mutation, false);
+    assert.equal(terminal?.attributes?.partial, false);
+    assert.equal(terminal?.attributes?.completion_reason, "dispatch_rejected");
+  } finally {
+    rmSync(fixture.root, { force: true, recursive: true });
+  }
+});
+
+for (const failure of [{ name: "secondary-rate-limit 403", value: "secondary-rate-limit" }]) {
+  test(`target fanout keeps definitive ${failure.name} rejection retryable`, () => {
+    const fixture = isolatedFanoutFixture();
+    const cursorPath = join(fixture.root, "results", "target-fanout-cursors", "hot-intake.json");
+    const outputRoot = join(fixture.root, "action-ledger-output");
+    mkdirSync(outputRoot, { recursive: true });
+
+    try {
+      const result = spawnSync(
+        process.execPath,
+        [
+          fixture.scriptPath,
+          "--mode",
+          "hot-intake",
+          "--limit",
+          "1",
+          "--cursor-path",
+          cursorPath,
+          "--repo",
+          "openclaw/clawsweeper",
+          "--owners",
+          "openclaw",
+        ],
+        {
+          cwd: fixture.root,
+          encoding: "utf8",
+          env: {
+            ...fanoutActionLedgerEnv(fixture.ghPath, outputRoot, `7104-${failure.value}`),
+            FAIL_DISPATCH: failure.value,
+          },
+        },
+      );
+      assert.equal(result.status, 1);
+      assert.equal(existsSync(cursorPath), false);
+
+      const events = readActionLedgerEvents(outputRoot);
+      const outcome = events.find(
+        (event) => event.event_type === "dispatch.lifecycle" && event.action.status === "skipped",
+      );
+      assert.ok(outcome);
+      assert.equal(outcome.attributes?.completion_reason, "mutation_rejected");
+      assert.equal(outcome.action.mutation, false);
+      assert.equal(outcome.action.retryable, true);
+
+      const terminal = events.at(-1);
+      assert.equal(terminal?.event_type, "queue.lifecycle");
+      assert.equal(terminal?.action.status, "failed");
+      assert.equal(terminal?.action.retryable, true);
+      assert.equal(terminal?.action.mutation, false);
+      assert.equal(terminal?.attributes?.partial, false);
+      assert.equal(terminal?.attributes?.completion_reason, "dispatch_rejected");
+    } finally {
+      rmSync(fixture.root, { force: true, recursive: true });
+    }
+  });
+}
+
+test("target fanout keeps HTTP 429 dispatch outcomes unknown and replay-unsafe", () => {
+  const fixture = isolatedFanoutFixture();
+  const cursorPath = join(fixture.root, "results", "target-fanout-cursors", "hot-intake.json");
+  const outputRoot = join(fixture.root, "action-ledger-output");
+  mkdirSync(outputRoot, { recursive: true });
+
+  try {
+    const result = spawnSync(
+      process.execPath,
+      [
+        fixture.scriptPath,
+        "--mode",
+        "hot-intake",
+        "--limit",
+        "1",
+        "--cursor-path",
+        cursorPath,
+        "--repo",
+        "openclaw/clawsweeper",
+        "--owners",
+        "openclaw",
+      ],
+      {
+        cwd: fixture.root,
+        encoding: "utf8",
+        env: {
+          ...fanoutActionLedgerEnv(fixture.ghPath, outputRoot, "7104-rate-limit"),
+          FAIL_DISPATCH: "rate-limit",
+        },
+      },
+    );
+    assert.equal(result.status, 1);
+    assert.equal(existsSync(cursorPath), false);
+
+    const events = readActionLedgerEvents(outputRoot);
+    const outcome = events.find(
+      (event) => event.event_type === "dispatch.lifecycle" && event.action.status === "failed",
+    );
+    assert.ok(outcome);
+    assert.equal(outcome.attributes?.completion_reason, "dispatch_outcome_unknown");
+    assert.equal(outcome.action.mutation, true);
+    assert.equal(outcome.action.retryable, false);
+
+    const terminal = events.at(-1);
+    assert.equal(terminal?.event_type, "queue.lifecycle");
+    assert.equal(terminal?.action.status, "failed");
+    assert.equal(terminal?.action.retryable, false);
+    assert.equal(terminal?.action.mutation, true);
+    assert.equal(terminal?.attributes?.partial, true);
+    assert.equal(terminal?.attributes?.completion_reason, "dispatch_outcome_unknown");
+  } finally {
+    rmSync(fixture.root, { force: true, recursive: true });
+  }
+});
+
+test("target fanout keeps a partially dispatched throttled batch replay-unsafe", () => {
+  const fixture = isolatedFanoutFixture();
+  const cursorPath = join(fixture.root, "results", "target-fanout-cursors", "hot-intake.json");
+  const outputRoot = join(fixture.root, "action-ledger-output");
+  mkdirSync(outputRoot, { recursive: true });
+
+  try {
+    const result = spawnSync(
+      process.execPath,
+      [
+        fixture.scriptPath,
+        "--mode",
+        "hot-intake",
+        "--limit",
+        "2",
+        "--cursor-path",
+        cursorPath,
+        "--repo",
+        "openclaw/clawsweeper",
+        "--owners",
+        "openclaw",
+      ],
+      {
+        cwd: fixture.root,
+        encoding: "utf8",
+        env: {
+          ...fanoutActionLedgerEnv(fixture.ghPath, outputRoot, "7105"),
+          FAIL_SECOND_DISPATCH: "secondary-rate-limit",
+        },
+      },
+    );
+    assert.equal(result.status, 1);
+    assert.equal(existsSync(cursorPath), false);
+
+    const events = readActionLedgerEvents(outputRoot);
+    const firstOutcome = events.find(
+      (event) =>
+        event.event_type === "dispatch.lifecycle" &&
+        event.subject.repository === "openclaw/a" &&
+        event.action.status === "dispatched",
+    );
+    const secondOutcome = events.find(
+      (event) =>
+        event.event_type === "dispatch.lifecycle" &&
+        event.subject.repository === "openclaw/b" &&
+        event.action.status === "skipped",
+    );
+    assert.ok(firstOutcome);
+    assert.ok(secondOutcome);
+    assert.equal(firstOutcome.action.mutation, true);
+    assert.equal(secondOutcome.action.mutation, false);
+    assert.equal(secondOutcome.action.retryable, true);
+    assert.equal(secondOutcome.attributes?.completion_reason, "mutation_rejected");
+
+    const terminal = events.at(-1);
+    assert.equal(terminal?.event_type, "queue.lifecycle");
+    assert.equal(terminal?.action.status, "failed");
+    assert.equal(terminal?.action.retryable, false);
+    assert.equal(terminal?.action.mutation, true);
+    assert.equal(terminal?.attributes?.processed_count, 1);
+    assert.equal(terminal?.attributes?.partial, true);
+    assert.equal(terminal?.attributes?.completion_reason, "dispatch_rejected");
+  } finally {
+    rmSync(fixture.root, { force: true, recursive: true });
+  }
+});
+
 test("target fanout publishes its cursor before finalizing and publishing exact shards", () => {
   const workflow = readFileSync(".github/workflows/sweep.yml", "utf8");
   const start = workflow.indexOf("\n  target-fanout:");
@@ -599,6 +839,25 @@ if (args[0] === "repo" && args[1] === "list") {
   process.exit(0);
 }
 if (args[0] === "api" && args[1].endsWith("/dispatches")) {
+  if (
+    process.env.FAIL_SECOND_DISPATCH === "secondary-rate-limit" &&
+    args.includes("client_payload[target_repo]=openclaw/b")
+  ) {
+    process.stderr.write("gh: You have exceeded a secondary rate limit. (HTTP 403)");
+    process.exit(1);
+  }
+  if (process.env.FAIL_DISPATCH === "secondary-rate-limit") {
+    process.stderr.write("gh: You have exceeded a secondary rate limit. (HTTP 403)");
+    process.exit(1);
+  }
+  if (process.env.FAIL_DISPATCH === "rate-limit") {
+    process.stderr.write("gh: API rate limit exceeded (HTTP 429)");
+    process.exit(1);
+  }
+  if (process.env.FAIL_DISPATCH === "rejected") {
+    process.stderr.write("gh: Validation Failed (HTTP 422)");
+    process.exit(1);
+  }
   if (process.env.FAIL_DISPATCH === "1") {
     process.stderr.write("sensitive-dispatch-marker https://example.invalid/private");
     process.exit(7);

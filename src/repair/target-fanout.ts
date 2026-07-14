@@ -12,6 +12,8 @@ import {
 } from "../action-ledger.js";
 import { flushWorkflowActionEvents, recordWorkflowPhaseEvent } from "../action-ledger-runtime.js";
 import { resolveCommand } from "../command.js";
+import { ghRetryKind } from "../github-retry.js";
+import { ghErrorText } from "./github-cli.js";
 import { parseArgs, repoRoot } from "./lib.js";
 
 type JsonRecord = Record<string, unknown>;
@@ -77,7 +79,12 @@ interface FanoutActionLedger {
   dispatchedCount: number;
   mutationObserved: boolean;
   uncertainMutationObserved: boolean;
-  uncertainCompletionReason: "dispatch_outcome_unknown" | "mutation_outcome_unknown" | null;
+  failureCompletionReason:
+    | "dispatch_rejected"
+    | "dispatch_outcome_unknown"
+    | "mutation_outcome_unknown"
+    | null;
+  failureRetryable: boolean | null;
   terminal: boolean;
 }
 
@@ -234,7 +241,8 @@ function startFanoutActionLedger(options: FanoutOptions): FanoutActionLedger {
     dispatchedCount: 0,
     mutationObserved: false,
     uncertainMutationObserved: false,
-    uncertainCompletionReason: null,
+    failureCompletionReason: null,
+    failureRetryable: null,
     terminal: false,
   };
 }
@@ -318,16 +326,23 @@ function recordFanoutDispatch(
   try {
     dispatch();
   } catch (error) {
+    const failure = fanoutDispatchFailure(error);
     const failed = recordWorkflowPhaseEvent(repoRoot(), {
       phase: ACTION_EVENT_TYPES.dispatchLifecycle,
-      status: ACTION_EVENT_STATUSES.failed,
-      reasonCode: ACTION_EVENT_REASON_CODES.unavailable,
-      retryable: false,
-      mutation: true,
+      status:
+        failure.outcome === "rejected"
+          ? ACTION_EVENT_STATUSES.skipped
+          : ACTION_EVENT_STATUSES.failed,
+      reasonCode:
+        failure.outcome === "rejected"
+          ? ACTION_EVENT_REASON_CODES.notApplicable
+          : ACTION_EVENT_REASON_CODES.unavailable,
+      retryable: failure.retryable,
+      mutation: failure.outcome === "unknown",
       identity: {
         slot: "fanout_dispatch_outcome",
         targetRepo: repository.targetRepo,
-        outcome: "failed",
+        outcome: failure.outcome,
       },
       operation: "target_fanout",
       operationIdentity: ledger.operationIdentity,
@@ -339,7 +354,8 @@ function recordFanoutDispatch(
       evidence: [{ kind: "fanout_dispatch_request", sha256: sha256(JSON.stringify(request)) }],
       attributes: {
         attempt: 1,
-        completion_reason: "dispatch_outcome_unknown",
+        completion_reason:
+          failure.outcome === "rejected" ? "mutation_rejected" : "dispatch_outcome_unknown",
         dispatch_kind: fanoutDispatchKind(options.mode),
         failed_count: 1,
         work_kind: options.mode,
@@ -347,9 +363,14 @@ function recordFanoutDispatch(
       privacy: fanoutActionLedgerPrivacy(),
     });
     ledger.lastEventId = failed?.event_id ?? ledger.lastEventId;
-    ledger.mutationObserved = true;
-    ledger.uncertainMutationObserved = true;
-    ledger.uncertainCompletionReason = "dispatch_outcome_unknown";
+    ledger.failureRetryable = failure.retryable;
+    if (failure.outcome === "rejected") {
+      ledger.failureCompletionReason = "dispatch_rejected";
+    } else {
+      ledger.mutationObserved = true;
+      ledger.uncertainMutationObserved = true;
+      ledger.failureCompletionReason = "dispatch_outcome_unknown";
+    }
     throw error;
   }
   const completed = recordWorkflowPhaseEvent(repoRoot(), {
@@ -492,7 +513,8 @@ function recordFanoutCursorPublication(
     ledger.lastEventId = failed?.event_id ?? ledger.lastEventId;
     ledger.mutationObserved = true;
     ledger.uncertainMutationObserved = true;
-    ledger.uncertainCompletionReason = "mutation_outcome_unknown";
+    ledger.failureCompletionReason = "mutation_outcome_unknown";
+    ledger.failureRetryable = false;
     throw error;
   }
   const completed = recordWorkflowPhaseEvent(repoRoot(), {
@@ -535,7 +557,11 @@ function finishFanoutActionLedger(
       : options.dryRun
         ? ACTION_EVENT_REASON_CODES.dryRun
         : ACTION_EVENT_REASON_CODES.completed,
-    retryable: failed && !ledger.mutationObserved && !ledger.uncertainMutationObserved,
+    retryable:
+      failed &&
+      !ledger.mutationObserved &&
+      !ledger.uncertainMutationObserved &&
+      (ledger.failureRetryable ?? true),
     mutation: ledger.mutationObserved || ledger.uncertainMutationObserved,
     identity: { slot: "fanout_queue_terminal", outcome: failed ? "failed" : "completed" },
     operation: "target_fanout",
@@ -557,7 +583,7 @@ function finishFanoutActionLedger(
       duration_ms: Math.max(0, Date.now() - ledger.startedAtMs),
       partial: failed && (ledger.mutationObserved || ledger.uncertainMutationObserved),
       completion_reason: failed
-        ? (ledger.uncertainCompletionReason ?? "failed")
+        ? (ledger.failureCompletionReason ?? "failed")
         : options.dryRun
           ? "dry_run"
           : "completed",
@@ -632,6 +658,27 @@ function sha256(value: string): string {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function fanoutDispatchFailure(error: unknown): {
+  outcome: "rejected" | "unknown";
+  retryable: boolean;
+} {
+  const code =
+    error && typeof error === "object" && "code" in error
+      ? String((error as NodeJS.ErrnoException).code ?? "")
+      : "";
+  if (code === "ENOENT" || code === "EACCES") {
+    return { outcome: "rejected", retryable: false };
+  }
+  const rejected =
+    /\b(?:HTTP|status(?: code)?)\s*:?\s*(?:400|401|403|404|405|406|407|410|411|413|414|415|416|417|421|422|426|428|431|451)\b/i.test(
+      ghErrorText(error),
+    );
+  return {
+    outcome: rejected ? "rejected" : "unknown",
+    retryable: rejected && ghRetryKind(error) !== "none",
+  };
 }
 
 export function readInventoryConfig(

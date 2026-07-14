@@ -513,9 +513,7 @@ function runLabelMutationWithRetry(
     } catch (error) {
       lastError = error;
       const retryKind = ghRetryKind(error);
-      if (attempt >= attempts || retryKind === "none" || githubMutationRejectedBeforeWrite(error)) {
-        throw error;
-      }
+      if (attempt >= attempts || retryKind === "none") throw error;
       sleepMs(ghRetryWaitMs(retryKind, attempt - 1));
     }
   }

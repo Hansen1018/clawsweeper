@@ -274,7 +274,7 @@ test("spam comment intake records explicit dispatch rejection without claiming m
   }
 });
 
-test("spam comment intake records unknown transport outcomes without masking the failure", async () => {
+test("spam comment intake records unknown transport outcomes as replay-unsafe", async () => {
   const primary = new Error("network failed after request start");
   const result = await runLedgerIntake({
     runId: "8104",
@@ -290,14 +290,42 @@ test("spam comment intake records unknown transport outcomes without masking the
     );
     assert.ok(outcome);
     assert.equal(outcome.action.mutation, true);
-    assert.equal(outcome.action.retryable, true);
+    assert.equal(outcome.action.retryable, false);
     assert.equal(outcome.attributes?.completion_reason, "mutation_outcome_unknown");
 
     const terminal = result.events.at(-1);
     assert.equal(terminal?.event_type, "review.batch");
     assert.equal(terminal?.action.status, "failed");
     assert.equal(terminal?.action.mutation, true);
-    assert.equal(terminal?.action.retryable, true);
+    assert.equal(terminal?.action.retryable, false);
+    assert.equal(terminal?.attributes?.partial, true);
+    assert.equal(terminal?.attributes?.completion_reason, "dispatch_outcome_unknown");
+  } finally {
+    fs.rmSync(result.root, { force: true, recursive: true });
+  }
+});
+
+test("spam comment intake keeps ambiguous HTTP dispatch outcomes unknown and replay-unsafe", async () => {
+  const result = await runLedgerIntake({
+    runId: "8105",
+    fetch: async () => new Response(null, { status: 503 }),
+    expectError: /spam scanner dispatch rejected: 503/,
+  });
+
+  try {
+    const outcome = result.events.find(
+      (event) => event.event_type === "dispatch.lifecycle" && event.action.status === "failed",
+    );
+    assert.ok(outcome);
+    assert.equal(outcome.action.mutation, true);
+    assert.equal(outcome.action.retryable, false);
+    assert.equal(outcome.attributes?.completion_reason, "mutation_outcome_unknown");
+
+    const terminal = result.events.at(-1);
+    assert.equal(terminal?.event_type, "review.batch");
+    assert.equal(terminal?.action.status, "failed");
+    assert.equal(terminal?.action.mutation, true);
+    assert.equal(terminal?.action.retryable, false);
     assert.equal(terminal?.attributes?.partial, true);
     assert.equal(terminal?.attributes?.completion_reason, "dispatch_outcome_unknown");
   } finally {

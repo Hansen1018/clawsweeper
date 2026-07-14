@@ -729,7 +729,7 @@ function recordDispatchOutcome(
           : options.outcome === "rejected"
             ? ACTION_EVENT_REASON_CODES.notApplicable
             : ACTION_EVENT_REASON_CODES.unavailable,
-      retryable: options.outcome === "unknown",
+      retryable: false,
       mutation: options.outcome !== "rejected",
       identity: {
         slot: "spam_dispatch_outcome",
@@ -783,7 +783,7 @@ function recordIntakeTerminal(
             ? ACTION_EVENT_STATUSES.skipped
             : ACTION_EVENT_STATUSES.failed,
       reasonCode: terminalReasonCode(summary),
-      retryable: ledger.uncertainMutationObserved,
+      retryable: false,
       mutation: ledger.mutationObserved,
       identity: {
         slot: "spam_intake_terminal",
