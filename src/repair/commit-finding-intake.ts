@@ -496,13 +496,14 @@ function parseCommitReport(markdown: string) {
 }
 
 function assertCommitReportIdentity(report: LooseRecord, targetRepo: string, sha: string): void {
-  const reportRepo = String(report.repository ?? "").trim();
+  const expectedRepo = normalizeRepo(targetRepo);
+  const reportRepo = normalizeRepo(String(report.repository ?? ""));
   const reportSha = String(report.sha ?? "")
     .trim()
     .toLowerCase();
-  if (reportRepo !== targetRepo || reportSha !== sha) {
+  if (reportRepo !== expectedRepo || reportSha !== sha) {
     die(
-      `commit finding report identity mismatch: expected ${targetRepo}@${sha}, got ${reportRepo || "missing"}@${reportSha || "missing"}`,
+      `commit finding report identity mismatch: expected ${expectedRepo}@${sha}, got ${reportRepo || "missing"}@${reportSha || "missing"}`,
     );
   }
 }

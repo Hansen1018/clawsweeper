@@ -17,6 +17,7 @@ import {
   parseRepairActionLedgerManifest,
   serializeRepairActionLedgerManifest,
 } from "../../dist/repair/repair-action-ledger-manifest.js";
+import { ACTION_EVENT_SHARD_IMPORT_LIMITS } from "../../dist/action-ledger-runtime.js";
 import { recordCommitArtifactPrepared } from "../../dist/commit-action-ledger.js";
 import {
   flushRepairActionEvents,
@@ -199,6 +200,40 @@ test("repair manifests allow an explicitly empty producer run without weakening 
       /shard set mismatch: .*extra=ledger\//,
     );
   } finally {
+    restoreEnv(previous);
+    fs.rmSync(root, { force: true, recursive: true });
+  }
+});
+
+test("repair manifest finalization enforces the publication aggregate byte budget", async () => {
+  const root = fs.realpathSync(
+    fs.mkdtempSync(path.join(os.tmpdir(), "repair-manifest-byte-budget-")),
+  );
+  const outputRoot = path.join(root, "output");
+  fs.mkdirSync(outputRoot);
+  const previous = { ...process.env };
+  const mutableLimits = ACTION_EVENT_SHARD_IMPORT_LIMITS as unknown as {
+    maxTotalBytes: number;
+  };
+  const originalMaxTotalBytes = mutableLimits.maxTotalBytes;
+  Object.assign(process.env, workflowEnv(root, outputRoot));
+
+  try {
+    recordRepairLifecycleEvent(repairLifecycle(), {
+      type: ACTION_EVENT_TYPES.repairPlan,
+      status: ACTION_EVENT_STATUSES.completed,
+      reasonCode: ACTION_EVENT_REASON_CODES.completed,
+      mutation: false,
+      component: "repair_worker",
+      state: "planned",
+    });
+    mutableLimits.maxTotalBytes = 1;
+    await assert.rejects(
+      finalizeRepairActionLedgerManifest("cluster"),
+      /repair action ledger manifest exceeds 1 total shard bytes/,
+    );
+  } finally {
+    mutableLimits.maxTotalBytes = originalMaxTotalBytes;
     restoreEnv(previous);
     fs.rmSync(root, { force: true, recursive: true });
   }

@@ -296,6 +296,75 @@ test("commit finding intake rejects a valid immutable report for another source"
   }
 });
 
+test("commit finding intake accepts mixed-case report repository identity", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "commit-finding-intake-repository-case-"));
+  const unique = randomUUID().replaceAll("-", "").slice(0, 12);
+  const targetRepo = `fixture-${unique}/repo`;
+  const mixedCaseRepo = `Fixture-${unique}/Repo`;
+  const targetSlug = `fixture-${unique}-repo`;
+  const sha = "7".repeat(40);
+  const revision = "8".repeat(40);
+  const reportPath = `records/${targetSlug}/commits/${sha}.md`;
+  const reportFile = path.join(root, "report.md");
+  const reportBytes = Buffer.from(
+    `---\nresult: no_findings\nsha: ${sha}\nrepository: ${mixedCaseRepo}\n---\n\n## Summary\n\nNo remaining finding.\n`,
+    "utf8",
+  );
+  const ghPath = path.join(root, "gh.js");
+  const auditRoot = path.join(process.cwd(), "results", "commit-findings", targetSlug);
+  fs.writeFileSync(reportFile, reportBytes);
+  fs.writeFileSync(
+    ghPath,
+    [
+      "const args = process.argv.slice(2);",
+      `if (args[0] === "api" && args[1] === ${JSON.stringify(`repos/${targetRepo}/commits/main`)}) {`,
+      `  process.stdout.write(${JSON.stringify("9".repeat(40))});`,
+      "  process.exit(0);",
+      "}",
+      'process.stderr.write(`unexpected gh args: ${args.join(" ")}\\n`);',
+      "process.exit(1);",
+    ].join("\n"),
+    { mode: 0o755 },
+  );
+
+  try {
+    const child = spawnSync(
+      process.execPath,
+      [
+        path.resolve("dist/repair/commit-finding-intake.js"),
+        "prepare",
+        "--target-repo",
+        targetRepo,
+        "--commit-sha",
+        sha,
+        "--report-repo",
+        "openclaw/clawsweeper-state",
+        "--report-path",
+        reportPath,
+        "--report-revision",
+        revision,
+        "--report-sha256",
+        createHash("sha256").update(reportBytes).digest("hex"),
+        "--report-file",
+        reportFile,
+      ],
+      {
+        cwd: process.cwd(),
+        encoding: "utf8",
+        env: { ...process.env, ...mockGhBinEnv(ghPath, root) },
+      },
+    );
+
+    assert.equal(child.status, 0, child.stderr);
+    const summary = JSON.parse(child.stdout);
+    assert.equal(summary.status, "non_findings");
+    assert.equal(summary.target_repo, targetRepo);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(auditRoot, { recursive: true, force: true });
+  }
+});
+
 test("commit finding intake classifies missing report blobs as skips", () => {
   const revision = "c".repeat(40);
   assert.equal(isMissingGithubContentError("gh: Not Found (HTTP 404)"), true);

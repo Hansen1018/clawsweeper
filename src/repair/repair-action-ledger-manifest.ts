@@ -66,6 +66,20 @@ export async function finalizeRepairActionLedgerManifest(
       `repair action ledger manifest exceeds ${ACTION_EVENT_SHARD_IMPORT_LIMITS.maxFiles} event paths`,
     );
   }
+  const totalShardBytes = repairShards.reduce(
+    (total, shard) =>
+      total +
+      Buffer.byteLength(
+        `${shard.events.map((event) => actionLedgerJson(event)).join("\n")}\n`,
+        "utf8",
+      ),
+    0,
+  );
+  if (totalShardBytes > ACTION_EVENT_SHARD_IMPORT_LIMITS.maxTotalBytes) {
+    throw new Error(
+      `repair action ledger manifest exceeds ${ACTION_EVENT_SHARD_IMPORT_LIMITS.maxTotalBytes} total shard bytes`,
+    );
+  }
   const events = repairShards.flatMap((shard) => shard.events);
   if (eventPaths.length > 0 && events.length === 0) {
     throw new Error(`repair action ledger lane ${lane} finalized empty event shards`);
