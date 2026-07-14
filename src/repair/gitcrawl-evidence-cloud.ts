@@ -111,7 +111,7 @@ export class CloudGitcrawlQuerySource implements GitcrawlQuerySource {
       try {
         response = await this.fetchImpl(queryUrl, {
           method: "POST",
-          redirect: "error",
+          redirect: "manual",
           headers: this.requestHeaders(),
           body: JSON.stringify({
             contract_version: GITCRAWL_QUERY_CONTRACT_VERSION,
@@ -138,6 +138,10 @@ export class CloudGitcrawlQuerySource implements GitcrawlQuerySource {
       } catch (error) {
         await response.body?.cancel().catch(() => undefined);
         throw error;
+      }
+      if (response.status >= 300 && response.status <= 399) {
+        await response.body?.cancel().catch(() => undefined);
+        throw new Error(`Gitcrawl cloud query ${request.name} refused a redirected response`);
       }
       if (response.ok) {
         try {

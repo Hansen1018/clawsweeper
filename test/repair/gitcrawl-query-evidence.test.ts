@@ -140,6 +140,51 @@ test("query evidence fails closed on source, relation, review, and packet drift"
     await adapter.close();
   });
 
+  await t.test("bounded queries reject nonterminal truncation and bind max_rows", async () => {
+    const source = new FixtureSource({
+      rows: {
+        "gitcrawl.clusters.list": [clusterRow(), clusterRow({ cluster_id: 8 })],
+      },
+    });
+    const adapter = await GitcrawlEvidenceAdapter.fromSources({
+      repository,
+      provider: "cloud",
+      primarySource: source,
+      pageSize: 1,
+      now: () => now,
+    });
+    await assert.rejects(
+      adapter.listClusters({ maxRows: 1 }),
+      /truncated a nonterminal result at max_rows=1/,
+    );
+    const request = source.requests.find(
+      (candidate) => candidate.name === "gitcrawl.clusters.list",
+    );
+    assert.equal(request?.args.max_rows, 1);
+    await adapter.close();
+  });
+
+  await t.test("overlapping pages cannot satisfy declared membership", async () => {
+    const source = new FixtureSource({
+      overlapSecondPageFor: "gitcrawl.clusters.members",
+      rows: {
+        "gitcrawl.clusters.members": [
+          memberRow({ cluster_member_count: 2 }),
+          memberRow({ cluster_member_count: 2, thread_id: 43, number: 43 }),
+        ],
+      },
+    });
+    const adapter = await GitcrawlEvidenceAdapter.fromSources({
+      repository,
+      provider: "cloud",
+      primarySource: source,
+      pageSize: 1,
+      now: () => now,
+    });
+    await assert.rejects(adapter.clusterMembers(7), /duplicate row identity/);
+    await adapter.close();
+  });
+
   await t.test("related results point back to themselves", async () => {
     const adapter = await adapterFor({
       "gitcrawl.clusters.related": [{ source_number: 42, ...memberRow() }],
@@ -248,6 +293,55 @@ test("query evidence fails closed on source, relation, review, and packet drift"
           relations: [{ predicate: "describes", target: " " }],
         }),
       /relation target is missing or malformed/,
+    );
+    assert.throws(
+      () =>
+        createGitcrawlEvidenceClaim({
+          ...base,
+          subject: "openclaw/other#dataset:threads",
+        }),
+      /claim subject is missing or malformed/,
+    );
+    assert.throws(
+      () =>
+        createGitcrawlEvidenceClaim({
+          ...base,
+          relations: [
+            {
+              predicate: "describes",
+              target: "openclaw/other#dataset:repositories",
+            },
+          ],
+        }),
+      /relation target is missing or malformed/,
+    );
+  });
+
+  await t.test("source revision metadata is canonical", () => {
+    const base = {
+      provider: "cloud" as const,
+      repository,
+      snapshotId,
+      queryName: "gitcrawl.coverage" as const,
+      queryArgs: {},
+      subject: `${repository}#dataset:threads`,
+      data: { dataset: "threads" },
+    };
+    assert.throws(
+      () =>
+        createGitcrawlEvidenceClaim({
+          ...base,
+          sourceRevision: { id: -1, updated_at: generatedAt },
+        }),
+      /id must be a positive safe integer/,
+    );
+    assert.throws(
+      () =>
+        createGitcrawlEvidenceClaim({
+          ...base,
+          sourceRevision: { id: 1, updated_at: "not-a-timestamp" },
+        }),
+      /source revision updated_at is invalid/,
     );
   });
 
@@ -478,6 +572,40 @@ test("cloud source does not retry before a long Retry-After window", async () =>
   assert.deepEqual(sleeps, []);
 });
 
+test("cloud source rejects redirects without retrying authenticated requests", async () => {
+  let requests = 0;
+  const sleeps: number[] = [];
+  const source = new CloudGitcrawlQuerySource({
+    baseUrl: "https://crawl.example.test",
+    archive,
+    repository,
+    token: "reader-token",
+    maxAttempts: 3,
+    sleep: async (delayMs) => {
+      sleeps.push(delayMs);
+    },
+    fetch: async () => {
+      requests += 1;
+      return new Response("", {
+        status: 302,
+        headers: { location: "https://other.example.test/query" },
+      });
+    },
+  });
+  await assert.rejects(
+    source.query({
+      name: "gitcrawl.coverage",
+      args: {},
+      limit: 50,
+      cursor: "",
+      snapshot_id: "",
+    }),
+    /refused a redirected response/,
+  );
+  assert.equal(requests, 1);
+  assert.deepEqual(sleeps, []);
+});
+
 test("local SQLite source snapshots and serves the six-query contract", async () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-query-evidence-"));
   const dbPath = path.join(directory, "gitcrawl.db");
@@ -501,6 +629,56 @@ test("local SQLite source snapshots and serves the six-query contract", async ()
     assert.equal((await adapter.searchOpenPullRequests()).rows[0]?.number, 42);
     assert.equal((await adapter.reviewContext(42)).rows.length, 2);
     assert.equal(adapter.coverage.length, GITCRAWL_DATASETS.length);
+  } finally {
+    await adapter.close();
+    fs.rmSync(directory, { force: true, recursive: true });
+  }
+});
+
+test("local coverage rejects active clusters without valid memberships", async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-query-coverage-"));
+  const dbPath = path.join(directory, "gitcrawl.db");
+  seedLocalDatabase(dbPath);
+  const db = new DatabaseSync(dbPath);
+  db.exec("delete from cluster_memberships");
+  db.close();
+  const source = await LocalGitcrawlQuerySource.open({
+    dbPath,
+    repository,
+    allowLegacy: false,
+  });
+  const adapter = await GitcrawlEvidenceAdapter.fromSources({
+    repository,
+    provider: "local",
+    primarySource: source,
+    now: () => now,
+  });
+  try {
+    await assert.rejects(adapter.listClusters(), /cluster_groups coverage is incomplete/);
+  } finally {
+    await adapter.close();
+    fs.rmSync(directory, { force: true, recursive: true });
+  }
+});
+
+test("local related query ignores memberships in closed clusters", async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-query-closed-related-"));
+  const dbPath = path.join(directory, "gitcrawl.db");
+  seedLocalDatabase(dbPath);
+  seedClosedRelatedMembership(dbPath);
+  const source = await LocalGitcrawlQuerySource.open({
+    dbPath,
+    repository,
+    allowLegacy: false,
+  });
+  const adapter = await GitcrawlEvidenceAdapter.fromSources({
+    repository,
+    provider: "local",
+    primarySource: source,
+    now: () => now,
+  });
+  try {
+    assert.deepEqual((await adapter.related(42)).rows, []);
   } finally {
     await adapter.close();
     fs.rmSync(directory, { force: true, recursive: true });
@@ -557,6 +735,20 @@ test("policy sanitization removes hidden instructions before scoring or claims",
     deriveGitcrawlThreadPolicySignals("maintenance", "Fix: refresh tokens").concreteFix,
     true,
   );
+  assert.equal(
+    stripGitcrawlHtmlComments("safe<!-- outer <!-- nested --> hidden -->tail"),
+    "safe\ntail",
+  );
+});
+
+test("search and review evidence must agree on one thread safety projection", async () => {
+  const adapter = await adapterFor({
+    "gitcrawl.threads.search": [memberRow()],
+    "gitcrawl.pull_requests.review_context": [reviewContextRow({ body: "Different review body" })],
+  });
+  await adapter.searchOpenPullRequests();
+  await assert.rejects(adapter.reviewContext(42), /search and review safety projections diverge/);
+  await adapter.close();
 });
 
 test("oversized multibyte label evidence becomes a bounded digest marker", async () => {
@@ -594,24 +786,34 @@ class FixtureSource implements GitcrawlQuerySource {
 
   private readonly rows: Partial<Record<GitcrawlQueryRequest["name"], Record<string, unknown>[]>>;
   private readonly snapshotForQuery: (request: GitcrawlQueryRequest) => string;
+  private readonly overlapSecondPageFor: GitcrawlQueryRequest["name"] | undefined;
 
   constructor(
     options: {
       provider?: "local" | "cloud";
       rows?: Partial<Record<GitcrawlQueryRequest["name"], Record<string, unknown>[]>>;
       snapshotForQuery?: (request: GitcrawlQueryRequest) => string;
+      overlapSecondPageFor?: GitcrawlQueryRequest["name"];
     } = {},
   ) {
     this.provider = options.provider ?? "cloud";
     this.rows = options.rows ?? {};
     this.snapshotForQuery = options.snapshotForQuery ?? (() => snapshotId);
+    this.overlapSecondPageFor = options.overlapSecondPageFor;
   }
 
   async query(request: GitcrawlQueryRequest): Promise<GitcrawlQueryEnvelope> {
     this.requests.push(request);
     const rows =
       request.name === "gitcrawl.coverage" ? completeCoverage() : (this.rows[request.name] ?? []);
-    const values = orderRows(request, rows).slice(0, request.limit);
+    const requestedOffset = request.cursor ? Number(request.cursor) : 0;
+    const offset =
+      request.name === this.overlapSecondPageFor && requestedOffset > 0
+        ? requestedOffset - 1
+        : requestedOffset;
+    const ordered = orderRows(request, rows);
+    const values = ordered.slice(offset, offset + request.limit);
+    const nextOffset = requestedOffset + values.length;
     const querySnapshotId = this.snapshotForQuery(request);
     return {
       values,
@@ -624,7 +826,7 @@ class FixtureSource implements GitcrawlQuerySource {
         source_sync_at: generatedAt,
         dataset_generated_at: generatedAt,
         coverage_complete: true,
-        next_cursor: "",
+        next_cursor: nextOffset < ordered.length ? String(nextOffset) : "",
       },
     };
   }
@@ -669,7 +871,7 @@ function completeCoverage(): GitcrawlCoverageRow[] {
   }));
 }
 
-function clusterRow(): Record<string, unknown> {
+function clusterRow(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     cluster_id: 7,
     stable_slug: "cluster-7",
@@ -685,6 +887,7 @@ function clusterRow(): Record<string, unknown> {
     created_at: generatedAt,
     updated_at: generatedAt,
     closed_at: "",
+    ...overrides,
   };
 }
 
@@ -1053,6 +1256,30 @@ function seedDuplicateRelatedMemberships(dbPath: string): void {
     values (
       8, 1, 'cluster-key-8', 'cluster-8', 'active', 'duplicate_candidate', 42,
       'Second provider cluster', '${generatedAt}', '${generatedAt}', '', 2
+    );
+    insert into cluster_memberships
+    values (8, 42, 'representative', 'active', 1, '${generatedAt}', '${generatedAt}');
+    insert into cluster_memberships
+    values (8, 43, 'member', 'active', 0.7, '${generatedAt}', '${generatedAt}');
+  `);
+  db.close();
+}
+
+function seedClosedRelatedMembership(dbPath: string): void {
+  const db = new DatabaseSync(dbPath);
+  db.exec(`
+    insert into threads
+    select 43, repo_id, 43, 'issue', state, 'Related provider issue', body,
+           author_login, author_type, author_association,
+           'https://github.com/openclaw/openclaw/issues/43',
+           labels_json, assignees_json, is_draft, created_at_gh, updated_at_gh,
+           closed_at_gh, merged_at_gh, last_pulled_at, updated_at
+    from threads where id = 42;
+
+    insert into cluster_groups
+    values (
+      8, 1, 'cluster-key-8', 'cluster-8', 'closed', 'duplicate_candidate', 42,
+      'Closed provider cluster', '${generatedAt}', '${generatedAt}', '${generatedAt}', 2
     );
     insert into cluster_memberships
     values (8, 42, 'representative', 'active', 1, '${generatedAt}', '${generatedAt}');

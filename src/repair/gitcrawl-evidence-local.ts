@@ -357,7 +357,11 @@ export class LocalGitcrawlQuerySource implements GitcrawlQuerySource {
 
   private relatedRows(number: number, limit: number, offset: number): Record<string, unknown>[] {
     const membershipTable = this.portable ? "cluster_memberships" : "cluster_members";
+    const clusterTable = this.portable ? "cluster_groups" : "clusters";
     const stateFilter = this.portable ? "and cm.state = 'active'" : "";
+    const activeClusterFilter = this.portable
+      ? "and c.status = 'active'"
+      : "and c.closed_at_local is null";
     const rows: Record<string, unknown>[] = [];
     const seenThreadIds = new Set<number>();
     let remainingOffset = offset;
@@ -366,7 +370,8 @@ export class LocalGitcrawlQuerySource implements GitcrawlQuerySource {
         `select cm.cluster_id
          from ${membershipTable} cm
          join threads t on t.id = cm.thread_id
-         where t.repo_id = ? and t.number = ? ${stateFilter}
+         join ${clusterTable} c on c.id = cm.cluster_id and c.repo_id = t.repo_id
+         where t.repo_id = ? and t.number = ? ${stateFilter} ${activeClusterFilter}
          order by cm.cluster_id`,
       )
       .iterate(this.repoId, number);
@@ -586,17 +591,34 @@ export class LocalGitcrawlQuerySource implements GitcrawlQuerySource {
     const clusterTable = this.portable ? "cluster_groups" : "clusters";
     const membershipTable = this.portable ? "cluster_memberships" : "cluster_members";
     const membershipWhere = this.portable ? "cm.state = 'active'" : "1 = 1";
+    const activeClusterWhere = this.portable ? "c.status = 'active'" : "c.closed_at_local is null";
     const clusterRows = tableExists(this.db, clusterTable)
       ? this.scalarNumber(
           `select count(*) as value from ${clusterTable} where repo_id = ?`,
           this.repoId,
         )
       : 0;
-    const clusterCovered = tableExists(this.db, membershipTable)
+    const clusterEligible = tableExists(this.db, clusterTable)
       ? this.scalarNumber(
           `select count(*) as value
+           from ${clusterTable} c
+           where c.repo_id = ? and ${activeClusterWhere}`,
+          this.repoId,
+        )
+      : 0;
+    const clusterCovered =
+      tableExists(this.db, clusterTable) && tableExists(this.db, membershipTable)
+        ? this.scalarNumber(
+            `select count(*) as value
              from ${clusterTable} c
              where c.repo_id = ?
+               and ${activeClusterWhere}
+               and exists (
+                 select 1
+                 from ${membershipTable} cm
+                 join threads t on t.id = cm.thread_id and t.repo_id = c.repo_id
+                 where cm.cluster_id = c.id and ${membershipWhere}
+               )
                and not exists (
                  select 1
                  from ${membershipTable} cm
@@ -604,14 +626,14 @@ export class LocalGitcrawlQuerySource implements GitcrawlQuerySource {
                  where cm.cluster_id = c.id and ${membershipWhere}
                    and t.id is null
                )`,
-          this.repoId,
-        )
-      : 0;
+            this.repoId,
+          )
+        : 0;
     rows.push(
       metric(
         "cluster_groups",
         clusterRows,
-        clusterRows,
+        clusterEligible,
         clusterCovered,
         this.repositoryTableMax(
           clusterTable,
@@ -620,30 +642,42 @@ export class LocalGitcrawlQuerySource implements GitcrawlQuerySource {
         generatedAt,
       ),
     );
-    const membershipRows = tableExists(this.db, membershipTable)
-      ? this.scalarNumber(
-          `select count(*) as value
+    const membershipRows =
+      tableExists(this.db, clusterTable) && tableExists(this.db, membershipTable)
+        ? this.scalarNumber(
+            `select count(*) as value
            from ${membershipTable} cm
            join ${clusterTable} c on c.id = cm.cluster_id
-           where c.repo_id = ? and ${membershipWhere}`,
-          this.repoId,
-        )
-      : 0;
-    const membershipCovered = tableExists(this.db, membershipTable)
-      ? this.scalarNumber(
-          `select count(*) as value
+           where c.repo_id = ?`,
+            this.repoId,
+          )
+        : 0;
+    const membershipEligible =
+      tableExists(this.db, clusterTable) && tableExists(this.db, membershipTable)
+        ? this.scalarNumber(
+            `select count(*) as value
+             from ${membershipTable} cm
+             join ${clusterTable} c on c.id = cm.cluster_id
+             where c.repo_id = ? and ${activeClusterWhere} and ${membershipWhere}`,
+            this.repoId,
+          )
+        : 0;
+    const membershipCovered =
+      tableExists(this.db, clusterTable) && tableExists(this.db, membershipTable)
+        ? this.scalarNumber(
+            `select count(*) as value
            from ${membershipTable} cm
            join ${clusterTable} c on c.id = cm.cluster_id
            join threads t on t.id = cm.thread_id and t.repo_id = c.repo_id
-           where c.repo_id = ? and ${membershipWhere}`,
-          this.repoId,
-        )
-      : 0;
+           where c.repo_id = ? and ${activeClusterWhere} and ${membershipWhere}`,
+            this.repoId,
+          )
+        : 0;
     rows.push(
       metric(
         "cluster_memberships",
         membershipRows,
-        membershipRows,
+        membershipEligible,
         membershipCovered,
         this.repositoryTableMax(
           membershipTable,

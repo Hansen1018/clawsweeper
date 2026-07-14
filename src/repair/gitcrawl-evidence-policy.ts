@@ -134,18 +134,32 @@ function templateAnswerIsBlank(answer: string): boolean {
 export function stripGitcrawlHtmlComments(value: string): string {
   const chunks: string[] = [];
   let cursor = 0;
+  let depth = 0;
   while (cursor < value.length) {
     const commentStart = value.indexOf("<!--", cursor);
-    if (commentStart === -1) {
-      chunks.push(value.slice(cursor));
+    const commentEnd = value.indexOf("-->", cursor);
+    const nextMarker =
+      commentStart === -1
+        ? commentEnd
+        : commentEnd === -1
+          ? commentStart
+          : Math.min(commentStart, commentEnd);
+    if (nextMarker === -1) {
+      if (depth === 0) chunks.push(value.slice(cursor));
       break;
     }
-    chunks.push(value.slice(cursor, commentStart), "\n");
-    const commentEnd = value.indexOf("-->", commentStart + 4);
-    if (commentEnd === -1) break;
-    cursor = commentEnd + 3;
+    if (depth === 0) chunks.push(value.slice(cursor, nextMarker));
+    if (nextMarker === commentStart) {
+      if (depth === 0) chunks.push("\n");
+      depth += 1;
+      cursor = nextMarker + 4;
+    } else {
+      if (depth > 0) depth -= 1;
+      else chunks.push("\n");
+      cursor = nextMarker + 3;
+    }
   }
-  return chunks.join("").replaceAll("<!--", "\n").replaceAll("-->", "\n");
+  return chunks.join("");
 }
 
 export function sanitizeGitcrawlPromptValue<T>(value: T, depth = 0): T {

@@ -27,6 +27,7 @@ import {
 import { CloudGitcrawlQuerySource } from "./gitcrawl-evidence-cloud.js";
 import { LocalGitcrawlQuerySource } from "./gitcrawl-evidence-local.js";
 import {
+  assertGitcrawlThreadSafetyProjectionMatches,
   deriveGitcrawlThreadPolicySignals,
   sanitizeGitcrawlPromptValue,
   stripGitcrawlHtmlComments,
@@ -222,6 +223,7 @@ export class GitcrawlEvidenceAdapter {
   private readonly pageSize: number;
   private readonly maxPages: number;
   private readonly clusterMemberCounts = new Map<number, number>();
+  private readonly threadSafetyProjections = new Map<number, GitcrawlThreadEvidence>();
   private closePromise: Promise<void> | undefined;
 
   private constructor(input: {
@@ -433,6 +435,7 @@ export class GitcrawlEvidenceAdapter {
       normalizeThread,
       clusterMemberParityView,
     );
+    this.rememberThreadSafetyProjections(rows);
     for (const row of rows) {
       if (row.clusterId !== clusterId) {
         throw new Error(`Gitcrawl cluster ${clusterId} returned a member from another cluster`);
@@ -510,6 +513,7 @@ export class GitcrawlEvidenceAdapter {
       },
       relatedThreadParityView,
     );
+    this.rememberThreadSafetyProjections(rows);
     return this.claimResult(
       "gitcrawl.clusters.related",
       rows.map((data) => ({
@@ -565,6 +569,7 @@ export class GitcrawlEvidenceAdapter {
     }
     const context = normalizeReviewContext(contextRows[0]!);
     context.thread.kind = "pull_request";
+    this.rememberThreadSafetyProjections([context.thread]);
     const files = raw
       .filter((row) => row.row_kind === "file")
       .map(normalizeReviewFile)
@@ -603,7 +608,7 @@ export class GitcrawlEvidenceAdapter {
       },
       ...boundedFiles.map((file) => ({
         data: file,
-        subject: `${pullSubject}@file:${file.position}:${file.path}`,
+        subject: `${pullSubject}@file:${file.position}`,
         relations: [{ predicate: "evidence_for" as const, target: pullSubject }],
       })),
     ];
@@ -622,6 +627,7 @@ export class GitcrawlEvidenceAdapter {
       kind: "pull_request",
       state: "open",
       order,
+      ...(maxRows === undefined ? {} : { max_rows: maxRows }),
     };
     const rows = await this.queryNormalized(
       "gitcrawl.threads.search",
@@ -630,6 +636,7 @@ export class GitcrawlEvidenceAdapter {
       searchThreadParityView,
       maxRows,
     );
+    this.rememberThreadSafetyProjections(rows);
     assertOpenPullRequestRows(rows);
     assertThreadOrder(rows, order);
     return this.claimResult(
@@ -717,6 +724,17 @@ export class GitcrawlEvidenceAdapter {
         throw new Error(`Gitcrawl cluster ${row.id} changed member count within one snapshot`);
       }
       this.clusterMemberCounts.set(row.id, row.memberCount);
+    }
+  }
+
+  private rememberThreadSafetyProjections(rows: GitcrawlThreadEvidence[]): void {
+    for (const row of rows) {
+      const previous = this.threadSafetyProjections.get(row.threadId);
+      if (previous !== undefined) {
+        assertGitcrawlThreadSafetyProjectionMatches(previous, row);
+      } else {
+        this.threadSafetyProjections.set(row.threadId, row);
+      }
     }
   }
 }
@@ -889,6 +907,7 @@ async function queryAll(
 ): Promise<Record<string, unknown>[]> {
   const rows: Record<string, unknown>[] = [];
   const seenCursors = new Set<string>();
+  const seenRows = new Set<string>();
   let cursor = "";
   for (let page = 0; page < maxPages; page += 1) {
     const remaining = maxRows === undefined ? pageSize : Math.min(pageSize, maxRows - rows.length);
@@ -910,16 +929,47 @@ async function queryAll(
     if (envelope.values.length > remaining) {
       throw new Error(`Gitcrawl ${name} returned more rows than requested`);
     }
-    rows.push(...envelope.values);
+    for (const row of envelope.values) {
+      const identity = queryRowIdentity(name, row);
+      if (seenRows.has(identity)) {
+        throw new Error(`Gitcrawl ${name} returned duplicate row identity ${identity}`);
+      }
+      seenRows.add(identity);
+      rows.push(row);
+    }
     const next = envelope.stats.next_cursor;
     if (next && (next === cursor || seenCursors.has(next))) {
       throw new Error(`Gitcrawl cursor drift detected for ${name}`);
     }
-    if (maxRows !== undefined && rows.length >= maxRows) return rows.slice(0, maxRows);
+    if (maxRows !== undefined && rows.length >= maxRows) {
+      if (next) {
+        throw new Error(`Gitcrawl ${name} truncated a nonterminal result at max_rows=${maxRows}`);
+      }
+      return rows;
+    }
     if (!next) return rows;
     cursor = next;
   }
   throw new Error(`Gitcrawl ${name} pagination exceeded ${maxPages} pages`);
+}
+
+function queryRowIdentity(name: GitcrawlQueryName, row: Record<string, unknown>): string {
+  switch (name) {
+    case "gitcrawl.coverage":
+      return `dataset:${String(row.dataset ?? "")}`;
+    case "gitcrawl.clusters.list":
+      return `cluster:${String(row.cluster_id ?? "")}`;
+    case "gitcrawl.clusters.members":
+      return `cluster-thread:${String(row.cluster_id ?? "")}:${String(row.thread_id ?? "")}`;
+    case "gitcrawl.clusters.related":
+      return `related-thread:${String(row.thread_id ?? "")}`;
+    case "gitcrawl.pull_requests.review_context":
+      return row.row_kind === "file"
+        ? `review-file:${String(row.thread_id ?? "")}:${String(row.file_position ?? "")}`
+        : `review-context:${String(row.thread_id ?? "")}`;
+    case "gitcrawl.threads.search":
+      return `thread:${String(row.thread_id ?? "")}`;
+  }
 }
 
 function bindEnvelope(
@@ -1084,8 +1134,8 @@ function requireDatasets(
 
 function clusterListQueryArgs(
   repository: string,
-  options: { status?: string; minSize?: number },
-): { owner: string; repo: string; status: string; min_size: number } {
+  options: { status?: string; minSize?: number; maxRows?: number },
+): { owner: string; repo: string; status: string; min_size: number; max_rows?: number } {
   const requestedStatus = options.status ?? "active";
   const status = boundedString(requestedStatus, 64);
   if (!status || status !== requestedStatus) {
@@ -1095,6 +1145,9 @@ function clusterListQueryArgs(
     ...ownerRepo(repository),
     status,
     min_size: positiveInteger(options.minSize ?? 1, "minimum cluster size"),
+    ...(options.maxRows === undefined
+      ? {}
+      : { max_rows: positiveInteger(options.maxRows, "max rows") }),
   };
 }
 

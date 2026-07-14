@@ -36,8 +36,10 @@ snapshot id must be the same lowercase SHA-256 digest as `source_sha256`.
 
 The initial `gitcrawl.coverage` query pins the session. Later pages or queries
 that change any pinned identity field fail closed. Opaque pagination is
-transport-local and bounded by page and row limits; this core does not expose
-or persist repair scan cursors.
+transport-local and bounded by page and row limits. Row limits are part of the
+canonical query arguments, and reaching one before the provider's terminal page
+is rejected rather than represented as complete evidence. This core does not
+expose or persist repair scan cursors.
 
 Coverage is query-specific:
 
@@ -72,8 +74,9 @@ missing required coverage, malformed persisted coverage, and digest tampering.
 
 Thread safety classification uses the complete source title, body, labels,
 assignees, actor identity, and author association before prompt fields are
-bounded. HTML comments are removed recursively from prompt-facing values, and
-sanitized object-key collisions are rejected.
+bounded. Every query shape for one thread must produce the same safety
+projection. Nested HTML comments are removed completely from prompt-facing
+values, and sanitized object-key collisions are rejected.
 
 ## Fail-Closed Rules
 
@@ -82,19 +85,21 @@ The query core rejects:
 - stale, incomplete, mixed, or malformed snapshot provenance;
 - unsupported query names or contract versions;
 - incomplete required dataset coverage;
-- provider cursor replay or page-limit exhaustion;
+- provider cursor replay, duplicate row identity, nonterminal row truncation, or
+  page-limit exhaustion;
 - cloud authentication, HTTPS, redirect, origin, envelope, or size failures;
 - server throttling windows that exceed the configured retry wait budget;
 - cloud/local parity drift;
-- cluster members from another cluster or incomplete declared membership;
+- active clusters without valid active memberships, or cluster members from
+  another cluster or incomplete declared membership;
 - duplicate related threads reached through multiple shared clusters;
 - related rows bound to another source or to themselves;
 - unknown issue or pull-request thread kinds;
 - search rows that are not open pull requests or violate requested ordering;
 - review context without one exact pull request and its complete contiguous
   file set;
-- malformed revision, fingerprint, Git object, timestamp, actor, or numeric
-  fields;
+- malformed or cross-repository graph identity, revision, fingerprint, Git
+  object, timestamp, actor, or numeric fields;
 - hidden HTML-comment content reaching a claim;
 - mixed, partial, relabeled, or tampered claims, coverage, graph data, or
   packet digests.

@@ -182,6 +182,11 @@ export function createGitcrawlEvidenceClaim<T>(input: {
   } else if (input.paritySnapshotId !== undefined) {
     throw new Error("Gitcrawl non-parity claim has a parity snapshot");
   }
+  assertCanonicalGitcrawlEvidenceIdentity(
+    input.repository,
+    input.subject,
+    "Gitcrawl claim subject",
+  );
   assertNoGitcrawlHtmlCommentMarkers(input.subject, "Gitcrawl claim subject");
   assertNoGitcrawlHtmlCommentMarkers(input.relations ?? [], "Gitcrawl claim relations");
   assertNoGitcrawlHtmlCommentMarkers(input.data, "Gitcrawl claim data");
@@ -200,8 +205,8 @@ export function createGitcrawlEvidenceClaim<T>(input: {
     version: GITCRAWL_QUERY_VERSION,
     args_sha256: queryArgsSha256!,
   };
-  if (input.sourceRevision?.sha256 !== undefined) {
-    assertSha256(input.sourceRevision.sha256, "source revision sha256");
+  if (input.sourceRevision !== undefined) {
+    assertSourceRevision(input.sourceRevision);
   }
   if (input.threadFingerprint !== undefined) {
     if (!input.threadFingerprint.algorithm.trim()) {
@@ -213,18 +218,11 @@ export function createGitcrawlEvidenceClaim<T>(input: {
     if (!GITCRAWL_EVIDENCE_RELATION_PREDICATES.includes(relation.predicate)) {
       throw new Error(`unsupported Gitcrawl evidence relation: ${relation.predicate}`);
     }
-    if (
-      typeof relation.target !== "string" ||
-      !relation.target ||
-      relation.target !== relation.target.trim() ||
-      Buffer.byteLength(relation.target, "utf8") > 2_048 ||
-      [...relation.target].some((character) => {
-        const code = character.codePointAt(0) ?? 0;
-        return code < 32 || code === 127;
-      })
-    ) {
-      throw new Error("Gitcrawl evidence relation target is missing or malformed");
-    }
+    assertCanonicalGitcrawlEvidenceIdentity(
+      input.repository,
+      relation.target,
+      "Gitcrawl evidence relation target",
+    );
   }
   const relations = [...(input.relations ?? [])]
     .map((relation) => ({ ...relation }))
@@ -260,6 +258,53 @@ export function createGitcrawlEvidenceClaim<T>(input: {
     ...unsigned,
     sha256: sha256Canonical(unsigned),
   };
+}
+
+function assertSourceRevision(sourceRevision: GitcrawlSourceRevision): void {
+  assertExactObjectKeys(sourceRevision, ["id", "sha256", "updated_at"], "Gitcrawl source revision");
+  if (
+    sourceRevision.id === undefined &&
+    sourceRevision.sha256 === undefined &&
+    sourceRevision.updated_at === undefined
+  ) {
+    throw new Error("Gitcrawl source revision is empty");
+  }
+  if (
+    sourceRevision.id !== undefined &&
+    (!Number.isSafeInteger(sourceRevision.id) || sourceRevision.id <= 0)
+  ) {
+    throw new Error("Gitcrawl source revision id must be a positive safe integer");
+  }
+  if (sourceRevision.sha256 !== undefined) {
+    assertSha256(sourceRevision.sha256, "source revision sha256");
+  }
+  if (sourceRevision.updated_at !== undefined) {
+    parseRfc3339Timestamp(sourceRevision.updated_at, "Gitcrawl source revision updated_at");
+  }
+}
+
+function assertCanonicalGitcrawlEvidenceIdentity(
+  repository: string,
+  value: string,
+  label: string,
+): void {
+  if (
+    typeof value !== "string" ||
+    value !== value.trim() ||
+    Buffer.byteLength(value, "utf8") > 2_048 ||
+    !value.startsWith(`${repository}#`)
+  ) {
+    throw new Error(`${label} is missing or malformed`);
+  }
+  const suffix = value.slice(repository.length + 1);
+  const datasetPattern = GITCRAWL_DATASETS.join("|");
+  const canonical =
+    /^(?:cluster|thread|pull|issue):[1-9]\d*$/.test(suffix) ||
+    /^(?:pull|issue):[1-9]\d*@file:(?:0|[1-9]\d*)$/.test(suffix) ||
+    new RegExp(`^dataset:(?:${datasetPattern})$`).test(suffix);
+  if (!canonical) {
+    throw new Error(`${label} is missing or malformed`);
+  }
 }
 
 export function verifyGitcrawlEvidenceClaim(claim: GitcrawlEvidenceClaim): void {
