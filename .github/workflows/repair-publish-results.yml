@@ -15,11 +15,12 @@ permissions:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
   CLAWSWEEPER_APP_CLIENT_ID: Iv23liOECG0slfuhz093
+  WORKER_SEALED_SOURCE_CONTRACT_SHA: 8d28bcf61b97284f9d0ee247881302186339ccfd
+  WORKER_ACTION_LEDGER_CONTRACT_SHA: 8eed7833147ec4b25682bb090b6e7172a6dbbb26
 
 concurrency:
-  group: clawsweeper-repair-publish-results
+  group: clawsweeper-repair-publish-results-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}
   cancel-in-progress: false
-  queue: max
 
 jobs:
   publish:
@@ -38,6 +39,8 @@ jobs:
         env:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           WORKER_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          SEALED_SOURCE_CONTRACT_SHA: ${{ env.WORKER_SEALED_SOURCE_CONTRACT_SHA }}
+          ACTION_LEDGER_CONTRACT_SHA: ${{ env.WORKER_ACTION_LEDGER_CONTRACT_SHA }}
         shell: bash
         run: |
           set -euo pipefail
@@ -53,24 +56,34 @@ jobs:
             echo "::error title=Untrusted worker::Worker head is not on default-branch history."
             exit 1
           fi
-          mapfile -t contract_commits < <(
-            git log --reverse --format=%H \
-              -S'Seal immutable source job provenance' \
-              -- .github/workflows/repair-cluster-worker.yml
-          )
-          contract_commit="${contract_commits[0]:-}"
-          if [ -z "$contract_commit" ]; then
-            echo "::error::Cannot locate the immutable worker artifact contract."
-            exit 1
-          fi
-          if git merge-base --is-ancestor "$WORKER_HEAD_SHA" "${contract_commit}^"; then
+
+          classify_contract() {
+            local contract_sha="$1"
+            local contract_name="$2"
+            if [[ ! "$contract_sha" =~ ^[a-f0-9]{40}$ ]] ||
+               ! git cat-file -e "${contract_sha}^{commit}" 2>/dev/null ||
+               ! git merge-base --is-ancestor "$contract_sha" "refs/remotes/origin/${DEFAULT_BRANCH}"; then
+              echo "::error title=Invalid worker contract::${contract_name} contract boundary is not reachable from the default branch."
+              return 1
+            fi
+            if git merge-base --is-ancestor "$contract_sha" "$WORKER_HEAD_SHA"; then
+              printf 'required\n'
+              return
+            fi
+            if git merge-base --is-ancestor "$WORKER_HEAD_SHA" "$contract_sha"; then
+              printf 'legacy\n'
+              return
+            fi
+            echo "::error title=Ambiguous worker contract::Worker head is not comparable with the ${contract_name} contract boundary." >&2
+            return 1
+          }
+
+          sealed_source_contract="$(classify_contract "$SEALED_SOURCE_CONTRACT_SHA" "sealed source")"
+          if [ "$sealed_source_contract" = "legacy" ]; then
             echo "trusted_legacy_worker_head=$WORKER_HEAD_SHA" >> "$GITHUB_OUTPUT"
           fi
-          worker_workflow="$RUNNER_TEMP/repair-cluster-worker-$WORKER_HEAD_SHA.yml"
-          git show "$WORKER_HEAD_SHA:.github/workflows/repair-cluster-worker.yml" > "$worker_workflow"
-          if grep -Fq 'clawsweeper-repair-worker-action-ledger-cluster-${{ github.run_id }}-${{ github.run_attempt }}' "$worker_workflow" &&
-             grep -Fq 'clawsweeper-repair-worker-action-ledger-execute-${{ github.run_id }}-${{ github.run_attempt }}' "$worker_workflow" &&
-             grep -Fq 'name: Execute and apply cluster actions' "$worker_workflow"; then
+          action_ledger_contract="$(classify_contract "$ACTION_LEDGER_CONTRACT_SHA" "worker action ledger")"
+          if [ "$action_ledger_contract" = "required" ]; then
             echo "worker_ledgers_required=1" >> "$GITHUB_OUTPUT"
           fi
 
@@ -368,6 +381,7 @@ jobs:
       # codeql[actions/untrusted-checkout/critical]
       # lgtm[actions/untrusted-checkout/critical]
       - name: Publish result ledger
+        id: publish-result-ledger
         if: ${{ steps.download.outputs.has_artifacts == '1' }}
         env:
           GH_TOKEN: ${{ steps.app_token.outputs.token }}
@@ -500,7 +514,7 @@ jobs:
       # codeql[actions/untrusted-checkout/critical]
       # lgtm[actions/untrusted-checkout/critical]
       - name: Commit result ledger
-        if: ${{ always() && steps.download.outputs.has_artifacts == '1' && steps.app_token.outcome == 'success' }}
+        if: ${{ always() && steps.download.outputs.has_artifacts == '1' && steps.publish-result-ledger.outcome == 'success' && steps.app_token.outcome == 'success' }}
         env:
           GH_TOKEN: ${{ steps.app_token.outputs.token }}
         run: |

@@ -1,18 +1,72 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 import { parse } from "yaml";
 
 import { readText } from "../helpers.ts";
 
-test("repair result publication serializes every completed worker generation", () => {
+function git(cwd: string, ...args: string[]): string {
+  return execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
+}
+
+function commitFixture(repo: string, contents: string, message: string): string {
+  const workflow = path.join(repo, ".github", "workflows", "repair-cluster-worker.yml");
+  mkdirSync(path.dirname(workflow), { recursive: true });
+  writeFileSync(workflow, contents);
+  git(repo, "add", workflow);
+  git(repo, "commit", "-m", message);
+  return git(repo, "rev-parse", "HEAD");
+}
+
+function classifyWorker(
+  repo: string,
+  script: string,
+  workerHeadSha: string,
+  sealedSourceContractSha: string,
+  actionLedgerContractSha: string,
+): Record<string, string> {
+  const output = path.join(repo, `classification-${workerHeadSha}.txt`);
+  writeFileSync(output, "");
+  execFileSync("bash", ["-c", script], {
+    cwd: repo,
+    env: {
+      ...process.env,
+      DEFAULT_BRANCH: "main",
+      WORKER_HEAD_SHA: workerHeadSha,
+      SEALED_SOURCE_CONTRACT_SHA: sealedSourceContractSha,
+      ACTION_LEDGER_CONTRACT_SHA: actionLedgerContractSha,
+      GITHUB_OUTPUT: output,
+      RUNNER_TEMP: repo,
+    },
+    stdio: "pipe",
+  });
+  return Object.fromEntries(
+    readFileSync(output, "utf8")
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => {
+        const separator = line.indexOf("=");
+        return [line.slice(0, separator), line.slice(separator + 1)];
+      }),
+  );
+}
+
+test("repair result publication keeps every worker generation in a supported concurrency group", () => {
   const worker = parse(readText(".github/workflows/repair-cluster-worker.yml"));
   const publisher = parse(readText(".github/workflows/repair-publish-results.yml"));
 
   assert.equal(worker.concurrency?.["cancel-in-progress"], false);
   assert.equal(worker.concurrency?.queue, "max");
-  assert.equal(publisher.concurrency?.group, "clawsweeper-repair-publish-results");
+  assert.equal(
+    publisher.concurrency?.group,
+    "clawsweeper-repair-publish-results-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}",
+  );
   assert.equal(publisher.concurrency?.["cancel-in-progress"], false);
-  assert.equal(publisher.concurrency?.queue, "max");
+  assert.equal(publisher.concurrency?.queue, undefined);
 });
 
 test("repair result publication binds canonical replacement to immutable producer order", () => {
@@ -96,11 +150,90 @@ test("repair result publication rejects untrusted worker heads before minting wr
   assert.match(classification, /! git merge-base --is-ancestor "\$WORKER_HEAD_SHA"[\s\S]*exit 1/);
   assert.match(
     classification,
-    /git show "\$WORKER_HEAD_SHA:\.github\/workflows\/repair-cluster-worker\.yml"/,
+    /sealed_source_contract="\$\(classify_contract "\$SEALED_SOURCE_CONTRACT_SHA" "sealed source"\)"/,
   );
   assert.match(classification, /worker_ledgers_required=0/);
-  assert.match(classification, /name: Execute and apply cluster actions/);
+  assert.match(
+    classification,
+    /action_ledger_contract="\$\(classify_contract "\$ACTION_LEDGER_CONTRACT_SHA" "worker action ledger"\)"/,
+  );
+  assert.match(classification, /if \[ "\$action_ledger_contract" = "required" \]; then/);
   assert.match(classification, /worker_ledgers_required=1/);
+  assert.doesNotMatch(classification, /git log|git show|grep -F/);
+  for (const marker of [
+    "8d28bcf61b97284f9d0ee247881302186339ccfd",
+    "8eed7833147ec4b25682bb090b6e7172a6dbbb26",
+  ]) {
+    assert.doesNotThrow(() => execFileSync("git", ["cat-file", "-e", `${marker}^{commit}`]));
+  }
+});
+
+test("repair result publication requires ledgers for every post-contract worker", () => {
+  const publisher = parse(readText(".github/workflows/repair-publish-results.yml"));
+  const classify = publisher.jobs.publish.steps.find(
+    (step: { name?: string }) => step.name === "Classify trusted worker capabilities",
+  );
+  assert.equal(typeof classify?.run, "string");
+
+  const root = mkdtempSync(path.join(os.tmpdir(), "clawsweeper-worker-contract-"));
+  const origin = path.join(root, "origin.git");
+  const repo = path.join(root, "repo");
+  try {
+    git(root, "init", "--bare", origin);
+    mkdirSync(repo);
+    git(repo, "init", "-b", "main");
+    git(repo, "config", "user.name", "ClawSweeper Test");
+    git(repo, "config", "user.email", "clawsweeper@example.invalid");
+    git(repo, "remote", "add", "origin", origin);
+
+    const legacyHead = commitFixture(repo, "name: repair cluster worker\n", "legacy worker");
+    const sealedSourceContract = commitFixture(
+      repo,
+      "name: repair cluster worker\n# sealed source contract\n",
+      "sealed source contract",
+    );
+    const actionLedgerContract = commitFixture(
+      repo,
+      "name: repair cluster worker\n# sealed source contract\n# action ledger contract\n",
+      "action ledger contract",
+    );
+    const regressedHead = commitFixture(
+      repo,
+      "name: repair cluster worker\n# ledger steps accidentally removed\n",
+      "regress worker contents",
+    );
+    git(repo, "push", "-u", "origin", "main");
+
+    assert.deepEqual(
+      classifyWorker(repo, classify.run, legacyHead, sealedSourceContract, actionLedgerContract),
+      {
+        trusted_legacy_worker_head: legacyHead,
+        worker_ledgers_required: "0",
+      },
+    );
+    assert.deepEqual(
+      classifyWorker(
+        repo,
+        classify.run,
+        sealedSourceContract,
+        sealedSourceContract,
+        actionLedgerContract,
+      ),
+      {
+        trusted_legacy_worker_head: "",
+        worker_ledgers_required: "0",
+      },
+    );
+    assert.deepEqual(
+      classifyWorker(repo, classify.run, regressedHead, sealedSourceContract, actionLedgerContract),
+      {
+        trusted_legacy_worker_head: "",
+        worker_ledgers_required: "1",
+      },
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("repair event notifications publish durable claims before delivery and receipts", () => {
@@ -140,4 +273,8 @@ test("repair event notifications publish durable claims before delivery and rece
   assert.doesNotMatch(receipt, /--best-effort-refresh/);
   assert.doesNotMatch(result, /--path notifications/);
   assert.doesNotMatch(result, /--best-effort-refresh/);
+  assert.match(
+    result,
+    /if: \$\{\{ always\(\) && steps\.download\.outputs\.has_artifacts == '1' && steps\.publish-result-ledger\.outcome == 'success' && steps\.app_token\.outcome == 'success' \}\}/,
+  );
 });

@@ -150,8 +150,14 @@ test("repair worker jobs upload current-attempt ledgers for the trusted publishe
   );
   assert.match(
     publisher,
-    /worker_ledgers_required=0[\s\S]*clawsweeper-repair-worker-action-ledger-cluster-\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}[\s\S]*clawsweeper-repair-worker-action-ledger-execute-\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}[\s\S]*name: Execute and apply cluster actions[\s\S]*worker_ledgers_required=1/,
+    /ACTION_LEDGER_CONTRACT_SHA: \$\{\{ env\.WORKER_ACTION_LEDGER_CONTRACT_SHA \}\}/,
   );
+  assert.match(publisher, /action_ledger_contract="\$\(classify_contract/);
+  assert.match(
+    publisher,
+    /if \[ "\$action_ledger_contract" = "required" \]; then[\s\S]*worker_ledgers_required=1/,
+  );
+  assert.doesNotMatch(publisher, /worker_workflow=|grep -Fq/);
   assert.ok(
     publisher.indexOf("- name: Verify current worker action ledgers") <
       publisher.indexOf("- name: Publish result ledger"),
@@ -533,8 +539,10 @@ test("result and finalizer workflows publish their repair operation receipts", (
   assert.match(results, /CLAWSWEEPER_ACTION_LEDGER_INVOCATION=open-pr-finalizer/);
   assert.match(results, /CLAWSWEEPER_ACTION_LEDGER_INVOCATION=finalizer-results/);
   assert.match(results, /Classify trusted worker capabilities/);
-  assert.match(results, /git merge-base --is-ancestor "\$WORKER_HEAD_SHA"/);
-  assert.match(results, /-S'Seal immutable source job provenance'/);
+  assert.match(results, /WORKER_SEALED_SOURCE_CONTRACT_SHA/);
+  assert.match(results, /WORKER_ACTION_LEDGER_CONTRACT_SHA/);
+  assert.match(results, /classify_contract/);
+  assert.doesNotMatch(results, /git log --reverse|grep -Fq/);
   assert.match(results, /worker_ledgers_required=0/);
   assert.match(results, /worker_ledgers_required=1/);
   assert.match(results, /--trusted-legacy-worker-head "\$TRUSTED_LEGACY_WORKER_HEAD"/);
