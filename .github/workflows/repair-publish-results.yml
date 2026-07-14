@@ -19,8 +19,9 @@ env:
   WORKER_ACTION_LEDGER_CONTRACT_SHA: 8eed7833147ec4b25682bb090b6e7172a6dbbb26
 
 concurrency:
-  group: clawsweeper-repair-publish-results-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}
+  group: clawsweeper-repair-publish-results
   cancel-in-progress: false
+  queue: max
 
 jobs:
   publish:

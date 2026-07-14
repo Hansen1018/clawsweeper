@@ -55,18 +55,15 @@ function classifyWorker(
   );
 }
 
-test("repair result publication keeps every worker generation in a supported concurrency group", () => {
+test("repair result publication serializes every completed worker generation", () => {
   const worker = parse(readText(".github/workflows/repair-cluster-worker.yml"));
   const publisher = parse(readText(".github/workflows/repair-publish-results.yml"));
 
   assert.equal(worker.concurrency?.["cancel-in-progress"], false);
   assert.equal(worker.concurrency?.queue, "max");
-  assert.equal(
-    publisher.concurrency?.group,
-    "clawsweeper-repair-publish-results-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}",
-  );
+  assert.equal(publisher.concurrency?.group, "clawsweeper-repair-publish-results");
   assert.equal(publisher.concurrency?.["cancel-in-progress"], false);
-  assert.equal(publisher.concurrency?.queue, undefined);
+  assert.equal(publisher.concurrency?.queue, "max");
 });
 
 test("repair result publication binds canonical replacement to immutable producer order", () => {
