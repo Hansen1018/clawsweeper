@@ -965,6 +965,41 @@ test("local SQLite source snapshots and serves the six-query contract", async ()
   }
 });
 
+test("local PR file aggregation is scoped to the selected repository", async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-query-multi-repo-"));
+  const dbPath = path.join(directory, "gitcrawl.db");
+  seedLocalDatabase(dbPath);
+  seedUnrelatedRepositoryFiles(dbPath);
+  const localSource = await LocalGitcrawlQuerySource.open({
+    dbPath,
+    repository,
+    allowLegacy: false,
+  });
+  const adapter = await GitcrawlEvidenceAdapter.fromSources({
+    repository,
+    provider: "local",
+    primarySource: localSource,
+    now: () => now,
+  });
+  try {
+    const fileCoverage = adapter.coverage.find((row) => row.dataset === "pull_request_files");
+    assert.deepEqual(fileCoverage, {
+      snapshot_id: adapter.snapshotId,
+      dataset: "pull_request_files",
+      row_count: 1,
+      eligible_count: 1,
+      covered_count: 1,
+      max_source_at: generatedAt,
+      dataset_generated_at: generatedAt,
+      complete: true,
+    });
+    assert.equal((await adapter.reviewContext(42)).rows.length, 2);
+  } finally {
+    await adapter.close();
+    fs.rmSync(directory, { force: true, recursive: true });
+  }
+});
+
 test("local coverage rejects active clusters without valid memberships", async () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-query-coverage-"));
   const dbPath = path.join(directory, "gitcrawl.db");
@@ -1775,6 +1810,42 @@ function seedDuplicateRelatedMemberships(dbPath: string): void {
     values (8, 42, 'representative', 'active', 1, 1, 1, '${generatedAt}', '${generatedAt}');
     insert into cluster_memberships
     values (8, 43, 'member', 'active', 0.7, 1, 1, '${generatedAt}', '${generatedAt}');
+  `);
+  db.close();
+}
+
+function seedUnrelatedRepositoryFiles(dbPath: string): void {
+  const db = new DatabaseSync(dbPath);
+  db.prepare("insert into repositories values (?, ?, ?, ?)").run(
+    2,
+    "openclaw/other",
+    "openclaw",
+    "other",
+  );
+  db.exec(`
+    insert into threads
+    select 84, 2, 84, 'pull_request', state, 'Unrelated provider change', body,
+           author_login, author_type, author_association,
+           'https://github.com/openclaw/other/pull/84',
+           labels_json, assignees_json, is_draft, created_at_gh, updated_at_gh,
+           closed_at_gh, merged_at_gh, last_pulled_at, observation_sequence,
+           evidence_observation_sequence, evidence_source_updated_at, updated_at
+    from threads where id = 42;
+
+    insert into pull_request_details
+    select 84, base_sha, head_sha, head_ref, 'contributor/other', mergeable_state,
+           additions, deletions, 2, fetched_at, updated_at
+    from pull_request_details where thread_id = 42;
+
+    insert into pull_request_files
+    select 84, 0, 'src/unrelated-a.ts', status, additions, deletions, changes,
+           previous_path, fetched_at
+    from pull_request_files where thread_id = 42;
+
+    insert into pull_request_files
+    select 84, 1, 'src/unrelated-b.ts', status, additions, deletions, changes,
+           previous_path, fetched_at
+    from pull_request_files where thread_id = 42;
   `);
   db.close();
 }

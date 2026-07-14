@@ -939,17 +939,20 @@ export class LocalGitcrawlQuerySource implements GitcrawlQuerySource {
        from threads t
        left join pull_request_details detail on detail.thread_id = t.id
        left join (
-         select thread_id,
+         select file.thread_id,
                 count(*) as file_count,
-                count(distinct position) as distinct_positions,
-                min(position) as minimum_position,
-                max(position) as maximum_position,
-                min(fetched_at) as oldest_fetched_at
-         from pull_request_files
-         group by thread_id
+                count(distinct file.position) as distinct_positions,
+                min(file.position) as minimum_position,
+                max(file.position) as maximum_position,
+                min(file.fetched_at) as oldest_fetched_at
+         from threads file_thread
+         join pull_request_files file on file.thread_id = file_thread.id
+         where file_thread.repo_id = ?
+         group by file.thread_id
        ) files on files.thread_id = t.id
        ${fileReservationJoin}
        where t.repo_id = ? and t.kind = 'pull_request'`,
+      this.repoId,
       this.repoId,
     );
     let fileEligible = 0;
