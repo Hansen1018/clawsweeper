@@ -217,18 +217,22 @@ export function parseRepairRunTitle(
   }
 
   const prefixes = [
-    DEFAULT_ISSUE_IMPLEMENTATION_RUN_NAME_PREFIX,
-    normalizeRepairRunNamePrefix(
-      automergeRunNamePrefix ?? DEFAULT_AUTOMERGE_REPAIR_RUN_NAME_PREFIX,
-    ),
-    DEFAULT_AUTOMERGE_REPAIR_RUN_NAME_PREFIX,
-    DEFAULT_REPAIR_RUN_NAME_PREFIX,
-  ];
-  const prefix = prefixes.find((candidate) => remaining.startsWith(candidate));
-  if (!prefix) return null;
-  const jobPath = remaining.slice(prefix.length);
-  if (!/^jobs\/[A-Za-z0-9_.-]+\/inbox\/[A-Za-z0-9_.-]+\.md$/.test(jobPath)) return null;
-  return { jobPath, dispatchKey, jobSha256 };
+    ...new Set([
+      DEFAULT_ISSUE_IMPLEMENTATION_RUN_NAME_PREFIX,
+      normalizeRepairRunNamePrefix(
+        automergeRunNamePrefix ?? DEFAULT_AUTOMERGE_REPAIR_RUN_NAME_PREFIX,
+      ),
+      DEFAULT_AUTOMERGE_REPAIR_RUN_NAME_PREFIX,
+      DEFAULT_REPAIR_RUN_NAME_PREFIX,
+    ]),
+  ].sort((left, right) => right.length - left.length);
+  for (const prefix of prefixes) {
+    if (!remaining.startsWith(prefix)) continue;
+    const jobPath = remaining.slice(prefix.length);
+    if (!/^jobs\/[A-Za-z0-9_.-]+\/inbox\/[A-Za-z0-9_.-]+\.md$/.test(jobPath)) continue;
+    return { jobPath, dispatchKey, jobSha256 };
+  }
+  return null;
 }
 
 export function activeRepairJobGenerations({

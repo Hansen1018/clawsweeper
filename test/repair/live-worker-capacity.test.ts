@@ -123,6 +123,18 @@ test("custom repair run prefixes normalize for formatting, parsing, and active l
   assert.deepEqual([...activeRunsByPrefix.keys()], ["custom repair "]);
 });
 
+test("overlapping custom prefixes cannot shadow valid built-in repair titles", () => {
+  const job = "jobs/openclaw/inbox/cluster-overlap.md";
+  const digest = "c".repeat(64);
+  const title = `repair cluster ${job} [router-overlap] (${digest})`;
+
+  assert.deepEqual(parseRepairRunTitle(title, "repair"), {
+    jobPath: job,
+    dispatchKey: "router-overlap",
+    jobSha256: digest,
+  });
+});
+
 test("repair run titles preserve immutable job generations", () => {
   const job = "jobs/openclaw/inbox/cluster-001.md";
   const oldDigest = "a".repeat(64);

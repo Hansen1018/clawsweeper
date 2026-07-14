@@ -1,5 +1,7 @@
 name: repair commit finding intake
 
+run-name: ${{ (github.event.inputs.dispatch_key || github.event.client_payload.dispatch_key) && format('Commit finding {0}@{1} [{2}]', github.event.inputs.target_repo || github.event.client_payload.target_repo || 'openclaw/openclaw', github.event.inputs.commit_sha || github.event.client_payload.commit_sha || '?', github.event.inputs.dispatch_key || github.event.client_payload.dispatch_key) || format('Commit finding {0}@{1}', github.event.inputs.target_repo || github.event.client_payload.target_repo || 'openclaw/openclaw', github.event.inputs.commit_sha || github.event.client_payload.commit_sha || '?') }}
+
 on:
   repository_dispatch:
     types: [clawsweeper_commit_finding]
@@ -89,9 +91,48 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  receipt:
+    name: Deduplicate commit finding dispatch receipt
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      proceed: ${{ steps.receipt.outputs.proceed }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: scripts/dispatch-receipt-owner.sh
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - id: receipt
+        env:
+          DISPATCH_KEY: ${{ github.event.inputs.dispatch_key || github.event.client_payload.dispatch_key || '' }}
+          TARGET_REPO: ${{ github.event.inputs.target_repo || github.event.client_payload.target_repo || 'openclaw/openclaw' }}
+          COMMIT_SHA: ${{ github.event.inputs.commit_sha || github.event.client_payload.commit_sha || '?' }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ -z "$DISPATCH_KEY" ]; then
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          expected_title="Commit finding ${TARGET_REPO}@${COMMIT_SHA} [${DISPATCH_KEY}]"
+          owner="$(bash scripts/dispatch-receipt-owner.sh \
+            repair-commit-finding-intake.yml "$expected_title" "$GITHUB_RUN_ID" \
+            "Intake commit finding" "Complete commit finding dispatch receipt")"
+          if [ "$owner" = "owner" ]; then
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            echo "An older active or durably published commit finding dispatch already exists; skipping duplicate intake."
+            exit 0
+          fi
+          echo "proceed=true" >> "$GITHUB_OUTPUT"
+
   disabled-target:
     name: Skip disabled target commit finding
-    if: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.target_repo == 'openclaw/clawhub' && vars.CLAWSWEEPER_ENABLE_CLAWHUB != '1' }}
+    needs: receipt
+    if: ${{ needs.receipt.outputs.proceed == 'true' && github.event_name == 'repository_dispatch' && github.event.client_payload.target_repo == 'openclaw/clawhub' && vars.CLAWSWEEPER_ENABLE_CLAWHUB != '1' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -101,7 +142,9 @@ jobs:
           echo "Set CLAWSWEEPER_ENABLE_CLAWHUB=1 after installing the ClawSweeper GitHub App on openclaw/clawhub."
 
   intake:
-    if: ${{ !(github.event_name == 'repository_dispatch' && github.event.client_payload.target_repo == 'openclaw/clawhub' && vars.CLAWSWEEPER_ENABLE_CLAWHUB != '1') }}
+    name: Intake commit finding
+    needs: receipt
+    if: ${{ needs.receipt.outputs.proceed == 'true' && !(github.event_name == 'repository_dispatch' && github.event.client_payload.target_repo == 'openclaw/clawhub' && vars.CLAWSWEEPER_ENABLE_CLAWHUB != '1') }}
     runs-on: ${{ github.event.inputs.runner || vars.CLAWSWEEPER_COMMIT_FINDING_RUNNER || 'blacksmith-16vcpu-ubuntu-2404' }}
     timeout-minutes: 75
     steps:
@@ -427,6 +470,10 @@ jobs:
             --message "chore: append commit finding intake action ledger" \
             "${action_ledger_args[@]}" \
             --rebase-strategy normal
+
+      - name: Complete commit finding dispatch receipt
+        if: ${{ success() && (github.event.inputs.dispatch_key || github.event.client_payload.dispatch_key) }}
+        run: echo "Commit finding intake is durably published."
 
       - name: Fail on repair failure
         if: ${{ steps.prepare.outputs.should_repair == 'true' && steps.execute.outcome == 'failure' }}

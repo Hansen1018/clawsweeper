@@ -256,6 +256,115 @@ test("commit finding intake keeps legacy reports audit-only", () => {
   }
 });
 
+test("commit finding intake owns stable dispatch receipts before processing", () => {
+  const workflow = readWorkflow(commitFindingWorkflowPath);
+  const receipt = workflowStep(workflow, "receipt", undefined);
+  const complete = workflowStep(workflow, "intake", "Complete commit finding dispatch receipt");
+  const targetRepo = "openclaw/openclaw";
+  const sha = "a".repeat(40);
+  const dispatchKey = `commit-finding-${"b".repeat(24)}`;
+  const expectedTitle = `Commit finding ${targetRepo}@${sha} [${dispatchKey}]`;
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-commit-finding-receipt-"));
+  const binDir = path.join(root, "bin");
+  const scriptsDir = path.join(root, "scripts");
+
+  assert.match(String(workflow["run-name"]), /Commit finding \{0\}@\{1\} \[\{2\}\]/);
+  assert.equal(workflow.jobs.receipt.name, "Deduplicate commit finding dispatch receipt");
+  assert.equal(workflow.jobs.intake.name, "Intake commit finding");
+  assert.equal(workflow.jobs.intake.needs, "receipt");
+  assert.match(String(workflow.jobs.intake.if), /needs\.receipt\.outputs\.proceed == 'true'/);
+  assert.equal(
+    receipt.env?.DISPATCH_KEY,
+    "${{ github.event.inputs.dispatch_key || github.event.client_payload.dispatch_key || '' }}",
+  );
+  assert.match(
+    receipt.run,
+    /repair-commit-finding-intake\.yml "\$expected_title" "\$GITHUB_RUN_ID" \\\n\s+"Intake commit finding" "Complete commit finding dispatch receipt"/,
+  );
+  assert.equal(
+    complete.if,
+    "${{ success() && (github.event.inputs.dispatch_key || github.event.client_payload.dispatch_key) }}",
+  );
+
+  try {
+    fs.mkdirSync(binDir);
+    fs.mkdirSync(scriptsDir);
+    fs.symlinkSync(
+      path.resolve("scripts/dispatch-receipt-owner.sh"),
+      path.join(scriptsDir, "dispatch-receipt-owner.sh"),
+    );
+    const ghPath = path.join(binDir, "gh");
+    fs.writeFileSync(
+      ghPath,
+      `#!/bin/sh
+case "$*" in
+  *actions/workflows/repair-commit-finding-intake.yml/runs*)
+    printf '%s\\n' "$FAKE_RUNS_JSON"
+    ;;
+  *actions/runs/101/jobs*)
+    printf '%s\\n' "$FAKE_JOBS_JSON"
+    ;;
+  *)
+    echo "unexpected gh args: $*" >&2
+    exit 9
+    ;;
+esac
+`,
+      { mode: 0o755 },
+    );
+    const duplicate = runStep(
+      receipt.run,
+      {
+        DISPATCH_KEY: dispatchKey,
+        TARGET_REPO: targetRepo,
+        COMMIT_SHA: sha,
+        GITHUB_REPOSITORY: "openclaw/clawsweeper",
+        GITHUB_RUN_ID: "200",
+        PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}`,
+        FAKE_RUNS_JSON: JSON.stringify([
+          {
+            workflow_runs: [{ id: 101, display_title: expectedTitle, status: "completed" }],
+          },
+        ]),
+        FAKE_JOBS_JSON: JSON.stringify([
+          {
+            jobs: [
+              {
+                name: "Intake commit finding",
+                conclusion: "success",
+                steps: [
+                  {
+                    name: "Complete commit finding dispatch receipt",
+                    conclusion: "success",
+                  },
+                ],
+              },
+            ],
+          },
+        ]),
+      },
+      root,
+    );
+    assert.equal(duplicate.status, 0, duplicate.stderr);
+    assert.equal(parseOutputs(duplicate.outputs).proceed, "false");
+
+    const legacy = runStep(
+      receipt.run,
+      {
+        DISPATCH_KEY: "",
+        TARGET_REPO: targetRepo,
+        COMMIT_SHA: sha,
+        GITHUB_RUN_ID: "201",
+      },
+      root,
+    );
+    assert.equal(legacy.status, 0, legacy.stderr);
+    assert.equal(parseOutputs(legacy.outputs).proceed, "true");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("commit finding intake canonicalizes mixed-case target repositories", () => {
   const workflow = readWorkflow(commitFindingWorkflowPath);
   const resolve = workflowStep(workflow, "intake", "Resolve commit finding report handoff");
@@ -308,12 +417,12 @@ function readWorkflow(file: string): any {
 function workflowStep(
   workflow: any,
   job: string,
-  name: string,
+  name?: string,
 ): { env?: Record<string, string>; run: string } {
-  const step = workflow.jobs[job].steps.find(
-    (candidate: { name?: string }) => candidate.name === name,
+  const step = workflow.jobs[job].steps.find((candidate: { id?: string; name?: string }) =>
+    name === undefined ? candidate.id === "receipt" : candidate.name === name,
   );
-  assert.equal(typeof step?.run, "string", `${job} is missing ${name}`);
+  assert.equal(typeof step?.run, "string", `${job} is missing ${name ?? "receipt step"}`);
   return step;
 }
 
