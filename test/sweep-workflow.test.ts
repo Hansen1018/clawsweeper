@@ -115,6 +115,12 @@ test("review and apply boundaries fail open only when the ledger is observationa
       `${jobName} ledger setup must fail open`,
     );
   }
+  const failedReviewRetry = step("retry-failed-reviews", "Plan or dispatch failed-review retries");
+  assert.match(failedReviewRetry.if ?? "", /vars\.CLAWSWEEPER_FAILED_REVIEW_RETRY_ENABLED != '1'/);
+  assert.match(
+    failedReviewRetry.if ?? "",
+    /steps\.failed-review-action-ledger\.outcome == 'success'/,
+  );
   for (const [jobName, stepName] of [
     ["event-review-apply", "Finalize exact event action ledger"],
     ["review", "Finalize review action ledger"],

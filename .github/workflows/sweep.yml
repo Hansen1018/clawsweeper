@@ -3110,6 +3110,7 @@ jobs:
           fetch-depth: 0
 
       - uses: ./.github/actions/setup-action-ledger
+        id: failed-review-action-ledger
         continue-on-error: true
 
       - name: Create state token
@@ -3129,6 +3130,7 @@ jobs:
 
       - name: Plan or dispatch failed-review retries
         id: retry-failed-reviews-run
+        if: ${{ vars.CLAWSWEEPER_FAILED_REVIEW_RETRY_ENABLED != '1' || steps.failed-review-action-ledger.outcome == 'success' }}
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
@@ -3166,7 +3168,7 @@ jobs:
           exit "$retry_exit_code"
 
       - name: Publish failed-review retry state
-        if: ${{ always() && vars.CLAWSWEEPER_FAILED_REVIEW_RETRY_ENABLED == '1' && hashFiles('results/failed-review-retries/openclaw-openclaw/*.json') != '' }}
+        if: ${{ always() && steps.failed-review-action-ledger.outcome == 'success' && vars.CLAWSWEEPER_FAILED_REVIEW_RETRY_ENABLED == '1' && hashFiles('results/failed-review-retries/openclaw-openclaw/*.json') != '' }}
         run: |
           pnpm run repair:publish-main -- \
             --message "chore: update failed review retry state" \
@@ -3176,7 +3178,7 @@ jobs:
 
       - name: Finalize failed-review retry action ledger
         id: finalize-failed-review-retry-action-ledger
-        if: ${{ always() }}
+        if: ${{ always() && steps.failed-review-action-ledger.outcome == 'success' }}
         env:
           RETRY_EXIT_CODE: ${{ steps.retry-failed-reviews-run.outputs.exit_code || '' }}
           RETRY_OUTCOME: ${{ steps.retry-failed-reviews-run.outcome || 'not_started' }}
