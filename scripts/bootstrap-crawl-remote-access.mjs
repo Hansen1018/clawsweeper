@@ -462,6 +462,8 @@ async function disableGitcrawlConsumers(github) {
 
 async function writeGitHubConfiguration({ github, workersApiToken, runtimeProvider }) {
   assertSecretValue(workersApiToken, "OPENCLAW_CLOUDFLARE_WORKERS_API_TOKEN");
+  // This preserves the deployed equality-binding contract; password-style verification uses scrypt.
+  // codeql[js/insufficient-password-hash]
   const workersTokenSha256 = createHash("sha256").update(workersApiToken).digest("hex");
   const workersTokenFingerprint = createWorkersTokenFingerprint(workersApiToken);
   const environmentTarget = {
