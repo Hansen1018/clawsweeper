@@ -14,8 +14,12 @@ import {
   repairCreatedCommentChange,
   runRepairMutation,
 } from "../../dist/repair/repair-mutation-safety.js";
+import {
+  EMPTY_REPAIR_REVIEW_ACTIVITY_CURSOR,
+  resolveRepairMutationReviewActivityCursor,
+} from "../../dist/repair/repair-mutation-review-baseline.js";
 
-const EMPTY_REVIEW_ACTIVITY_CURSOR = `v2:0:${createHash("sha256").update("[]").digest("hex")}`;
+const EMPTY_REVIEW_ACTIVITY_CURSOR = EMPTY_REPAIR_REVIEW_ACTIVITY_CURSOR;
 
 test("repair mutation receipts distinguish accepted and unknown outcomes without raw content", () => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "repair-mutation-ledger-")));
@@ -289,19 +293,82 @@ test("repair freshness rechecks after the attempt receipt and before the request
   }
 });
 
-test("repair freshness requires reviewed PR activity provenance", () => {
+test("repair review baselines do not absorb unbound live review activity", () => {
+  const reviewedCursor = `v2:1:${"b".repeat(64)}`;
+  const expectedReviewActivityCursor = resolveRepairMutationReviewActivityCursor({
+    repository: "openclaw/openclaw",
+    number: 123,
+    targetKind: "pull_request",
+    expectedUpdatedAt: "2026-07-14T10:00:00Z",
+  });
+  assert.equal(expectedReviewActivityCursor, EMPTY_REVIEW_ACTIVITY_CURSOR);
+
+  const freshness = createRepairMutationFreshnessGuard({
+    repository: "openclaw/openclaw",
+    number: 123,
+    targetKind: "pull_request",
+    expectedUpdatedAt: "2026-07-14T10:00:00Z",
+    expectedReviewActivityCursor,
+    readTargetActivity: () => targetActivity(),
+    readReviewActivityCursor: () => reviewedCursor,
+  });
   assert.throws(
-    () =>
-      createRepairMutationFreshnessGuard({
+    () => freshness.assertFresh("pull_request_merge"),
+    /review activity changed after repair validation/,
+  );
+});
+
+test("repair review baselines reuse only state records reviewed before the repair plan", () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "repair-review-baseline-")));
+  const recordPath = path.join(root, "records", "openclaw-openclaw", "items", "123.md");
+  const reviewedCursor = `v2:1:${"b".repeat(64)}`;
+  fs.mkdirSync(path.dirname(recordPath), { recursive: true });
+  fs.writeFileSync(
+    recordPath,
+    [
+      "---",
+      "number: 123",
+      "repository: openclaw/openclaw",
+      "type: pull_request",
+      "state_at_review: open",
+      "item_updated_at: 2026-07-14T10:00:00Z",
+      "reviewed_at: 2026-07-14T10:01:00Z",
+      "review_status: complete",
+      "review_terminal_failure: false",
+      "local_checkout_access: verified",
+      `review_activity_cursor: ${reviewedCursor}`,
+      "---",
+      "PRIVATE_REVIEW_BODY",
+      "",
+    ].join("\n"),
+  );
+
+  try {
+    assert.equal(
+      resolveRepairMutationReviewActivityCursor({
         repository: "openclaw/openclaw",
         number: 123,
         targetKind: "pull_request",
         expectedUpdatedAt: "2026-07-14T10:00:00Z",
-        readTargetActivity: () => targetActivity(),
-        readReviewActivityCursor: () => EMPTY_REVIEW_ACTIVITY_CURSOR,
+        reviewedBefore: "2026-07-14T10:02:00Z",
+        stateRoot: root,
       }),
-    /reviewed pull request activity cursor is unavailable/,
-  );
+      reviewedCursor,
+    );
+    assert.equal(
+      resolveRepairMutationReviewActivityCursor({
+        repository: "openclaw/openclaw",
+        number: 123,
+        targetKind: "pull_request",
+        expectedUpdatedAt: "2026-07-14T10:00:00Z",
+        reviewedBefore: "2026-07-14T10:00:30Z",
+        stateRoot: root,
+      }),
+      EMPTY_REVIEW_ACTIVITY_CURSOR,
+    );
+  } finally {
+    fs.rmSync(root, { force: true, recursive: true });
+  }
 });
 
 test("repair freshness rejects concurrent target activity after an owned comment", () => {
@@ -371,6 +438,10 @@ test("repair executors route authoritative GitHub writes through the mutation bo
   const applySource = fs.readFileSync("src/repair/apply-result.ts", "utf8");
   const postFlightSource = fs.readFileSync("src/repair/post-flight.ts", "utf8");
   const safetySource = fs.readFileSync("src/repair/repair-mutation-safety.ts", "utf8");
+  const reviewBaselineSource = fs.readFileSync(
+    "src/repair/repair-mutation-review-baseline.ts",
+    "utf8",
+  );
   const receiptSource = fs.readFileSync("src/repair/repair-mutation-receipts.ts", "utf8");
 
   for (const source of [applySource, postFlightSource]) {
@@ -389,6 +460,10 @@ test("repair executors route authoritative GitHub writes through the mutation bo
   assert.match(receiptSource, /importActionEventShards/);
   assert.match(receiptSource, /CLAWSWEEPER_STATE_DIR/);
   assert.match(safetySource, /reviewed pull request activity cursor is unavailable/);
+  assert.match(reviewBaselineSource, /item_updated_at/);
+  assert.match(reviewBaselineSource, /reviewedAt > options\.reviewedBefore/);
+  assert.match(applySource, /resolveRepairMutationReviewActivityCursor/);
+  assert.match(postFlightSource, /resolveRepairMutationReviewActivityCursor/);
   assert.match(applySource, /finally \{\s+await flushRepairMutationActionEvents\(\)/);
   assert.match(postFlightSource, /finally \{\s+await flushRepairMutationActionEvents\(\)/);
 });

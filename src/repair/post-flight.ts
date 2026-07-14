@@ -42,6 +42,7 @@ import {
   type RepairMutationContext,
   type RepairMutationFreshnessGuard,
 } from "./repair-mutation-safety.js";
+import { resolveRepairMutationReviewActivityCursor } from "./repair-mutation-review-baseline.js";
 import { compactText as compactPlainText } from "./text-utils.js";
 
 const PASSING_CHECK_CONCLUSIONS = new Set(["SUCCESS", "SKIPPED", "NEUTRAL"]);
@@ -85,6 +86,7 @@ if (process.env.CLAWSWEEPER_ALLOW_EXECUTE !== "1") {
 
 const resultPath = resultPathArg ? path.resolve(resultPathArg) : findLatestResultPath();
 const result = JSON.parse(fs.readFileSync(resultPath, "utf8"));
+const clusterPlan = readSiblingJson(resultPath, "cluster-plan.json");
 if (result.repo !== job.frontmatter.repo) {
   throw new Error(`result repo ${result.repo} does not match job repo ${job.frontmatter.repo}`);
 }
@@ -219,8 +221,16 @@ function finalizeFixPr(action: LooseRecord) {
           number: parsed.number,
           targetKind: "pull_request",
           expectedUpdatedAt: pull.updated_at ?? view.updatedAt,
-          expectedReviewActivityCursor:
-            action.review_activity_cursor ?? action.merge_preflight?.review_activity_cursor,
+          expectedReviewActivityCursor: resolveRepairMutationReviewActivityCursor({
+            repository: result.repo,
+            number: parsed.number,
+            targetKind: "pull_request",
+            explicitCursor:
+              action.review_activity_cursor ?? action.merge_preflight?.review_activity_cursor,
+            expectedUpdatedAt: pull.updated_at ?? view.updatedAt,
+            reviewedBefore:
+              fixReport?.executed_at ?? clusterPlan?.generated_at ?? result.generated_at,
+          }),
         });
       } catch (error) {
         if (error instanceof RepairMutationFreshnessError) {
@@ -459,6 +469,26 @@ function finalizePostMergeCloseout({
       merge_commit_sha: finalized.merge_commit_sha ?? null,
     };
   }
+  const expectedUpdatedAt = action.target_updated_at ?? action.live_updated_at;
+  if (!expectedUpdatedAt) {
+    return {
+      ...base,
+      status: "blocked",
+      reason: "missing target_updated_at; rerun the worker against live GitHub state",
+      live_state: live.state,
+      live_updated_at: live.updated_at,
+    };
+  }
+  if (expectedUpdatedAt !== live.updated_at) {
+    return {
+      ...base,
+      status: "blocked",
+      reason: "target changed since worker review",
+      expected_updated_at: expectedUpdatedAt,
+      live_updated_at: live.updated_at,
+      live_state: live.state,
+    };
+  }
   let mutationContext: RepairMutationContext | null = null;
   let freshness: RepairMutationFreshnessGuard | null = null;
   if (!dryRun) {
@@ -475,9 +505,15 @@ function finalizePostMergeCloseout({
         repository: result.repo,
         number: target,
         targetKind: live.pull_request ? "pull_request" : "issue",
-        expectedUpdatedAt: live.updated_at,
-        expectedReviewActivityCursor:
-          action.review_activity_cursor ?? action.target_review_activity_cursor,
+        expectedUpdatedAt,
+        expectedReviewActivityCursor: resolveRepairMutationReviewActivityCursor({
+          repository: result.repo,
+          number: target,
+          targetKind: live.pull_request ? "pull_request" : "issue",
+          explicitCursor: action.target_review_activity_cursor,
+          expectedUpdatedAt,
+          reviewedBefore: clusterPlan?.generated_at ?? result.generated_at,
+        }),
       });
     } catch (error) {
       if (error instanceof RepairMutationFreshnessError) {

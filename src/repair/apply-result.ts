@@ -58,6 +58,7 @@ import {
   type RepairMutationContext,
   type RepairMutationFreshnessGuard,
 } from "./repair-mutation-safety.js";
+import { resolveRepairMutationReviewActivityCursor } from "./repair-mutation-review-baseline.js";
 
 const MAINTAINER_AUTHOR_ASSOCIATIONS = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
 const CLOSE_ACTIONS = new Set([
@@ -147,6 +148,7 @@ if (process.env.CLAWSWEEPER_ALLOW_EXECUTE !== "1") {
 }
 const resultPath = resultPathArg ? path.resolve(resultPathArg) : findLatestResultPath();
 const result = JSON.parse(fs.readFileSync(resultPath, "utf8"));
+const clusterPlan = readSiblingJson(resultPath, "cluster-plan.json");
 if (result.repo !== job.frontmatter.repo) {
   throw new Error(`result repo ${result.repo} does not match job repo ${job.frontmatter.repo}`);
 }
@@ -249,6 +251,12 @@ function findLatestResultPath() {
   candidates.sort((left: JsonValue, right: JsonValue) => right.mtimeMs - left.mtimeMs);
   if (!candidates[0]) throw new Error("no result.json files found");
   return candidates[0].path;
+}
+
+function readSiblingJson(resultPath: string, name: string) {
+  const file = path.join(path.dirname(resultPath), name);
+  if (!fs.existsSync(file)) return null;
+  return JSON.parse(fs.readFileSync(file, "utf8"));
 }
 
 function readFixExecutionReport(_result?: JsonValue) {
@@ -616,8 +624,14 @@ function applyCloseAction({
       number: target,
       targetKind: kind,
       expectedUpdatedAt,
-      expectedReviewActivityCursor:
-        action.review_activity_cursor ?? action.target_review_activity_cursor,
+      expectedReviewActivityCursor: resolveRepairMutationReviewActivityCursor({
+        repository: result.repo,
+        number: target,
+        targetKind: kind,
+        explicitCursor: action.review_activity_cursor ?? action.target_review_activity_cursor,
+        expectedUpdatedAt,
+        reviewedBefore: clusterPlan?.generated_at ?? result.generated_at,
+      }),
     });
     if (!existingComment) {
       postIssueComment(mutationContext, freshness, body);
@@ -726,8 +740,14 @@ function applyMergeAction({
         number: target,
         targetKind: "pull_request",
         expectedUpdatedAt,
-        expectedReviewActivityCursor:
-          action.review_activity_cursor ?? action.target_review_activity_cursor,
+        expectedReviewActivityCursor: resolveRepairMutationReviewActivityCursor({
+          repository: result.repo,
+          number: target,
+          targetKind: "pull_request",
+          explicitCursor: action.review_activity_cursor ?? action.target_review_activity_cursor,
+          expectedUpdatedAt,
+          reviewedBefore: clusterPlan?.generated_at ?? result.generated_at,
+        }),
       });
     } catch (error) {
       if (error instanceof RepairMutationFreshnessError) {

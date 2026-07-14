@@ -9,7 +9,6 @@ import test from "node:test";
 import { mockGhBinEnv } from "../helpers.ts";
 
 const repoRoot = process.cwd();
-const EMPTY_REVIEW_ACTIVITY_CURSOR = `v2:0:${createHash("sha256").update("[]").digest("hex")}`;
 
 test("repair apply blocks PR duplicate close when coverage proof keeps the source open", () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-apply-result-"));

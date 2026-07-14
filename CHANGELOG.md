@@ -59,9 +59,10 @@ checkpoint, and status-only commits are intentionally omitted.
 ### Changed
 
 - Guarded repair apply and post-flight merge, close, comment, and label requests
-  with required reviewed PR cursors and exact target-activity checks at every
-  request boundary, plus privacy-bounded attempt/outcome receipts durably
-  appended to the state ledger around each authoritative mutation.
+  with plan-bound reviewed PR cursors, known-empty baselines for new PRs, and
+  exact target-activity checks at every request boundary, plus privacy-bounded
+  attempt/outcome receipts durably appended to the state ledger around each
+  authoritative mutation.
 - Preserved crawl-remote's reviewed `limits.cpu_ms` value through immutable
   release packaging and post-transfer deployment verification.
 - Reverted the action-lifecycle expansion from PR #521, restoring the pre-merge ClawSweeper paths while retaining later exact-review throughput fixes and retrying coalesced reconciliations after any partial lookup failure.

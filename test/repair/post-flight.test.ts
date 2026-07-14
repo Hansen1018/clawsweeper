@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -9,7 +8,6 @@ import test from "node:test";
 import { mockGhBinEnv } from "../helpers.ts";
 
 const repoRoot = process.cwd();
-const EMPTY_REVIEW_ACTIVITY_CURSOR = `v2:0:${createHash("sha256").update("[]").digest("hex")}`;
 
 test("issue implementation post-flight waits for green PR checks without merging", () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-post-flight-"));
@@ -671,7 +669,6 @@ function writeMergeReports(
             status: "opened",
             pr_url: "https://github.com/openclaw/openclaw/pull/123",
             branch: "clawsweeper/automerge-openclaw-openclaw-123",
-            review_activity_cursor: EMPTY_REVIEW_ACTIVITY_CURSOR,
             merge_preflight: {
               security_status: "cleared",
               security_evidence: ["no security signal"],
