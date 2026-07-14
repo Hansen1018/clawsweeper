@@ -55,7 +55,7 @@ mtime are not freshness proof.
 
 Normalized rows become digest-bound claims containing:
 
-- provider and snapshot identity;
+- provider, repository, and snapshot identity;
 - query name and canonical argument digest;
 - canonical repository subject;
 - source revision and thread fingerprint when available;
@@ -64,9 +64,11 @@ Normalized rows become digest-bound claims containing:
 - semantic and full claim SHA-256 digests.
 
 Claims can be assembled into a bounded evidence packet with coverage, graph
-nodes, graph edges, included counts, and a packet digest. Verification rebuilds
-the graph from verified claims and rejects mixed snapshots, missing required
-coverage, malformed persisted coverage, and digest tampering.
+nodes, graph edges, included counts, and a packet digest. Version 2 packets are
+complete or rejected: claim, graph, and byte bounds never silently discard
+evidence. Verification rebuilds the full canonical graph from verified claims
+and rejects repository relabeling, unknown claim fields, mixed snapshots,
+missing required coverage, malformed persisted coverage, and digest tampering.
 
 Thread safety classification uses the complete source title, body, labels,
 assignees, actor identity, and author association before prompt fields are
@@ -82,16 +84,20 @@ The query core rejects:
 - incomplete required dataset coverage;
 - provider cursor replay or page-limit exhaustion;
 - cloud authentication, HTTPS, redirect, origin, envelope, or size failures;
+- server throttling windows that exceed the configured retry wait budget;
 - cloud/local parity drift;
 - cluster members from another cluster or incomplete declared membership;
+- duplicate related threads reached through multiple shared clusters;
 - related rows bound to another source or to themselves;
+- unknown issue or pull-request thread kinds;
 - search rows that are not open pull requests or violate requested ordering;
 - review context without one exact pull request and its complete contiguous
   file set;
 - malformed revision, fingerprint, Git object, timestamp, actor, or numeric
   fields;
 - hidden HTML-comment content reaching a claim;
-- mixed or tampered claims, coverage, graph data, or packet digests.
+- mixed, partial, relabeled, or tampered claims, coverage, graph data, or
+  packet digests.
 
 ## Deliberate Non-Goals
 
