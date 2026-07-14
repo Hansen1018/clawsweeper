@@ -186,9 +186,10 @@ hot intake `14`, and commit review `2`. Existing repair lanes keep their
   `--skip-closed-percent` is overridden.
 - `CLAWSWEEPER_CLUSTER_REPAIR_IMPORT_LIMIT` overrides the scheduled
   `repair-cluster-intake.yml` import limit. The default is `1` cluster per daily
-  run; the upstream gitcrawl-store refreshes every 15 minutes, and ClawSweeper
-  records the processed store SHA so repeated ticks against the same snapshot
-  skip.
+  run. `CLAWSWEEPER_CLUSTER_REPAIR_GITCRAWL_PROVIDER` selects `local`, `cloud`,
+  or `parity` evidence; the default remains `local`. The intake records the
+  processed snapshot and source identity, and local/parity runs retain the
+  portable-store SHA duplicate fast path.
 - `CLAWSWEEPER_MAX_LIVE_WORKERS` overrides the `job_intent`-derived repair
   dispatch cap.
 - `CLAWSWEEPER_AUTOMERGE_MAX_LIVE_WORKERS` overrides

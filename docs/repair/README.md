@@ -40,15 +40,17 @@ vulnerabilities unless there is a real trust-boundary bypass.
 The repair lane is intentionally narrower than the sweep lanes. The sweepers scan OpenClaw commits and backlog items on a cadence; repair handles targeted clusters that were already grouped by a human, gitcrawl, or another dedupe tool.
 
 Cluster discovery currently comes from [openclaw/gitcrawl](https://github.com/openclaw/gitcrawl).
-ClawSweeper reads existing gitcrawl SQLite state; it does not crawl or download
-issues during repair import. By default, import scripts prefer a checked-out
-portable store at `../gitcrawl-store/data/<owner>__<repo>.sync.db`, then
+ClawSweeper reads existing Gitcrawl evidence; it does not crawl or download
+issues during repair import. `repair:import-gitcrawl` supports snapshot-bound
+`local`, crawl-remote `cloud`, and cloud/local `parity` providers. Local mode
+prefers a checked-out portable store at
+`../gitcrawl-store/data/<owner>__<repo>.sync.db`, then
 `~/.config/gitcrawl/stores/gitcrawl-store/data/<owner>__<repo>.sync.db`, then
 the legacy `~/.config/gitcrawl/gitcrawl.db`. Use `--db` or
 `CLAWSWEEPER_GITCRAWL_DB` to override. Store freshness is maintained outside
 ClawSweeper by the gitcrawl-store refresh workflow and by refreshing the local
-checkout, for example `git -C ../gitcrawl-store pull --ff-only`, before
-importing jobs.
+checkout, for example `git -C ../gitcrawl-store pull --ff-only`, before local
+or parity imports.
 
 <img width="3582" height="2160" alt="image" src="https://github.com/user-attachments/assets/20b816cc-72ab-479e-bc18-84f5b2b53745" />
 
@@ -265,12 +267,17 @@ pnpm run repair:import-gitcrawl-low-signal -- --limit 20 --batch-size 5 --mode a
 # Mixed clusters can route security refs while continuing ordinary bug/dedupe work.
 pnpm run repair:import-gitcrawl -- --from-gitcrawl --limit 40 --mode autonomous --suffix autonomous-smoke --allow-instant-close --allow-merge --allow-fix-pr --allow-post-merge-close
 
+# Query the Cloudflare crawl-remote service instead of a local DB.
+CLAWSWEEPER_GITCRAWL_CLOUD_URL=https://crawl.example.test \
+CLAWSWEEPER_GITCRAWL_CLOUD_TOKEN=... \
+pnpm run repair:import-gitcrawl -- --from-gitcrawl --gitcrawl-provider cloud --limit 1 --mode plan
+
 # Automatic imported-cluster intake runs through repair-cluster-intake.yml.
-# gitcrawl-store refreshes openclaw/openclaw every 15 minutes; the ClawSweeper
-# intake runs daily, records the processed portable DB SHA in
-# results/cluster-repair-intake/<repo>.json, and skips repeated ticks for the
-# same store snapshot. It imports at most one cluster by default and dispatches
-# through the two-worker cluster_repair lane.
+# Gitcrawl refreshes openclaw/openclaw every 15 minutes; the ClawSweeper intake
+# runs daily against the configured local, cloud, or parity provider and records
+# the snapshot plus source identity in results/cluster-repair-intake/<repo>.json.
+# It imports at most one cluster by default and dispatches through the two-worker
+# cluster_repair lane.
 
 # Dispatch reviewed jobs. Dispatch derives its default live-worker cap from the
 # job's job_intent and config/automation-limits.json. Existing repair lanes

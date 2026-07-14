@@ -595,10 +595,11 @@ Important gates:
   override.
 - `CLAWSWEEPER_CLUSTER_REPAIR_IMPORT_LIMIT`: scheduled imported-cluster intake
   limit; default `1` cluster per daily `repair-cluster-intake.yml` run.
-  The upstream `openclaw/gitcrawl-store` refreshes `openclaw/openclaw` every 15
-  minutes, so the intake records the processed portable DB SHA in
-  `results/cluster-repair-intake/<repo>.json` and skips duplicate ticks against
-  the same store snapshot.
+- `CLAWSWEEPER_CLUSTER_REPAIR_GITCRAWL_PROVIDER`: selects `local`, `cloud`, or
+  `parity` evidence for scheduled cluster intake. The default is `local`.
+  Intake records the processed snapshot and source identity in
+  `results/cluster-repair-intake/<repo>.json`; local and parity runs also retain
+  the portable-store SHA duplicate fast path.
 - `CLAWSWEEPER_ALLOW_EXECUTE`: allows deterministic write lanes. Workflows treat
   any value except literal `1` as closed.
 - `CLAWSWEEPER_ALLOW_FIX_PR`: allows branch repair and replacement PR creation.

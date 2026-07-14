@@ -11,7 +11,7 @@ queries:
 - `gitcrawl.coverage`
 
 The core snapshots, validates, normalizes, and digest-binds query results. It
-does not mutate Gitcrawl, GitHub, repair jobs, workflows, or durable state.
+does not mutate Gitcrawl or GitHub.
 
 ## Providers
 
@@ -27,6 +27,21 @@ projections, and response bodies over 512 KiB are rejected.
 
 `parity` treats cloud as primary and compares normalized rows and required
 coverage against a local snapshot before returning evidence.
+
+## Cluster Repair Import
+
+`repair:import-gitcrawl` consumes this adapter for active-cluster discovery and
+complete member hydration. `--gitcrawl-provider local|cloud|parity` selects the
+source. Cloud mode uses the crawl-remote service API; parity mode requires both
+the cloud service and a local portable database and rejects any normalized-row
+drift.
+
+Generated jobs record the provider, snapshot id, source identity digest, and
+optional parity snapshot id. `--provenance-out` writes the same source identity
+for the intake ledger without persisting credentials or raw provider logs.
+Security, feature-request, open-member, closed-percentage, overlap, and
+drip-feed filters remain importer-owned and run after complete snapshot-bound
+member hydration.
 
 ## Snapshot Contract
 
@@ -112,5 +127,5 @@ The query core rejects:
 ## Deliberate Non-Goals
 
 This core does not include repair-action-ledger events, job publication
-transactions, importer state, durable scan cursors, workflow activation,
-GitHub mutation, PR lifecycle handling, or raw provider logs.
+transactions, durable scan cursors, GitHub mutation, PR lifecycle handling, or
+raw provider logs.
