@@ -1070,7 +1070,7 @@ test("local coverage rejects active clusters without valid memberships", async (
 });
 
 test("local cluster coverage requires the latest successful run", async (t) => {
-  for (const scenario of ["missing", "stale"] as const) {
+  for (const scenario of ["missing", "stale", "predates-source"] as const) {
     await t.test(scenario, async () => {
       const directory = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-query-run-"));
       const dbPath = path.join(directory, "gitcrawl.db");
@@ -1078,7 +1078,7 @@ test("local cluster coverage requires the latest successful run", async (t) => {
       const db = new DatabaseSync(dbPath);
       if (scenario === "missing") {
         db.exec("delete from cluster_runs");
-      } else {
+      } else if (scenario === "stale") {
         db.prepare("insert into cluster_runs values (?, ?, ?, ?, ?, ?, ?)").run(
           2,
           1,
@@ -1087,6 +1087,27 @@ test("local cluster coverage requires the latest successful run", async (t) => {
           generatedAt,
           generatedAt,
           "{}",
+        );
+      } else {
+        const sourceAt = "2026-07-14T09:56:00.000Z";
+        db.prepare(
+          `update sync_runs
+           set started_at = ?, finished_at = ?, stats_json = ?
+           where repo_id = ?`,
+        ).run(
+          sourceAt,
+          sourceAt,
+          JSON.stringify({
+            repository,
+            threads_synced: 1,
+            metadata_only: false,
+            started_at: sourceAt,
+            finished_at: sourceAt,
+          }),
+          1,
+        );
+        db.prepare("update portable_metadata set value = ? where key = 'exported_at'").run(
+          sourceAt,
         );
       }
       db.close();
