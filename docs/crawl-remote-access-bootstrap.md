@@ -6,8 +6,9 @@ Cloudflare token to the deploy workflow.
 
 Until the separately reviewed slot-aware consumer lands, production deployment
 continues to use the existing `CRAWL_REMOTE_CLOUDFLARE_TOKEN_SHA256` contract.
-The bootstrap stages the future salted fingerprint but does not make it a live
-deployment requirement.
+The bootstrap updates that live SHA-256 binding whenever it writes the
+production token. It also stages the future salted fingerprint but does not
+make the fingerprint a live deployment requirement.
 
 The workflow is intentionally inert until the separately owned deploy consumer
 adds one exact `crawl_remote_access_verify` job after `preflight` and `deploy`.
@@ -36,8 +37,9 @@ owned consumer change lands, every dispatch fails closed before privileged
 work.
 
 The bootstrap rechecks the live ClawSweeper `main` SHA before token minting,
-immediately before its first mutation, and again before narrowing Access policy
-or revoking an old service token. It writes and reads back both Gitcrawl kill
+immediately before its first mutation, immediately before a resumed rotation
+narrows Access policy, and again before a fresh rotation narrows policy or
+revokes an old service token. It writes and reads back both Gitcrawl kill
 switches before creating a token, changing Access policy, or publishing any
 credential generation.
 

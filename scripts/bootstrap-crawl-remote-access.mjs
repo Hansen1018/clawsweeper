@@ -187,6 +187,9 @@ export async function bootstrapCrawlRemoteAccess(options, dependencies) {
       ? [...new Set([...authorizedOldTokens.map((token) => token.id), activeToken.id])]
       : [activeToken.id];
 
+  if (!createdCredentials && oldTokenIds.length > 0) {
+    await github.assertCurrentMain();
+  }
   let configuredPolicy = await cloudflare.ensureAccessPolicy({
     applicationId: application.id,
     existingPolicy: applicationState.policy,
@@ -459,6 +462,7 @@ async function disableGitcrawlConsumers(github) {
 
 async function writeGitHubConfiguration({ github, workersApiToken, runtimeProvider }) {
   assertSecretValue(workersApiToken, "OPENCLAW_CLOUDFLARE_WORKERS_API_TOKEN");
+  const workersTokenSha256 = createHash("sha256").update(workersApiToken).digest("hex");
   const workersTokenFingerprint = createWorkersTokenFingerprint(workersApiToken);
   const environmentTarget = {
     repository: BOOTSTRAP_CONTRACT.clawsweeperRepository,
@@ -479,6 +483,11 @@ async function writeGitHubConfiguration({ github, workersApiToken, runtimeProvid
     ...environmentTarget,
     name: "CRAWL_REMOTE_CUSTOM_ROUTE_PROOF",
     value: "access-service-token",
+  });
+  await github.setVariable({
+    ...environmentTarget,
+    name: "CRAWL_REMOTE_CLOUDFLARE_TOKEN_SHA256",
+    value: workersTokenSha256,
   });
   await github.setVariable({
     ...environmentTarget,

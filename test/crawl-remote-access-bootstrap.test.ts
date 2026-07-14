@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { scryptSync } from "node:crypto";
+import { createHash, scryptSync } from "node:crypto";
 import test from "node:test";
 import {
   BOOTSTRAP_CONTRACT,
@@ -444,7 +444,7 @@ test("first bootstrap creates one service-auth policy and writes every destinati
   assert.equal(policies.length, 1);
   assert.deepEqual(policies[0]?.tokenIds, ["token-new"]);
   assert.equal(github.secrets.length, 7);
-  assert.equal(github.variables.length, 15);
+  assert.equal(github.variables.length, 16);
   for (const target of credentialTargets) {
     const names = credentialNames(target.prefix, "blue");
     assert.ok(
@@ -507,6 +507,14 @@ test("first bootstrap creates one service-auth policy and writes every destinati
       maxmem: 64 * 1024 * 1024,
     }).toString("hex"),
     fingerprintMatch[2],
+  );
+  assert.equal(
+    variableValue(
+      github.variables,
+      "CRAWL_REMOTE_CLOUDFLARE_TOKEN_SHA256",
+      BOOTSTRAP_CONTRACT.clawsweeperRepository,
+    ),
+    createHash("sha256").update("fixture-workers-credential").digest("hex"),
   );
   assert.equal(
     variableValue(
@@ -1096,6 +1104,54 @@ test("explicit rotation resumes finalization when markers bind the newest manage
   assert.deepEqual(
     github.secrets.map((secret) => secret.name),
     ["CRAWL_REMOTE_PRODUCTION_CLOUDFLARE_API_TOKEN"],
+  );
+});
+
+test("resumed rotation reauthorizes immediately before narrowing Access", async () => {
+  const cloudflare = createCloudflareFixture({
+    tokens: [
+      { id: "token-old", name: BOOTSTRAP_CONTRACT.accessServiceTokenName },
+      {
+        id: "token-new",
+        name: `${BOOTSTRAP_CONTRACT.accessServiceTokenName} rotation 456-1`,
+      },
+    ],
+    application: {
+      id: "app-existing",
+      name: BOOTSTRAP_CONTRACT.accessAppName,
+      domain: BOOTSTRAP_CONTRACT.accessDomain,
+    },
+    policy: { id: "policy-existing" },
+  });
+  const github = createGitHubFixture({ activeTokenId: "token-new", activeSlot: "green" });
+  github.client.assertCurrentMain = async () => {
+    github.mainChecks.push(github.mainChecks.length + 1);
+    if (github.mainChecks.length === 2) {
+      throw new Error("ClawSweeper main advanced during crawl-remote Access bootstrap");
+    }
+  };
+
+  await assert.rejects(
+    bootstrapCrawlRemoteAccess(
+      {
+        publisherEnabled: "0",
+        rotateServiceToken: true,
+        rotationLabel: "456-2",
+        runtimeProvider: "cloud",
+        workersApiToken: "fixture-workers-credential",
+      },
+      { cloudflare: cloudflare.client, github: github.client, logger: quietLogger },
+    ),
+    /main advanced/,
+  );
+  assert.equal(github.mainChecks.length, 2);
+  assert.equal(
+    cloudflare.events.some((event) => event.event === "ensure-policy"),
+    false,
+  );
+  assert.equal(
+    cloudflare.events.some((event) => event.event === "delete-token"),
+    false,
   );
 });
 
