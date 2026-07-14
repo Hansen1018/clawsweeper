@@ -762,28 +762,35 @@ test("repair worker renews and rebinds state credentials before post-flight publ
   const executeIndex = workflow.indexOf("- name: Execute credited fix artifact");
   const stateTokenIndex = workflow.indexOf("- name: Renew state token for post-flight");
   const rebindIndex = workflow.indexOf("- name: Rebind state checkout credentials");
+  const ledgerPublishIndex = workflow.indexOf("- name: Publish immutable execute-fix action ledger");
   const deferredIndex = workflow.indexOf("- name: Publish deferred fix outcome");
   const applyIndex = workflow.indexOf("- name: Apply safe closure actions");
   const postFlightIndex = workflow.indexOf("- name: Post-flight finalize fix PRs");
   const closeoutIndex = workflow.indexOf("- name: Apply post-flight closeouts");
+  const requeueIndex = workflow.indexOf("- name: Requeue source-head repair races");
 
   for (const index of [
     executeIndex,
     stateTokenIndex,
     rebindIndex,
+    ledgerPublishIndex,
     deferredIndex,
     applyIndex,
     postFlightIndex,
     closeoutIndex,
+    requeueIndex,
   ]) {
     assert.notEqual(index, -1);
   }
   assert.ok(executeIndex < stateTokenIndex);
   assert.ok(stateTokenIndex < rebindIndex);
+  assert.ok(rebindIndex < ledgerPublishIndex);
+  assert.ok(ledgerPublishIndex < deferredIndex);
   assert.ok(rebindIndex < deferredIndex);
   assert.ok(rebindIndex < applyIndex);
   assert.ok(rebindIndex < postFlightIndex);
   assert.ok(rebindIndex < closeoutIndex);
+  assert.ok(rebindIndex < requeueIndex);
 
   const rebindBlock = workflow.slice(rebindIndex, deferredIndex);
   assert.match(
@@ -799,7 +806,14 @@ test("repair worker renews and rebinds state credentials before post-flight publ
     /git -C "\$CLAWSWEEPER_STATE_DIR" ls-remote --exit-code origin refs\/heads\/state/,
   );
 
-  for (const stepIndex of [deferredIndex, applyIndex, postFlightIndex, closeoutIndex]) {
+  for (const stepIndex of [
+    ledgerPublishIndex,
+    deferredIndex,
+    applyIndex,
+    postFlightIndex,
+    closeoutIndex,
+    requeueIndex,
+  ]) {
     const stepHeader = workflow.slice(
       stepIndex,
       workflow.indexOf("\n      - name:", stepIndex + 1),

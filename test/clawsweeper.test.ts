@@ -2125,7 +2125,7 @@ test("repair workers hydrate only durable jobs from generated state", () => {
   assert.match(workflow, /\.status == "ready"/);
   assert.match(
     workflow,
-    /id: requeue_dispatch[\s\S]*if: \$\{\{ always\(\) && steps\.repair-requeue-ledger\.outcome == 'success' && steps\.repair_requeue\.outputs\.count != '' && steps\.repair_requeue\.outputs\.count != '0' \}\}/,
+    /id: requeue_dispatch[\s\S]*if: \$\{\{ always\(\) && steps\.state_post_flight_credentials\.outcome == 'success' && steps\.repair-requeue-ledger\.outcome == 'success' && steps\.repair_requeue\.outputs\.count != '' && steps\.repair_requeue\.outputs\.count != '0' \}\}/,
   );
   assert.match(
     workflow,

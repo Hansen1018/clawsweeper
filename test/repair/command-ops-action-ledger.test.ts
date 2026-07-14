@@ -85,6 +85,10 @@ test("direct repair requeues forward a stable dispatch receipt and publish it", 
     publishStep,
     /if: \$\{\{ always\(\) && steps\.state_post_flight_credentials\.outcome == 'success' && steps\.execute-setup-pnpm\.outcome == 'success' && steps\.repair-requeue-ledger\.outcome == 'success' && steps\.repair_requeue\.outputs\.count != '' && steps\.repair_requeue\.outputs\.count != '0' \}\}/,
   );
+  assert.match(
+    workflow.slice(requeueStart, finalizeStart),
+    /if: \$\{\{ always\(\) && steps\.state_post_flight_credentials\.outcome == 'success' && steps\.repair-requeue-ledger\.outcome == 'success' && steps\.repair_requeue\.outputs\.count != '' && steps\.repair_requeue\.outputs\.count != '0' \}\}/,
+  );
   assertCommandFinalizerUsesCanonicalRoot(finalizeStep);
   assertCommandPublisherUsesCanonicalRoot(publishStep);
   assert.match(finalizeStep, /--lane repair-requeue/);
@@ -119,6 +123,14 @@ test("repair execution publishes crash-safe workflow attempt receipts", () => {
     "- name: Publish immutable execute-fix action ledger",
     finalizeStart,
   );
+  const stateTokenStart = workflow.indexOf(
+    "- name: Renew state token for post-flight",
+    finalizeStart,
+  );
+  const stateCredentialsStart = workflow.indexOf(
+    "- name: Rebind state checkout credentials",
+    stateTokenStart,
+  );
   const postFlightTokenStart = workflow.indexOf(
     "- name: Renew target write token for post-flight",
     publishStart,
@@ -135,7 +147,9 @@ test("repair execution publishes crash-safe workflow attempt receipts", () => {
   assert.ok(pnpmStart > setupStart);
   assert.ok(executeStart > pnpmStart);
   assert.ok(finalizeStart > executeStart);
-  assert.ok(publishStart > finalizeStart);
+  assert.ok(stateTokenStart > finalizeStart);
+  assert.ok(stateCredentialsStart > stateTokenStart);
+  assert.ok(publishStart > stateCredentialsStart);
   assert.ok(postFlightTokenStart > publishStart);
   assert.ok(requeueStart > publishStart);
   assert.match(workflow.slice(executeJobStart, deadlineStart), /timeout-minutes: 120/);
@@ -184,7 +198,10 @@ test("repair execution publishes crash-safe workflow attempt receipts", () => {
   assert.match(finalizeStep, /finalize-action-events/);
   assert.match(finalizeStep, /--interrupt-open-attempts/);
   assert.match(finalizeStep, /--reason "\$reason"/);
-  assert.match(publishStep, /steps\.finalize-execute-fix-action-ledger\.outcome == 'success'/);
+  assert.match(
+    publishStep,
+    /steps\.finalize-execute-fix-action-ledger\.outcome == 'success' && steps\.state_post_flight_credentials\.outcome == 'success'/,
+  );
   assert.match(
     publishStep,
     /source_root="\$\{CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:\?setup-action-ledger output root is required\}"/,
