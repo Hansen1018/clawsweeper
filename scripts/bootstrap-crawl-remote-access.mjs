@@ -77,9 +77,13 @@ export async function bootstrapCrawlRemoteAccess(options, dependencies) {
       throw new Error("multiple managed service tokens match the active credential generation");
     }
     if (boundTokens.length === 1) {
-      activeToken = boundTokens[0];
-      oldTokens = matchingTokens.filter((token) => token.id !== activeToken.id);
-      resumedRotation = true;
+      const boundToken = boundTokens[0];
+      const remainingTokens = matchingTokens.filter((token) => token.id !== boundToken.id);
+      if (isStrictlyNewestManagedServiceToken(boundToken, remainingTokens)) {
+        activeToken = boundToken;
+        oldTokens = remainingTokens;
+        resumedRotation = true;
+      }
     }
   }
 
@@ -702,6 +706,39 @@ function isManagedServiceToken(token) {
     (token.name === BOOTSTRAP_CONTRACT.accessServiceTokenName ||
       token.name.startsWith(`${BOOTSTRAP_CONTRACT.accessServiceTokenName} rotation `))
   );
+}
+
+function isStrictlyNewestManagedServiceToken(candidate, otherTokens) {
+  const candidateGeneration = managedServiceTokenGeneration(candidate);
+  if (candidateGeneration === null) return false;
+  return otherTokens.every((token) => {
+    const generation = managedServiceTokenGeneration(token);
+    return (
+      generation !== null && compareServiceTokenGenerations(candidateGeneration, generation) > 0
+    );
+  });
+}
+
+function managedServiceTokenGeneration(token) {
+  if (token?.name === BOOTSTRAP_CONTRACT.accessServiceTokenName) {
+    return { initial: true, runId: 0n, attempt: 0n };
+  }
+  const prefix = `${BOOTSTRAP_CONTRACT.accessServiceTokenName} rotation `;
+  if (typeof token?.name !== "string" || !token.name.startsWith(prefix)) return null;
+  const match = /^([0-9]+)(?:-([0-9]+))?$/.exec(token.name.slice(prefix.length));
+  if (!match) return null;
+  return {
+    initial: false,
+    runId: BigInt(match[1]),
+    attempt: BigInt(match[2] ?? "0"),
+  };
+}
+
+function compareServiceTokenGenerations(left, right) {
+  if (left.initial !== right.initial) return left.initial ? -1 : 1;
+  if (left.runId !== right.runId) return left.runId > right.runId ? 1 : -1;
+  if (left.attempt !== right.attempt) return left.attempt > right.attempt ? 1 : -1;
+  return 0;
 }
 
 function assertCreatedServiceToken(token) {

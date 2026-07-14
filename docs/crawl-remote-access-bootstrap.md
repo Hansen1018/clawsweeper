@@ -45,7 +45,9 @@ then switches the three generation markers. Only after all markers switch does
 it narrow the policy and delete old tokens. A pair-write failure changes no
 marker; a marker-write failure can leave consumers on different generations,
 but every selected generation remains authorized. A later explicit rotation
-either finishes a fully published generation or supersedes a partial one.
+finishes a fully published generation only when its managed generation label is
+strictly newer than every leftover token. Otherwise it mints a fresh generation
+and supersedes every ambiguous partial token.
 
 After crawl-remote deployment and staged archive proof:
 

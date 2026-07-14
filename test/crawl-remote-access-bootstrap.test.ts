@@ -113,10 +113,12 @@ function createCloudflareFixture({
   tokens = [],
   application = null,
   policy = null,
+  createdTokenId = "token-new",
 }: {
   tokens?: Array<{ id: string; name: string }>;
   application?: { id: string; name?: string; domain?: string } | null;
   policy?: { id: string } | null;
+  createdTokenId?: string;
 } = {}) {
   const events: Array<Record<string, unknown>> = [];
   return {
@@ -133,7 +135,7 @@ function createCloudflareFixture({
       async createServiceToken(input: { name: string; duration: string }) {
         events.push({ event: "create-token", ...input });
         return {
-          id: "token-new",
+          id: createdTokenId,
           client_id: "fixture-client-id",
           client_secret: "fixture-client-credential",
           ...input,
@@ -485,7 +487,103 @@ test("rotation keeps active markers and the old token when an inactive pair writ
   }
 });
 
-test("explicit rotation resumes finalization when every marker binds one managed token", async () => {
+test("retry after an inactive pair failure supersedes every ambiguous token", async () => {
+  const github = createGitHubFixture({ activeTokenId: "token-old" });
+  const originalSetSecret = github.client.setSecret;
+  let failInactiveWrite = true;
+  github.client.setSecret = async (target: SecretTarget) => {
+    if (
+      failInactiveWrite &&
+      target.name === "CLAWSWEEPER_GITCRAWL_CLOUD_ACCESS_GREEN_CLIENT_SECRET"
+    ) {
+      failInactiveWrite = false;
+      throw new Error("injected GitHub write failure");
+    }
+    await originalSetSecret(target);
+  };
+  const interruptedCloudflare = createCloudflareFixture({
+    tokens: [{ id: "token-old", name: BOOTSTRAP_CONTRACT.accessServiceTokenName }],
+    application: {
+      id: "app-existing",
+      name: BOOTSTRAP_CONTRACT.accessAppName,
+      domain: BOOTSTRAP_CONTRACT.accessDomain,
+    },
+    policy: { id: "policy-existing" },
+    createdTokenId: "token-partial",
+  });
+
+  await assert.rejects(
+    bootstrapCrawlRemoteAccess(
+      {
+        publisherEnabled: "0",
+        rotateServiceToken: true,
+        rotationLabel: "789-1",
+        runtimeProvider: "local",
+        workersApiToken: "fixture-workers-credential",
+      },
+      {
+        cloudflare: interruptedCloudflare.client,
+        github: github.client,
+        logger: quietLogger,
+      },
+    ),
+    /injected GitHub write failure/,
+  );
+
+  const retryCloudflare = createCloudflareFixture({
+    tokens: [
+      { id: "token-old", name: BOOTSTRAP_CONTRACT.accessServiceTokenName },
+      {
+        id: "token-partial",
+        name: `${BOOTSTRAP_CONTRACT.accessServiceTokenName} rotation 789-1`,
+      },
+    ],
+    application: {
+      id: "app-existing",
+      name: BOOTSTRAP_CONTRACT.accessAppName,
+      domain: BOOTSTRAP_CONTRACT.accessDomain,
+    },
+    policy: { id: "policy-existing" },
+    createdTokenId: "token-retry",
+  });
+
+  const result = await bootstrapCrawlRemoteAccess(
+    {
+      publisherEnabled: "0",
+      rotateServiceToken: true,
+      rotationLabel: "790-1",
+      runtimeProvider: "local",
+      workersApiToken: "fixture-workers-credential",
+    },
+    { cloudflare: retryCloudflare.client, github: github.client, logger: quietLogger },
+  );
+
+  assert.equal(result.accessServiceTokenId, "token-retry");
+  assert.equal(result.createdServiceToken, true);
+  assert.equal(result.rotatedServiceToken, true);
+  assert.equal(result.resumedServiceTokenRotation, false);
+  assert.deepEqual(
+    retryCloudflare.events
+      .filter((event) => event.event === "ensure-policy")
+      .map((event) => event.tokenIds),
+    [["token-old", "token-partial", "token-retry"], ["token-retry"]],
+  );
+  assert.deepEqual(
+    retryCloudflare.events.filter((event) => event.event === "delete-token"),
+    [
+      { event: "delete-token", tokenId: "token-old" },
+      { event: "delete-token", tokenId: "token-partial" },
+    ],
+  );
+  for (const target of credentialTargets) {
+    assert.equal(
+      github.variableValues.get(`${targetKey(target)}:${target.generationVariable}`),
+      credentialGenerationMarker("token-retry", "green"),
+    );
+  }
+});
+
+test("explicit rotation resumes finalization when markers bind the newest managed token", async () => {
   const cloudflare = createCloudflareFixture({
     tokens: [
       { id: "token-old", name: BOOTSTRAP_CONTRACT.accessServiceTokenName },
