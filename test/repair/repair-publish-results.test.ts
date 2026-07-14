@@ -173,6 +173,11 @@ test("repair result publication rejects untrusted worker heads before minting wr
   );
   assert.match(classification, /if ! git cat-file blob "\$marker_oid"/);
   assert.match(classification, /Unreadable worker capabilities/);
+  assert.match(
+    classification,
+    /git log -1 --format=%H "\$WORKER_HEAD_SHA" -- "\$CAPABILITIES_PATH"/,
+  );
+  assert.match(classification, /Removed worker capabilities/);
   assert.match(classification, /\.schema == "clawsweeper\.repair-worker-capabilities"/);
   assert.match(
     classification,
@@ -180,7 +185,7 @@ test("repair result publication rejects untrusted worker heads before minting wr
   );
   assert.match(classification, /worker_ledgers_required=0/);
   assert.match(classification, /worker_ledgers_required=1/);
-  assert.doesNotMatch(classification, /classify_contract|CONTRACT_SHA|git log|git show|grep -F/);
+  assert.doesNotMatch(classification, /classify_contract|CONTRACT_SHA|git show|grep -F/);
   const capabilities = JSON.parse(readText(".github/repair-worker-capabilities.json"));
   assert.deepEqual(capabilities, {
     action_ledger: true,
@@ -227,6 +232,12 @@ test("repair result publication requires ledgers for every post-contract worker"
       "regress worker contents",
       { sealed_source: true, action_ledger: true },
     );
+    const removedContract = commitFixture(
+      repo,
+      "name: repair cluster worker\n# capability marker accidentally removed\n",
+      "remove worker capabilities",
+      null,
+    );
     git(repo, "switch", "-c", "squash-landing", legacyHead);
     const squashLanding = commitFixture(
       repo,
@@ -261,6 +272,17 @@ test("repair result publication requires ledgers for every post-contract worker"
       trusted_legacy_worker_head: "",
       worker_ledgers_required: "1",
     });
+    assert.throws(
+      () => classifyWorker(repo, classify.run, removedContract),
+      (error: unknown) => {
+        const output = error as { stderr?: string; stdout?: string };
+        assert.match(
+          `${String(output.stdout ?? "")}\n${String(output.stderr ?? "")}`,
+          /Removed worker capabilities/,
+        );
+        return true;
+      },
+    );
     assert.deepEqual(classifyWorker(repo, classify.run, squashLanding), {
       trusted_legacy_worker_head: "",
       worker_ledgers_required: "1",

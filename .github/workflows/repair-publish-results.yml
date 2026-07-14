@@ -58,6 +58,11 @@ jobs:
 
           marker_entry="$(git ls-tree --full-tree "$WORKER_HEAD_SHA" -- "$CAPABILITIES_PATH")"
           if [ -z "$marker_entry" ]; then
+            marker_history="$(git log -1 --format=%H "$WORKER_HEAD_SHA" -- "$CAPABILITIES_PATH")"
+            if [ -n "$marker_history" ]; then
+              echo "::error title=Removed worker capabilities::Worker capability marker was removed after rollout."
+              exit 1
+            fi
             echo "trusted_legacy_worker_head=$WORKER_HEAD_SHA" >> "$GITHUB_OUTPUT"
             exit 0
           fi
