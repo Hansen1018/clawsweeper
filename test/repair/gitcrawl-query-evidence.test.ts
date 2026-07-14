@@ -1153,6 +1153,36 @@ test("local coverage rejects active clusters without valid memberships", async (
   }
 });
 
+test("local portable export timestamps are not source freshness proof", async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-query-export-age-"));
+  const dbPath = path.join(directory, "gitcrawl.db");
+  seedLocalDatabase(dbPath);
+  const db = new DatabaseSync(dbPath);
+  db.exec("drop table sync_runs");
+  db.prepare("update portable_metadata set value = ? where key = 'exported_at'").run(
+    now.toISOString(),
+  );
+  db.close();
+  const source = await LocalGitcrawlQuerySource.open({
+    dbPath,
+    repository,
+    allowLegacy: false,
+  });
+  try {
+    await assert.rejects(
+      GitcrawlEvidenceAdapter.fromSources({
+        repository,
+        provider: "local",
+        primarySource: source,
+        now: () => now,
+      }),
+      /source sync timestamp is invalid/,
+    );
+  } finally {
+    fs.rmSync(directory, { force: true, recursive: true });
+  }
+});
+
 test("local portable cluster coverage binds to exported metadata", async () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-query-portable-"));
   const dbPath = path.join(directory, "gitcrawl.db");
@@ -1161,7 +1191,21 @@ test("local portable cluster coverage binds to exported metadata", async () => {
   db.exec(`
     drop table cluster_runs;
     drop table sync_runs;
+    create table repo_sync_state (
+      repo_id integer primary key,
+      last_full_open_scan_started_at text not null,
+      last_overlapping_open_scan_completed_at text not null,
+      last_non_overlapping_scan_completed_at text not null,
+      last_open_close_reconciled_at text not null
+    );
   `);
+  db.prepare("insert into repo_sync_state values (?, ?, ?, ?, ?)").run(
+    1,
+    generatedAt,
+    generatedAt,
+    generatedAt,
+    generatedAt,
+  );
   db.close();
   const source = await LocalGitcrawlQuerySource.open({
     dbPath,

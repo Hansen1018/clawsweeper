@@ -1629,12 +1629,6 @@ function localSourceSyncAt(db: DatabaseSync, repoId: number, repository: string)
   }
   const reconciled = completeOpenReconciliationAt(db, repoId);
   if (reconciled) candidates.push(reconciled);
-  if (candidates.length === 0 && tableExists(db, "portable_metadata")) {
-    const exportedAt = db
-      .prepare("select value from portable_metadata where key = 'exported_at'")
-      .get()?.value;
-    if (typeof exportedAt === "string") candidates.push(exportedAt);
-  }
   return latestTimestamp(...candidates);
 }
 
