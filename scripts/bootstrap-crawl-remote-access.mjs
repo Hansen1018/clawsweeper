@@ -421,7 +421,7 @@ export function createGitHubClient({
   apiBase = "https://api.github.com",
   runGh = defaultRunGh,
 }) {
-  assertSecretValue(token, "OPENCLAW_GH_TOKEN");
+  assertSecretValue(token, "GH_TOKEN");
 
   async function get(path) {
     const response = await fetchImpl(`${apiBase}${path}`, {
@@ -478,7 +478,7 @@ async function runGhCommand({ args, input, token, runGh }) {
   const childEnvironment = { ...process.env };
   delete childEnvironment.OPENCLAW_CLOUDFLARE_CONFIG_API_TOKEN;
   delete childEnvironment.OPENCLAW_CLOUDFLARE_WORKERS_API_TOKEN;
-  delete childEnvironment.OPENCLAW_GH_TOKEN;
+  delete childEnvironment.GH_TOKEN;
   const result = await runGh(args, {
     input,
     env: {
@@ -651,7 +651,7 @@ async function main() {
   const cloudflare = createCloudflareClient({
     token: process.env.OPENCLAW_CLOUDFLARE_CONFIG_API_TOKEN,
   });
-  const github = createGitHubClient({ token: process.env.OPENCLAW_GH_TOKEN });
+  const github = createGitHubClient({ token: process.env.GH_TOKEN });
   await bootstrapCrawlRemoteAccess(
     {
       publisherEnabled: args["publisher-enabled"] ?? "0",

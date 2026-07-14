@@ -34,7 +34,17 @@ test("manual workflow keeps bootstrap separate from deployment authority", () =>
     bootstrap.env.OPENCLAW_CLOUDFLARE_WORKERS_API_TOKEN,
     "${{ secrets.OPENCLAW_CLOUDFLARE_WORKERS_API_TOKEN }}",
   );
-  assert.equal(bootstrap.env.OPENCLAW_GH_TOKEN, "${{ secrets.OPENCLAW_GH_TOKEN }}");
+  assert.equal(bootstrap.env.GH_TOKEN, "${{ steps.bootstrap-admin-token.outputs.token }}");
+  const token = job.steps.find(
+    (candidate: { name?: string }) => candidate.name === "Create repository-scoped bootstrap token",
+  );
+  assert.equal(
+    token.uses,
+    "actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1",
+  );
+  assert.equal(token.with.owner, "openclaw");
+  assert.equal(token.with.repositories, "clawsweeper\ngitcrawl-store\n");
+  assert.equal(token.with["private-key"], "${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}");
   assert.match(bootstrap.run, /bootstrap:crawl-remote-access/);
   assert.match(bootstrap.run, /--rotate-service-token/);
   assert.doesNotMatch(source, /deploy-crawl-remote/);

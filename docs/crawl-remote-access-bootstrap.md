@@ -53,9 +53,11 @@ The ClawSweeper repository must already contain:
 - `OPENCLAW_CLOUDFLARE_CONFIG_API_TOKEN` with Access applications, policies,
   and service-token write permissions
 - `OPENCLAW_CLOUDFLARE_WORKERS_API_TOKEN`
-- `OPENCLAW_GH_TOKEN` with administration access to ClawSweeper environments
-  and Actions secrets/variables in ClawSweeper and gitcrawl-store
+- `CLAWSWEEPER_APP_PRIVATE_KEY`; the workflow mints a short-lived installation
+  token scoped to only ClawSweeper and gitcrawl-store
 
 The bootstrap never prints returned service credentials. GitHub secret writes
 are passed to `gh secret set` over standard input so encryption happens locally
-before the API request.
+before the API request. The installed ClawSweeper GitHub App must grant
+environment, Actions secret, and Actions variable administration on both
+repositories.

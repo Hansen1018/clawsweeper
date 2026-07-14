@@ -452,6 +452,5 @@ test("GitHub client sends secret values only over standard input", async () => {
   assert.equal(commands[0]?.options.env.GH_TOKEN, "fixture-github-credential");
   assert.equal(commands[0]?.options.env.OPENCLAW_CLOUDFLARE_CONFIG_API_TOKEN, undefined);
   assert.equal(commands[0]?.options.env.OPENCLAW_CLOUDFLARE_WORKERS_API_TOKEN, undefined);
-  assert.equal(commands[0]?.options.env.OPENCLAW_GH_TOKEN, undefined);
   assert.doesNotMatch(commands[0]?.args.join(" "), /fixture-secret-value/);
 });
