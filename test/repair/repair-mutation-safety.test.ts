@@ -728,6 +728,11 @@ test("repair executors route authoritative GitHub writes through the mutation bo
 
   for (const source of [applySource, postFlightSource]) {
     assert.match(source, /kind: "pull_request_merge"/);
+    assert.match(source, /outcome: \(confirmed\) => \{[\s\S]*confirmed\.merged_at/);
+    assert.match(
+      source,
+      /merge command completed but GitHub has not reported the pull request as merged/,
+    );
     assert.match(source, /kind: "label_add"/);
     assert.match(source, /kind: "label_create"/);
     assert.doesNotMatch(source, /ghWithRetry\(mergeArgs\)/);
@@ -751,6 +756,7 @@ test("repair executors route authoritative GitHub writes through the mutation bo
   assert.match(activitySource, /compactPullRequestRef\(pull\.head\)/);
   assert.match(activitySource, /autoMerge: compactAutoMerge/);
   assert.match(postFlightSource, /fix PR head changed after repair validation/);
+  assert.doesNotMatch(postFlightSource, /CLAWSWEEPER_POST_FLIGHT_REQUIRE_PR_CHECKS/);
   assert.match(applySource, /resolveRepairMutationReviewActivityCursor/);
   assert.match(postFlightSource, /resolveRepairMutationReviewActivityCursor/);
   assert.match(applySource, /finally \{\s+await flushRepairMutationActionEvents\(\)/);
@@ -762,7 +768,9 @@ test("repair worker renews and rebinds state credentials before post-flight publ
   const executeIndex = workflow.indexOf("- name: Execute credited fix artifact");
   const stateTokenIndex = workflow.indexOf("- name: Renew state token for post-flight");
   const rebindIndex = workflow.indexOf("- name: Rebind state checkout credentials");
-  const ledgerPublishIndex = workflow.indexOf("- name: Publish immutable execute-fix action ledger");
+  const ledgerPublishIndex = workflow.indexOf(
+    "- name: Publish immutable execute-fix action ledger",
+  );
   const deferredIndex = workflow.indexOf("- name: Publish deferred fix outcome");
   const applyIndex = workflow.indexOf("- name: Apply safe closure actions");
   const postFlightIndex = workflow.indexOf("- name: Post-flight finalize fix PRs");

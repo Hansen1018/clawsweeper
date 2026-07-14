@@ -1841,6 +1841,107 @@ test("repair apply requeues a merge rejected after guarded preflight", () => {
   }
 });
 
+test("repair apply blocks when GitHub accepts merge without completing it", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-apply-result-"));
+  try {
+    const mergeCommandPath = path.join(tmp, "merge-command");
+    const paths = writeApplyMergeFixture(tmp);
+    writeFakeGh(paths.binDir, {
+      issues: {
+        101: issue({ number: 101, title: "Fix config validation", pullRequest: true }),
+      },
+      pulls: {
+        101: pull({ number: 101, title: "Fix config validation" }),
+      },
+      comments: { 101: [] },
+      mergeCommandPath,
+      logPath: paths.ghLogPath,
+    });
+
+    execFileSync(
+      process.execPath,
+      ["dist/repair/apply-result.js", paths.jobPath, paths.resultPath],
+      {
+        cwd: repoRoot,
+        env: {
+          ...process.env,
+          CLAWSWEEPER_ALLOW_EXECUTE: "1",
+          CLAWSWEEPER_ALLOW_MERGE: "1",
+          CLAWSWEEPER_ALLOWED_OWNER: "openclaw",
+          CLAWSWEEPER_GH_RETRY_ATTEMPTS: "1",
+          GH_TOKEN: "write-token",
+          ...mockGhBinEnv(path.join(paths.binDir, "gh.js")),
+          PATH: `${paths.binDir}${path.delimiter}${process.env.PATH ?? ""}`,
+        },
+        stdio: "pipe",
+      },
+    );
+
+    const report = JSON.parse(fs.readFileSync(paths.reportPath, "utf8"));
+    assert.equal(report.actions[0].status, "blocked");
+    assert.equal(
+      report.actions[0].reason,
+      "merge command completed but GitHub has not reported the pull request as merged",
+    );
+    assert.equal(report.actions[0].requeue_required, true);
+    assert.equal(fs.existsSync(mergeCommandPath), true);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("repair apply executes only after GitHub reports the merge complete", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-apply-result-"));
+  try {
+    const mergeCommandPath = path.join(tmp, "merge-command");
+    const paths = writeApplyMergeFixture(tmp);
+    writeFakeGh(paths.binDir, {
+      issues: {
+        101: issue({ number: 101, title: "Fix config validation", pullRequest: true }),
+      },
+      pulls: {
+        101: pull({ number: 101, title: "Fix config validation" }),
+      },
+      comments: { 101: [] },
+      mergeCommandPath,
+      postMergePulls: {
+        101: {
+          state: "closed",
+          merged_at: "2026-05-25T00:05:00Z",
+          merge_commit_sha: "b".repeat(40),
+        },
+      },
+      logPath: paths.ghLogPath,
+    });
+
+    execFileSync(
+      process.execPath,
+      ["dist/repair/apply-result.js", paths.jobPath, paths.resultPath],
+      {
+        cwd: repoRoot,
+        env: {
+          ...process.env,
+          CLAWSWEEPER_ALLOW_EXECUTE: "1",
+          CLAWSWEEPER_ALLOW_MERGE: "1",
+          CLAWSWEEPER_ALLOWED_OWNER: "openclaw",
+          CLAWSWEEPER_GH_RETRY_ATTEMPTS: "1",
+          GH_TOKEN: "write-token",
+          ...mockGhBinEnv(path.join(paths.binDir, "gh.js")),
+          PATH: `${paths.binDir}${path.delimiter}${process.env.PATH ?? ""}`,
+        },
+        stdio: "pipe",
+      },
+    );
+
+    const report = JSON.parse(fs.readFileSync(paths.reportPath, "utf8"));
+    assert.equal(report.actions[0].status, "executed");
+    assert.equal(report.actions[0].merged_at, "2026-05-25T00:05:00Z");
+    assert.equal(report.actions[0].merge_commit_sha, "b".repeat(40));
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
 type ApplyFixturePaths = {
   binDir: string;
   jobPath: string;
@@ -1885,6 +1986,8 @@ type FakeGhData = {
   postProofPrViewFailure?: { number: number; message: string };
   prViews?: Record<number, Record<string, unknown>[]>;
   mergeFailure?: string;
+  mergeCommandPath?: string;
+  postMergePulls?: Record<number, Record<string, unknown>>;
   logPath: string;
 };
 
@@ -2245,10 +2348,16 @@ if (args[0] === "api") {
       fs.existsSync(data.reviewChangePath) &&
       data.postMutationPulls &&
       data.postMutationPulls[number];
+    const postMergePull =
+      data.mergeCommandPath &&
+      fs.existsSync(data.mergeCommandPath) &&
+      data.postMergePulls &&
+      data.postMergePulls[number];
     write({
       ...pull,
       ...(postProofPull ? postProofPull : {}),
       ...(postMutationPull ? postMutationPull : {}),
+      ...(postMergePull ? postMergePull : {}),
     });
     process.exit(0);
   }
@@ -2268,6 +2377,7 @@ if (args[0] === "pr" && args[1] === "merge") {
     process.stderr.write(data.mergeFailure + "\\n");
     process.exit(1);
   }
+  if (data.mergeCommandPath) fs.writeFileSync(data.mergeCommandPath, "1");
   write({ merged: Number(args[2]) });
   process.exit(0);
 }

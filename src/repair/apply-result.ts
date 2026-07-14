@@ -55,6 +55,7 @@ import {
 } from "./closure-result-plan.js";
 import {
   RepairMutationFreshnessError,
+  RepairMutationOutcomeUnknownError,
   createRepairMutationBoundaryGuard,
   createRepairMutationFreshnessGuard,
   flushRepairMutationActionEvents,
@@ -942,6 +943,7 @@ function applyMergeAction({
     readFailureReason: "required check rollup could not be refreshed",
     retryableOnChange: true,
   });
+  let merged: LooseRecord | null = null;
   try {
     runRepairMutation(mutationContext, {
       kind: "pull_request_merge",
@@ -956,11 +958,29 @@ function applyMergeAction({
       },
       freshness,
       boundaryGuards: [requiredChecksGuard],
-      operation: () => ghOneShot(mergeArgs),
+      operation: () => {
+        ghOneShot(mergeArgs);
+        return fetchPullRequest(result.repo, target);
+      },
+      outcome: (confirmed) => {
+        merged = confirmed;
+        return confirmed.merged_at ? "accepted" : "unknown";
+      },
       knownNoMutation: (error) =>
         isLockedConversationCommentError(error) || isRecoverableRepairMergeRaceError(error),
     });
   } catch (error) {
+    if (error instanceof RepairMutationOutcomeUnknownError && merged && !merged.merged_at) {
+      return {
+        ...base,
+        status: "blocked",
+        reason: "merge command completed but GitHub has not reported the pull request as merged",
+        live_state: live.state,
+        live_updated_at: live.updated_at,
+        requeue_required: true,
+        merge_method: "squash",
+      };
+    }
     if (error instanceof RepairMutationFreshnessError) {
       return repairFreshnessBlock(base, live, error);
     }
@@ -988,14 +1008,16 @@ function applyMergeAction({
     }
     throw error;
   }
-  const merged = fetchPullRequest(result.repo, target);
+  if (!merged?.merged_at) {
+    throw new Error("confirmed merge state was unavailable after accepted repair merge");
+  }
   return {
     ...base,
     status: "executed",
     reason: "merged by clawsweeper-repair",
     live_state: "merged",
     live_updated_at: live.updated_at,
-    merged_at: merged.merged_at ?? null,
+    merged_at: merged.merged_at,
     merge_commit_sha: merged.merge_commit_sha ?? null,
     merge_method: "squash",
     commit_subject: mergeMessage.subject,

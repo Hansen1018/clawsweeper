@@ -40,6 +40,7 @@ import {
 } from "./repair-merge-race.js";
 import {
   RepairMutationFreshnessError,
+  RepairMutationOutcomeUnknownError,
   createRepairMutationBoundaryGuard,
   createRepairMutationFreshnessGuard,
   flushRepairMutationActionEvents,
@@ -343,21 +344,18 @@ function finalizeFixPr(action: LooseRecord) {
     bodyFile,
   ];
   if (pull.head?.sha) mergeArgs.push("--match-head-commit", String(pull.head.sha));
-  const requiredChecks = shouldRequirePrChecks()
-    ? postFlightRequiredCheckRollupSnapshot(view.statusCheckRollup ?? [])
-    : null;
-  const requiredChecksGuard = requiredChecks
-    ? createRepairMutationBoundaryGuard({
-        expectedState: requiredChecks,
-        readState: () =>
-          postFlightRequiredCheckRollupSnapshot(
-            fetchPullRequestView(result.repo, parsed.number).statusCheckRollup ?? [],
-          ),
-        changedReason: "required check rollup changed after merge preflight",
-        readFailureReason: "required check rollup could not be refreshed",
-        retryableOnChange: true,
-      })
-    : null;
+  const requiredChecks = postFlightRequiredCheckRollupSnapshot(view.statusCheckRollup ?? []);
+  const requiredChecksGuard = createRepairMutationBoundaryGuard({
+    expectedState: requiredChecks,
+    readState: () =>
+      postFlightRequiredCheckRollupSnapshot(
+        fetchPullRequestView(result.repo, parsed.number).statusCheckRollup ?? [],
+      ),
+    changedReason: "required check rollup changed after merge preflight",
+    readFailureReason: "required check rollup could not be refreshed",
+    retryableOnChange: true,
+  });
+  let merged: LooseRecord | null = null;
   try {
     runRepairMutation(mutationContext, {
       kind: "pull_request_merge",
@@ -366,18 +364,35 @@ function finalizeFixPr(action: LooseRecord) {
         number: parsed.number,
         headSha: pull.head?.sha ?? null,
         method: "squash",
-        requiredChecksSha256: requiredChecks
-          ? createHash("sha256").update(JSON.stringify(requiredChecks)).digest("hex")
-          : null,
+        requiredChecksSha256: createHash("sha256")
+          .update(JSON.stringify(requiredChecks))
+          .digest("hex"),
         subjectSha256: createHash("sha256").update(mergeMessage.subject).digest("hex"),
         bodySha256: createHash("sha256").update(mergeMessage.body).digest("hex"),
       },
       freshness,
-      boundaryGuards: requiredChecksGuard ? [requiredChecksGuard] : [],
-      operation: () => ghOneShot(mergeArgs),
+      boundaryGuards: [requiredChecksGuard],
+      operation: () => {
+        ghOneShot(mergeArgs);
+        return fetchPullRequest(result.repo, parsed.number);
+      },
+      outcome: (confirmed) => {
+        merged = confirmed;
+        return confirmed.merged_at ? "accepted" : "unknown";
+      },
       knownNoMutation: isRecoverableRepairMergeRaceError,
     });
   } catch (error) {
+    if (error instanceof RepairMutationOutcomeUnknownError && merged && !merged.merged_at) {
+      return {
+        ...prBase,
+        status: "blocked",
+        reason: "merge command completed but GitHub has not reported the pull request as merged",
+        retry_recommended: true,
+        merge_method: "squash",
+        waited_ms: waitedMs,
+      };
+    }
     if (error instanceof RepairMutationFreshnessError) {
       return postFlightFreshnessBlock(prBase, error, waitedMs);
     }
@@ -397,12 +412,14 @@ function finalizeFixPr(action: LooseRecord) {
     }
     throw error;
   }
-  const merged = fetchPullRequest(result.repo, parsed.number);
+  if (!merged?.merged_at) {
+    throw new Error("confirmed merge state was unavailable after accepted post-flight merge");
+  }
   return {
     ...prBase,
     status: "executed",
     reason: "merged by ClawSweeper Repair post-flight",
-    merged_at: merged.merged_at ?? null,
+    merged_at: merged.merged_at,
     merge_commit_sha: merged.merge_commit_sha ?? null,
     merge_method: "squash",
     commit_subject: mergeMessage.subject,
@@ -821,9 +838,7 @@ function validateMergeableFixPr({ pull, view, preflight }: LooseRecord) {
   const threadBlock = validateResolvedReviewThreads(result.repo, pull.number);
   if (threadBlock) return threadBlock;
 
-  const checkBlock = shouldRequirePrChecks()
-    ? validateStatusChecks(view.statusCheckRollup ?? [])
-    : "";
+  const checkBlock = validateStatusChecks(view.statusCheckRollup ?? []);
   if (checkBlock) return checkBlock;
 
   return "";
@@ -972,10 +987,6 @@ function ignoredCheckNames() {
       .map((item: string) => item.toLowerCase())
       .filter(Boolean),
   );
-}
-
-function shouldRequirePrChecks() {
-  return process.env.CLAWSWEEPER_POST_FLIGHT_REQUIRE_PR_CHECKS === "1";
 }
 
 function validateResolvedReviewThreads(repo: string, number: JsonValue) {
