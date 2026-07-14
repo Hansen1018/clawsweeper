@@ -133,6 +133,8 @@ test("operator docs preserve the dormant consumer and no-deploy boundaries", () 
   assert.match(docs, /generation marker and selects the matching slot/);
   assert.match(docs, /fresh protected-environment job has only a pinned sparse checkout/);
   assert.match(docs, /emits no credential outputs/);
+  assert.match(docs, /deny an unauthenticated probe/);
+  assert.match(docs, /direct, computed, or bulk access\s+to the GitHub `secrets` context/);
   assert.match(docs, /exact approved release SHA, both rollout states/);
   assert.match(docs, /fails\s+closed before\s+privileged\s+work/);
   assert.match(docs, /never prints returned service credentials/);

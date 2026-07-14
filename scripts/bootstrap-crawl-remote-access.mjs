@@ -305,6 +305,14 @@ export function assertCrawlRemoteDeployConsumerContract(source) {
       );
     }
   }
+  const secretContextExpressions = sourceOutsideVerifier
+    .match(/\$\{\{[\s\S]*?\}\}/g)
+    ?.filter((expression) => /\bSECRETS\b/.test(expression));
+  if (secretContextExpressions?.length) {
+    throw new Error(
+      "crawl-remote deploy consumer must not access the secrets context outside the isolated verifier job",
+    );
+  }
   const legacyReferences = DEPLOY_CONSUMER_CONTRACT.forbiddenReferences.filter((reference) =>
     normalizedSource.toUpperCase().includes(reference),
   );

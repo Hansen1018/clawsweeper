@@ -286,6 +286,18 @@ test("deploy consumer gate rejects encoded and out-of-job credential access", ()
       ),
     /must reference CRAWL_REMOTE_ACCESS_GREEN_CLIENT_SECRET only in the isolated verifier job/,
   );
+  for (const expression of [
+    "${{ secrets[format('CRAWL_REMOTE_ACCESS_{0}_CLIENT_SECRET', 'GREEN')] }}",
+    "${{ toJSON(secrets) }}",
+  ]) {
+    assert.throws(
+      () =>
+        assertCrawlRemoteDeployConsumerContract(
+          validSource.replace("      - run: echo deploy", `      - run: echo "${expression}"`),
+        ),
+      /must not access the secrets context outside the isolated verifier job/,
+    );
+  }
   assert.throws(
     () =>
       assertCrawlRemoteDeployConsumerContract(

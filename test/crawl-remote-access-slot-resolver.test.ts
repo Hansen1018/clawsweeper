@@ -41,6 +41,10 @@ function contractResponse(releaseSha = "1".repeat(40)) {
   };
 }
 
+function deniedAccessResponse() {
+  return new Response(null, { status: 403 });
+}
+
 test("slot resolver selects one complete generation without mixing pairs", () => {
   const common = {
     CRAWL_REMOTE_ACCESS_BLUE_CLIENT_ID: "fixture-blue-id",
@@ -112,7 +116,9 @@ test("resolver selects and verifies one generation in the same process", async (
     {
       nonce: "fixture-probe",
       fetchImpl: async (url: string | URL, init?: RequestInit) => {
-        requests.push({ url: String(url), headers: new Headers(init?.headers) });
+        const headers = new Headers(init?.headers);
+        requests.push({ url: String(url), headers });
+        if (!headers.has("CF-Access-Client-Id")) return deniedAccessResponse();
         return Response.json(
           String(url).includes("/v1/contract")
             ? contractResponse(releaseSha)
@@ -125,9 +131,15 @@ test("resolver selects and verifies one generation in the same process", async (
   assert.deepEqual(result, { releaseSha, slot: "green" });
   assert.deepEqual(
     requests.map((request) => new URL(request.url).pathname),
-    ["/crawl-remote/health", "/crawl-remote/v1/contract"],
+    ["/crawl-remote/health", "/crawl-remote/health", "/crawl-remote/v1/contract"],
   );
-  for (const request of requests) {
+  assert.equal(
+    new URL(requests[0]!.url).searchParams.get("access_preflight"),
+    "fixture-probe-denied",
+  );
+  assert.equal(requests[0]!.headers.has("CF-Access-Client-Id"), false);
+  assert.equal(requests[0]!.headers.has("CF-Access-Client-Secret"), false);
+  for (const request of requests.slice(1)) {
     assert.equal(new URL(request.url).searchParams.get("access_preflight"), "fixture-probe");
     assert.equal(request.headers.get("CF-Access-Client-Id"), "fixture-green-id");
     assert.equal(request.headers.get("CF-Access-Client-Secret"), "fixture-green-credential");
@@ -156,15 +168,36 @@ test("Access verifier rejects alternate routes and unapproved releases", async (
       },
       {
         nonce: "fixture-probe",
-        fetchImpl: async (url: string | URL) =>
-          Response.json(
+        fetchImpl: async (url: string | URL, init?: RequestInit) => {
+          if (!new Headers(init?.headers).has("CF-Access-Client-Id")) {
+            return deniedAccessResponse();
+          }
+          return Response.json(
             String(url).includes("/v1/contract")
               ? contractResponse("2".repeat(40))
               : { ok: true, release_sha: "2".repeat(40) },
-          ),
+          );
+        },
       },
     ),
     /did not reach the approved release/,
+  );
+});
+
+test("Access verifier rejects a publicly reachable route before accepting credentials", async () => {
+  await assert.rejects(
+    verifyCrawlRemoteAccessCredentials(
+      {
+        CF_ACCESS_CLIENT_ID: "fixture-client-id",
+        CF_ACCESS_CLIENT_SECRET: "fixture-client-credential",
+        ...verificationEnvironment(),
+      },
+      {
+        nonce: "fixture-probe",
+        fetchImpl: async () => Response.json({ ok: true }),
+      },
+    ),
+    /did not deny the unauthenticated probe \(HTTP 200\)/,
   );
 });
 
@@ -190,7 +223,10 @@ test("Access verifier cancels oversized responses before buffering the body", as
       },
       {
         nonce: "fixture-probe",
-        fetchImpl: async () => new Response(oversized),
+        fetchImpl: async (_url: string | URL, init?: RequestInit) =>
+          new Headers(init?.headers).has("CF-Access-Client-Id")
+            ? new Response(oversized)
+            : deniedAccessResponse(),
       },
     ),
     /response exceeded the size limit/,
@@ -208,12 +244,16 @@ test("Access verifier binds notes and capability states to the approved deployme
   await assert.rejects(
     verifyCrawlRemoteAccessCredentials(environment, {
       nonce: "fixture-probe",
-      fetchImpl: async (url: string | URL) =>
-        Response.json(
+      fetchImpl: async (url: string | URL, init?: RequestInit) => {
+        if (!new Headers(init?.headers).has("CF-Access-Client-Id")) {
+          return deniedAccessResponse();
+        }
+        return Response.json(
           String(url).includes("/v1/contract")
             ? { ...contractResponse(), notes: [] }
             : { ok: true, release_sha: "1".repeat(40) },
-        ),
+        );
+      },
     }),
     /missing the observation-order fence/,
   );
@@ -226,12 +266,16 @@ test("Access verifier binds notes and capability states to the approved deployme
       },
       {
         nonce: "fixture-probe",
-        fetchImpl: async (url: string | URL) =>
-          Response.json(
+        fetchImpl: async (url: string | URL, init?: RequestInit) => {
+          if (!new Headers(init?.headers).has("CF-Access-Client-Id")) {
+            return deniedAccessResponse();
+          }
+          return Response.json(
             String(url).includes("/v1/contract")
               ? contractResponse()
               : { ok: true, release_sha: "1".repeat(40) },
-          ),
+          );
+        },
       },
     ),
     /does not match expected active gitcrawl\.snapshot\.provenance\.v1 state/,

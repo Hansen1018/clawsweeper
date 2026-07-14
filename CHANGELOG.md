@@ -14,8 +14,9 @@ checkpoint, and status-only commits are intentionally omitted.
   crawl-remote custom route, with generation-bound service-token rotation,
   interruption-safe credential publication, and repository-scoped GitHub App
   permissions. It stages the contract for an isolated post-deploy verifier to
-  select and exercise one credential generation without secret-bearing step
-  outputs, bound to the approved release and Gitcrawl capability states. Cloud
+  reject unauthenticated public access, then select and exercise one credential
+  generation without secret-bearing step outputs, bound to the approved release
+  and Gitcrawl capability states. Cloud
   Gitcrawl credentials and source settings are staged while scheduled
   actionable intake and publication remain disabled; live deployment
   credentials and controls remain unchanged.

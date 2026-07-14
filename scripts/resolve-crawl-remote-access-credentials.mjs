@@ -67,12 +67,34 @@ export async function verifyCrawlRemoteAccessCredentials(
     "CF-Access-Client-Id": clientId,
     "CF-Access-Client-Secret": clientSecret,
   };
+  const denialUrl = new URL(`${probeUrl}/health`);
+  denialUrl.searchParams.set("access_preflight", `${probeNonce}-denied`);
+  const denialResponse = await fetchImpl(denialUrl, {
+    headers: {
+      accept: "application/json",
+      "cache-control": "no-cache",
+    },
+    redirect: "manual",
+    signal: AbortSignal.timeout(20_000),
+  });
+  const accessDenied =
+    (denialResponse.status >= 300 && denialResponse.status < 400) ||
+    denialResponse.status === 401 ||
+    denialResponse.status === 403;
+  try {
+    await denialResponse.body?.cancel();
+  } catch {}
+  if (!accessDenied) {
+    throw new Error(
+      `crawl-remote Access verification did not deny the unauthenticated probe (HTTP ${denialResponse.status})`,
+    );
+  }
   const request = async (path) => {
     const url = new URL(`${probeUrl}${path}`);
     url.searchParams.set("access_preflight", probeNonce);
     const response = await fetchImpl(url, {
       headers,
-      redirect: "error",
+      redirect: "manual",
       signal: AbortSignal.timeout(20_000),
     });
     if (!response.ok) {

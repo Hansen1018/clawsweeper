@@ -22,19 +22,21 @@ The single resolver process binds the generation marker and all four slot
 secrets, selects the matching pair in memory, and directly invokes
 `node scripts/resolve-crawl-remote-access-credentials.mjs
 --resolve-and-verify-access`. It emits no credential outputs. The same process
-sends both Access headers to the canonical `/health` and `/v1/contract`
-endpoints, then requires the exact approved release SHA, both rollout states,
-the observation-order and snapshot-provenance notes, both Gitcrawl capability
-fences, and the required routes.
+first requires the canonical `/health` route to deny an unauthenticated probe,
+then sends both Access headers to `/health` and `/v1/contract` and requires the
+exact approved release SHA, both rollout states, the observation-order and
+snapshot-provenance notes, both Gitcrawl capability fences, and the required
+routes.
 
 The bootstrap compares the complete verifier job against this exact contract
 before minting privileged GitHub tokens and again before any Cloudflare or
 GitHub mutation. Extra steps or controls, encoded YAML scalar values, workflow
 run defaults, direct slot-secret references outside the verifier, and legacy
-unversioned secret references fail closed. The verifier job and step both bind
-`BASH_ENV`, `ENV`, and `NODE_OPTIONS` to empty values. Until the separately
-owned consumer change lands, every dispatch fails closed before privileged
-work.
+unversioned secret references fail closed. Any direct, computed, or bulk access
+to the GitHub `secrets` context outside the verifier also fails closed. The
+verifier job and step both bind `BASH_ENV`, `ENV`, and `NODE_OPTIONS` to empty
+values. Until the separately owned consumer change lands, every dispatch fails
+closed before privileged work.
 
 The bootstrap rechecks the live ClawSweeper `main` SHA immediately before every
 privileged mutation phase: kill-switch writes, token creation, application and
