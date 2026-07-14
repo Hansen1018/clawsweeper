@@ -13,7 +13,10 @@ import {
   renderClawSweeperEventMessage,
   runClawSweeperEventNotifier,
 } from "../../dist/repair/notify-events.js";
-import { deliverNotificationAttempt } from "../../dist/repair/notification-action-ledger.js";
+import {
+  deliverNotificationAttempt,
+  recordNotificationPhase,
+} from "../../dist/repair/notification-action-ledger.js";
 import { flushRepairActionEvents } from "../../dist/repair/repair-action-ledger.js";
 
 test("buildApplyEvent maps ClawSweeper merge, close, and blocked events", () => {
@@ -423,7 +426,7 @@ test("accepted hook receipts recover a checkpoint while unsafe receipts prevent 
     { kind: "status_dashboard_delivery", destination: "status_dashboard" },
   ] as const;
   for (const deliveryIdentity of deliveries) {
-    for (const outcome of ["accepted", "unknown"] as const) {
+    for (const outcome of ["accepted", "unknown", "unknown_then_accepted"] as const) {
       const root = fs.realpathSync(
         fs.mkdtempSync(
           path.join(
@@ -478,15 +481,39 @@ test("accepted hook receipts recover a checkpoint while unsafe receipts prevent 
           {
             ...deliveryIdentity,
             operation: async () => {
-              if (outcome === "unknown") throw new Error("connection reset after dispatch");
+              if (outcome !== "accepted") throw new Error("connection reset after dispatch");
               return { accepted: true };
             },
           },
         );
-        if (outcome === "unknown") {
+        if (outcome !== "accepted") {
           await assert.rejects(delivery, /connection reset after dispatch/);
         } else {
           await delivery;
+        }
+        if (outcome === "unknown_then_accepted") {
+          await deliverNotificationAttempt(
+            {
+              repository: claim.repo,
+              key: claim.key,
+              number: 123,
+            },
+            {
+              ...deliveryIdentity,
+              operation: async () => ({ accepted: true }),
+            },
+          );
+          recordNotificationPhase(
+            {
+              repository: claim.repo,
+              key: claim.key,
+              number: 123,
+            },
+            "sent",
+            "retry_sent",
+            "mutation_outcome_unknown",
+            deliveryIdentity,
+          );
         }
         await flushRepairActionEvents();
         restoreEnv(previous);
@@ -536,7 +563,7 @@ test("accepted hook receipts recover a checkpoint while unsafe receipts prevent 
 
         assert.equal(retry.sent, 0);
         const recoversHookCheckpoint =
-          deliveryIdentity.destination === "openclaw_hook" && outcome === "accepted";
+          deliveryIdentity.destination === "openclaw_hook" && outcome !== "unknown";
         assert.equal(retry.skipped, recoversHookCheckpoint ? 0 : 1);
         assert.equal(deliveryCalls, 0);
         const retainedClaim = JSON.parse(

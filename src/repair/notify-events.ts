@@ -970,38 +970,41 @@ function notificationReceiptEvidence(
     return { status: "none", reason: "no durable notification mutation receipt exists" };
   }
 
-  let attempted = 0;
-  let accepted = 0;
-  let rejected = 0;
-  let unknown = 0;
+  let state: "none" | "attempted" | "accepted" | "rejected" | "unsafe" = "none";
   for (const event of matching) {
     const completionReason = String(event.attributes?.completion_reason ?? "");
-    if (completionReason === "mutation_attempted") attempted += 1;
-    if (completionReason === "mutation_accepted" || completionReason === "mutation_observed") {
-      accepted += 1;
+    if (completionReason === "mutation_attempted" && state !== "accepted" && state !== "unsafe") {
+      state = "attempted";
     }
-    if (completionReason === "mutation_rejected") rejected += 1;
-    if (completionReason === "mutation_outcome_unknown") unknown += 1;
+    if (completionReason === "mutation_accepted" || completionReason === "mutation_observed") {
+      state = "accepted";
+    }
+    if (completionReason === "mutation_rejected" && state !== "accepted") {
+      state = state === "unsafe" ? "unsafe" : "rejected";
+    }
+    if (completionReason === "mutation_outcome_unknown" && state !== "accepted") {
+      state = "unsafe";
+    }
   }
-  if (attempted > accepted + rejected + unknown) {
+  if (state === "attempted") {
     return {
       status: "unsafe",
       reason: `durable ${delivery.destination} receipt has an unresolved mutation attempt; delivery will not be replayed`,
     };
   }
-  if (unknown > 0) {
+  if (state === "unsafe") {
     return {
       status: "unsafe",
       reason: `durable ${delivery.destination} receipt is mutation_outcome_unknown; delivery will not be replayed`,
     };
   }
-  if (accepted > 0) {
+  if (state === "accepted") {
     return {
       status: "accepted",
       reason: `durable ${delivery.destination} receipts prove delivery mutation was accepted`,
     };
   }
-  if (rejected > 0) {
+  if (state === "rejected") {
     return {
       status: "rejected",
       reason: `durable ${delivery.destination} receipts prove no delivery mutation was accepted`,
