@@ -1122,6 +1122,7 @@ test("local cluster coverage requires the latest successful run", async (t) => {
         );
       } else {
         const sourceAt = "2026-07-14T09:56:00.000Z";
+        const clusterFinishedAt = "2026-07-14T09:57:00.000Z";
         db.prepare(
           `update sync_runs
            set started_at = ?, finished_at = ?, stats_json = ?
@@ -1140,6 +1141,10 @@ test("local cluster coverage requires the latest successful run", async (t) => {
         );
         db.prepare("update portable_metadata set value = ? where key = 'exported_at'").run(
           sourceAt,
+        );
+        db.prepare("update cluster_runs set finished_at = ? where repo_id = ?").run(
+          clusterFinishedAt,
+          1,
         );
       }
       db.close();

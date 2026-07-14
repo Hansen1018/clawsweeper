@@ -739,11 +739,15 @@ export class LocalGitcrawlQuerySource implements GitcrawlQuerySource {
     const latestRunAt = clusterRunSupport
       ? String(latestRun?.finished_at ?? "")
       : portableExportedAt;
+    const latestRunInputAt = clusterRunSupport
+      ? String(latestRun?.started_at ?? "")
+      : portableExportedAt;
     const hasLatestRun =
       Number.isSafeInteger(latestRunId) &&
       latestRunId > 0 &&
       latestRunAt !== "" &&
-      timestampAtOrAfter(latestRunAt, this.sourceSyncAt);
+      latestRunInputAt !== "" &&
+      timestampAtOrAfter(latestRunInputAt, this.sourceSyncAt);
     const groupEligible = this.scalarNumber(
       "select count(*) as value from cluster_groups where repo_id = ? and status = 'active'",
       this.repoId,
