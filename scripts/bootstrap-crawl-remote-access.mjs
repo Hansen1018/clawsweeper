@@ -22,15 +22,20 @@ export const BOOTSTRAP_CONTRACT = Object.freeze({
 
 const ACCESS_CREDENTIAL_SLOTS = Object.freeze(["blue", "green"]);
 const DEPLOY_CONSUMER_CONTRACT = Object.freeze({
-  marker: "crawl-remote-access-contract: generation-slots-v1",
+  command: "node scripts/resolve-crawl-remote-access-credentials.mjs",
+  job: "deploy",
   path: ".github/workflows/deploy-crawl-remote.yml",
-  requiredReferences: [
-    "vars.CRAWL_REMOTE_ACCESS_CREDENTIAL_GENERATION",
-    "secrets.CRAWL_REMOTE_ACCESS_BLUE_CLIENT_ID",
-    "secrets.CRAWL_REMOTE_ACCESS_BLUE_CLIENT_SECRET",
-    "secrets.CRAWL_REMOTE_ACCESS_GREEN_CLIENT_ID",
-    "secrets.CRAWL_REMOTE_ACCESS_GREEN_CLIENT_SECRET",
-  ],
+  stepId: "crawl-remote-access-credentials",
+  stepName: "Resolve crawl-remote Access credentials",
+  requiredEnvironment: {
+    CRAWL_REMOTE_ACCESS_CREDENTIAL_GENERATION:
+      "${{ vars.CRAWL_REMOTE_ACCESS_CREDENTIAL_GENERATION }}",
+    CRAWL_REMOTE_ACCESS_BLUE_CLIENT_ID: "${{ secrets.CRAWL_REMOTE_ACCESS_BLUE_CLIENT_ID }}",
+    CRAWL_REMOTE_ACCESS_BLUE_CLIENT_SECRET: "${{ secrets.CRAWL_REMOTE_ACCESS_BLUE_CLIENT_SECRET }}",
+    CRAWL_REMOTE_ACCESS_GREEN_CLIENT_ID: "${{ secrets.CRAWL_REMOTE_ACCESS_GREEN_CLIENT_ID }}",
+    CRAWL_REMOTE_ACCESS_GREEN_CLIENT_SECRET:
+      "${{ secrets.CRAWL_REMOTE_ACCESS_GREEN_CLIENT_SECRET }}",
+  },
   forbiddenReferences: [
     "secrets.CRAWL_REMOTE_ACCESS_CLIENT_ID",
     "secrets.CRAWL_REMOTE_ACCESS_CLIENT_SECRET",
@@ -61,6 +66,7 @@ const ACCESS_CREDENTIAL_TARGETS = Object.freeze([
 export async function bootstrapCrawlRemoteAccess(options, dependencies) {
   const runtimeProvider = normalizeRuntimeProvider(options.runtimeProvider);
   const publisherEnabled = normalizeBinaryFlag(options.publisherEnabled, "publisher enabled");
+  assertDormantOptionalConsumers({ runtimeProvider, publisherEnabled });
   const rotateServiceToken = Boolean(options.rotateServiceToken);
   const rotationLabel = normalizeRotationLabel(options.rotationLabel);
   const cloudflare = dependencies.cloudflare;
@@ -190,24 +196,159 @@ export function assertCrawlRemoteDeployConsumerContract(source) {
   if (typeof source !== "string") {
     throw new Error("crawl-remote deploy consumer source is unavailable");
   }
-  const missingReferences = [
-    DEPLOY_CONSUMER_CONTRACT.marker,
-    ...DEPLOY_CONSUMER_CONTRACT.requiredReferences,
-  ].filter((reference) => !source.includes(reference));
+  const deploySteps = parseWorkflowJobSteps(source, DEPLOY_CONSUMER_CONTRACT.job);
+  const matchingSteps = deploySteps.filter(
+    (step) => step.name === DEPLOY_CONSUMER_CONTRACT.stepName,
+  );
+  if (matchingSteps.length !== 1) {
+    throw new Error(
+      `crawl-remote deploy consumer requires exactly one "${DEPLOY_CONSUMER_CONTRACT.stepName}" ` +
+        `step in the ${DEPLOY_CONSUMER_CONTRACT.job} job`,
+    );
+  }
+  const resolver = matchingSteps[0];
+  if (
+    resolver.fields.get("id") !== DEPLOY_CONSUMER_CONTRACT.stepId ||
+    resolver.fields.has("if") ||
+    resolver.fields.has("continue-on-error")
+  ) {
+    throw new Error("crawl-remote deploy credential resolver has an unsafe step contract");
+  }
+  for (const [name, value] of Object.entries(DEPLOY_CONSUMER_CONTRACT.requiredEnvironment)) {
+    if (resolver.environment.get(name) !== value) {
+      throw new Error(`crawl-remote deploy credential resolver has invalid ${name} binding`);
+    }
+  }
+  const executableLines = resolver.run
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0 && !line.startsWith("#"));
+  if (executableLines.length !== 1 || executableLines[0] !== DEPLOY_CONSUMER_CONTRACT.command) {
+    throw new Error("crawl-remote deploy credential resolver does not invoke the tested artifact");
+  }
+  const resolverIndex = deploySteps.indexOf(resolver);
+  const credentialConsumers = deploySteps
+    .map((step, index) => ({
+      index,
+      source: step.run
+        .map((line) => line.trim())
+        .filter((line) => line.length > 0 && !line.startsWith("#"))
+        .join("\n"),
+    }))
+    .filter(
+      ({ source: runSource }) =>
+        runSource.includes("$CF_ACCESS_CLIENT_ID") &&
+        runSource.includes("$CF_ACCESS_CLIENT_SECRET"),
+    );
+  if (
+    credentialConsumers.length === 0 ||
+    credentialConsumers.some(({ index }) => index <= resolverIndex)
+  ) {
+    throw new Error(
+      "crawl-remote deploy credential consumers must run after the generation-slot resolver",
+    );
+  }
   const legacyReferences = DEPLOY_CONSUMER_CONTRACT.forbiddenReferences.filter((reference) =>
     source.includes(reference),
   );
-  if (missingReferences.length > 0 || legacyReferences.length > 0) {
+  if (legacyReferences.length > 0) {
     throw new Error(
-      "crawl-remote deploy consumer is not generation-slot ready; bootstrap remains inert" +
-        (missingReferences.length > 0
-          ? `; missing contract references: ${missingReferences.join(", ")}`
-          : "") +
-        (legacyReferences.length > 0
-          ? `; legacy unversioned references remain: ${legacyReferences.join(", ")}`
-          : ""),
+      "crawl-remote deploy consumer retains legacy unversioned references: " +
+        legacyReferences.join(", "),
     );
   }
+}
+
+function parseWorkflowJobSteps(source, expectedJob) {
+  const lines = source.replace(/\r\n?/g, "\n").split("\n");
+  if (lines.some((line) => line.includes("\t"))) {
+    throw new Error("crawl-remote deploy workflow must not contain tab indentation");
+  }
+  const jobsIndex = lines.findIndex((line) => line === "jobs:");
+  if (jobsIndex < 0) {
+    throw new Error("crawl-remote deploy workflow has no jobs mapping");
+  }
+  const jobStart = lines.findIndex(
+    (line, index) => index > jobsIndex && line === `  ${expectedJob}:`,
+  );
+  if (jobStart < 0) {
+    throw new Error(`crawl-remote deploy workflow has no ${expectedJob} job`);
+  }
+  let jobEnd = lines.length;
+  for (let index = jobStart + 1; index < lines.length; index += 1) {
+    if (/^  [A-Za-z0-9_-]+:\s*$/.test(lines[index])) {
+      jobEnd = index;
+      break;
+    }
+  }
+  const stepsIndex = lines.findIndex(
+    (line, index) => index > jobStart && index < jobEnd && line === "    steps:",
+  );
+  if (stepsIndex < 0) {
+    throw new Error(`crawl-remote deploy ${expectedJob} job has no steps`);
+  }
+
+  const steps = [];
+  for (let index = stepsIndex + 1; index < jobEnd; index += 1) {
+    const stepMatch = /^      - name:\s*(.+?)\s*$/.exec(lines[index]);
+    if (!stepMatch) continue;
+    let stepEnd = jobEnd;
+    for (let cursor = index + 1; cursor < jobEnd; cursor += 1) {
+      if (lines[cursor].startsWith("      - ")) {
+        stepEnd = cursor;
+        break;
+      }
+    }
+    steps.push(parseWorkflowStep(lines.slice(index, stepEnd), parseYamlScalar(stepMatch[1])));
+    index = stepEnd - 1;
+  }
+  return steps;
+}
+
+function parseWorkflowStep(lines, name) {
+  const fields = new Map();
+  const environment = new Map();
+  const run = [];
+  let block = null;
+  for (const line of lines.slice(1)) {
+    if (/^\s*$/.test(line) || /^\s*#/.test(line)) continue;
+    const fieldMatch = /^        ([A-Za-z0-9_-]+):(?:\s*(.*))?$/.exec(line);
+    if (fieldMatch) {
+      const [, key, rawValue = ""] = fieldMatch;
+      block = null;
+      if (key === "env" && rawValue.length === 0) {
+        block = "env";
+      } else if (key === "run" && /^[|>][+-]?$/.test(rawValue)) {
+        block = "run";
+      } else {
+        fields.set(key, parseYamlScalar(rawValue));
+      }
+      continue;
+    }
+    if (block === "env") {
+      const environmentMatch = /^          ([A-Za-z_][A-Za-z0-9_]*):\s*(.+?)\s*$/.exec(line);
+      if (!environmentMatch) {
+        throw new Error(`crawl-remote deploy resolver has invalid env syntax: ${line.trim()}`);
+      }
+      environment.set(environmentMatch[1], parseYamlScalar(environmentMatch[2]));
+      continue;
+    }
+    if (block === "run" && line.startsWith("          ")) {
+      run.push(line.slice(10));
+    }
+  }
+  return { name, fields, environment, run };
+}
+
+function parseYamlScalar(value) {
+  const trimmed = value.trim();
+  if (
+    trimmed.length >= 2 &&
+    ((trimmed.startsWith('"') && trimmed.endsWith('"')) ||
+      (trimmed.startsWith("'") && trimmed.endsWith("'")))
+  ) {
+    return trimmed.slice(1, -1);
+  }
+  return trimmed;
 }
 
 function assertLocalDeployConsumerContract() {
@@ -820,6 +961,19 @@ function normalizeRuntimeProvider(value) {
     throw new Error("runtime provider must be local, parity, or cloud");
   }
   return provider;
+}
+
+function assertDormantOptionalConsumers({ runtimeProvider, publisherEnabled }) {
+  if (runtimeProvider !== "local") {
+    throw new Error(
+      "ClawSweeper Gitcrawl must remain local until its generation-slot consumer contract lands",
+    );
+  }
+  if (publisherEnabled !== "0") {
+    throw new Error(
+      "gitcrawl-store publication must remain disabled until its generation-slot consumer contract lands",
+    );
+  }
 }
 
 function normalizeBinaryFlag(value, label) {

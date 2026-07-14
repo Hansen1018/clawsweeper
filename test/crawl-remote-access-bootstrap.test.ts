@@ -172,32 +172,77 @@ function variableValue(variables: VariableTarget[], name: string, repository: st
     ?.value;
 }
 
-test("deploy consumer gate rejects legacy names and accepts the explicit slot contract", () => {
+test("deploy consumer gate rejects comment-only claims and accepts a structural resolver", () => {
   assert.throws(
     () =>
       assertCrawlRemoteDeployConsumerContract(
         [
-          "crawl-remote-access-contract: generation-slots-v1",
-          "vars.CRAWL_REMOTE_ACCESS_CREDENTIAL_GENERATION",
-          "secrets.CRAWL_REMOTE_ACCESS_CLIENT_ID",
-          "secrets.CRAWL_REMOTE_ACCESS_CLIENT_SECRET",
+          "jobs:",
+          "  deploy:",
+          "    steps:",
+          "      - name: Placeholder",
+          "        run: |",
+          "          # - name: Resolve crawl-remote Access credentials",
+          "          # node scripts/resolve-crawl-remote-access-credentials.mjs",
         ].join("\n"),
       ),
-    /bootstrap remains inert.*missing contract references.*legacy unversioned references remain/,
+    /requires exactly one "Resolve crawl-remote Access credentials" step/,
   );
 
   assert.doesNotThrow(() =>
     assertCrawlRemoteDeployConsumerContract(
       [
-        "crawl-remote-access-contract: generation-slots-v1",
-        "vars.CRAWL_REMOTE_ACCESS_CREDENTIAL_GENERATION",
-        "secrets.CRAWL_REMOTE_ACCESS_BLUE_CLIENT_ID",
-        "secrets.CRAWL_REMOTE_ACCESS_BLUE_CLIENT_SECRET",
-        "secrets.CRAWL_REMOTE_ACCESS_GREEN_CLIENT_ID",
-        "secrets.CRAWL_REMOTE_ACCESS_GREEN_CLIENT_SECRET",
+        "jobs:",
+        "  deploy:",
+        "    steps:",
+        "      - name: Resolve crawl-remote Access credentials",
+        "        id: crawl-remote-access-credentials",
+        "        env:",
+        "          CRAWL_REMOTE_ACCESS_CREDENTIAL_GENERATION: ${{ vars.CRAWL_REMOTE_ACCESS_CREDENTIAL_GENERATION }}",
+        "          CRAWL_REMOTE_ACCESS_BLUE_CLIENT_ID: ${{ secrets.CRAWL_REMOTE_ACCESS_BLUE_CLIENT_ID }}",
+        "          CRAWL_REMOTE_ACCESS_BLUE_CLIENT_SECRET: ${{ secrets.CRAWL_REMOTE_ACCESS_BLUE_CLIENT_SECRET }}",
+        "          CRAWL_REMOTE_ACCESS_GREEN_CLIENT_ID: ${{ secrets.CRAWL_REMOTE_ACCESS_GREEN_CLIENT_ID }}",
+        "          CRAWL_REMOTE_ACCESS_GREEN_CLIENT_SECRET: ${{ secrets.CRAWL_REMOTE_ACCESS_GREEN_CLIENT_SECRET }}",
+        "        run: |",
+        "          node scripts/resolve-crawl-remote-access-credentials.mjs",
+        "      - name: Validate protected production proof credentials",
+        "        run: |",
+        '          test -n "$CF_ACCESS_CLIENT_ID"',
+        '          test -n "$CF_ACCESS_CLIENT_SECRET"',
       ].join("\n"),
     ),
   );
+});
+
+test("optional Gitcrawl consumers remain dormant before Cloudflare reads", async () => {
+  for (const [options, expected] of [
+    [
+      { publisherEnabled: "0", runtimeProvider: "parity" },
+      /ClawSweeper Gitcrawl must remain local/,
+    ],
+    [
+      { publisherEnabled: "1", runtimeProvider: "local" },
+      /gitcrawl-store publication must remain disabled/,
+    ],
+  ] as const) {
+    const cloudflare = createCloudflareFixture();
+    const github = createGitHubFixture();
+    await assert.rejects(
+      bootstrapCrawlRemoteAccess(
+        {
+          ...options,
+          rotateServiceToken: false,
+          rotationLabel: "123-1",
+          workersApiToken: "fixture-workers-credential",
+        },
+        { cloudflare: cloudflare.client, github: github.client, logger: quietLogger },
+      ),
+      expected,
+    );
+    assert.equal(cloudflare.events.length, 0);
+    assert.equal(github.lists.length, 0);
+    assert.equal(github.variableReads.length, 0);
+  }
 });
 
 test("first bootstrap creates one service-auth policy and writes every destination", async () => {
@@ -367,10 +412,10 @@ test("complete existing bootstrap reconciles without rewriting Access secrets", 
 
   const result = await bootstrapCrawlRemoteAccess(
     {
-      publisherEnabled: "1",
+      publisherEnabled: "0",
       rotateServiceToken: false,
       rotationLabel: "123-1",
-      runtimeProvider: "parity",
+      runtimeProvider: "local",
       workersApiToken: "fixture-workers-credential",
     },
     { cloudflare: cloudflare.client, github: github.client, logger: quietLogger },
@@ -391,7 +436,7 @@ test("complete existing bootstrap reconciles without rewriting Access secrets", 
       "CLAWSWEEPER_GITCRAWL_PROVIDER",
       BOOTSTRAP_CONTRACT.clawsweeperRepository,
     ),
-    "parity",
+    "local",
   );
   assert.equal(
     variableValue(
@@ -399,7 +444,7 @@ test("complete existing bootstrap reconciles without rewriting Access secrets", 
       "GITCRAWL_CLOUD_PUBLISH_ENABLED",
       BOOTSTRAP_CONTRACT.gitcrawlStoreRepository,
     ),
-    "1",
+    "0",
   );
   assert.equal(
     cloudflare.events.some((event) => event.event === "create-token"),

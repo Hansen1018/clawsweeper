@@ -12,20 +12,6 @@ on:
         required: true
         default: false
         type: boolean
-      runtime_provider:
-        description: "ClawSweeper Gitcrawl intake provider after reconciliation"
-        required: true
-        default: local
-        type: choice
-        options:
-          - local
-          - parity
-          - cloud
-      publisher_enabled:
-        description: "Enable staged gitcrawl-store cloud publication"
-        required: true
-        default: false
-        type: boolean
 
 permissions:
   contents: read
@@ -112,15 +98,13 @@ jobs:
           GITCRAWL_STORE_BOOTSTRAP_GH_TOKEN: ${{ steps.gitcrawl-store-admin-token.outputs.token }}
           OPENCLAW_CLOUDFLARE_CONFIG_API_TOKEN: ${{ secrets.OPENCLAW_CLOUDFLARE_CONFIG_API_TOKEN }}
           OPENCLAW_CLOUDFLARE_WORKERS_API_TOKEN: ${{ secrets.OPENCLAW_CLOUDFLARE_WORKERS_API_TOKEN }}
-          PUBLISHER_ENABLED: ${{ inputs.publisher_enabled && '1' || '0' }}
           ROTATE_SERVICE_TOKEN: ${{ inputs.rotate_service_token && '1' || '0' }}
-          RUNTIME_PROVIDER: ${{ inputs.runtime_provider }}
         run: |
           args=(
             --confirm "bootstrap crawl-remote access"
-            --publisher-enabled "$PUBLISHER_ENABLED"
+            --publisher-enabled 0
             --rotation-label "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-            --runtime-provider "$RUNTIME_PROVIDER"
+            --runtime-provider local
           )
           if [[ "$ROTATE_SERVICE_TOKEN" == "1" ]]; then
             args+=(--rotate-service-token)

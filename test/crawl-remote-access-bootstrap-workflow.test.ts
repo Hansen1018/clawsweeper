@@ -25,6 +25,10 @@ test("manual workflow keeps bootstrap separate from deployment authority", () =>
   );
 
   assert.deepEqual(Object.keys(workflow.on), ["workflow_dispatch"]);
+  assert.deepEqual(Object.keys(workflow.on.workflow_dispatch.inputs), [
+    "confirmation",
+    "rotate_service_token",
+  ]);
   assert.deepEqual(workflow.permissions, { contents: "read" });
   assert.equal(job.environment, undefined);
   assert.equal(job["runs-on"], "ubuntu-latest");
@@ -90,6 +94,9 @@ test("manual workflow keeps bootstrap separate from deployment authority", () =>
   assert.equal(gitcrawlStoreToken.with["permission-variables"], "write");
   assert.match(bootstrap.run, /node scripts\/bootstrap-crawl-remote-access\.mjs/);
   assert.match(bootstrap.run, /--rotate-service-token/);
+  assert.match(bootstrap.run, /--publisher-enabled 0/);
+  assert.match(bootstrap.run, /--runtime-provider local/);
+  assert.doesNotMatch(source, /inputs\.(runtime_provider|publisher_enabled)/);
   assert.doesNotMatch(bootstrap.run, /corepack|pnpm/);
   assert.doesNotMatch(source, /deploy-crawl-remote/);
   assert.doesNotMatch(source, /schedule:|push:|pull_request:/);
@@ -99,14 +106,15 @@ test("manual workflow keeps bootstrap separate from deployment authority", () =>
   );
 });
 
-test("operator docs preserve the two-phase rollout and no-deploy boundary", () => {
+test("operator docs preserve the dormant consumer and no-deploy boundaries", () => {
   const docs = readFileSync(docsPath, "utf8");
   assert.match(docs, /does not deploy crawl-remote/);
-  assert.match(docs, /runtime provider: `local`/);
-  assert.match(docs, /publisher enabled: off/);
+  assert.match(docs, /always keeps `CLAWSWEEPER_GITCRAWL_PROVIDER=local`/);
+  assert.match(docs, /cannot\s+activate parity\/cloud intake or publication/);
   assert.match(docs, /GITCRAWL_CLOUD_STAGE_ONLY=1/);
   assert.match(docs, /temporarily\s+allows every old and new token ID/);
   assert.match(docs, /generation marker and selects the matching slot/);
-  assert.match(docs, /fails closed before privileged work/);
+  assert.match(docs, /Comments, unrelated\s+declarations, conditional steps/);
+  assert.match(docs, /fails\s+closed before privileged work/);
   assert.match(docs, /never prints returned service credentials/);
 });

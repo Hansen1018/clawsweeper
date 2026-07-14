@@ -5,12 +5,15 @@ does not deploy crawl-remote, alter deployment protection, or provide a fallback
 Cloudflare token to the deploy workflow.
 
 The workflow is intentionally inert until the separately owned deploy consumer
-declares `crawl-remote-access-contract: generation-slots-v1`, resolves
-`CRAWL_REMOTE_ACCESS_CREDENTIAL_GENERATION`, references both blue and green
-credential pairs, and removes the legacy unversioned secret references. The
-bootstrap verifies that source contract before minting privileged GitHub tokens
-and again before any Cloudflare or GitHub mutation. Until that consumer change
-lands, every dispatch fails closed before privileged work.
+adds an unconditional `Resolve crawl-remote Access credentials` step to its
+protected `deploy` job. That step must bind the generation marker and all four
+slot secrets, then invoke the tested
+`scripts/resolve-crawl-remote-access-credentials.mjs` artifact. The bootstrap
+parses that exact step contract before minting privileged GitHub tokens and
+again before any Cloudflare or GitHub mutation. Comments, unrelated
+declarations, conditional steps, and legacy unversioned secret references do
+not satisfy the gate. Until the consumer change lands, every dispatch fails
+closed before privileged work.
 
 ## First bootstrap
 
@@ -19,8 +22,6 @@ current `main` with:
 
 - confirmation: `bootstrap crawl-remote access`
 - rotate service token: off
-- runtime provider: `local`
-- publisher enabled: off
 
 The workflow creates the path-specific Access application for
 `reports.openclaw.ai/crawl-remote/*`, attaches one Service Auth policy, and
@@ -58,13 +59,11 @@ finishes a fully published generation only when its managed generation label is
 strictly newer than every leftover token. Otherwise it mints a fresh generation
 and supersedes every ambiguous partial token.
 
-After crawl-remote deployment and staged archive proof:
-
-1. Rerun with publisher enabled to stage snapshots while
-   `GITCRAWL_CLOUD_STAGE_ONLY=1`.
-2. Rerun with runtime provider `parity` for comparison.
-3. Move to provider `cloud` and disable stage-only only through the separately
-   reviewed rollout that activates the crawl-remote capability fences.
+This workflow always keeps `CLAWSWEEPER_GITCRAWL_PROVIDER=local`,
+`GITCRAWL_CLOUD_PUBLISH_ENABLED=0`, and `GITCRAWL_CLOUD_STAGE_ONLY=1`. It cannot
+activate parity/cloud intake or publication. Those transitions belong to
+separate reviewed changes that prove each consumer resolves its own generation
+marker and matching slot.
 
 ## Required source credentials
 
