@@ -126,7 +126,7 @@ test("repair result publication keeps results current while resolving prior prod
   assert.match(verify, /echo "has_artifacts=0" >> "\$GITHUB_OUTPUT"/);
   assert.match(verify, /exit 0/);
   assert.match(workflow, /artifact-ids: \$\{\{ steps\.result-artifact\.outputs\.artifact_id \}\}/);
-  assert.match(verify, /findResultPaths\("artifacts"\)/);
+  assert.match(verify, /findResultPaths\(process\.env\.RESULT_ARTIFACT_ROOT\)/);
   assert.match(verify, /pnpm run repair:review-results -- "\$\{result_paths\[@\]\}"/);
   assert.match(worker, /Resolve latest worker transfer artifact/);
   assert.match(worker, /selectLatestAttemptArtifact/);
@@ -161,7 +161,13 @@ test("repair result publication rejects untrusted worker heads before minting wr
   )) {
     assert.match(block[1] ?? "", /github-token: \$\{\{ github\.token \}\}/);
     assert.doesNotMatch(block[1] ?? "", /steps\.app_token\.outputs\.token/);
+    assert.match(
+      block[1] ?? "",
+      /path: \$\{\{ runner\.temp \}\}\/clawsweeper-repair-worker-artifacts\//,
+    );
   }
+  assert.doesNotMatch(workflow, /path: (?:artifacts|\.clawsweeper-repair\/action-ledger-download)/);
+  assert.match(workflow, /pnpm run repair:publish-result -- "\$RESULT_ARTIFACT_ROOT"/);
   assert.match(
     classification,
     /if \[\[ ! "\$WORKER_HEAD_SHA" =~ \^\[a-f0-9\]\{40\}\$ \]\]; then[\s\S]*exit 1/,
