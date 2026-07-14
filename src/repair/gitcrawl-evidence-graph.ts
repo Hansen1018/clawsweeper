@@ -8,6 +8,7 @@ import {
   type GitcrawlDataset,
   type GitcrawlEvidenceClaim,
   type GitcrawlProvider,
+  assertGitcrawlRepository,
   assertSha256,
   assertSnapshotId,
   canonicalJson,
@@ -100,6 +101,7 @@ export function buildGitcrawlEvidencePacket(input: {
   };
   validatePacketBindings({
     provider: input.provider,
+    repository: input.repository,
     snapshotId: input.snapshotId,
     ...(input.paritySnapshotId === undefined ? {} : { paritySnapshotId: input.paritySnapshotId }),
     coverage: input.coverage,
@@ -114,47 +116,50 @@ export function buildGitcrawlEvidencePacket(input: {
       `${right.subject}:${right.query.name}:${right.sha256}`,
     );
   });
-  let claimLimit = Math.min(sortedClaims.length, limits.claims);
-  for (;;) {
-    const claims = sortedClaims.slice(0, claimLimit);
-    const graph = buildGraph(claims, limits.nodes, limits.edges);
-    const unsigned = {
-      version: GITCRAWL_PACKET_VERSION,
-      provider: input.provider,
-      repository: input.repository,
-      snapshot_id: input.snapshotId,
-      ...(input.paritySnapshotId === undefined
-        ? {}
-        : { parity_snapshot_id: input.paritySnapshotId }),
-      query_version: GITCRAWL_QUERY_VERSION,
-      generated_at: input.generatedAt ?? new Date().toISOString(),
-      required_coverage: [...(input.requiredCoverage ?? GITCRAWL_DATASETS)].sort(
-        compareCanonicalText,
-      ),
-      coverage: [...input.coverage].sort((left, right) =>
-        compareCanonicalText(left.dataset, right.dataset),
-      ),
-      claims,
-      graph: {
-        nodes: graph.nodes,
-        edges: graph.edges,
-      },
-      included: {
-        claims: claims.length,
-        nodes: graph.nodes.length,
-        edges: graph.edges.length,
-      },
-    } satisfies Omit<GitcrawlEvidencePacketV2, "sha256">;
-    const packet = {
-      ...unsigned,
-      sha256: sha256Canonical(unsigned),
-    };
-    if (renderedPacketBytes(packet) <= limits.bytes) return packet;
-    if (claimLimit === 0) {
-      throw new Error(`Gitcrawl evidence packet metadata exceeds ${limits.bytes} bytes`);
-    }
-    claimLimit -= 1;
+  if (sortedClaims.length > limits.claims) {
+    throw new Error(
+      `Gitcrawl evidence packet requires ${sortedClaims.length} claims but the limit is ${limits.claims}`,
+    );
   }
+  const graph = buildGraph(sortedClaims, limits.nodes, limits.edges);
+  if (graph.omittedNodes > 0 || graph.omittedEdges > 0) {
+    throw new Error(
+      `Gitcrawl evidence packet graph exceeds its complete bounds (${graph.totalNodes} nodes, ${graph.totalEdges} edges)`,
+    );
+  }
+  const unsigned = {
+    version: GITCRAWL_PACKET_VERSION,
+    provider: input.provider,
+    repository: input.repository,
+    snapshot_id: input.snapshotId,
+    ...(input.paritySnapshotId === undefined ? {} : { parity_snapshot_id: input.paritySnapshotId }),
+    query_version: GITCRAWL_QUERY_VERSION,
+    generated_at: input.generatedAt ?? new Date().toISOString(),
+    required_coverage: [...(input.requiredCoverage ?? GITCRAWL_DATASETS)].sort(
+      compareCanonicalText,
+    ),
+    coverage: [...input.coverage].sort((left, right) =>
+      compareCanonicalText(left.dataset, right.dataset),
+    ),
+    claims: sortedClaims,
+    graph: {
+      nodes: graph.nodes,
+      edges: graph.edges,
+    },
+    included: {
+      claims: sortedClaims.length,
+      nodes: graph.nodes.length,
+      edges: graph.edges.length,
+    },
+  } satisfies Omit<GitcrawlEvidencePacketV2, "sha256">;
+  const packet = {
+    ...unsigned,
+    sha256: sha256Canonical(unsigned),
+  };
+  if (renderedPacketBytes(packet) > limits.bytes) {
+    throw new Error(`Gitcrawl evidence packet exceeds ${limits.bytes} bytes`);
+  }
+  return packet;
 }
 
 export function verifyGitcrawlEvidencePacket(
@@ -180,6 +185,7 @@ export function verifyGitcrawlEvidencePacket(
   assertPacketCardinality(packet);
   validatePacketBindings({
     provider: packet.provider,
+    repository: packet.repository,
     snapshotId: packet.snapshot_id,
     ...(packet.parity_snapshot_id === undefined
       ? {}
@@ -195,11 +201,20 @@ export function verifyGitcrawlEvidencePacket(
   if (renderedPacketBytes(packet) > maxBytes) {
     throw new Error(`Gitcrawl evidence packet exceeds ${maxBytes} bytes`);
   }
-  const reconstructed = buildGraph(
-    packet.claims,
-    packet.graph.nodes.length,
-    packet.graph.edges.length,
-  );
+  const reconstructed =
+    packet.version === GITCRAWL_PACKET_VERSION_V1
+      ? buildGraph(packet.claims, packet.graph.nodes.length, packet.graph.edges.length)
+      : buildGraph(
+          packet.claims,
+          DEFAULT_EVIDENCE_PACKET_MAX_NODES,
+          DEFAULT_EVIDENCE_PACKET_MAX_EDGES,
+        );
+  if (
+    packet.version === GITCRAWL_PACKET_VERSION &&
+    (reconstructed.omittedNodes > 0 || reconstructed.omittedEdges > 0)
+  ) {
+    throw new Error("Gitcrawl v2 evidence packet claims exceed the canonical graph bounds");
+  }
   if (
     canonicalJson(packet.graph.nodes) !== canonicalJson(reconstructed.nodes) ||
     canonicalJson(packet.graph.edges) !== canonicalJson(reconstructed.edges)
@@ -342,6 +357,7 @@ function claimPriority(claim: GitcrawlEvidenceClaim): number {
 
 function validatePacketBindings(input: {
   provider: GitcrawlProvider;
+  repository: string;
   snapshotId: string;
   paritySnapshotId?: string;
   coverage: GitcrawlCoverageRow[];
@@ -351,6 +367,7 @@ function validatePacketBindings(input: {
   if (!["local", "cloud", "parity"].includes(input.provider)) {
     throw new Error(`Gitcrawl evidence packet has unknown provider ${input.provider}`);
   }
+  assertGitcrawlRepository(input.repository);
   assertSnapshotId(input.snapshotId);
   if (input.provider === "parity") {
     if (input.paritySnapshotId === undefined) {
@@ -364,6 +381,7 @@ function validatePacketBindings(input: {
     verifyGitcrawlEvidenceClaim(claim);
     if (
       claim.provider !== input.provider ||
+      claim.repository !== input.repository ||
       claim.snapshot_id !== input.snapshotId ||
       claim.parity_snapshot_id !== input.paritySnapshotId
     ) {

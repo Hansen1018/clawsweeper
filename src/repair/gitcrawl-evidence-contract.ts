@@ -126,12 +126,13 @@ export type GitcrawlEvidenceRelation = {
 export type GitcrawlEvidenceClaim<T = Record<string, unknown>> = {
   version: typeof GITCRAWL_CLAIM_VERSION;
   provider: GitcrawlProvider;
+  repository: string;
   snapshot_id: string;
   parity_snapshot_id?: string;
   query: {
     name: GitcrawlQueryName;
     version: typeof GITCRAWL_QUERY_VERSION;
-    args_sha256?: string;
+    args_sha256: string;
   };
   subject: string;
   source_revision?: GitcrawlSourceRevision;
@@ -149,6 +150,7 @@ export type GitcrawlEvidenceResult<T> = {
 
 export function createGitcrawlEvidenceClaim<T>(input: {
   provider: GitcrawlProvider;
+  repository: string;
   snapshotId: string;
   paritySnapshotId?: string;
   queryName: GitcrawlQueryName;
@@ -160,6 +162,10 @@ export function createGitcrawlEvidenceClaim<T>(input: {
   relations?: GitcrawlEvidenceRelation[];
   data: T;
 }): GitcrawlEvidenceClaim<T> {
+  if (!["local", "cloud", "parity"].includes(input.provider)) {
+    throw new Error(`unsupported Gitcrawl provider: ${input.provider}`);
+  }
+  assertGitcrawlRepository(input.repository);
   assertSnapshotId(input.snapshotId);
   if (input.paritySnapshotId !== undefined) assertSnapshotId(input.paritySnapshotId);
   assertNoGitcrawlHtmlCommentMarkers(input.subject, "Gitcrawl claim subject");
@@ -168,19 +174,17 @@ export function createGitcrawlEvidenceClaim<T>(input: {
   if (!GITCRAWL_QUERY_NAMES.includes(input.queryName)) {
     throw new Error(`unsupported Gitcrawl query: ${input.queryName}`);
   }
-  if (input.queryArgs !== undefined && input.queryArgsSha256 !== undefined) {
-    throw new Error("Gitcrawl claim query arguments must have one digest source");
+  if ((input.queryArgs === undefined) === (input.queryArgsSha256 === undefined)) {
+    throw new Error("Gitcrawl claim query arguments must have exactly one digest source");
   }
   assertNoGitcrawlHtmlCommentMarkers(input.queryArgs ?? {}, "Gitcrawl claim query arguments");
   const queryArgsSha256 =
     input.queryArgs === undefined ? input.queryArgsSha256 : sha256Canonical(input.queryArgs);
-  if (queryArgsSha256 !== undefined) {
-    assertSha256(queryArgsSha256, "claim query arguments sha256");
-  }
+  assertSha256(queryArgsSha256!, "claim query arguments sha256");
   const query: GitcrawlEvidenceClaim["query"] = {
     name: input.queryName,
     version: GITCRAWL_QUERY_VERSION,
-    ...(queryArgsSha256 === undefined ? {} : { args_sha256: queryArgsSha256 }),
+    args_sha256: queryArgsSha256!,
   };
   if (input.sourceRevision?.sha256 !== undefined) {
     assertSha256(input.sourceRevision.sha256, "source revision sha256");
@@ -200,6 +204,7 @@ export function createGitcrawlEvidenceClaim<T>(input: {
       ),
     );
   const semanticPayload = {
+    repository: input.repository,
     query,
     subject: input.subject,
     data: input.data,
@@ -207,6 +212,7 @@ export function createGitcrawlEvidenceClaim<T>(input: {
   const unsigned = {
     version: GITCRAWL_CLAIM_VERSION,
     provider: input.provider,
+    repository: input.repository,
     snapshot_id: input.snapshotId,
     ...(input.paritySnapshotId === undefined ? {} : { parity_snapshot_id: input.paritySnapshotId }),
     query,
@@ -226,16 +232,61 @@ export function createGitcrawlEvidenceClaim<T>(input: {
 }
 
 export function verifyGitcrawlEvidenceClaim(claim: GitcrawlEvidenceClaim): void {
+  assertExactObjectKeys(
+    claim,
+    [
+      "version",
+      "provider",
+      "repository",
+      "snapshot_id",
+      "parity_snapshot_id",
+      "query",
+      "subject",
+      "source_revision",
+      "thread_fingerprint",
+      "relations",
+      "data",
+      "semantic_sha256",
+      "sha256",
+    ],
+    "Gitcrawl evidence claim",
+  );
+  assertExactObjectKeys(
+    claim.query,
+    ["name", "version", "args_sha256"],
+    "Gitcrawl evidence claim query",
+  );
+  if (claim.source_revision !== undefined) {
+    assertExactObjectKeys(
+      claim.source_revision,
+      ["id", "sha256", "updated_at"],
+      "Gitcrawl evidence claim source revision",
+    );
+  }
+  if (claim.thread_fingerprint !== undefined) {
+    assertExactObjectKeys(
+      claim.thread_fingerprint,
+      ["algorithm", "sha256"],
+      "Gitcrawl evidence claim thread fingerprint",
+    );
+  }
+  if (!Array.isArray(claim.relations)) {
+    throw new Error("Gitcrawl evidence claim relations must be an array");
+  }
+  for (const relation of claim.relations) {
+    assertExactObjectKeys(relation, ["predicate", "target"], "Gitcrawl evidence claim relation");
+  }
   assertSha256(claim.semantic_sha256, "claim semantic sha256");
   assertSha256(claim.sha256, "claim sha256");
   const expected = createGitcrawlEvidenceClaim({
     provider: claim.provider,
+    repository: claim.repository,
     snapshotId: claim.snapshot_id,
     ...(claim.parity_snapshot_id === undefined
       ? {}
       : { paritySnapshotId: claim.parity_snapshot_id }),
     queryName: claim.query.name,
-    ...(claim.query.args_sha256 === undefined ? {} : { queryArgsSha256: claim.query.args_sha256 }),
+    queryArgsSha256: claim.query.args_sha256,
     subject: claim.subject,
     ...(claim.source_revision === undefined ? {} : { sourceRevision: claim.source_revision }),
     ...(claim.thread_fingerprint === undefined
@@ -286,6 +337,12 @@ export function assertSnapshotId(value: string): void {
     })
   ) {
     throw new Error("Gitcrawl snapshot id is missing or malformed");
+  }
+}
+
+export function assertGitcrawlRepository(value: string): void {
+  if (typeof value !== "string" || value !== value.trim() || !/^[^/\s]+\/[^/\s]+$/.test(value)) {
+    throw new Error("Gitcrawl repository is missing or malformed");
   }
 }
 
@@ -373,6 +430,17 @@ export function parseRfc3339Timestamp(value: string, label: string): number {
 
 export function compareCanonicalText(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function assertExactObjectKeys(value: unknown, allowed: readonly string[], label: string): void {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error(`${label} must be an object`);
+  }
+  const allowedKeys = new Set(allowed);
+  const unknown = Object.keys(value).filter((key) => !allowedKeys.has(key));
+  if (unknown.length > 0) {
+    throw new Error(`${label} contains unsupported field ${unknown.sort(compareCanonicalText)[0]}`);
+  }
 }
 
 function canonicalValue(value: unknown, depth = 0): unknown {

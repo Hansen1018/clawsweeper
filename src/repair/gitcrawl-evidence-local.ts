@@ -359,6 +359,7 @@ export class LocalGitcrawlQuerySource implements GitcrawlQuerySource {
     const membershipTable = this.portable ? "cluster_memberships" : "cluster_members";
     const stateFilter = this.portable ? "and cm.state = 'active'" : "";
     const rows: Record<string, unknown>[] = [];
+    const seenThreadIds = new Set<number>();
     let remainingOffset = offset;
     const clusters = this.db
       .prepare(
@@ -377,6 +378,9 @@ export class LocalGitcrawlQuerySource implements GitcrawlQuerySource {
         if (members.length === 0) break;
         for (const member of members) {
           if (Number(member.number) === number) continue;
+          const threadId = Number(member.thread_id);
+          if (seenThreadIds.has(threadId)) continue;
+          seenThreadIds.add(threadId);
           if (remainingOffset > 0) {
             remainingOffset -= 1;
             continue;

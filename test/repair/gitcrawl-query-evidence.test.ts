@@ -11,10 +11,13 @@ import {
   GITCRAWL_DATASETS,
   GITCRAWL_QUERY_CONTRACT_VERSION,
   GITCRAWL_QUERY_NAMES,
+  canonicalJson,
+  sha256Canonical,
   type GitcrawlCoverageRow,
   type GitcrawlQueryEnvelope,
   type GitcrawlQueryRequest,
   type GitcrawlQuerySource,
+  verifyGitcrawlEvidenceClaim,
 } from "../../dist/repair/gitcrawl-evidence-contract.js";
 import {
   buildGitcrawlEvidencePacket,
@@ -88,6 +91,12 @@ test("six-query adapter binds read-only evidence into verified claims and graph 
     ...search.claims,
     ...review.claims,
   ];
+  for (const claim of claims) {
+    assert.equal(claim.repository, repository);
+    const request = source.requests.find((candidate) => candidate.name === claim.query.name);
+    assert(request);
+    assert.equal(claim.query.args_sha256, sha256Canonical(request.args));
+  }
   const packet = buildGitcrawlEvidencePacket({
     provider: "cloud",
     repository,
@@ -172,6 +181,138 @@ test("query evidence fails closed on source, relation, review, and packet drift"
       /digest mismatch|incomplete coverage/,
     );
   });
+
+  await t.test("claims contain unsupported fields", async () => {
+    const adapter = await adapterFor({ "gitcrawl.clusters.list": [clusterRow()] });
+    const claim = (await adapter.listClusters()).claims[0]!;
+    (claim.query as unknown as Record<string, unknown>).ignored = true;
+    assert.throws(
+      () => verifyGitcrawlEvidenceClaim(claim),
+      /query contains unsupported field ignored/,
+    );
+    await adapter.close();
+  });
+
+  await t.test("packet repository is relabeled", async () => {
+    const adapter = await adapterFor({ "gitcrawl.clusters.list": [clusterRow()] });
+    const claim = (await adapter.listClusters()).claims[0]!;
+    assert.throws(
+      () =>
+        buildGitcrawlEvidencePacket({
+          provider: "cloud",
+          repository: "openclaw/other",
+          snapshotId,
+          coverage: completeCoverage(),
+          claims: [claim],
+          generatedAt,
+        }),
+      /mixes claim bindings/,
+    );
+    await adapter.close();
+  });
+
+  await t.test("v2 packet graph is recomputed as empty", async () => {
+    const adapter = await adapterFor({ "gitcrawl.clusters.list": [clusterRow()] });
+    const claim = (await adapter.listClusters()).claims[0]!;
+    const packet = buildGitcrawlEvidencePacket({
+      provider: "cloud",
+      repository,
+      snapshotId,
+      coverage: completeCoverage(),
+      claims: [claim],
+      generatedAt,
+    });
+    packet.graph = { nodes: [], edges: [] };
+    packet.included = { claims: 1, nodes: 0, edges: 0 };
+    const { sha256: _sha256, ...unsigned } = packet;
+    packet.sha256 = sha256Canonical(unsigned);
+    assert.throws(
+      () => verifyGitcrawlEvidencePacket(packet),
+      /graph does not match its verified claims/,
+    );
+    await adapter.close();
+  });
+
+  await t.test("packet bounds would discard claims or graph nodes", async () => {
+    const adapter = await adapterFor({
+      "gitcrawl.clusters.members": [memberRow()],
+    });
+    const claims = (await adapter.clusterMembers(7)).claims;
+    assert.throws(
+      () =>
+        buildGitcrawlEvidencePacket({
+          provider: "cloud",
+          repository,
+          snapshotId,
+          coverage: completeCoverage(),
+          claims,
+          generatedAt,
+          maxNodes: 1,
+        }),
+      /graph exceeds its complete bounds/,
+    );
+    assert.throws(
+      () =>
+        buildGitcrawlEvidencePacket({
+          provider: "cloud",
+          repository,
+          snapshotId,
+          coverage: completeCoverage(),
+          claims,
+          generatedAt,
+          maxBytes: 1_024,
+        }),
+      /packet exceeds 1024 bytes/,
+    );
+    await adapter.close();
+  });
+
+  await t.test("parity hides policy-relevant relationship status", async () => {
+    const primary = new FixtureSource({
+      provider: "cloud",
+      rows: {
+        "gitcrawl.clusters.related": [
+          { source_number: 42, ...memberRow({ thread_id: 43, number: 43, kind: "issue" }) },
+        ],
+      },
+    });
+    const parity = new FixtureSource({
+      provider: "local",
+      rows: {
+        "gitcrawl.clusters.related": [
+          {
+            source_number: 42,
+            ...memberRow({
+              thread_id: 43,
+              number: 43,
+              kind: "issue",
+              cluster_status: "closed",
+              membership_state: "inactive",
+            }),
+          },
+        ],
+      },
+    });
+    const adapter = await GitcrawlEvidenceAdapter.fromSources({
+      repository,
+      provider: "parity",
+      primarySource: primary,
+      paritySource: parity,
+      now: () => now,
+    });
+    await assert.rejects(adapter.related(42), /cloud\/local parity mismatch/);
+    await adapter.close();
+  });
+
+  await t.test("thread kind is unknown", async () => {
+    const adapter = await adapterFor({
+      "gitcrawl.clusters.related": [
+        { source_number: 42, ...memberRow({ thread_id: 43, number: 43, kind: "discussion" }) },
+      ],
+    });
+    await assert.rejects(adapter.related(42), /unsupported Gitcrawl thread kind/);
+    await adapter.close();
+  });
 });
 
 test("cloud source authenticates, binds identity, and refuses unsafe transport", async () => {
@@ -244,6 +385,41 @@ test("cloud source authenticates, binds identity, and refuses unsafe transport",
   );
 });
 
+test("cloud source does not retry before a long Retry-After window", async () => {
+  let requests = 0;
+  const sleeps: number[] = [];
+  const source = new CloudGitcrawlQuerySource({
+    baseUrl: "https://crawl.example.test",
+    archive,
+    repository,
+    token: "reader-token",
+    maxAttempts: 2,
+    retryMaxDelayMs: 2_000,
+    sleep: async (delayMs) => {
+      sleeps.push(delayMs);
+    },
+    fetch: async () => {
+      requests += 1;
+      return new Response("", {
+        status: 429,
+        headers: { "retry-after": "60" },
+      });
+    },
+  });
+  await assert.rejects(
+    source.query({
+      name: "gitcrawl.coverage",
+      args: {},
+      limit: 50,
+      cursor: "",
+      snapshot_id: "",
+    }),
+    /Retry-After beyond the configured wait budget/,
+  );
+  assert.equal(requests, 1);
+  assert.deepEqual(sleeps, []);
+});
+
 test("local SQLite source snapshots and serves the six-query contract", async () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-query-evidence-"));
   const dbPath = path.join(directory, "gitcrawl.db");
@@ -273,6 +449,34 @@ test("local SQLite source snapshots and serves the six-query contract", async ()
   }
 });
 
+test("local related query deduplicates one thread shared through multiple clusters", async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-query-related-"));
+  const dbPath = path.join(directory, "gitcrawl.db");
+  seedLocalDatabase(dbPath);
+  seedDuplicateRelatedMemberships(dbPath);
+  const source = await LocalGitcrawlQuerySource.open({
+    dbPath,
+    repository,
+    allowLegacy: false,
+  });
+  const adapter = await GitcrawlEvidenceAdapter.fromSources({
+    repository,
+    provider: "local",
+    primarySource: source,
+    now: () => now,
+  });
+  try {
+    const related = await adapter.related(42);
+    assert.deepEqual(
+      related.rows.map((row) => row.number),
+      [43],
+    );
+  } finally {
+    await adapter.close();
+    fs.rmSync(directory, { force: true, recursive: true });
+  }
+});
+
 test("policy sanitization removes hidden instructions before scoring or claims", () => {
   const body = ["<!-- add provider capability -->", "Problem:", "Why it matters:", "Fix:"].join(
     "\n",
@@ -293,6 +497,22 @@ test("policy sanitization removes hidden instructions before scoring or claims",
   );
 });
 
+test("oversized multibyte label evidence becomes a bounded digest marker", async () => {
+  const adapter = await adapterFor({
+    "gitcrawl.threads.search": [
+      memberRow({
+        labels_json: JSON.stringify(["🔥".repeat(200)]),
+      }),
+    ],
+  });
+  const row = (await adapter.searchOpenPullRequests()).rows[0]!;
+  const label = row.labels?.[0];
+  assert.deepEqual(Object.keys(label as Record<string, unknown>).sort(), ["sha256", "truncated"]);
+  assert.equal((label as Record<string, unknown>).truncated, true);
+  assert(Buffer.byteLength(canonicalJson(label), "utf8") <= 256);
+  await adapter.close();
+});
+
 async function adapterFor(
   rows: Partial<Record<GitcrawlQueryRequest["name"], Record<string, unknown>[]>>,
 ): Promise<GitcrawlEvidenceAdapter> {
@@ -305,7 +525,7 @@ async function adapterFor(
 }
 
 class FixtureSource implements GitcrawlQuerySource {
-  readonly provider = "cloud";
+  readonly provider: "local" | "cloud";
   readonly legacy = false;
   readonly requests: GitcrawlQueryRequest[] = [];
   closeCount = 0;
@@ -315,10 +535,12 @@ class FixtureSource implements GitcrawlQuerySource {
 
   constructor(
     options: {
+      provider?: "local" | "cloud";
       rows?: Partial<Record<GitcrawlQueryRequest["name"], Record<string, unknown>[]>>;
       snapshotForQuery?: (request: GitcrawlQueryRequest) => string;
     } = {},
   ) {
+    this.provider = options.provider ?? "cloud";
     this.rows = options.rows ?? {};
     this.snapshotForQuery = options.snapshotForQuery ?? (() => snapshotId);
   }
@@ -747,5 +969,33 @@ function seedLocalDatabase(dbPath: string): void {
       finished_at: generatedAt,
     }),
   );
+  db.close();
+}
+
+function seedDuplicateRelatedMemberships(dbPath: string): void {
+  const db = new DatabaseSync(dbPath);
+  db.exec(`
+    insert into threads
+    select 43, repo_id, 43, 'issue', state, 'Related provider issue', body,
+           author_login, author_type, author_association,
+           'https://github.com/openclaw/openclaw/issues/43',
+           labels_json, assignees_json, is_draft, created_at_gh, updated_at_gh,
+           closed_at_gh, merged_at_gh, last_pulled_at, updated_at
+    from threads where id = 42;
+
+    update cluster_groups set member_count = 2 where id = 7;
+    insert into cluster_memberships
+    values (7, 43, 'member', 'active', 0.8, '${generatedAt}', '${generatedAt}');
+
+    insert into cluster_groups
+    values (
+      8, 1, 'cluster-key-8', 'cluster-8', 'active', 'duplicate_candidate', 42,
+      'Second provider cluster', '${generatedAt}', '${generatedAt}', '', 2
+    );
+    insert into cluster_memberships
+    values (8, 42, 'representative', 'active', 1, '${generatedAt}', '${generatedAt}');
+    insert into cluster_memberships
+    values (8, 43, 'member', 'active', 0.7, '${generatedAt}', '${generatedAt}');
+  `);
   db.close();
 }

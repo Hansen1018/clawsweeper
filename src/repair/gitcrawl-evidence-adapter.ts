@@ -423,12 +423,13 @@ export class GitcrawlEvidenceAdapter {
   }
 
   async clusterMembers(clusterId: number): Promise<GitcrawlEvidenceResult<GitcrawlThreadEvidence>> {
+    const queryArgs = {
+      ...ownerRepo(this.repository),
+      cluster_id: positiveInteger(clusterId, "cluster id"),
+    };
     const rows = await this.queryNormalized(
       "gitcrawl.clusters.members",
-      {
-        ...ownerRepo(this.repository),
-        cluster_id: positiveInteger(clusterId, "cluster id"),
-      },
+      queryArgs,
       normalizeThread,
       clusterMemberParityView,
     );
@@ -479,17 +480,19 @@ export class GitcrawlEvidenceAdapter {
           },
         ],
       })),
+      queryArgs,
     );
   }
 
   async related(number: number): Promise<GitcrawlEvidenceResult<GitcrawlThreadEvidence>> {
     const requestedNumber = positiveInteger(number, "thread number");
+    const queryArgs = {
+      ...ownerRepo(this.repository),
+      number: requestedNumber,
+    };
     const rows = await this.queryNormalized(
       "gitcrawl.clusters.related",
-      {
-        ...ownerRepo(this.repository),
-        number: requestedNumber,
-      },
+      queryArgs,
       (row) => {
         const sourceNumber = safePositive(row.source_number, "related source number");
         if (sourceNumber !== requestedNumber) {
@@ -523,18 +526,20 @@ export class GitcrawlEvidenceAdapter {
           },
         ],
       })),
+      queryArgs,
     );
   }
 
   async reviewContext(
     number: number,
   ): Promise<GitcrawlEvidenceResult<GitcrawlReviewContext | GitcrawlReviewFile>> {
+    const queryArgs = {
+      ...ownerRepo(this.repository),
+      number: positiveInteger(number, "pull request number"),
+    };
     const raw = await this.queryNormalized(
       "gitcrawl.pull_requests.review_context",
-      {
-        ...ownerRepo(this.repository),
-        number: positiveInteger(number, "pull request number"),
-      },
+      queryArgs,
       (row) => ({ ...row }),
       reviewRawParityView,
     );
@@ -602,7 +607,7 @@ export class GitcrawlEvidenceAdapter {
         relations: [{ predicate: "evidence_for" as const, target: pullSubject }],
       })),
     ];
-    return this.claimResult("gitcrawl.pull_requests.review_context", claims);
+    return this.claimResult("gitcrawl.pull_requests.review_context", claims, queryArgs);
   }
 
   async searchOpenPullRequests(
@@ -611,15 +616,16 @@ export class GitcrawlEvidenceAdapter {
     const maxRows =
       options.maxRows === undefined ? undefined : positiveInteger(options.maxRows, "max rows");
     const order = options.order ?? "newest";
+    const queryArgs = {
+      ...ownerRepo(this.repository),
+      query: "",
+      kind: "pull_request",
+      state: "open",
+      order,
+    };
     const rows = await this.queryNormalized(
       "gitcrawl.threads.search",
-      {
-        ...ownerRepo(this.repository),
-        query: "",
-        kind: "pull_request",
-        state: "open",
-        order,
-      },
+      queryArgs,
       normalizeThread,
       searchThreadParityView,
       maxRows,
@@ -636,6 +642,7 @@ export class GitcrawlEvidenceAdapter {
           ? {}
           : { threadFingerprint: data.threadFingerprint }),
       })),
+      queryArgs,
     );
   }
 
@@ -681,15 +688,16 @@ export class GitcrawlEvidenceAdapter {
   private claimResult<T>(
     queryName: GitcrawlQueryName,
     inputs: ClaimInput<T>[],
-    queryArgs?: Record<string, unknown>,
+    queryArgs: Record<string, unknown>,
   ): GitcrawlEvidenceResult<T> {
     const claims = inputs.map((input) =>
       createGitcrawlEvidenceClaim({
         provider: this.provider,
+        repository: this.repository,
         snapshotId: this.primary.snapshotId,
         ...(this.parity === undefined ? {} : { paritySnapshotId: this.parity.snapshotId }),
         queryName,
-        ...(queryArgs === undefined ? {} : { queryArgs }),
+        queryArgs,
         subject: input.subject,
         ...(input.sourceRevision === undefined ? {} : { sourceRevision: input.sourceRevision }),
         ...(input.threadFingerprint === undefined
@@ -1250,7 +1258,7 @@ function normalizeThread(row: Record<string, unknown>): GitcrawlThreadEvidence {
         }),
     threadId: safePositive(row.thread_id, "thread id"),
     number: safePositive(row.number, "thread number"),
-    kind: boundedString(row.kind, 32),
+    kind: supportedThreadKind(row.kind),
     state: threadState,
     title: boundedString(promptTitle, 512),
     body: boundedString(promptBody, 2_048),
@@ -1397,14 +1405,7 @@ function clusterMemberParityView(row: GitcrawlThreadEvidence): unknown {
 }
 
 function relatedThreadParityView(row: GitcrawlThreadEvidence): unknown {
-  const {
-    sourceRevision: _sourceRevision,
-    clusterStatus: _clusterStatus,
-    membershipState: _membershipState,
-    createdAt: _createdAt,
-    isDraft: _isDraft,
-    ...common
-  } = row;
+  const { sourceRevision: _sourceRevision, ...common } = row;
   return common;
 }
 
@@ -1479,7 +1480,16 @@ function clusterSubject(repository: string, clusterId: number): string {
 }
 
 function threadSubject(repository: string, kind: string, number: number): string {
-  return `${repository}#${kind === "pull_request" ? "pull" : "issue"}:${number}`;
+  const supportedKind = supportedThreadKind(kind);
+  return `${repository}#${supportedKind === "pull_request" ? "pull" : "issue"}:${number}`;
+}
+
+function supportedThreadKind(value: unknown): "issue" | "pull_request" {
+  const kind = boundedString(value, 32);
+  if (kind !== "issue" && kind !== "pull_request") {
+    throw new Error(`unsupported Gitcrawl thread kind: ${kind || "missing"}`);
+  }
+  return kind;
 }
 
 function boundedString(value: unknown, maxLength: number): string {
@@ -1525,7 +1535,14 @@ function boundedJsonArray(value: unknown, maxItems: number, maxItemBytes: number
     .map((entry) => {
       const text = canonicalJson(entry);
       if (Buffer.byteLength(text, "utf8") <= maxItemBytes) return entry;
-      return text.slice(0, maxItemBytes);
+      const marker = {
+        truncated: true,
+        sha256: sha256Canonical(entry),
+      };
+      if (Buffer.byteLength(canonicalJson(marker), "utf8") > maxItemBytes) {
+        throw new Error("Gitcrawl JSON array item digest exceeds the safety bound");
+      }
+      return marker;
     });
 }
 

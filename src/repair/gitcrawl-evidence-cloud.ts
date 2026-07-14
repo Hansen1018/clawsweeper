@@ -159,6 +159,11 @@ export class CloudGitcrawlQuerySource implements GitcrawlQuerySource {
       const delayMs = retryable ? this.retryDelayMs(attempt, response) : 0;
       await response.body?.cancel().catch(() => undefined);
       if (retryable && attempt < this.maxAttempts) {
+        if (delayMs > this.retryMaxDelayMs) {
+          throw new Error(
+            `Gitcrawl cloud query ${request.name} refused Retry-After beyond the configured wait budget`,
+          );
+        }
         await this.sleepImpl(delayMs);
         continue;
       }
@@ -184,7 +189,7 @@ export class CloudGitcrawlQuerySource implements GitcrawlQuerySource {
 
   private retryDelayMs(attempt: number, response?: Response): number {
     const retryAfter = response === undefined ? undefined : parseRetryAfter(response);
-    if (retryAfter !== undefined) return Math.min(retryAfter, this.retryMaxDelayMs);
+    if (retryAfter !== undefined) return retryAfter;
     return Math.min(this.retryBaseDelayMs * 2 ** Math.max(0, attempt - 1), this.retryMaxDelayMs);
   }
 }
