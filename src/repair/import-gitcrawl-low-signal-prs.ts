@@ -6,6 +6,7 @@ import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { hasSecuritySignalText, parseArgs, repoRoot } from "./lib.js";
 import { renderJobIntentFrontmatter } from "./job-intent.js";
+import { deriveGitcrawlThreadPolicySignals } from "./gitcrawl-evidence-policy.js";
 
 const args = parseArgs(process.argv.slice(2));
 const repo = String(args.repo ?? "openclaw/openclaw");
@@ -125,6 +126,7 @@ function scoreCandidate(row: LooseRecord) {
   );
   const title = String(row.title ?? "");
   const body = String(row.body ?? "");
+  const policySignals = deriveGitcrawlThreadPolicySignals(title, body);
   const signals: LooseRecord[] = [];
   const blockers: LooseRecord[] = [];
 
@@ -134,22 +136,23 @@ function scoreCandidate(row: LooseRecord) {
   if (hasSecuritySignalText(title, body, labels))
     blockers.push("security-sensitive text or labels");
 
-  addSignal(signals, blankTemplateSignal(body), "blank_template");
+  addSignal(signals, policySignals.blankTemplate, "blank_template");
   addSignal(signals, docsOnlySignal(title, files), "docs_only");
   addSignal(signals, testsOnlySignal(title, files), "test_only");
-  addSignal(signals, refactorOnlySignal(title, body, files), "refactor_or_cleanup");
   addSignal(
     signals,
-    thirdPartyCoreSignal(title, body, files),
+    refactorOnlySignal(title, files, policySignals.issueReference),
+    "refactor_or_cleanup",
+  );
+  addSignal(
+    signals,
+    thirdPartyCoreSignal(files, policySignals.thirdPartyCapability),
     "third_party_or_external_capability",
   );
   addSignal(signals, riskyInfraSignal(title, files), "risky_infra");
   addSignal(signals, dirtyBranchSignal(files), "dirty_branch");
 
-  const hasConcreteFix = /\b(fixes|fixes?|root cause|repro|regression|bug|problem)\b/i.test(
-    `${title}\n${body}`,
-  );
-  if (hasConcreteFix && signals.length === 1 && !signals.includes("blank_template")) {
+  if (policySignals.concreteFix && signals.length === 1 && !policySignals.blankTemplate) {
     blockers.push("possible focused fix needs human review");
   }
 
@@ -280,22 +283,6 @@ function staleCompare(left: JsonValue, right: JsonValue) {
   return String(left.updated_at).localeCompare(String(right.updated_at));
 }
 
-function blankTemplateSignal(body: string) {
-  const text = String(body ?? "");
-  if (
-    /Describe the problem and fix in 2.?5 bullets:\s*[\r\n]+\s*-\s*Problem:\s*[\r\n]+\s*-\s*Fix:/i.test(
-      text,
-    )
-  ) {
-    return true;
-  }
-  const placeholders = ["Problem:", "Why it matters:", "Describe the problem and fix"];
-  return (
-    placeholders.filter((placeholder: JsonValue) => text.includes(placeholder)).length >= 2 &&
-    text.length < 700
-  );
-}
-
 function docsOnlySignal(title: JsonValue, files: LooseRecord[]) {
   return (
     /\bdocs?\b/i.test(title) &&
@@ -312,18 +299,15 @@ function testsOnlySignal(title: JsonValue, files: LooseRecord[]) {
   );
 }
 
-function refactorOnlySignal(title: JsonValue, body: string, files: LooseRecord[]) {
+function refactorOnlySignal(title: JsonValue, files: LooseRecord[], hasIssueReference: boolean) {
   return (
-    /\b(refactor|cleanup|format|chore)\b/i.test(title) &&
-    !/#\d+\b/.test(`${title}\n${body}`) &&
-    files.length > 0
+    /\b(refactor|cleanup|format|chore)\b/i.test(title) && !hasIssueReference && files.length > 0
   );
 }
 
-function thirdPartyCoreSignal(title: JsonValue, body: string, files: LooseRecord[]) {
-  const text = `${title}\n${body}`.toLowerCase();
+function thirdPartyCoreSignal(files: LooseRecord[], hasThirdPartyCapability: boolean) {
   return (
-    /\b(new|add|feat).*(plugin|provider|channel|skill|tool|app)\b/.test(text) ||
+    hasThirdPartyCapability ||
     files.some((file: JsonValue) => String(file).startsWith("apps/linux/"))
   );
 }

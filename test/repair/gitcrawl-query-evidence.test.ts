@@ -928,6 +928,14 @@ test("policy sanitization removes hidden instructions before scoring or claims",
     true,
   );
   assert.equal(
+    deriveGitcrawlThreadPolicySignals("Add<!-- hidden -->provider", "").thirdPartyCapability,
+    true,
+  );
+  assert.equal(
+    deriveGitcrawlThreadPolicySignals("Refactor", "<!-- references #42 -->").issueReference,
+    false,
+  );
+  assert.equal(
     stripGitcrawlHtmlComments("safe<!-- outer <!-- nested --> hidden -->tail"),
     "safe\ntail",
   );
