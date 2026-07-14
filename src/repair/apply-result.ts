@@ -689,6 +689,9 @@ function applyMergeAction({
   if (existingMerge.mergedAt) {
     const mergeOwned =
       preliminaryClaim.status === "existing" && preliminaryClaim.dispatched === true;
+    if (mergeOwned) {
+      recordApplyMergeObserved(target, authorizedHeadSha);
+    }
     return {
       ...base,
       status: mergeOwned ? "executed" : "skipped",
@@ -1093,8 +1096,9 @@ function applyMergeAction({
     }
     const claimedPendingMerge = exactHeadPendingMerge(claimedView, authorizedHeadSha);
     if (claimedPendingMerge) {
-      recordApplyMergeObserved(target, authorizedHeadSha);
-      return pendingMergeAction({ base, live: claimedLive, reason: claimedPendingMerge });
+      return releaseBeforeDispatch(
+        pendingMergeAction({ base, live: claimedLive, reason: claimedPendingMerge }),
+      );
     }
     const claimedReadinessBlock = validateMergeablePullRequestReadiness({ view: claimedView });
     if (claimedReadinessBlock) {

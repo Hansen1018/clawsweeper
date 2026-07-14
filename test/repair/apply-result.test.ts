@@ -1417,6 +1417,41 @@ for (const pendingKind of ["queue", "auto_merge"] as const) {
 }
 
 for (const pendingKind of ["queue", "auto_merge"] as const) {
+  test(`repair apply releases an undispatched claim when external ${pendingKind} state appears`, () => {
+    const fixture = writeMergeApplyFixture({
+      pendingAfterClaim: true,
+      pendingKind,
+    });
+    try {
+      runMergeApplyResult(fixture, {
+        actionLedgerInvocation: `apply-result-external-${pendingKind}-after-claim`,
+      });
+
+      const report = readApplyReport(fixture.reportPath);
+      assert.equal(report.actions[0].status, "blocked");
+      assert.equal(report.actions[0].requeue_required, true);
+      assert.equal(mergeCallCount(fixture.ghLogPath), 0);
+      const comments = JSON.parse(fs.readFileSync(fixture.mergeClaimPath, "utf8"));
+      assert.equal(comments.length, 2);
+      assert.match(comments[0].body, /clawsweeper-exact-head-merge-claim:v1/);
+      assert.match(comments[1].body, /clawsweeper-exact-head-merge-release:v1 claim=1001/);
+      const observedApplyEvents = readSpooledActionEvents(
+        fixture.ledgerRoot,
+        "openclaw/openclaw",
+      ).filter(
+        (event) =>
+          event.event_type === "repair.mutation" &&
+          String(event.producer.component).startsWith("apply_result.") &&
+          event.attributes?.completion_reason === "mutation_observed",
+      );
+      assert.equal(observedApplyEvents.length, 0);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+}
+
+for (const pendingKind of ["queue", "auto_merge"] as const) {
   test(`repair apply reports terminal check failure before exact-head ${pendingKind} state`, () => {
     const fixture = writeMergeApplyFixture({
       mergeMode: "pending_after_command",
@@ -1762,6 +1797,33 @@ test("repair apply reconstructs durable squash proof in a fresh process", () => 
           call.args[1] === `repos/openclaw/openclaw/commits/${"c".repeat(40)}`,
       ).length >= 2,
     );
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("repair apply records an observed effect when reconciling a dispatched merged claim", () => {
+  const fixture = writeMergeApplyFixture();
+  try {
+    runMergeApplyResult(fixture, { runAttempt: 1 });
+    runMergeApplyResult(fixture, {
+      runAttempt: 2,
+      actionLedgerInvocation: "apply-result-existing-dispatched-merge",
+    });
+
+    const report = readApplyReport(fixture.reportPath);
+    assert.equal(report.actions[0].status, "executed");
+    assert.equal(report.actions[0].reason, "already merged");
+    const observedApplyEvents = readSpooledActionEvents(
+      fixture.ledgerRoot,
+      "openclaw/openclaw",
+    ).filter(
+      (event) =>
+        event.event_type === "repair.mutation" &&
+        String(event.producer.component).startsWith("apply_result.") &&
+        event.attributes?.completion_reason === "mutation_observed",
+    );
+    assert.equal(observedApplyEvents.length, 1);
   } finally {
     fixture.cleanup();
   }
@@ -2528,6 +2590,7 @@ function writeMergeApplyFixture(
       | "external_exact"
       | "wrong_head_merged";
     pendingKind?: "queue" | "auto_merge";
+    pendingAfterClaim?: boolean;
     mergeable?: "MERGEABLE" | "UNKNOWN";
     securityOnFinalIssueFetch?: boolean;
     securityOnPostClaimIssueFetchOnce?: boolean;
@@ -2645,6 +2708,7 @@ function writeMergeApplyFixture(
     wrongHeadSha: "b".repeat(40),
     mergeMode: options.mergeMode ?? "success_exact",
     pendingKind: options.pendingKind ?? null,
+    pendingAfterClaim: options.pendingAfterClaim ?? false,
     mergeable: options.mergeable ?? "MERGEABLE",
     securityOnFinalIssueFetch: options.securityOnFinalIssueFetch ?? false,
     securityOnPostClaimIssueFetchOnce: options.securityOnPostClaimIssueFetchOnce ?? false,
@@ -2921,7 +2985,9 @@ if (args[0] === "api") {
 }
 
 if (args[0] === "pr" && args[1] === "view") {
-  const pending = mergeCount() > 0 && data.mergeMode === "pending_after_command";
+  const pending =
+    (mergeCount() > 0 && data.mergeMode === "pending_after_command") ||
+    (data.pendingAfterClaim && mergeComments().length > 0 && !dispatchRecorded());
   const absoluteFinalSnapshot = dispatchRecorded() && pullViewReadCount() >= 5;
   const terminalCheckFailure =
     data.terminalCheckFailure || (data.terminalCheckFailureAfterCommand && mergeCount() > 0);
