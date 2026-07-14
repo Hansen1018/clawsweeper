@@ -168,6 +168,37 @@ test("Access verifier rejects alternate routes and unapproved releases", async (
   );
 });
 
+test("Access verifier cancels oversized responses before buffering the body", async () => {
+  let pulls = 0;
+  let cancelled = false;
+  const oversized = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      pulls += 1;
+      controller.enqueue(new Uint8Array(512 * 1024));
+    },
+    cancel() {
+      cancelled = true;
+    },
+  });
+
+  await assert.rejects(
+    verifyCrawlRemoteAccessCredentials(
+      {
+        CF_ACCESS_CLIENT_ID: "fixture-client-id",
+        CF_ACCESS_CLIENT_SECRET: "fixture-client-credential",
+        ...verificationEnvironment(),
+      },
+      {
+        nonce: "fixture-probe",
+        fetchImpl: async () => new Response(oversized),
+      },
+    ),
+    /response exceeded the size limit/,
+  );
+  assert.equal(cancelled, true);
+  assert.ok(pulls <= 4, `oversized response produced ${pulls} chunks before cancellation`);
+});
+
 test("Access verifier binds notes and capability states to the approved deployment", async () => {
   const environment = {
     CF_ACCESS_CLIENT_ID: "fixture-client-id",

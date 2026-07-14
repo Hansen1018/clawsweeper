@@ -78,10 +78,7 @@ export async function verifyCrawlRemoteAccessCredentials(
     if (!response.ok) {
       throw new Error(`crawl-remote Access verification failed with HTTP ${response.status}`);
     }
-    const body = await response.text();
-    if (Buffer.byteLength(body, "utf8") > MAX_PROBE_RESPONSE_BYTES) {
-      throw new Error("crawl-remote Access verification response exceeded the size limit");
-    }
+    const body = await readBoundedResponseBody(response);
     try {
       return JSON.parse(body);
     } catch {
@@ -142,6 +139,32 @@ export async function resolveAndVerifyCrawlRemoteAccessCredentials(environment, 
     options,
   );
   return { ...result, slot: credentials.slot };
+}
+
+async function readBoundedResponseBody(response) {
+  const reader = response.body?.getReader();
+  if (!reader) {
+    throw new Error("crawl-remote Access verification response body is unavailable");
+  }
+  const chunks = [];
+  let byteLength = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      byteLength += value.byteLength;
+      if (byteLength > MAX_PROBE_RESPONSE_BYTES) {
+        throw new Error("crawl-remote Access verification response exceeded the size limit");
+      }
+      chunks.push(Buffer.from(value));
+    }
+  } catch (error) {
+    try {
+      await reader.cancel();
+    } catch {}
+    throw error;
+  }
+  return Buffer.concat(chunks, byteLength).toString("utf8");
 }
 
 function requiredSingleLineValue(value, name) {

@@ -53,10 +53,7 @@ test("manual workflow keeps bootstrap separate from deployment authority", () =>
     bootstrap.env.OPENCLAW_CLOUDFLARE_CONFIG_API_TOKEN,
     "${{ secrets.OPENCLAW_CLOUDFLARE_CONFIG_API_TOKEN }}",
   );
-  assert.equal(
-    bootstrap.env.OPENCLAW_CLOUDFLARE_WORKERS_API_TOKEN,
-    "${{ secrets.OPENCLAW_CLOUDFLARE_WORKERS_API_TOKEN }}",
-  );
+  assert.equal(bootstrap.env.OPENCLAW_CLOUDFLARE_WORKERS_API_TOKEN, undefined);
   assert.equal(
     bootstrap.env.CLAWSWEEPER_BOOTSTRAP_GH_TOKEN,
     "${{ steps.clawsweeper-admin-token.outputs.token }}",
@@ -113,6 +110,7 @@ test("manual workflow keeps bootstrap separate from deployment authority", () =>
   assert.doesNotMatch(bootstrap.run, /corepack|pnpm/);
   assert.doesNotMatch(source, /uses:.*deploy-crawl-remote|workflow_call:/);
   assert.doesNotMatch(source, /schedule:|push:|pull_request:/);
+  assert.doesNotMatch(source, /OPENCLAW_CLOUDFLARE_WORKERS_API_TOKEN/);
   assert.equal(
     JSON.parse(readFileSync("package.json", "utf8")).scripts["bootstrap:crawl-remote-access"],
     `node ${scriptPath}`,
@@ -138,4 +136,5 @@ test("operator docs preserve the dormant consumer and no-deploy boundaries", () 
   assert.match(docs, /exact approved release SHA, both rollout states/);
   assert.match(docs, /fails\s+closed before\s+privileged\s+work/);
   assert.match(docs, /never prints returned service credentials/);
+  assert.match(docs, /production\s+deployment credentials and controls are deliberately untouched/);
 });

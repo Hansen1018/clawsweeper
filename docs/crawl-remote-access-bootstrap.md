@@ -6,9 +6,9 @@ Cloudflare token to the deploy workflow.
 
 Until the separately reviewed slot-aware consumer lands, production deployment
 continues to use the existing `CRAWL_REMOTE_CLOUDFLARE_TOKEN_SHA256` contract.
-The bootstrap updates that live SHA-256 binding whenever it writes the
-production token. It also stages the future salted fingerprint but does not
-make the fingerprint a live deployment requirement.
+The bootstrap does not read or write that token, its SHA-256 binding, deployment
+authority, or route-proof controls. Those live inputs remain owned by the
+protected deployment path.
 
 The workflow is intentionally inert until the separately owned deploy consumer
 adds one exact `crawl_remote_access_verify` job after `preflight` and `deploy`.
@@ -36,12 +36,13 @@ unversioned secret references fail closed. The verifier job and step both bind
 owned consumer change lands, every dispatch fails closed before privileged
 work.
 
-The bootstrap rechecks the live ClawSweeper `main` SHA before token minting,
-immediately before its first mutation, immediately before a resumed rotation
-narrows Access policy, and again before a fresh rotation narrows policy or
-revokes an old service token. It writes and reads back both Gitcrawl kill
-switches before creating a token, changing Access policy, or publishing any
-credential generation.
+The bootstrap rechecks the live ClawSweeper `main` SHA immediately before every
+privileged mutation phase: kill-switch writes, token creation, application and
+policy reconciliation, secret-pair publication, generation-marker cutover,
+each repository's staged configuration, policy narrowing, and each old-token
+revocation. It writes and reads back both Gitcrawl kill switches before
+creating a token, changing Access policy, or publishing any credential
+generation.
 
 Bootstrap and production deploy runs share one non-cancelling concurrency group,
 so rotation cannot revoke a credential held by an in-flight deploy. During
@@ -70,18 +71,18 @@ variable. The marker has the form `v1:<slot>:<sha256-service-token-id>`. A
 consumer resolves both values from the marked slot; the bootstrap never
 publishes an unversioned mixed pair.
 
-It also writes the protected deployment authority, proof mode, a salted scrypt
-Workers token fingerprint, cloud endpoint/archive, and conservative rollout variables. The initial
-settings stage ClawSweeper on the cloud provider while keeping scheduled cluster
-repair intake and cloud publication disabled.
+It writes only cloud endpoint/archive and conservative rollout variables. The
+initial settings stage ClawSweeper on the cloud provider while keeping scheduled
+cluster repair intake and cloud publication disabled. Existing production
+deployment credentials and controls are deliberately untouched.
 
 ## Reconciliation and rotation
 
-A repeat run without rotation reconciles the application, policy, variables,
-and production Workers token only when every active slot exists and every
-generation marker hashes to the selected Cloudflare service-token ID. Missing,
-malformed, or stale markers fail before Cloudflare mutation because GitHub does
-not reveal stored secret values.
+A repeat run without rotation reconciles the application, policy, and staged
+variables only when every active slot exists and every generation marker hashes
+to the selected Cloudflare service-token ID. Missing, malformed, or stale
+markers fail before Cloudflare mutation because GitHub does not reveal stored
+secret values.
 
 Use `rotate service token` only when replacing credentials. Rotation temporarily
 allows marker-selected existing token IDs plus the newly minted token ID, writes
@@ -109,7 +110,6 @@ The ClawSweeper repository must already contain:
 
 - `OPENCLAW_CLOUDFLARE_CONFIG_API_TOKEN` with Access applications, policies,
   and service-token write permissions
-- `OPENCLAW_CLOUDFLARE_WORKERS_API_TOKEN`
 - `CLAWSWEEPER_APP_PRIVATE_KEY`; the workflow mints separate short-lived
   installation tokens for the two repositories
 

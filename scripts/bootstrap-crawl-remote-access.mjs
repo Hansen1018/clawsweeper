@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawnSync } from "node:child_process";
-import { createHash, randomBytes, scryptSync } from "node:crypto";
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import process from "node:process";
 import { pathToFileURL } from "node:url";
@@ -162,7 +162,6 @@ export async function bootstrapCrawlRemoteAccess(options, dependencies) {
     activeToken = managedTokens[0];
   }
 
-  await github.assertCurrentMain();
   await disableGitcrawlConsumers(github);
 
   if (!activeToken) {
@@ -172,6 +171,7 @@ export async function bootstrapCrawlRemoteAccess(options, dependencies) {
       oldTokens.length === 0
         ? BOOTSTRAP_CONTRACT.accessServiceTokenName
         : `${BOOTSTRAP_CONTRACT.accessServiceTokenName} rotation ${rotationLabel}`;
+    await github.assertCurrentMain();
     createdCredentials = await cloudflare.createServiceToken({
       name: tokenName,
       duration: BOOTSTRAP_CONTRACT.accessServiceTokenDuration,
@@ -180,6 +180,7 @@ export async function bootstrapCrawlRemoteAccess(options, dependencies) {
     activeToken = createdCredentials;
   }
 
+  await github.assertCurrentMain();
   const application = await cloudflare.ensureAccessApplication(applicationState.application);
   const oldTokenIds = oldTokens.map((token) => token.id);
   const transitionalTokenIds =
@@ -187,9 +188,7 @@ export async function bootstrapCrawlRemoteAccess(options, dependencies) {
       ? [...new Set([...authorizedOldTokens.map((token) => token.id), activeToken.id])]
       : [activeToken.id];
 
-  if (!createdCredentials && oldTokenIds.length > 0) {
-    await github.assertCurrentMain();
-  }
+  await github.assertCurrentMain();
   let configuredPolicy = await cloudflare.ensureAccessPolicy({
     applicationId: application.id,
     existingPolicy: applicationState.policy,
@@ -204,15 +203,14 @@ export async function bootstrapCrawlRemoteAccess(options, dependencies) {
     });
   }
 
-  await writeGitHubConfiguration({
+  await writeStagedGitHubConfiguration({
     github,
-    workersApiToken: options.workersApiToken,
     runtimeProvider,
   });
 
   if (oldTokenIds.length > 0) {
-    await github.assertCurrentMain();
     if (createdCredentials) {
+      await github.assertCurrentMain();
       configuredPolicy = await cloudflare.ensureAccessPolicy({
         applicationId: application.id,
         existingPolicy: configuredPolicy,
@@ -220,6 +218,7 @@ export async function bootstrapCrawlRemoteAccess(options, dependencies) {
       });
     }
     for (const token of oldTokens) {
+      await github.assertCurrentMain();
       await cloudflare.deleteServiceToken(token.id);
     }
   }
@@ -232,7 +231,7 @@ export async function bootstrapCrawlRemoteAccess(options, dependencies) {
         : "reconciled crawl-remote Access without rotating its service token",
   );
   logger.log(
-    `configured protected deployment inputs, staged ClawSweeper ${runtimeProvider} intake ` +
+    `staged ClawSweeper ${runtimeProvider} intake ` +
       `with automation disabled, and gitcrawl-store publisher=${publisherEnabled}`,
   );
 
@@ -423,6 +422,7 @@ async function publishAccessCredentials({ github, accessCredentials, credentialS
     };
   });
 
+  await github.assertCurrentMain();
   for (const state of prepared) {
     await github.setSecret({
       repository: state.target.repository,
@@ -438,6 +438,7 @@ async function publishAccessCredentials({ github, accessCredentials, credentialS
     });
   }
 
+  await github.assertCurrentMain();
   for (const state of prepared) {
     await github.setVariable({
       repository: state.target.repository,
@@ -449,6 +450,7 @@ async function publishAccessCredentials({ github, accessCredentials, credentialS
 }
 
 async function disableGitcrawlConsumers(github) {
+  await github.assertCurrentMain();
   for (const target of GITCRAWL_CONSUMER_KILL_SWITCHES) {
     await github.setVariable({ ...target, value: "0" });
   }
@@ -460,44 +462,9 @@ async function disableGitcrawlConsumers(github) {
   }
 }
 
-async function writeGitHubConfiguration({ github, workersApiToken, runtimeProvider }) {
-  assertSecretValue(workersApiToken, "OPENCLAW_CLOUDFLARE_WORKERS_API_TOKEN");
-  // This preserves the deployed equality-binding contract; password-style verification uses scrypt.
-  // codeql[js/insufficient-password-hash]
-  const workersTokenSha256 = createHash("sha256").update(workersApiToken).digest("hex");
-  const workersTokenFingerprint = createWorkersTokenFingerprint(workersApiToken);
-  const environmentTarget = {
-    repository: BOOTSTRAP_CONTRACT.clawsweeperRepository,
-    environment: BOOTSTRAP_CONTRACT.productionEnvironment,
-  };
-
-  await github.setSecret({
-    ...environmentTarget,
-    name: "CRAWL_REMOTE_PRODUCTION_CLOUDFLARE_API_TOKEN",
-    value: workersApiToken,
-  });
-  await github.setVariable({
-    ...environmentTarget,
-    name: "CRAWL_REMOTE_DEPLOY_AUTHORITY",
-    value: "clawsweeper-v1",
-  });
-  await github.setVariable({
-    ...environmentTarget,
-    name: "CRAWL_REMOTE_CUSTOM_ROUTE_PROOF",
-    value: "access-service-token",
-  });
-  await github.setVariable({
-    ...environmentTarget,
-    name: "CRAWL_REMOTE_CLOUDFLARE_TOKEN_SHA256",
-    value: workersTokenSha256,
-  });
-  await github.setVariable({
-    ...environmentTarget,
-    name: "CRAWL_REMOTE_CLOUDFLARE_TOKEN_FINGERPRINT",
-    value: workersTokenFingerprint,
-  });
-
+async function writeStagedGitHubConfiguration({ github, runtimeProvider }) {
   const clawsweeperTarget = { repository: BOOTSTRAP_CONTRACT.clawsweeperRepository };
+  await github.assertCurrentMain();
   await github.setVariable({
     ...clawsweeperTarget,
     name: "CLAWSWEEPER_GITCRAWL_PROVIDER",
@@ -515,6 +482,7 @@ async function writeGitHubConfiguration({ github, workersApiToken, runtimeProvid
   });
 
   const storeTarget = { repository: BOOTSTRAP_CONTRACT.gitcrawlStoreRepository };
+  await github.assertCurrentMain();
   for (const [name, value] of [
     ["GITCRAWL_CLOUD_STAGE_ONLY", "1"],
     ["GITCRAWL_CLOUD_OBSERVATION_ORDER", "0"],
@@ -920,20 +888,6 @@ export function credentialGenerationMarker(tokenId, slot) {
   return `v1:${slot}:${generation}`;
 }
 
-export function createWorkersTokenFingerprint(token, salt = randomBytes(16)) {
-  assertSecretValue(token, "Cloudflare Workers API token");
-  if (!Buffer.isBuffer(salt) || salt.length !== 16) {
-    throw new Error("Cloudflare Workers token fingerprint salt must be 16 bytes");
-  }
-  const digest = scryptSync(token, salt, 32, {
-    N: 16_384,
-    r: 8,
-    p: 1,
-    maxmem: 64 * 1024 * 1024,
-  });
-  return `scrypt-v1:${salt.toString("hex")}:${digest.toString("hex")}`;
-}
-
 function parseCredentialGenerationMarker(value) {
   if (typeof value !== "string") return null;
   const match = /^v1:(blue|green):([0-9a-f]{64})$/.exec(value);
@@ -1172,7 +1126,6 @@ async function main() {
       rotateServiceToken,
       rotationLabel: args["rotation-label"],
       runtimeProvider: args["runtime-provider"] ?? "cloud",
-      workersApiToken: process.env.OPENCLAW_CLOUDFLARE_WORKERS_API_TOKEN,
     },
     { cloudflare, github },
   );
