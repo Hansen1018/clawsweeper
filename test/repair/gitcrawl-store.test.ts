@@ -60,8 +60,17 @@ test("scheduled cluster repair intake supports snapshot-bound providers", () => 
   assert.match(workflow, /local, cloud, or parity evidence provider/);
   assert.match(workflow, /CLAWSWEEPER_CLUSTER_REPAIR_GITCRAWL_PROVIDER/);
   assert.match(workflow, /CLAWSWEEPER_GITCRAWL_CLOUD_URL/);
-  assert.match(workflow, /secrets\.CRAWL_REMOTE_ACCESS_CLIENT_ID/);
-  assert.match(workflow, /secrets\.CRAWL_REMOTE_ACCESS_CLIENT_SECRET/);
+  assert.match(workflow, /id-token: write/);
+  assert.match(workflow, /ACTIONS_ID_TOKEN_REQUEST_URL/);
+  assert.match(
+    workflow,
+    /https:\/\/crawl-remote\.services-91b\.workers\.dev\/v1\/auth\/github-actions\/session/,
+  );
+  assert.match(workflow, /CLAWSWEEPER_GITCRAWL_CLOUD_TOKEN=\$\{session\.token\}/);
+  assert.match(workflow, /::add-mask::\$\{session\.token\}/);
+  assert.doesNotMatch(workflow, /secrets\.CRAWL_REMOTE_ACCESS_CLIENT_ID/);
+  assert.doesNotMatch(workflow, /secrets\.CRAWL_REMOTE_ACCESS_CLIENT_SECRET/);
+  assert.doesNotMatch(workflow, /secrets\.CLAWSWEEPER_GITCRAWL_CLOUD_TOKEN/);
   assert.match(workflow, /last_processed_snapshot_id/);
   assert.match(workflow, /last_processed_source_identity_sha256/);
   assert.match(workflow, /last_processed_store_sha256/);

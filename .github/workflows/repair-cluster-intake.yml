@@ -55,6 +55,7 @@ on:
 permissions:
   actions: write
   contents: write
+  id-token: write
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
@@ -209,6 +210,69 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "should_import=true" >> "$GITHUB_OUTPUT"
 
+      - name: Mint crawl-remote reader session
+        if: ${{ steps.prepare.outputs.should_import == 'true' && steps.prepare.outputs.provider != 'local' }}
+        env:
+          OIDC_AUDIENCE: crawl-remote
+          OIDC_EXCHANGE_URL: https://crawl-remote.services-91b.workers.dev/v1/auth/github-actions/session
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const fs = require("node:fs");
+
+          const requestUrl = new URL(process.env.ACTIONS_ID_TOKEN_REQUEST_URL);
+          requestUrl.searchParams.set("audience", process.env.OIDC_AUDIENCE);
+          const oidcResponse = await fetch(requestUrl, {
+            headers: {
+              authorization: `Bearer ${process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN}`,
+            },
+            redirect: "error",
+          });
+          if (!oidcResponse.ok) {
+            throw new Error(`GitHub OIDC request failed (${oidcResponse.status})`);
+          }
+          const oidcBody = await oidcResponse.json();
+          if (typeof oidcBody.value !== "string" || oidcBody.value.length < 100) {
+            throw new Error("GitHub OIDC response did not contain a token");
+          }
+
+          const exchangeResponse = await fetch(process.env.OIDC_EXCHANGE_URL, {
+            method: "POST",
+            headers: {
+              accept: "application/json",
+              "content-type": "application/json",
+            },
+            body: JSON.stringify({ token: oidcBody.value }),
+            redirect: "error",
+          });
+          if (!exchangeResponse.ok) {
+            throw new Error(`crawl-remote OIDC exchange failed (${exchangeResponse.status})`);
+          }
+          const session = await exchangeResponse.json();
+          if (
+            session.auth !== "github-actions-oidc" ||
+            typeof session.token !== "string" ||
+            !/^[A-Za-z0-9_-]+\.[a-f0-9]{64}$/.test(session.token)
+          ) {
+            throw new Error("crawl-remote OIDC exchange returned an invalid reader session");
+          }
+          const expiresAt = Date.parse(session.expires_at);
+          if (
+            !Number.isFinite(expiresAt) ||
+            expiresAt <= Date.now() ||
+            expiresAt > Date.now() + 20 * 60 * 1000
+          ) {
+            throw new Error("crawl-remote OIDC exchange returned an invalid expiry");
+          }
+
+          process.stdout.write(`::add-mask::${session.token}\n`);
+          fs.appendFileSync(
+            process.env.GITHUB_ENV,
+            `CLAWSWEEPER_GITCRAWL_CLOUD_TOKEN=${session.token}\n`,
+            { encoding: "utf8" },
+          );
+          NODE
+
       - name: Import one Gitcrawl cluster
         id: import
         if: ${{ steps.prepare.outputs.should_import == 'true' }}
@@ -216,11 +280,8 @@ jobs:
           TARGET_REPO: ${{ steps.prepare.outputs.target_repo }}
           DB_PATH: ${{ steps.prepare.outputs.db_path }}
           CLAWSWEEPER_GITCRAWL_PROVIDER: ${{ steps.prepare.outputs.provider }}
-          CLAWSWEEPER_GITCRAWL_CLOUD_URL: ${{ vars.CLAWSWEEPER_GITCRAWL_CLOUD_URL || 'https://reports.openclaw.ai/crawl-remote' }}
+          CLAWSWEEPER_GITCRAWL_CLOUD_URL: https://crawl-remote.services-91b.workers.dev
           CLAWSWEEPER_GITCRAWL_CLOUD_ARCHIVE: ${{ vars.CLAWSWEEPER_GITCRAWL_CLOUD_ARCHIVE }}
-          CLAWSWEEPER_GITCRAWL_CLOUD_TOKEN: ${{ secrets.CLAWSWEEPER_GITCRAWL_CLOUD_TOKEN }}
-          CLAWSWEEPER_GITCRAWL_CLOUD_ACCESS_CLIENT_ID: ${{ secrets.CRAWL_REMOTE_ACCESS_CLIENT_ID }}
-          CLAWSWEEPER_GITCRAWL_CLOUD_ACCESS_CLIENT_SECRET: ${{ secrets.CRAWL_REMOTE_ACCESS_CLIENT_SECRET }}
           LIMIT: ${{ github.event.inputs.limit || vars.CLAWSWEEPER_CLUSTER_REPAIR_IMPORT_LIMIT || '1' }}
         run: |
           set -euo pipefail
