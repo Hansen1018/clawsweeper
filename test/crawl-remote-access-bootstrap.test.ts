@@ -247,6 +247,16 @@ test("deploy consumer gate rejects comment-only claims and accepts a structural 
     () =>
       assertCrawlRemoteDeployConsumerContract(
         validSource.replace(
+          "        id: crawl-remote-access-credentials",
+          ['        "if": false', "        id: crawl-remote-access-credentials"].join("\n"),
+        ),
+      ),
+    /invalid step syntax/,
+  );
+  assert.throws(
+    () =>
+      assertCrawlRemoteDeployConsumerContract(
+        validSource.replace(
           "      - name: Resolve crawl-remote Access credentials",
           [
             "      - run: |",

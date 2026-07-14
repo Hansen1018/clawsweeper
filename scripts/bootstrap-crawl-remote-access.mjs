@@ -306,16 +306,18 @@ function parseWorkflowJobSteps(source, expectedJob) {
   if (lines.some((line) => line.includes("\t"))) {
     throw new Error("crawl-remote deploy workflow must not contain tab indentation");
   }
-  const jobsIndex = lines.findIndex((line) => line === "jobs:");
-  if (jobsIndex < 0) {
+  const jobsIndexes = lines.flatMap((line, index) => (line === "jobs:" ? [index] : []));
+  if (jobsIndexes.length !== 1) {
     throw new Error("crawl-remote deploy workflow has no jobs mapping");
   }
-  const jobStart = lines.findIndex(
-    (line, index) => index > jobsIndex && line === `  ${expectedJob}:`,
+  const jobsIndex = jobsIndexes[0];
+  const jobIndexes = lines.flatMap((line, index) =>
+    index > jobsIndex && line === `  ${expectedJob}:` ? [index] : [],
   );
-  if (jobStart < 0) {
-    throw new Error(`crawl-remote deploy workflow has no ${expectedJob} job`);
+  if (jobIndexes.length !== 1) {
+    throw new Error(`crawl-remote deploy workflow must have exactly one ${expectedJob} job`);
   }
+  const jobStart = jobIndexes[0];
   let jobEnd = lines.length;
   for (let index = jobStart + 1; index < lines.length; index += 1) {
     if (/^  [A-Za-z0-9_-]+:\s*$/.test(lines[index])) {
@@ -323,17 +325,23 @@ function parseWorkflowJobSteps(source, expectedJob) {
       break;
     }
   }
-  const stepsIndex = lines.findIndex(
-    (line, index) => index > jobStart && index < jobEnd && line === "    steps:",
+  const stepsIndexes = lines.flatMap((line, index) =>
+    index > jobStart && index < jobEnd && line === "    steps:" ? [index] : [],
   );
-  if (stepsIndex < 0) {
-    throw new Error(`crawl-remote deploy ${expectedJob} job has no steps`);
+  if (stepsIndexes.length !== 1) {
+    throw new Error(`crawl-remote deploy ${expectedJob} job must have exactly one steps sequence`);
   }
+  const stepsIndex = stepsIndexes[0];
 
   const steps = [];
   for (let index = stepsIndex + 1; index < jobEnd; index += 1) {
     const stepMatch = /^      - (.+?)\s*$/.exec(lines[index]);
-    if (!stepMatch) continue;
+    if (!stepMatch) {
+      if (/^      -(?:\s|$)/.test(lines[index])) {
+        throw new Error(`crawl-remote deploy workflow has invalid step syntax: ${lines[index]}`);
+      }
+      continue;
+    }
     let stepEnd = jobEnd;
     for (let cursor = index + 1; cursor < jobEnd; cursor += 1) {
       if (lines[cursor].startsWith("      - ")) {
@@ -402,7 +410,9 @@ function parseWorkflowStep(lines, firstEntry) {
     }
     if (block === "run" && line.startsWith("          ")) {
       run.push(line.slice(10));
+      continue;
     }
+    throw new Error(`crawl-remote deploy workflow has invalid step syntax: ${line.trim()}`);
   }
   return { name, fields, environment, configuration, run };
 }
