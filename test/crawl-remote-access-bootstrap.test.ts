@@ -411,6 +411,47 @@ test("Cloudflare client uses exact account-scoped application and policy contrac
   });
 });
 
+test("Cloudflare client replaces a managed policy with any extra include selector", async () => {
+  const requests: Array<{ method: string; body?: unknown }> = [];
+  const fetchImpl = async (_url: string | URL, init?: RequestInit) => {
+    const body = typeof init?.body === "string" ? JSON.parse(init.body) : undefined;
+    requests.push({ method: init?.method ?? "GET", body });
+    return Response.json({ success: true, result: { id: "policy-existing", ...body } });
+  };
+  const client = createCloudflareClient({
+    token: "fixture-config-credential",
+    fetchImpl,
+    apiBase: "https://cloudflare.invalid/client/v4",
+  });
+
+  await client.ensureAccessPolicy({
+    applicationId: "app-existing",
+    existingPolicy: {
+      id: "policy-existing",
+      name: BOOTSTRAP_CONTRACT.accessPolicyName,
+      decision: "non_identity",
+      include: [{ service_token: { token_id: "token-existing" } }, { everyone: {} }],
+      exclude: [],
+      require: [],
+      precedence: 1,
+      session_duration: "24h",
+    },
+    tokenIds: ["token-existing"],
+  });
+
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0]?.method, "PUT");
+  assert.deepEqual(requests[0]?.body, {
+    name: BOOTSTRAP_CONTRACT.accessPolicyName,
+    decision: "non_identity",
+    include: [{ service_token: { token_id: "token-existing" } }],
+    exclude: [],
+    require: [],
+    precedence: 1,
+    session_duration: "24h",
+  });
+});
+
 test("GitHub client sends secret values only over standard input", async () => {
   const commands: Array<{
     args: string[];

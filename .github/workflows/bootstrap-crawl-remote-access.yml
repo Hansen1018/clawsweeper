@@ -53,13 +53,13 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Check out trusted bootstrap
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           fetch-depth: 1
           persist-credentials: false
 
       - name: Set up Node
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
         with:
           node-version: 24
 
@@ -87,6 +87,11 @@ jobs:
           repositories: |
             clawsweeper
             gitcrawl-store
+          permission-environments: write
+          permission-secrets: write
+          # The action runtime forwards this GitHub permission even though its generated metadata
+          # currently omits the input.
+          permission-variables: write
 
       - name: Bootstrap crawl-remote Access
         env:

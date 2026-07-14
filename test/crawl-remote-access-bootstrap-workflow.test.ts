@@ -14,6 +14,12 @@ test("manual workflow keeps bootstrap separate from deployment authority", () =>
   const bootstrap = job.steps.find(
     (candidate: { name?: string }) => candidate.name === "Bootstrap crawl-remote Access",
   );
+  const checkout = job.steps.find(
+    (candidate: { name?: string }) => candidate.name === "Check out trusted bootstrap",
+  );
+  const setupNode = job.steps.find(
+    (candidate: { name?: string }) => candidate.name === "Set up Node",
+  );
 
   assert.deepEqual(Object.keys(workflow.on), ["workflow_dispatch"]);
   assert.deepEqual(workflow.permissions, { contents: "read" });
@@ -26,6 +32,8 @@ test("manual workflow keeps bootstrap separate from deployment authority", () =>
   assert.match(job.if, /github\.run_attempt == 1/);
   assert.match(job.if, /github\.ref == 'refs\/heads\/main'/);
   assert.match(job.if, /inputs\.confirmation == 'bootstrap crawl-remote access'/);
+  assert.equal(checkout.uses, "actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0");
+  assert.equal(setupNode.uses, "actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e");
   assert.equal(
     bootstrap.env.OPENCLAW_CLOUDFLARE_CONFIG_API_TOKEN,
     "${{ secrets.OPENCLAW_CLOUDFLARE_CONFIG_API_TOKEN }}",
@@ -45,6 +53,9 @@ test("manual workflow keeps bootstrap separate from deployment authority", () =>
   assert.equal(token.with.owner, "openclaw");
   assert.equal(token.with.repositories, "clawsweeper\ngitcrawl-store\n");
   assert.equal(token.with["private-key"], "${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}");
+  assert.equal(token.with["permission-environments"], "write");
+  assert.equal(token.with["permission-secrets"], "write");
+  assert.equal(token.with["permission-variables"], "write");
   assert.match(bootstrap.run, /bootstrap:crawl-remote-access/);
   assert.match(bootstrap.run, /--rotate-service-token/);
   assert.doesNotMatch(source, /deploy-crawl-remote/);

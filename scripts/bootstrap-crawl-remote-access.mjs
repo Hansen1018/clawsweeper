@@ -546,25 +546,37 @@ function accessApplicationMatches(application, canonical) {
 }
 
 function accessPolicyMatches(policy, canonical) {
+  const policyIncludes = normalizeExactPolicyIncludes(policy.include);
+  const canonicalIncludes = normalizeExactPolicyIncludes(canonical.include);
   return (
+    policyIncludes !== null &&
+    canonicalIncludes !== null &&
     policy.name === canonical.name &&
     policy.decision === canonical.decision &&
     policy.precedence === canonical.precedence &&
     policy.session_duration === canonical.session_duration &&
     JSON.stringify(policy.exclude ?? []) === JSON.stringify(canonical.exclude) &&
     JSON.stringify(policy.require ?? []) === JSON.stringify(canonical.require) &&
-    JSON.stringify(normalizePolicyIncludes(policy.include)) ===
-      JSON.stringify(normalizePolicyIncludes(canonical.include))
+    JSON.stringify(policyIncludes) === JSON.stringify(canonicalIncludes)
   );
 }
 
-function normalizePolicyIncludes(includes) {
-  if (!Array.isArray(includes)) return [];
-  return includes
-    .map((entry) => entry?.service_token?.token_id)
-    .filter(isNonEmptyString)
-    .sort()
-    .map((tokenId) => ({ service_token: { token_id: tokenId } }));
+function normalizeExactPolicyIncludes(includes) {
+  if (!Array.isArray(includes)) return null;
+  const tokenIds = [];
+  for (const entry of includes) {
+    if (
+      !isPlainObject(entry) ||
+      Object.keys(entry).length !== 1 ||
+      !isPlainObject(entry.service_token) ||
+      Object.keys(entry.service_token).length !== 1 ||
+      !isNonEmptyString(entry.service_token.token_id)
+    ) {
+      return null;
+    }
+    tokenIds.push(entry.service_token.token_id);
+  }
+  return tokenIds.sort().map((tokenId) => ({ service_token: { token_id: tokenId } }));
 }
 
 function isManagedServiceToken(token) {
@@ -624,6 +636,10 @@ function normalizeRotationLabel(value) {
 
 function isNonEmptyString(value) {
   return typeof value === "string" && value.length > 0;
+}
+
+function isPlainObject(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function parseArgs(argv) {
