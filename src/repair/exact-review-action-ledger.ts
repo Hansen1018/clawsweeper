@@ -407,11 +407,32 @@ async function parseClaimResponse(
 }
 
 async function boundedResponseText(response: Response): Promise<string> {
-  const text = await response.text();
-  if (Buffer.byteLength(text, "utf8") > 1024 * 1024) {
-    throw new Error("exact-review response exceeds 1 MiB");
+  const body = response.body;
+  if (!body) return "";
+
+  const limit = 1024 * 1024;
+  const chunks: Buffer[] = [];
+  const reader = body.getReader();
+  let bytes = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      bytes += value.byteLength;
+      if (bytes > limit) {
+        try {
+          await reader.cancel();
+        } catch {
+          // Preserve the response-size failure if cancellation also fails.
+        }
+        throw new Error("exact-review response exceeds 1 MiB");
+      }
+      chunks.push(Buffer.from(value));
+    }
+  } finally {
+    reader.releaseLock();
   }
-  return text;
+  return Buffer.concat(chunks, bytes).toString("utf8");
 }
 
 function exactReviewTarget(

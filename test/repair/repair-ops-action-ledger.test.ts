@@ -361,6 +361,40 @@ test("commit review and notification workflows publish their operation receipts"
       workflowPath,
     );
   }
+  const activityWorkflow = parse(activity) as {
+    jobs: {
+      notify: {
+        steps: Array<{
+          id?: string;
+          name?: string;
+          if?: string;
+          env?: Record<string, string>;
+        }>;
+      };
+    };
+  };
+  const activitySteps = activityWorkflow.jobs.notify.steps;
+  const spamIntake = activitySteps.find((step) => step.name === "Dispatch spam scan candidate");
+  const activityFinalizer = activitySteps.find(
+    (step) => step.name === "Finalize GitHub activity notification action ledger",
+  );
+  const activityPublisher = activitySteps.find(
+    (step) => step.name === "Publish immutable GitHub activity notification action ledger",
+  );
+  assert.ok(spamIntake);
+  assert.match(
+    spamIntake.env?.CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT ?? "",
+    /clawsweeper-spam-comment-intake/,
+  );
+  assert.match(
+    spamIntake.env?.CLAWSWEEPER_ACTION_LEDGER_ROOT ?? "",
+    /clawsweeper-spam-comment-intake/,
+  );
+  assert.ok(activityFinalizer?.id);
+  assert.match(
+    activityPublisher?.if ?? "",
+    new RegExp(`steps\\.${activityFinalizer.id}\\.outcome == 'success'`),
+  );
   assert.match(publisher, /Verify current-attempt commit review bundles/);
   assert.match(publisher, /merge-multiple: false/);
   assert.match(publisher, /--commit-report "\$\{report_files\[0\]\}"/);

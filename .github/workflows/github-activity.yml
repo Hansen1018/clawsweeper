@@ -170,6 +170,8 @@ jobs:
         if: steps.core-budget.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
+          CLAWSWEEPER_ACTION_LEDGER_ROOT: ${{ runner.temp }}/clawsweeper-spam-comment-intake/${{ github.run_id }}/${{ github.run_attempt }}/spool
+          CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT: ${{ runner.temp }}/clawsweeper-spam-comment-intake/${{ github.run_id }}/${{ github.run_attempt }}/output
         run: |
           set -euo pipefail
           pnpm run repair:spam-comment-intake -- --write-report
@@ -186,6 +188,7 @@ jobs:
           pnpm run repair:notify-github-activity -- --write-report
 
       - name: Finalize GitHub activity notification action ledger
+        id: finalize-github-activity-notification-action-ledger
         if: ${{ always() && steps.setup-pnpm.outcome == 'success' }}
         run: |
           set -euo pipefail
@@ -197,7 +200,7 @@ jobs:
             > .artifacts/github-activity-action-ledger-manifest.json
 
       - name: Publish immutable GitHub activity notification action ledger
-        if: ${{ always() && steps.setup-pnpm.outcome == 'success' }}
+        if: ${{ always() && steps.setup-pnpm.outcome == 'success' && steps.finalize-github-activity-notification-action-ledger.outcome == 'success' }}
         run: |
           set -euo pipefail
           test -n "${CLAWSWEEPER_STATE_DIR:-}"

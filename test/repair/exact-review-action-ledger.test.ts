@@ -163,6 +163,49 @@ test("exact-review claim preserves the protocol-v2 request and response contract
   });
 });
 
+test("exact-review claim stops streaming once the response limit is exceeded", async () => {
+  await withLedgerEnvironment(async () => {
+    let pulls = 0;
+    let cancelled = false;
+    const chunk = new Uint8Array(600 * 1024).fill(0x61);
+    const body = new ReadableStream<Uint8Array>(
+      {
+        pull(controller) {
+          pulls += 1;
+          controller.enqueue(chunk);
+        },
+        cancel() {
+          cancelled = true;
+        },
+      },
+      { highWaterMark: 0 },
+    );
+
+    await assert.rejects(
+      runExactReviewQueueCommand(
+        "claim",
+        {
+          ...process.env,
+          DISPATCH_PAYLOAD: JSON.stringify({}),
+          ITEM_KEY: "openclaw/openclaw#77",
+          QUEUE_LEASE_ID: "lease-private-77",
+          QUEUE_LEASE_REVISION: "9",
+          QUEUE_URL: "https://queue.private.example",
+          RUN_ATTEMPT: "3",
+        },
+        {
+          attempts: 1,
+          fetch: async () => new Response(body, { status: 200 }),
+        },
+      ),
+      /request failed after 1 attempts/,
+    );
+
+    assert.equal(pulls, 2);
+    assert.equal(cancelled, true);
+  });
+});
+
 test("exact-review claim and completion share one isolated durable manifest", async () => {
   await withLedgerEnvironment(async (root) => {
     const genericOutputRoot = process.env.CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT!;
@@ -412,8 +455,21 @@ test("exact-review workflows isolate state credentials and publish exact manifes
   );
   assert.match(
     event,
-    /Complete exact-review queue lease[\s\S]*if: \$\{\{ always\(\) && steps\.finalize-exact-event-action-ledger\.outcome == 'success' && steps\.publish-exact-event-action-ledger\.outcome == 'success' \}\}/,
+    /Complete exact-review queue lease[\s\S]*steps\.finalize-exact-event-action-ledger\.outcome == 'success'/,
   );
+  const completion = event.slice(
+    event.indexOf("- name: Complete exact-review queue lease"),
+    event.indexOf("- name: Finalize exact-review queue action ledger"),
+  );
+  for (const terminalNoop of [
+    "steps.target.outputs.target_enabled == 'false'",
+    "steps.live-item.outputs.terminal_noop == 'true'",
+    "steps.live-item.outputs.terminal_missing == 'true'",
+    "steps.live-item.outputs.guarded_open == 'true'",
+  ]) {
+    assert.match(completion, new RegExp(escapeRegExp(terminalNoop)));
+  }
+  assert.match(completion, /steps\.publish-exact-event-action-ledger\.outcome == 'success'/);
   assert.ok(
     event.indexOf("Complete exact-review queue lease") <
       event.indexOf("Finalize exact-review queue action ledger"),

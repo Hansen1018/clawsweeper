@@ -120,8 +120,56 @@ test("each sweep caller producer finalizes and publishes after its last mutation
   }
 });
 
+test("sweep ledger publishers require their finalizer to succeed", () => {
+  const workflow = parse(fs.readFileSync(workflowPath, "utf8"));
+  const pairs = [
+    [
+      "event-review-apply",
+      "Finalize exact event action ledger",
+      "Publish exact event action ledger",
+    ],
+    [
+      "event-review-apply",
+      "Finalize late command status action ledger",
+      "Publish late command status action ledger",
+    ],
+    [
+      "requeue-source-revision-drift",
+      "Finalize source-drift dispatch action ledger",
+      "Publish source-drift dispatch action ledger",
+    ],
+    ["publish", "Finalize sweep caller action ledger", "Publish sweep caller action ledger"],
+    [
+      "recover-review-failures",
+      "Finalize review recovery action ledger",
+      "Publish review recovery action ledger",
+    ],
+    [
+      "retry-failed-reviews",
+      "Finalize failed-review retry action ledger",
+      "Publish failed-review retry action ledger",
+    ],
+    ["apply-existing", "Finalize apply action ledger", "Publish apply action events"],
+  ] as const;
+
+  for (const [jobId, finalizerName, publisherName] of pairs) {
+    const steps = (workflow.jobs[jobId].steps ?? []) as WorkflowStep[];
+    const finalizer = steps.find((step) => step.name === finalizerName);
+    const publisher = steps.find((step) => step.name === publisherName);
+    assert.ok(finalizer, `${jobId}: missing ${finalizerName}`);
+    assert.ok(publisher, `${jobId}: missing ${publisherName}`);
+    assert.ok(finalizer.id, `${jobId}: ${finalizerName} needs a stable step id`);
+    assert.match(
+      String(publisher.if ?? ""),
+      new RegExp(`steps\\.${finalizer.id}\\.outcome == 'success'`),
+      `${jobId}: ${publisherName} must not run after finalization fails`,
+    );
+  }
+});
+
 type WorkflowStep = {
   name?: string;
+  id?: string;
   uses?: string;
   run?: string;
   if?: string;

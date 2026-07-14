@@ -1063,7 +1063,7 @@ jobs:
 
       - name: Complete exact-review queue lease
         id: complete-exact-review-queue
-        if: ${{ always() && steps.finalize-exact-event-action-ledger.outcome == 'success' && steps.publish-exact-event-action-ledger.outcome == 'success' }}
+        if: ${{ always() && steps.finalize-exact-event-action-ledger.outcome == 'success' && (steps.publish-exact-event-action-ledger.outcome == 'success' || steps.target.outputs.target_enabled == 'false' || steps.live-item.outputs.terminal_noop == 'true' || steps.live-item.outputs.terminal_missing == 'true' || steps.live-item.outputs.guarded_open == 'true') }}
         continue-on-error: true
         env:
           CLAWSWEEPER_ACTION_LEDGER_ROOT: ${{ steps.exact-review-action-ledger.outputs.output-root || runner.temp }}/exact-review-queue-spool
@@ -1132,6 +1132,7 @@ jobs:
         run: exit 1
 
       - name: Finalize late command status action ledger
+        id: finalize-late-command-status-action-ledger
         if: ${{ always() && steps.setup-state.outcome == 'success' && steps.setup-pnpm.outcome == 'success' && steps.publish-event-result.outputs.requeue_latest == 'true' && steps.complete-exact-review-queue.outcome == 'success' }}
         run: |
           set -euo pipefail
@@ -1142,7 +1143,7 @@ jobs:
             > .artifacts/late-command-status-action-ledger-manifest.json
 
       - name: Publish late command status action ledger
-        if: ${{ always() && steps.setup-state.outcome == 'success' && steps.setup-pnpm.outcome == 'success' && steps.publish-event-result.outputs.requeue_latest == 'true' && steps.complete-exact-review-queue.outcome == 'success' }}
+        if: ${{ always() && steps.setup-state.outcome == 'success' && steps.setup-pnpm.outcome == 'success' && steps.publish-event-result.outputs.requeue_latest == 'true' && steps.complete-exact-review-queue.outcome == 'success' && steps.finalize-late-command-status-action-ledger.outcome == 'success' }}
         run: |
           set -euo pipefail
           test -n "${CLAWSWEEPER_STATE_DIR:-}"
@@ -2260,11 +2261,12 @@ jobs:
           echo "::notice::Requeued $TARGET_REPO#$item_number at source revision $actual_revision."
 
       - name: Finalize source-drift dispatch action ledger
+        id: finalize-source-drift-dispatch-action-ledger
         if: ${{ always() && steps.source-drift-action-ledger.outcome == 'success' && steps.source-drift-setup-pnpm.outcome == 'success' }}
         run: pnpm run --silent repair:action-ledger -- finalize
 
       - name: Publish source-drift dispatch action ledger
-        if: ${{ always() && steps.source-drift-setup-state.outcome == 'success' && steps.source-drift-setup-pnpm.outcome == 'success' }}
+        if: ${{ always() && steps.source-drift-setup-state.outcome == 'success' && steps.source-drift-setup-pnpm.outcome == 'success' && steps.finalize-source-drift-dispatch-action-ledger.outcome == 'success' }}
         run: |
           set -euo pipefail
           source_root="${CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:?setup-action-ledger output root is required}"
@@ -3008,11 +3010,12 @@ jobs:
             --field additional_prompt="$recovery_prompt"
 
       - name: Finalize review recovery action ledger
+        id: finalize-review-recovery-action-ledger
         if: ${{ always() && steps.recovery-action-ledger.outcome == 'success' && steps.recovery-setup-pnpm.outcome == 'success' }}
         run: pnpm run --silent repair:action-ledger -- finalize
 
       - name: Publish review recovery action ledger
-        if: ${{ always() && steps.recovery-setup-state.outcome == 'success' && steps.recovery-setup-pnpm.outcome == 'success' }}
+        if: ${{ always() && steps.recovery-setup-state.outcome == 'success' && steps.recovery-setup-pnpm.outcome == 'success' && steps.finalize-review-recovery-action-ledger.outcome == 'success' }}
         run: |
           set -euo pipefail
           source_root="${CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT:?setup-action-ledger output root is required}"
@@ -3124,6 +3127,7 @@ jobs:
             --rebase-strategy theirs
 
       - name: Finalize failed-review retry action ledger
+        id: finalize-failed-review-retry-action-ledger
         if: ${{ always() }}
         env:
           RETRY_EXIT_CODE: ${{ steps.retry-failed-reviews-run.outputs.exit_code || '' }}
@@ -3140,7 +3144,7 @@ jobs:
           pnpm run --silent finalize-action-events -- "${args[@]}"
 
       - name: Publish failed-review retry action ledger
-        if: ${{ always() }}
+        if: ${{ always() && steps.finalize-failed-review-retry-action-ledger.outcome == 'success' }}
         run: |
           set -euo pipefail
           test -n "${CLAWSWEEPER_STATE_DIR:-}"
@@ -4318,6 +4322,7 @@ jobs:
           fi
 
       - name: Finalize apply action ledger
+        id: finalize-apply-action-ledger
         if: ${{ always() }}
         env:
           APPLY_OUTCOME: ${{ steps.apply-existing-run.outcome || 'not_started' }}
@@ -4331,7 +4336,7 @@ jobs:
           pnpm run --silent finalize-action-events -- "${args[@]}"
 
       - name: Publish apply action events
-        if: ${{ always() }}
+        if: ${{ always() && steps.finalize-apply-action-ledger.outcome == 'success' }}
         run: |
           set -euo pipefail
           test -n "${CLAWSWEEPER_STATE_DIR:-}"
