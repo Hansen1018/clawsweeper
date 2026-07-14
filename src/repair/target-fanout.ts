@@ -8,6 +8,9 @@ import {
   ACTION_EVENT_REASON_CODES,
   ACTION_EVENT_STATUSES,
   ACTION_EVENT_TYPES,
+  actionIdempotencyKey,
+  readSpooledActionEvents,
+  type ActionEvent,
   type ActionEventSubject,
 } from "../action-ledger.js";
 import { flushWorkflowActionEvents, recordWorkflowPhaseEvent } from "../action-ledger-runtime.js";
@@ -15,6 +18,7 @@ import { resolveCommand } from "../command.js";
 import { ghRetryKind } from "../github-retry.js";
 import { ghErrorText } from "./github-cli.js";
 import { parseArgs, repoRoot } from "./lib.js";
+import { readDurableActionEventsByIdempotency } from "./sweep-mutation.js";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -302,11 +306,12 @@ function recordFanoutDispatch(
   reserveAccepted: () => void,
 ): void {
   const request = fanoutDispatchRequestIdentity(repository, options);
-  const idempotencyIdentity = {
-    operationIdentity: ledger.operationIdentity,
-    slot: "fanout_dispatch",
-    request,
-  };
+  const idempotencyIdentity = fanoutDispatchIdempotencyIdentity(ledger, request);
+  if (fanoutDispatchDecision(ledger, repository, idempotencyIdentity) === "already_accepted") {
+    reserveAccepted();
+    recordAcceptedFanoutDispatchReplay(ledger, repository, options, request, idempotencyIdentity);
+    return;
+  }
   const subject: ActionEventSubject = {
     repository: repository.targetRepo,
     kind: "repository",
@@ -429,6 +434,90 @@ function recordFanoutDispatch(
     throw error;
   }
   ledger.lastEventId = completed?.event_id ?? ledger.lastEventId;
+}
+
+function fanoutDispatchDecision(
+  ledger: FanoutActionLedger,
+  repository: SelectedRepository,
+  idempotencyIdentity: unknown,
+): "dispatch" | "already_accepted" {
+  const idempotencyKey = actionIdempotencyKey(idempotencyIdentity);
+  const localEvents = readSpooledActionEvents(repoRoot(), repository.targetRepo);
+  const runAttempt = positiveRunAttempt();
+  let durableEvents: ActionEvent[] = [];
+  if (runAttempt > 1) {
+    const stateRoot = String(process.env.CLAWSWEEPER_STATE_DIR ?? "").trim();
+    if (!stateRoot) {
+      throw new Error(
+        "target fanout rerun requires hydrated durable action ledger state before dispatch",
+      );
+    }
+    const producerRepository = ledger.operationIdentity.repository;
+    durableEvents = readDurableActionEventsByIdempotency(
+      stateRoot,
+      producerRepository,
+      idempotencyKey,
+    );
+  }
+  const events = [...localEvents, ...durableEvents].filter(
+    (event) =>
+      event.event_type === ACTION_EVENT_TYPES.dispatchLifecycle &&
+      event.idempotency_key_sha256 === idempotencyKey,
+  );
+  if (events.some((event) => event.attributes?.completion_reason === "mutation_accepted")) {
+    return "already_accepted";
+  }
+  const attempted = events.filter(
+    (event) => event.attributes?.completion_reason === "dispatch_attempted",
+  ).length;
+  const rejected = events.filter(
+    (event) => event.attributes?.completion_reason === "mutation_rejected",
+  ).length;
+  const unknown = events.some((event) =>
+    ["dispatch_outcome_unknown", "mutation_outcome_unknown"].includes(
+      String(event.attributes?.completion_reason ?? ""),
+    ),
+  );
+  if (unknown || attempted > rejected) {
+    throw new Error("refusing duplicate target fanout dispatch after an outcome-unknown attempt");
+  }
+  return "dispatch";
+}
+
+function recordAcceptedFanoutDispatchReplay(
+  ledger: FanoutActionLedger,
+  repository: SelectedRepository,
+  options: FanoutOptions,
+  request: ReturnType<typeof fanoutDispatchRequestIdentity>,
+  idempotencyIdentity: unknown,
+): void {
+  const event = recordWorkflowPhaseEvent(repoRoot(), {
+    phase: ACTION_EVENT_TYPES.dispatchLifecycle,
+    status: ACTION_EVENT_STATUSES.skipped,
+    reasonCode: ACTION_EVENT_REASON_CODES.alreadyProcessed,
+    retryable: false,
+    mutation: false,
+    identity: { slot: "fanout_dispatch_replay", targetRepo: repository.targetRepo },
+    operation: "target_fanout",
+    operationIdentity: ledger.operationIdentity,
+    parentEventId: ledger.lastEventId,
+    phaseSeq: nextFanoutPhaseSeq(ledger),
+    idempotencyIdentity,
+    component: "target_fanout",
+    subject: {
+      repository: repository.targetRepo,
+      kind: "repository",
+    },
+    evidence: [{ kind: "fanout_dispatch_request", sha256: sha256(JSON.stringify(request)) }],
+    attributes: {
+      completion_reason: "already_accepted",
+      dispatch_kind: fanoutDispatchKind(options.mode),
+      work_kind: options.mode,
+    },
+    privacy: fanoutActionLedgerPrivacy(),
+  });
+  ledger.lastEventId = event?.event_id ?? ledger.lastEventId;
+  ledger.dispatchedCount += 1;
 }
 
 function recordFanoutDispatchSkipped(
@@ -647,6 +736,17 @@ function fanoutDispatchRequestIdentity(
     mode: options.mode,
     dispatchKind: fanoutDispatchKind(options.mode),
     ...(options.mode === "audit" ? { workflow: options.workflow, ref: options.ref } : {}),
+  };
+}
+
+function fanoutDispatchIdempotencyIdentity(
+  ledger: FanoutActionLedger,
+  request: ReturnType<typeof fanoutDispatchRequestIdentity>,
+) {
+  return {
+    operationIdentity: ledger.operationIdentity,
+    slot: "fanout_dispatch",
+    request,
   };
 }
 
@@ -918,6 +1018,16 @@ function positiveNumber(value: string, label: string): number {
   const parsed = Number(value);
   if (!Number.isInteger(parsed) || parsed < 1) throw new Error(`--${label} must be positive`);
   return parsed;
+}
+
+function positiveRunAttempt(): number {
+  const raw = String(process.env.GITHUB_RUN_ATTEMPT ?? "").trim();
+  if (!raw) return 1;
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new Error("GITHUB_RUN_ATTEMPT must be a positive integer");
+  }
+  return value;
 }
 
 function normalizeCursor(cursor: number, length: number): number {

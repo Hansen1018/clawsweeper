@@ -23,6 +23,7 @@ import {
   type InventoryConfig,
   type ListedRepository,
 } from "../../dist/repair/target-fanout.js";
+import { importActionEventShards } from "../../dist/action-ledger-runtime.js";
 import { mockGhBinEnv } from "../helpers.ts";
 
 const config: InventoryConfig = {
@@ -818,6 +819,166 @@ test("target fanout reserves an accepted dispatch before writing its receipt", (
     );
     assert.equal(second.status, 0, second.stderr);
     assert.deepEqual(readDispatchLog(fixture.logPath), ["openclaw/a", "openclaw/b"]);
+  } finally {
+    rmSync(fixture.root, { force: true, recursive: true });
+  }
+});
+
+test("target fanout reruns advance past a durably accepted dispatch without repeating it", () => {
+  const fixture = isolatedFanoutFixture();
+  const cursorPath = join(fixture.root, "results", "target-fanout-cursors", "hot-intake.json");
+  const firstOutput = join(fixture.root, "first-action-ledger-output");
+  const secondOutput = join(fixture.root, "second-action-ledger-output");
+  const stateRoot = join(fixture.root, "state");
+  for (const directory of [firstOutput, secondOutput, stateRoot]) {
+    mkdirSync(directory, { recursive: true });
+  }
+
+  try {
+    const first = spawnSync(
+      process.execPath,
+      [
+        fixture.scriptPath,
+        "--mode",
+        "hot-intake",
+        "--limit",
+        "1",
+        "--cursor-path",
+        cursorPath,
+        "--repo",
+        "openclaw/clawsweeper",
+        "--owners",
+        "openclaw",
+      ],
+      {
+        cwd: fixture.root,
+        encoding: "utf8",
+        env: {
+          ...fanoutActionLedgerEnv(fixture.ghPath, firstOutput, "7110"),
+          DISPATCH_LOG_PATH: fixture.logPath,
+        },
+      },
+    );
+    assert.equal(first.status, 0, first.stderr);
+    importActionEventShards(firstOutput, stateRoot);
+    rmSync(cursorPath);
+    rmSync(join(fixture.root, ".clawsweeper-repair", "action-events"), {
+      force: true,
+      recursive: true,
+    });
+
+    const second = spawnSync(
+      process.execPath,
+      [
+        fixture.scriptPath,
+        "--mode",
+        "hot-intake",
+        "--limit",
+        "1",
+        "--cursor-path",
+        cursorPath,
+        "--repo",
+        "openclaw/clawsweeper",
+        "--owners",
+        "openclaw",
+      ],
+      {
+        cwd: fixture.root,
+        encoding: "utf8",
+        env: {
+          ...fanoutActionLedgerEnv(fixture.ghPath, secondOutput, "7110"),
+          CLAWSWEEPER_STATE_DIR: stateRoot,
+          DISPATCH_LOG_PATH: fixture.logPath,
+          GITHUB_RUN_ATTEMPT: "2",
+        },
+      },
+    );
+    assert.equal(second.status, 0, second.stderr);
+    assert.deepEqual(readDispatchLog(fixture.logPath), ["openclaw/a"]);
+    assert.deepEqual(JSON.parse(readFileSync(cursorPath, "utf8")), { next_cursor: 1 });
+    assert.ok(
+      readActionLedgerEvents(secondOutput).some(
+        (event) => event.attributes?.completion_reason === "already_accepted",
+      ),
+    );
+  } finally {
+    rmSync(fixture.root, { force: true, recursive: true });
+  }
+});
+
+test("target fanout reruns block an outcome-unknown durable dispatch", () => {
+  const fixture = isolatedFanoutFixture();
+  const cursorPath = join(fixture.root, "results", "target-fanout-cursors", "hot-intake.json");
+  const firstOutput = join(fixture.root, "first-action-ledger-output");
+  const secondOutput = join(fixture.root, "second-action-ledger-output");
+  const stateRoot = join(fixture.root, "state");
+  for (const directory of [firstOutput, secondOutput, stateRoot]) {
+    mkdirSync(directory, { recursive: true });
+  }
+
+  try {
+    const first = spawnSync(
+      process.execPath,
+      [
+        fixture.scriptPath,
+        "--mode",
+        "hot-intake",
+        "--limit",
+        "1",
+        "--cursor-path",
+        cursorPath,
+        "--repo",
+        "openclaw/clawsweeper",
+        "--owners",
+        "openclaw",
+      ],
+      {
+        cwd: fixture.root,
+        encoding: "utf8",
+        env: {
+          ...fanoutActionLedgerEnv(fixture.ghPath, firstOutput, "7111"),
+          DISPATCH_LOG_PATH: fixture.logPath,
+          FAIL_DISPATCH: "rate-limit",
+        },
+      },
+    );
+    assert.equal(first.status, 1);
+    importActionEventShards(firstOutput, stateRoot);
+    rmSync(join(fixture.root, ".clawsweeper-repair", "action-events"), {
+      force: true,
+      recursive: true,
+    });
+
+    const second = spawnSync(
+      process.execPath,
+      [
+        fixture.scriptPath,
+        "--mode",
+        "hot-intake",
+        "--limit",
+        "1",
+        "--cursor-path",
+        cursorPath,
+        "--repo",
+        "openclaw/clawsweeper",
+        "--owners",
+        "openclaw",
+      ],
+      {
+        cwd: fixture.root,
+        encoding: "utf8",
+        env: {
+          ...fanoutActionLedgerEnv(fixture.ghPath, secondOutput, "7111"),
+          CLAWSWEEPER_STATE_DIR: stateRoot,
+          DISPATCH_LOG_PATH: fixture.logPath,
+          GITHUB_RUN_ATTEMPT: "2",
+        },
+      },
+    );
+    assert.equal(second.status, 1);
+    assert.match(second.stderr, /refusing duplicate target fanout dispatch/);
+    assert.deepEqual(readDispatchLog(fixture.logPath), ["openclaw/a"]);
+    assert.equal(existsSync(cursorPath), false);
   } finally {
     rmSync(fixture.root, { force: true, recursive: true });
   }

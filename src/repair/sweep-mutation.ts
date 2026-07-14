@@ -336,7 +336,7 @@ function assertDispatchCanStart(
     requiredRepository(producerRepository);
     durableEvents =
       readImportedRepairMutationEvents(stateRoot, producerRepository, idempotencyKey) ??
-      readDurableDispatchEvents(stateRoot, producerRepository, idempotencyKey);
+      readDurableActionEventsByIdempotency(stateRoot, producerRepository, idempotencyKey);
   }
   const events = [...localEvents, ...durableEvents].filter(
     (event) =>
@@ -482,7 +482,7 @@ function readDispatchPayload(filePath: string): unknown {
   return value;
 }
 
-function readDurableDispatchEvents(
+export function readDurableActionEventsByIdempotency(
   stateRoot: string,
   repository: string,
   idempotencyKey: string,
