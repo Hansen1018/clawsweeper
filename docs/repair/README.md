@@ -50,7 +50,10 @@ the legacy `~/.config/gitcrawl/gitcrawl.db`. Use `--db` or
 `CLAWSWEEPER_GITCRAWL_DB` to override. Store freshness is maintained outside
 ClawSweeper by the gitcrawl-store refresh workflow and by refreshing the local
 checkout, for example `git -C ../gitcrawl-store pull --ff-only`, before local
-or parity imports.
+or parity imports. Scheduled cloud and parity intake requests a GitHub Actions
+OIDC token and exchanges it for a 15-minute crawl-remote reader session pinned
+to the exact protected `main` workflow. No long-lived crawl-remote or
+Cloudflare credential is stored in ClawSweeper.
 
 <img width="3582" height="2160" alt="image" src="https://github.com/user-attachments/assets/20b816cc-72ab-479e-bc18-84f5b2b53745" />
 

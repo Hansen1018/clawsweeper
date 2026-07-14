@@ -189,7 +189,8 @@ hot intake `14`, and commit review `2`. Existing repair lanes keep their
   run. `CLAWSWEEPER_CLUSTER_REPAIR_GITCRAWL_PROVIDER` selects `local`, `cloud`,
   or `parity` evidence; the default remains `local`. The intake records the
   processed snapshot and source identity, and local/parity runs retain the
-  portable-store SHA duplicate fast path.
+  portable-store SHA duplicate fast path. Cloud access uses a short-lived,
+  reader-only GitHub Actions OIDC exchange on protected `main`.
 - `CLAWSWEEPER_MAX_LIVE_WORKERS` overrides the `job_intent`-derived repair
   dispatch cap.
 - `CLAWSWEEPER_AUTOMERGE_MAX_LIVE_WORKERS` overrides

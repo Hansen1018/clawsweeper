@@ -599,7 +599,10 @@ Important gates:
   `parity` evidence for scheduled cluster intake. The default is `local`.
   Intake records the processed snapshot and source identity in
   `results/cluster-repair-intake/<repo>.json`; local and parity runs also retain
-  the portable-store SHA duplicate fast path.
+  the portable-store SHA duplicate fast path. Cloud and parity intake exchange
+  a signed GitHub Actions OIDC token for a 15-minute crawl-remote reader session
+  bound to the exact protected workflow; no persistent remote credential enters
+  the workflow.
 - `CLAWSWEEPER_ALLOW_EXECUTE`: allows deterministic write lanes. Workflows treat
   any value except literal `1` as closed.
 - `CLAWSWEEPER_ALLOW_FIX_PR`: allows branch repair and replacement PR creation.
