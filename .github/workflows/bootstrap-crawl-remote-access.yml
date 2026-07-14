@@ -77,32 +77,42 @@ jobs:
             exit 1
           fi
 
-      - name: Create repository-scoped bootstrap token
-        id: bootstrap-admin-token
+      - name: Create ClawSweeper bootstrap token
+        id: clawsweeper-admin-token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           client-id: ${{ env.CLAWSWEEPER_APP_CLIENT_ID }}
           private-key: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
           owner: openclaw
-          repositories: |
-            clawsweeper
-            gitcrawl-store
+          repositories: clawsweeper
           permission-environments: write
           permission-secrets: write
           # The action runtime forwards this GitHub permission even though its generated metadata
           # currently omits the input.
           permission-variables: write
 
+      - name: Create gitcrawl-store bootstrap token
+        id: gitcrawl-store-admin-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ env.CLAWSWEEPER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
+          owner: openclaw
+          repositories: gitcrawl-store
+          permission-secrets: write
+          # See the ClawSweeper token note above.
+          permission-variables: write
+
       - name: Bootstrap crawl-remote Access
         env:
-          GH_TOKEN: ${{ steps.bootstrap-admin-token.outputs.token }}
+          CLAWSWEEPER_BOOTSTRAP_GH_TOKEN: ${{ steps.clawsweeper-admin-token.outputs.token }}
+          GITCRAWL_STORE_BOOTSTRAP_GH_TOKEN: ${{ steps.gitcrawl-store-admin-token.outputs.token }}
           OPENCLAW_CLOUDFLARE_CONFIG_API_TOKEN: ${{ secrets.OPENCLAW_CLOUDFLARE_CONFIG_API_TOKEN }}
           OPENCLAW_CLOUDFLARE_WORKERS_API_TOKEN: ${{ secrets.OPENCLAW_CLOUDFLARE_WORKERS_API_TOKEN }}
           PUBLISHER_ENABLED: ${{ inputs.publisher_enabled && '1' || '0' }}
           ROTATE_SERVICE_TOKEN: ${{ inputs.rotate_service_token && '1' || '0' }}
           RUNTIME_PROVIDER: ${{ inputs.runtime_provider }}
         run: |
-          corepack enable
           args=(
             --confirm "bootstrap crawl-remote access"
             --publisher-enabled "$PUBLISHER_ENABLED"
@@ -112,4 +122,4 @@ jobs:
           if [[ "$ROTATE_SERVICE_TOKEN" == "1" ]]; then
             args+=(--rotate-service-token)
           fi
-          pnpm run --silent bootstrap:crawl-remote-access -- "${args[@]}"
+          node scripts/bootstrap-crawl-remote-access.mjs "${args[@]}"

@@ -641,18 +641,30 @@ test("Cloudflare client replaces a managed policy with any extra include selecto
   });
 });
 
-test("GitHub client sends secret values only over standard input", async () => {
+test("GitHub client routes repository tokens and sends secret values only over standard input", async () => {
   const commands: Array<{
     args: string[];
     options: { input: string; env: NodeJS.ProcessEnv };
   }> = [];
+  const requests: Array<{ url: string; authorization: string | null }> = [];
   const client = createGitHubClient({
-    token: "fixture-github-credential",
-    fetchImpl: async () =>
-      Response.json({
+    tokensByRepository: {
+      [BOOTSTRAP_CONTRACT.clawsweeperRepository]: "fixture-clawsweeper-credential",
+      [BOOTSTRAP_CONTRACT.gitcrawlStoreRepository]: "fixture-store-credential",
+    },
+    fetchImpl: async (url, init) => {
+      requests.push({
+        url: String(url),
+        authorization: new Headers(init?.headers).get("authorization"),
+      });
+      if (String(url).includes("/variables/")) {
+        return Response.json({ message: "not found" }, { status: 404 });
+      }
+      return Response.json({
         total_count: 2,
         secrets: [{ name: "ONE" }, { name: "TWO" }],
-      }),
+      });
+    },
     apiBase: "https://github.invalid",
     runGh: async (args, options) => {
       commands.push({ args, options });
@@ -660,17 +672,39 @@ test("GitHub client sends secret values only over standard input", async () => {
     },
   });
 
-  const names = await client.listSecretNames({
+  const clawsweeperNames = await client.listSecretNames({
     repository: BOOTSTRAP_CONTRACT.clawsweeperRepository,
   });
-  assert.deepEqual([...names], ["ONE", "TWO"]);
+  const storeNames = await client.listSecretNames({
+    repository: BOOTSTRAP_CONTRACT.gitcrawlStoreRepository,
+  });
+  const missingVariable = await client.getVariable({
+    repository: BOOTSTRAP_CONTRACT.gitcrawlStoreRepository,
+    name: "MISSING_VARIABLE",
+  });
+  assert.deepEqual([...clawsweeperNames], ["ONE", "TWO"]);
+  assert.deepEqual([...storeNames], ["ONE", "TWO"]);
+  assert.equal(missingVariable, null);
+  assert.deepEqual(
+    requests.map((request) => request.authorization),
+    [
+      "Bearer fixture-clawsweeper-credential",
+      "Bearer fixture-store-credential",
+      "Bearer fixture-store-credential",
+    ],
+  );
   await client.setSecret({
     repository: BOOTSTRAP_CONTRACT.clawsweeperRepository,
     name: "FIXTURE_SECRET",
     value: "fixture-secret-value",
   });
+  await client.setVariable({
+    repository: BOOTSTRAP_CONTRACT.gitcrawlStoreRepository,
+    name: "FIXTURE_VARIABLE",
+    value: "fixture-variable-value",
+  });
 
-  assert.equal(commands.length, 1);
+  assert.equal(commands.length, 2);
   assert.deepEqual(commands[0]?.args, [
     "secret",
     "set",
@@ -678,9 +712,22 @@ test("GitHub client sends secret values only over standard input", async () => {
     "--repo",
     BOOTSTRAP_CONTRACT.clawsweeperRepository,
   ]);
+  assert.deepEqual(commands[1]?.args, [
+    "variable",
+    "set",
+    "FIXTURE_VARIABLE",
+    "--repo",
+    BOOTSTRAP_CONTRACT.gitcrawlStoreRepository,
+  ]);
   assert.equal(commands[0]?.options.input, "fixture-secret-value");
-  assert.equal(commands[0]?.options.env.GH_TOKEN, "fixture-github-credential");
-  assert.equal(commands[0]?.options.env.OPENCLAW_CLOUDFLARE_CONFIG_API_TOKEN, undefined);
-  assert.equal(commands[0]?.options.env.OPENCLAW_CLOUDFLARE_WORKERS_API_TOKEN, undefined);
-  assert.doesNotMatch(commands[0]?.args.join(" "), /fixture-secret-value/);
+  assert.equal(commands[0]?.options.env.GH_TOKEN, "fixture-clawsweeper-credential");
+  assert.equal(commands[1]?.options.input, "fixture-variable-value");
+  assert.equal(commands[1]?.options.env.GH_TOKEN, "fixture-store-credential");
+  for (const command of commands) {
+    assert.equal(command.options.env.OPENCLAW_CLOUDFLARE_CONFIG_API_TOKEN, undefined);
+    assert.equal(command.options.env.OPENCLAW_CLOUDFLARE_WORKERS_API_TOKEN, undefined);
+    assert.equal(command.options.env.CLAWSWEEPER_BOOTSTRAP_GH_TOKEN, undefined);
+    assert.equal(command.options.env.GITCRAWL_STORE_BOOTSTRAP_GH_TOKEN, undefined);
+  }
+  assert.doesNotMatch(commands[0]?.args.join(" ") ?? "", /fixture-secret-value/);
 });

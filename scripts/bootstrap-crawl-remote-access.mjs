@@ -456,14 +456,31 @@ export function createCloudflareClient({
 }
 
 export function createGitHubClient({
-  token,
+  tokensByRepository,
   fetchImpl = fetch,
   apiBase = "https://api.github.com",
   runGh = defaultRunGh,
 }) {
-  assertSecretValue(token, "GH_TOKEN");
+  const repositoryTokens = new Map();
+  for (const repository of [
+    BOOTSTRAP_CONTRACT.clawsweeperRepository,
+    BOOTSTRAP_CONTRACT.gitcrawlStoreRepository,
+  ]) {
+    const token = tokensByRepository?.[repository];
+    assertSecretValue(token, `${repository} GitHub token`);
+    repositoryTokens.set(repository, token);
+  }
 
-  async function get(path, { allowNotFound = false } = {}) {
+  function tokenFor(repository) {
+    const token = repositoryTokens.get(repository);
+    if (!token) {
+      throw new Error(`no GitHub token is configured for ${repository}`);
+    }
+    return token;
+  }
+
+  async function get(repository, path, { allowNotFound = false } = {}) {
+    const token = tokenFor(repository);
     const response = await fetchImpl(`${apiBase}${path}`, {
       headers: {
         accept: "application/vnd.github+json",
@@ -487,7 +504,7 @@ export function createGitHubClient({
       const path = environment
         ? `${prefix}/environments/${encodeURIComponent(environment)}/secrets?per_page=100`
         : `${prefix}/actions/secrets?per_page=100`;
-      const payload = await get(path);
+      const payload = await get(repository, path);
       if (
         !Number.isSafeInteger(payload?.total_count) ||
         payload.total_count < 0 ||
@@ -504,7 +521,7 @@ export function createGitHubClient({
       const path = environment
         ? `${prefix}/environments/${encodeURIComponent(environment)}/variables/${encodeURIComponent(name)}`
         : `${prefix}/actions/variables/${encodeURIComponent(name)}`;
-      const payload = await get(path, { allowNotFound: true });
+      const payload = await get(repository, path, { allowNotFound: true });
       if (payload === null) return null;
       if (payload?.name !== name || !isNonEmptyString(payload?.value)) {
         throw new Error(`GitHub GET ${path} returned an invalid variable`);
@@ -516,7 +533,7 @@ export function createGitHubClient({
       assertSecretValue(value, name);
       const args = ["secret", "set", name, "--repo", repository];
       if (environment) args.push("--env", environment);
-      await runGhCommand({ args, input: value, token, runGh });
+      await runGhCommand({ args, input: value, token: tokenFor(repository), runGh });
     },
 
     async setVariable({ repository, environment, name, value }) {
@@ -525,7 +542,7 @@ export function createGitHubClient({
       }
       const args = ["variable", "set", name, "--repo", repository];
       if (environment) args.push("--env", environment);
-      await runGhCommand({ args, input: value, token, runGh });
+      await runGhCommand({ args, input: value, token: tokenFor(repository), runGh });
     },
   };
 }
@@ -534,6 +551,8 @@ async function runGhCommand({ args, input, token, runGh }) {
   const childEnvironment = { ...process.env };
   delete childEnvironment.OPENCLAW_CLOUDFLARE_CONFIG_API_TOKEN;
   delete childEnvironment.OPENCLAW_CLOUDFLARE_WORKERS_API_TOKEN;
+  delete childEnvironment.CLAWSWEEPER_BOOTSTRAP_GH_TOKEN;
+  delete childEnvironment.GITCRAWL_STORE_BOOTSTRAP_GH_TOKEN;
   delete childEnvironment.GH_TOKEN;
   const result = await runGh(args, {
     input,
@@ -764,7 +783,12 @@ async function main() {
   const cloudflare = createCloudflareClient({
     token: process.env.OPENCLAW_CLOUDFLARE_CONFIG_API_TOKEN,
   });
-  const github = createGitHubClient({ token: process.env.GH_TOKEN });
+  const github = createGitHubClient({
+    tokensByRepository: {
+      [BOOTSTRAP_CONTRACT.clawsweeperRepository]: process.env.CLAWSWEEPER_BOOTSTRAP_GH_TOKEN,
+      [BOOTSTRAP_CONTRACT.gitcrawlStoreRepository]: process.env.GITCRAWL_STORE_BOOTSTRAP_GH_TOKEN,
+    },
+  });
   await bootstrapCrawlRemoteAccess(
     {
       publisherEnabled: args["publisher-enabled"] ?? "0",

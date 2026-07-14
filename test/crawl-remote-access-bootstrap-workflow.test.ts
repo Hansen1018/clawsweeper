@@ -42,22 +42,46 @@ test("manual workflow keeps bootstrap separate from deployment authority", () =>
     bootstrap.env.OPENCLAW_CLOUDFLARE_WORKERS_API_TOKEN,
     "${{ secrets.OPENCLAW_CLOUDFLARE_WORKERS_API_TOKEN }}",
   );
-  assert.equal(bootstrap.env.GH_TOKEN, "${{ steps.bootstrap-admin-token.outputs.token }}");
-  const token = job.steps.find(
-    (candidate: { name?: string }) => candidate.name === "Create repository-scoped bootstrap token",
+  assert.equal(
+    bootstrap.env.CLAWSWEEPER_BOOTSTRAP_GH_TOKEN,
+    "${{ steps.clawsweeper-admin-token.outputs.token }}",
   );
   assert.equal(
-    token.uses,
+    bootstrap.env.GITCRAWL_STORE_BOOTSTRAP_GH_TOKEN,
+    "${{ steps.gitcrawl-store-admin-token.outputs.token }}",
+  );
+  const clawsweeperToken = job.steps.find(
+    (candidate: { name?: string }) => candidate.name === "Create ClawSweeper bootstrap token",
+  );
+  const gitcrawlStoreToken = job.steps.find(
+    (candidate: { name?: string }) => candidate.name === "Create gitcrawl-store bootstrap token",
+  );
+  assert.equal(
+    clawsweeperToken.uses,
     "actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1",
   );
-  assert.equal(token.with.owner, "openclaw");
-  assert.equal(token.with.repositories, "clawsweeper\ngitcrawl-store\n");
-  assert.equal(token.with["private-key"], "${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}");
-  assert.equal(token.with["permission-environments"], "write");
-  assert.equal(token.with["permission-secrets"], "write");
-  assert.equal(token.with["permission-variables"], "write");
-  assert.match(bootstrap.run, /bootstrap:crawl-remote-access/);
+  assert.equal(clawsweeperToken.with.owner, "openclaw");
+  assert.equal(clawsweeperToken.with.repositories, "clawsweeper");
+  assert.equal(clawsweeperToken.with["private-key"], "${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}");
+  assert.equal(clawsweeperToken.with["permission-environments"], "write");
+  assert.equal(clawsweeperToken.with["permission-secrets"], "write");
+  assert.equal(clawsweeperToken.with["permission-variables"], "write");
+  assert.equal(
+    gitcrawlStoreToken.uses,
+    "actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1",
+  );
+  assert.equal(gitcrawlStoreToken.with.owner, "openclaw");
+  assert.equal(gitcrawlStoreToken.with.repositories, "gitcrawl-store");
+  assert.equal(
+    gitcrawlStoreToken.with["private-key"],
+    "${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}",
+  );
+  assert.equal(gitcrawlStoreToken.with["permission-environments"], undefined);
+  assert.equal(gitcrawlStoreToken.with["permission-secrets"], "write");
+  assert.equal(gitcrawlStoreToken.with["permission-variables"], "write");
+  assert.match(bootstrap.run, /node scripts\/bootstrap-crawl-remote-access\.mjs/);
   assert.match(bootstrap.run, /--rotate-service-token/);
+  assert.doesNotMatch(bootstrap.run, /corepack|pnpm/);
   assert.doesNotMatch(source, /deploy-crawl-remote/);
   assert.doesNotMatch(source, /schedule:|push:|pull_request:/);
   assert.equal(
@@ -72,6 +96,7 @@ test("operator docs preserve the two-phase rollout and no-deploy boundary", () =
   assert.match(docs, /runtime provider: `local`/);
   assert.match(docs, /publisher enabled: off/);
   assert.match(docs, /GITCRAWL_CLOUD_STAGE_ONLY=1/);
-  assert.match(docs, /temporarily\s+allows both old and new token IDs/);
+  assert.match(docs, /temporarily\s+allows every old and new token ID/);
+  assert.match(docs, /generation marker and selects the matching slot/);
   assert.match(docs, /never prints returned service credentials/);
 });
