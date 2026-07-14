@@ -14,14 +14,11 @@ import {
 import { stripAnsi } from "./comment-router-utils.js";
 import {
   ghErrorText,
-  ghJson as ghJsonOneShot,
   ghJsonWithRetry as ghJson,
   ghText as ghOneShot,
   ghTextWithRetry as ghWithRetry,
 } from "./github-cli.js";
-import { issueNumberFromRef, parsePullRequestUrl } from "./github-ref.js";
-import { isLockedConversationCommentError } from "../github-retry.js";
-import { lockedConversationSkip } from "./apply-locks.js";
+import { parsePullRequestUrl } from "./github-ref.js";
 import { sleepMs } from "./timing.js";
 import {
   CLAWSWEEPER_LABEL,
@@ -44,7 +41,6 @@ import {
   createRepairMutationBoundaryGuard,
   createRepairMutationFreshnessGuard,
   flushRepairMutationActionEvents,
-  repairCreatedCommentChange,
   runRepairMutation,
   type RepairMutationContext,
   type RepairMutationFreshnessGuard,
@@ -94,7 +90,6 @@ if (process.env.CLAWSWEEPER_ALLOW_EXECUTE !== "1") {
 
 const resultPath = resultPathArg ? path.resolve(resultPathArg) : findLatestResultPath();
 const result = JSON.parse(fs.readFileSync(resultPath, "utf8"));
-const clusterPlan = readSiblingJson(resultPath, "cluster-plan.json");
 if (result.repo !== job.frontmatter.repo) {
   throw new Error(`result repo ${result.repo} does not match job repo ${job.frontmatter.repo}`);
 }
@@ -129,9 +124,6 @@ try {
       if (!FIX_PR_ACTIONS.has(String(action.action ?? ""))) continue;
       const finalized = finalizeFixPr(action);
       report.actions.push(finalized);
-      if (finalized.status === "executed") {
-        report.actions.push(...finalizePostMergeCloseouts(action, finalized));
-      }
     }
   }
 
@@ -480,229 +472,6 @@ function finalizeIssueImplementationPr({ base, parsed }: LooseRecord) {
     sleepMs(sleepFor);
     waitedMs += sleepFor;
   }
-}
-
-function finalizePostMergeCloseouts(fixAction: LooseRecord, finalized: LooseRecord) {
-  const fixPr = parsePullRequestUrl(fixAction.pr_url ?? fixAction.target);
-  if (!fixPr) return [];
-  const fixRef = `#${fixPr.number}`;
-  const fixUrl = `https://github.com/${result.repo}/pull/${fixPr.number}`;
-  const closeouts: JsonValue[] = [];
-  for (const action of result.actions ?? []) {
-    const actionName = String(action.action ?? "");
-    if (!POST_MERGE_CLOSE_ACTIONS.has(actionName)) continue;
-    if (!["blocked", "planned"].includes(String(action.status ?? ""))) continue;
-    const target = normalizeIssueRef(action.target);
-    if (!target || target === fixPr.number) continue;
-    const candidateFix = normalizeIssueRef(
-      action.candidate_fix ?? action.fixed_by ?? action.fix_candidate,
-    );
-    if (candidateFix !== fixPr.number) continue;
-    closeouts.push(
-      finalizePostMergeCloseout({ action, actionName, target, fixRef, fixUrl, finalized }),
-    );
-  }
-  return closeouts;
-}
-
-function finalizePostMergeCloseout({
-  action,
-  actionName,
-  target,
-  fixRef,
-  fixUrl,
-  finalized,
-}: LooseRecord) {
-  const base = {
-    action: "post_merge_closeout",
-    source_action: actionName,
-    target: `#${target}`,
-    canonical: action.canonical ?? undefined,
-    candidate_fix: fixRef,
-    fix_pr: fixUrl,
-  };
-  const live = fetchIssue(result.repo, target);
-  if (live.state !== "open") {
-    return {
-      ...base,
-      status: live.state === "closed" ? "executed" : "skipped",
-      reason:
-        live.state === "closed"
-          ? "target already closed after canonical fix merged"
-          : `target is ${live.state}`,
-      live_state: live.state,
-      merge_commit_sha: finalized.merge_commit_sha ?? null,
-    };
-  }
-  const expectedUpdatedAt = action.target_updated_at ?? action.live_updated_at;
-  if (!expectedUpdatedAt) {
-    return {
-      ...base,
-      status: "blocked",
-      reason: "missing target_updated_at; rerun the worker against live GitHub state",
-      live_state: live.state,
-      live_updated_at: live.updated_at,
-    };
-  }
-  if (expectedUpdatedAt !== live.updated_at) {
-    return {
-      ...base,
-      status: "blocked",
-      reason: "target changed since worker review",
-      expected_updated_at: expectedUpdatedAt,
-      live_updated_at: live.updated_at,
-      live_state: live.state,
-    };
-  }
-  let mutationContext: RepairMutationContext | null = null;
-  let freshness: RepairMutationFreshnessGuard | null = null;
-  if (!dryRun) {
-    try {
-      mutationContext = postFlightMutationContext({
-        action,
-        number: target,
-        targetKind: live.pull_request ? "pull_request" : "issue",
-        operationKey: `${actionName}:${fixRef}:${finalized.merge_commit_sha ?? "unknown"}`,
-        sourceRevision:
-          finalized.merge_commit_sha ?? action.commit ?? result.reviewed_sha ?? result.head_sha,
-      });
-      freshness = createRepairMutationFreshnessGuard({
-        repository: result.repo,
-        number: target,
-        targetKind: live.pull_request ? "pull_request" : "issue",
-        expectedUpdatedAt,
-        expectedReviewActivityCursor: resolveRepairMutationReviewActivityCursor({
-          repository: result.repo,
-          number: target,
-          targetKind: live.pull_request ? "pull_request" : "issue",
-          authorization: "close",
-          explicitCursor: action.target_review_activity_cursor,
-          expectedUpdatedAt,
-          expectedHeadSha: clusterPlanPullHeadSha(target),
-          reviewedBefore: clusterPlan?.generated_at ?? result.generated_at,
-        }),
-      });
-    } catch (error) {
-      if (error instanceof RepairMutationFreshnessError) {
-        return postMergeCloseoutFreshnessBlock(base, finalized, error);
-      }
-      throw error;
-    }
-  }
-  if (hasLiveSecuritySignal(target, live.labels ?? [])) {
-    return {
-      ...base,
-      status: "blocked",
-      reason: "security-sensitive target requires central security triage",
-    };
-  }
-  if (dryRun) {
-    return {
-      ...base,
-      status: "planned",
-      reason: "dry run",
-      merge_commit_sha: finalized.merge_commit_sha ?? null,
-    };
-  }
-  if (!mutationContext || !freshness) {
-    throw new Error("post-flight closeout mutation guard was not initialized");
-  }
-
-  const commentBody = postMergeCloseoutComment({
-    actionName,
-    fixUrl,
-    provenance: externalMessageProvenance({
-      reviewedSha:
-        finalized.merge_commit_sha ?? action.commit ?? result.reviewed_sha ?? result.head_sha,
-    }),
-  });
-  try {
-    runRepairMutation(mutationContext, {
-      kind: "label_add",
-      identity: {
-        repository: result.repo,
-        number: target,
-        label: CLAWSWEEPER_LABEL,
-      },
-      freshness,
-      operation: () =>
-        ghOneShot([
-          "issue",
-          "edit",
-          String(target),
-          "--repo",
-          result.repo,
-          "--add-label",
-          CLAWSWEEPER_LABEL,
-        ]),
-      knownNoMutation: isAlreadyExistsError,
-      acceptedChange: () => ({ kind: "label_add", label: CLAWSWEEPER_LABEL }),
-    });
-    const bodySha256 = createHash("sha256").update(commentBody).digest("hex");
-    const payloadPath = writePayload(`post-flight-comment-${target}`, { body: commentBody });
-    runRepairMutation(mutationContext, {
-      kind: "comment_create",
-      identity: {
-        repository: result.repo,
-        number: target,
-        bodySha256,
-      },
-      freshness,
-      operation: () =>
-        ghJsonOneShot<unknown>([
-          "api",
-          `repos/${result.repo}/issues/${target}/comments`,
-          "--method",
-          "POST",
-          "--input",
-          payloadPath,
-        ]),
-      knownNoMutation: isLockedConversationCommentError,
-      acceptedChange: (created) => repairCreatedCommentChange(created, bodySha256),
-    });
-    runRepairMutation(mutationContext, {
-      kind: live.pull_request ? "pull_request_close" : "issue_close",
-      identity: {
-        repository: result.repo,
-        number: target,
-        stateReason: live.pull_request ? null : "completed",
-      },
-      freshness,
-      operation: () =>
-        live.pull_request
-          ? ghOneShot(["pr", "close", String(target), "--repo", result.repo])
-          : ghOneShot([
-              "issue",
-              "close",
-              String(target),
-              "--repo",
-              result.repo,
-              "--reason",
-              "completed",
-            ]),
-      knownNoMutation: isLockedConversationCommentError,
-    });
-  } catch (error) {
-    if (error instanceof RepairMutationFreshnessError) {
-      return postMergeCloseoutFreshnessBlock(base, finalized, error);
-    }
-    if (isLockedConversationCommentError(error)) {
-      return {
-        ...lockedConversationSkip(base, live, { terminalWriteError: true }),
-        merge_commit_sha: finalized.merge_commit_sha ?? null,
-      };
-    }
-    throw error;
-  }
-  const after = fetchIssue(result.repo, target);
-  return {
-    ...base,
-    status: after.state === "closed" ? "executed" : "blocked",
-    reason:
-      after.state === "closed" ? "closed after canonical fix merged" : `target is ${after.state}`,
-    live_state: after.state,
-    merge_commit_sha: finalized.merge_commit_sha ?? null,
-  };
 }
 
 function validateMergePolicy(action: LooseRecord, pull: LooseRecord) {
@@ -1096,29 +865,6 @@ function writeReport(report: LooseRecord, resultPath: string) {
   console.log(JSON.stringify(report, null, 2));
 }
 
-function writePayload(name: string, value: JsonValue) {
-  const dir = path.join(repoRoot(), ".clawsweeper-repair", "payloads");
-  fs.mkdirSync(dir, { recursive: true });
-  const file = path.join(dir, `${name}-${Date.now()}.json`);
-  fs.writeFileSync(file, JSON.stringify(value), "utf8");
-  return file;
-}
-
-function normalizeIssueRef(value: JsonValue) {
-  return issueNumberFromRef(value);
-}
-
-function clusterPlanPullHeadSha(number: number): string | null {
-  for (const item of clusterPlan?.items ?? []) {
-    if (normalizeIssueRef(item?.ref ?? item?.number) !== number) continue;
-    const headSha = String(
-      item?.pull_request?.head_sha ?? item?.pull_request?.headSha ?? "",
-    ).trim();
-    return /^[a-f0-9]{40}$/i.test(headSha) ? headSha : null;
-  }
-  return null;
-}
-
 function postFlightMutationContext({
   action,
   number,
@@ -1154,20 +900,6 @@ function postFlightFreshnessBlock(
     reason: error.message,
     ...(error.retryable ? { retry_recommended: true } : {}),
     waited_ms: waitedMs,
-  };
-}
-
-function postMergeCloseoutFreshnessBlock(
-  base: LooseRecord,
-  finalized: LooseRecord,
-  error: RepairMutationFreshnessError,
-) {
-  return {
-    ...base,
-    status: "blocked",
-    reason: error.message,
-    ...(error.retryable ? { retry_recommended: true } : {}),
-    merge_commit_sha: finalized.merge_commit_sha ?? null,
   };
 }
 

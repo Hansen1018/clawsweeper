@@ -803,7 +803,7 @@ test("post-flight blocks queued merges before downstream closeouts", () => {
   }
 });
 
-test("post-flight treats a locked post-merge comment rejection as a terminal skip", () => {
+test("post-flight leaves post-merge closeouts to the second apply pass", () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-post-flight-"));
   const fakeBin = path.join(tmp, "bin");
   const jobPath = path.join(tmp, "job.md");
@@ -911,12 +911,8 @@ test("post-flight treats a locked post-merge comment rejection as a terminal ski
 
     const report = JSON.parse(fs.readFileSync(reportPath, "utf8"));
     assert.equal(report.actions[0]?.status, "executed");
-    assert.equal(report.actions[1]?.action, "post_merge_closeout");
-    assert.equal(report.actions[1]?.status, "skipped");
-    assert.equal(report.actions[1]?.reason, "target is locked; GitHub rejected the write");
-    assert.equal(report.actions[1]?.live_state, "open");
-    assert.equal(report.actions[1]?.merge_commit_sha, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
-    assert.equal(fs.existsSync(labelFlagPath), true);
+    assert.equal(report.actions.length, 1);
+    assert.equal(fs.existsSync(labelFlagPath), false);
     assert.equal(fs.existsSync(closeFlagPath), false);
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });

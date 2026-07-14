@@ -2046,7 +2046,6 @@ function writeApplyFixture(
       target: resultAction.target ?? "#101",
       target_kind: resultAction.target_kind ?? "pull_request",
       ...(omitTargetUpdatedAt ? {} : { target_updated_at: "2026-05-25T00:00:00Z" }),
-      review_activity_cursor: resultAction.review_activity_cursor ?? EMPTY_REVIEW_ACTIVITY_CURSOR,
       status: resultAction.status ?? "planned",
       evidence: ["PR B is referenced as the canonical replacement for PR A."],
       idempotency_key:
