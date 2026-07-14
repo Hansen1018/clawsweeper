@@ -12,11 +12,12 @@ and all four slot secrets, then invokes the tested
 `scripts/resolve-crawl-remote-access-credentials.mjs` artifact. The bootstrap
 parses that exact step contract before minting privileged GitHub tokens and
 again before any Cloudflare or GitHub mutation. Comments, unrelated
-declarations, conditional steps, and legacy unversioned secret references do
-not satisfy the gate. Downstream consumers must inherit the resolver's
-`GITHUB_ENV` values; fixed-slot `CF_ACCESS_CLIENT_ID` or
-`CF_ACCESS_CLIENT_SECRET` overrides are rejected. Until the consumer change
-lands, every dispatch fails closed before privileged work.
+declarations, unnamed intervening steps, extra checkout or resolver controls,
+conditional steps, and legacy unversioned secret references do not satisfy the
+gate. Downstream consumers must inherit the resolver's `GITHUB_ENV` values;
+fixed-slot `CF_ACCESS_CLIENT_ID` or `CF_ACCESS_CLIENT_SECRET` overrides are
+rejected. Until the consumer change lands, every dispatch fails closed before
+privileged work.
 
 ## First bootstrap
 

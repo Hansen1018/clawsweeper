@@ -114,7 +114,10 @@ test("operator docs preserve the dormant consumer and no-deploy boundaries", () 
   assert.match(docs, /GITCRAWL_CLOUD_STAGE_ONLY=1/);
   assert.match(docs, /temporarily\s+allows every old and new token ID/);
   assert.match(docs, /generation marker and selects the matching slot/);
-  assert.match(docs, /Comments, unrelated\s+declarations, conditional steps/);
-  assert.match(docs, /fails\s+closed before privileged work/);
+  assert.match(
+    docs,
+    /Comments, unrelated\s+declarations, unnamed intervening steps, extra checkout or resolver controls/,
+  );
+  assert.match(docs, /fails\s+closed before\s+privileged work/);
   assert.match(docs, /never prints returned service credentials/);
 });

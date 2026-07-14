@@ -216,9 +216,10 @@ export function assertCrawlRemoteDeployConsumerContract(source) {
   }
   const resolver = matchingSteps[0];
   if (
+    resolver.fields.size !== 1 ||
     resolver.fields.get("id") !== DEPLOY_CONSUMER_CONTRACT.stepId ||
-    resolver.fields.has("if") ||
-    resolver.fields.has("continue-on-error")
+    resolver.configuration.size !== 0 ||
+    resolver.environment.size !== Object.keys(DEPLOY_CONSUMER_CONTRACT.requiredEnvironment).length
   ) {
     throw new Error("crawl-remote deploy credential resolver has an unsafe step contract");
   }
@@ -226,9 +227,11 @@ export function assertCrawlRemoteDeployConsumerContract(source) {
   const checkout = deploySteps[resolverIndex - 1];
   if (
     checkout?.name !== DEPLOY_CONSUMER_CONTRACT.checkoutStepName ||
+    checkout.fields.size !== 1 ||
     checkout.fields.get("uses") !== DEPLOY_CONSUMER_CONTRACT.checkoutUses ||
-    checkout.fields.has("if") ||
-    checkout.fields.has("continue-on-error")
+    checkout.environment.size !== 0 ||
+    checkout.configuration.size !== Object.keys(DEPLOY_CONSUMER_CONTRACT.checkoutWith).length ||
+    checkout.run.length !== 0
   ) {
     throw new Error(
       "crawl-remote deploy credential resolver requires its pinned sparse checkout immediately before it",
@@ -329,7 +332,7 @@ function parseWorkflowJobSteps(source, expectedJob) {
 
   const steps = [];
   for (let index = stepsIndex + 1; index < jobEnd; index += 1) {
-    const stepMatch = /^      - name:\s*(.+?)\s*$/.exec(lines[index]);
+    const stepMatch = /^      - (.+?)\s*$/.exec(lines[index]);
     if (!stepMatch) continue;
     let stepEnd = jobEnd;
     for (let cursor = index + 1; cursor < jobEnd; cursor += 1) {
@@ -338,33 +341,47 @@ function parseWorkflowJobSteps(source, expectedJob) {
         break;
       }
     }
-    steps.push(parseWorkflowStep(lines.slice(index, stepEnd), parseYamlScalar(stepMatch[1])));
+    steps.push(parseWorkflowStep(lines.slice(index, stepEnd), stepMatch[1]));
     index = stepEnd - 1;
   }
   return steps;
 }
 
-function parseWorkflowStep(lines, name) {
+function parseWorkflowStep(lines, firstEntry) {
+  let name = null;
   const fields = new Map();
   const environment = new Map();
   const configuration = new Map();
   const run = [];
   let block = null;
+
+  const setField = (key, rawValue) => {
+    block = null;
+    if (key === "name") {
+      name = parseYamlScalar(rawValue);
+    } else if (key === "env" && rawValue.length === 0) {
+      block = "env";
+    } else if (key === "with" && rawValue.length === 0) {
+      block = "with";
+    } else if (key === "run" && /^[|>][+-]?$/.test(rawValue)) {
+      block = "run";
+    } else {
+      fields.set(key, parseYamlScalar(rawValue));
+    }
+  };
+
+  const firstField = /^([A-Za-z0-9_-]+):(?:\s*(.*))?$/.exec(firstEntry);
+  if (!firstField) {
+    throw new Error(`crawl-remote deploy workflow has invalid step syntax: ${firstEntry}`);
+  }
+  setField(firstField[1], firstField[2] ?? "");
+
   for (const line of lines.slice(1)) {
     if (/^\s*$/.test(line) || /^\s*#/.test(line)) continue;
     const fieldMatch = /^        ([A-Za-z0-9_-]+):(?:\s*(.*))?$/.exec(line);
     if (fieldMatch) {
       const [, key, rawValue = ""] = fieldMatch;
-      block = null;
-      if (key === "env" && rawValue.length === 0) {
-        block = "env";
-      } else if (key === "with" && rawValue.length === 0) {
-        block = "with";
-      } else if (key === "run" && /^[|>][+-]?$/.test(rawValue)) {
-        block = "run";
-      } else {
-        fields.set(key, parseYamlScalar(rawValue));
-      }
+      setField(key, rawValue);
       continue;
     }
     if (block === "env") {

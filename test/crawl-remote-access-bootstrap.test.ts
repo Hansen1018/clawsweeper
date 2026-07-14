@@ -220,6 +220,47 @@ test("deploy consumer gate rejects comment-only claims and accepts a structural 
     () =>
       assertCrawlRemoteDeployConsumerContract(
         validSource.replace(
+          "          fetch-depth: 1",
+          [
+            "          fetch-depth: 1",
+            "          repository: untrusted/example",
+            "          ref: unreviewed",
+          ].join("\n"),
+        ),
+      ),
+    /requires its pinned sparse checkout immediately before it/,
+  );
+  assert.throws(
+    () =>
+      assertCrawlRemoteDeployConsumerContract(
+        validSource.replace(
+          "          CRAWL_REMOTE_ACCESS_CREDENTIAL_GENERATION:",
+          [
+            '          NODE_OPTIONS: "--import ./unreviewed.mjs"',
+            "          CRAWL_REMOTE_ACCESS_CREDENTIAL_GENERATION:",
+          ].join("\n"),
+        ),
+      ),
+    /unsafe step contract/,
+  );
+  assert.throws(
+    () =>
+      assertCrawlRemoteDeployConsumerContract(
+        validSource.replace(
+          "      - name: Resolve crawl-remote Access credentials",
+          [
+            "      - run: |",
+            "          printf unreviewed > scripts/resolve-crawl-remote-access-credentials.mjs",
+            "      - name: Resolve crawl-remote Access credentials",
+          ].join("\n"),
+        ),
+      ),
+    /requires its pinned sparse checkout immediately before it/,
+  );
+  assert.throws(
+    () =>
+      assertCrawlRemoteDeployConsumerContract(
+        validSource.replace(
           "      - name: Validate protected production proof credentials\n        run: |",
           [
             "      - name: Validate protected production proof credentials",
