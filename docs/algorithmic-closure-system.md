@@ -58,8 +58,10 @@ covers code meaning. Exact content identity is the final fallback.
 
 1. Run the structural probe from lightweight GitHub state. A matching structural
    record can avoid full hydration.
-2. Otherwise acquire the normal durable review lease and hydrate the complete
-   review context.
+2. On a pull request cache miss, acquire the durable review lease before
+   hydrating the complete review context. On an issue cache miss, hydrate first
+   to derive `context.sourceRevision`, then acquire the issue review lease
+   before reuse or publication.
 3. Build a semantic digest from complete supported patches, file modes, syntax,
    and behavior-affecting directives. Build exact content identity as the
    fallback.
