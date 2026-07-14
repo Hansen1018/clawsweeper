@@ -76,6 +76,27 @@ test("forced replay attempt identity flows through the production workflow", () 
   assert.equal(workflow.match(/args\+=\(--attempt-id "\$attempt_id"\)/g)?.length, 2);
 });
 
+test("production comment router binds authenticated App provenance", () => {
+  const workflow = readText(".github/workflows/repair-comment-router.yml");
+
+  assert.match(
+    workflow,
+    /name: Bind authenticated mutation App identity[\s\S]*id: mutation_app[\s\S]*APP_SLUG: \$\{\{ steps\.app_token\.outputs\.app-slug \}\}[\s\S]*gh api "apps\/\$APP_SLUG" --jq '\.id'/,
+  );
+  assert.equal(
+    workflow.match(
+      /CLAWSWEEPER_AUTHENTICATED_APP_ID: \$\{\{ steps\.mutation_app\.outputs\.app_id \}\}/g,
+    )?.length,
+    2,
+  );
+  assert.equal(
+    workflow.match(
+      /CLAWSWEEPER_AUTHENTICATED_APP_SLUG: \$\{\{ steps\.mutation_app\.outputs\.app_slug \}\}/g,
+    )?.length,
+    2,
+  );
+});
+
 test("command receipt identity excludes list position and binds command attempts", () => {
   const source = readText("src/repair/command-action-ledger.ts");
 

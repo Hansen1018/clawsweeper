@@ -862,6 +862,56 @@ jobs:
           repository: ${{ github.repository }}
           run-id: ${{ github.run_id }}
 
+      - name: Seal immutable source in worker artifacts
+        if: ${{ steps.check_job.outputs.job_exists == '1' }}
+        env:
+          JOB_PATH: ${{ inputs.job }}
+          STATE_REVISION: ${{ needs.cluster.outputs.state_revision }}
+          JOB_SHA256: ${{ needs.cluster.outputs.job_sha256 }}
+        run: |
+          set -euo pipefail
+          source_root=".clawsweeper-repair/immutable-state"
+          source_path="$source_root/$JOB_PATH"
+          actual_revision="$(git -C "$source_root" rev-parse HEAD)"
+          if [ "$actual_revision" != "$STATE_REVISION" ]; then
+            echo "Immutable execution state revision mismatch while sealing artifacts: expected $STATE_REVISION, got $actual_revision." >&2
+            exit 1
+          fi
+          actual_sha256="$(sha256sum "$source_path" | cut -d' ' -f1)"
+          if [ "$actual_sha256" != "$JOB_SHA256" ]; then
+            echo "Immutable execution job SHA-256 mismatch while sealing artifacts: expected $JOB_SHA256, got $actual_sha256." >&2
+            exit 1
+          fi
+
+          sealed_count=0
+          while IFS= read -r -d '' result_path; do
+            run_dir="$(dirname "$result_path")"
+            cp "$source_path" "$run_dir/source-job.md"
+            SOURCE_IDENTITY_PATH="$run_dir/source-job.json" node --input-type=module <<'NODE'
+          import fs from "node:fs";
+
+          fs.writeFileSync(
+            process.env.SOURCE_IDENTITY_PATH,
+            `${JSON.stringify(
+              {
+                job_sha256: process.env.JOB_SHA256,
+                schema_version: 1,
+                source_job: process.env.JOB_PATH,
+                state_revision: process.env.STATE_REVISION,
+              },
+              null,
+              2,
+            )}\n`,
+          );
+          NODE
+            sealed_count=$((sealed_count + 1))
+          done < <(find .clawsweeper-repair/runs -type f -name result.json -print0)
+
+          if [ "$sealed_count" -eq 0 ]; then
+            echo "Downloaded worker artifacts contain no result.json to seal." >&2
+            exit 1
+          fi
+
       - name: Validate job
         if: ${{ steps.check_job.outputs.job_exists == '1' }}
         env:
@@ -912,6 +962,27 @@ jobs:
           permission-pull-requests: write
           permission-workflows: write
 
+      - name: Bind authenticated mutation App identity
+        id: mutation_app
+        if: ${{ steps.check_job.outputs.job_exists == '1' && steps.self_heal_head.outputs.matched != 'false' && env.CLAWSWEEPER_ALLOW_EXECUTE == '1' && env.CLAWSWEEPER_ALLOW_MERGE == '1' }}
+        env:
+          GH_TOKEN: ${{ steps.target_post_flight_token.outputs.token }}
+          APP_SLUG: ${{ steps.target_post_flight_token.outputs.app-slug }}
+          EXPECTED_APP_SLUG: ${{ env.CLAWSWEEPER_APP_SLUG }}
+        run: |
+          set -euo pipefail
+          if [ -z "$APP_SLUG" ] || [ "$APP_SLUG" != "$EXPECTED_APP_SLUG" ]; then
+            echo "Authenticated mutation App slug is missing or unexpected: ${APP_SLUG:-<empty>}." >&2
+            exit 1
+          fi
+          app_id="$(gh api "apps/$APP_SLUG" --jq '.id')"
+          if ! printf '%s' "$app_id" | grep -Eq '^[1-9][0-9]*$'; then
+            echo "Authenticated mutation App ID is invalid: ${app_id:-<empty>}." >&2
+            exit 1
+          fi
+          echo "app_id=$app_id" >> "$GITHUB_OUTPUT"
+          echo "app_slug=$APP_SLUG" >> "$GITHUB_OUTPUT"
+
       - name: Publish deferred fix outcome
         if: ${{ always() && steps.check_job.outputs.job_exists == '1' && steps.self_heal_head.outputs.matched != 'false' && env.CLAWSWEEPER_ALLOW_EXECUTE == '1' }}
         env:
@@ -927,7 +998,10 @@ jobs:
         if: ${{ steps.check_job.outputs.job_exists == '1' && steps.self_heal_head.outputs.matched != 'false' && env.CLAWSWEEPER_ALLOW_EXECUTE == '1' }}
         env:
           GH_TOKEN: ${{ steps.target_post_flight_token.outputs.token }}
+          CLAWSWEEPER_WORKFLOW_GH_TOKEN: ${{ steps.requeue-token.outputs.token }}
           CLAWSWEEPER_ALLOWED_OWNER: ${{ steps.target.outputs.target_owner }}
+          CLAWSWEEPER_AUTHENTICATED_APP_ID: ${{ steps.mutation_app.outputs.app_id }}
+          CLAWSWEEPER_AUTHENTICATED_APP_SLUG: ${{ steps.mutation_app.outputs.app_slug }}
         run: pnpm run repair:apply-result -- "${{ inputs.job }}" --latest
 
       - name: Post-flight finalize fix PRs
@@ -935,14 +1009,20 @@ jobs:
         if: ${{ steps.check_job.outputs.job_exists == '1' && steps.self_heal_head.outputs.matched != 'false' && env.CLAWSWEEPER_ALLOW_EXECUTE == '1' && env.CLAWSWEEPER_ALLOW_FIX_PR == '1' }}
         env:
           GH_TOKEN: ${{ steps.target_post_flight_token.outputs.token }}
+          CLAWSWEEPER_WORKFLOW_GH_TOKEN: ${{ steps.requeue-token.outputs.token }}
           CLAWSWEEPER_ALLOWED_OWNER: ${{ steps.target.outputs.target_owner }}
+          CLAWSWEEPER_AUTHENTICATED_APP_ID: ${{ steps.mutation_app.outputs.app_id }}
+          CLAWSWEEPER_AUTHENTICATED_APP_SLUG: ${{ steps.mutation_app.outputs.app_slug }}
         run: pnpm run repair:post-flight -- "${{ inputs.job }}" --latest
 
       - name: Apply post-flight closeouts
         if: ${{ steps.check_job.outputs.job_exists == '1' && steps.self_heal_head.outputs.matched != 'false' && env.CLAWSWEEPER_ALLOW_EXECUTE == '1' }}
         env:
           GH_TOKEN: ${{ steps.target_post_flight_token.outputs.token }}
+          CLAWSWEEPER_WORKFLOW_GH_TOKEN: ${{ steps.requeue-token.outputs.token }}
           CLAWSWEEPER_ALLOWED_OWNER: ${{ steps.target.outputs.target_owner }}
+          CLAWSWEEPER_AUTHENTICATED_APP_ID: ${{ steps.mutation_app.outputs.app_id }}
+          CLAWSWEEPER_AUTHENTICATED_APP_SLUG: ${{ steps.mutation_app.outputs.app_slug }}
         run: pnpm run repair:apply-result -- "${{ inputs.job }}" --latest
 
       - name: Tag ClawSweeper targets

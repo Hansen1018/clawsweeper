@@ -70,6 +70,57 @@ test("immutable worker handoff overwrites mutable state and is rerun-stable", ()
   }
 });
 
+test("execute worker seals the immutable job into every downloaded result", () => {
+  const workflow = parse(fs.readFileSync(workerWorkflowPath, "utf8"));
+  const sealStep = workflow.jobs.execute.steps.find(
+    (step: { name?: string }) => step.name === "Seal immutable source in worker artifacts",
+  );
+  assert.equal(typeof sealStep?.run, "string");
+
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-source-seal-"));
+  const jobPath = "jobs/openclaw/inbox/cluster-openclaw-openclaw-sealed.md";
+  const immutableRoot = path.join(root, ".clawsweeper-repair", "immutable-state");
+  const immutablePath = path.join(immutableRoot, jobPath);
+  const runDirs = [
+    path.join(root, ".clawsweeper-repair", "runs", "cluster-a"),
+    path.join(root, ".clawsweeper-repair", "runs", "nested", "cluster-b"),
+  ];
+  const immutableBytes = Buffer.from("sealed immutable job bytes\n", "utf8");
+  const digest = createHash("sha256").update(immutableBytes).digest("hex");
+  fs.mkdirSync(path.dirname(immutablePath), { recursive: true });
+  fs.writeFileSync(immutablePath, immutableBytes);
+  for (const runDir of runDirs) {
+    fs.mkdirSync(runDir, { recursive: true });
+    fs.writeFileSync(path.join(runDir, "result.json"), "{}\n");
+  }
+  const stateRevision = commitImmutableState(immutableRoot);
+
+  try {
+    const child = spawnSync("bash", ["-c", sealStep.run], {
+      cwd: root,
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        JOB_PATH: jobPath,
+        STATE_REVISION: stateRevision,
+        JOB_SHA256: digest,
+      },
+    });
+    assert.equal(child.status, 0, child.stderr);
+    for (const runDir of runDirs) {
+      assert.deepEqual(fs.readFileSync(path.join(runDir, "source-job.md")), immutableBytes);
+      assert.deepEqual(JSON.parse(fs.readFileSync(path.join(runDir, "source-job.json"), "utf8")), {
+        job_sha256: digest,
+        schema_version: 1,
+        source_job: jobPath,
+        state_revision: stateRevision,
+      });
+    }
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("immutable worker handoff fails closed on a digest mismatch", () => {
   const workflow = parse(fs.readFileSync(workerWorkflowPath, "utf8"));
   const checkStep = workflow.jobs.cluster.steps.find(

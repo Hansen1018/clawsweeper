@@ -503,9 +503,18 @@ test("commit review and notification workflows publish their operation receipts"
 });
 
 test("merge claim recovery reads ClawSweeper workflow state with central credentials", () => {
+  const worker = readText(".github/workflows/repair-cluster-worker.yml");
   const router = readText(".github/workflows/repair-comment-router.yml");
   const sweep = readText(".github/workflows/sweep.yml");
 
+  assert.equal(
+    [
+      ...worker.matchAll(
+        /CLAWSWEEPER_WORKFLOW_GH_TOKEN: \$\{\{ steps\.requeue-token\.outputs\.token \}\}/g,
+      ),
+    ].length,
+    3,
+  );
   assert.equal(
     [
       ...router.matchAll(
@@ -515,6 +524,31 @@ test("merge claim recovery reads ClawSweeper workflow state with central credent
     2,
   );
   assert.match(sweep, /CLAWSWEEPER_WORKFLOW_GH_TOKEN: \$\{\{ github\.token \}\}/);
+});
+
+test("cluster merge consumers bind authenticated App provenance", () => {
+  const workflow = readText(".github/workflows/repair-cluster-worker.yml");
+
+  assert.match(
+    workflow,
+    /name: Bind authenticated mutation App identity[\s\S]*id: mutation_app[\s\S]*APP_SLUG: \$\{\{ steps\.target_post_flight_token\.outputs\.app-slug \}\}[\s\S]*gh api "apps\/\$APP_SLUG" --jq '\.id'/,
+  );
+  assert.equal(
+    [
+      ...workflow.matchAll(
+        /CLAWSWEEPER_AUTHENTICATED_APP_ID: \$\{\{ steps\.mutation_app\.outputs\.app_id \}\}/g,
+      ),
+    ].length,
+    3,
+  );
+  assert.equal(
+    [
+      ...workflow.matchAll(
+        /CLAWSWEEPER_AUTHENTICATED_APP_SLUG: \$\{\{ steps\.mutation_app\.outputs\.app_slug \}\}/g,
+      ),
+    ].length,
+    3,
+  );
 });
 
 test("issue implementation intake finalizes and publishes source-bound status receipts", () => {
