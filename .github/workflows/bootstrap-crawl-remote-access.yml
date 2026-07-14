@@ -115,7 +115,7 @@ jobs:
             --confirm "bootstrap crawl-remote access"
             --publisher-enabled 0
             --rotation-label "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-            --runtime-provider local
+            --runtime-provider cloud
           )
           if [[ "$ROTATE_SERVICE_TOKEN" == "1" ]]; then
             args+=(--rotate-service-token)

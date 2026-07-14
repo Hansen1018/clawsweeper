@@ -108,7 +108,7 @@ test("manual workflow keeps bootstrap separate from deployment authority", () =>
   assert.match(bootstrap.run, /node scripts\/bootstrap-crawl-remote-access\.mjs/);
   assert.match(bootstrap.run, /--rotate-service-token/);
   assert.match(bootstrap.run, /--publisher-enabled 0/);
-  assert.match(bootstrap.run, /--runtime-provider local/);
+  assert.match(bootstrap.run, /--runtime-provider cloud/);
   assert.doesNotMatch(source, /inputs\.(runtime_provider|publisher_enabled)/);
   assert.doesNotMatch(bootstrap.run, /corepack|pnpm/);
   assert.doesNotMatch(source, /uses:.*deploy-crawl-remote|workflow_call:/);
@@ -122,8 +122,9 @@ test("manual workflow keeps bootstrap separate from deployment authority", () =>
 test("operator docs preserve the dormant consumer and no-deploy boundaries", () => {
   const docs = readFileSync(docsPath, "utf8");
   assert.match(docs, /does not deploy crawl-remote/);
-  assert.match(docs, /always keeps `CLAWSWEEPER_GITCRAWL_PROVIDER=local`/);
-  assert.match(docs, /cannot\s+activate parity\/cloud intake or publication/);
+  assert.match(docs, /always keeps `CLAWSWEEPER_GITCRAWL_PROVIDER=cloud`/);
+  assert.match(docs, /`CLAWSWEEPER_FEATURE_CLUSTER_REPAIR_ENABLED=0`/);
+  assert.match(docs, /does not activate scheduled\s+actionable intake or publication/);
   assert.match(docs, /GITCRAWL_CLOUD_STAGE_ONLY=1/);
   assert.match(docs, /temporarily\s+allows every old and new token ID/);
   assert.match(docs, /generation marker and selects the matching slot/);

@@ -96,7 +96,7 @@ const ACCESS_CREDENTIAL_TARGETS = Object.freeze([
 export async function bootstrapCrawlRemoteAccess(options, dependencies) {
   const runtimeProvider = normalizeRuntimeProvider(options.runtimeProvider);
   const publisherEnabled = normalizeBinaryFlag(options.publisherEnabled, "publisher enabled");
-  assertDormantOptionalConsumers({ runtimeProvider, publisherEnabled });
+  assertStagedCloudConfiguration({ runtimeProvider, publisherEnabled });
   const rotateServiceToken = Boolean(options.rotateServiceToken);
   const rotationLabel = normalizeRotationLabel(options.rotationLabel);
   const cloudflare = dependencies.cloudflare;
@@ -214,8 +214,8 @@ export async function bootstrapCrawlRemoteAccess(options, dependencies) {
         : "reconciled crawl-remote Access without rotating its service token",
   );
   logger.log(
-    `configured protected deployment inputs, ClawSweeper ${runtimeProvider} intake, ` +
-      `and gitcrawl-store publisher=${publisherEnabled}`,
+    `configured protected deployment inputs, staged ClawSweeper ${runtimeProvider} intake ` +
+      `with automation disabled, and gitcrawl-store publisher=${publisherEnabled}`,
   );
 
   return {
@@ -793,6 +793,11 @@ async function writeGitHubConfiguration({
   const clawsweeperTarget = { repository: BOOTSTRAP_CONTRACT.clawsweeperRepository };
   await github.setVariable({
     ...clawsweeperTarget,
+    name: "CLAWSWEEPER_FEATURE_CLUSTER_REPAIR_ENABLED",
+    value: "0",
+  });
+  await github.setVariable({
+    ...clawsweeperTarget,
     name: "CLAWSWEEPER_GITCRAWL_PROVIDER",
     value: runtimeProvider,
   });
@@ -1312,17 +1317,17 @@ function assertSecretValue(value, name) {
 }
 
 function normalizeRuntimeProvider(value) {
-  const provider = String(value ?? "local").trim();
+  const provider = String(value ?? "cloud").trim();
   if (!["local", "parity", "cloud"].includes(provider)) {
     throw new Error("runtime provider must be local, parity, or cloud");
   }
   return provider;
 }
 
-function assertDormantOptionalConsumers({ runtimeProvider, publisherEnabled }) {
-  if (runtimeProvider !== "local") {
+function assertStagedCloudConfiguration({ runtimeProvider, publisherEnabled }) {
+  if (runtimeProvider !== "cloud") {
     throw new Error(
-      "ClawSweeper Gitcrawl must remain local until its generation-slot consumer contract lands",
+      "ClawSweeper Gitcrawl must stage the cloud provider without enabling actionable intake",
     );
   }
   if (publisherEnabled !== "0") {
@@ -1400,7 +1405,7 @@ async function main() {
       publisherEnabled: args["publisher-enabled"] ?? "0",
       rotateServiceToken: Boolean(args["rotate-service-token"]),
       rotationLabel: args["rotation-label"],
-      runtimeProvider: args["runtime-provider"] ?? "local",
+      runtimeProvider: args["runtime-provider"] ?? "cloud",
       workersApiToken: process.env.OPENCLAW_CLOUDFLARE_WORKERS_API_TOKEN,
     },
     { cloudflare, github },

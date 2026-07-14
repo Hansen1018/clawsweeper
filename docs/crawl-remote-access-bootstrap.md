@@ -55,8 +55,8 @@ publishes an unversioned mixed pair.
 
 It also writes the protected deployment authority, proof mode, Workers token
 hash, cloud endpoint/archive, and conservative rollout variables. The initial
-settings keep ClawSweeper on the local provider and keep cloud publication
-disabled.
+settings stage ClawSweeper on the cloud provider while keeping scheduled cluster
+repair intake and cloud publication disabled.
 
 ## Reconciliation and rotation
 
@@ -76,11 +76,13 @@ finishes a fully published generation only when its managed generation label is
 strictly newer than every leftover token. Otherwise it mints a fresh generation
 and supersedes every ambiguous partial token.
 
-This workflow always keeps `CLAWSWEEPER_GITCRAWL_PROVIDER=local`,
-`GITCRAWL_CLOUD_PUBLISH_ENABLED=0`, and `GITCRAWL_CLOUD_STAGE_ONLY=1`. It cannot
-activate parity/cloud intake or publication. Those transitions belong to
-separate reviewed changes that prove each consumer resolves its own generation
-marker and matching slot.
+This workflow always keeps `CLAWSWEEPER_GITCRAWL_PROVIDER=cloud`,
+`CLAWSWEEPER_FEATURE_CLUSTER_REPAIR_ENABLED=0`,
+`GITCRAWL_CLOUD_PUBLISH_ENABLED=0`, and `GITCRAWL_CLOUD_STAGE_ONLY=1`. The cloud
+provider value stages source selection only; it does not activate scheduled
+actionable intake or publication. Those transitions belong to separate reviewed
+changes after crawl-remote is ready and each consumer proves it resolves its own
+generation marker and matching slot.
 
 ## Required source credentials
 

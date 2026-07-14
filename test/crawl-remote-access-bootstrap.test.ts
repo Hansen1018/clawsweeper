@@ -449,12 +449,10 @@ test("deploy consumer gate rejects comment-only claims and accepts a structural 
 
 test("optional Gitcrawl consumers remain dormant before Cloudflare reads", async () => {
   for (const [options, expected] of [
+    [{ publisherEnabled: "0", runtimeProvider: "local" }, /must stage the cloud provider/],
+    [{ publisherEnabled: "0", runtimeProvider: "parity" }, /must stage the cloud provider/],
     [
-      { publisherEnabled: "0", runtimeProvider: "parity" },
-      /ClawSweeper Gitcrawl must remain local/,
-    ],
-    [
-      { publisherEnabled: "1", runtimeProvider: "local" },
+      { publisherEnabled: "1", runtimeProvider: "cloud" },
       /gitcrawl-store publication must remain disabled/,
     ],
   ] as const) {
@@ -487,7 +485,7 @@ test("first bootstrap creates one service-auth policy and writes every destinati
       publisherEnabled: "0",
       rotateServiceToken: false,
       rotationLabel: "123-1",
-      runtimeProvider: "local",
+      runtimeProvider: "cloud",
       workersApiToken: "fixture-workers-credential",
     },
     {
@@ -512,7 +510,7 @@ test("first bootstrap creates one service-auth policy and writes every destinati
   assert.equal(policies.length, 1);
   assert.deepEqual(policies[0]?.tokenIds, ["token-new"]);
   assert.equal(github.secrets.length, 7);
-  assert.equal(github.variables.length, 14);
+  assert.equal(github.variables.length, 15);
   for (const target of credentialTargets) {
     const names = credentialNames(target.prefix, "blue");
     assert.ok(
@@ -543,6 +541,15 @@ test("first bootstrap creates one service-auth policy and writes every destinati
     (write) => write.kind === "secret" && write.name.includes("_ACCESS_"),
   );
   assert.ok(firstMarkerWrite > lastAccessSecretWrite);
+  const intakeDisableWrite = github.writes.findIndex(
+    (write) =>
+      write.kind === "variable" && write.name === "CLAWSWEEPER_FEATURE_CLUSTER_REPAIR_ENABLED",
+  );
+  const cloudProviderWrite = github.writes.findIndex(
+    (write) => write.kind === "variable" && write.name === "CLAWSWEEPER_GITCRAWL_PROVIDER",
+  );
+  assert.ok(intakeDisableWrite >= 0);
+  assert.ok(cloudProviderWrite > intakeDisableWrite);
   assert.equal(
     variableValue(
       github.variables,
@@ -554,10 +561,18 @@ test("first bootstrap creates one service-auth policy and writes every destinati
   assert.equal(
     variableValue(
       github.variables,
+      "CLAWSWEEPER_FEATURE_CLUSTER_REPAIR_ENABLED",
+      BOOTSTRAP_CONTRACT.clawsweeperRepository,
+    ),
+    "0",
+  );
+  assert.equal(
+    variableValue(
+      github.variables,
       "CLAWSWEEPER_GITCRAWL_PROVIDER",
       BOOTSTRAP_CONTRACT.clawsweeperRepository,
     ),
-    "local",
+    "cloud",
   );
   assert.equal(
     variableValue(
@@ -590,7 +605,7 @@ test("existing token without matching credential generations fails before Cloudf
         publisherEnabled: "0",
         rotateServiceToken: false,
         rotationLabel: "123-1",
-        runtimeProvider: "local",
+        runtimeProvider: "cloud",
         workersApiToken: "fixture-workers-credential",
       },
       { cloudflare: cloudflare.client, github: github.client, logger: quietLogger },
@@ -617,7 +632,7 @@ test("populated slots bound to a stale token still require explicit rotation", a
         publisherEnabled: "0",
         rotateServiceToken: false,
         rotationLabel: "123-1",
-        runtimeProvider: "local",
+        runtimeProvider: "cloud",
         workersApiToken: "fixture-workers-credential",
       },
       { cloudflare: cloudflare.client, github: github.client, logger: quietLogger },
@@ -649,7 +664,7 @@ test("complete existing bootstrap reconciles without rewriting Access secrets", 
       publisherEnabled: "0",
       rotateServiceToken: false,
       rotationLabel: "123-1",
-      runtimeProvider: "local",
+      runtimeProvider: "cloud",
       workersApiToken: "fixture-workers-credential",
     },
     { cloudflare: cloudflare.client, github: github.client, logger: quietLogger },
@@ -667,10 +682,18 @@ test("complete existing bootstrap reconciles without rewriting Access secrets", 
   assert.equal(
     variableValue(
       github.variables,
+      "CLAWSWEEPER_FEATURE_CLUSTER_REPAIR_ENABLED",
+      BOOTSTRAP_CONTRACT.clawsweeperRepository,
+    ),
+    "0",
+  );
+  assert.equal(
+    variableValue(
+      github.variables,
       "CLAWSWEEPER_GITCRAWL_PROVIDER",
       BOOTSTRAP_CONTRACT.clawsweeperRepository,
     ),
-    "local",
+    "cloud",
   );
   assert.equal(
     variableValue(
@@ -707,7 +730,7 @@ test("rotation authorizes both tokens until all GitHub credentials are replaced"
       publisherEnabled: "0",
       rotateServiceToken: true,
       rotationLabel: "456-2",
-      runtimeProvider: "local",
+      runtimeProvider: "cloud",
       workersApiToken: "fixture-workers-credential",
     },
     { cloudflare: cloudflare.client, github: github.client, logger: quietLogger },
@@ -756,7 +779,7 @@ test("main drift blocks initial mutation and old-token revocation", async () => 
         publisherEnabled: "0",
         rotateServiceToken: false,
         rotationLabel: "456-1",
-        runtimeProvider: "local",
+        runtimeProvider: "cloud",
         workersApiToken: "fixture-workers-credential",
       },
       {
@@ -796,7 +819,7 @@ test("main drift blocks initial mutation and old-token revocation", async () => 
         publisherEnabled: "0",
         rotateServiceToken: true,
         rotationLabel: "456-2",
-        runtimeProvider: "local",
+        runtimeProvider: "cloud",
         workersApiToken: "fixture-workers-credential",
       },
       {
@@ -845,7 +868,7 @@ test("rotation keeps active markers and the old token when an inactive pair writ
         publisherEnabled: "0",
         rotateServiceToken: true,
         rotationLabel: "789-1",
-        runtimeProvider: "local",
+        runtimeProvider: "cloud",
         workersApiToken: "fixture-workers-credential",
       },
       { cloudflare: cloudflare.client, github: github.client, logger: quietLogger },
@@ -905,7 +928,7 @@ test("retry after an inactive pair failure supersedes every ambiguous token", as
         publisherEnabled: "0",
         rotateServiceToken: true,
         rotationLabel: "789-1",
-        runtimeProvider: "local",
+        runtimeProvider: "cloud",
         workersApiToken: "fixture-workers-credential",
       },
       {
@@ -939,7 +962,7 @@ test("retry after an inactive pair failure supersedes every ambiguous token", as
       publisherEnabled: "0",
       rotateServiceToken: true,
       rotationLabel: "790-1",
-      runtimeProvider: "local",
+      runtimeProvider: "cloud",
       workersApiToken: "fixture-workers-credential",
     },
     { cloudflare: retryCloudflare.client, github: github.client, logger: quietLogger },
@@ -993,7 +1016,7 @@ test("explicit rotation resumes finalization when markers bind the newest manage
       publisherEnabled: "0",
       rotateServiceToken: true,
       rotationLabel: "456-2",
-      runtimeProvider: "local",
+      runtimeProvider: "cloud",
       workersApiToken: "fixture-workers-credential",
     },
     { cloudflare: cloudflare.client, github: github.client, logger: quietLogger },
