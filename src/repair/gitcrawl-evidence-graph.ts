@@ -623,7 +623,7 @@ function assertPersistedCoverageRow(row: GitcrawlCoverageRow): void {
   if (typeof row.complete !== "boolean") {
     throw new Error(`Gitcrawl evidence packet coverage ${row.dataset} complete must be boolean`);
   }
-  if (row.complete && row.eligible_count > row.row_count) {
+  if (row.eligible_count > row.row_count) {
     throw new Error(
       `Gitcrawl evidence packet coverage ${row.dataset} has more eligible rows than total rows`,
     );

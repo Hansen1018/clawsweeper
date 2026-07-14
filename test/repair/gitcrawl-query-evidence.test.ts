@@ -491,6 +491,29 @@ test("query evidence fails closed on source, relation, review, and packet drift"
     );
   });
 
+  await t.test("incomplete packet coverage cannot exceed total rows", () => {
+    const coverage = completeCoverage();
+    const clusterCoverage = coverage.find((row) => row.dataset === "cluster_groups");
+    assert(clusterCoverage);
+    clusterCoverage.row_count = 1;
+    clusterCoverage.eligible_count = 2;
+    clusterCoverage.covered_count = 0;
+    clusterCoverage.complete = false;
+    assert.throws(
+      () =>
+        buildGitcrawlEvidencePacket({
+          provider: "cloud",
+          repository,
+          snapshotId,
+          coverage,
+          requiredCoverage: ["repositories", "threads"],
+          claims: [],
+          generatedAt,
+        }),
+      /more eligible rows than total rows/,
+    );
+  });
+
   await t.test("packet generation is an RFC 3339 timestamp", () => {
     assert.throws(
       () =>
