@@ -1631,7 +1631,7 @@ test("repair apply recovers a terminal pre-merge dispatch marker after proving n
     assert.equal(report.actions[0].requeue_required, true);
     assert.match(
       report.actions[0].reason,
-      /failed after dispatch without an observable merge effect/i,
+      /completed after dispatch without an observable merge effect/i,
     );
     assert.equal(mergeCallCount(fixture.ghLogPath), 0);
     const comments = JSON.parse(fs.readFileSync(fixture.mergeClaimPath, "utf8"));

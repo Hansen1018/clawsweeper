@@ -112,7 +112,7 @@ test("exact review publishes post-ack status receipts in a second ledger", () =>
   assert.match(source, /await flushCommandActionEvents\(\)/);
   assert.match(
     publishStep,
-    /if: \$\{\{ always\(\) && steps\.setup-state\.outcome == 'success' && steps\.setup-pnpm\.outcome == 'success' && steps\.publish-event-result\.outputs\.requeue_latest == 'true' && steps\.complete-exact-review-queue\.outcome == 'success' \}\}/,
+    /if: \$\{\{ always\(\) && steps\.setup-state\.outcome == 'success' && steps\.setup-pnpm\.outcome == 'success' && steps\.publish-event-result\.outputs\.requeue_latest == 'true' && steps\.complete-exact-review-queue\.outcome == 'success' && steps\.finalize-late-command-status-action-ledger\.outcome == 'success' \}\}/,
   );
   assertCommandFinalizerUsesCanonicalRoot(finalizeStep);
   assertCommandPublisherUsesCanonicalRoot(publishStep);
