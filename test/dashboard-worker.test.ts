@@ -6392,6 +6392,49 @@ test("dashboard CI projection preserves newer legacy event history", async () =>
   );
 });
 
+test("dashboard CI projection ignores newer non-CI item events", async () => {
+  const harness = createCiProjectionHarness();
+  await harness.seed("events", [
+    {
+      id: "repair-event",
+      idempotency_key: "repair-event",
+      received_at: "2026-07-13T10:03:00.000Z",
+      updated_at: "2026-07-13T10:03:00.000Z",
+      event_type: "repair.operation",
+      repository: "openclaw/openclaw",
+      item_number: 80609,
+      status: "completed",
+      title: "Newer repair event",
+    },
+    {
+      id: "legacy-ci",
+      idempotency_key: "legacy-ci",
+      received_at: "2026-07-13T10:01:00.000Z",
+      updated_at: "2026-07-13T10:01:00.000Z",
+      event_type: "ci.status",
+      repository: "openclaw/openclaw",
+      item_number: 80609,
+      status: "red",
+      title: "Older legacy CI",
+    },
+  ]);
+
+  await harness.ingest({
+    idempotencyKey: "ci-current",
+    state: "green",
+    title: "Current CI",
+    updatedAt: "2026-07-13T10:02:00.000Z",
+  });
+
+  const projected = await harness.projection();
+  assert.equal(projected.state, "green");
+  assert.equal(projected.head_sha, "ci-current-green");
+  assert.deepEqual(
+    (await harness.events()).map((event: { title: string }) => event.title),
+    ["Current CI", "Newer repair event", "Older legacy CI"],
+  );
+});
+
 test("dashboard counts cluster-fixer operation events", async () => {
   const originalFetch = globalThis.fetch;
   const originalCaches = globalThis.caches;

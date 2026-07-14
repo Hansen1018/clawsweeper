@@ -6933,6 +6933,7 @@ function ciProjectionOrder(value) {
 function storedCiProjectionOrder(value) {
   const order = ciProjectionOrder(value);
   if (order) return order;
+  if (!isLegacyCiProjection(value)) return null;
   const timestamp =
     canonicalCiSourceTimestamp(value?.ci_projection_updated_at) ??
     canonicalCiSourceTimestamp(value?.updated_at) ??
@@ -6944,6 +6945,19 @@ function storedCiProjectionOrder(value) {
     key: "",
     legacy: true,
   };
+}
+
+function isLegacyCiProjection(value) {
+  const eventType = nullableString(value?.event_type);
+  if (eventType) return eventType === "ci.status";
+  const itemNumber = numberOrNull(value?.item_number);
+  return Boolean(
+    nullableString(value?.repository) &&
+    Number.isInteger(itemNumber) &&
+    itemNumber > 0 &&
+    nullableString(value?.source) &&
+    nullableString(value?.state),
+  );
 }
 
 function compareStoredCiProjectionOrder(left, right) {
