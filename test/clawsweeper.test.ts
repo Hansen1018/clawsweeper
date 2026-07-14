@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import test from "node:test";
@@ -42,6 +43,11 @@ import {
 } from "../dist/clawsweeper.js";
 import { parseArgs as parseClawsweeperArgs } from "../dist/clawsweeper-args.js";
 import { AUTOMATION_LIMITS } from "../dist/limits.js";
+import {
+  repairTargetActivityDigest,
+  repairTargetActivitySnapshotFromTarget,
+} from "../dist/repair/repair-mutation-activity.js";
+import { mintRepairMutationReviewAuthorizations } from "../dist/repair/repair-mutation-review-baseline.js";
 import {
   auditRecord,
   closeDecision,
@@ -1936,6 +1942,358 @@ if (args[0] === "api" && /\\/issues\\/comments\\/\\d+$/.test(path)) {
         reason: "updated durable Codex review comment",
       },
     ]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("apply-decisions rebinds repair authorization after owned publication and rejects external drift", () => {
+  const root = mkdtempSync(tmpPrefix);
+  try {
+    const itemsDir = join(root, "items");
+    const closedDir = join(root, "closed");
+    const plansDir = join(root, "plans");
+    const reportPath = join(root, "apply-report.json");
+    const statePath = join(root, "github-state.json");
+    const logPath = join(root, "gh.log");
+    mkdirSync(itemsDir, { recursive: true });
+    mkdirSync(plansDir, { recursive: true });
+
+    const number = 564;
+    const headSha = "a".repeat(40);
+    const baseSha = "b".repeat(40);
+    const sourceRevision = "c".repeat(64);
+    const reviewedUpdatedAt = "2026-07-14T20:00:00Z";
+    const reviewActivityCursor = `v2:0:${createHash("sha256").update("[]").digest("hex")}`;
+    const target = {
+      id: 564,
+      node_id: "PR_564",
+      number,
+      state: "open",
+      title: "Repair mutation authorization",
+      body: "Keep authoritative repair mutations bound to the reviewed target.",
+      updated_at: reviewedUpdatedAt,
+      locked: false,
+      draft: false,
+      author_association: "MEMBER",
+      assignees: [],
+      milestone: null,
+      labels: [{ name: "clawsweeper:automerge" }],
+      requested_reviewers: [],
+      requested_teams: [],
+      auto_merge: null,
+      changed_files: 1,
+      commits: 1,
+      review_comments: 0,
+      head: {
+        sha: headSha,
+        ref: "repair-auth",
+        label: "contributor:repair-auth",
+        repo: { id: 2, node_id: "R_fork", full_name: "contributor/clawsweeper" },
+      },
+      base: {
+        sha: baseSha,
+        ref: "main",
+        label: "openclaw:main",
+        repo: { id: 1, node_id: "R_main", full_name: "openclaw/clawsweeper" },
+      },
+      user: { login: "maintainer" },
+    };
+    const issue = {
+      number,
+      title: target.title,
+      body: target.body,
+      html_url: `https://github.com/openclaw/clawsweeper/pull/${number}`,
+      created_at: "2026-07-14T19:00:00Z",
+      updated_at: reviewedUpdatedAt,
+      closed_at: null,
+      state: "open",
+      locked: false,
+      active_lock_reason: null,
+      author_association: "MEMBER",
+      assignees: [],
+      milestone: null,
+      user: { login: "maintainer" },
+      labels: ["clawsweeper:automerge"],
+      comments: 0,
+      pull_request: { url: `https://api.github.com/repos/openclaw/clawsweeper/pulls/${number}` },
+    };
+    const initialDigest = repairTargetActivityDigest(
+      repairTargetActivitySnapshotFromTarget(target, [], "pull_request"),
+    );
+    writeFileSync(
+      statePath,
+      JSON.stringify({
+        target,
+        issue,
+        comments: [],
+        nextCommentId: 9400,
+        sequence: 0,
+        injectExternalDrift: false,
+      }),
+      "utf8",
+    );
+    const report = `${workPlanCandidateReport({
+      number,
+      repository: "openclaw/clawsweeper",
+      type: "pull_request",
+      title: target.title,
+      author: "maintainer",
+      author_association: "MEMBER",
+      labels: JSON.stringify(["clawsweeper:automerge"]),
+      reviewed_at: "2026-07-14T20:01:00Z",
+      item_updated_at: reviewedUpdatedAt,
+      item_snapshot_hash: "reviewed-snapshot-564",
+      item_source_revision: sourceRevision,
+      pull_head_sha: headSha,
+      review_activity_cursor: reviewActivityCursor,
+      review_authorization_target_digest: initialDigest,
+      review_lease_owner: "completed-review-owner",
+      review_lease_comment_id: "9300",
+      confidence: "high",
+      review_status: "complete",
+      decision: "keep_open",
+      close_reason: "none",
+      action_taken: "kept_open",
+      work_candidate: "none",
+      work_status: "none",
+      work_confidence: "low",
+      work_priority: "none",
+      triage_priority: "none",
+      impact_labels: "[]",
+      merge_risk_labels: "[]",
+      maturity_labels: "[]",
+      config_surface_change: false,
+      data_model_change: false,
+    })}
+
+## Review Findings
+
+Overall correctness: patch is correct
+
+Overall confidence: 0.99
+
+Full review comments:
+
+- none
+`;
+    writeFileSync(join(itemsDir, `${number}.md`), report, "utf8");
+
+    const ghMock = `
+const { appendFileSync, readFileSync, writeFileSync } = require("fs");
+const statePath = ${JSON.stringify(statePath)};
+const logPath = ${JSON.stringify(logPath)};
+const rawArgs = process.argv.slice(2);
+const args = rawArgs[0] === "--repo" ? rawArgs.slice(2) : rawArgs;
+const path = args.includes("-i") ? args[args.indexOf("-i") + 1] : args[1] || "";
+const readState = () => JSON.parse(readFileSync(statePath, "utf8"));
+const saveState = (state) => writeFileSync(statePath, JSON.stringify(state));
+const nextTimestamp = (state) => {
+  state.sequence += 1;
+  return new Date(Date.parse("2026-07-14T20:02:00Z") + state.sequence * 1000).toISOString();
+};
+const pages = (entries) => args.includes("--slurp") ? [entries] : entries;
+appendFileSync(logPath, JSON.stringify(args) + "\\n");
+
+if (args[0] === "api" && /\\/issues\\/comments\\/\\d+$/.test(path)) {
+  const state = readState();
+  const id = Number(path.match(/\\/issues\\/comments\\/(\\d+)$/)[1]);
+  const index = state.comments.findIndex((comment) => comment.id === id);
+  if (args.includes("DELETE")) {
+    if (index >= 0) state.comments.splice(index, 1);
+    state.target.updated_at = nextTimestamp(state);
+    state.issue.updated_at = state.target.updated_at;
+    state.issue.comments = state.comments.length;
+    saveState(state);
+    console.log("");
+  } else {
+    const inputPath = args[args.indexOf("--input") + 1];
+    const body = JSON.parse(readFileSync(inputPath, "utf8")).body;
+    if (index < 0) process.exit(2);
+    state.comments[index].body = body;
+    state.comments[index].updated_at = nextTimestamp(state);
+    state.target.updated_at = state.comments[index].updated_at;
+    state.issue.updated_at = state.target.updated_at;
+    saveState(state);
+    console.log(JSON.stringify(state.comments[index]));
+  }
+} else if (args[0] === "api" && /\\/issues\\/${number}\\/comments(?:\\?|$)/.test(path) && args.includes("POST")) {
+  const state = readState();
+  const inputPath = args[args.indexOf("--input") + 1];
+  const body = JSON.parse(readFileSync(inputPath, "utf8")).body;
+  const timestamp = nextTimestamp(state);
+  const comment = {
+    id: state.nextCommentId++,
+    node_id: "IC_" + state.nextCommentId,
+    html_url: "https://github.com/openclaw/clawsweeper/pull/${number}#issuecomment-" + state.nextCommentId,
+    issue_url: "https://api.github.com/repos/openclaw/clawsweeper/issues/${number}",
+    created_at: timestamp,
+    updated_at: timestamp,
+    author_association: "MEMBER",
+    user: { login: "clawsweeper[bot]" },
+    body
+  };
+  state.comments.push(comment);
+  state.target.updated_at = timestamp;
+  state.issue.updated_at = timestamp;
+  if (state.injectExternalDrift && body.includes("<!-- clawsweeper-review item=${number} -->")) {
+    const externalTimestamp = nextTimestamp(state);
+    state.comments.push({
+      id: 9500,
+      node_id: "IC_external",
+      html_url: "https://github.com/openclaw/clawsweeper/pull/${number}#issuecomment-9500",
+      issue_url: "https://api.github.com/repos/openclaw/clawsweeper/issues/${number}",
+      created_at: externalTimestamp,
+      updated_at: externalTimestamp,
+      author_association: "CONTRIBUTOR",
+      user: { login: "contributor" },
+      body: "External activity raced with durable review publication."
+    });
+    state.target.updated_at = externalTimestamp;
+    state.issue.updated_at = externalTimestamp;
+  }
+  state.issue.comments = state.comments.length;
+  saveState(state);
+  console.log(JSON.stringify(comment));
+} else if (args[0] === "api" && /\\/issues\\/${number}\\/comments(?:\\?|$)/.test(path)) {
+  console.log(JSON.stringify(pages(readState().comments)));
+} else if (args[0] === "api" && /\\/issues\\/${number}\\/timeline/.test(path) && args.includes("-i")) {
+  console.log("HTTP/2 200\\n\\n" + JSON.stringify([]));
+} else if (args[0] === "api" && /\\/issues\\/${number}\\/timeline/.test(path)) {
+  console.log(JSON.stringify(pages([])));
+} else if (args[0] === "api" && /\\/issues\\/${number}$/.test(path)) {
+  console.log(JSON.stringify(readState().issue));
+} else if (args[0] === "api" && /\\/pulls\\/${number}$/.test(path)) {
+  console.log(JSON.stringify(readState().target));
+} else if (args[0] === "api" && /\\/pulls\\/${number}\\/(files|commits|reviews|comments)(?:\\?|$)/.test(path)) {
+  console.log(JSON.stringify(pages([])));
+} else if (args[0] === "api" && /\\/commits\\/${headSha}\\/check-runs(?:\\?|$)/.test(path)) {
+  console.log(JSON.stringify({ total_count: 0, check_runs: [] }));
+} else if (args[0] === "api" && /\\/commits\\/${headSha}\\/status(?:\\?|$)/.test(path)) {
+  console.log(JSON.stringify({ state: "success", statuses: [] }));
+} else if (args[0] === "api" && path.startsWith("search/issues?")) {
+  console.log(JSON.stringify({ items: [] }));
+} else if (args[0] === "api" && args[1] === "graphql") {
+  console.log(JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } } } }));
+} else if (args[0] === "label" && args[1] === "create") {
+  console.log("");
+} else if (args[0] === "issue" && args[1] === "edit") {
+  const state = readState();
+  const addIndex = args.indexOf("--add-label");
+  const removeIndex = args.indexOf("--remove-label");
+  const labels = state.target.labels.map((label) => label.name);
+  if (addIndex >= 0 && !labels.includes(args[addIndex + 1])) {
+    labels.push(args[addIndex + 1]);
+  }
+  if (removeIndex >= 0) {
+    const remove = args[removeIndex + 1];
+    const index = labels.indexOf(remove);
+    if (index >= 0) labels.splice(index, 1);
+  }
+  state.target.labels = labels.map((name) => ({ name }));
+  state.issue.labels = labels;
+  state.target.updated_at = nextTimestamp(state);
+  state.issue.updated_at = state.target.updated_at;
+  saveState(state);
+  console.log("");
+} else {
+  console.error("unexpected gh args", JSON.stringify(args));
+  process.exit(1);
+}
+`;
+    withMockGh(root, ghMock, () => {
+      runApplyDecisionsForTest({
+        itemsDir,
+        closedDir,
+        plansDir,
+        reportPath,
+        extraArgs: [
+          "--apply-kind",
+          "pull_request",
+          "--sync-comments-only",
+          "--comment-sync-min-age-days",
+          "0",
+        ],
+      });
+    });
+
+    const updatedReport = readFileSync(join(itemsDir, `${number}.md`), "utf8");
+    const updatedDigest = updatedReport.match(
+      /^review_authorization_target_digest: ([a-f0-9]{64})$/m,
+    )?.[1];
+    assert.ok(updatedDigest);
+    assert.notEqual(updatedDigest, initialDigest);
+    const finalState = JSON.parse(readFileSync(statePath, "utf8")) as {
+      target: Record<string, unknown>;
+      comments: Record<string, unknown>[];
+    };
+    assert.equal(
+      finalState.comments.some((comment) =>
+        String(comment.body ?? "").includes("clawsweeper-review-lease"),
+      ),
+      false,
+    );
+    const authorization = mintRepairMutationReviewAuthorizations({
+      repository: "openclaw/clawsweeper",
+      number,
+      targetKind: "pull_request",
+      target: finalState.target,
+      comments: finalState.comments,
+      expectedHeadSha: headSha,
+      reviewedBefore: "2026-07-14T21:00:00Z",
+    }).find((candidate) => candidate.authorization === "merge");
+    assert.ok(authorization);
+    assert.equal(authorization.target_activity_digest, updatedDigest);
+
+    writeFileSync(
+      statePath,
+      JSON.stringify({
+        target,
+        issue,
+        comments: [],
+        nextCommentId: 9600,
+        sequence: 0,
+        injectExternalDrift: true,
+      }),
+      "utf8",
+    );
+    writeFileSync(join(itemsDir, `${number}.md`), report, "utf8");
+    withMockGh(root, ghMock, () => {
+      runApplyDecisionsForTest({
+        itemsDir,
+        closedDir,
+        plansDir,
+        reportPath,
+        extraArgs: [
+          "--apply-kind",
+          "pull_request",
+          "--sync-comments-only",
+          "--comment-sync-min-age-days",
+          "0",
+        ],
+      });
+    });
+    const driftedReport = readFileSync(join(itemsDir, `${number}.md`), "utf8");
+    assert.match(
+      driftedReport,
+      new RegExp(`^review_authorization_target_digest: ${initialDigest}$`, "m"),
+    );
+    const driftedState = JSON.parse(readFileSync(statePath, "utf8")) as {
+      target: Record<string, unknown>;
+      comments: Record<string, unknown>[];
+    };
+    assert.equal(
+      mintRepairMutationReviewAuthorizations({
+        repository: "openclaw/clawsweeper",
+        number,
+        targetKind: "pull_request",
+        target: driftedState.target,
+        comments: driftedState.comments,
+        expectedHeadSha: headSha,
+        reviewedBefore: "2026-07-14T21:00:00Z",
+      }).some((candidate) => candidate.authorization === "merge"),
+      false,
+    );
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

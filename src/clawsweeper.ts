@@ -124,8 +124,11 @@ import {
   freshExactHeadReviewStartLease,
 } from "./repair/comment-router-core.js";
 import {
+  fetchStableRepairTargetActivityEvidence,
+  normalizeRepairTargetActivitySnapshot,
   repairTargetActivityDigest,
   repairTargetActivitySnapshotFromTarget,
+  type RepairTargetActivitySnapshot,
 } from "./repair/repair-mutation-activity.js";
 import {
   AUTOMERGE_LABEL,
@@ -789,6 +792,20 @@ interface ItemContext {
     pullReviewCommentsFiltered?: number;
   };
 }
+
+type RepairReviewAuthorizationRebindBaseline = {
+  snapshot: RepairTargetActivitySnapshot;
+  reviewCommentId: string | null;
+  leaseCommentId: string;
+};
+
+type RepairReviewAuthorizationRebindPlan = {
+  comment: Record<string, unknown>;
+  digest: string;
+  markedBody: string;
+  markdown: string;
+  mutationIdentity: string;
+};
 
 interface GitTreeEntry {
   mode: string;
@@ -8761,10 +8778,16 @@ function collectItemContext(
     try {
       const previousReviewCommentId =
         stringOrUndefined(asRecord(previousClawSweeperReview).commentId)?.trim() ?? "";
-      context.pullReviewTargetActivityDigest = repairTargetActivityDigest(
-        repairTargetActivitySnapshotFromTarget(pullRequest, sourceRevisionComments, "pull_request"),
-        previousReviewCommentId || null,
-      );
+      context.pullReviewTargetActivityDigest = repairReviewAuthorizationTargetDigest({
+        number: item.number,
+        snapshot: repairTargetActivitySnapshotFromTarget(
+          pullRequest,
+          sourceRevisionComments,
+          "pull_request",
+        ),
+        comments: sourceRevisionComments.map(asRecord),
+        reviewCommentId: previousReviewCommentId || null,
+      });
     } catch {
       // A missing bounded target digest leaves the review non-authorizing for repair mutations.
     }
@@ -19795,6 +19818,187 @@ function upsertReviewComment(
   );
 }
 
+function stableRepairReviewAuthorizationTargetActivity(number: number): {
+  snapshot: RepairTargetActivitySnapshot;
+  comments: Record<string, unknown>[];
+} | null {
+  const evidence = fetchStableRepairTargetActivityEvidence(targetRepo(), number, "pull_request");
+  if (!evidence) return null;
+  return {
+    snapshot: evidence.snapshot,
+    comments: evidence.comments.map(asRecord),
+  };
+}
+
+function repairReviewAuthorizationSnapshotWithoutOwnedLeases(options: {
+  number: number;
+  snapshot: RepairTargetActivitySnapshot;
+  comments: readonly Record<string, unknown>[];
+}): RepairTargetActivitySnapshot {
+  const ownedLeaseCommentIds = new Set(
+    options.comments
+      .filter(
+        (comment) =>
+          canPatchReviewComment(comment) &&
+          rawCommentBody(comment).includes(reviewStartLeaseCommentMarker(options.number)),
+      )
+      .map(commentId)
+      .filter((id): id is number => id !== null)
+      .map(String),
+  );
+  return normalizeRepairTargetActivitySnapshot({
+    ...options.snapshot,
+    comments: options.snapshot.comments.filter((comment) => !ownedLeaseCommentIds.has(comment.id)),
+  });
+}
+
+function repairReviewAuthorizationTargetDigest(options: {
+  number: number;
+  snapshot: RepairTargetActivitySnapshot;
+  comments: readonly Record<string, unknown>[];
+  reviewCommentId: string | null;
+}): string {
+  return repairTargetActivityDigest(
+    repairReviewAuthorizationSnapshotWithoutOwnedLeases(options),
+    options.reviewCommentId,
+  );
+}
+
+function currentRepairReviewAuthorizationTargetDigest(number: number): string | null {
+  const evidence = stableRepairReviewAuthorizationTargetActivity(number);
+  if (!evidence) return null;
+  const reviewComment = selectIssueReviewComment(number, evidence.comments);
+  const reviewCommentId = commentId(reviewComment);
+  return repairReviewAuthorizationTargetDigest({
+    number,
+    snapshot: evidence.snapshot,
+    comments: evidence.comments,
+    reviewCommentId: reviewCommentId === null ? null : String(reviewCommentId),
+  });
+}
+
+function repairReviewAuthorizationRebindBaseline(options: {
+  number: number;
+  markdown: string;
+  lease: AcquiredReviewStartLease;
+}): RepairReviewAuthorizationRebindBaseline | null {
+  const storedDigest = frontMatterValue(options.markdown, "review_authorization_target_digest");
+  if (!storedDigest || !/^[a-f0-9]{64}$/.test(storedDigest)) return null;
+  const evidence = stableRepairReviewAuthorizationTargetActivity(options.number);
+  if (!evidence) return null;
+  const reviewComment = selectIssueReviewComment(options.number, evidence.comments);
+  const reviewCommentId = commentId(reviewComment);
+  const normalizedSnapshot = repairReviewAuthorizationSnapshotWithoutOwnedLeases({
+    number: options.number,
+    snapshot: evidence.snapshot,
+    comments: evidence.comments,
+  });
+  if (
+    repairTargetActivityDigest(
+      normalizedSnapshot,
+      reviewCommentId === null ? null : String(reviewCommentId),
+    ) !== storedDigest ||
+    !evidence.snapshot.comments.some((comment) => comment.id === String(options.lease.commentId))
+  ) {
+    return null;
+  }
+  return {
+    snapshot: normalizedSnapshot,
+    reviewCommentId: reviewCommentId === null ? null : String(reviewCommentId),
+    leaseCommentId: String(options.lease.commentId),
+  };
+}
+
+function rebindRepairReviewAuthorizationCommentBody(
+  number: number,
+  body: string,
+  digest: string,
+): string | null {
+  const identity = reviewCommentMarker(number);
+  const identityIndex = body.lastIndexOf(identity);
+  if (identityIndex < 0 || body.slice(identityIndex + identity.length).trim()) return null;
+  const markerPrefix = body.slice(0, identityIndex);
+  const markers = trailingHtmlComments(markerPrefix);
+  const authorizationMarkers = markers.filter((marker) =>
+    /^<!--\s+clawsweeper-(?:review-version|verdict:[^\s>]+|action:[^\s>]+)\b/.test(marker),
+  );
+  if (
+    authorizationMarkers.length === 0 ||
+    authorizationMarkers.some((marker) => !/\btarget_activity_digest=[^\s>]+/.test(marker))
+  ) {
+    return null;
+  }
+  const firstMarker = markers[0];
+  if (!firstMarker) return null;
+  const markerStart = markerPrefix.lastIndexOf(firstMarker);
+  if (markerStart < 0) return null;
+  let replacements = 0;
+  const reboundTail = markerPrefix
+    .slice(markerStart)
+    .replace(
+      /(<!--\s+clawsweeper-(?:review-version|verdict:[^\s>]+|action:[^\s>]+)\b[^>]*\btarget_activity_digest=)[^\s>]+/g,
+      (_match, prefix: string) => {
+        replacements += 1;
+        return `${prefix}${digest}`;
+      },
+    );
+  if (replacements !== authorizationMarkers.length) return null;
+  return `${markerPrefix.slice(0, markerStart)}${reboundTail}${body.slice(identityIndex)}`;
+}
+
+function repairReviewAuthorizationRebindPlan(options: {
+  number: number;
+  markdown: string;
+  expectedLabels: readonly string[];
+  baseline: RepairReviewAuthorizationRebindBaseline;
+}): RepairReviewAuthorizationRebindPlan | null {
+  const evidence = stableRepairReviewAuthorizationTargetActivity(options.number);
+  if (!evidence) return null;
+  const reviewComment = selectIssueReviewComment(options.number, evidence.comments);
+  if (!reviewComment || !canPatchReviewComment(reviewComment)) return null;
+  const reviewCommentId = commentId(reviewComment);
+  if (reviewCommentId === null) return null;
+  const finalSnapshot = repairReviewAuthorizationSnapshotWithoutOwnedLeases({
+    number: options.number,
+    snapshot: evidence.snapshot,
+    comments: evidence.comments,
+  });
+  const excludedBaselineCommentIds = new Set(
+    [
+      options.baseline.reviewCommentId,
+      options.baseline.leaseCommentId,
+      String(reviewCommentId),
+    ].filter((value): value is string => Boolean(value)),
+  );
+  const expectedSnapshot = normalizeRepairTargetActivitySnapshot({
+    ...options.baseline.snapshot,
+    labels: [...options.expectedLabels],
+    comments: options.baseline.snapshot.comments.filter(
+      (comment) => !excludedBaselineCommentIds.has(comment.id),
+    ),
+  });
+  const digest = repairTargetActivityDigest(finalSnapshot, String(reviewCommentId));
+  if (digest !== repairTargetActivityDigest(expectedSnapshot)) return null;
+  const markedBody = rebindRepairReviewAuthorizationCommentBody(
+    options.number,
+    rawCommentBody(reviewComment),
+    digest,
+  );
+  if (!markedBody) return null;
+  const markdown = replaceFrontMatterValue(
+    options.markdown,
+    "review_authorization_target_digest",
+    digest,
+  );
+  return {
+    comment: reviewComment,
+    digest,
+    markedBody,
+    markdown,
+    mutationIdentity: `review_authorization_rebind:${options.number}:${digest}`,
+  };
+}
+
 function reviewCommentFromMutationResponse(
   response: string,
   args: readonly string[],
@@ -22334,6 +22538,11 @@ function reviewCommand(args: Args): void {
                   "review_activity_cursor",
                   revalidatedReviewActivityCursor!,
                 );
+                carried = replaceFrontMatterValue(
+                  carried,
+                  "review_authorization_target_digest",
+                  currentRepairReviewAuthorizationTargetDigest(item.number) ?? "unknown",
+                );
               }
               carried = replaceFrontMatterValue(
                 carried,
@@ -22848,6 +23057,11 @@ function reviewCommand(args: Args): void {
             "review_activity_cursor",
             revalidatedReviewActivityCursor!,
           );
+          carried = replaceFrontMatterValue(
+            carried,
+            "review_authorization_target_digest",
+            currentRepairReviewAuthorizationTargetDigest(item.number) ?? "unknown",
+          );
         }
         carried = replaceFrontMatterValue(
           carried,
@@ -22957,6 +23171,11 @@ function reviewCommand(args: Args): void {
             carried,
             "review_activity_cursor",
             revalidatedContentCacheReviewActivityCursor!,
+          );
+          carried = replaceFrontMatterValue(
+            carried,
+            "review_authorization_target_digest",
+            currentRepairReviewAuthorizationTargetDigest(item.number) ?? "unknown",
           );
         }
         carried = replaceFrontMatterValue(carried, "review_cache_hit", "true");
@@ -25755,18 +25974,26 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
     itemNumber: number;
     lease: AcquiredReviewStartLease;
   } | null = null;
-  const releaseActiveApplyMutationLease = (): void => {
+  let applyFinalizationError: unknown = null;
+  const releaseActiveApplyMutationLease = (): boolean => {
     const active = activeApplyMutationLease;
     activeApplyMutationLease = null;
-    if (!active) return;
+    if (!active) return true;
     try {
-      deleteOwnedDedicatedReviewStartLease(active.itemNumber, active.lease, {
+      const released = deleteOwnedDedicatedReviewStartLease(active.itemNumber, active.lease, {
         throwOnError: true,
       });
+      if (!released) {
+        console.error(
+          `[apply] could not confirm owned review lease comment ${active.lease.commentId} before deletion`,
+        );
+      }
+      return released;
     } catch (error) {
       console.error(
         `[apply] could not delete owned review lease comment ${active.lease.commentId}: ${mutationErrorMessage(error)}`,
       );
+      return false;
     }
   };
   runtimeBudget.onFailure = (error: unknown): void => {
@@ -25807,6 +26034,7 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
   // oxfmt-ignore
   for (const entry of fileEntries) {
     releaseActiveApplyMutationLease();
+    if (applyFinalizationError) break;
     const file = entry.name;
     const path = entry.path;
     if (runtimeBudgetExceeded(startedAtMs, maxRuntimeMs, Date.now())) {
@@ -25828,6 +26056,11 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
     let recordApplyMutationGuardBlock:
       | ((block: ApplyMutationReviewBlock) => boolean)
       | null = null;
+    let reviewAuthorizationRebindBaselineState: RepairReviewAuthorizationRebindBaseline | null =
+      null;
+    let reviewAuthorizationCommentPublished = false;
+    let reviewAuthorizationExpectedLabels: string[] = [];
+    let postLeaseAuthorizationMutationIdentity: string | null = null;
     const previousApplyMutationRunner = activeApplyMutationRunner;
     try {
     const markMutationObserved = (): void => {
@@ -25855,7 +26088,10 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
       );
       if (!attempt) return options.operation();
       try {
-        if (!options.identity.startsWith("review_lease_")) {
+        if (
+          !options.identity.startsWith("review_lease_") &&
+          options.idempotencyIdentity !== postLeaseAuthorizationMutationIdentity
+        ) {
           const mutationLeaseBlock = currentApplyMutationLeaseBlock();
           if (mutationLeaseBlock) throw new ApplyMutationReviewGuardError(mutationLeaseBlock);
         }
@@ -27229,6 +27465,30 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
         if (recordReviewActivityBlock(mutationLeaseBlock)) break;
         continue;
       }
+      const heldApplyMutationLease = activeApplyMutationLease as {
+        itemNumber: number;
+        lease: AcquiredReviewStartLease;
+      } | null;
+      if (
+        item.kind === "pull_request" &&
+        requiresApplyMutationLease &&
+        heldApplyMutationLease
+      ) {
+        reviewAuthorizationRebindBaselineState = repairReviewAuthorizationRebindBaseline({
+          number,
+          markdown: markdownBeforeApplyDecisionMutations,
+          lease: heldApplyMutationLease.lease,
+        });
+        if (!reviewAuthorizationRebindBaselineState) {
+          const block = {
+            sourceChanged: true,
+            reason:
+              "pull request target activity changed since review or its authorization baseline is unavailable",
+          };
+          if (recordReviewActivityBlock(block)) break;
+          continue;
+        }
+      }
     }
     if (state === "open" && item.kind === "pull_request") {
       if (stalePrReviewHead) {
@@ -27315,6 +27575,7 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
       }
     }
     markdown = replaceFrontMatterValue(markdown, "labels", JSON.stringify(item.labels));
+    reviewAuthorizationExpectedLabels = [...item.labels];
     if (clawSweeperLabelsChanged && !dryRun) {
       rememberSelfMutationUpdatedAt();
     }
@@ -28043,6 +28304,7 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
       }
       markdown = replaceFrontMatterValue(markdown, "apply_checked_at", new Date().toISOString());
       if (!dryRun) writeReportMarkdown(path, markdown);
+      reviewAuthorizationCommentPublished = !dryRun && Boolean(syncedComment);
       results.push({
         number,
         action: closeBlockedForCommentSync?.actionTaken ?? "review_comment_synced",
@@ -28055,6 +28317,13 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
       processedCount += 1;
       maybeLogProgress(`synced review comment #${number}`);
       if (processedCount >= processedLimit) break;
+    }
+    if (
+      !needsReviewCommentSync &&
+      !needsReviewCommentBodySync &&
+      existingReviewCommentMatches
+    ) {
+      reviewAuthorizationCommentPublished = !dryRun && Boolean(existingReviewComment);
     }
     if (closeBlockedForCommentSync) {
       if (!needsReviewCommentSync) {
@@ -28321,8 +28590,60 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
       applyItemFailed = true;
       throw error;
     } finally {
-      releaseActiveApplyMutationLease();
-      activeApplyMutationRunner = previousApplyMutationRunner;
+      let rebindError: unknown = null;
+      const leaseReleased = releaseActiveApplyMutationLease();
+      try {
+        if (
+          !applyItemFailed &&
+          leaseReleased &&
+          reviewAuthorizationCommentPublished &&
+          reviewAuthorizationRebindBaselineState &&
+          existsSync(path)
+        ) {
+          const plan = repairReviewAuthorizationRebindPlan({
+            number,
+            markdown,
+            expectedLabels: reviewAuthorizationExpectedLabels,
+            baseline: reviewAuthorizationRebindBaselineState,
+          });
+          if (plan) {
+            postLeaseAuthorizationMutationIdentity = plan.mutationIdentity;
+            try {
+              const reboundComment = upsertReviewComment(
+                number,
+                plan.markedBody,
+                plan.comment,
+                plan.mutationIdentity,
+              );
+              if (commentId(reboundComment) !== commentId(plan.comment)) {
+                rebindError = new Error(
+                  `review authorization rebind for #${number} did not preserve the trusted comment identity`,
+                );
+              } else {
+                markdown = updateReviewCommentMetadata(
+                  plan.markdown,
+                  reboundComment,
+                  plan.markedBody,
+                );
+                writeReportMarkdown(path, markdown);
+              }
+            } finally {
+              postLeaseAuthorizationMutationIdentity = null;
+            }
+          } else {
+            console.error(
+              `[apply] did not rebind repair review authorization for #${number}; final target activity was not the trusted review state plus owned publication mutations`,
+            );
+          }
+        }
+      } catch (error) {
+        applyItemFailed = true;
+        rebindError = error;
+      } finally {
+        postLeaseAuthorizationMutationIdentity = null;
+        activeApplyMutationRunner = previousApplyMutationRunner;
+      }
+      if (rebindError) applyItemFailed = true;
       if (!applyItemFailed) {
         const state = applyLedger.items.get(actionLedgerItemKey(entry));
         if (!applyLedger.terminal && state?.started && !state.terminal) {
@@ -28354,9 +28675,11 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
         }
         activeApplyItem = null;
       }
+      if (rebindError) applyFinalizationError = rebindError;
     }
   }
   releaseActiveApplyMutationLease();
+  if (applyFinalizationError) throw applyFinalizationError;
   activeApplyItem = null;
   if (runtimeBudget.yieldReason) {
     runtimeBudget.onYield?.(runtimeBudget.yieldReason);
