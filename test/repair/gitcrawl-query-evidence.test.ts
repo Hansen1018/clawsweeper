@@ -1183,7 +1183,7 @@ test("local portable export timestamps are not source freshness proof", async ()
   }
 });
 
-test("local portable cluster coverage binds to exported metadata", async () => {
+test("local portable cluster coverage requires explicit run provenance", async () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-query-portable-"));
   const dbPath = path.join(directory, "gitcrawl.db");
   seedLocalDatabase(dbPath);
@@ -1219,10 +1219,10 @@ test("local portable cluster coverage binds to exported metadata", async () => {
     now: () => now,
   });
   try {
-    assert.equal((await adapter.listClusters()).rows[0]?.id, 7);
-    assert.equal((await adapter.clusterMembers(7)).rows[0]?.number, 42);
     assert.equal(adapter.provenance.source_sync_at, generatedAt);
     assert.equal(adapter.provenance.dataset_generated_at, generatedAt);
+    await assert.rejects(adapter.listClusters(), /cluster_groups coverage is incomplete/);
+    await assert.rejects(adapter.clusterMembers(7), /cluster_groups coverage is incomplete/);
   } finally {
     await adapter.close();
     fs.rmSync(directory, { force: true, recursive: true });

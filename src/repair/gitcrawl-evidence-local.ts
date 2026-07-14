@@ -692,14 +692,7 @@ export class LocalGitcrawlQuerySource implements GitcrawlQuerySource {
       columnExists(this.db, "cluster_runs", "started_at") &&
       columnExists(this.db, "cluster_runs", "finished_at") &&
       columnExists(this.db, "cluster_memberships", "last_seen_run_id");
-    const portableExportedAt = this.portableMetadata("exported_at");
-    const portableGenerationSupport =
-      this.portable &&
-      !clusterRunSupport &&
-      portableExportedAt !== "" &&
-      columnExists(this.db, "cluster_memberships", "last_seen_run_id");
-    const currentSchema = clusterRunSupport || portableGenerationSupport;
-    if (!currentSchema) {
+    if (!clusterRunSupport) {
       return [
         metric(
           this.snapshotId,
@@ -724,31 +717,18 @@ export class LocalGitcrawlQuerySource implements GitcrawlQuerySource {
       ];
     }
 
-    const latestRun = clusterRunSupport
-      ? this.db
-          .prepare(
-            `select id, started_at, finished_at
-             from cluster_runs
-             where repo_id = ? and status in ('success', 'completed') and finished_at is not null
-             order by id desc
-             limit 1`,
-          )
-          .get(this.repoId)
-      : this.db
-          .prepare(
-            `select max(cm.last_seen_run_id) as id
-             from cluster_memberships cm
-             join cluster_groups c on c.id = cm.cluster_id
-             where c.repo_id = ? and c.status = 'active' and cm.state = 'active'`,
-          )
-          .get(this.repoId);
+    const latestRun = this.db
+      .prepare(
+        `select id, started_at, finished_at
+         from cluster_runs
+         where repo_id = ? and status in ('success', 'completed') and finished_at is not null
+         order by id desc
+         limit 1`,
+      )
+      .get(this.repoId);
     const latestRunId = Number(latestRun?.id ?? 0);
-    const latestRunAt = clusterRunSupport
-      ? String(latestRun?.finished_at ?? "")
-      : portableExportedAt;
-    const latestRunInputAt = clusterRunSupport
-      ? String(latestRun?.started_at ?? "")
-      : portableExportedAt;
+    const latestRunAt = String(latestRun?.finished_at ?? "");
+    const latestRunInputAt = String(latestRun?.started_at ?? "");
     const hasLatestRun =
       Number.isSafeInteger(latestRunId) &&
       latestRunId > 0 &&
