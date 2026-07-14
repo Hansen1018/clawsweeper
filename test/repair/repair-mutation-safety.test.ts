@@ -650,6 +650,7 @@ function repairActionLedgerEnv(root: string): NodeJS.ProcessEnv {
     CLAWSWEEPER_ACTION_LEDGER_FORCE: "1",
     CLAWSWEEPER_ACTION_LEDGER_ROOT: root,
     CLAWSWEEPER_ACTION_LEDGER_INVOCATION: "repair-mutation-test",
+    GITHUB_ACTIONS: "false",
     GITHUB_REPOSITORY: "openclaw/clawsweeper",
     GITHUB_SHA: "d".repeat(40),
     GITHUB_WORKFLOW: "repair cluster worker",
