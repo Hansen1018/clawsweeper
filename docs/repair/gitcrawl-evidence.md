@@ -53,6 +53,10 @@ Local freshness is accepted only from a completed, repository-scoped full/open
 sync or a complete open-reconciliation tuple. Export timestamps and database
 mtime are not freshness proof.
 
+Cluster coverage additionally requires the latest successful cluster run to
+have started at or after the accepted source sync. Portable exports that omit
+cluster-run provenance cannot certify cluster queries.
+
 ## Evidence Binding
 
 Normalized rows become digest-bound claims containing:
