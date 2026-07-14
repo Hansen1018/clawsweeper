@@ -380,6 +380,7 @@ test("merge post-flight leaves dependency-gated closeouts to the second apply pa
     assert.equal(report.actions.length, 1);
     assert.equal(report.actions[0]?.status, "executed");
     assert.equal(report.actions[0]?.merge_commit_sha, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    assert.equal(report.actions[0]?.validated_head_sha, "a".repeat(40));
     assert.deepEqual(report.closure_authorization, {
       version: 1,
       status: "authorized",
@@ -387,6 +388,7 @@ test("merge post-flight leaves dependency-gated closeouts to the second apply pa
         {
           fix_ref: "#123",
           merge_commit_sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          validated_head_sha: "a".repeat(40),
         },
       ],
     });
@@ -396,7 +398,7 @@ test("merge post-flight leaves dependency-gated closeouts to the second apply pa
   }
 });
 
-test("post-flight rejects a fix PR head that advanced after repair validation", () => {
+test("post-flight rejects an already-merged fix PR head that differs from repair validation", () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-post-flight-"));
   const fakeBin = path.join(tmp, "bin");
   const jobPath = path.join(tmp, "job.md");
@@ -415,8 +417,10 @@ test("post-flight rejects a fix PR head that advanced after repair validation", 
       "const args = process.argv.slice(2);",
       "if (args[0] === 'api' && args[1] === 'repos/openclaw/openclaw/pulls/123') {",
       "  process.stdout.write(JSON.stringify({",
-      "    number: 123, state: 'open', title: 'fix(ui): preserve source config',",
-      "    draft: false, labels: [], base: { ref: 'main' }, merged_at: null,",
+      "    number: 123, state: 'closed', title: 'fix(ui): preserve source config',",
+      "    draft: false, labels: [], base: { ref: 'main' },",
+      "    merged_at: '2026-05-24T00:42:00Z',",
+      "    merge_commit_sha: 'cccccccccccccccccccccccccccccccccccccccc',",
       "    updated_at: '2026-05-24T00:40:00Z',",
       "    head: { sha: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' },",
       "  }));",
@@ -425,7 +429,9 @@ test("post-flight rejects a fix PR head that advanced after repair validation", 
       "if (args[0] === 'pr' && args[1] === 'view') {",
       "  process.stdout.write(JSON.stringify({",
       "    baseRefName: 'main', isDraft: false, mergeable: 'MERGEABLE',",
-      "    mergeStateStatus: 'CLEAN', reviewDecision: null, state: 'OPEN',",
+      "    mergeStateStatus: 'CLEAN', mergedAt: '2026-05-24T00:42:00Z',",
+      "    mergeCommit: { oid: 'cccccccccccccccccccccccccccccccccccccccc' },",
+      "    reviewDecision: null, state: 'MERGED',",
       "    statusCheckRollup: [{ name: 'pnpm check', workflowName: 'CI', status: 'COMPLETED', conclusion: 'SUCCESS' }],",
       "    title: 'fix(ui): preserve source config',",
       "    updatedAt: '2026-05-24T00:40:00Z',",

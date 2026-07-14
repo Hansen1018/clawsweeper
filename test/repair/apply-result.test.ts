@@ -1602,6 +1602,7 @@ test("repair second apply promotes a fix-first close after post-flight merge aut
               {
                 fix_ref: "#202",
                 merge_commit_sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                validated_head_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
               },
             ],
           },
@@ -1663,6 +1664,7 @@ test("repair second apply does not infer fix-first authorization from prose", ()
               {
                 fix_ref: "#202",
                 merge_commit_sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                validated_head_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
               },
             ],
           },

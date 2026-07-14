@@ -323,7 +323,10 @@ function applyPostFlightClosurePromotions(sourceResult: LooseRecord): {
     (postFlightReport.closure_authorization.merged_fixes ?? [])
       .filter(
         (entry: JsonValue) =>
-          typeof entry?.merge_commit_sha === "string" && entry.merge_commit_sha.trim(),
+          typeof entry?.merge_commit_sha === "string" &&
+          entry.merge_commit_sha.trim() &&
+          typeof entry.validated_head_sha === "string" &&
+          /^[a-f0-9]{40}$/i.test(entry.validated_head_sha),
       )
       .map((entry: JsonValue) => normalizeRepairClosureRef(entry.fix_ref))
       .filter(Boolean),
@@ -686,6 +689,7 @@ function applyCloseAction({
         targetKind: kind,
         authorization: "close",
         explicitCursor: action.review_activity_cursor ?? action.target_review_activity_cursor,
+        explicitVerdict: action.review_verdict ?? action.target_review_verdict,
         expectedUpdatedAt,
         expectedHeadSha: clusterPlanPullHeadSha(target),
         reviewedBefore: clusterPlan?.generated_at ?? result.generated_at,
@@ -823,6 +827,7 @@ function applyMergeAction({
           targetKind: "pull_request",
           authorization: "merge",
           explicitCursor: action.review_activity_cursor ?? action.target_review_activity_cursor,
+          explicitVerdict: action.review_verdict ?? action.target_review_verdict,
           expectedUpdatedAt,
           expectedHeadSha: clusterPlanPullHeadSha(target),
           reviewedBefore: clusterPlan?.generated_at ?? result.generated_at,

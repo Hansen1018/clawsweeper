@@ -150,11 +150,14 @@ function buildClosureAuthorization(actions: LooseRecord[]) {
         typeof action.pr === "string" &&
         /^#\d+$/.test(action.pr) &&
         typeof action.merge_commit_sha === "string" &&
-        action.merge_commit_sha.trim(),
+        action.merge_commit_sha.trim() &&
+        typeof action.validated_head_sha === "string" &&
+        /^[a-f0-9]{40}$/i.test(action.validated_head_sha),
     )
     .map((action) => ({
       fix_ref: action.pr,
       merge_commit_sha: action.merge_commit_sha,
+      validated_head_sha: action.validated_head_sha,
     }));
   return {
     version: 1,
@@ -194,6 +197,7 @@ function finalizeFixPr(action: LooseRecord) {
   let prBase;
   let mergeBlock = "";
   let freshness: RepairMutationFreshnessGuard | null = null;
+  let validatedCommit = "";
   let waitedMs = 0;
   for (;;) {
     pull = fetchPullRequest(result.repo, parsed.number);
@@ -202,18 +206,7 @@ function finalizeFixPr(action: LooseRecord) {
     const policyBlock = validateMergePolicy(action, pull);
     if (policyBlock) return { ...prBase, status: "blocked", reason: policyBlock };
 
-    const mergedAt = pull.merged_at ?? view.mergedAt ?? null;
-    if (mergedAt) {
-      return {
-        ...prBase,
-        status: "executed",
-        reason: "already merged",
-        merged_at: mergedAt,
-        merge_commit_sha: pull.merge_commit_sha ?? view.mergeCommit?.oid ?? null,
-        waited_ms: waitedMs,
-      };
-    }
-    const validatedCommit = String(action.commit ?? "").trim();
+    validatedCommit = String(action.commit ?? "").trim();
     const liveHeadSha = String(pull.head?.sha ?? "").trim();
     if (!/^[a-f0-9]{40}$/i.test(validatedCommit)) {
       return {
@@ -234,6 +227,18 @@ function finalizeFixPr(action: LooseRecord) {
         waited_ms: waitedMs,
       };
     }
+    const mergedAt = pull.merged_at ?? view.mergedAt ?? null;
+    if (mergedAt) {
+      return {
+        ...prBase,
+        status: "executed",
+        reason: "already merged",
+        merged_at: mergedAt,
+        merge_commit_sha: pull.merge_commit_sha ?? view.mergeCommit?.oid ?? null,
+        validated_head_sha: validatedCommit,
+        waited_ms: waitedMs,
+      };
+    }
 
     if (!dryRun) {
       try {
@@ -249,6 +254,7 @@ function finalizeFixPr(action: LooseRecord) {
             authorization: "merge",
             explicitCursor:
               action.review_activity_cursor ?? action.merge_preflight?.review_activity_cursor,
+            explicitVerdict: action.review_verdict ?? action.merge_preflight?.review_verdict,
             expectedUpdatedAt: pull.updated_at ?? view.updatedAt,
             expectedHeadSha: action.commit,
             reviewedBefore: report.post_flight_at,
@@ -370,20 +376,37 @@ function finalizeFixPr(action: LooseRecord) {
       },
       outcome: (confirmed) => {
         merged = confirmed;
-        return confirmed.merged_at ? "accepted" : "unknown";
+        return confirmed.merged_at && String(confirmed.head?.sha ?? "").trim() === validatedCommit
+          ? "accepted"
+          : "unknown";
       },
       knownNoMutation: isRecoverableRepairMergeRaceError,
     });
   } catch (error) {
-    if (error instanceof RepairMutationOutcomeUnknownError && merged && !merged.merged_at) {
-      return {
-        ...prBase,
-        status: "blocked",
-        reason: "merge command completed but GitHub has not reported the pull request as merged",
-        retry_recommended: true,
-        merge_method: "squash",
-        waited_ms: waitedMs,
-      };
+    if (error instanceof RepairMutationOutcomeUnknownError && merged) {
+      const mergedHeadSha = String(merged.head?.sha ?? "").trim();
+      if (merged.merged_at && mergedHeadSha !== validatedCommit) {
+        return {
+          ...prBase,
+          status: "blocked",
+          reason: "merged fix PR head does not match validated repair commit",
+          expected_head_sha: validatedCommit,
+          merged_head_sha: mergedHeadSha || null,
+          retry_recommended: true,
+          merge_method: "squash",
+          waited_ms: waitedMs,
+        };
+      }
+      if (!merged.merged_at) {
+        return {
+          ...prBase,
+          status: "blocked",
+          reason: "merge command completed but GitHub has not reported the pull request as merged",
+          retry_recommended: true,
+          merge_method: "squash",
+          waited_ms: waitedMs,
+        };
+      }
     }
     if (error instanceof RepairMutationFreshnessError) {
       return postFlightFreshnessBlock(prBase, error, waitedMs);
@@ -404,8 +427,8 @@ function finalizeFixPr(action: LooseRecord) {
     }
     throw error;
   }
-  if (!merged?.merged_at) {
-    throw new Error("confirmed merge state was unavailable after accepted post-flight merge");
+  if (!merged?.merged_at || String(merged.head?.sha ?? "").trim() !== validatedCommit) {
+    throw new Error("confirmed merge state was not bound to the validated repair commit");
   }
   return {
     ...prBase,
@@ -413,6 +436,7 @@ function finalizeFixPr(action: LooseRecord) {
     reason: "merged by ClawSweeper Repair post-flight",
     merged_at: merged.merged_at,
     merge_commit_sha: merged.merge_commit_sha ?? null,
+    validated_head_sha: validatedCommit,
     merge_method: "squash",
     commit_subject: mergeMessage.subject,
     summary_lines: mergeMessage.summaryLines,

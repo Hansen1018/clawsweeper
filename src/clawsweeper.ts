@@ -20655,7 +20655,7 @@ function markdownFor(options: {
   const configSurfaceChange = configSurfaceChangeFromContext(options.item.repo, options.context);
   const dataModelChange = dataModelChangeFromContext(options.item.repo, options.context);
   const prSurfaceFiles = prSurfaceFilesFromContext(options.context);
-  return `---
+  const markdown = `---
 number: ${options.item.number}
 repository: ${options.item.repo}
 type: ${options.item.kind}
@@ -20699,6 +20699,7 @@ review_codex_elapsed_ms: ${reviewTelemetryNumber(options.runtime.codexElapsedMs)
 review_mode: ${options.reviewMode}
 review_status: ${options.decision.summary.startsWith("Codex review failed") ? "failed" : "complete"}
 review_terminal_failure: ${options.decision.codexTerminalFailure === true}
+review_verdict: pending
 local_checkout_access: verified
 item_snapshot_hash: ${options.snapshotHash}
 review_content_digest: ${options.contentDigest}
@@ -20961,6 +20962,11 @@ ${renderReviewContextBudget(options.context)}
 - context collection ms: ${reviewTelemetryNumber(options.runtime.contextElapsedMs)}
 - Codex review ms: ${reviewTelemetryNumber(options.runtime.codexElapsedMs)}
   `;
+  const verdict =
+    reviewAutomationMarkersFromReport(markdown).match(
+      /<!--\s*clawsweeper-verdict:([a-z-]+)\b/i,
+    )?.[1] ?? "none";
+  return replaceFrontMatterValue(markdown, "review_verdict", verdict);
 }
 
 function planCommand(args: Args): void {

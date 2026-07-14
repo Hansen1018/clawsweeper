@@ -16,6 +16,7 @@ type RepairMutationReviewBaselineOptions = {
   targetKind: RepairMutationTargetKind;
   authorization: RepairMutationReviewAuthorization;
   explicitCursor?: unknown;
+  explicitVerdict?: unknown;
   expectedUpdatedAt?: unknown;
   expectedHeadSha?: unknown;
   reviewedBefore?: unknown;
@@ -44,7 +45,12 @@ export function resolveRepairMutationReviewActivityCursor(
   if (options.targetKind !== "pull_request") return null;
 
   const explicitCursor = stringValue(options.explicitCursor);
-  if (explicitCursor) return explicitCursor;
+  if (
+    explicitCursor &&
+    isAuthorizedReviewVerdict(options.authorization, stringValue(options.explicitVerdict))
+  ) {
+    return explicitCursor;
+  }
 
   if (stringValue(options.expectedHeadSha)) {
     return trustedRepairReviewActivityCursor(options);
@@ -72,6 +78,7 @@ function storedRepairReviewActivityCursor(
       recordPath,
       repository: options.repository,
       number: options.number,
+      authorization: options.authorization,
       expectedUpdatedAt,
       reviewedBefore,
     });
@@ -84,6 +91,7 @@ function cursorFromStateRecord(options: {
   recordPath: string;
   repository: string;
   number: number;
+  authorization: RepairMutationReviewAuthorization;
   expectedUpdatedAt: string;
   reviewedBefore: number;
 }): string | null {
@@ -106,6 +114,7 @@ function cursorFromStateRecord(options: {
     frontmatter.review_status !== "complete" ||
     frontmatter.review_terminal_failure !== "false" ||
     frontmatter.local_checkout_access !== "verified" ||
+    !isAuthorizedReviewVerdict(options.authorization, stringValue(frontmatter.review_verdict)) ||
     reviewedAt === null ||
     reviewedAt > options.reviewedBefore ||
     !isReviewedPrActivityCursor(cursor)
@@ -127,8 +136,6 @@ function trustedRepairReviewActivityCursor(
     reviewedBefore === null
   )
     return null;
-  const authorizedVerdicts = AUTHORIZED_REVIEW_VERDICTS[options.authorization];
-
   let comments: unknown[];
   try {
     comments =
@@ -167,7 +174,7 @@ function trustedRepairReviewActivityCursor(
     const marker = body.match(/<!--\s*clawsweeper-verdict:([a-z-]+)\b([^>]*)-->/i);
     if (!marker) return null;
     const verdict = (marker[1] ?? "").toLowerCase();
-    if (!authorizedVerdicts.has(verdict)) return null;
+    if (!isAuthorizedReviewVerdict(options.authorization, verdict)) return null;
     const attributes = markerAttributes(marker[2] ?? "");
     const reviewedAt = timestamp(attributes.reviewed_at);
     if (
@@ -181,6 +188,13 @@ function trustedRepairReviewActivityCursor(
     }
     return { cursor: attributes.review_activity_cursor, reviewedAt };
   }
+}
+
+function isAuthorizedReviewVerdict(
+  authorization: RepairMutationReviewAuthorization,
+  verdict: string,
+): boolean {
+  return AUTHORIZED_REVIEW_VERDICTS[authorization].has(verdict.trim().toLowerCase());
 }
 
 function parseFrontmatter(markdown: string): Record<string, string> {

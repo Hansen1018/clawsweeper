@@ -456,6 +456,28 @@ test("repair boundary guards reject drift after the attempt receipt", () => {
 
 test("repair review baselines do not absorb unbound live review activity", () => {
   const reviewedCursor = `v2:1:${"b".repeat(64)}`;
+  assert.equal(
+    resolveRepairMutationReviewActivityCursor({
+      repository: "openclaw/openclaw",
+      number: 123,
+      targetKind: "pull_request",
+      authorization: "merge",
+      explicitCursor: reviewedCursor,
+      explicitVerdict: "close",
+    }),
+    EMPTY_REVIEW_ACTIVITY_CURSOR,
+  );
+  assert.equal(
+    resolveRepairMutationReviewActivityCursor({
+      repository: "openclaw/openclaw",
+      number: 123,
+      targetKind: "pull_request",
+      authorization: "merge",
+      explicitCursor: reviewedCursor,
+      explicitVerdict: "pass",
+    }),
+    reviewedCursor,
+  );
   const expectedReviewActivityCursor = resolveRepairMutationReviewActivityCursor({
     repository: "openclaw/openclaw",
     number: 123,
@@ -497,6 +519,7 @@ test("repair review baselines reuse only state records reviewed before the repai
       "reviewed_at: 2026-07-14T10:01:00Z",
       "review_status: complete",
       "review_terminal_failure: false",
+      "review_verdict: pass",
       "local_checkout_access: verified",
       `review_activity_cursor: ${reviewedCursor}`,
       "---",
@@ -517,6 +540,18 @@ test("repair review baselines reuse only state records reviewed before the repai
         stateRoot: root,
       }),
       reviewedCursor,
+    );
+    assert.equal(
+      resolveRepairMutationReviewActivityCursor({
+        repository: "openclaw/openclaw",
+        number: 123,
+        targetKind: "pull_request",
+        authorization: "close",
+        expectedUpdatedAt: "2026-07-14T10:00:00Z",
+        reviewedBefore: "2026-07-14T10:02:00Z",
+        stateRoot: root,
+      }),
+      EMPTY_REVIEW_ACTIVITY_CURSOR,
     );
     assert.equal(
       resolveRepairMutationReviewActivityCursor({
@@ -797,8 +832,8 @@ test("repair executors route authoritative GitHub writes through the mutation bo
   assert.match(applySource, /kind: "comment_create"/);
   assert.match(applySource, /kind: "pull_request_close"/);
   assert.match(applySource, /kind: "issue_close"/);
-  assert.match(postFlightSource, /kind: "comment_create"/);
-  assert.match(postFlightSource, /"pull_request_close" : "issue_close"/);
+  assert.doesNotMatch(postFlightSource, /kind: "comment_create"/);
+  assert.doesNotMatch(postFlightSource, /kind: "(?:pull_request|issue)_close"/);
   assert.match(receiptSource, /publishMainCommit/);
   assert.match(receiptSource, /importActionEventShards/);
   assert.match(receiptSource, /CLAWSWEEPER_STATE_DIR/);
@@ -812,7 +847,6 @@ test("repair executors route authoritative GitHub writes through the mutation bo
   assert.match(applySource, /authorization: "merge"/);
   assert.match(applySource, /authorization: "close"/);
   assert.match(postFlightSource, /authorization: "merge"/);
-  assert.match(postFlightSource, /authorization: "close"/);
   assert.match(activitySource, /requestedReviewers/);
   assert.match(activitySource, /compactPullRequestRef\(pull\.head\)/);
   assert.match(activitySource, /autoMerge: compactAutoMerge/);
