@@ -106,6 +106,21 @@ export class CloudGitcrawlQuerySource implements GitcrawlQuerySource {
     queryUrl: string,
     request: GitcrawlQueryRequest,
   ): Promise<string> {
+    let requestBody: string;
+    try {
+      requestBody = JSON.stringify({
+        contract_version: GITCRAWL_QUERY_CONTRACT_VERSION,
+        repository: this.repository,
+        archive: this.archive,
+        name: request.name,
+        args: request.args,
+        limit: request.limit,
+        ...(request.cursor ? { cursor: request.cursor } : {}),
+        ...(request.snapshot_id ? { snapshot_id: request.snapshot_id } : {}),
+      });
+    } catch {
+      throw new Error(`Gitcrawl cloud query ${request.name} request is not JSON serializable`);
+    }
     for (let attempt = 1; attempt <= this.maxAttempts; attempt += 1) {
       let response: Response;
       try {
@@ -113,16 +128,7 @@ export class CloudGitcrawlQuerySource implements GitcrawlQuerySource {
           method: "POST",
           redirect: "manual",
           headers: this.requestHeaders(),
-          body: JSON.stringify({
-            contract_version: GITCRAWL_QUERY_CONTRACT_VERSION,
-            repository: this.repository,
-            archive: this.archive,
-            name: request.name,
-            args: request.args,
-            limit: request.limit,
-            ...(request.cursor ? { cursor: request.cursor } : {}),
-            ...(request.snapshot_id ? { snapshot_id: request.snapshot_id } : {}),
-          }),
+          body: requestBody,
           signal: AbortSignal.timeout(this.timeoutMs),
         });
       } catch (error) {
@@ -143,7 +149,7 @@ export class CloudGitcrawlQuerySource implements GitcrawlQuerySource {
         await response.body?.cancel().catch(() => undefined);
         throw new Error(`Gitcrawl cloud query ${request.name} refused a redirected response`);
       }
-      if (response.ok) {
+      if (response.status === 200) {
         try {
           return await readBoundedResponse(response, request.name);
         } catch (error) {
@@ -202,7 +208,9 @@ function assertResponseOrigin(response: Response, queryUrl: string, queryName: s
   if (response.redirected) {
     throw new Error(`Gitcrawl cloud query ${queryName} refused a redirected response`);
   }
-  if (!response.url) return;
+  if (!response.url) {
+    throw new Error(`Gitcrawl cloud query ${queryName} response is missing origin metadata`);
+  }
   const expected = new URL(queryUrl);
   const actual = new URL(response.url);
   if (actual.protocol !== "https:" || actual.origin !== expected.origin) {
@@ -405,7 +413,12 @@ async function readBoundedResponse(response: Response, queryName: string): Promi
   } finally {
     reader.releaseLock();
   }
-  return Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))).toString("utf8");
+  const bytes = Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)));
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    throw new Error(`Gitcrawl cloud query ${queryName} returned malformed UTF-8`);
+  }
 }
 
 function responseTooLarge(queryName: string): Error {
@@ -444,6 +457,13 @@ function parseRetryAfter(response: Response): number | undefined {
   const value = response.headers.get("retry-after")?.trim();
   if (!value) return undefined;
   if (/^[0-9]+$/.test(value)) return Number(value) * 1_000;
+  if (
+    !/^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), \d{2} (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{4} \d{2}:\d{2}:\d{2} GMT$/.test(
+      value,
+    )
+  ) {
+    return undefined;
+  }
   const timestamp = Date.parse(value);
   if (!Number.isFinite(timestamp)) return undefined;
   return Math.max(0, timestamp - Date.now());

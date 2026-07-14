@@ -38,6 +38,7 @@ const revision = "b".repeat(64);
 const fingerprint = "c".repeat(64);
 const repository = "openclaw/openclaw";
 const archive = "gitcrawl/openclaw__openclaw";
+const cloudQueryUrl = `https://crawl.example.test/v1/apps/gitcrawl/archives/${encodeURIComponent(archive)}/query`;
 
 test("six-query adapter binds read-only evidence into verified claims and graph packets", async () => {
   const source = new FixtureSource({
@@ -552,10 +553,12 @@ test("cloud source does not retry before a long Retry-After window", async () =>
     },
     fetch: async () => {
       requests += 1;
-      return new Response("", {
-        status: 429,
-        headers: { "retry-after": "60" },
-      });
+      return cloudResponse(
+        new Response("", {
+          status: 429,
+          headers: { "retry-after": "60" },
+        }),
+      );
     },
   });
   await assert.rejects(
@@ -586,10 +589,12 @@ test("cloud source rejects redirects without retrying authenticated requests", a
     },
     fetch: async () => {
       requests += 1;
-      return new Response("", {
-        status: 302,
-        headers: { location: "https://other.example.test/query" },
-      });
+      return cloudResponse(
+        new Response("", {
+          status: 302,
+          headers: { location: "https://other.example.test/query" },
+        }),
+      );
     },
   });
   await assert.rejects(
@@ -604,6 +609,95 @@ test("cloud source rejects redirects without retrying authenticated requests", a
   );
   assert.equal(requests, 1);
   assert.deepEqual(sleeps, []);
+});
+
+test("cloud source requires exact successful status, origin metadata, and strict UTF-8", async () => {
+  const request = {
+    name: "gitcrawl.coverage" as const,
+    args: {},
+    limit: 50,
+    cursor: "",
+    snapshot_id: "",
+  };
+  for (const [response, pattern] of [
+    [cloudResponse(new Response("{}", { status: 202 })), /failed \(202;/],
+    [new Response("{}", { status: 200 }), /missing origin metadata/],
+    [
+      cloudResponse(
+        new Response(Uint8Array.from([0xc3, 0x28]), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      ),
+      /malformed UTF-8/,
+    ],
+  ] as const) {
+    const source = new CloudGitcrawlQuerySource({
+      baseUrl: "https://crawl.example.test",
+      archive,
+      repository,
+      token: "reader-token",
+      fetch: async () => response,
+    });
+    await assert.rejects(source.query(request), pattern);
+  }
+});
+
+test("cloud source validates request JSON before retrying and ignores malformed Retry-After", async () => {
+  let serializationRequests = 0;
+  const serializationSource = new CloudGitcrawlQuerySource({
+    baseUrl: "https://crawl.example.test",
+    archive,
+    repository,
+    token: "reader-token",
+    fetch: async () => {
+      serializationRequests += 1;
+      return jsonResponse(completeCoverage());
+    },
+  });
+  const circular: Record<string, unknown> = {};
+  circular.self = circular;
+  await assert.rejects(
+    serializationSource.query({
+      name: "gitcrawl.coverage",
+      args: circular,
+      limit: 50,
+      cursor: "",
+      snapshot_id: "",
+    }),
+    /request is not JSON serializable/,
+  );
+  assert.equal(serializationRequests, 0);
+
+  let retryRequests = 0;
+  const sleeps: number[] = [];
+  const retrySource = new CloudGitcrawlQuerySource({
+    baseUrl: "https://crawl.example.test",
+    archive,
+    repository,
+    token: "reader-token",
+    maxAttempts: 2,
+    retryBaseDelayMs: 25,
+    retryMaxDelayMs: 100,
+    sleep: async (delayMs) => {
+      sleeps.push(delayMs);
+    },
+    fetch: async () => {
+      retryRequests += 1;
+      return retryRequests === 1
+        ? cloudResponse(new Response("", { status: 429, headers: { "retry-after": "tomorrow" } }))
+        : jsonResponse(completeCoverage());
+    },
+  });
+  await retrySource.query({
+    name: "gitcrawl.coverage",
+    args: {},
+    limit: 50,
+    cursor: "",
+    snapshot_id: "",
+  });
+  assert.equal(retryRequests, 2);
+  assert.deepEqual(sleeps, [25]);
 });
 
 test("local SQLite source snapshots and serves the six-query contract", async () => {
@@ -984,26 +1078,33 @@ function jsonResponse(
   stats: Record<string, unknown> = {},
 ): Response {
   const columns = values.length > 0 ? Object.keys(values[0]!) : [];
-  return new Response(
-    JSON.stringify({
-      columns,
-      rows: values.map((row) => columns.map((column) => row[column])),
-      values,
-      snapshot: snapshotProvenance(snapshotId),
-      stats: {
-        contract_version: GITCRAWL_QUERY_CONTRACT_VERSION,
-        repository,
-        archive,
-        snapshot_id: snapshotId,
-        source_sync_at: generatedAt,
-        dataset_generated_at: generatedAt,
-        coverage_complete: true,
-        next_cursor: "",
-        ...stats,
-      },
-    }),
-    { status: 200, headers: { "content-type": "application/json" } },
+  return cloudResponse(
+    new Response(
+      JSON.stringify({
+        columns,
+        rows: values.map((row) => columns.map((column) => row[column])),
+        values,
+        snapshot: snapshotProvenance(snapshotId),
+        stats: {
+          contract_version: GITCRAWL_QUERY_CONTRACT_VERSION,
+          repository,
+          archive,
+          snapshot_id: snapshotId,
+          source_sync_at: generatedAt,
+          dataset_generated_at: generatedAt,
+          coverage_complete: true,
+          next_cursor: "",
+          ...stats,
+        },
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    ),
   );
+}
+
+function cloudResponse(response: Response, url = cloudQueryUrl): Response {
+  Object.defineProperty(response, "url", { configurable: true, value: url });
+  return response;
 }
 
 function seedLocalDatabase(dbPath: string): void {
