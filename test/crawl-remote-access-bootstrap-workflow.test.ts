@@ -34,6 +34,10 @@ test("manual workflow keeps bootstrap separate from deployment authority", () =>
     "rotate_service_token",
   ]);
   assert.deepEqual(workflow.permissions, { contents: "read" });
+  assert.deepEqual(workflow.concurrency, {
+    group: "deploy-crawl-remote-production",
+    "cancel-in-progress": false,
+  });
   assert.equal(job.environment, undefined);
   assert.equal(job["runs-on"], "ubuntu-latest");
   assert.equal(job["timeout-minutes"], 10);
@@ -107,7 +111,7 @@ test("manual workflow keeps bootstrap separate from deployment authority", () =>
   assert.match(bootstrap.run, /--runtime-provider local/);
   assert.doesNotMatch(source, /inputs\.(runtime_provider|publisher_enabled)/);
   assert.doesNotMatch(bootstrap.run, /corepack|pnpm/);
-  assert.doesNotMatch(source, /deploy-crawl-remote/);
+  assert.doesNotMatch(source, /uses:.*deploy-crawl-remote|workflow_call:/);
   assert.doesNotMatch(source, /schedule:|push:|pull_request:/);
   assert.equal(
     JSON.parse(readFileSync("package.json", "utf8")).scripts["bootstrap:crawl-remote-access"],

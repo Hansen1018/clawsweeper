@@ -197,6 +197,9 @@ test("deploy consumer gate rejects comment-only claims and accepts a structural 
   const validSource = [
     "jobs:",
     "  deploy:",
+    "    runs-on: ubuntu-latest",
+    "    environment:",
+    "      name: crawl-remote-production",
     "    defaults:",
     "      run:",
     "        shell: bash --noprofile --norc -euo pipefail {0}",
@@ -291,6 +294,50 @@ test("deploy consumer gate rejects comment-only claims and accepts a structural 
   assert.throws(
     () =>
       assertCrawlRemoteDeployConsumerContract(
+        validSource
+          .replace("    env:", "    env :")
+          .replace(
+            '      NODE_OPTIONS: ""',
+            ['      NODE_OPTIONS: ""', "      PATH: /tmp"].join("\n"),
+          ),
+      ),
+    /unsafe inherited PATH binding/,
+  );
+  assert.throws(
+    () =>
+      assertCrawlRemoteDeployConsumerContract(
+        validSource
+          .replace("    defaults:", "    defaults :")
+          .replace(
+            "        shell: bash --noprofile --norc -euo pipefail {0}",
+            [
+              "        shell: bash --noprofile --norc -euo pipefail {0}",
+              "        working-directory: /tmp",
+            ].join("\n"),
+          ),
+      ),
+    /unsafe inherited run controls/,
+  );
+  assert.throws(
+    () =>
+      assertCrawlRemoteDeployConsumerContract(
+        validSource.replace("    runs-on: ubuntu-latest", "    runs-on: self-hosted"),
+      ),
+    /unsafe inherited run controls/,
+  );
+  assert.throws(
+    () =>
+      assertCrawlRemoteDeployConsumerContract(
+        validSource.replace(
+          "    runs-on: ubuntu-latest",
+          ["    runs-on: ubuntu-latest", "    container: untrusted/image"].join("\n"),
+        ),
+      ),
+    /unsafe inherited run controls/,
+  );
+  assert.throws(
+    () =>
+      assertCrawlRemoteDeployConsumerContract(
         validSource.replace(
           '          NODE_OPTIONS: ""',
           ['          NODE_OPTIONS: "--import ./bad.mjs"', '          NODE_OPTIONS: ""'].join("\n"),
@@ -353,6 +400,36 @@ test("deploy consumer gate rejects comment-only claims and accepts a structural 
         ),
       ),
     /resolver outputs must be scoped to credential consumers/,
+  );
+  assert.throws(
+    () =>
+      assertCrawlRemoteDeployConsumerContract(
+        validSource.replace(
+          "      - name: Validate protected production proof credentials",
+          [
+            "      - name: Alternate resolver output access",
+            "        env:",
+            "          UNRELATED_SECRET: ${{ steps['crawl-remote-access-credentials'].outputs['client_secret'] }}",
+            "        run: echo unrelated",
+            "      - name: Validate protected production proof credentials",
+          ].join("\n"),
+        ),
+      ),
+    /resolver outputs must use only allowlisted consumer bindings/,
+  );
+  assert.throws(
+    () =>
+      assertCrawlRemoteDeployConsumerContract(
+        validSource.replace(
+          "      - name: Validate protected production proof credentials",
+          [
+            "      - name: Legacy credential audit",
+            "        run: echo CRAWL_REMOTE_ACCESS_CLIENT_ID CRAWL_REMOTE_ACCESS_CLIENT_SECRET",
+            "      - name: Validate protected production proof credentials",
+          ].join("\n"),
+        ),
+      ),
+    /legacy unversioned references/,
   );
 });
 
@@ -862,7 +939,7 @@ test("retry after an inactive pair failure supersedes every ambiguous token", as
     retryCloudflare.events
       .filter((event) => event.event === "ensure-policy")
       .map((event) => event.tokenIds),
-    [["token-old", "token-partial", "token-retry"], ["token-retry"]],
+    [["token-old", "token-retry"], ["token-retry"]],
   );
   assert.deepEqual(
     retryCloudflare.events.filter((event) => event.event === "delete-token"),

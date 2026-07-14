@@ -26,6 +26,12 @@ values. The bootstrap rechecks the live ClawSweeper `main` SHA before token
 minting, immediately before its first mutation, and again before narrowing
 Access policy or revoking an old service token.
 
+Bootstrap and production deploy runs share one non-cancelling concurrency group,
+so rotation cannot revoke a credential held by an in-flight deploy. During
+rotation, the transitional Access policy includes only marker-selected existing
+generations plus the newly minted generation; orphan name-matching tokens are
+never authorized.
+
 ## First bootstrap
 
 After the generation-slot deploy consumer lands, dispatch the workflow from

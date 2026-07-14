@@ -17,7 +17,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: bootstrap-crawl-remote-access
+  group: deploy-crawl-remote-production
   cancel-in-progress: false
 
 env:

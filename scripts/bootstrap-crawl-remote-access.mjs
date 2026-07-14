@@ -36,7 +36,19 @@ const DEPLOY_CONSUMER_CONTRACT = Object.freeze({
     ENV: "",
     NODE_OPTIONS: "",
   },
+  forbiddenInheritedEnvironment: [
+    "BASHOPTS",
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_LIBRARY_PATH",
+    "LD_LIBRARY_PATH",
+    "LD_PRELOAD",
+    "NODE_PATH",
+    "PATH",
+    "SHELLOPTS",
+  ],
   job: "deploy",
+  jobEnvironment: "crawl-remote-production",
+  jobRunsOn: "ubuntu-latest",
   jobShell: "bash --noprofile --norc -euo pipefail {0}",
   consumerEnvironment: {
     CF_ACCESS_CLIENT_ID: "${{ steps.crawl-remote-access-credentials.outputs.client_id }}",
@@ -57,10 +69,7 @@ const DEPLOY_CONSUMER_CONTRACT = Object.freeze({
     ENV: "",
     NODE_OPTIONS: "",
   },
-  forbiddenReferences: [
-    "secrets.CRAWL_REMOTE_ACCESS_CLIENT_ID",
-    "secrets.CRAWL_REMOTE_ACCESS_CLIENT_SECRET",
-  ],
+  forbiddenReferences: ["CRAWL_REMOTE_ACCESS_CLIENT_ID", "CRAWL_REMOTE_ACCESS_CLIENT_SECRET"],
 });
 const ACCESS_CREDENTIAL_TARGETS = Object.freeze([
   {
@@ -102,6 +111,9 @@ export async function bootstrapCrawlRemoteAccess(options, dependencies) {
   }
 
   const credentialStates = await inspectAccessCredentialStates(github);
+  const markerSelectedTokens = matchingTokens.filter((token) =>
+    credentialStates.some((state) => credentialStateBindsToken(state, token)),
+  );
   if (matchingTokens.length === 1 && !rotateServiceToken) {
     assertCredentialStatesBoundToToken(credentialStates, matchingTokens[0]);
   }
@@ -111,6 +123,7 @@ export async function bootstrapCrawlRemoteAccess(options, dependencies) {
   let activeToken = null;
   let createdCredentials = null;
   let resumedRotation = false;
+  let authorizedOldTokens = [];
 
   if (rotateServiceToken && matchingTokens.length > 1) {
     const boundTokens = matchingTokens.filter((token) =>
@@ -138,6 +151,7 @@ export async function bootstrapCrawlRemoteAccess(options, dependencies) {
 
   if (!activeToken) {
     oldTokens = matchingTokens;
+    authorizedOldTokens = markerSelectedTokens;
     const tokenName =
       oldTokens.length === 0
         ? BOOTSTRAP_CONTRACT.accessServiceTokenName
@@ -154,7 +168,7 @@ export async function bootstrapCrawlRemoteAccess(options, dependencies) {
   const oldTokenIds = oldTokens.map((token) => token.id);
   const transitionalTokenIds =
     createdCredentials && oldTokenIds.length > 0
-      ? [...new Set([...oldTokenIds, activeToken.id])]
+      ? [...new Set([...authorizedOldTokens.map((token) => token.id), activeToken.id])]
       : [activeToken.id];
 
   let configuredPolicy = await cloudflare.ensureAccessPolicy({
@@ -223,7 +237,11 @@ export function assertCrawlRemoteDeployConsumerContract(source) {
   const {
     steps: deploySteps,
     jobEnvironment,
+    jobDeploymentEnvironment,
     jobRunDefaults,
+    jobRunsOn,
+    hasJobContainer,
+    hasJobServices,
     hasWorkflowDefaults,
     hasWorkflowEnvironment,
   } = parseWorkflowJobSteps(source, DEPLOY_CONSUMER_CONTRACT.job);
@@ -248,6 +266,10 @@ export function assertCrawlRemoteDeployConsumerContract(source) {
   if (
     hasWorkflowDefaults ||
     hasWorkflowEnvironment ||
+    hasJobContainer ||
+    hasJobServices ||
+    jobRunsOn !== DEPLOY_CONSUMER_CONTRACT.jobRunsOn ||
+    jobDeploymentEnvironment.get("name") !== DEPLOY_CONSUMER_CONTRACT.jobEnvironment ||
     jobRunDefaults.size !== 1 ||
     jobRunDefaults.get("shell") !== DEPLOY_CONSUMER_CONTRACT.jobShell
   ) {
@@ -255,6 +277,13 @@ export function assertCrawlRemoteDeployConsumerContract(source) {
   }
   for (const [name, value] of Object.entries(DEPLOY_CONSUMER_CONTRACT.inheritedEnvironment)) {
     if (jobEnvironment.get(name) !== value) {
+      throw new Error(
+        `crawl-remote deploy credential resolver has unsafe inherited ${name} binding`,
+      );
+    }
+  }
+  for (const name of DEPLOY_CONSUMER_CONTRACT.forbiddenInheritedEnvironment) {
+    if (jobEnvironment.has(name)) {
       throw new Error(
         `crawl-remote deploy credential resolver has unsafe inherited ${name} binding`,
       );
@@ -341,6 +370,19 @@ export function assertCrawlRemoteDeployConsumerContract(source) {
       );
     }
   }
+  for (const step of deploySteps) {
+    let unapprovedSource = step.source;
+    if (credentialConsumers.some((consumer) => consumer.step === step)) {
+      for (const value of Object.values(DEPLOY_CONSUMER_CONTRACT.consumerEnvironment)) {
+        unapprovedSource = unapprovedSource.replace(value, "");
+      }
+    }
+    if (containsResolverOutputReference(unapprovedSource)) {
+      throw new Error(
+        "crawl-remote deploy resolver outputs must use only allowlisted consumer bindings",
+      );
+    }
+  }
   const hasAccessOverride =
     jobEnvironment.has("CF_ACCESS_CLIENT_ID") ||
     jobEnvironment.has("CF_ACCESS_CLIENT_SECRET") ||
@@ -384,6 +426,15 @@ function countOccurrences(source, value) {
   }
 }
 
+function containsResolverOutputReference(source) {
+  const normalized = source.replace(/\s+/g, "").toLowerCase();
+  return (
+    normalized.includes(DEPLOY_CONSUMER_CONTRACT.stepId.toLowerCase()) &&
+    normalized.includes("outputs") &&
+    (normalized.includes("client_id") || normalized.includes("client_secret"))
+  );
+}
+
 function parseWorkflowJobSteps(source, expectedJob) {
   const lines = source.replace(/\r\n?/g, "\n").split("\n");
   if (lines.some((line) => line.includes("\t"))) {
@@ -394,10 +445,12 @@ function parseWorkflowJobSteps(source, expectedJob) {
     throw new Error("crawl-remote deploy workflow has no jobs mapping");
   }
   const jobsIndex = jobsIndexes[0];
-  const hasWorkflowDefaults = lines.some((line) =>
-    /^(?:"defaults"|'defaults'|defaults):(?:\s|$)/.test(line),
+  const hasWorkflowDefaults = lines.some(
+    (line) => matchYamlMappingLine(line, 0, "defaults") !== null,
   );
-  const hasWorkflowEnvironment = lines.some((line) => /^(?:"env"|'env'|env):(?:\s|$)/.test(line));
+  const hasWorkflowEnvironment = lines.some(
+    (line) => matchYamlMappingLine(line, 0, "env") !== null,
+  );
   const jobIndexes = lines.flatMap((line, index) =>
     index > jobsIndex && line === `  ${expectedJob}:` ? [index] : [],
   );
@@ -420,7 +473,19 @@ function parseWorkflowJobSteps(source, expectedJob) {
   }
   const stepsIndex = stepsIndexes[0];
   const jobEnvironment = parseJobMapping(lines, jobStart, stepsIndex, "env");
+  const jobDeploymentEnvironment = parseJobMapping(lines, jobStart, stepsIndex, "environment");
   const jobRunDefaults = parseJobRunDefaults(lines, jobStart, stepsIndex);
+  const jobRunsOnEntries = lines
+    .slice(jobStart + 1, stepsIndex)
+    .map((line) => matchYamlMappingLine(line, 4, "runs-on"))
+    .filter((value) => value !== null);
+  const jobRunsOn = jobRunsOnEntries.length === 1 ? parseYamlScalar(jobRunsOnEntries[0]) : null;
+  const hasJobContainer = lines
+    .slice(jobStart + 1, stepsIndex)
+    .some((line) => matchYamlMappingLine(line, 4, "container") !== null);
+  const hasJobServices = lines
+    .slice(jobStart + 1, stepsIndex)
+    .some((line) => matchYamlMappingLine(line, 4, "services") !== null);
 
   const steps = [];
   for (let index = stepsIndex + 1; index < jobEnd; index += 1) {
@@ -444,17 +509,22 @@ function parseWorkflowJobSteps(source, expectedJob) {
   return {
     steps,
     jobEnvironment,
+    jobDeploymentEnvironment,
     jobRunDefaults,
+    jobRunsOn,
+    hasJobContainer,
+    hasJobServices,
     hasWorkflowDefaults,
     hasWorkflowEnvironment,
   };
 }
 
 function parseJobMapping(lines, jobStart, stepsIndex, key) {
-  const header = `    ${key}:`;
-  const indexes = lines.flatMap((line, index) =>
-    index > jobStart && index < stepsIndex && line === header ? [index] : [],
-  );
+  const indexes = lines.flatMap((line, index) => {
+    if (index <= jobStart || index >= stepsIndex) return [];
+    const value = matchYamlMappingLine(line, 4, key);
+    return value === "" ? [index] : [];
+  });
   if (indexes.length !== 1) {
     return new Map();
   }
@@ -462,8 +532,8 @@ function parseJobMapping(lines, jobStart, stepsIndex, key) {
   for (let index = indexes[0] + 1; index < stepsIndex; index += 1) {
     const line = lines[index];
     if (/^\s*$/.test(line) || /^\s*#/.test(line)) continue;
-    if (/^    [A-Za-z0-9_-]+:\s*$/.test(line)) break;
-    const match = /^      ([A-Za-z_][A-Za-z0-9_]*):\s*(.*?)\s*$/.exec(line);
+    if (isYamlMappingAtIndent(line, 4)) break;
+    const match = /^      ([A-Za-z_][A-Za-z0-9_-]*):\s*(.*?)\s*$/.exec(line);
     if (!match || values.has(match[1])) {
       throw new Error(`crawl-remote deploy workflow has invalid inherited ${key} syntax`);
     }
@@ -473,9 +543,11 @@ function parseJobMapping(lines, jobStart, stepsIndex, key) {
 }
 
 function parseJobRunDefaults(lines, jobStart, stepsIndex) {
-  const indexes = lines.flatMap((line, index) =>
-    index > jobStart && index < stepsIndex && line === "    defaults:" ? [index] : [],
-  );
+  const indexes = lines.flatMap((line, index) => {
+    if (index <= jobStart || index >= stepsIndex) return [];
+    const value = matchYamlMappingLine(line, 4, "defaults");
+    return value === "" ? [index] : [];
+  });
   if (indexes.length !== 1) {
     return new Map();
   }
@@ -484,8 +556,8 @@ function parseJobRunDefaults(lines, jobStart, stepsIndex) {
   for (let index = indexes[0] + 1; index < stepsIndex; index += 1) {
     const line = lines[index];
     if (/^\s*$/.test(line) || /^\s*#/.test(line)) continue;
-    if (/^    [A-Za-z0-9_-]+:\s*$/.test(line)) break;
-    if (line === "      run:") {
+    if (isYamlMappingAtIndent(line, 4)) break;
+    if (matchYamlMappingLine(line, 6, "run") === "") {
       if (foundRun) {
         throw new Error("crawl-remote deploy workflow has duplicate inherited run defaults");
       }
@@ -499,6 +571,19 @@ function parseJobRunDefaults(lines, jobStart, stepsIndex) {
     values.set(match[1], parseYamlScalar(match[2]));
   }
   return foundRun ? values : new Map();
+}
+
+function matchYamlMappingLine(line, indentation, key) {
+  const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const pattern = new RegExp(
+    `^ {${indentation}}(?:"${escapedKey}"|'${escapedKey}'|${escapedKey})\\s*:\\s*(.*?)\\s*$`,
+  );
+  return pattern.exec(line)?.[1] ?? null;
+}
+
+function isYamlMappingAtIndent(line, indentation) {
+  const pattern = new RegExp(`^ {${indentation}}(?:"[^"]+"|'[^']+'|[A-Za-z0-9_-]+)\\s*:`);
+  return pattern.test(line);
 }
 
 function parseWorkflowStep(lines, firstEntry) {
