@@ -14,14 +14,16 @@ type RepairMutationReviewBaselineOptions = {
   repository: string;
   number: number;
   targetKind: RepairMutationTargetKind;
+  authorization: RepairMutationReviewAuthorization;
   explicitCursor?: unknown;
   expectedUpdatedAt?: unknown;
   expectedHeadSha?: unknown;
   reviewedBefore?: unknown;
   stateRoot?: string | null;
   readIssueComments?: () => unknown[];
-  allowedVerdicts?: readonly string[];
 };
+
+export type RepairMutationReviewAuthorization = "merge" | "close";
 
 const DEFAULT_TRUSTED_REVIEW_AUTHORS = new Set(
   [
@@ -31,6 +33,10 @@ const DEFAULT_TRUSTED_REVIEW_AUTHORS = new Set(
     process.env.CLAWSWEEPER_COMMENT_AUTHOR_LOGIN,
   ].filter((value): value is string => typeof value === "string" && value.length > 0),
 );
+const AUTHORIZED_REVIEW_VERDICTS: Record<RepairMutationReviewAuthorization, ReadonlySet<string>> = {
+  merge: new Set(["pass"]),
+  close: new Set(["close"]),
+};
 
 export function resolveRepairMutationReviewActivityCursor(
   options: RepairMutationReviewBaselineOptions,
@@ -121,9 +127,7 @@ function trustedRepairReviewActivityCursor(
     reviewedBefore === null
   )
     return null;
-  const allowedVerdicts = new Set(
-    (options.allowedVerdicts ?? ["pass"]).map((value) => value.trim().toLowerCase()),
-  );
+  const authorizedVerdicts = AUTHORIZED_REVIEW_VERDICTS[options.authorization];
 
   let comments: unknown[];
   try {
@@ -163,7 +167,7 @@ function trustedRepairReviewActivityCursor(
     const marker = body.match(/<!--\s*clawsweeper-verdict:([a-z-]+)\b([^>]*)-->/i);
     if (!marker) return null;
     const verdict = (marker[1] ?? "").toLowerCase();
-    if (!allowedVerdicts.has(verdict)) return null;
+    if (!authorizedVerdicts.has(verdict)) return null;
     const attributes = markerAttributes(marker[2] ?? "");
     const reviewedAt = timestamp(attributes.reviewed_at);
     if (

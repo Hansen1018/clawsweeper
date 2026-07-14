@@ -90,7 +90,6 @@ const CLEAN_MERGE_STATES = new Set(["CLEAN"]);
 const VIABLE_COVERING_PR_MERGE_STATES = new Set(["CLEAN", "BEHIND"]);
 const PR_CLOSE_COVERAGE_PROOF_COMMENT_LIMIT = 50;
 const GITHUB_MAX_PAGE_SIZE = 100;
-const REVIEW_BASELINE_VERDICTS = ["pass", "close", "needs-changes", "needs-human"] as const;
 const CLAWSWEEPER_COMMAND_ONLY_PATTERN = /^@clawsweeper\s+(?:re-review|re-run|review)\s*$/i;
 const CLAWSWEEPER_BOT_AUTHORS = new Set(
   [
@@ -685,11 +684,11 @@ function applyCloseAction({
         repository: result.repo,
         number: target,
         targetKind: kind,
+        authorization: "close",
         explicitCursor: action.review_activity_cursor ?? action.target_review_activity_cursor,
         expectedUpdatedAt,
         expectedHeadSha: clusterPlanPullHeadSha(target),
         reviewedBefore: clusterPlan?.generated_at ?? result.generated_at,
-        allowedVerdicts: REVIEW_BASELINE_VERDICTS,
       }),
     });
     const coveringBoundaryGuard = coveringAuthorizationSnapshot
@@ -822,11 +821,11 @@ function applyMergeAction({
           repository: result.repo,
           number: target,
           targetKind: "pull_request",
+          authorization: "merge",
           explicitCursor: action.review_activity_cursor ?? action.target_review_activity_cursor,
           expectedUpdatedAt,
           expectedHeadSha: clusterPlanPullHeadSha(target),
           reviewedBefore: clusterPlan?.generated_at ?? result.generated_at,
-          allowedVerdicts: REVIEW_BASELINE_VERDICTS,
         }),
       });
     } catch (error) {

@@ -58,7 +58,6 @@ const FIX_PR_MERGE_STATES = new Set(["CLEAN", "HAS_HOOKS", "UNSTABLE"]);
 const FIX_PR_ACTIONS = new Set(["open_fix_pr", "repair_contributor_branch"]);
 const FIX_PR_READY_STATUSES = new Set(["opened", "pushed"]);
 const DEFAULT_IGNORED_CHECKS = ["auto-response", "Labeler", "Stale"];
-const REVIEW_BASELINE_VERDICTS = ["pass", "close", "needs-changes", "needs-human"] as const;
 const POST_FLIGHT_WAIT_MS = numberEnv("CLAWSWEEPER_POST_FLIGHT_WAIT_MS", 10 * 60 * 1000);
 const POST_FLIGHT_POLL_MS = numberEnv("CLAWSWEEPER_POST_FLIGHT_POLL_MS", 15 * 1000);
 
@@ -255,6 +254,7 @@ function finalizeFixPr(action: LooseRecord) {
             repository: result.repo,
             number: parsed.number,
             targetKind: "pull_request",
+            authorization: "merge",
             explicitCursor:
               action.review_activity_cursor ?? action.merge_preflight?.review_activity_cursor,
             expectedUpdatedAt: pull.updated_at ?? view.updatedAt,
@@ -575,11 +575,11 @@ function finalizePostMergeCloseout({
           repository: result.repo,
           number: target,
           targetKind: live.pull_request ? "pull_request" : "issue",
+          authorization: "close",
           explicitCursor: action.target_review_activity_cursor,
           expectedUpdatedAt,
           expectedHeadSha: clusterPlanPullHeadSha(target),
           reviewedBefore: clusterPlan?.generated_at ?? result.generated_at,
-          allowedVerdicts: REVIEW_BASELINE_VERDICTS,
         }),
       });
     } catch (error) {

@@ -460,6 +460,7 @@ test("repair review baselines do not absorb unbound live review activity", () =>
     repository: "openclaw/openclaw",
     number: 123,
     targetKind: "pull_request",
+    authorization: "merge",
     expectedUpdatedAt: "2026-07-14T10:00:00Z",
   });
   assert.equal(expectedReviewActivityCursor, EMPTY_REVIEW_ACTIVITY_CURSOR);
@@ -510,6 +511,7 @@ test("repair review baselines reuse only state records reviewed before the repai
         repository: "openclaw/openclaw",
         number: 123,
         targetKind: "pull_request",
+        authorization: "merge",
         expectedUpdatedAt: "2026-07-14T10:00:00Z",
         reviewedBefore: "2026-07-14T10:02:00Z",
         stateRoot: root,
@@ -521,6 +523,7 @@ test("repair review baselines reuse only state records reviewed before the repai
         repository: "openclaw/openclaw",
         number: 123,
         targetKind: "pull_request",
+        authorization: "merge",
         expectedUpdatedAt: "2026-07-14T10:00:00Z",
         reviewedBefore: "2026-07-14T10:00:30Z",
         stateRoot: root,
@@ -556,6 +559,7 @@ test("repair review baselines accept only trusted exact-head post-repair verdict
       repository: "openclaw/openclaw",
       number: 123,
       targetKind: "pull_request",
+      authorization: "merge",
       expectedUpdatedAt: "2026-07-14T10:00:00Z",
       expectedHeadSha,
       reviewedBefore: "2026-07-14T10:02:00Z",
@@ -568,6 +572,7 @@ test("repair review baselines accept only trusted exact-head post-repair verdict
       repository: "openclaw/openclaw",
       number: 123,
       targetKind: "pull_request",
+      authorization: "merge",
       expectedUpdatedAt: "2026-07-14T10:00:00Z",
       expectedHeadSha: "d".repeat(40),
       reviewedBefore: "2026-07-14T10:02:00Z",
@@ -580,6 +585,7 @@ test("repair review baselines accept only trusted exact-head post-repair verdict
       repository: "openclaw/openclaw",
       number: 123,
       targetKind: "pull_request",
+      authorization: "merge",
       expectedUpdatedAt: "2026-07-14T10:00:01Z",
       expectedHeadSha,
       reviewedBefore: "2026-07-14T10:02:00Z",
@@ -587,6 +593,56 @@ test("repair review baselines accept only trusted exact-head post-repair verdict
     }),
     null,
   );
+});
+
+test("repair review baselines require action-specific authorization", () => {
+  const expectedHeadSha = "a".repeat(40);
+  const passCursor = `v2:1:${"b".repeat(64)}`;
+  const closeCursor = `v2:2:${"c".repeat(64)}`;
+  const blockedCursor = `v2:3:${"d".repeat(64)}`;
+  const verdictComment = (verdict: string, cursor: string, reviewedAt: string) => ({
+    user: { login: "openclaw-clawsweeper[bot]" },
+    body: `<!-- clawsweeper-verdict:${verdict} item=123 sha=${expectedHeadSha} updated_at=2026-07-14T10:00:00Z reviewed_at=${reviewedAt} review_activity_cursor=${cursor} -->`,
+  });
+  const resolve = (
+    authorization: "merge" | "close",
+    comments: ReturnType<typeof verdictComment>[],
+  ) =>
+    resolveRepairMutationReviewActivityCursor({
+      repository: "openclaw/openclaw",
+      number: 123,
+      targetKind: "pull_request",
+      authorization,
+      expectedUpdatedAt: "2026-07-14T10:00:00Z",
+      expectedHeadSha,
+      reviewedBefore: "2026-07-14T10:05:00Z",
+      readIssueComments: () => comments,
+    });
+
+  assert.equal(
+    resolve("merge", [
+      verdictComment("pass", passCursor, "2026-07-14T10:01:00Z"),
+      verdictComment("close", closeCursor, "2026-07-14T10:02:00Z"),
+    ]),
+    passCursor,
+  );
+  assert.equal(
+    resolve("close", [
+      verdictComment("pass", passCursor, "2026-07-14T10:01:00Z"),
+      verdictComment("close", closeCursor, "2026-07-14T10:02:00Z"),
+    ]),
+    closeCursor,
+  );
+  for (const verdict of ["needs-changes", "needs-human"]) {
+    assert.equal(
+      resolve("merge", [verdictComment(verdict, blockedCursor, "2026-07-14T10:03:00Z")]),
+      null,
+    );
+    assert.equal(
+      resolve("close", [verdictComment(verdict, blockedCursor, "2026-07-14T10:03:00Z")]),
+      null,
+    );
+  }
 });
 
 test("repair freshness rejects concurrent target activity after an owned comment", () => {
@@ -751,7 +807,12 @@ test("repair executors route authoritative GitHub writes through the mutation bo
   assert.match(reviewBaselineSource, /reviewedAt > options\.reviewedBefore/);
   assert.match(reviewBaselineSource, /candidate\.reviewedAt <= reviewedBefore/);
   assert.match(reviewBaselineSource, /attributes\.updated_at !== expectedUpdatedAt/);
-  assert.match(reviewBaselineSource, /allowedVerdicts/);
+  assert.match(reviewBaselineSource, /AUTHORIZED_REVIEW_VERDICTS/);
+  assert.doesNotMatch(reviewBaselineSource, /needs-changes|needs-human/);
+  assert.match(applySource, /authorization: "merge"/);
+  assert.match(applySource, /authorization: "close"/);
+  assert.match(postFlightSource, /authorization: "merge"/);
+  assert.match(postFlightSource, /authorization: "close"/);
   assert.match(activitySource, /requestedReviewers/);
   assert.match(activitySource, /compactPullRequestRef\(pull\.head\)/);
   assert.match(activitySource, /autoMerge: compactAutoMerge/);
