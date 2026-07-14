@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import process from "node:process";
 import { pathToFileURL } from "node:url";
 
@@ -20,6 +21,21 @@ export const BOOTSTRAP_CONTRACT = Object.freeze({
 });
 
 const ACCESS_CREDENTIAL_SLOTS = Object.freeze(["blue", "green"]);
+const DEPLOY_CONSUMER_CONTRACT = Object.freeze({
+  marker: "crawl-remote-access-contract: generation-slots-v1",
+  path: ".github/workflows/deploy-crawl-remote.yml",
+  requiredReferences: [
+    "vars.CRAWL_REMOTE_ACCESS_CREDENTIAL_GENERATION",
+    "secrets.CRAWL_REMOTE_ACCESS_BLUE_CLIENT_ID",
+    "secrets.CRAWL_REMOTE_ACCESS_BLUE_CLIENT_SECRET",
+    "secrets.CRAWL_REMOTE_ACCESS_GREEN_CLIENT_ID",
+    "secrets.CRAWL_REMOTE_ACCESS_GREEN_CLIENT_SECRET",
+  ],
+  forbiddenReferences: [
+    "secrets.CRAWL_REMOTE_ACCESS_CLIENT_ID",
+    "secrets.CRAWL_REMOTE_ACCESS_CLIENT_SECRET",
+  ],
+});
 const ACCESS_CREDENTIAL_TARGETS = Object.freeze([
   {
     label: "crawl-remote-production",
@@ -168,6 +184,41 @@ export async function bootstrapCrawlRemoteAccess(options, dependencies) {
     publisherEnabled,
     accessPolicyId: configuredPolicy.id,
   };
+}
+
+export function assertCrawlRemoteDeployConsumerContract(source) {
+  if (typeof source !== "string") {
+    throw new Error("crawl-remote deploy consumer source is unavailable");
+  }
+  const missingReferences = [
+    DEPLOY_CONSUMER_CONTRACT.marker,
+    ...DEPLOY_CONSUMER_CONTRACT.requiredReferences,
+  ].filter((reference) => !source.includes(reference));
+  const legacyReferences = DEPLOY_CONSUMER_CONTRACT.forbiddenReferences.filter((reference) =>
+    source.includes(reference),
+  );
+  if (missingReferences.length > 0 || legacyReferences.length > 0) {
+    throw new Error(
+      "crawl-remote deploy consumer is not generation-slot ready; bootstrap remains inert" +
+        (missingReferences.length > 0
+          ? `; missing contract references: ${missingReferences.join(", ")}`
+          : "") +
+        (legacyReferences.length > 0
+          ? `; legacy unversioned references remain: ${legacyReferences.join(", ")}`
+          : ""),
+    );
+  }
+}
+
+function assertLocalDeployConsumerContract() {
+  let source;
+  try {
+    source = readFileSync(DEPLOY_CONSUMER_CONTRACT.path, "utf8");
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`cannot read ${DEPLOY_CONSUMER_CONTRACT.path}: ${detail}`);
+  }
+  assertCrawlRemoteDeployConsumerContract(source);
 }
 
 async function inspectAccessCredentialStates(github) {
@@ -814,9 +865,15 @@ function parseArgs(argv) {
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
+  if (args["check-consumer-contract"]) {
+    assertLocalDeployConsumerContract();
+    console.log("verified crawl-remote generation-slot deploy consumer contract");
+    return;
+  }
   if (args.confirm !== BOOTSTRAP_CONTRACT.confirmation) {
     throw new Error(`--confirm must equal "${BOOTSTRAP_CONTRACT.confirmation}"`);
   }
+  assertLocalDeployConsumerContract();
   const cloudflare = createCloudflareClient({
     token: process.env.OPENCLAW_CLOUDFLARE_CONFIG_API_TOKEN,
   });

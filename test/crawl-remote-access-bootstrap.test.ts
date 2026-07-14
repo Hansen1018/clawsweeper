@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import test from "node:test";
 import {
   BOOTSTRAP_CONTRACT,
+  assertCrawlRemoteDeployConsumerContract,
   bootstrapCrawlRemoteAccess,
   credentialGenerationMarker,
   createCloudflareClient,
@@ -170,6 +171,34 @@ function variableValue(variables: VariableTarget[], name: string, repository: st
   return variables.find((variable) => variable.name === name && variable.repository === repository)
     ?.value;
 }
+
+test("deploy consumer gate rejects legacy names and accepts the explicit slot contract", () => {
+  assert.throws(
+    () =>
+      assertCrawlRemoteDeployConsumerContract(
+        [
+          "crawl-remote-access-contract: generation-slots-v1",
+          "vars.CRAWL_REMOTE_ACCESS_CREDENTIAL_GENERATION",
+          "secrets.CRAWL_REMOTE_ACCESS_CLIENT_ID",
+          "secrets.CRAWL_REMOTE_ACCESS_CLIENT_SECRET",
+        ].join("\n"),
+      ),
+    /bootstrap remains inert.*missing contract references.*legacy unversioned references remain/,
+  );
+
+  assert.doesNotThrow(() =>
+    assertCrawlRemoteDeployConsumerContract(
+      [
+        "crawl-remote-access-contract: generation-slots-v1",
+        "vars.CRAWL_REMOTE_ACCESS_CREDENTIAL_GENERATION",
+        "secrets.CRAWL_REMOTE_ACCESS_BLUE_CLIENT_ID",
+        "secrets.CRAWL_REMOTE_ACCESS_BLUE_CLIENT_SECRET",
+        "secrets.CRAWL_REMOTE_ACCESS_GREEN_CLIENT_ID",
+        "secrets.CRAWL_REMOTE_ACCESS_GREEN_CLIENT_SECRET",
+      ].join("\n"),
+    ),
+  );
+});
 
 test("first bootstrap creates one service-auth policy and writes every destination", async () => {
   const cloudflare = createCloudflareFixture();

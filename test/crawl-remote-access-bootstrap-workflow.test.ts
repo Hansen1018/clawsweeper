@@ -20,6 +20,9 @@ test("manual workflow keeps bootstrap separate from deployment authority", () =>
   const setupNode = job.steps.find(
     (candidate: { name?: string }) => candidate.name === "Set up Node",
   );
+  const consumerContract = job.steps.find(
+    (candidate: { name?: string }) => candidate.name === "Verify generation-slot consumer contract",
+  );
 
   assert.deepEqual(Object.keys(workflow.on), ["workflow_dispatch"]);
   assert.deepEqual(workflow.permissions, { contents: "read" });
@@ -56,6 +59,12 @@ test("manual workflow keeps bootstrap separate from deployment authority", () =>
   const gitcrawlStoreToken = job.steps.find(
     (candidate: { name?: string }) => candidate.name === "Create gitcrawl-store bootstrap token",
   );
+  assert.equal(
+    consumerContract.run,
+    "node scripts/bootstrap-crawl-remote-access.mjs --check-consumer-contract",
+  );
+  assert.ok(job.steps.indexOf(consumerContract) < job.steps.indexOf(clawsweeperToken));
+  assert.equal(consumerContract.env, undefined);
   assert.equal(
     clawsweeperToken.uses,
     "actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1",
@@ -98,5 +107,6 @@ test("operator docs preserve the two-phase rollout and no-deploy boundary", () =
   assert.match(docs, /GITCRAWL_CLOUD_STAGE_ONLY=1/);
   assert.match(docs, /temporarily\s+allows every old and new token ID/);
   assert.match(docs, /generation marker and selects the matching slot/);
+  assert.match(docs, /fails closed before privileged work/);
   assert.match(docs, /never prints returned service credentials/);
 });

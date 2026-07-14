@@ -4,9 +4,18 @@ The manual `Bootstrap crawl-remote Access` workflow owns configuration only. It
 does not deploy crawl-remote, alter deployment protection, or provide a fallback
 Cloudflare token to the deploy workflow.
 
+The workflow is intentionally inert until the separately owned deploy consumer
+declares `crawl-remote-access-contract: generation-slots-v1`, resolves
+`CRAWL_REMOTE_ACCESS_CREDENTIAL_GENERATION`, references both blue and green
+credential pairs, and removes the legacy unversioned secret references. The
+bootstrap verifies that source contract before minting privileged GitHub tokens
+and again before any Cloudflare or GitHub mutation. Until that consumer change
+lands, every dispatch fails closed before privileged work.
+
 ## First bootstrap
 
-Dispatch the workflow from current `main` with:
+After the generation-slot deploy consumer lands, dispatch the workflow from
+current `main` with:
 
 - confirmation: `bootstrap crawl-remote access`
 - rotate service token: off
