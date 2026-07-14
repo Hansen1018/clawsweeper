@@ -4,6 +4,11 @@ The manual `Bootstrap crawl-remote Access` workflow owns configuration only. It
 does not deploy crawl-remote, alter deployment protection, or provide a fallback
 Cloudflare token to the deploy workflow.
 
+Until the separately reviewed slot-aware consumer lands, production deployment
+continues to use the existing `CRAWL_REMOTE_CLOUDFLARE_TOKEN_SHA256` contract.
+The bootstrap stages the future salted fingerprint but does not make it a live
+deployment requirement.
+
 The workflow is intentionally inert until the separately owned deploy consumer
 adds one exact `crawl_remote_access_verify` job after `preflight` and `deploy`.
 That fresh protected-environment job has only a pinned sparse checkout at the
