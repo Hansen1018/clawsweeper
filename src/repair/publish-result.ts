@@ -257,10 +257,12 @@ function publishResult(resultPath: string) {
     );
   }
 
-  for (const action of report.apply_actions.filter(
-    (action: JsonValue) => action.status === "executed",
-  )) {
-    writeClosedRecord({ report, action, owner, root });
+  if (canonicalDecision.publish) {
+    for (const action of report.apply_actions.filter(
+      (action: JsonValue) => action.status === "executed",
+    )) {
+      writeClosedRecord({ report, action, owner, root });
+    }
   }
 
   recordRepairLifecycleEvent(

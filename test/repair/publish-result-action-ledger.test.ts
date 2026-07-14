@@ -215,20 +215,25 @@ test("publisher keeps the newer canonical report when an older generation finish
       publisherRunId: "9902",
       createdAt: "2026-07-13T10:01:00Z",
       summary: "newer generation",
+      closeReason: "newer generation closed the target",
     });
     const staleOutput = publishFixture(root, {
       runId: "9001",
       publisherRunId: "9901",
       createdAt: "2026-07-13T10:00:00Z",
       summary: "older generation finishing later",
+      closeReason: "stale generation replaced the target",
     });
 
     const canonical = fs.readFileSync(path.join(root, "results/openclaw/repair-pr-42.md"), "utf8");
+    const closedRecord = fs.readFileSync(path.join(root, "jobs/openclaw/closed/42.md"), "utf8");
     const staleRecord = JSON.parse(
       fs.readFileSync(path.join(root, "results/runs/9001.json"), "utf8"),
     );
     assert.match(canonical, /newer generation/);
     assert.doesNotMatch(canonical, /older generation finishing later/);
+    assert.match(closedRecord, /newer generation closed the target/);
+    assert.doesNotMatch(closedRecord, /stale generation replaced the target/);
     assert.equal(staleRecord.canonical_publication_status, "stale_noop");
     assert.equal(staleRecord.canonical_superseded_by_run_id, "9002");
     assert.equal(staleOutput.records[0]?.canonical_publication_status, "stale_noop");
@@ -504,6 +509,7 @@ function publishFixture(
     publisherRunId: string;
     createdAt: string;
     summary: string;
+    closeReason?: string;
   },
 ) {
   const runDir = path.join(root, "artifacts", `clawsweeper-repair-${fixture.runId}-1`, "run");
@@ -527,6 +533,22 @@ function publishFixture(
       items: [],
     })}\n`,
   );
+  if (fixture.closeReason) {
+    fs.writeFileSync(
+      path.join(runDir, "apply-report.json"),
+      `${JSON.stringify({
+        actions: [
+          {
+            target: "#42",
+            action: "close_duplicate",
+            status: "executed",
+            classification: "duplicate",
+            reason: fixture.closeReason,
+          },
+        ],
+      })}\n`,
+    );
+  }
   const output = execFileSync(
     process.execPath,
     [
