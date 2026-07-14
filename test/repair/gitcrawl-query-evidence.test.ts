@@ -1000,6 +1000,33 @@ test("local PR file aggregation is scoped to the selected repository", async () 
   }
 });
 
+test("local close removes its snapshot when database close fails", async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-query-close-"));
+  const dbPath = path.join(directory, "gitcrawl.db");
+  seedLocalDatabase(dbPath);
+  const source = await LocalGitcrawlQuerySource.open({
+    dbPath,
+    repository,
+    allowLegacy: false,
+  });
+  const internals = source as unknown as {
+    db: { close: () => void };
+    tempDir: string;
+  };
+  const originalClose = internals.db.close.bind(internals.db);
+  const closeError = new Error("fixture database close failed");
+  internals.db.close = () => {
+    originalClose();
+    throw closeError;
+  };
+  try {
+    await assert.rejects(source.close(), (error: unknown) => error === closeError);
+    assert.equal(fs.existsSync(internals.tempDir), false);
+  } finally {
+    fs.rmSync(directory, { force: true, recursive: true });
+  }
+});
+
 test("local coverage rejects active clusters without valid memberships", async () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-query-coverage-"));
   const dbPath = path.join(directory, "gitcrawl.db");

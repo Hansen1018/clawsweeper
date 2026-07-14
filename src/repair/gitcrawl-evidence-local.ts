@@ -209,12 +209,34 @@ export class LocalGitcrawlQuerySource implements GitcrawlQuerySource {
   }
 
   private async closeOnce(): Promise<void> {
+    const cleanupErrors: unknown[] = [];
     if (!this.databaseClosed) {
-      this.db.close();
-      this.databaseClosed = true;
+      try {
+        this.db.close();
+        this.databaseClosed = true;
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
     }
-    await rm(this.tempDir, { force: true, recursive: true });
-    this.cleanupComplete = true;
+    try {
+      await rm(this.tempDir, { force: true, recursive: true });
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+    if (cleanupErrors.length === 0) {
+      this.cleanupComplete = true;
+      return;
+    }
+    if (cleanupErrors.length === 1) {
+      throw cleanupErrors[0];
+    }
+    throw new AggregateError(
+      cleanupErrors,
+      "failed to close and clean up the local Gitcrawl snapshot",
+      {
+        cause: cleanupErrors[0],
+      },
+    );
   }
 
   private queryRows(
