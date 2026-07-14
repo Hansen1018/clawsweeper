@@ -12,6 +12,7 @@ import {
   GITCRAWL_QUERY_CONTRACT_VERSION,
   GITCRAWL_QUERY_NAMES,
   canonicalJson,
+  createGitcrawlEvidenceClaim,
   sha256Canonical,
   type GitcrawlCoverageRow,
   type GitcrawlQueryEnvelope,
@@ -191,6 +192,63 @@ test("query evidence fails closed on source, relation, review, and packet drift"
       /query contains unsupported field ignored/,
     );
     await adapter.close();
+  });
+
+  await t.test("standalone claims have inconsistent parity bindings", () => {
+    const base = {
+      repository,
+      snapshotId,
+      queryName: "gitcrawl.coverage" as const,
+      queryArgs: {},
+      subject: `${repository}#dataset:threads`,
+      data: { dataset: "threads" },
+    };
+    assert.throws(
+      () => createGitcrawlEvidenceClaim({ ...base, provider: "parity" }),
+      /missing its local snapshot/,
+    );
+    assert.throws(
+      () =>
+        createGitcrawlEvidenceClaim({
+          ...base,
+          provider: "cloud",
+          paritySnapshotId: "d".repeat(64),
+        }),
+      /non-parity claim has a parity snapshot/,
+    );
+  });
+
+  await t.test("claim relations have unsupported semantics", () => {
+    const base = {
+      provider: "cloud" as const,
+      repository,
+      snapshotId,
+      queryName: "gitcrawl.coverage" as const,
+      queryArgs: {},
+      subject: `${repository}#dataset:threads`,
+      data: { dataset: "threads" },
+    };
+    assert.throws(
+      () =>
+        createGitcrawlEvidenceClaim({
+          ...base,
+          relations: [
+            {
+              predicate: "owns" as "member_of",
+              target: `${repository}#dataset:repositories`,
+            },
+          ],
+        }),
+      /unsupported Gitcrawl evidence relation/,
+    );
+    assert.throws(
+      () =>
+        createGitcrawlEvidenceClaim({
+          ...base,
+          relations: [{ predicate: "describes", target: " " }],
+        }),
+      /relation target is missing or malformed/,
+    );
   });
 
   await t.test("packet repository is relabeled", async () => {
@@ -494,6 +552,10 @@ test("policy sanitization removes hidden instructions before scoring or claims",
   assert.throws(
     () => sanitizeGitcrawlPromptValue({ "a<!-- x -->": 1, a: 2 }),
     /sanitized key collision/,
+  );
+  assert.equal(
+    deriveGitcrawlThreadPolicySignals("maintenance", "Fix: refresh tokens").concreteFix,
+    true,
   );
 });
 

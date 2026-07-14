@@ -30,7 +30,7 @@ export function deriveGitcrawlThreadPolicySignals(
   return {
     blankTemplate: blankTemplateSignal(body),
     issueReference: /#\d+\b/.test(text),
-    concreteFix: /\b(fixes|fixes?|root cause|repro|regression|bug|problem)\b/i.test(text),
+    concreteFix: /\b(fix(?:es)?|root cause|repro|regression|bug|problem)\b/i.test(text),
     thirdPartyCapability: /\b(new|add|feat).*(plugin|provider|channel|skill|tool|app)\b/i.test(
       text,
     ),

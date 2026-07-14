@@ -17,6 +17,13 @@ export const GITCRAWL_QUERY_NAMES = [
   "gitcrawl.threads.search",
 ] as const;
 
+const GITCRAWL_EVIDENCE_RELATION_PREDICATES = [
+  "member_of",
+  "related_to",
+  "evidence_for",
+  "describes",
+] as const;
+
 export const GITCRAWL_DATASETS = [
   "repositories",
   "threads",
@@ -167,7 +174,14 @@ export function createGitcrawlEvidenceClaim<T>(input: {
   }
   assertGitcrawlRepository(input.repository);
   assertSnapshotId(input.snapshotId);
-  if (input.paritySnapshotId !== undefined) assertSnapshotId(input.paritySnapshotId);
+  if (input.provider === "parity") {
+    if (input.paritySnapshotId === undefined) {
+      throw new Error("Gitcrawl parity claim is missing its local snapshot");
+    }
+    assertSnapshotId(input.paritySnapshotId);
+  } else if (input.paritySnapshotId !== undefined) {
+    throw new Error("Gitcrawl non-parity claim has a parity snapshot");
+  }
   assertNoGitcrawlHtmlCommentMarkers(input.subject, "Gitcrawl claim subject");
   assertNoGitcrawlHtmlCommentMarkers(input.relations ?? [], "Gitcrawl claim relations");
   assertNoGitcrawlHtmlCommentMarkers(input.data, "Gitcrawl claim data");
@@ -194,6 +208,23 @@ export function createGitcrawlEvidenceClaim<T>(input: {
       throw new Error("thread fingerprint algorithm is required");
     }
     assertSha256(input.threadFingerprint.sha256, "thread fingerprint sha256");
+  }
+  for (const relation of input.relations ?? []) {
+    if (!GITCRAWL_EVIDENCE_RELATION_PREDICATES.includes(relation.predicate)) {
+      throw new Error(`unsupported Gitcrawl evidence relation: ${relation.predicate}`);
+    }
+    if (
+      typeof relation.target !== "string" ||
+      !relation.target ||
+      relation.target !== relation.target.trim() ||
+      Buffer.byteLength(relation.target, "utf8") > 2_048 ||
+      [...relation.target].some((character) => {
+        const code = character.codePointAt(0) ?? 0;
+        return code < 32 || code === 127;
+      })
+    ) {
+      throw new Error("Gitcrawl evidence relation target is missing or malformed");
+    }
   }
   const relations = [...(input.relations ?? [])]
     .map((relation) => ({ ...relation }))
