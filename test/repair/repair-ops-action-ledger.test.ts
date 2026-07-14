@@ -86,6 +86,22 @@ test("repair worker jobs upload current-attempt ledgers for the trusted publishe
     1,
   );
   assert.match(cluster, /id: cluster-setup-pnpm\n\s+with:/);
+  assert.match(
+    cluster,
+    /name: Register repair lifecycle receipt[\s\S]*id: lifecycle_session[\s\S]*CLAWSWEEPER_ACTION_SESSION_REMOTE: "0"[\s\S]*repair:action-session -- register/,
+  );
+  assert.match(
+    cluster,
+    /name: Register steerable Action session[\s\S]*register "\$\{\{ inputs\.job \}\}" --skip-repair-receipt/,
+  );
+  assert.match(
+    cluster,
+    /name: Record planning completion[\s\S]*steps\.lifecycle_session\.outcome == 'success'/,
+  );
+  assert.match(
+    cluster,
+    /name: Record planning failure[\s\S]*steps\.lifecycle_session\.outcome == 'success'/,
+  );
   assert.match(cluster, /Finalize cluster repair action ledger/);
   assert.match(
     cluster,
@@ -94,6 +110,10 @@ test("repair worker jobs upload current-attempt ledgers for the trusted publishe
   assert.match(clusterWorker, /pnpm run repair:worker/);
   assert.ok(
     cluster.indexOf("uses: ./.github/actions/setup-action-ledger") <
+      cluster.indexOf("- name: Run worker"),
+  );
+  assert.ok(
+    cluster.indexOf("- name: Register repair lifecycle receipt") <
       cluster.indexOf("- name: Run worker"),
   );
   assert.ok(

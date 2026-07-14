@@ -437,6 +437,13 @@ jobs:
         with:
           codex-home: ${{ steps.codex_session.outputs.codex_home }}
 
+      - name: Register repair lifecycle receipt
+        id: lifecycle_session
+        if: ${{ steps.check_job.outputs.job_exists == '1' }}
+        env:
+          CLAWSWEEPER_ACTION_SESSION_REMOTE: "0"
+        run: pnpm run repair:action-session -- register "${{ inputs.job }}"
+
       - name: Restore Codex session
         id: restore_codex_session
         if: ${{ steps.check_job.outputs.job_exists == '1' && env.CLAWSWEEPER_STEERABLE_CODEX == '1' }}
@@ -455,7 +462,7 @@ jobs:
         env:
           CLAWSWEEPER_CRABFLEET_SERVICE_TOKEN: ${{ secrets.CLAWSWEEPER_CRABFLEET_SERVICE_TOKEN }}
           CLAWSWEEPER_CRABFLEET_OWNER: ${{ vars.CLAWSWEEPER_CRABFLEET_OWNER }}
-        run: pnpm run repair:action-session -- register "${{ inputs.job }}"
+        run: pnpm run repair:action-session -- register "${{ inputs.job }}" --skip-repair-receipt
 
       - name: Verify GitHub read token
         if: ${{ steps.check_job.outputs.job_exists == '1' }}
@@ -569,7 +576,7 @@ jobs:
           key: ${{ runner.os }}-clawsweeper-codex-thread-${{ steps.codex_session.outputs.key }}-${{ github.run_id }}-${{ github.run_attempt }}-cluster
 
       - name: Record planning completion
-        if: ${{ success() && steps.crabfleet_session.outcome == 'success' }}
+        if: ${{ success() && steps.lifecycle_session.outcome == 'success' }}
         run: |
           if [[ "${{ steps.recovery_inputs.outputs.effective_mode }}" == "plan" || "${{ inputs.dry_run }}" == "true" ]]; then
             pnpm run repair:action-session -- update \
@@ -585,7 +592,7 @@ jobs:
           fi
 
       - name: Record planning failure
-        if: ${{ failure() && steps.crabfleet_session.outcome == 'success' }}
+        if: ${{ failure() && steps.lifecycle_session.outcome == 'success' }}
         continue-on-error: true
         run: pnpm run repair:action-session -- update --state blocked --phase planning_failed --summary "Planning Action failed" --completion-reason action_failed
 
