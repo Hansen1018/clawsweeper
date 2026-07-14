@@ -1156,6 +1156,9 @@ function clusterListQueryArgs(
 }
 
 function normalizeCluster(row: Record<string, unknown>): GitcrawlClusterEvidence {
+  const createdAt = requiredTimestamp(row.created_at, "Gitcrawl cluster created_at");
+  const updatedAt = requiredTimestamp(row.updated_at, "Gitcrawl cluster updated_at");
+  const closedAt = optionalTimestamp(row.closed_at, "Gitcrawl cluster closed_at");
   return {
     id: safePositive(row.cluster_id, "cluster id"),
     stableSlug: boundedString(row.stable_slug, 512),
@@ -1175,9 +1178,9 @@ function normalizeCluster(row: Record<string, unknown>): GitcrawlClusterEvidence
       ),
     },
     memberCount: safeNonNegative(row.member_count, "member count"),
-    createdAt: boundedString(row.created_at, 64),
-    updatedAt: boundedString(row.updated_at, 64),
-    closedAt: boundedString(row.closed_at, 64),
+    createdAt,
+    updatedAt,
+    closedAt,
   };
 }
 
@@ -1270,6 +1273,14 @@ function normalizeThread(row: Record<string, unknown>): GitcrawlThreadEvidence {
     row.revision_source_updated_at || row.updated_at_gh || row.updated_at,
     64,
   );
+  if (revisionUpdatedAt) {
+    assertTimestamp(revisionUpdatedAt, "Gitcrawl source revision updated_at");
+  }
+  const createdAt = requiredTimestamp(row.created_at_gh, "Gitcrawl thread created_at");
+  const updatedAt = requiredTimestamp(
+    row.updated_at_gh || row.updated_at,
+    "Gitcrawl thread updated_at",
+  );
   const sourceRevision =
     revisionId === null && !revisionHash && !revisionUpdatedAt
       ? undefined
@@ -1326,8 +1337,8 @@ function normalizeThread(row: Record<string, unknown>): GitcrawlThreadEvidence {
     ...(hasLabelsField ? { labels: boundedJsonArray(promptLabels, 32, 256) } : {}),
     ...(hasAssigneesField ? { assignees: boundedJsonArray(promptAssignees, 16, 256) } : {}),
     isDraft: booleanValue(row.is_draft),
-    createdAt: boundedString(row.created_at_gh, 64),
-    updatedAt: boundedString(row.updated_at_gh || row.updated_at, 64),
+    createdAt,
+    updatedAt,
     keySummary: boundedString(
       stripGitcrawlHtmlComments(safetyString(row.key_summary, "thread key summary")),
       2_048,
@@ -1487,7 +1498,7 @@ function assertRowsParity<T>(
   parity: T[],
   project: (row: T) => unknown,
 ): void {
-  const normalize = (rows: T[]) => rows.map(project).map(canonicalJson).sort(compareCanonicalText);
+  const normalize = (rows: T[]) => rows.map(project).map(canonicalJson);
   if (canonicalJson(normalize(primary)) !== canonicalJson(normalize(parity))) {
     throw new Error(`Gitcrawl cloud/local parity mismatch for ${name}`);
   }
@@ -1504,6 +1515,19 @@ function assertFreshTimestamp(value: string, label: string, maxAge: number, now:
 
 function assertTimestamp(value: string, label: string): void {
   parseRfc3339Timestamp(value, label);
+}
+
+function requiredTimestamp(value: unknown, label: string): string {
+  const normalized = boundedString(value, 64);
+  if (!normalized) throw new Error(`${label} is required`);
+  assertTimestamp(normalized, label);
+  return normalized;
+}
+
+function optionalTimestamp(value: unknown, label: string): string {
+  const normalized = boundedString(value, 64);
+  if (normalized) assertTimestamp(normalized, label);
+  return normalized;
 }
 
 function assertSourceTopology(options: GitcrawlEvidenceSourceOptions): void {

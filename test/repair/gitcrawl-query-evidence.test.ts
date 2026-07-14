@@ -516,6 +516,45 @@ test("query evidence fails closed on source, relation, review, and packet drift"
     await adapter.close();
   });
 
+  await t.test("parity reverses an ordered result", async () => {
+    const first = memberRow({ cluster_member_count: 2 });
+    const second = memberRow({
+      cluster_member_count: 2,
+      thread_id: 43,
+      number: 43,
+      updated_at_gh: "2026-07-14T09:54:00.000Z",
+    });
+    const adapter = await GitcrawlEvidenceAdapter.fromSources({
+      repository,
+      provider: "parity",
+      primarySource: new FixtureSource({
+        provider: "cloud",
+        rows: { "gitcrawl.clusters.members": [first, second] },
+      }),
+      paritySource: new FixtureSource({
+        provider: "local",
+        rows: { "gitcrawl.clusters.members": [second, first] },
+      }),
+      now: () => now,
+    });
+    await assert.rejects(adapter.clusterMembers(7), /cloud\/local parity mismatch/);
+    await adapter.close();
+  });
+
+  await t.test("cluster and thread timestamps are canonical", async () => {
+    const clusters = await adapterFor({
+      "gitcrawl.clusters.list": [clusterRow({ created_at: "not-a-timestamp" })],
+    });
+    await assert.rejects(clusters.listClusters(), /cluster created_at is invalid/);
+    await clusters.close();
+
+    const threads = await adapterFor({
+      "gitcrawl.threads.search": [memberRow({ created_at_gh: "not-a-timestamp" })],
+    });
+    await assert.rejects(threads.searchOpenPullRequests(), /thread created_at is invalid/);
+    await threads.close();
+  });
+
   await t.test("thread kind is unknown", async () => {
     const adapter = await adapterFor({
       "gitcrawl.clusters.related": [
