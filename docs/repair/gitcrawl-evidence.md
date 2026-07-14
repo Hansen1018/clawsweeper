@@ -84,9 +84,10 @@ values, and sanitized object-key collisions are rejected.
 
 ## Action Receipts
 
-Callers can prepare, record, and flush immutable Gitcrawl action receipts with
-`prepareGitcrawlActionReceipt`, `recordGitcrawlActionReceipt`, and
-`flushGitcrawlActionReceipts`.
+Callers can prepare and record immutable Gitcrawl action receipts with
+`prepareGitcrawlActionReceipt` and `recordGitcrawlActionReceipt`. The owning
+workflow remains responsible for finalizing and publishing its shared action
+ledger after every producer has finished.
 
 The receipt surface records:
 

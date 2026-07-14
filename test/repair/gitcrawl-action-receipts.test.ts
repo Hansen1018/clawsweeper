@@ -8,10 +8,10 @@ import { readActionEventShard, readAllSpooledActionEvents } from "../../dist/act
 import {
   GITCRAWL_ACTION_RECEIPT_LIMITS,
   classifyGitcrawlActionFailure,
-  flushGitcrawlActionReceipts,
   prepareGitcrawlActionReceipt,
   recordGitcrawlActionReceipt,
 } from "../../dist/repair/gitcrawl-action-receipts.js";
+import { flushWorkflowActionEvents } from "../../dist/action-ledger-runtime.js";
 import {
   GITCRAWL_QUERY_NAMES,
   sha256Canonical,
@@ -110,7 +110,7 @@ test("Gitcrawl emits bounded snapshot, six-query, coverage, and parity receipts"
     { env, now: () => now },
   );
 
-  const [shardPath] = await flushGitcrawlActionReceipts(root, { env, outputRoot });
+  const [shardPath] = await flushWorkflowActionEvents(root, { env, outputRoot });
   assert.ok(shardPath);
   const events = readActionEventShard(path.join(outputRoot, shardPath));
   assert.equal(events.length, 9);
@@ -501,7 +501,7 @@ test("Gitcrawl failure receipts retain only a class and digest", async () => {
   } as unknown as Parameters<typeof recordGitcrawlActionReceipt>[1];
   recordGitcrawlActionReceipt(root, input, { env, now: () => now });
 
-  const [shardPath] = await flushGitcrawlActionReceipts(root, { env, outputRoot });
+  const [shardPath] = await flushWorkflowActionEvents(root, { env, outputRoot });
   assert.ok(shardPath);
   const [event] = readActionEventShard(path.join(outputRoot, shardPath));
   assert.equal(event?.event_type, "gitcrawl.query");

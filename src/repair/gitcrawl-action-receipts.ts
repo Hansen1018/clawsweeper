@@ -8,7 +8,6 @@ import {
   type ActionEventSubject,
 } from "../action-ledger.js";
 import {
-  flushWorkflowActionEvents,
   prepareWorkflowPhaseEvent,
   recordWorkflowPhaseEvent,
   type PreparedWorkflowActionEvent,
@@ -205,13 +204,6 @@ export function recordGitcrawlActionReceipt(
     },
     options,
   );
-}
-
-export async function flushGitcrawlActionReceipts(
-  root: string,
-  options: Parameters<typeof flushWorkflowActionEvents>[1] = {},
-): Promise<string[]> {
-  return flushWorkflowActionEvents(root, options);
 }
 
 export function classifyGitcrawlActionFailure(error: unknown): GitcrawlFailureClass {
