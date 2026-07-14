@@ -426,6 +426,10 @@ test("commit review and notification workflows publish their operation receipts"
     /clawsweeper-spam-comment-intake/,
   );
   assert.ok(spamFinalizer?.id);
+  assert.match(
+    spamFinalizer?.run ?? "",
+    /mkdir -p[\s\S]*"\$CLAWSWEEPER_ACTION_LEDGER_ROOT"[\s\S]*"\$CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT"[\s\S]*--allow-empty/,
+  );
   assert.match(spamFinalizer?.run ?? "", /--repair-lane spam-comment-intake/);
   assert.ok(activityFinalizer?.id);
   assert.match(

@@ -185,7 +185,10 @@ jobs:
           CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT: ${{ runner.temp }}/clawsweeper-spam-comment-intake/${{ github.run_id }}/${{ github.run_attempt }}/output
         run: |
           set -euo pipefail
-          mkdir -p .artifacts
+          mkdir -p \
+            "$CLAWSWEEPER_ACTION_LEDGER_ROOT" \
+            "$CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT" \
+            .artifacts
           pnpm run --silent repair:action-ledger -- finalize \
             --repair-lane spam-comment-intake \
             --allow-empty \
