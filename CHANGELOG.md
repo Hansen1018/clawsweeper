@@ -10,6 +10,10 @@ checkpoint, and status-only commits are intentionally omitted.
 ### Added
 
 - Added end-to-end exact-review handoff health with phase ages, delayed/stalled claim classification, and a phase-aware operator rail on the live dashboard.
+- Added a manual-only, fail-closed Cloudflare Access bootstrap for the
+  crawl-remote custom route, with generation-bound service-token rotation,
+  interruption-safe credential publication, and repository-scoped GitHub App
+  permissions.
 - Added a maintainer-only two-runner workflow that builds a hash-bound
   crawl-remote release artifact without production credentials, then requires
   that exact SHA to remain the current main tip on a fresh protected runner
