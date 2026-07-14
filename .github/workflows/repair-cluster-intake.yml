@@ -18,6 +18,15 @@ on:
         required: false
         default: "1"
         type: string
+      gitcrawl_provider:
+        description: "Gitcrawl evidence provider"
+        required: false
+        default: local
+        type: choice
+        options:
+          - local
+          - cloud
+          - parity
       runner:
         description: "Runner label for repair planning/review work"
         required: false
@@ -34,14 +43,13 @@ on:
         default: internal
         type: string
       force_store:
-        description: "Ignore the processed-store ledger and retry the current gitcrawl-store snapshot"
+        description: "Ignore the processed-source ledger and retry the current Gitcrawl snapshot"
         required: false
         default: false
         type: boolean
   schedule:
-    # gitcrawl-store refreshes openclaw/openclaw every 15 minutes. This intake
-    # runs daily and records the processed portable DB SHA so a
-    # delayed or duplicate tick does not enqueue work from the same store twice.
+    # Gitcrawl refreshes openclaw/openclaw every 15 minutes. This intake runs
+    # daily against the configured local, cloud, or parity evidence provider.
     - cron: "8 8 * * *"
 
 permissions:
@@ -55,6 +63,7 @@ env:
   CLAWSWEEPER_MODEL: internal
   CLAWSWEEPER_GIT_USER_NAME: ${{ vars.CLAWSWEEPER_GIT_USER_NAME || 'clawsweeper[bot]' }}
   CLAWSWEEPER_GIT_USER_EMAIL: ${{ vars.CLAWSWEEPER_GIT_USER_EMAIL || '274271284+clawsweeper[bot]@users.noreply.github.com' }}
+  GITCRAWL_PROVIDER: ${{ github.event.inputs.gitcrawl_provider || vars.CLAWSWEEPER_CLUSTER_REPAIR_GITCRAWL_PROVIDER || 'local' }}
 
 concurrency:
   group: cluster-repair-intake-${{ github.event.inputs.target_repo || vars.CLAWSWEEPER_CLUSTER_REPAIR_TARGET_REPO || 'openclaw/openclaw' }}
@@ -79,6 +88,7 @@ jobs:
 
       - name: Create gitcrawl-store token
         id: store-token
+        if: ${{ env.GITCRAWL_PROVIDER != 'cloud' }}
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           client-id: ${{ env.CLAWSWEEPER_APP_CLIENT_ID }}
@@ -110,6 +120,7 @@ jobs:
           fetch-depth: 1
 
       - uses: actions/checkout@v7
+        if: ${{ env.GITCRAWL_PROVIDER != 'cloud' }}
         with:
           repository: openclaw/gitcrawl-store
           token: ${{ steps.store-token.outputs.token }}
@@ -117,6 +128,7 @@ jobs:
           fetch-depth: 1
 
       - name: Ensure SQLite CLI
+        if: ${{ env.GITCRAWL_PROVIDER != 'cloud' }}
         run: |
           if ! command -v sqlite3 >/dev/null 2>&1; then
             sudo apt-get update
@@ -130,6 +142,7 @@ jobs:
           SCHEDULE_ENABLED: ${{ vars.CLAWSWEEPER_FEATURE_CLUSTER_REPAIR_ENABLED == '1' && '1' || '0' }}
           TARGET_REPO: ${{ github.event.inputs.target_repo || vars.CLAWSWEEPER_CLUSTER_REPAIR_TARGET_REPO || 'openclaw/openclaw' }}
           FORCE_STORE: ${{ github.event.inputs.force_store == 'true' && '1' || '0' }}
+          PROVIDER: ${{ env.GITCRAWL_PROVIDER }}
         run: |
           set -euo pipefail
           if [ "$ENABLED" != "1" ]; then
@@ -146,67 +159,91 @@ jobs:
           fi
 
           repo_slug="${TARGET_REPO//\//-}"
+          ledger_path="results/cluster-repair-intake/${repo_slug}.json"
+          if [[ "$PROVIDER" != "local" && "$PROVIDER" != "cloud" && "$PROVIDER" != "parity" ]]; then
+            echo "::error::Unsupported Gitcrawl provider: ${PROVIDER}"
+            exit 1
+          fi
+
           db_name="${TARGET_REPO,,}"
           db_name="${db_name//\//__}.sync.db"
           manifest_path="gitcrawl-store/data/${db_name}.manifest.json"
           db_path="gitcrawl-store/data/${db_name}"
-          ledger_path="results/cluster-repair-intake/${repo_slug}.json"
-          if [ ! -f "$manifest_path" ]; then
-            echo "::error::Missing gitcrawl-store manifest: ${manifest_path}"
-            exit 1
-          fi
-          if [ ! -f "$db_path" ]; then
-            echo "::error::Missing gitcrawl-store DB: ${db_path}"
-            exit 1
-          fi
-
-          store_sha="$(node -e "const fs=require('fs'); const m=JSON.parse(fs.readFileSync(process.argv[1], 'utf8')); console.log(m.sha256 || '')" "$manifest_path")"
-          exported_at="$(node -e "const fs=require('fs'); const m=JSON.parse(fs.readFileSync(process.argv[1], 'utf8')); console.log(m.exportedAt || '')" "$manifest_path")"
-          previous_sha=""
-          if [ -f "$ledger_path" ]; then
-            previous_sha="$(node -e "const fs=require('fs'); const p=process.argv[1]; const r=JSON.parse(fs.readFileSync(p, 'utf8')); console.log(r.last_processed_store_sha256 || '')" "$ledger_path")"
+          store_sha=""
+          exported_at=""
+          if [ "$PROVIDER" = "cloud" ]; then
+            manifest_path=""
+            db_path=""
+          else
+            if [ ! -f "$manifest_path" ]; then
+              echo "::error::Missing gitcrawl-store manifest: ${manifest_path}"
+              exit 1
+            fi
+            if [ ! -f "$db_path" ]; then
+              echo "::error::Missing gitcrawl-store DB: ${db_path}"
+              exit 1
+            fi
+            store_sha="$(node -e "const fs=require('fs'); const m=JSON.parse(fs.readFileSync(process.argv[1], 'utf8')); console.log(m.sha256 || '')" "$manifest_path")"
+            exported_at="$(node -e "const fs=require('fs'); const m=JSON.parse(fs.readFileSync(process.argv[1], 'utf8')); console.log(m.exportedAt || '')" "$manifest_path")"
+            previous_sha=""
+            if [ -f "$ledger_path" ]; then
+              previous_sha="$(node -e "const fs=require('fs'); const p=process.argv[1]; const r=JSON.parse(fs.readFileSync(p, 'utf8')); console.log(r.last_processed_store_sha256 || '')" "$ledger_path")"
+            fi
+            if [ "$FORCE_STORE" != "1" ] && [ -n "$store_sha" ] && [ "$store_sha" = "$previous_sha" ]; then
+              echo "should_import=false" >> "$GITHUB_OUTPUT"
+              echo "should_dispatch=false" >> "$GITHUB_OUTPUT"
+              echo "Already processed gitcrawl-store SHA ${store_sha}; skipping intake."
+              exit 0
+            fi
           fi
 
           {
             echo "target_repo=${TARGET_REPO}"
             echo "repo_slug=${repo_slug}"
+            echo "provider=${PROVIDER}"
             echo "db_path=${db_path}"
             echo "manifest_path=${manifest_path}"
             echo "ledger_path=${ledger_path}"
             echo "store_sha=${store_sha}"
             echo "exported_at=${exported_at}"
           } >> "$GITHUB_OUTPUT"
-
-          if [ "$FORCE_STORE" != "1" ] && [ -n "$store_sha" ] && [ "$store_sha" = "$previous_sha" ]; then
-            echo "should_import=false" >> "$GITHUB_OUTPUT"
-            echo "should_dispatch=false" >> "$GITHUB_OUTPUT"
-            echo "Already processed gitcrawl-store SHA ${store_sha}; skipping intake."
-            exit 0
-          fi
           echo "should_import=true" >> "$GITHUB_OUTPUT"
 
-      - name: Import one cluster from gitcrawl-store
+      - name: Import one Gitcrawl cluster
         id: import
         if: ${{ steps.prepare.outputs.should_import == 'true' }}
         env:
           TARGET_REPO: ${{ steps.prepare.outputs.target_repo }}
           DB_PATH: ${{ steps.prepare.outputs.db_path }}
+          CLAWSWEEPER_GITCRAWL_PROVIDER: ${{ steps.prepare.outputs.provider }}
+          CLAWSWEEPER_GITCRAWL_CLOUD_URL: ${{ vars.CLAWSWEEPER_GITCRAWL_CLOUD_URL }}
+          CLAWSWEEPER_GITCRAWL_CLOUD_ARCHIVE: ${{ vars.CLAWSWEEPER_GITCRAWL_CLOUD_ARCHIVE }}
+          CLAWSWEEPER_GITCRAWL_CLOUD_TOKEN: ${{ secrets.CLAWSWEEPER_GITCRAWL_CLOUD_TOKEN }}
+          CLAWSWEEPER_GITCRAWL_CLOUD_ACCESS_CLIENT_ID: ${{ vars.CLAWSWEEPER_GITCRAWL_CLOUD_ACCESS_CLIENT_ID }}
+          CLAWSWEEPER_GITCRAWL_CLOUD_ACCESS_CLIENT_SECRET: ${{ secrets.CLAWSWEEPER_GITCRAWL_CLOUD_ACCESS_CLIENT_SECRET }}
+          CLAWSWEEPER_GITCRAWL_EXPECTED_SNAPSHOT_ID: ${{ vars.CLAWSWEEPER_GITCRAWL_EXPECTED_SNAPSHOT_ID }}
           LIMIT: ${{ github.event.inputs.limit || vars.CLAWSWEEPER_CLUSTER_REPAIR_IMPORT_LIMIT || '1' }}
         run: |
           set -euo pipefail
           mkdir -p .artifacts/cluster-repair-intake
           generated_log=".artifacts/cluster-repair-intake/generated.txt"
-          pnpm run repair:import-gitcrawl -- \
+          provenance_path=".artifacts/cluster-repair-intake/provenance.json"
+          args=( \
             --from-gitcrawl \
             --repo "$TARGET_REPO" \
-            --db "$DB_PATH" \
+            --gitcrawl-provider "$CLAWSWEEPER_GITCRAWL_PROVIDER" \
+            --provenance-out "$provenance_path" \
             --allow-empty \
             --limit "$LIMIT" \
             --mode autonomous \
             --allow-fix-pr true \
             --allow-merge false \
             --allow-instant-close false \
-            --allow-post-merge-close true \
+            --allow-post-merge-close true)
+          if [ "$CLAWSWEEPER_GITCRAWL_PROVIDER" != "cloud" ]; then
+            args+=(--db "$DB_PATH")
+          fi
+          pnpm run repair:import-gitcrawl -- "${args[@]}" \
             2> >(tee .artifacts/cluster-repair-intake/import-stderr.txt >&2) \
             | tee "$generated_log"
 
@@ -229,6 +266,7 @@ jobs:
           STORE_SHA: ${{ steps.prepare.outputs.store_sha }}
           EXPORTED_AT: ${{ steps.prepare.outputs.exported_at }}
           MANIFEST_PATH: ${{ steps.prepare.outputs.manifest_path }}
+          PROVIDER: ${{ steps.prepare.outputs.provider }}
           GENERATED_COUNT: ${{ steps.import.outputs.count || '0' }}
         run: |
           set -euo pipefail
@@ -236,13 +274,18 @@ jobs:
           node <<'NODE'
           const fs = require("fs");
           const generatedPath = ".artifacts/cluster-repair-intake/generated-paths.txt";
+          const provenancePath = ".artifacts/cluster-repair-intake/provenance.json";
           const generated = (fs.existsSync(generatedPath) ? fs.readFileSync(generatedPath, "utf8") : "")
             .split(/\r?\n/)
             .map((line) => line.trim())
             .filter(Boolean);
+          const provenance = JSON.parse(fs.readFileSync(provenancePath, "utf8"));
           const ledger = {
-            schema: "clawsweeper-cluster-repair-intake-v1",
+            schema: "clawsweeper-cluster-repair-intake-v2",
             target_repo: process.env.TARGET_REPO,
+            provider: provenance.provider || process.env.PROVIDER,
+            last_processed_snapshot_id: provenance.snapshot_id,
+            last_processed_source_identity_sha256: provenance.source.identity_sha256,
             last_processed_store_sha256: process.env.STORE_SHA,
             last_processed_store_exported_at: process.env.EXPORTED_AT,
             manifest_path: process.env.MANIFEST_PATH,
