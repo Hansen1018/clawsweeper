@@ -11,7 +11,10 @@ import {
   readSpooledActionEvents,
   type ActionEvent,
 } from "../action-ledger.js";
-import { readImportedRepairMutationEvents } from "../action-ledger-runtime.js";
+import {
+  readImportedRepairMutationEvents,
+  workflowActionEventsEnabled,
+} from "../action-ledger-runtime.js";
 import {
   prepareSafeReadRoot,
   prepareSafeReadTarget,
@@ -99,6 +102,7 @@ export function executeSweepMutation(
   dependencies: SweepMutationDependencies = {},
 ): SweepMutationResult {
   validateRequest(request);
+  assertSweepMutationLedgerEnabled();
   const descriptor = mutationDescriptor(request);
   const lifecycle = mutationLifecycle(request, descriptor.payloadSha256);
   const mutationOptions = {
@@ -109,7 +113,10 @@ export function executeSweepMutation(
   } as const;
 
   if (descriptor.nonIdempotent) {
-    assertDispatchCanStart(lifecycle, mutationOptions);
+    const dispatchDecision = assertDispatchCanStart(lifecycle, mutationOptions);
+    if (dispatchDecision === "already_accepted") {
+      return { outcome: "accepted", attempts: 0 };
+    }
   }
 
   const runWire = dependencies.runWire ?? defaultWireRunner;
@@ -311,7 +318,7 @@ function mutationLifecycle(
 function assertDispatchCanStart(
   lifecycle: RepairLifecycleInput,
   options: { kind: string; identity: unknown; operationName: string },
-): void {
+): "dispatch" | "already_accepted" {
   const idempotencyKey = actionIdempotencyKey(
     repairMutationIdempotencyIdentity(lifecycle, options),
   );
@@ -342,15 +349,30 @@ function assertDispatchCanStart(
   const rejected = events.filter(
     (event) => event.attributes?.completion_reason === "mutation_rejected",
   ).length;
-  const acceptedOrUnknown = events.some((event) =>
-    ["mutation_accepted", "mutation_outcome_unknown", "mutation_observed"].includes(
+  const acceptedOrObserved = events.some((event) =>
+    ["mutation_accepted", "mutation_observed"].includes(
       String(event.attributes?.completion_reason ?? ""),
     ),
   );
-  if (acceptedOrUnknown || attempted > rejected) {
+  if (acceptedOrObserved) return "already_accepted";
+  const unknown = events.some(
+    (event) => event.attributes?.completion_reason === "mutation_outcome_unknown",
+  );
+  if (unknown || attempted > rejected) {
     throw new Error(
-      "refusing duplicate non-idempotent sweep dispatch after an accepted or outcome-unknown attempt",
+      "refusing duplicate non-idempotent sweep dispatch after an outcome-unknown attempt",
     );
+  }
+  return "dispatch";
+}
+
+function assertSweepMutationLedgerEnabled(): void {
+  if (
+    !workflowActionEventsEnabled(process.env) ||
+    !String(process.env.CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT ?? "").trim() ||
+    !String(process.env.GITHUB_RUN_STARTED_AT ?? "").trim()
+  ) {
+    throw new Error("sweep mutation requires successful action-ledger setup before dispatch");
   }
 }
 

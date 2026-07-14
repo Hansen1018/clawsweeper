@@ -5,15 +5,21 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { readSpooledActionEvents } from "../../dist/action-ledger.js";
-import { importActionEventShards } from "../../dist/action-ledger-runtime.js";
+import { actionIdempotencyKey, readSpooledActionEvents } from "../../dist/action-ledger.js";
+import {
+  importActionEventShards,
+  readImportedRepairMutationEvents,
+} from "../../dist/action-ledger-runtime.js";
 import {
   executeSweepMutation,
   sweepMutationPayloadDigest,
   type SweepMutationRequest,
   type SweepWireRunner,
 } from "../../dist/repair/sweep-mutation.js";
-import { flushRepairActionEvents } from "../../dist/repair/repair-action-ledger.js";
+import {
+  flushRepairActionEvents,
+  repairMutationIdempotencyIdentity,
+} from "../../dist/repair/repair-action-ledger.js";
 
 test("sweep workflow dispatch records accepted receipts without persisting raw inputs", () => {
   withLedger((root) => {
@@ -51,6 +57,37 @@ test("sweep workflow dispatch records accepted receipts without persisting raw i
     assert.equal(serialized.includes("private repair prompt"), false);
     assert.equal(serialized.includes("additional_prompt"), false);
   });
+});
+
+test("sweep mutations fail closed before the wire call when ledger setup is unavailable", () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "sweep-disabled-")));
+  const outputRoot = path.join(root, "output");
+  const stateRoot = path.join(root, "state");
+  fs.mkdirSync(outputRoot);
+  fs.mkdirSync(stateRoot);
+  const previous = { ...process.env };
+  let calls = 0;
+  Object.assign(process.env, workflowEnv(root, outputRoot, stateRoot));
+  delete process.env.CLAWSWEEPER_ACTION_LEDGER_FORCE;
+  delete process.env.CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT;
+  delete process.env.GITHUB_RUN_STARTED_AT;
+
+  try {
+    assert.throws(
+      () =>
+        executeSweepMutation(workflowDispatch(), {
+          runWire: () => {
+            calls += 1;
+            return success();
+          },
+        }),
+      /requires successful action-ledger setup/,
+    );
+    assert.equal(calls, 0);
+  } finally {
+    restoreEnv(previous);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("sweep mutation classifies definite 4xx failures as rejected before write", () => {
@@ -209,6 +246,11 @@ test("indexed durable action history blocks duplicate dispatch without scanning 
     );
     await flushRepairActionEvents();
     importActionEventShards(firstOutput, stateRoot);
+    const firstIdempotencyKey = mutationEvents(firstRoot)[0]?.idempotency_key_sha256;
+    assert.ok(firstIdempotencyKey);
+    assert.ok(
+      readImportedRepairMutationEvents(stateRoot, "openclaw/clawsweeper", firstIdempotencyKey),
+    );
     poisonLegacyScan(stateRoot);
 
     Object.assign(process.env, workflowEnv(secondRoot, secondOutput, stateRoot), {
@@ -227,6 +269,100 @@ test("indexed durable action history blocks duplicate dispatch without scanning 
     );
     assert.equal(calls, 1);
     assert.equal(mutationEvents(secondRoot).length, 0);
+  } finally {
+    restoreEnv(previous);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("indexed accepted dispatches become no-ops without blocking later work", async () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "sweep-accepted-")));
+  const firstRoot = path.join(root, "first-spool");
+  const firstOutput = path.join(root, "first-output");
+  const secondRoot = path.join(root, "second-spool");
+  const secondOutput = path.join(root, "second-output");
+  const stateRoot = path.join(root, "state");
+  for (const directory of [firstRoot, firstOutput, secondRoot, secondOutput, stateRoot]) {
+    fs.mkdirSync(directory);
+  }
+  const previous = { ...process.env };
+  Object.assign(process.env, workflowEnv(firstRoot, firstOutput, stateRoot));
+  let calls = 0;
+  const acceptedRequest = workflowDispatch();
+
+  try {
+    assert.deepEqual(
+      executeSweepMutation(acceptedRequest, {
+        runWire: () => {
+          calls += 1;
+          return success();
+        },
+      }),
+      { outcome: "accepted", attempts: 1 },
+    );
+    await flushRepairActionEvents();
+    importActionEventShards(firstOutput, stateRoot);
+    const payloadSha256 = sweepMutationPayloadDigest(acceptedRequest.fields);
+    const expectedIdempotencyKey = actionIdempotencyKey(
+      repairMutationIdempotencyIdentity(
+        {
+          repository: acceptedRequest.targetRepository ?? acceptedRequest.repository,
+          workKey: `sweep-caller:${acceptedRequest.type}:${payloadSha256}`,
+          number: acceptedRequest.itemNumber,
+          subjectKind: "issue",
+        },
+        {
+          kind: "sweep_workflow_dispatch",
+          operationName: "sweep_caller_mutation",
+          identity: {
+            repository: acceptedRequest.repository,
+            workflow: acceptedRequest.workflow,
+            ref: acceptedRequest.ref,
+            targetRepository: acceptedRequest.targetRepository ?? null,
+            itemNumber: acceptedRequest.itemNumber ?? null,
+            businessKey: acceptedRequest.businessKey,
+            payloadSha256,
+          },
+        },
+      ),
+    );
+    assert.equal(mutationEvents(firstRoot)[0]?.idempotency_key_sha256, expectedIdempotencyKey);
+    assert.ok(
+      readImportedRepairMutationEvents(stateRoot, "openclaw/clawsweeper", expectedIdempotencyKey),
+    );
+    poisonLegacyScan(stateRoot);
+
+    Object.assign(process.env, workflowEnv(secondRoot, secondOutput, stateRoot), {
+      GITHUB_RUN_ATTEMPT: "2",
+      CLAWSWEEPER_ACTION_LEDGER_INVOCATION: "sweep-mutation-test-rerun",
+    });
+    assert.deepEqual(
+      executeSweepMutation(acceptedRequest, {
+        runWire: () => {
+          calls += 1;
+          return success();
+        },
+      }),
+      { outcome: "accepted", attempts: 0 },
+    );
+    clearPoisonLegacyScan(stateRoot);
+    assert.deepEqual(
+      executeSweepMutation(
+        {
+          ...workflowDispatch({ target_repo: "openclaw/openclaw", item_number: "43" }),
+          itemNumber: 43,
+          businessKey: "test-dispatch:7130:43",
+        },
+        {
+          runWire: () => {
+            calls += 1;
+            return success();
+          },
+        },
+      ),
+      { outcome: "accepted", attempts: 1 },
+    );
+    assert.equal(calls, 2);
   } finally {
     restoreEnv(previous);
     fs.rmSync(root, { recursive: true, force: true });
@@ -534,6 +670,7 @@ function workflowEnv(root: string, outputRoot: string, stateRoot: string) {
     GITHUB_REPOSITORY: "openclaw/clawsweeper",
     GITHUB_RUN_ATTEMPT: "1",
     GITHUB_RUN_ID: "7130",
+    GITHUB_RUN_STARTED_AT: "2026-07-13T10:00:00Z",
     GITHUB_SHA: "a".repeat(40),
     GITHUB_WORKFLOW: "sweep",
     GITHUB_WORKFLOW_REF: "openclaw/clawsweeper/.github/workflows/sweep.yml@refs/heads/main",
@@ -563,6 +700,15 @@ function poisonLegacyScan(stateRoot: string): void {
   fs.mkdirSync(eventRoot, { recursive: true });
   for (let index = 0; index < 513; index += 1) {
     fs.writeFileSync(path.join(eventRoot, `unrelated-${String(index).padStart(3, "0")}`), "");
+  }
+}
+
+function clearPoisonLegacyScan(stateRoot: string): void {
+  const eventRoot = path.join(stateRoot, "ledger", "v1", "events");
+  for (let index = 0; index < 513; index += 1) {
+    fs.rmSync(path.join(eventRoot, `unrelated-${String(index).padStart(3, "0")}`), {
+      force: true,
+    });
   }
 }
 

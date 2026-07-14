@@ -56,6 +56,10 @@ test("sweep caller mutations use the validated receipt CLI", () => {
   assert.match(mutationSource, /if \(runAttempt > 1\)/);
   assert.match(mutationSource, /readImportedRepairMutationEvents/);
   assert.match(mutationSource, /readDurableDispatchEvents/);
+  assert.match(mutationSource, /assertSweepMutationLedgerEnabled\(\)/);
+  assert.match(mutationSource, /workflowActionEventsEnabled\(process\.env\)/);
+  assert.match(mutationSource, /return "already_accepted"/);
+  assert.match(mutationSource, /attempts: 0/);
 });
 
 test("each sweep caller producer finalizes and publishes after its last mutation", () => {
