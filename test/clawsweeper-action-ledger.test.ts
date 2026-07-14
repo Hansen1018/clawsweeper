@@ -520,8 +520,45 @@ test("apply receipts start per item and persist mutation observation before fina
   assert.match(source, /idempotencyIdentity: options\.identity/);
   assert.match(
     applyLoop,
-    /if \(!options\.identity\.startsWith\("review_lease_"\)\) \{[\s\S]*currentApplyMutationLeaseBlock\(\)[\s\S]*throw new ApplyMutationReviewGuardError/,
+    /!options\.identity\.startsWith\("review_lease_"\)\s*&&\s*options\.idempotencyIdentity !== postLeaseAuthorizationMutationIdentity/,
   );
+  const mutationReceiptStart = applyLoop.indexOf("const attempt = startApplyMutationAttempt(");
+  const reviewLeaseException = applyLoop.indexOf(
+    '!options.identity.startsWith("review_lease_")',
+    mutationReceiptStart,
+  );
+  const postLeaseAuthorizationException = applyLoop.indexOf(
+    "options.idempotencyIdentity !== postLeaseAuthorizationMutationIdentity",
+    reviewLeaseException,
+  );
+  const mutationGuard = applyLoop.indexOf(
+    "const mutationLeaseBlock = currentApplyMutationLeaseBlock();",
+    postLeaseAuthorizationException,
+  );
+  const guardRejection = applyLoop.indexOf(
+    "throw new ApplyMutationReviewGuardError(mutationLeaseBlock);",
+    mutationGuard,
+  );
+  const mutationOperation = applyLoop.indexOf(
+    "const result = options.operation();",
+    guardRejection,
+  );
+  const mutationReceiptFinalization = applyLoop.indexOf(
+    "const outcomeEventId = finishApplyMutationAttempt({",
+    mutationOperation,
+  );
+  const mutationObservation = applyLoop.indexOf(
+    "if (mutated) recordMutation(outcomeEventId);",
+    mutationReceiptFinalization,
+  );
+  assert.ok(mutationReceiptStart >= 0);
+  assert.ok(reviewLeaseException > mutationReceiptStart);
+  assert.ok(postLeaseAuthorizationException > reviewLeaseException);
+  assert.ok(mutationGuard > postLeaseAuthorizationException);
+  assert.ok(guardRejection > mutationGuard);
+  assert.ok(mutationOperation > guardRejection);
+  assert.ok(mutationReceiptFinalization > mutationOperation);
+  assert.ok(mutationObservation > mutationReceiptFinalization);
   assert.match(
     applyLoop,
     /error instanceof ApplyMutationReviewGuardError \|\|[\s\S]*options\.knownNoMutation\?\.\(error\) === true/,

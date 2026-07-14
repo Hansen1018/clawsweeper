@@ -8,6 +8,10 @@ import {
   renderReviewStartStatusComment,
 } from "../dist/clawsweeper.js";
 import {
+  repairTargetActivityDigest,
+  repairTargetActivitySnapshotFromTarget,
+} from "../dist/repair/repair-mutation-activity.js";
+import {
   lowSignalCloseReport,
   markedReviewCommentForTest,
   promotionGhMock,
@@ -552,8 +556,31 @@ test("apply-decisions corrects stale close comments when the canonical PR closed
     const commentWriteLogPath = join(root, "comment-write.log");
     const canonicalUrl = "https://github.com/openclaw/openclaw/pull/400";
     const headSha = "a".repeat(40);
+    const itemUpdatedAt = "2026-05-02T00:00:00Z";
     const reviewLeaseOwner = "stale-canonical-review";
     const reviewLeaseCommentId = 9351;
+    const reviewAuthorizationTargetDigest = repairTargetActivityDigest(
+      repairTargetActivitySnapshotFromTarget(
+        {
+          number: 350,
+          title: "Provider route fallback",
+          body: "Stale PR body.",
+          state: "open",
+          updated_at: itemUpdatedAt,
+          locked: false,
+          author_association: "CONTRIBUTOR",
+          assignees: [],
+          milestone: null,
+          labels: [{ name: "status: 📣 needs proof" }],
+          requested_reviewers: [],
+          requested_teams: [],
+          head: { sha: headSha, ref: "branch", repo: { id: 123, full_name: "fork/openclaw" } },
+          base: { sha: "base-sha", ref: "main", repo: { full_name: "openclaw/openclaw" } },
+        },
+        [],
+        "pull_request",
+      ),
+    );
     mkdirSync(itemsDir, { recursive: true });
     mkdirSync(plansDir, { recursive: true });
     const rootCauseCluster = {
@@ -667,7 +694,15 @@ Reason: No work is needed because ${canonicalUrl} is the canonical landing path.
 
 - The proof is already available on ${canonicalUrl}.
 `;
-    const synced = reportWithSyncedReviewComment(reportMarkdown, 350, "duplicate_or_superseded");
+    const authorizedReportMarkdown = reportMarkdown.replace(
+      /^review_authorization_target_digest: .*$/m,
+      `review_authorization_target_digest: ${reviewAuthorizationTargetDigest}`,
+    );
+    const synced = reportWithSyncedReviewComment(
+      authorizedReportMarkdown,
+      350,
+      "duplicate_or_superseded",
+    );
     const recentlySyncedReport = synced.report.replace(
       /^review_comment_synced_at: .*$/m,
       `review_comment_synced_at: ${new Date().toISOString()}`,
@@ -749,7 +784,7 @@ Reason: No work is needed because ${canonicalUrl} is the canonical landing path.
       leasedPromotionGhMock({
         number: 350,
         title: "Provider route fallback",
-        itemUpdatedAt: "2026-05-02T00:00:00Z",
+        itemUpdatedAt,
         comment: newerStaleCloseComment,
         commentWriteLogPath,
         commentWriteError: "gh: Requires authentication (HTTP 401)",
@@ -815,7 +850,7 @@ Reason: No work is needed because ${canonicalUrl} is the canonical landing path.
         leasedPromotionGhMock({
           number: 350,
           title: "Provider route fallback",
-          itemUpdatedAt: "2026-05-02T00:00:00Z",
+          itemUpdatedAt,
           comment,
           commentWriteLogPath,
           linkedPulls: { 400: linkedPull },
@@ -916,7 +951,7 @@ Reason: No work is needed because ${canonicalUrl} is the canonical landing path.
       leasedPromotionGhMock({
         number: 350,
         title: "Provider route fallback",
-        itemUpdatedAt: "2026-05-02T00:00:00Z",
+        itemUpdatedAt,
         comment: multiMemberCloseComment,
         commentWriteLogPath,
         linkedPulls: {
@@ -990,7 +1025,7 @@ Reason: No work is needed because ${canonicalUrl} is the canonical landing path.
       promotionGhMock({
         number: 350,
         title: "Provider route fallback",
-        itemUpdatedAt: "2026-05-02T00:00:00Z",
+        itemUpdatedAt,
         comment: markedReviewCommentForTest(350, "Stale durable review comment."),
       }),
       () => {
