@@ -287,6 +287,33 @@ test("query evidence fails closed on source, relation, review, and packet drift"
     );
   });
 
+  await t.test("packets and coverage rows reject unsupported fields", () => {
+    const packet = buildGitcrawlEvidencePacket({
+      provider: "cloud",
+      repository,
+      snapshotId,
+      coverage: completeCoverage(),
+      claims: [],
+      generatedAt,
+    });
+    (packet as unknown as Record<string, unknown>).ignored = true;
+    let { sha256: _sha256, ...unsigned } = packet as unknown as Record<string, unknown>;
+    packet.sha256 = sha256Canonical(unsigned);
+    assert.throws(
+      () => verifyGitcrawlEvidencePacket(packet),
+      /packet contains unsupported field ignored/,
+    );
+
+    delete (packet as unknown as Record<string, unknown>).ignored;
+    (packet.coverage[0] as unknown as Record<string, unknown>).ignored = true;
+    ({ sha256: _sha256, ...unsigned } = packet as unknown as Record<string, unknown>);
+    packet.sha256 = sha256Canonical(unsigned);
+    assert.throws(
+      () => verifyGitcrawlEvidencePacket(packet),
+      /coverage row contains unsupported field ignored/,
+    );
+  });
+
   await t.test("claims contain unsupported fields", async () => {
     const adapter = await adapterFor({ "gitcrawl.clusters.list": [clusterRow()] });
     const claim = (await adapter.listClusters()).claims[0]!;

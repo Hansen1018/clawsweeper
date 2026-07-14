@@ -173,6 +173,7 @@ export function verifyGitcrawlEvidencePacket(
   if (packetVersion !== GITCRAWL_PACKET_VERSION && packetVersion !== GITCRAWL_PACKET_VERSION_V1) {
     throw new Error(`unsupported Gitcrawl packet version: ${String(packetVersion)}`);
   }
+  assertPacketSchema(packet);
   const rawPacket = packet as unknown as Record<string, unknown>;
   if (packet.version === GITCRAWL_PACKET_VERSION) {
     if (!("included" in rawPacket) || "totals" in rawPacket || "omitted" in rawPacket) {
@@ -228,6 +229,80 @@ export function verifyGitcrawlEvidencePacket(
     verifyLegacyPacketCounts(packet, reconstructed);
   } else {
     verifyIncludedPacketCounts(packet);
+  }
+}
+
+function assertPacketSchema(packet: GitcrawlEvidencePacket): void {
+  const commonFields = [
+    "version",
+    "provider",
+    "repository",
+    "snapshot_id",
+    "parity_snapshot_id",
+    "query_version",
+    "generated_at",
+    "required_coverage",
+    "coverage",
+    "claims",
+    "graph",
+    "sha256",
+  ] as const;
+  if (packet.version === GITCRAWL_PACKET_VERSION) {
+    assertExactObjectKeys(packet, [...commonFields, "included"], "Gitcrawl v2 evidence packet");
+    assertExactObjectKeys(
+      packet.included,
+      ["claims", "nodes", "edges"],
+      "Gitcrawl v2 evidence packet included counts",
+    );
+  } else {
+    assertExactObjectKeys(
+      packet,
+      [...commonFields, "totals", "omitted"],
+      "Gitcrawl v1 evidence packet",
+    );
+    assertExactObjectKeys(
+      packet.totals,
+      ["claims", "nodes", "edges"],
+      "Gitcrawl v1 evidence packet totals",
+    );
+    assertExactObjectKeys(
+      packet.omitted,
+      ["claims", "nodes", "edges"],
+      "Gitcrawl v1 evidence packet omissions",
+    );
+  }
+  assertExactObjectKeys(packet.graph, ["nodes", "edges"], "Gitcrawl evidence packet graph");
+  if (!Array.isArray(packet.graph.nodes) || !Array.isArray(packet.graph.edges)) {
+    throw new Error("Gitcrawl evidence packet graph is malformed");
+  }
+  for (const node of packet.graph.nodes) {
+    assertExactObjectKeys(node, ["id", "kind", "label"], "Gitcrawl evidence packet graph node");
+  }
+  for (const edge of packet.graph.edges) {
+    assertExactObjectKeys(
+      edge,
+      ["from", "predicate", "to", "claim_sha256"],
+      "Gitcrawl evidence packet graph edge",
+    );
+  }
+  if (!Array.isArray(packet.coverage)) {
+    throw new Error("Gitcrawl evidence packet coverage is malformed");
+  }
+  for (const row of packet.coverage) {
+    assertExactObjectKeys(
+      row,
+      [
+        "snapshot_id",
+        "dataset",
+        "row_count",
+        "eligible_count",
+        "covered_count",
+        "max_source_at",
+        "dataset_generated_at",
+        "complete",
+      ],
+      "Gitcrawl evidence packet coverage row",
+    );
   }
 }
 
@@ -486,6 +561,17 @@ function assertPersistedCoverageRow(row: GitcrawlCoverageRow): void {
     row.dataset_generated_at,
     `Gitcrawl evidence packet coverage ${row.dataset} dataset_generated_at`,
   );
+}
+
+function assertExactObjectKeys(value: unknown, allowed: readonly string[], label: string): void {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error(`${label} is malformed`);
+  }
+  const allowedKeys = new Set(allowed);
+  const unknown = Object.keys(value).filter((key) => !allowedKeys.has(key));
+  if (unknown.length > 0) {
+    throw new Error(`${label} contains unsupported field ${unknown.sort(compareCanonicalText)[0]}`);
+  }
 }
 
 function boundedLimit(value: number | undefined, fallback: number): number {
