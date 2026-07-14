@@ -14,6 +14,7 @@ import {
   readUtf8FileNoFollow,
   removeFileNoFollow,
   removeUtf8FileIfContentNoFollow,
+  unlinkFileIfExistsNoFollow,
   writeUtf8FileAtomicReplaceNoFollow,
 } from "./action-ledger-files.js";
 import { actionLedgerJson } from "./action-ledger.js";
@@ -28,6 +29,8 @@ const MUTATION_RECOVERY_TEMP_PATTERN =
   /^\.(?<key>[a-f0-9]{64})\.(?<pid>[1-9][0-9]*)\.(?<incarnation>[a-f0-9]{64})\.(?<createdAt>[0-9]+)\.(?<nonce>[a-f0-9-]{36})\.tmp$/;
 const LEGACY_MUTATION_RECOVERY_TEMP_PATTERN =
   /^\.(?<key>[a-f0-9]{64})\.(?<pid>[1-9][0-9]*)\.(?<createdAt>[0-9]+)\.tmp$/;
+const MUTATION_RECOVERY_RECLAIM_PATTERN =
+  /^(?<key>[a-f0-9]{64})\.json\.(?<pid>[1-9][0-9]*)\.(?<nonce>[a-f0-9-]{36})\.reclaim$/;
 const WORKFLOW_ENV_KEYS = [
   "CLAWSWEEPER_ACTION_LEDGER_FORCE",
   "CLAWSWEEPER_ACTION_LEDGER_INVOCATION",
@@ -161,6 +164,15 @@ export function readMutationRecoveries<T>(
           "stale legacy mutation recovery staging file",
         );
       }
+      continue;
+    }
+    const reclaim = MUTATION_RECOVERY_RECLAIM_PATTERN.exec(entry.name);
+    if (reclaim?.groups) {
+      removeMutationRecoveryClaim(
+        safeRoot,
+        path.join(relativeDirectory, entry.name),
+        "interrupted mutation recovery reclaim file",
+      );
       continue;
     }
     if (!entry.isFile() || !entry.name.endsWith(".json")) {
@@ -354,6 +366,21 @@ function removeMutationRecoveryEntry(
   if (result === "changed" || result === "replaced") {
     throw new Error(`refusing changed ${label}: ${target.path}`);
   }
+}
+
+function removeMutationRecoveryClaim(
+  root: ReturnType<typeof prepareSafeReadRoot>,
+  relativePath: string,
+  label: string,
+): void {
+  let target;
+  try {
+    target = prepareSafeReadTarget(root, relativePath, label);
+  } catch (error) {
+    if (isNotFoundError(error)) return;
+    throw error;
+  }
+  unlinkFileIfExistsNoFollow(target);
 }
 
 function mutationRecoveryWriterIsStale(pid: number, expectedIncarnation: string): boolean {

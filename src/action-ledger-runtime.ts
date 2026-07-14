@@ -1246,6 +1246,7 @@ export function readImportedRepairMutationEvents(
   const events: ActionEvent[] = [];
   const shardPaths = new Set<string>();
   const eventIds = new Set<string>();
+  const indexes: RepairMutationIdempotencyIndex[] = [];
   const shardBudget: ActionEventShardReadBudget = {
     directories: 0,
     entries: 0,
@@ -1288,13 +1289,22 @@ export function readImportedRepairMutationEvents(
       throw new Error("repair mutation idempotency index contains a duplicate shard");
     }
     shardPaths.add(index.shard.path);
+    indexes.push(index);
+  }
 
-    const shard = readImportedActionEventShards(
+  const completeShardPaths = validateExpectedActionEventPaths([
+    ...new Set(indexes.flatMap((index) => completeImportedActionEventShardPaths(index.shard.path))),
+  ]);
+  const shardsByPath = new Map(
+    readImportedActionEventShards(
       root,
-      [index.shard.path],
+      completeShardPaths,
       { requireManifestPaths: true },
       shardBudget,
-    )[0];
+    ).map((shard) => [shard.relativePath, shard]),
+  );
+  for (const index of indexes) {
+    const shard = shardsByPath.get(index.shard.path);
     if (!shard) throw new Error("repair mutation idempotency index shard is missing");
     const shardEvents = shard.events;
     const replaySha256 = actionEventShardReplaySha256(shardEvents);
@@ -1333,6 +1343,22 @@ export function readImportedRepairMutationEvents(
     }
   }
   return events;
+}
+
+function completeImportedActionEventShardPaths(relativePath: string): string[] {
+  const { shardIndex, shardCount } = importedShardPart(relativePath);
+  if (shardIndex === undefined || shardCount === undefined) return [relativePath];
+  if (shardCount > ACTION_EVENT_SHARD_IMPORT_LIMITS.maxFiles) {
+    throw new Error(
+      `action event shard manifest exceeds ${ACTION_EVENT_SHARD_IMPORT_LIMITS.maxFiles} event paths`,
+    );
+  }
+  const match = /^(.*-part-)\d{6}(-of-\d{6}\.jsonl)$/.exec(relativePath);
+  if (!match) throw new Error(`invalid action event shard path: ${relativePath}`);
+  return Array.from(
+    { length: shardCount },
+    (_, index) => `${match[1]}${String(index + 1).padStart(6, "0")}${match[2]}`,
+  );
 }
 
 function readRepairMutationIdempotencyIndexDirectory(

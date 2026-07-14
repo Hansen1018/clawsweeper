@@ -25,6 +25,7 @@ import {
 import {
   ACTION_EVENT_PHASE_TYPES,
   ACTION_EVENT_REASON_CODES,
+  ACTION_EVENT_SHARD_FILE_LIMITS,
   ACTION_EVENT_STATUSES,
   ACTION_EVENT_TYPES,
   actionEventId,
@@ -4335,6 +4336,44 @@ test("repair mutation idempotency index reads enforce aggregate shard byte limit
     );
   } finally {
     mutableLimits.maxTotalBytes = originalMaxTotalBytes;
+  }
+});
+
+test("repair mutation idempotency index reads validate complete multipart shard sets", async () => {
+  const root = tempRoot();
+  const spool = trustedChildRoot(root, "spool");
+  const source = trustedChildRoot(root, "source");
+  const destination = trustedChildRoot(root, "destination");
+  const env = workflowEnv();
+  const mutableLimits = ACTION_EVENT_SHARD_FILE_LIMITS as unknown as { maxEvents: number };
+  const originalMaxEvents = mutableLimits.maxEvents;
+
+  try {
+    mutableLimits.maxEvents = 2;
+    const { mutationOutcome } = recordWorkflowAttemptMutationOutcome(spool, env, "unknown");
+    const mutationAttempt = readAllSpooledActionEvents(spool).find(
+      (event) =>
+        event.event_type === ACTION_EVENT_TYPES.repairMutation &&
+        event.action.status === ACTION_EVENT_STATUSES.started,
+    );
+    assert.ok(mutationAttempt);
+    const paths = await flushWorkflowActionEvents(spool, { env, outputRoot: source });
+    assert.equal(paths.length, 2);
+    assert.match(paths[0]!, /-part-000001-of-000002\.jsonl$/);
+    assert.match(paths[1]!, /-part-000002-of-000002\.jsonl$/);
+    importActionEventShards(source, destination);
+
+    const indexed = readImportedRepairMutationEvents(
+      destination,
+      mutationOutcome.producer.repository,
+      mutationOutcome.idempotency_key_sha256,
+    );
+    assert.deepEqual(
+      indexed?.map((event) => event.event_id),
+      [mutationAttempt.event_id, mutationOutcome.event_id],
+    );
+  } finally {
+    mutableLimits.maxEvents = originalMaxEvents;
   }
 });
 

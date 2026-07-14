@@ -291,6 +291,26 @@ test("mutation recovery removal preserves a refined replacement envelope", () =>
   }
 });
 
+test("mutation recovery readers remove interrupted reclaim files", () => {
+  const root = fs.realpathSync(
+    fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-recovery-reclaim-")),
+  );
+  const key = "5".repeat(64);
+
+  try {
+    writeMutationRecovery(root, "repair", key, { state: "accepted" });
+    const directory = path.join(root, ".mutation-recovery", "repair");
+    const recoveryPath = path.join(directory, `${key}.json`);
+    const reclaimPath = `${recoveryPath}.${process.pid}.${crypto.randomUUID()}.reclaim`;
+    fs.renameSync(recoveryPath, reclaimPath);
+
+    assert.deepEqual(readMutationRecoveries(root, "repair"), []);
+    assert.equal(fs.existsSync(reclaimPath), false);
+  } finally {
+    fs.rmSync(root, { force: true, recursive: true });
+  }
+});
+
 test("mutation recovery readers preserve a live writer staging file", async () => {
   const root = fs.realpathSync(
     fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-recovery-concurrency-")),

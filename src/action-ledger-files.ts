@@ -358,6 +358,27 @@ export function removeFileNoFollow(target: SafeWriteTarget): ConditionalRemoveRe
   return claimAndRemoveUtf8FileNoFollow(target);
 }
 
+export function unlinkFileIfExistsNoFollow(target: SafeWriteTarget): boolean {
+  const parentChain = captureSafeParentChain(target, false);
+  let descriptor: number | undefined;
+  try {
+    assertStableParentChain(target, parentChain);
+    const pathIdentity = fileIdentity(target.path, `${target.label} claimed file`);
+    descriptor = fs.openSync(target.path, fs.constants.O_RDONLY | NO_FOLLOW | NON_BLOCKING);
+    const openedIdentity = descriptorIdentity(descriptor, `${target.label} claimed file`);
+    if (!fileIdentitiesEqual(pathIdentity, openedIdentity)) {
+      throw new FileIdentityMismatchError(`refusing replaced ${target.label}: ${target.path}`);
+    }
+    unlinkFileNoFollow(target, openedIdentity, parentChain);
+    return true;
+  } catch (error) {
+    if (isNotFoundError(error)) return false;
+    throw error;
+  } finally {
+    if (descriptor !== undefined) fs.closeSync(descriptor);
+  }
+}
+
 function claimAndRemoveUtf8FileNoFollow(
   target: SafeWriteTarget,
   expectedContent?: string,
