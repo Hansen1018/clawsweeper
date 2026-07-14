@@ -2890,6 +2890,14 @@ test("post-migration D1 fence validator accepts only the selected state", () => 
 test("production proof polls semantic state and binds both responses to the release", () => {
   const verify = step(deploy, "Poll exact production release");
   const run = verify.run ?? "";
+  const requiredQueryNames = [
+    "gitcrawl.coverage",
+    "gitcrawl.clusters.list",
+    "gitcrawl.clusters.members",
+    "gitcrawl.clusters.related",
+    "gitcrawl.pull_requests.review_context",
+    "gitcrawl.threads.search",
+  ];
   assert.equal(verify.env?.CLOUDFLARE_API_TOKEN, undefined);
   assert.equal(verify.env?.CUSTOM_ROUTE_PROOF, "${{ vars.CRAWL_REMOTE_CUSTOM_ROUTE_PROOF }}");
   assert.match(run, /while \(\( SECONDS < deadline \)\)/);
@@ -2901,6 +2909,17 @@ test("production proof polls semantic state and binds both responses to the rele
   assert.match(run, /\$WORKERS_DEV_URL\/v1\/contract/);
   assert.match(run, /\$PRODUCTION_ROUTE_URL\/health/);
   assert.match(run, /\$PRODUCTION_ROUTE_URL\/v1\/contract/);
+  assert.match(
+    run,
+    /\$PRODUCTION_ROUTE_URL\/v1\/apps\/gitcrawl\/archives\/\$canary_route_archive\/query/,
+  );
+  assert.match(run, /canary_archive='gitcrawl\/clawsweeper__query_canary'/);
+  assert.match(run, /live_archive='gitcrawl\/openclaw__openclaw'/);
+  assert.match(run, /live-coverage\.json/);
+  assert.match(run, /"POST"/);
+  assert.match(run, /gitcrawl-query-safety-v3/);
+  assert.match(run, /read-only POST query route/);
+  assert.match(run, /safe read-only Gitcrawl query/);
   assert.match(run, /CF-Access-Client-Id/);
   assert.match(run, /CF-Access-Client-Secret/);
   assert.match(run, /CUSTOM_ROUTE_PROOF.*access-service-token/s);
@@ -2928,6 +2947,22 @@ test("production proof polls semantic state and binds both responses to the rele
   assert.match(run, /gitcrawl\.capabilities\.includes\(\s*'gitcrawl\.snapshot\.provenance\.v1'/);
   assert.match(run, /expectedSnapshotProvenanceState === 'active'.*!snapshotProvenanceActive/s);
   assert.match(run, /expectedSnapshotProvenanceState === 'dormant'.*snapshotProvenanceActive/s);
+  for (const queryName of requiredQueryNames) {
+    assert.match(run, new RegExp(`'${queryName.replaceAll(".", "\\.")}'`));
+  }
+  assert.match(run, /fetch_canary_query\(\)/);
+  assert.match(run, /"status":"active","min_size":2/);
+  assert.match(run, /"cluster_id":10/);
+  assert.match(run, /"number":103/);
+  assert.match(run, /"query":"canary"/);
+  assert.match(run, /const probeClusterId = 10/);
+  assert.match(run, /const probeNumber = 103/);
+  assert.match(run, /const canarySnapshotId =/);
+  assert.match(run, /did not prove fresh live Gitcrawl coverage/);
+  assert.doesNotMatch(run, /no bounded open pull request with related and review evidence/);
+  assert.match(run, /fetch_gitcrawl_queries &&/);
+  assert.match(run, /const maxFreshnessMs = 6 \* 60 \* 60 \* 1000/);
+  assert.match(run, /if \(age < 0\)/);
   assert.match(run, /process\.exit\(1\)/);
   assert.match(run, /required production endpoints did not converge to release \$DEPLOY_SHA/);
   assert.doesNotMatch(run, /curl .*--retry/s);
@@ -2943,18 +2978,301 @@ test("production semantic validator requires workers.dev and the Access route", 
   const workersDevContractPath = join(directory, "workers-dev-contract.json");
   const productionRouteHealthPath = join(directory, "production-route-health.json");
   const productionRouteContractPath = join(directory, "production-route-contract.json");
+  const productionRouteQueryDirectory = join(directory, "production-route-queries");
   const releaseSha = mergedCrawlRemoteMain;
   const observationCapability = "gitcrawl.observation-order.v1";
   const snapshotProvenanceCapability = "gitcrawl.snapshot.provenance.v1";
+  const querySafetyCapability = "gitcrawl-query-safety-v3";
   const observationFenceNote =
     "Gitcrawl observation ordering requires the D1 migration, explicit publisher capability, and operator cutover fence before it is advertised or activated.";
   const snapshotProvenanceNote =
     "Gitcrawl content-addressed snapshots bind manifest.source_sha256, status, queries, and SQLite bundle manifests to one source image.";
+  const requiredQueryNames = [
+    "gitcrawl.coverage",
+    "gitcrawl.clusters.list",
+    "gitcrawl.clusters.members",
+    "gitcrawl.clusters.related",
+    "gitcrawl.pull_requests.review_context",
+    "gitcrawl.threads.search",
+  ] as const;
+  type RequiredQueryName = (typeof requiredQueryNames)[number];
+  const canaryArchive = "gitcrawl/clawsweeper__query_canary";
+  const canaryRepository = "openclaw/clawsweeper-query-canary";
+  const canarySnapshotId = "9a03e9ec2d365b4f671ce29f1290d19faab979f2e7e01c73088bac6a905f9d36";
+  const probeClusterId = 10;
+  const probeNumber = 103;
 
   interface EndpointResponse {
     healthSha?: string;
     contractSha?: string;
     capabilities?: unknown;
+    contractQueries?: unknown;
+    queryContractVersion?: string;
+    queryResponses?: Partial<Record<RequiredQueryName, Record<string, unknown> | null>>;
+    liveCoverageResponse?: Record<string, unknown> | null;
+  }
+
+  const proofNow = "2026-07-14T12:00:00.000Z";
+  const liveTimestamp = "2026-07-14T11:55:00.000Z";
+  const canaryTimestamp = "2020-01-02T03:04:05.000Z";
+  function queryEnvelope(
+    queryName: RequiredQueryName,
+    generatedAt = canaryTimestamp,
+    contractVersion = querySafetyCapability,
+  ): Record<string, unknown> {
+    const thread = {
+      thread_id: 3,
+      number: probeNumber,
+      kind: "pull_request",
+      state: "open",
+      title: "Verify the ClawSweeper query canary",
+      body: "The deterministic canary exercises review and related-thread evidence.",
+      snippet: "The deterministic canary exercises review and related-thread evidence.",
+      updated_at_gh: generatedAt,
+    };
+    let values: Array<Record<string, unknown>>;
+    switch (queryName) {
+      case "gitcrawl.coverage":
+        values = [
+          "repositories",
+          "threads",
+          "thread_revisions",
+          "thread_fingerprints",
+          "thread_key_summaries",
+          "cluster_groups",
+          "cluster_memberships",
+          "pull_request_details",
+          "pull_request_files",
+        ].map((dataset) => ({
+          dataset,
+          row_count: 1,
+          eligible_count: 1,
+          covered_count: 1,
+          max_source_at: generatedAt,
+          dataset_generated_at: generatedAt,
+          complete: true,
+        }));
+        break;
+      case "gitcrawl.clusters.list":
+        values = [
+          {
+            cluster_id: probeClusterId,
+            stable_slug: "clawsweeper-query-canary",
+            status: "active",
+            title: "ClawSweeper query canary",
+            member_count: 3,
+            created_at: generatedAt,
+            updated_at: generatedAt,
+          },
+        ];
+        break;
+      case "gitcrawl.clusters.members":
+        values = [
+          {
+            ...thread,
+            cluster_id: probeClusterId,
+            cluster_status: "active",
+            role: "member",
+            membership_state: "active",
+          },
+          {
+            ...thread,
+            thread_id: 1,
+            number: 101,
+            kind: "issue",
+            cluster_id: probeClusterId,
+            cluster_status: "active",
+            role: "representative",
+            membership_state: "active",
+          },
+          {
+            ...thread,
+            thread_id: 2,
+            number: 102,
+            kind: "issue",
+            cluster_id: probeClusterId,
+            cluster_status: "active",
+            role: "member",
+            membership_state: "active",
+          },
+        ];
+        break;
+      case "gitcrawl.clusters.related":
+        values = [
+          {
+            ...thread,
+            thread_id: 1,
+            number: 101,
+            kind: "issue",
+            cluster_id: probeClusterId,
+            role: "representative",
+            source_number: probeNumber,
+          },
+          {
+            ...thread,
+            thread_id: 2,
+            number: 102,
+            kind: "issue",
+            cluster_id: probeClusterId,
+            role: "member",
+            source_number: probeNumber,
+          },
+        ];
+        break;
+      case "gitcrawl.pull_requests.review_context": {
+        const context = {
+          row_kind: "context",
+          thread_id: thread.thread_id,
+          number: thread.number,
+          state: thread.state,
+          title: thread.title,
+          body: thread.body,
+          author_login: "canary-author",
+          author_type: "User",
+          html_url: "https://github.com/openclaw/clawsweeper-query-canary/pull/103",
+          is_draft: 0,
+          created_at_gh: generatedAt,
+          updated_at_gh: generatedAt,
+          merged_at_gh: "",
+          base_sha: "1".repeat(40),
+          head_sha: "2".repeat(40),
+          head_ref: "canary",
+          head_repo_full_name: canaryRepository,
+          mergeable_state: "clean",
+          additions: 3,
+          deletions: 1,
+          changed_files: 1,
+          details_fetched_at: generatedAt,
+          details_updated_at: generatedAt,
+          key_summary: "Deterministic review canary",
+          fingerprint_hash: "canary-fingerprint",
+          fingerprint_slug: "clawsweeper-query-canary",
+          cluster_id: probeClusterId,
+          cluster_slug: "clawsweeper-query-canary",
+          cluster_title: "ClawSweeper query canary",
+          cluster_status: "active",
+          cluster_role: "member",
+          score_to_representative: 0.9,
+          file_position: null,
+          file_path: null,
+          file_status: null,
+          file_additions: null,
+          file_deletions: null,
+          file_changes: null,
+          file_previous_path: null,
+          file_fetched_at: null,
+          observation_sequence: null,
+          revision_id: 1003,
+          revision_source_updated_at: generatedAt,
+          revision_observation_sequence: null,
+          revision_content_hash: "canary-content",
+        };
+        values = [
+          context,
+          {
+            ...context,
+            row_kind: "file",
+            state: null,
+            title: null,
+            body: null,
+            author_login: null,
+            author_type: null,
+            html_url: null,
+            is_draft: null,
+            created_at_gh: null,
+            updated_at_gh: null,
+            merged_at_gh: null,
+            base_sha: null,
+            head_sha: null,
+            head_ref: null,
+            head_repo_full_name: null,
+            mergeable_state: null,
+            additions: null,
+            deletions: null,
+            changed_files: null,
+            details_fetched_at: null,
+            details_updated_at: null,
+            key_summary: null,
+            fingerprint_hash: null,
+            fingerprint_slug: null,
+            cluster_id: null,
+            cluster_slug: null,
+            cluster_title: null,
+            cluster_status: null,
+            cluster_role: null,
+            score_to_representative: null,
+            file_position: 0,
+            file_path: "src/canary.ts",
+            file_status: "modified",
+            file_additions: 3,
+            file_deletions: 1,
+            file_changes: 4,
+            file_previous_path: "",
+            file_fetched_at: generatedAt,
+            observation_sequence: null,
+            revision_id: null,
+            revision_source_updated_at: null,
+            revision_observation_sequence: null,
+            revision_content_hash: null,
+          },
+        ];
+        break;
+      }
+      case "gitcrawl.threads.search":
+        values = [thread];
+        break;
+    }
+    const columns = values.length === 0 ? [] : Object.keys(values[0]!);
+    return {
+      columns,
+      rows: values.map((value) => columns.map((column) => value[column as keyof typeof value])),
+      values,
+      snapshot: {
+        id: canarySnapshotId,
+        source_sha256: canarySnapshotId,
+        schema_name: "gitcrawl-portable",
+        schema_version: 1,
+        schema_hash: "schema-v1",
+        capabilities: [...requiredQueryNames],
+        source_sync_at: generatedAt,
+        dataset_generated_at: generatedAt,
+        coverage_complete: true,
+        published_at: generatedAt,
+        cutover_at: generatedAt,
+      },
+      stats: {
+        contract_version: contractVersion,
+        repository: canaryRepository,
+        archive: canaryArchive,
+        snapshot_id: canarySnapshotId,
+        source_sync_at: generatedAt,
+        dataset_generated_at: generatedAt,
+        coverage_complete: true,
+        next_cursor: "",
+      },
+    };
+  }
+
+  function liveCoverageEnvelope(): Record<string, unknown> {
+    const envelope = queryEnvelope("gitcrawl.coverage", liveTimestamp);
+    const liveSnapshotId = "a".repeat(64);
+    Object.assign(envelope.stats as Record<string, unknown>, {
+      repository: "openclaw/openclaw",
+      archive: "gitcrawl/openclaw__openclaw",
+      snapshot_id: liveSnapshotId,
+    });
+    Object.assign(envelope.snapshot as Record<string, unknown>, {
+      id: liveSnapshotId,
+      source_sha256: liveSnapshotId,
+    });
+    return envelope;
+  }
+
+  function synchronizeRows(envelope: Record<string, unknown>): void {
+    const values = envelope.values as Array<Record<string, unknown>>;
+    const columns = values.length === 0 ? [] : Object.keys(values[0]!);
+    envelope.columns = columns;
+    envelope.rows = values.map((value) => columns.map((column) => value[column]));
   }
 
   function validate(
@@ -2965,6 +3283,7 @@ test("production semantic validator requires workers.dev and the Access route", 
     customRouteProof: "access-service-token" = "access-service-token",
   ) {
     const defaultCapabilities = [
+      querySafetyCapability,
       ...(observationState === "active" ? [observationCapability] : []),
       ...(snapshotState === "active" ? [snapshotProvenanceCapability] : []),
     ];
@@ -2986,15 +3305,51 @@ test("production semantic validator requires workers.dev and the Access route", 
           routes: [
             { method: "GET", path: "/health" },
             { method: "GET", path: "/v1/contract" },
+            {
+              method: "POST",
+              path: "/v1/apps/:app/archives/:archive/query",
+              auth: "reader",
+            },
           ],
-          apps: [{ app: "gitcrawl", capabilities }],
+          apps: [
+            {
+              app: "gitcrawl",
+              capabilities,
+              queries: Object.hasOwn(response, "contractQueries")
+                ? response.contractQueries
+                : requiredQueryNames.map((name) => ({ name })),
+            },
+          ],
         }),
       );
     }
     writeEndpoint(workersDevHealthPath, workersDevContractPath, workersDev);
     writeEndpoint(productionRouteHealthPath, productionRouteContractPath, productionRoute);
+    rmSync(productionRouteQueryDirectory, { recursive: true, force: true });
+    mkdirSync(productionRouteQueryDirectory, { recursive: true });
+    for (const queryName of requiredQueryNames) {
+      const response = productionRoute.queryResponses?.[queryName];
+      if (response === null) continue;
+      writeFileSync(
+        join(productionRouteQueryDirectory, `${queryName}.json`),
+        JSON.stringify(
+          response ??
+            queryEnvelope(
+              queryName,
+              canaryTimestamp,
+              productionRoute.queryContractVersion ?? querySafetyCapability,
+            ),
+        ),
+      );
+    }
+    if (productionRoute.liveCoverageResponse !== null) {
+      writeFileSync(
+        join(productionRouteQueryDirectory, "live-coverage.json"),
+        JSON.stringify(productionRoute.liveCoverageResponse ?? liveCoverageEnvelope()),
+      );
+    }
     return spawnSync(process.execPath, ["--input-type=module"], {
-      input: validator,
+      input: `Date.now = () => ${Date.parse(proofNow)};\n${validator}`,
       encoding: "utf8",
       env: {
         ...process.env,
@@ -3003,6 +3358,7 @@ test("production semantic validator requires workers.dev and the Access route", 
         OBSERVATION_ORDER_STATE: observationState,
         PRODUCTION_ROUTE_CONTRACT_RESPONSE: productionRouteContractPath,
         PRODUCTION_ROUTE_HEALTH_RESPONSE: productionRouteHealthPath,
+        PRODUCTION_ROUTE_QUERY_RESPONSE_DIR: productionRouteQueryDirectory,
         WORKERS_DEV_CONTRACT_RESPONSE: workersDevContractPath,
         WORKERS_DEV_HEALTH_RESPONSE: workersDevHealthPath,
         SNAPSHOT_PROVENANCE_STATE: snapshotState,
@@ -3024,6 +3380,270 @@ test("production semantic validator requires workers.dev and the Access route", 
       0,
     );
     assert.notEqual(validate("dormant", "dormant", {}, { capabilities: null }).status, 0);
+    assert.notEqual(validate("dormant", "dormant", { capabilities: [] }).status, 0);
+    assert.notEqual(
+      validate(
+        "dormant",
+        "dormant",
+        {},
+        {
+          contractQueries: requiredQueryNames
+            .filter((name) => name !== "gitcrawl.threads.search")
+            .map((name) => ({ name })),
+        },
+      ).status,
+      0,
+    );
+    assert.notEqual(
+      validate(
+        "dormant",
+        "dormant",
+        {},
+        {
+          queryResponses: { "gitcrawl.threads.search": null },
+        },
+      ).status,
+      0,
+    );
+    assert.notEqual(validate("dormant", "dormant", {}, { liveCoverageResponse: null }).status, 0);
+    assert.notEqual(
+      validate("dormant", "dormant", {}, { queryContractVersion: "legacy-v1" }).status,
+      0,
+    );
+    for (const queryName of requiredQueryNames) {
+      const empty = queryEnvelope(queryName);
+      empty.columns = [];
+      empty.rows = [];
+      empty.values = [];
+      const result = validate("dormant", "dormant", {}, { queryResponses: { [queryName]: empty } });
+      assert.notEqual(result.status, 0, `${queryName} must reject columnless envelopes`);
+    }
+    for (const queryName of requiredQueryNames.filter((name) => name !== "gitcrawl.coverage")) {
+      const empty = queryEnvelope(queryName);
+      empty.rows = [];
+      empty.values = [];
+      const result = validate("dormant", "dormant", {}, { queryResponses: { [queryName]: empty } });
+      assert.notEqual(result.status, 0, `${queryName} must prove data-bearing canary behavior`);
+    }
+    const unrelatedMembers = queryEnvelope("gitcrawl.clusters.members");
+    (unrelatedMembers.values as Array<Record<string, unknown>>)[0]!.cluster_id = 8;
+    synchronizeRows(unrelatedMembers);
+    assert.notEqual(
+      validate(
+        "dormant",
+        "dormant",
+        {},
+        { queryResponses: { "gitcrawl.clusters.members": unrelatedMembers } },
+      ).status,
+      0,
+    );
+    const unrelatedRelated = queryEnvelope("gitcrawl.clusters.related");
+    (unrelatedRelated.values as Array<Record<string, unknown>>)[0]!.source_number = 999;
+    synchronizeRows(unrelatedRelated);
+    assert.notEqual(
+      validate(
+        "dormant",
+        "dormant",
+        {},
+        { queryResponses: { "gitcrawl.clusters.related": unrelatedRelated } },
+      ).status,
+      0,
+    );
+    const unrelatedReview = queryEnvelope("gitcrawl.pull_requests.review_context");
+    (unrelatedReview.values as Array<Record<string, unknown>>)[0]!.number = 999;
+    synchronizeRows(unrelatedReview);
+    assert.notEqual(
+      validate(
+        "dormant",
+        "dormant",
+        {},
+        { queryResponses: { "gitcrawl.pull_requests.review_context": unrelatedReview } },
+      ).status,
+      0,
+    );
+    const malformedSearch = queryEnvelope("gitcrawl.threads.search");
+    (malformedSearch.values as Array<Record<string, unknown>>)[0]!.kind = "issue";
+    synchronizeRows(malformedSearch);
+    assert.notEqual(
+      validate(
+        "dormant",
+        "dormant",
+        {},
+        { queryResponses: { "gitcrawl.threads.search": malformedSearch } },
+      ).status,
+      0,
+    );
+    const withoutColumns = queryEnvelope("gitcrawl.coverage");
+    delete withoutColumns.columns;
+    assert.notEqual(
+      validate(
+        "dormant",
+        "dormant",
+        {},
+        {
+          queryResponses: { "gitcrawl.coverage": withoutColumns },
+        },
+      ).status,
+      0,
+    );
+    const withoutRows = queryEnvelope("gitcrawl.coverage");
+    delete withoutRows.rows;
+    assert.notEqual(
+      validate(
+        "dormant",
+        "dormant",
+        {},
+        {
+          queryResponses: { "gitcrawl.coverage": withoutRows },
+        },
+      ).status,
+      0,
+    );
+    const withoutSnapshot = queryEnvelope("gitcrawl.clusters.members");
+    delete withoutSnapshot.snapshot;
+    assert.notEqual(
+      validate(
+        "dormant",
+        "dormant",
+        {},
+        {
+          queryResponses: { "gitcrawl.clusters.members": withoutSnapshot },
+        },
+      ).status,
+      0,
+    );
+    const withoutCursor = queryEnvelope("gitcrawl.coverage");
+    delete (withoutCursor.stats as Record<string, unknown>).next_cursor;
+    assert.notEqual(
+      validate(
+        "dormant",
+        "dormant",
+        {},
+        {
+          queryResponses: { "gitcrawl.coverage": withoutCursor },
+        },
+      ).status,
+      0,
+    );
+    const paginatedCoverage = queryEnvelope("gitcrawl.coverage");
+    (paginatedCoverage.stats as Record<string, unknown>).next_cursor = "next-page";
+    assert.notEqual(
+      validate(
+        "dormant",
+        "dormant",
+        {},
+        {
+          queryResponses: { "gitcrawl.coverage": paginatedCoverage },
+        },
+      ).status,
+      0,
+    );
+    const missingCoverage = queryEnvelope("gitcrawl.coverage");
+    (missingCoverage.values as unknown[]).pop();
+    (missingCoverage.rows as unknown[]).pop();
+    assert.notEqual(
+      validate(
+        "dormant",
+        "dormant",
+        {},
+        {
+          queryResponses: { "gitcrawl.coverage": missingCoverage },
+        },
+      ).status,
+      0,
+    );
+    const incompleteCoverage = queryEnvelope("gitcrawl.coverage");
+    (incompleteCoverage.values as Array<Record<string, unknown>>)[0]!.covered_count = 0;
+    (incompleteCoverage.rows as unknown[][])[0]! = (incompleteCoverage.columns as string[]).map(
+      (column) => (incompleteCoverage.values as Array<Record<string, unknown>>)[0]![column],
+    );
+    assert.notEqual(
+      validate(
+        "dormant",
+        "dormant",
+        {},
+        {
+          queryResponses: { "gitcrawl.coverage": incompleteCoverage },
+        },
+      ).status,
+      0,
+    );
+    const mismatchedSnapshot = queryEnvelope("gitcrawl.coverage");
+    (mismatchedSnapshot.snapshot as Record<string, unknown>).dataset_generated_at =
+      "2026-07-14T11:55:01.000Z";
+    assert.notEqual(
+      validate(
+        "dormant",
+        "dormant",
+        {},
+        {
+          queryResponses: { "gitcrawl.coverage": mismatchedSnapshot },
+        },
+      ).status,
+      0,
+    );
+    const staleSource = liveCoverageEnvelope();
+    (staleSource.stats as Record<string, unknown>).source_sync_at = "2026-07-14T05:59:59.999Z";
+    (staleSource.snapshot as Record<string, unknown>).source_sync_at = "2026-07-14T05:59:59.999Z";
+    const staleSourceResult = validate(
+      "dormant",
+      "dormant",
+      {},
+      {
+        liveCoverageResponse: staleSource,
+      },
+    );
+    assert.notEqual(staleSourceResult.status, 0);
+    assert.match(staleSourceResult.stderr, /source sync is older than six hours/);
+    const staleDataset = liveCoverageEnvelope();
+    (staleDataset.stats as Record<string, unknown>).dataset_generated_at =
+      "2026-07-14T05:59:59.999Z";
+    (staleDataset.snapshot as Record<string, unknown>).dataset_generated_at =
+      "2026-07-14T05:59:59.999Z";
+    for (const value of staleDataset.values as Array<Record<string, unknown>>) {
+      value.dataset_generated_at = "2026-07-14T05:59:59.999Z";
+    }
+    const staleDatasetResult = validate(
+      "dormant",
+      "dormant",
+      {},
+      {
+        liveCoverageResponse: staleDataset,
+      },
+    );
+    assert.notEqual(staleDatasetResult.status, 0);
+    assert.match(staleDatasetResult.stderr, /dataset generation is older than six hours/);
+    const futureSource = liveCoverageEnvelope();
+    (futureSource.stats as Record<string, unknown>).source_sync_at = "2026-07-14T12:00:00.001Z";
+    (futureSource.snapshot as Record<string, unknown>).source_sync_at = "2026-07-14T12:00:00.001Z";
+    const futureSourceResult = validate(
+      "dormant",
+      "dormant",
+      {},
+      {
+        liveCoverageResponse: futureSource,
+      },
+    );
+    assert.notEqual(futureSourceResult.status, 0);
+    assert.match(futureSourceResult.stderr, /source sync is in the future/);
+    const futureDataset = liveCoverageEnvelope();
+    (futureDataset.stats as Record<string, unknown>).dataset_generated_at =
+      "2026-07-14T12:00:00.001Z";
+    (futureDataset.snapshot as Record<string, unknown>).dataset_generated_at =
+      "2026-07-14T12:00:00.001Z";
+    for (const value of futureDataset.values as Array<Record<string, unknown>>) {
+      value.dataset_generated_at = "2026-07-14T12:00:00.001Z";
+    }
+    const futureDatasetResult = validate(
+      "dormant",
+      "dormant",
+      {},
+      {
+        liveCoverageResponse: futureDataset,
+      },
+    );
+    assert.notEqual(futureDatasetResult.status, 0);
+    assert.match(futureDatasetResult.stderr, /dataset generation is in the future/);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }

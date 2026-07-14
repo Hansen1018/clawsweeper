@@ -2429,6 +2429,7 @@ jobs:
           CUSTOM_ROUTE_PROOF: ${{ vars.CRAWL_REMOTE_CUSTOM_ROUTE_PROOF }}
           PRODUCTION_ROUTE_CONTRACT_RESPONSE: ${{ runner.temp }}/crawl-remote-production-route-contract.json
           PRODUCTION_ROUTE_HEALTH_RESPONSE: ${{ runner.temp }}/crawl-remote-production-route-health.json
+          PRODUCTION_ROUTE_QUERY_RESPONSE_DIR: ${{ runner.temp }}/crawl-remote-production-route-queries
           WORKERS_DEV_CONTRACT_RESPONSE: ${{ runner.temp }}/crawl-remote-workers-dev-contract.json
           WORKERS_DEV_HEALTH_RESPONSE: ${{ runner.temp }}/crawl-remote-workers-dev-health.json
         run: |
@@ -2440,9 +2441,12 @@ jobs:
             local url="$1"
             local output="$2"
             local access_mode="${3:-public}"
+            local method="${4:-GET}"
+            local data="${5:-}"
             local remaining=$((deadline - SECONDS))
             local timeout
             local -a access_headers=()
+            local -a request_args=()
 
             if (( remaining <= 0 )); then
               return 1
@@ -2460,6 +2464,16 @@ jobs:
               echo "::error::unsupported endpoint access mode: $access_mode"
               return 1
             fi
+            if [[ "$method" == "POST" ]]; then
+              request_args=(
+                --request POST
+                --header "content-type: application/json"
+                --data "$data"
+              )
+            elif [[ "$method" != "GET" ]]; then
+              echo "::error::unsupported endpoint method: $method"
+              return 1
+            fi
             timeout="$remaining"
             if (( timeout > 10 )); then
               timeout=10
@@ -2471,8 +2485,74 @@ jobs:
               --max-filesize 1048576 \
               --header "cache-control: no-cache" \
               "${access_headers[@]}" \
+              "${request_args[@]}" \
               --output "$output" \
               "$url"
+          }
+
+          fetch_gitcrawl_queries() {
+            local canary_archive='gitcrawl/clawsweeper__query_canary'
+            local canary_repository='openclaw/clawsweeper-query-canary'
+            local canary_route_archive='gitcrawl%2Fclawsweeper__query_canary'
+            local live_archive='gitcrawl/openclaw__openclaw'
+            local live_repository='openclaw/openclaw'
+            local live_route_archive='gitcrawl%2Fopenclaw__openclaw'
+            local query_body
+
+            rm -rf -- "$PRODUCTION_ROUTE_QUERY_RESPONSE_DIR"
+            mkdir -p -- "$PRODUCTION_ROUTE_QUERY_RESPONSE_DIR"
+
+            fetch_canary_query() {
+              local query_name="$1"
+              local query_args="$2"
+              local query_limit="$3"
+              printf -v query_body \
+                '{"contract_version":"gitcrawl-query-safety-v3","repository":"%s","archive":"%s","name":"%s","args":%s,"limit":%d}' \
+                "$canary_repository" \
+                "$canary_archive" \
+                "$query_name" \
+                "$query_args" \
+                "$query_limit"
+              fetch_endpoint \
+                "$PRODUCTION_ROUTE_URL/v1/apps/gitcrawl/archives/$canary_route_archive/query" \
+                "$PRODUCTION_ROUTE_QUERY_RESPONSE_DIR/$query_name.json" \
+                "access-service-token" \
+                "POST" \
+                "$query_body"
+            }
+
+            fetch_canary_query 'gitcrawl.coverage' '{}' 64 || return 1
+            fetch_canary_query \
+              'gitcrawl.clusters.list' \
+              '{"owner":"openclaw","repo":"clawsweeper-query-canary","status":"active","min_size":2}' \
+              1 || return 1
+            fetch_canary_query \
+              'gitcrawl.clusters.members' \
+              '{"owner":"openclaw","repo":"clawsweeper-query-canary","cluster_id":10}' \
+              8 || return 1
+            fetch_canary_query \
+              'gitcrawl.clusters.related' \
+              '{"owner":"openclaw","repo":"clawsweeper-query-canary","number":103}' \
+              8 || return 1
+            fetch_canary_query \
+              'gitcrawl.pull_requests.review_context' \
+              '{"owner":"openclaw","repo":"clawsweeper-query-canary","number":103}' \
+              8 || return 1
+            fetch_canary_query \
+              'gitcrawl.threads.search' \
+              '{"owner":"openclaw","repo":"clawsweeper-query-canary","query":"canary","kind":"pull_request","state":"open"}' \
+              8 || return 1
+
+            printf -v query_body \
+              '{"contract_version":"gitcrawl-query-safety-v3","repository":"%s","archive":"%s","name":"gitcrawl.coverage","args":{},"limit":64}' \
+              "$live_repository" \
+              "$live_archive"
+            fetch_endpoint \
+              "$PRODUCTION_ROUTE_URL/v1/apps/gitcrawl/archives/$live_route_archive/query" \
+              "$PRODUCTION_ROUTE_QUERY_RESPONSE_DIR/live-coverage.json" \
+              "access-service-token" \
+              "POST" \
+              "$query_body"
           }
 
           test "$CUSTOM_ROUTE_PROOF" = "access-service-token"
@@ -2490,6 +2570,7 @@ jobs:
               fetch_endpoint "$WORKERS_DEV_URL/v1/contract" "$WORKERS_DEV_CONTRACT_RESPONSE" &&
               fetch_endpoint "$PRODUCTION_ROUTE_URL/health" "$PRODUCTION_ROUTE_HEALTH_RESPONSE" "access-service-token" &&
               fetch_endpoint "$PRODUCTION_ROUTE_URL/v1/contract" "$PRODUCTION_ROUTE_CONTRACT_RESPONSE" "access-service-token" &&
+              fetch_gitcrawl_queries &&
               node --input-type=module <<'NODE'
           import { readFileSync } from 'node:fs';
 
@@ -2502,6 +2583,14 @@ jobs:
               'Gitcrawl observation ordering requires the D1 migration, explicit publisher capability, and operator cutover fence before it is advertised or activated.';
             const snapshotProvenanceNote =
               'Gitcrawl content-addressed snapshots bind manifest.source_sha256, status, queries, and SQLite bundle manifests to one source image.';
+            const requiredQueryNames = [
+              'gitcrawl.coverage',
+              'gitcrawl.clusters.list',
+              'gitcrawl.clusters.members',
+              'gitcrawl.clusters.related',
+              'gitcrawl.pull_requests.review_context',
+              'gitcrawl.threads.search',
+            ];
             const endpoints = [
               {
                 label: 'workers.dev',
@@ -2512,13 +2601,14 @@ jobs:
                 label: 'production route',
                 healthPath: process.env.PRODUCTION_ROUTE_HEALTH_RESPONSE,
                 contractPath: process.env.PRODUCTION_ROUTE_CONTRACT_RESPONSE,
+                queryResponseDir: process.env.PRODUCTION_ROUTE_QUERY_RESPONSE_DIR,
               },
             ];
             if (process.env.CUSTOM_ROUTE_PROOF !== 'access-service-token') {
               throw new Error('custom-route proof mode is invalid');
             }
 
-            function validateEndpoint({ label, healthPath, contractPath }) {
+            function validateEndpoint({ label, healthPath, contractPath, queryResponseDir }) {
               const health = JSON.parse(readFileSync(healthPath, 'utf8'));
               if (health.ok !== true || health.release_sha !== expectedSha) {
                 throw new Error(`${label} health response does not identify the approved release`);
@@ -2548,6 +2638,20 @@ jobs:
               }
               if (!Array.isArray(gitcrawl.capabilities)) {
                 throw new Error(`${label} Gitcrawl capabilities are malformed`);
+              }
+              if (!gitcrawl.capabilities.includes('gitcrawl-query-safety-v3')) {
+                throw new Error(`${label} contract is missing the Gitcrawl query safety capability`);
+              }
+              if (!Array.isArray(gitcrawl.queries)) {
+                throw new Error(`${label} Gitcrawl queries are malformed`);
+              }
+              const advertisedQueryNames = gitcrawl.queries.map((entry) => entry?.name);
+              if (
+                advertisedQueryNames.some((name) => typeof name !== 'string' || !name) ||
+                new Set(advertisedQueryNames).size !== advertisedQueryNames.length ||
+                requiredQueryNames.some((name) => !advertisedQueryNames.includes(name))
+              ) {
+                throw new Error(`${label} contract is missing required Gitcrawl queries`);
               }
               const observationOrderActive = gitcrawl.capabilities.includes(
                 'gitcrawl.observation-order.v1',
@@ -2590,6 +2694,536 @@ jobs:
               for (const path of ['/health', '/v1/contract']) {
                 if (!routes.some((route) => route?.method === 'GET' && route?.path === path)) {
                   throw new Error(`${label} contract is missing GET ${path}`);
+                }
+              }
+              if (
+                !routes.some(
+                  (route) =>
+                    route?.method === 'POST' &&
+                    route?.path === '/v1/apps/:app/archives/:archive/query' &&
+                    route?.auth === 'reader',
+                )
+              ) {
+                throw new Error(`${label} contract is missing the read-only POST query route`);
+              }
+              if (queryResponseDir) {
+                const isRecord = (value) =>
+                  typeof value === 'object' && value !== null && !Array.isArray(value);
+                const isRfc3339 = (value) =>
+                  typeof value === 'string' &&
+                  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/.test(
+                    value,
+                  ) &&
+                  Number.isFinite(Date.parse(value));
+                const proofNow = Date.now();
+                const maxFreshnessMs = 6 * 60 * 60 * 1000;
+                const assertFreshTimestamp = (value, timestampLabel) => {
+                  if (!isRfc3339(value)) {
+                    throw new Error(`${timestampLabel} is not a valid RFC3339 timestamp`);
+                  }
+                  const age = proofNow - Date.parse(value);
+                  if (age < 0) {
+                    throw new Error(`${timestampLabel} is in the future`);
+                  }
+                  if (age > maxFreshnessMs) {
+                    throw new Error(`${timestampLabel} is older than six hours`);
+                  }
+                };
+                const canonical = (value) => {
+                  if (Array.isArray(value)) return value.map(canonical);
+                  if (!isRecord(value)) return value;
+                  return Object.fromEntries(
+                    Object.entries(value)
+                      .sort(([left], [right]) => left.localeCompare(right))
+                      .map(([key, entry]) => [key, canonical(entry)]),
+                  );
+                };
+                const isPositiveInteger = (value) =>
+                  Number.isSafeInteger(value) && value > 0;
+                const isNonNegativeInteger = (value) =>
+                  Number.isSafeInteger(value) && value >= 0;
+                const isNonEmptyString = (value) =>
+                  typeof value === 'string' && value.trim().length > 0;
+                const isGitObjectId = (value) =>
+                  typeof value === 'string' && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(value);
+                const canaryArchive = 'gitcrawl/clawsweeper__query_canary';
+                const canaryRepository = 'openclaw/clawsweeper-query-canary';
+                const canarySnapshotId =
+                  '9a03e9ec2d365b4f671ce29f1290d19faab979f2e7e01c73088bac6a905f9d36';
+                const probeClusterId = 10;
+                const probeNumber = 103;
+                const expectedCoverageDatasets = [
+                  'repositories',
+                  'threads',
+                  'thread_revisions',
+                  'thread_fingerprints',
+                  'thread_key_summaries',
+                  'cluster_groups',
+                  'cluster_memberships',
+                  'pull_request_details',
+                  'pull_request_files',
+                ];
+                const requiredColumns = new Map([
+                  [
+                    'gitcrawl.coverage',
+                    [
+                      'dataset',
+                      'row_count',
+                      'eligible_count',
+                      'covered_count',
+                      'max_source_at',
+                      'dataset_generated_at',
+                      'complete',
+                    ],
+                  ],
+                  [
+                    'gitcrawl.clusters.list',
+                    [
+                      'cluster_id',
+                      'stable_slug',
+                      'status',
+                      'title',
+                      'member_count',
+                      'created_at',
+                      'updated_at',
+                    ],
+                  ],
+                  [
+                    'gitcrawl.clusters.members',
+                    [
+                      'thread_id',
+                      'number',
+                      'kind',
+                      'state',
+                      'title',
+                      'updated_at_gh',
+                      'cluster_id',
+                      'cluster_status',
+                      'role',
+                      'membership_state',
+                    ],
+                  ],
+                  [
+                    'gitcrawl.clusters.related',
+                    [
+                      'thread_id',
+                      'number',
+                      'kind',
+                      'state',
+                      'title',
+                      'updated_at_gh',
+                      'cluster_id',
+                      'role',
+                      'source_number',
+                    ],
+                  ],
+                  [
+                    'gitcrawl.pull_requests.review_context',
+                    [
+                      'row_kind',
+                      'thread_id',
+                      'number',
+                      'state',
+                      'title',
+                      'updated_at_gh',
+                      'base_sha',
+                      'head_sha',
+                      'changed_files',
+                      'details_fetched_at',
+                    ],
+                  ],
+                  [
+                    'gitcrawl.threads.search',
+                    ['thread_id', 'number', 'kind', 'state', 'title', 'updated_at_gh'],
+                  ],
+                ]);
+                const queryEnvelopes = new Map();
+                let expectedSnapshotGeneration;
+                for (const queryName of requiredQueryNames) {
+                  const query = JSON.parse(
+                    readFileSync(`${queryResponseDir}/${queryName}.json`, 'utf8'),
+                  );
+                  const stats = query?.stats;
+                  const snapshot = query?.snapshot;
+                  const columns = query?.columns;
+                  const rows = query?.rows;
+                  const values = query?.values;
+                  const snapshotId = stats?.snapshot_id;
+                  if (
+                    !isRecord(stats) ||
+                    stats.contract_version !== 'gitcrawl-query-safety-v3' ||
+                    stats.repository !== canaryRepository ||
+                    stats.archive !== canaryArchive ||
+                    snapshotId !== canarySnapshotId ||
+                    stats.coverage_complete !== true ||
+                    typeof stats.next_cursor !== 'string' ||
+                    stats.next_cursor !== '' ||
+                    !isRfc3339(stats.source_sync_at) ||
+                    !isRfc3339(stats.dataset_generated_at) ||
+                    !Array.isArray(columns) ||
+                    columns.some((column) => typeof column !== 'string' || !column) ||
+                    new Set(columns).size !== columns.length ||
+                    columns.length === 0 ||
+                    requiredColumns
+                      .get(queryName)
+                      .some((column) => !columns.includes(column)) ||
+                    !Array.isArray(rows) ||
+                    !Array.isArray(values) ||
+                    rows.length !== values.length ||
+                    values.length === 0 ||
+                    !isRecord(snapshot) ||
+                    snapshot.id !== snapshotId ||
+                    snapshot.source_sha256 !== canarySnapshotId ||
+                    typeof snapshot.schema_name !== 'string' ||
+                    !snapshot.schema_name.trim() ||
+                    !Number.isSafeInteger(snapshot.schema_version) ||
+                    snapshot.schema_version <= 0 ||
+                    typeof snapshot.schema_hash !== 'string' ||
+                    !snapshot.schema_hash.trim() ||
+                    !Array.isArray(snapshot.capabilities) ||
+                    !snapshot.capabilities.includes(queryName) ||
+                    snapshot.capabilities.some(
+                      (capability) => typeof capability !== 'string' || !capability.trim(),
+                    ) ||
+                    new Set(snapshot.capabilities).size !== snapshot.capabilities.length ||
+                    snapshot.source_sync_at !== stats.source_sync_at ||
+                    snapshot.dataset_generated_at !== stats.dataset_generated_at ||
+                    snapshot.coverage_complete !== true ||
+                    !isRfc3339(snapshot.published_at) ||
+                    !isRfc3339(snapshot.cutover_at)
+                  ) {
+                    throw new Error(
+                      `${label} did not complete safe read-only Gitcrawl query ${queryName}`,
+                    );
+                  }
+                  const snapshotGeneration = canonical({
+                    archive: stats.archive,
+                    capabilities: snapshot.capabilities,
+                    cutover_at: snapshot.cutover_at,
+                    dataset_generated_at: stats.dataset_generated_at,
+                    id: snapshotId,
+                    published_at: snapshot.published_at,
+                    schema_hash: snapshot.schema_hash,
+                    schema_name: snapshot.schema_name,
+                    schema_version: snapshot.schema_version,
+                    source_sync_at: stats.source_sync_at,
+                  });
+                  if (expectedSnapshotGeneration === undefined) {
+                    expectedSnapshotGeneration = snapshotGeneration;
+                  } else if (
+                    JSON.stringify(snapshotGeneration) !==
+                    JSON.stringify(expectedSnapshotGeneration)
+                  ) {
+                    throw new Error(`${label} Gitcrawl query proof mixed snapshot generations`);
+                  }
+                  for (const [index, row] of rows.entries()) {
+                    if (
+                      !Array.isArray(row) ||
+                      row.length !== columns.length ||
+                      !isRecord(values[index])
+                    ) {
+                      throw new Error(
+                        `${label} did not complete safe read-only Gitcrawl query ${queryName}`,
+                      );
+                    }
+                    const projected = Object.fromEntries(
+                      columns.map((column, columnIndex) => [column, row[columnIndex]]),
+                    );
+                    if (
+                      JSON.stringify(canonical(projected)) !==
+                      JSON.stringify(canonical(values[index]))
+                    ) {
+                      throw new Error(
+                        `${label} did not complete safe read-only Gitcrawl query ${queryName}`,
+                      );
+                    }
+                  }
+                  queryEnvelopes.set(queryName, query);
+                  if (queryName !== 'gitcrawl.coverage') continue;
+                  if (values.length === 0) {
+                    throw new Error(
+                      `${label} did not complete safe read-only Gitcrawl query ${queryName}`,
+                    );
+                  }
+                  for (const value of values) {
+                    if (
+                      typeof value.dataset !== 'string' ||
+                      !value.dataset.trim() ||
+                      !Number.isSafeInteger(value.row_count) ||
+                      value.row_count < 1 ||
+                      !Number.isSafeInteger(value.eligible_count) ||
+                      value.eligible_count < 1 ||
+                      !Number.isSafeInteger(value.covered_count) ||
+                      value.covered_count < 1 ||
+                      value.covered_count > value.eligible_count ||
+                      value.row_count < value.covered_count ||
+                      typeof value.max_source_at !== 'string' ||
+                      (value.max_source_at !== '' && !isRfc3339(value.max_source_at)) ||
+                      !isRfc3339(value.dataset_generated_at) ||
+                      value.complete !== true ||
+                      value.covered_count !== value.eligible_count ||
+                      value.dataset_generated_at !== stats.dataset_generated_at ||
+                      (value.max_source_at !== '' && !isRfc3339(value.max_source_at))
+                    ) {
+                      throw new Error(
+                        `${label} did not complete safe read-only Gitcrawl query ${queryName}`,
+                      );
+                    }
+                  }
+                  const coverageDatasets = values.map((value) => value.dataset);
+                  if (
+                    values.length !== expectedCoverageDatasets.length ||
+                    new Set(coverageDatasets).size !== expectedCoverageDatasets.length ||
+                    expectedCoverageDatasets.some(
+                      (dataset) => !coverageDatasets.includes(dataset),
+                    )
+                  ) {
+                    throw new Error(
+                      `${label} did not return complete Gitcrawl dataset coverage`,
+                    );
+                  }
+                }
+
+                const valuesFor = (queryName) => queryEnvelopes.get(queryName).values;
+                const assertThreadRow = (row, queryName) => {
+                  if (
+                    !isRecord(row) ||
+                    !isPositiveInteger(row.thread_id) ||
+                    !isPositiveInteger(row.number) ||
+                    !isNonEmptyString(row.kind) ||
+                    !isNonEmptyString(row.state) ||
+                    typeof row.title !== 'string' ||
+                    !isRfc3339(row.updated_at_gh ?? row.updated_at)
+                  ) {
+                    throw new Error(
+                      `${label} returned a malformed Gitcrawl thread row for ${queryName}`,
+                    );
+                  }
+                };
+
+                const clusterRows = valuesFor('gitcrawl.clusters.list');
+                if (clusterRows.length !== 1) {
+                  throw new Error(`${label} did not return the deterministic Gitcrawl canary cluster`);
+                }
+                for (const row of clusterRows) {
+                  if (
+                    !isRecord(row) ||
+                    row.cluster_id !== probeClusterId ||
+                    !isNonEmptyString(row.stable_slug) ||
+                    row.status !== 'active' ||
+                    row.member_count !== 3 ||
+                    typeof row.title !== 'string' ||
+                    !isRfc3339(row.created_at) ||
+                    !isRfc3339(row.updated_at)
+                  ) {
+                    throw new Error(`${label} returned malformed Gitcrawl cluster rows`);
+                  }
+                }
+
+                const memberRows = valuesFor('gitcrawl.clusters.members');
+                const memberNumbers = new Set();
+                if (memberRows.length !== 3) {
+                  throw new Error(`${label} did not return all deterministic Gitcrawl canary members`);
+                }
+                for (const row of memberRows) {
+                  assertThreadRow(row, 'gitcrawl.clusters.members');
+                  if (
+                    row.cluster_id !== probeClusterId ||
+                    row.cluster_status !== 'active' ||
+                    !isNonEmptyString(row.role) ||
+                    row.membership_state !== 'active' ||
+                    memberNumbers.has(row.number)
+                  ) {
+                    throw new Error(`${label} returned unrelated Gitcrawl cluster members`);
+                  }
+                  memberNumbers.add(row.number);
+                }
+                if ([101, 102, 103].some((number) => !memberNumbers.has(number))) {
+                  throw new Error(`${label} returned an incomplete Gitcrawl canary member set`);
+                }
+
+                const searchRows = valuesFor('gitcrawl.threads.search');
+                if (searchRows.length !== 1) {
+                  throw new Error(`${label} did not return the deterministic Gitcrawl canary search hit`);
+                }
+                for (const row of searchRows) {
+                  assertThreadRow(row, 'gitcrawl.threads.search');
+                  if (
+                    row.number !== probeNumber ||
+                    row.kind !== 'pull_request' ||
+                    row.state !== 'open' ||
+                    !`${row.title}\n${row.body}\n${row.snippet}`.toLowerCase().includes('canary')
+                  ) {
+                    throw new Error(`${label} returned malformed open pull request search rows`);
+                  }
+                }
+
+                const relatedRows = valuesFor('gitcrawl.clusters.related');
+                const relatedNumbers = new Set();
+                if (relatedRows.length !== 2) {
+                  throw new Error(`${label} did not return all deterministic Gitcrawl canary relations`);
+                }
+                for (const row of relatedRows) {
+                  assertThreadRow(row, 'gitcrawl.clusters.related');
+                  if (
+                    row.source_number !== probeNumber ||
+                    row.number === probeNumber ||
+                    row.cluster_id !== probeClusterId ||
+                    !isNonEmptyString(row.role) ||
+                    relatedNumbers.has(row.number)
+                  ) {
+                    throw new Error(`${label} returned unrelated Gitcrawl related rows`);
+                  }
+                  relatedNumbers.add(row.number);
+                }
+                if ([101, 102].some((number) => !relatedNumbers.has(number))) {
+                  throw new Error(`${label} returned an incomplete Gitcrawl canary relation set`);
+                }
+
+                const reviewRows = valuesFor('gitcrawl.pull_requests.review_context');
+                const contextRows = reviewRows.filter((row) => row?.row_kind === 'context');
+                const fileRows = reviewRows.filter((row) => row?.row_kind === 'file');
+                if (
+                  reviewRows.length < 2 ||
+                  contextRows.length !== 1 ||
+                  fileRows.length < 1 ||
+                  contextRows.length + fileRows.length !== reviewRows.length
+                ) {
+                  throw new Error(`${label} returned malformed Gitcrawl review row kinds`);
+                }
+                const context = contextRows[0];
+                if (
+                  !isRecord(context) ||
+                  !isPositiveInteger(context.thread_id) ||
+                  context.number !== probeNumber ||
+                  context.state !== 'open' ||
+                  typeof context.title !== 'string' ||
+                  !isRfc3339(context.updated_at_gh) ||
+                  !isGitObjectId(context.base_sha) ||
+                  !isGitObjectId(context.head_sha) ||
+                  context.changed_files !== fileRows.length ||
+                  !isRfc3339(context.details_fetched_at)
+                ) {
+                  throw new Error(
+                    `${label} returned review context for an unrelated pull request`,
+                  );
+                }
+                const filePositions = new Set();
+                for (const row of fileRows) {
+                  if (
+                    !isRecord(row) ||
+                    row.thread_id !== context.thread_id ||
+                    row.number !== probeNumber ||
+                    !isNonNegativeInteger(row.file_position) ||
+                    !isNonEmptyString(row.file_path) ||
+                    !isNonEmptyString(row.file_status) ||
+                    !isNonNegativeInteger(row.file_additions) ||
+                    !isNonNegativeInteger(row.file_deletions) ||
+                    !isNonNegativeInteger(row.file_changes) ||
+                    !isRfc3339(row.file_fetched_at) ||
+                    filePositions.has(row.file_position)
+                  ) {
+                    throw new Error(`${label} returned unrelated Gitcrawl review file rows`);
+                  }
+                  filePositions.add(row.file_position);
+                }
+
+                const liveCoverage = JSON.parse(
+                  readFileSync(`${queryResponseDir}/live-coverage.json`, 'utf8'),
+                );
+                const liveStats = liveCoverage?.stats;
+                const liveSnapshot = liveCoverage?.snapshot;
+                const liveColumns = liveCoverage?.columns;
+                const liveRows = liveCoverage?.rows;
+                const liveValues = liveCoverage?.values;
+                const liveSnapshotId = liveStats?.snapshot_id;
+                if (isRecord(liveStats)) {
+                  assertFreshTimestamp(
+                    liveStats.source_sync_at,
+                    `${label} live Gitcrawl coverage source sync`,
+                  );
+                  assertFreshTimestamp(
+                    liveStats.dataset_generated_at,
+                    `${label} live Gitcrawl coverage dataset generation`,
+                  );
+                }
+                if (
+                  !isRecord(liveStats) ||
+                  liveStats.contract_version !== 'gitcrawl-query-safety-v3' ||
+                  liveStats.repository !== 'openclaw/openclaw' ||
+                  liveStats.archive !== 'gitcrawl/openclaw__openclaw' ||
+                  typeof liveSnapshotId !== 'string' ||
+                  !/^[0-9a-f]{64}$/.test(liveSnapshotId) ||
+                  liveStats.coverage_complete !== true ||
+                  liveStats.next_cursor !== '' ||
+                  !Array.isArray(liveColumns) ||
+                  liveColumns.some((column) => typeof column !== 'string' || !column) ||
+                  new Set(liveColumns).size !== liveColumns.length ||
+                  requiredColumns
+                    .get('gitcrawl.coverage')
+                    .some((column) => !liveColumns.includes(column)) ||
+                  !Array.isArray(liveRows) ||
+                  !Array.isArray(liveValues) ||
+                  liveRows.length !== liveValues.length ||
+                  liveValues.length !== expectedCoverageDatasets.length ||
+                  !isRecord(liveSnapshot) ||
+                  liveSnapshot.id !== liveSnapshotId ||
+                  liveSnapshot.source_sha256 !== liveSnapshotId ||
+                  !isNonEmptyString(liveSnapshot.schema_name) ||
+                  !Number.isSafeInteger(liveSnapshot.schema_version) ||
+                  liveSnapshot.schema_version <= 0 ||
+                  !isNonEmptyString(liveSnapshot.schema_hash) ||
+                  !Array.isArray(liveSnapshot.capabilities) ||
+                  !liveSnapshot.capabilities.includes('gitcrawl.coverage') ||
+                  liveSnapshot.source_sync_at !== liveStats.source_sync_at ||
+                  liveSnapshot.dataset_generated_at !== liveStats.dataset_generated_at ||
+                  liveSnapshot.coverage_complete !== true ||
+                  !isRfc3339(liveSnapshot.published_at) ||
+                  !isRfc3339(liveSnapshot.cutover_at)
+                ) {
+                  throw new Error(`${label} did not prove fresh live Gitcrawl coverage`);
+                }
+                const liveCoverageDatasets = [];
+                for (const [index, row] of liveRows.entries()) {
+                  const value = liveValues[index];
+                  if (
+                    !Array.isArray(row) ||
+                    row.length !== liveColumns.length ||
+                    !isRecord(value)
+                  ) {
+                    throw new Error(`${label} returned malformed live Gitcrawl coverage rows`);
+                  }
+                  const projected = Object.fromEntries(
+                    liveColumns.map((column, columnIndex) => [column, row[columnIndex]]),
+                  );
+                  if (
+                    JSON.stringify(canonical(projected)) !==
+                    JSON.stringify(canonical(value)) ||
+                    !isNonEmptyString(value.dataset) ||
+                    !Number.isSafeInteger(value.row_count) ||
+                    value.row_count < 0 ||
+                    !Number.isSafeInteger(value.eligible_count) ||
+                    value.eligible_count < 0 ||
+                    !Number.isSafeInteger(value.covered_count) ||
+                    value.covered_count < 0 ||
+                    value.covered_count !== value.eligible_count ||
+                    value.row_count < value.covered_count ||
+                    typeof value.max_source_at !== 'string' ||
+                    (value.max_source_at !== '' && !isRfc3339(value.max_source_at)) ||
+                    value.dataset_generated_at !== liveStats.dataset_generated_at ||
+                    value.complete !== true
+                  ) {
+                    throw new Error(`${label} returned incomplete live Gitcrawl coverage`);
+                  }
+                  liveCoverageDatasets.push(value.dataset);
+                }
+                if (
+                  new Set(liveCoverageDatasets).size !== expectedCoverageDatasets.length ||
+                  expectedCoverageDatasets.some(
+                    (dataset) => !liveCoverageDatasets.includes(dataset),
+                  )
+                ) {
+                  throw new Error(`${label} did not return every live Gitcrawl coverage dataset`);
                 }
               }
             }
