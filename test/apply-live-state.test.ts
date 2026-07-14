@@ -179,6 +179,86 @@ test("apply-decisions rejects recorded PR review activity drift before mutations
   }
 });
 
+test("apply-decisions records review activity that changes after lease acquisition", () => {
+  const reviewedCursor = createReviewedPrActivityCursor({
+    reviews: [],
+    inlineComments: [],
+  });
+  assert.ok(reviewedCursor);
+  const root = mkdtempSync(tmpPrefix);
+  try {
+    const itemsDir = join(root, "items");
+    const closedDir = join(root, "closed");
+    const plansDir = join(root, "plans");
+    const reportPath = join(root, "apply-report.json");
+    mkdirSync(itemsDir, { recursive: true });
+    mkdirSync(plansDir, { recursive: true });
+
+    const synced = reportWithSyncedReviewComment(
+      implementedCloseReport({
+        repository: "openclaw/openclaw",
+        number: 321,
+        type: "pull_request",
+        title: "Reviewed PR",
+        url: "https://github.com/openclaw/openclaw/pull/321",
+        author: "reporter",
+        author_association: "CONTRIBUTOR",
+        labels: JSON.stringify([]),
+        pull_head_sha: "head-sha",
+        review_activity_cursor: reviewedCursor,
+      }),
+      321,
+      "implemented_on_main",
+    );
+    writeFileSync(join(itemsDir, "321.md"), synced.report, "utf8");
+
+    withMockGh(
+      root,
+      promotionGhMock({
+        number: 321,
+        title: "Reviewed PR",
+        labels: [],
+        comment: synced.comment,
+        reviews: [],
+        reviewsAfterFirstRead: [
+          {
+            id: 7001,
+            user: { login: "maintainer" },
+            state: "COMMENTED",
+            body: "please recheck this",
+            submitted_at: "2026-05-01T00:30:00Z",
+            commit_id: "head-sha",
+          },
+        ],
+        pullReviewComments: [],
+      }),
+      () => {
+        runApplyDecisionsForTest({
+          targetRepo: "openclaw/openclaw",
+          itemsDir,
+          closedDir,
+          plansDir,
+          reportPath,
+        });
+      },
+    );
+
+    assert.deepEqual(JSON.parse(readText(reportPath)), [
+      {
+        number: 321,
+        action: "skipped_changed_since_review",
+        reason: "pull request review activity changed since review",
+      },
+    ]);
+    assert.match(
+      readText(join(itemsDir, "321.md")),
+      /^action_taken: skipped_changed_since_review$/m,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("apply-decisions fails closed when reviewed PR activity exceeds the cursor bound", () => {
   const root = mkdtempSync(tmpPrefix);
   const overflowCursor = createReviewedPrActivityCursor({
