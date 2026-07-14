@@ -277,13 +277,14 @@ test("query evidence fails closed on source, relation, review, and packet drift"
       repository,
       snapshotId,
       coverage: completeCoverage(),
+      requiredCoverage: ["repositories", "threads"],
       claims: [],
       generatedAt,
     });
     packet.coverage[0]!.covered_count = 0;
     assert.throws(
       () => verifyGitcrawlEvidencePacket(packet),
-      /digest mismatch|incomplete coverage/,
+      /digest mismatch|incomplete coverage|invalid complete coverage/,
     );
   });
 
@@ -293,6 +294,7 @@ test("query evidence fails closed on source, relation, review, and packet drift"
       repository,
       snapshotId,
       coverage: completeCoverage(),
+      requiredCoverage: ["repositories", "threads"],
       claims: [],
       generatedAt,
     });
@@ -456,6 +458,7 @@ test("query evidence fails closed on source, relation, review, and packet drift"
           repository,
           snapshotId,
           coverage,
+          requiredCoverage: ["repositories", "threads"],
           claims: [],
           generatedAt,
         }),
@@ -471,6 +474,7 @@ test("query evidence fails closed on source, relation, review, and packet drift"
           repository,
           snapshotId,
           coverage: completeCoverage(),
+          requiredCoverage: ["repositories", "threads"],
           claims: [],
           generatedAt: "not-a-timestamp",
         }),
@@ -481,6 +485,7 @@ test("query evidence fails closed on source, relation, review, and packet drift"
       repository,
       snapshotId,
       coverage: completeCoverage(),
+      requiredCoverage: ["repositories", "threads"],
       claims: [],
       generatedAt,
     });
@@ -488,6 +493,45 @@ test("query evidence fails closed on source, relation, review, and packet drift"
     const { sha256: _sha256, ...unsigned } = packet;
     packet.sha256 = sha256Canonical(unsigned);
     assert.throws(() => verifyGitcrawlEvidencePacket(packet), /packet generated_at is invalid/);
+  });
+
+  await t.test("packet coverage defaults to the included claim queries", () => {
+    const coverage = completeCoverage();
+    const unrelated = coverage.find((row) => row.dataset === "cluster_groups");
+    assert(unrelated);
+    unrelated.covered_count = 0;
+    unrelated.complete = false;
+    const claim = createGitcrawlEvidenceClaim({
+      provider: "cloud",
+      repository,
+      snapshotId,
+      queryName: "gitcrawl.threads.search",
+      queryArgs: { owner: "openclaw", repo: "openclaw" },
+      subject: `${repository}#pull:42`,
+      data: memberRow(),
+    });
+    const packet = buildGitcrawlEvidencePacket({
+      provider: "cloud",
+      repository,
+      snapshotId,
+      coverage,
+      claims: [claim],
+      generatedAt,
+    });
+    assert.deepEqual(packet.required_coverage, ["repositories", "threads"]);
+    assert.doesNotThrow(() => verifyGitcrawlEvidencePacket(packet));
+    assert.throws(
+      () =>
+        buildGitcrawlEvidencePacket({
+          provider: "cloud",
+          repository,
+          snapshotId,
+          coverage,
+          claims: [],
+          generatedAt,
+        }),
+      /without claims require explicit coverage/,
+    );
   });
 
   await t.test("packet repository is relabeled", async () => {

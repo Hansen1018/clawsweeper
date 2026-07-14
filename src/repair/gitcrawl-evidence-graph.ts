@@ -101,13 +101,17 @@ export function buildGitcrawlEvidencePacket(input: {
   };
   const generatedAt = input.generatedAt ?? new Date().toISOString();
   parseRfc3339Timestamp(generatedAt, "Gitcrawl evidence packet generated_at");
+  const requiredCoverage = input.requiredCoverage ?? [...requiredCoverageForClaims(input.claims)];
+  if (requiredCoverage.length === 0) {
+    throw new Error("Gitcrawl evidence packets without claims require explicit coverage");
+  }
   validatePacketBindings({
     provider: input.provider,
     repository: input.repository,
     snapshotId: input.snapshotId,
     ...(input.paritySnapshotId === undefined ? {} : { paritySnapshotId: input.paritySnapshotId }),
     coverage: input.coverage,
-    requiredCoverage: input.requiredCoverage ?? [...GITCRAWL_DATASETS],
+    requiredCoverage,
     claims: input.claims,
   });
   const sortedClaims = [...input.claims].sort((left, right) => {
@@ -137,9 +141,7 @@ export function buildGitcrawlEvidencePacket(input: {
     ...(input.paritySnapshotId === undefined ? {} : { parity_snapshot_id: input.paritySnapshotId }),
     query_version: GITCRAWL_QUERY_VERSION,
     generated_at: generatedAt,
-    required_coverage: [...(input.requiredCoverage ?? GITCRAWL_DATASETS)].sort(
-      compareCanonicalText,
-    ),
+    required_coverage: [...requiredCoverage].sort(compareCanonicalText),
     coverage: [...input.coverage].sort((left, right) =>
       compareCanonicalText(left.dataset, right.dataset),
     ),
