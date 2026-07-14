@@ -446,7 +446,7 @@ export class GitcrawlEvidenceAdapter {
     const rows = await this.queryNormalized(
       "gitcrawl.clusters.members",
       queryArgs,
-      normalizeThread,
+      (row) => normalizeThread(row, this.repository),
       clusterMemberParityView,
     );
     this.rememberThreadSafetyProjections(rows);
@@ -520,7 +520,7 @@ export class GitcrawlEvidenceAdapter {
             `Gitcrawl related evidence for thread ${requestedNumber} was returned for thread ${sourceNumber}`,
           );
         }
-        const data = normalizeThread(row);
+        const data = normalizeThread(row, this.repository);
         if (data.number === requestedNumber) {
           throw new Error(
             `Gitcrawl related evidence cannot relate thread ${requestedNumber} to itself`,
@@ -562,7 +562,7 @@ export class GitcrawlEvidenceAdapter {
       "gitcrawl.pull_requests.review_context",
       queryArgs,
       (row) => ({ ...row }),
-      reviewRawParityView,
+      (row) => reviewRawParityView(row, this.repository),
     );
     const contextRows = raw.filter((row) => row.row_kind === "context");
     if (contextRows.length !== 1) {
@@ -584,7 +584,7 @@ export class GitcrawlEvidenceAdapter {
         throw new Error(`Gitcrawl review context for #${number} mixed pull request file rows`);
       }
     }
-    const context = normalizeReviewContext(contextRows[0]!);
+    const context = normalizeReviewContext(contextRows[0]!, this.repository);
     context.thread.kind = "pull_request";
     this.rememberThreadSafetyProjections([context.thread]);
     const files = raw
@@ -649,7 +649,7 @@ export class GitcrawlEvidenceAdapter {
     const rows = await this.queryNormalized(
       "gitcrawl.threads.search",
       queryArgs,
-      normalizeThread,
+      (row) => normalizeThread(row, this.repository),
       searchThreadParityView,
       maxRows,
     );
@@ -1219,7 +1219,10 @@ function normalizeRequestedCluster(
   return cluster;
 }
 
-function normalizeThread(row: Record<string, unknown>): GitcrawlThreadEvidence {
+function normalizeThread(row: Record<string, unknown>, repository: string): GitcrawlThreadEvidence {
+  const number = safePositive(row.number, "thread number");
+  const kind = supportedThreadKind(row.kind);
+  const htmlUrl = exactThreadHtmlUrl(row.html_url, repository, kind, number);
   const completeSecurityMetadata = booleanValue(row.security_metadata_complete);
   if (completeSecurityMetadata && typeof row.title !== "string") {
     throw new Error("Gitcrawl thread title is missing from complete security metadata");
@@ -1348,15 +1351,15 @@ function normalizeThread(row: Record<string, unknown>): GitcrawlThreadEvidence {
           ),
         }),
     threadId: safePositive(row.thread_id, "thread id"),
-    number: safePositive(row.number, "thread number"),
-    kind: supportedThreadKind(row.kind),
+    number,
+    kind,
     state: threadState,
     title: boundedString(promptTitle, 512),
     body: boundedString(promptBody, 2_048),
     authorLogin,
     authorType,
     ...(authorAssociation ? { authorAssociation } : {}),
-    htmlUrl: boundedString(row.html_url, 2_048),
+    htmlUrl,
     ...(hasLabelsField ? { labels: boundedJsonArray(promptLabels, 32, 256) } : {}),
     ...(hasAssigneesField ? { assignees: boundedJsonArray(promptAssignees, 16, 256) } : {}),
     isDraft: booleanValue(row.is_draft),
@@ -1377,9 +1380,10 @@ function normalizeThread(row: Record<string, unknown>): GitcrawlThreadEvidence {
 
 function normalizeReviewContext(
   row: Record<string, unknown>,
+  repository: string,
 ): Omit<GitcrawlReviewContext, "files" | "filesOmitted"> {
   return {
-    thread: normalizeThread(row),
+    thread: normalizeThread(row, repository),
     baseSha: gitObjectId(row.base_sha, "PR base revision"),
     headSha: gitObjectId(row.head_sha, "PR head revision"),
     headRef: boundedString(row.head_ref, 512),
@@ -1500,14 +1504,14 @@ function relatedThreadParityView(row: GitcrawlThreadEvidence): unknown {
   return common;
 }
 
-function reviewRawParityView(row: Record<string, unknown>): unknown {
+function reviewRawParityView(row: Record<string, unknown>, repository: string): unknown {
   if (row.row_kind === "file") {
     return {
       rowKind: "file",
       ...normalizeReviewFile(row),
     };
   }
-  const context = normalizeReviewContext(row);
+  const context = normalizeReviewContext(row, repository);
   return {
     rowKind: "context",
     ...context,
@@ -1594,6 +1598,19 @@ function supportedThreadKind(value: unknown): "issue" | "pull_request" {
     throw new Error(`unsupported Gitcrawl thread kind: ${kind || "missing"}`);
   }
   return kind;
+}
+
+function exactThreadHtmlUrl(
+  value: unknown,
+  repository: string,
+  kind: "issue" | "pull_request",
+  number: number,
+): string {
+  const expected = `https://github.com/${repository}/${kind === "pull_request" ? "pull" : "issues"}/${number}`;
+  if (typeof value !== "string" || value !== expected) {
+    throw new Error(`Gitcrawl thread identity does not match ${repository} ${kind} #${number}`);
+  }
+  return value;
 }
 
 function boundedString(value: unknown, maxLength: number): string {

@@ -257,6 +257,20 @@ test("query evidence fails closed on source, relation, review, and packet drift"
     }
   });
 
+  await t.test("thread rows bind repository, kind, and number to their URL", async () => {
+    for (const mismatched of [
+      { html_url: "https://github.com/openclaw/other/pull/42" },
+      { kind: "issue", html_url: "https://github.com/openclaw/openclaw/pull/42" },
+      { number: 43, html_url: "https://github.com/openclaw/openclaw/pull/42" },
+    ]) {
+      const adapter = await adapterFor({
+        "gitcrawl.threads.search": [memberRow(mismatched)],
+      });
+      await assert.rejects(adapter.searchOpenPullRequests(), /thread identity does not match/);
+      await adapter.close();
+    }
+  });
+
   await t.test("packet claims are mutated after binding", () => {
     const packet = buildGitcrawlEvidencePacket({
       provider: "cloud",
@@ -1261,6 +1275,8 @@ function clusterRow(overrides: Record<string, unknown> = {}): Record<string, unk
 }
 
 function memberRow(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  const number = Number(overrides.number ?? 42);
+  const kind = String(overrides.kind ?? "pull_request");
   return {
     cluster_id: 7,
     cluster_member_count: 1,
@@ -1270,15 +1286,15 @@ function memberRow(overrides: Record<string, unknown> = {}): Record<string, unkn
     membership_state: "active",
     score_to_representative: 1,
     thread_id: 42,
-    number: 42,
-    kind: "pull_request",
+    number,
+    kind,
     state: "open",
     title: "Fix provider refresh",
     body: "Fixes token refresh after expiry.",
     author_login: "contributor",
     author_type: "User",
     author_association: "CONTRIBUTOR",
-    html_url: "https://github.com/openclaw/openclaw/pull/42",
+    html_url: `https://github.com/openclaw/openclaw/${kind === "pull_request" ? "pull" : "issues"}/${number}`,
     labels_json: "[]",
     assignees_json: "[]",
     security_metadata_complete: 1,
