@@ -2320,6 +2320,42 @@ test("prepared workflow events persist their validated input snapshot", () => {
   assert.deepEqual(prepared.commit(), committed);
 });
 
+test("prepared workflow event replay exposes the durable first-writer event", () => {
+  const root = tempRoot();
+  const input: WorkflowActionEventInput = {
+    scope: "review.completed",
+    identity: { number: 42 },
+    type: ACTION_EVENT_TYPES.reviewCompleted,
+    component: "review",
+    subject: {
+      repository: "openclaw/openclaw",
+      kind: "pull_request",
+      number: 42,
+    },
+    action: {
+      name: "review",
+      status: "completed",
+      retryable: false,
+      mutation: false,
+    },
+  };
+  const first = prepareWorkflowActionEvent(root, input, {
+    env: workflowEnv(),
+    now: () => new Date("2026-07-12T10:01:00.000Z"),
+  });
+  const durable = first.commit();
+  assert.ok(durable);
+
+  const replay = prepareWorkflowActionEvent(root, input, {
+    env: workflowEnv(),
+    now: () => new Date("2026-07-12T11:30:00.000Z"),
+  });
+  assert.deepEqual(replay.event, durable);
+  assert.equal(replay.event?.recorded_at, "2026-07-12T10:01:00.000Z");
+  assert.deepEqual(replay.commit(), durable);
+  assert.deepEqual(replay.event, durable);
+});
+
 test("historical producer partitions survive later-run flush environments", async () => {
   const root = tempRoot();
   const outputRoot = trustedChildRoot(root, "state");

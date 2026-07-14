@@ -37,6 +37,7 @@ import {
   isActionEventStatus,
   parseActionEventShardContent,
   readAllSpooledActionEvents,
+  readSpooledActionEvent,
   sortActionEventsCausally,
   validateActionEvent,
   writeActionEvent,
@@ -340,27 +341,36 @@ export function prepareWorkflowActionEvent(
   const recordedAt = options.now ? options.now() : new Date();
   const writeOptions = { now: () => recordedAt };
   const candidate = freezeActionEvent(createActionEvent(eventInputSnapshot, writeOptions));
+  const existing = readSpooledActionEvent(root, candidate.subject.repository, candidate.event_id);
+  const preparedEvent =
+    existing !== null && actionEventReplayJson(existing) === actionEventReplayJson(candidate)
+      ? freezeActionEvent(existing)
+      : candidate;
   const partitionDate = workflowPartitionDate(env);
   let committed: ActionEvent | undefined;
   let committing = false;
   return {
-    event: candidate,
+    get event() {
+      return committed ?? preparedEvent;
+    },
     commit() {
       if (committed !== undefined) return committed;
       if (committing) throw new Error("workflow action event commit is already in progress");
       committing = true;
       try {
-        committed = withWorkflowProducerLock(root, candidate.producer, () => {
-          assertWorkflowProducerAcceptsEvent(root, candidate);
-          ensureWorkflowPartitionDateValue(
-            root,
-            persistedWorkflowProducer(producer),
-            partitionDate,
-          );
-          const persisted = writeActionEvent(root, eventInputSnapshot, writeOptions).event;
-          queueCrabFleetEvent(root, persisted, env, options.fetchImpl ?? fetch);
-          return persisted;
-        });
+        committed = freezeActionEvent(
+          withWorkflowProducerLock(root, candidate.producer, () => {
+            assertWorkflowProducerAcceptsEvent(root, candidate);
+            ensureWorkflowPartitionDateValue(
+              root,
+              persistedWorkflowProducer(producer),
+              partitionDate,
+            );
+            const persisted = writeActionEvent(root, eventInputSnapshot, writeOptions).event;
+            queueCrabFleetEvent(root, persisted, env, options.fetchImpl ?? fetch);
+            return persisted;
+          }),
+        );
         return committed;
       } finally {
         committing = false;

@@ -1008,6 +1008,28 @@ export function readActionEvent(filePath: string): ActionEvent {
   );
 }
 
+export function readSpooledActionEvent(
+  root: string | SafeReadRoot,
+  repository: string,
+  eventId: string,
+): ActionEvent | null {
+  const normalizedRepository = requiredRepo(repository);
+  const relativePath = actionEventSpoolRelativePath(normalizedRepository, eventId);
+  let event: ActionEvent | null;
+  try {
+    event = readActionEventIfExists(
+      prepareSafeReadTarget(root, relativePath, "action event spool entry"),
+    );
+  } catch (error) {
+    if (isNotFoundError(error)) return null;
+    throw error;
+  }
+  if (event !== null) {
+    assertCanonicalSpooledEventPath(event, relativePath, normalizedRepository);
+  }
+  return event;
+}
+
 export function readActionEventShard(filePath: string): ActionEvent[] {
   return readActionEventShardTarget(prepareActionEventShardReadTarget(filePath));
 }
