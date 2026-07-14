@@ -21,6 +21,7 @@ import {
   verifyGitcrawlEvidenceClaim,
 } from "../../dist/repair/gitcrawl-evidence-contract.js";
 import {
+  DEFAULT_EVIDENCE_PACKET_MAX_BYTES,
   buildGitcrawlEvidencePacket,
   verifyGitcrawlEvidencePacket,
 } from "../../dist/repair/gitcrawl-evidence-graph.js";
@@ -664,6 +665,24 @@ test("query evidence fails closed on source, relation, review, and packet drift"
       /packet exceeds 1024 bytes/,
     );
     await adapter.close();
+  });
+
+  await t.test("packet verification bounds input before canonicalization", () => {
+    const packet = buildGitcrawlEvidencePacket({
+      provider: "cloud",
+      repository,
+      snapshotId,
+      coverage: completeCoverage(),
+      requiredCoverage: ["repositories", "threads"],
+      claims: [],
+      generatedAt,
+    });
+    packet.coverage[0]!.max_source_at = "x".repeat(DEFAULT_EVIDENCE_PACKET_MAX_BYTES);
+    assert.throws(() => verifyGitcrawlEvidencePacket(packet), /packet exceeds 65536 bytes/);
+    assert.throws(
+      () => verifyGitcrawlEvidencePacket(packet, DEFAULT_EVIDENCE_PACKET_MAX_BYTES + 1),
+      /packet limit must be an integer from 1 to 65536/,
+    );
   });
 
   await t.test("parity hides policy-relevant relationship status", async () => {

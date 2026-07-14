@@ -170,6 +170,8 @@ export function verifyGitcrawlEvidencePacket(
   packet: GitcrawlEvidencePacket,
   maxBytes = DEFAULT_EVIDENCE_PACKET_MAX_BYTES,
 ): void {
+  const byteLimit = boundedLimit(maxBytes, DEFAULT_EVIDENCE_PACKET_MAX_BYTES);
+  assertBoundedPacketInput(packet, byteLimit);
   assertSha256(packet.sha256, "packet sha256");
   const packetVersion = (packet as unknown as { version?: unknown }).version;
   if (packetVersion !== GITCRAWL_PACKET_VERSION && packetVersion !== GITCRAWL_PACKET_VERSION_V1) {
@@ -189,6 +191,9 @@ export function verifyGitcrawlEvidencePacket(
   }
   parseRfc3339Timestamp(packet.generated_at, "Gitcrawl evidence packet generated_at");
   assertPacketCardinality(packet);
+  if (renderedPacketBytes(packet) > byteLimit) {
+    throw new Error(`Gitcrawl evidence packet exceeds ${byteLimit} bytes`);
+  }
   validatePacketBindings({
     provider: packet.provider,
     repository: packet.repository,
@@ -203,9 +208,6 @@ export function verifyGitcrawlEvidencePacket(
   const { sha256: _sha256, ...unsigned } = packet;
   if (sha256Canonical(unsigned) !== packet.sha256) {
     throw new Error("Gitcrawl evidence packet digest mismatch");
-  }
-  if (renderedPacketBytes(packet) > maxBytes) {
-    throw new Error(`Gitcrawl evidence packet exceeds ${maxBytes} bytes`);
   }
   const reconstructed =
     packet.version === GITCRAWL_PACKET_VERSION_V1
@@ -361,6 +363,77 @@ function assertNonnegativePacketCounts(
 
 function renderedPacketBytes(packet: GitcrawlEvidencePacket): number {
   return Buffer.byteLength(JSON.stringify(packet, null, 2), "utf8");
+}
+
+function assertBoundedPacketInput(packet: unknown, maxBytes: number): void {
+  let bytes = 0;
+  const activeObjects = new WeakSet<object>();
+  const addBytes = (value: number): void => {
+    bytes += value;
+    if (bytes > maxBytes) {
+      throw new Error(`Gitcrawl evidence packet exceeds ${maxBytes} bytes`);
+    }
+  };
+  const visit = (value: unknown, depth: number, arrayValue: boolean): boolean => {
+    if (depth > 128) {
+      throw new Error("Gitcrawl evidence packet exceeds the maximum JSON depth");
+    }
+    if (value === null) {
+      addBytes(4);
+      return true;
+    }
+    switch (typeof value) {
+      case "string":
+        addBytes(Buffer.byteLength(JSON.stringify(value), "utf8"));
+        return true;
+      case "number":
+        addBytes(Buffer.byteLength(JSON.stringify(value), "utf8"));
+        return true;
+      case "boolean":
+        addBytes(value ? 4 : 5);
+        return true;
+      case "undefined":
+      case "function":
+      case "symbol":
+        if (arrayValue) addBytes(4);
+        return arrayValue;
+      case "bigint":
+        throw new Error("Gitcrawl evidence packet contains an unsupported JSON value");
+      case "object":
+        break;
+    }
+    if (activeObjects.has(value)) {
+      throw new Error("Gitcrawl evidence packet contains a JSON cycle");
+    }
+    activeObjects.add(value);
+    if (Array.isArray(value)) {
+      addBytes(2);
+      for (let index = 0; index < value.length; index += 1) {
+        if (index > 0) addBytes(1);
+        if (Object.hasOwn(value, index)) {
+          visit(value[index], depth + 1, true);
+        } else {
+          addBytes(4);
+        }
+      }
+    } else {
+      addBytes(2);
+      let emitted = 0;
+      for (const key of Object.keys(value)) {
+        const child = (value as Record<string, unknown>)[key];
+        if (child === undefined || typeof child === "function" || typeof child === "symbol") {
+          continue;
+        }
+        if (emitted > 0) addBytes(1);
+        addBytes(Buffer.byteLength(JSON.stringify(key), "utf8") + 1);
+        visit(child, depth + 1, false);
+        emitted += 1;
+      }
+    }
+    activeObjects.delete(value);
+    return true;
+  };
+  visit(packet, 0, false);
 }
 
 function buildGraph(
