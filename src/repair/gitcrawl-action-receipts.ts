@@ -131,6 +131,8 @@ type GitcrawlReceiptEvent = {
 
 const GITCRAWL_RECEIPT_DROPPED_FIELDS = [
   "bodies",
+  "error_message",
+  "error_name",
   "local_paths",
   "logs",
   "prompts",
@@ -427,7 +429,6 @@ function gitcrawlReceiptEvent(
         item_count: queryCount,
         result_count: primaryCount,
         validation_count: parityCount,
-        coverage_complete: input.matched,
       },
     };
   }
@@ -435,8 +436,10 @@ function gitcrawlReceiptEvent(
   if (input.queryName !== undefined) assertQueryName(input.queryName);
   const failureClass = classifyGitcrawlActionFailure(input.error);
   const failureSha256 = sha256Canonical({
-    name: errorName(input.error),
-    message: errorText(input.error),
+    redaction: "failure-class-v1",
+    failure_class: failureClass,
+    phase: input.phase,
+    query_name: input.queryName ?? null,
   });
   const failure = failureDisposition(failureClass);
   return {
@@ -595,10 +598,6 @@ function failurePhaseSeq(
       ? GITCRAWL_QUERY_NAMES.length
       : GITCRAWL_QUERY_NAMES.indexOf(queryName))
   );
-}
-
-function errorName(error: unknown): string {
-  return error instanceof Error && error.name ? error.name : "Error";
 }
 
 function errorText(error: unknown): string {

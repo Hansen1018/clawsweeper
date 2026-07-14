@@ -117,6 +117,11 @@ test("Gitcrawl emits bounded snapshot, six-query, coverage, and parity receipts"
   assert.equal(events.filter((event) => event.event_type === "gitcrawl.snapshot").length, 1);
   assert.equal(events.filter((event) => event.event_type === "gitcrawl.query").length, 6);
   assert.equal(events.filter((event) => event.event_type === "gitcrawl.binding").length, 2);
+  const parity = events.find(
+    (event) =>
+      event.event_type === "gitcrawl.binding" && event.attributes?.validation_kind === "parity",
+  );
+  assert.equal(parity?.attributes?.coverage_complete, undefined);
   assert.deepEqual(
     events
       .filter((event) => event.event_type === "gitcrawl.query")
@@ -134,6 +139,8 @@ test("Gitcrawl emits bounded snapshot, six-query, coverage, and parity receipts"
     );
     assert.deepEqual(event.privacy.fields_dropped, [
       "bodies",
+      "error_message",
+      "error_name",
       "local_paths",
       "logs",
       "prompts",
@@ -516,6 +523,37 @@ test("Gitcrawl failure receipts retain only a class and digest", async () => {
   assert.doesNotMatch(
     JSON.stringify(event),
     /Users|archive\.db|ROW_SENTINEL|SQL_SENTINEL|PROMPT_SENTINEL|LOG_SENTINEL|TOKEN_SENTINEL|BODY_SENTINEL/,
+  );
+
+  const otherRoot = tempRoot();
+  const otherOutputRoot = trustedChildRoot(otherRoot, "state");
+  recordGitcrawlActionReceipt(
+    otherRoot,
+    {
+      ...input,
+      error: new Error(
+        "Gitcrawl cloud/local parity mismatch at /private/guessable/other.db with OTHER_SENTINEL",
+      ),
+    },
+    { env, now: () => now },
+  );
+  const [otherShardPath] = await flushWorkflowActionEvents(otherRoot, {
+    env,
+    outputRoot: otherOutputRoot,
+  });
+  assert.ok(otherShardPath);
+  const [otherEvent] = readActionEventShard(path.join(otherOutputRoot, otherShardPath));
+  const failureDigest = event?.evidence?.find((entry) => entry.kind === "gitcrawl_failure")?.sha256;
+  const otherFailureDigest = otherEvent?.evidence?.find(
+    (entry) => entry.kind === "gitcrawl_failure",
+  )?.sha256;
+  assert.equal(otherFailureDigest, failureDigest);
+  assert.notEqual(
+    failureDigest,
+    sha256Canonical({
+      name: "Error",
+      message: rawFailure,
+    }),
   );
 });
 
