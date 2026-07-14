@@ -56,7 +56,6 @@ checkpoint, and status-only commits are intentionally omitted.
 - Added a system, light, and dark theme switcher to the generated documentation site. Thanks @joshka.
 
 ### Changed
-
 - Preserved crawl-remote's reviewed `limits.cpu_ms` value through immutable
   release packaging and post-transfer deployment verification.
 - Reverted the action-lifecycle expansion from PR #521, restoring the pre-merge ClawSweeper paths while retaining later exact-review throughput fixes and retrying coalesced reconciliations after any partial lookup failure.
