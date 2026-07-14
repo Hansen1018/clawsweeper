@@ -354,6 +354,9 @@ test("Gitcrawl success receipt slots reject contradictory outcomes", () => {
   for (const [index, receiptCase] of cases.entries()) {
     const caseRoot = trustedChildRoot(tempRoot(), `case-${index}`);
     recordGitcrawlActionReceipt(caseRoot, receiptCase.first, { env, now: () => now });
+    if (index === 1) {
+      (receiptCase.second as unknown as Record<string, unknown>).phaseSeq = 999;
+    }
     assert.throws(
       () =>
         recordGitcrawlActionReceipt(caseRoot, receiptCase.second, {
@@ -363,6 +366,48 @@ test("Gitcrawl success receipt slots reject contradictory outcomes", () => {
       /action event conflict/,
     );
   }
+});
+
+test("Gitcrawl query receipts reject incomplete non-coverage results", () => {
+  const root = tempRoot();
+  assert.throws(
+    () =>
+      recordGitcrawlActionReceipt(
+        root,
+        {
+          receipt: "query",
+          repository,
+          provider: "cloud",
+          snapshotId,
+          queryName: "gitcrawl.threads.search",
+          queryArgsSha256: sha256Canonical({ args: "safe" }),
+          resultSha256: sha256Canonical({ result: "safe" }),
+          rowCount: 1,
+          claimCount: 1,
+          coverageComplete: false,
+        },
+        { env, now: () => now },
+      ),
+    /non-coverage query receipts require complete coverage/,
+  );
+  const coverage = recordGitcrawlActionReceipt(
+    root,
+    {
+      receipt: "query",
+      repository,
+      provider: "cloud",
+      snapshotId,
+      queryName: "gitcrawl.coverage",
+      queryArgsSha256: sha256Canonical({ args: "safe" }),
+      resultSha256: sha256Canonical({ result: "incomplete" }),
+      rowCount: 1,
+      claimCount: 1,
+      coverageComplete: false,
+    },
+    { env, now: () => now },
+  );
+  assert.equal(coverage?.action.status, "validated");
+  assert.equal(coverage?.attributes?.coverage_complete, false);
 });
 
 test("Gitcrawl binding receipts prove complete coverage and matched parity", () => {

@@ -50,7 +50,6 @@ export type GitcrawlReceiptPhase = "snapshot" | "query" | "binding";
 type GitcrawlReceiptBase = {
   repository: string;
   provider: GitcrawlProvider;
-  phaseSeq?: number;
 };
 
 export type GitcrawlSnapshotReceiptInput = GitcrawlReceiptBase & {
@@ -282,7 +281,7 @@ function gitcrawlReceiptEvent(
       reasonCode: ACTION_EVENT_REASON_CODES.selected,
       retryable: false,
       identity: { receipt: "snapshot" },
-      phaseSeq: input.phaseSeq ?? 1,
+      phaseSeq: 1,
       evidence: [
         ...snapshotEvidence,
         { kind: "gitcrawl_selection", sha256: selectionSha256 },
@@ -309,6 +308,9 @@ function gitcrawlReceiptEvent(
     if ((input.provider === "parity") !== (input.parityResultSha256 !== undefined)) {
       throw new Error("Gitcrawl query receipt parity digest does not match its provider");
     }
+    if (!input.coverageComplete && input.queryName !== "gitcrawl.coverage") {
+      throw new Error("Gitcrawl non-coverage query receipts require complete coverage");
+    }
     const bindingSha256 = sha256Canonical({
       provider: input.provider,
       snapshot_id: input.snapshotId,
@@ -331,7 +333,7 @@ function gitcrawlReceiptEvent(
         receipt: "query",
         queryName: input.queryName,
       },
-      phaseSeq: input.phaseSeq ?? 10 + GITCRAWL_QUERY_NAMES.indexOf(input.queryName),
+      phaseSeq: 10 + GITCRAWL_QUERY_NAMES.indexOf(input.queryName),
       evidence: [
         ...gitcrawlSnapshotEvidence(input.snapshotId, input.paritySnapshotId),
         { kind: "gitcrawl_query_args", sha256: input.queryArgsSha256 },
@@ -375,7 +377,7 @@ function gitcrawlReceiptEvent(
           receipt: "binding",
           binding: "coverage",
         },
-        phaseSeq: input.phaseSeq ?? 100,
+        phaseSeq: 100,
         evidence: [
           ...gitcrawlSnapshotEvidence(input.snapshotId, input.paritySnapshotId),
           { kind: "gitcrawl_coverage", sha256: input.coverageSha256 },
@@ -420,7 +422,7 @@ function gitcrawlReceiptEvent(
         receipt: "binding",
         binding: "parity",
       },
-      phaseSeq: input.phaseSeq ?? 101,
+      phaseSeq: 101,
       evidence: [
         ...gitcrawlSnapshotEvidence(input.snapshotId, input.paritySnapshotId),
         { kind: "gitcrawl_parity", sha256: input.paritySha256 },
@@ -457,7 +459,7 @@ function gitcrawlReceiptEvent(
       failureSha256,
       ...(input.queryName === undefined ? {} : { queryName: input.queryName }),
     },
-    phaseSeq: input.phaseSeq ?? failurePhaseSeq(input.phase, input.queryName),
+    phaseSeq: failurePhaseSeq(input.phase, input.queryName),
     evidence: [
       ...gitcrawlSnapshotEvidence(input.snapshotId, input.paritySnapshotId),
       { kind: "gitcrawl_failure", sha256: failureSha256 },
