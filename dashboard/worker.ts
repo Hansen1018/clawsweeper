@@ -6430,9 +6430,12 @@ function latestStoredEventProjectionIndex(events, itemKey) {
   let winner = -1;
   for (let index = 0; index < events.length; index += 1) {
     if (storedEventItemKey(events[index]) !== itemKey) continue;
-    const order = ciProjectionOrder(events[index]);
+    const order = storedCiProjectionOrder(events[index]);
     if (!order) continue;
-    if (winner === -1 || compareCiProjectionOrder(order, ciProjectionOrder(events[winner])) > 0) {
+    if (
+      winner === -1 ||
+      compareStoredCiProjectionOrder(order, storedCiProjectionOrder(events[winner])) > 0
+    ) {
       winner = index;
     }
   }
@@ -6442,8 +6445,15 @@ function latestStoredEventProjectionIndex(events, itemKey) {
 function shouldAdvanceCiProjection(current, incoming) {
   const incomingOrder = ciProjectionOrder(incoming);
   if (!incomingOrder) return false;
-  const currentOrder = ciProjectionOrder(current);
+  const currentOrder = storedCiProjectionOrder(current);
   if (!currentOrder) return true;
+  if (
+    currentOrder.legacy &&
+    incomingOrder.timestamp === currentOrder.timestamp &&
+    incomingOrder.receivedAt === currentOrder.receivedAt
+  ) {
+    return false;
+  }
   const order = compareCiProjectionOrder(incomingOrder, currentOrder);
   return order > 0 || (order === 0 && incomingOrder.key === currentOrder.key);
 }
@@ -6453,7 +6463,32 @@ function ciProjectionOrder(value) {
   if (!key) return null;
   const receivedAt = canonicalCiSourceTimestamp(value?.received_at);
   const timestamp = canonicalCiSourceTimestamp(value?.ci_projection_updated_at) ?? receivedAt;
-  return timestamp && receivedAt ? { timestamp, receivedAt, key } : null;
+  return timestamp && receivedAt ? { timestamp, receivedAt, key, legacy: false } : null;
+}
+
+function storedCiProjectionOrder(value) {
+  const order = ciProjectionOrder(value);
+  if (order) return order;
+  const timestamp =
+    canonicalCiSourceTimestamp(value?.ci_projection_updated_at) ??
+    canonicalCiSourceTimestamp(value?.updated_at) ??
+    canonicalCiSourceTimestamp(value?.received_at);
+  if (!timestamp) return null;
+  return {
+    timestamp,
+    receivedAt: canonicalCiSourceTimestamp(value?.received_at) ?? timestamp,
+    key: "",
+    legacy: true,
+  };
+}
+
+function compareStoredCiProjectionOrder(left, right) {
+  if (!right) return 1;
+  const timestampOrder = compareCanonicalText(left.timestamp, right.timestamp);
+  if (timestampOrder) return timestampOrder;
+  const receiptOrder = compareCanonicalText(left.receivedAt, right.receivedAt);
+  if (receiptOrder) return receiptOrder;
+  return left.legacy || right.legacy ? 0 : compareCanonicalText(left.key, right.key);
 }
 
 function compareCiProjectionOrder(left, right) {

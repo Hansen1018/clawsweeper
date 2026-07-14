@@ -5490,7 +5490,25 @@ function createCiProjectionHarness() {
     JSON.parse(
       await (await store.fetch(new Request("https://clawsweeper-status-store/events"))).text(),
     );
-  return { ingest, projection, events };
+  const seed = async (key: string, value: unknown) => {
+    const response = await store.fetch(
+      new Request(`https://clawsweeper-status-store/${encodeURIComponent(key)}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ value: JSON.stringify(value) }),
+      }),
+    );
+    assert.equal(response.status, 204);
+  };
+  const projectionStatus = async () =>
+    (
+      await store.fetch(
+        new Request(
+          `https://clawsweeper-status-store/${encodeURIComponent("ci:openclaw/openclaw#80609")}`,
+        ),
+      )
+    ).status;
+  return { ingest, projection, projectionStatus, events, seed };
 }
 
 test("dashboard CI projection ignores delayed distinct keys and malformed source timestamps", async () => {
@@ -5592,6 +5610,60 @@ test("dashboard CI projection resolves equal source timestamps by first-seen ord
     head_sha: "ci-z-green",
     eventCount: 2,
   });
+});
+
+test("dashboard CI projection does not regress a newer legacy projection", async () => {
+  const harness = createCiProjectionHarness();
+  await harness.seed("ci:openclaw/openclaw#80609", {
+    state: "green",
+    source: "github-checks",
+    repository: "openclaw/openclaw",
+    item_number: 80609,
+    head_sha: "legacy-green",
+    updated_at: "2026-07-13T10:02:00.000Z",
+    received_at: "2026-07-13T10:02:00.000Z",
+  });
+
+  await harness.ingest({
+    idempotencyKey: "ci-delayed",
+    state: "red",
+    title: "Delayed older CI",
+    updatedAt: "2026-07-13T10:01:00.000Z",
+  });
+
+  const projected = await harness.projection();
+  assert.equal(projected.state, "green");
+  assert.equal(projected.head_sha, "legacy-green");
+});
+
+test("dashboard CI projection preserves newer legacy event history", async () => {
+  const harness = createCiProjectionHarness();
+  await harness.seed("events", [
+    {
+      id: "legacy-ci",
+      idempotency_key: "legacy-ci",
+      received_at: "2026-07-13T10:02:00.000Z",
+      updated_at: "2026-07-13T10:02:00.000Z",
+      event_type: "ci.status",
+      repository: "openclaw/openclaw",
+      item_number: 80609,
+      status: "green",
+      title: "Legacy newer CI",
+    },
+  ]);
+
+  await harness.ingest({
+    idempotencyKey: "ci-delayed",
+    state: "red",
+    title: "Delayed older CI",
+    updatedAt: "2026-07-13T10:01:00.000Z",
+  });
+
+  assert.equal(await harness.projectionStatus(), 404);
+  assert.deepEqual(
+    (await harness.events()).map((event: { title: string }) => event.title),
+    ["Delayed older CI", "Legacy newer CI"],
+  );
 });
 
 test("dashboard counts cluster-fixer operation events", async () => {
