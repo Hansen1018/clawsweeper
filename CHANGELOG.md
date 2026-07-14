@@ -13,8 +13,11 @@ checkpoint, and status-only commits are intentionally omitted.
 - Added a manual-only, fail-closed Cloudflare Access bootstrap for the
   crawl-remote custom route, with generation-bound service-token rotation,
   interruption-safe credential publication, and repository-scoped GitHub App
-  permissions. Cloud Gitcrawl credentials and source settings are staged while
-  scheduled actionable intake and publication remain disabled.
+  permissions. An isolated post-deploy verifier selects and exercises one
+  credential generation without secret-bearing step outputs, bound to the
+  approved release and Gitcrawl capability states. Cloud Gitcrawl credentials
+  and source settings are staged while scheduled actionable intake and
+  publication remain disabled.
 - Added a maintainer-only two-runner workflow that builds a hash-bound
   crawl-remote release artifact without production credentials, then requires
   that exact SHA to remain the current main tip on a fresh protected runner
