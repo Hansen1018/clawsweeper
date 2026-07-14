@@ -450,7 +450,13 @@ export class LocalGitcrawlQuerySource implements GitcrawlQuerySource {
     limit: number,
     offset: number,
   ): Record<string, unknown>[] {
-    if (!tableExists(this.db, "pull_request_details")) return [];
+    if (
+      !tableExists(this.db, "pull_request_details") ||
+      !columnExists(this.db, "pull_request_details", "repo_id") ||
+      !columnExists(this.db, "pull_request_details", "number")
+    ) {
+      return [];
+    }
     const body = this.threadBody("t");
     const labels = this.threadColumn("t", "labels_json", "null");
     const assignees = this.threadColumn("t", "assignees_json", "null");
@@ -482,7 +488,8 @@ export class LocalGitcrawlQuerySource implements GitcrawlQuerySource {
               ${clusterContext.select},
               ${enrichment}
        from threads t
-       left join pull_request_details pr on pr.thread_id = t.id
+       left join pull_request_details pr
+         on pr.thread_id = t.id and pr.repo_id = t.repo_id and pr.number = t.number
        ${clusterContext.joins}
        where t.repo_id = ? and t.number = ? and t.kind = 'pull_request'
        limit 1`,
@@ -833,7 +840,10 @@ export class LocalGitcrawlQuerySource implements GitcrawlQuerySource {
       ? this.scalarNumber(
           `select count(*) as value
            from pull_request_details detail
-           join threads t on t.id = detail.thread_id
+           join threads t
+             on t.id = detail.thread_id
+            and t.repo_id = detail.repo_id
+            and t.number = detail.number
            where t.repo_id = ?`,
           this.repoId,
         )
@@ -850,6 +860,8 @@ export class LocalGitcrawlQuerySource implements GitcrawlQuerySource {
     const detailSupport =
       tableExists(this.db, "pull_request_details") &&
       columnExists(this.db, "pull_request_details", "thread_id") &&
+      columnExists(this.db, "pull_request_details", "repo_id") &&
+      columnExists(this.db, "pull_request_details", "number") &&
       columnExists(this.db, "pull_request_details", "fetched_at");
     const fileSupport =
       detailSupport &&
@@ -913,7 +925,8 @@ export class LocalGitcrawlQuerySource implements GitcrawlQuerySource {
                 reservationSupport ? "coalesce(detail_reservation.observation_sequence, 0)" : "0"
               } as detail_reserved_sequence
        from threads t
-       left join pull_request_details detail on detail.thread_id = t.id
+       left join pull_request_details detail
+         on detail.thread_id = t.id and detail.repo_id = t.repo_id and detail.number = t.number
        ${detailReservationJoin}
        where t.repo_id = ? and t.kind = 'pull_request'`,
       this.repoId,
@@ -986,7 +999,8 @@ export class LocalGitcrawlQuerySource implements GitcrawlQuerySource {
                 reservationSupport ? "coalesce(file_reservation.observation_sequence, 0)" : "0"
               } as file_reserved_sequence
        from threads t
-       left join pull_request_details detail on detail.thread_id = t.id
+       left join pull_request_details detail
+         on detail.thread_id = t.id and detail.repo_id = t.repo_id and detail.number = t.number
        left join (
          select file.thread_id,
                 count(*) as file_count,
@@ -1442,7 +1456,7 @@ export class LocalGitcrawlQuerySource implements GitcrawlQuerySource {
       },
       pull_request_details: {
         from: "pull_request_details source join threads t on t.id = source.thread_id",
-        where: "t.repo_id = ?",
+        where: "t.repo_id = ? and source.repo_id = t.repo_id and source.number = t.number",
       },
       pull_request_files: {
         from: "pull_request_files source join threads t on t.id = source.thread_id",

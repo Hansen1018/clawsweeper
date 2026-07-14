@@ -1238,6 +1238,32 @@ test("local PR file coverage requires its own current child reservation", async 
   }
 });
 
+test("local PR details require canonical repository and number identity", async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-query-pr-identity-"));
+  const dbPath = path.join(directory, "gitcrawl.db");
+  seedLocalDatabase(dbPath);
+  const db = new DatabaseSync(dbPath);
+  db.exec("update pull_request_details set number = 43 where thread_id = 42");
+  db.close();
+  const source = await LocalGitcrawlQuerySource.open({
+    dbPath,
+    repository,
+    allowLegacy: false,
+  });
+  const adapter = await GitcrawlEvidenceAdapter.fromSources({
+    repository,
+    provider: "local",
+    primarySource: source,
+    now: () => now,
+  });
+  try {
+    await assert.rejects(adapter.reviewContext(42), /pull_request_details coverage is incomplete/);
+  } finally {
+    await adapter.close();
+    fs.rmSync(directory, { force: true, recursive: true });
+  }
+});
+
 test("local related query ignores memberships in closed clusters", async () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-query-closed-related-"));
   const dbPath = path.join(directory, "gitcrawl.db");
@@ -1691,6 +1717,8 @@ function seedLocalDatabase(dbPath: string): void {
     );
     create table pull_request_details (
       thread_id integer primary key,
+      repo_id integer not null,
+      number integer not null,
       base_sha text not null,
       head_sha text not null,
       head_ref text not null,
@@ -1825,7 +1853,9 @@ function seedLocalDatabase(dbPath: string): void {
     generatedAt,
     generatedAt,
   );
-  db.prepare("insert into pull_request_details values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run(
+  db.prepare("insert into pull_request_details values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run(
+    42,
+    1,
     42,
     "1".repeat(40),
     "2".repeat(40),
@@ -1937,7 +1967,7 @@ function seedUnrelatedRepositoryFiles(dbPath: string): void {
     from threads where id = 42;
 
     insert into pull_request_details
-    select 84, base_sha, head_sha, head_ref, 'contributor/other', mergeable_state,
+    select 84, 2, 84, base_sha, head_sha, head_ref, 'contributor/other', mergeable_state,
            additions, deletions, 2, fetched_at, updated_at
     from pull_request_details where thread_id = 42;
 
