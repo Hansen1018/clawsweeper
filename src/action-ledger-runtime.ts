@@ -1291,9 +1291,13 @@ export function readImportedRepairMutationEvents(
     indexes.push(index);
   }
 
-  const completeShardPaths = validateExpectedActionEventPaths([
-    ...new Set(indexes.flatMap((index) => completeImportedActionEventShardPaths(index.shard.path))),
-  ]);
+  const completeShardPaths = validateExpectedActionEventPaths(
+    [
+      ...new Set(
+        indexes.flatMap((index) => completeImportedActionEventShardPaths(index.shard.path)),
+      ),
+    ].sort(),
+  );
   const shardsByPath = new Map(
     readImportedActionEventShards(
       root,

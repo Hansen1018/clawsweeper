@@ -4294,6 +4294,72 @@ test("state shard imports create replayable repair mutation idempotency indexes"
   );
 });
 
+test("repair mutation idempotency indexes sort shard paths independently of index hashes", async () => {
+  const root = tempRoot();
+  const destination = trustedChildRoot(root, "destination");
+  const candidates: Array<{
+    source: string;
+    relativePath: string;
+    shardSha256: string;
+    idempotencyKeySha256: string;
+    runId: string;
+  }> = [];
+
+  for (let index = 0; index < 16; index += 1) {
+    const spool = trustedChildRoot(root, `spool-${index}`);
+    const source = trustedChildRoot(root, `source-${index}`);
+    const runId = String(200 + index);
+    const env = workflowEnv({
+      GITHUB_RUN_ID: runId,
+      GITHUB_RUN_ATTEMPT: "1",
+    });
+    const { mutationOutcome } = recordWorkflowAttemptMutationOutcome(
+      spool,
+      env,
+      "unknown",
+      index + 1,
+    );
+    const [relativePath] = await flushWorkflowActionEvents(spool, { env, outputRoot: source });
+    assert.ok(relativePath);
+    candidates.push({
+      source,
+      relativePath,
+      shardSha256: createHash("sha256")
+        .update(fs.readFileSync(path.join(source, relativePath)))
+        .digest("hex"),
+      idempotencyKeySha256: mutationOutcome.idempotency_key_sha256,
+      runId,
+    });
+  }
+
+  const byIndexHash = [...candidates].sort((left, right) =>
+    left.shardSha256.localeCompare(right.shardSha256),
+  );
+  const inversion = byIndexHash
+    .flatMap((left, leftIndex) =>
+      byIndexHash
+        .slice(leftIndex + 1)
+        .map((right) => [left, right] as const)
+        .filter(([first, second]) => first.relativePath > second.relativePath),
+    )
+    .at(0);
+  assert.ok(inversion, "fixture must reverse index-hash and shard-path order");
+  const [first, second] = inversion;
+  importActionEventShards(first.source, destination);
+  importActionEventShards(second.source, destination);
+
+  const indexed = readImportedRepairMutationEvents(
+    destination,
+    "openclaw/clawsweeper",
+    first.idempotencyKeySha256,
+  );
+  assert.equal(indexed?.length, 4);
+  assert.deepEqual(
+    [...new Set(indexed?.map((event) => event.producer.run_id))].sort(),
+    [first.runId, second.runId].sort(),
+  );
+});
+
 test("repair mutation idempotency index reads enforce aggregate shard byte limits", async () => {
   const root = tempRoot();
   const firstSpool = trustedChildRoot(root, "first-spool");
