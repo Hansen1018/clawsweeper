@@ -55,114 +55,35 @@ checkpoint, and status-only commits are intentionally omitted.
 - Added apply-health telemetry and a quiet-by-default dashboard alert for stalled, cursorless, or fully blocked pruning windows. Thanks @brokemac79.
 - Added author-wide PR repair intake across configured public repositories, with private and unsupported repositories excluded before job generation. Thanks @Jhacarreiro.
 - Added a system, light, and dark theme switcher to the generated documentation site. Thanks @joshka.
-- Added provider-neutral action-ledger event contracts for evidence-service
-  request, deploy, and rollback alongside Gitcrawl snapshot/query/binding and
-  proof phases. These contracts define the planned Gitcrawl-backed,
-  Cloudflare-hosted direction; this branch does not implement the replacement
-  service, deployment, or production service emitters.
 
 ### Changed
 
-- Stripped GitHub Actions artifact and OIDC credentials plus ambient secrets
-  from repair Codex subprocesses, and redacted streamed logs, structured
-  last-message output, and collected debug artifacts before publication,
-  including scheme-independent authorization and cookie headers.
-- Checkpointed accepted OpenClaw event hooks before status-dashboard delivery
-  and publish those receipts after later delivery failures, so reruns retry only
-  the unfinished destination instead of replaying Discord.
-- Expanded exact-review backlog capacity while making background review yield,
-  released exact-review leases before ledger publication, and aggregated
-  healthy retry scans into one bounded ledger summary.
+- Expanded exact-review backlog capacity while making background review yield, released exact-review leases before ledger publication, and aggregated healthy retry scans into one bounded ledger summary.
 - Accepted package-manager argument separators in the action-ledger CLI and
   allowed proven zero-command router runs to finish without empty publication.
-  Added authenticated generic-workflow shard publication and explicit,
-  allowlisted state hydration for `ledger/`; default hydration still excludes
-  ledger history.
-- Expanded immutable action-ledger coverage across the six review, command,
-  repair, apply, operations, and evidence families. Review workflows now record
-  batches, items, retries, Codex logs, and durable comments; apply records
-  actions, batches, reports, request attempts, and conservative interruption
-  recovery; and the command router records receipt, classification, claims,
-  progress, mutation outcomes, dispatch, wait, requeue, recovery, and terminal
-  state.
-- Instrumented the spam audit, assist, proof, and target-fanout surfaces. Spam
-  intake records classification, dispatch attempts, outcomes, report
-  publication, and uncertain terminals before trusted shard import; the audit
-  records review batches, items, and logs. Assist records generation, local
-  output, artifact validation, and comment publication; proof records stage
-  results, comment and label mutations, reports, and cursors; and fanout records
-  queue selection, per-target dispatch attempts and outcomes, and cursor
-  publication.
-- Added exact-review queue receipts for enqueue, claim, completion, and
-  reconciliation with per-wire attempts, stable business idempotency, bounded
-  redaction, credential-isolated producers, and exact-manifest publication by a
-  separate trusted job.
-- Added request-bound receipts for repository-label creation, target-label
-  addition, and replacement-label cleanup. Definite pre-write rejection remains
-  non-mutating, while transport and server uncertainty remains retryable and
-  cannot be rewritten as a clean failure.
-- Added separate repair-result receipts for blocked-merge label creation and
-  addition, closeout-comment creation, and issue or pull-request close.
-  Closeout comments are one-shot on transport uncertainty so reruns reconcile
-  the marker instead of risking duplicate user-visible comments.
-- Wrapped apply-throttle status writes, commits, and pushes in the active
-  per-item mutation lifecycle. No-diff heartbeats remain explicit no-ops, while
-  ambiguous state-repository pushes remain unknown without masking the original
-  GitHub retry.
-- Required every mutable `repair:publish-main` call to declare a canonical
-  publication receipt, with receipt-free operation limited to path sets wholly
-  under immutable `ledger/`. Added workflow guards for setup, finalization,
-  publication ordering, mixed paths, traversal, absolute paths, and
-  helper-driven apply publications.
-- Completed repair receipts across intake, queue, plan, executor, validation,
-  review, publication, post-flight, requeue, recovery, self-heal, status,
-  dashboard, notification, session, result, and finalizer lifecycles. Persisted
-  executor Codex output and reports are digest-bound. Branch, pull request,
-  comment, label, review-thread, continuation, source compensation, closeout,
-  post-flight merge, CrabFleet, and dashboard requests record a pre-request
-  receipt and an accepted, rejected-before-write, or unknown outcome without
-  masking the primary failure.
-- Changed repair result publication from current-attempt-only worker discovery
-  to workflow-attempt cohort resolution. The coordinating attempt supplies the
-  result artifact, while cluster and execute jobs are selected independently
-  from the latest attempt in which each ran and must provide their matching
-  producer-attempt ledgers. The trusted publisher verifies the complete
-  repository, SHA, workflow, job, run, attempt, manifest, and report provenance
-  before state mutation. Commit-review matrix jobs retain per-invocation
-  producer-attempt bundles and trusted report attestation.
-- Made action-ledger publication include every transactional import binding and
-  fail closed on missing, ambiguous, incomplete, extra, or forged required
-  producer paths. Each process keeps a monotonic local chain; authenticated
-  manifests provide cross-job continuity without synthetic cross-shard parent
-  links. Repair receipts bind the sealed target source revision rather than the
-  ClawSweeper checkout SHA, and credential-isolated workers never receive state
-  publication authority.
-- Kept one-shot exact-head merge ownership and conservative unknown-outcome
-  recovery across workflow attempts. Merge owners reconcile ambiguous responses
-  against exact GitHub state instead of issuing a second successful mutation;
-  hard proof or policy drift remains terminal.
-- Bound every repair-worker dispatch to an exact `clawsweeper-state` commit and
-  job SHA-256, including cluster and issue intake, commit findings, report
-  requeues, failed-run recovery, open-PR finalization, and conflict self-heal.
-  Workers verify the same immutable job again at execution authorization and
-  seal its bytes into result artifacts, while active-run matching and dispatch
-  receipts distinguish later job generations. Failed-run self-heal refuses
-  dispatch when active-generation discovery is unavailable and blocks older
-  generations behind any newer run with unresolved provenance. Pre-contract
-  workers that finish during rollout remain publishable only when their exact
-  worker commit is verified on default-branch history before the immutable
-  handoff contract, and those records carry explicit legacy provenance.
-  Pre-contract self-heal attempts continue to consume the source job's retry
-  budget, and missing historical job paths skip only the affected candidate.
-  Commit-finding intake also verifies canonical report paths, exact report
-  bytes, and embedded source identity. Deterministic no-op intake and paginated
-  commit-review continuations retain receipt ownership across workflow reruns,
-  while deduplicated continuations skip publication without reading empty plan
-  outputs.
-- Kept valid blocked and generic repair results publishable without invented
-  source revisions, rejected ledger-only result fallbacks, derived publication
-  receipt provenance from the sealed source job instead of mutable live state,
-  and recorded permanent hook rejections as definite no-mutation outcomes.
+- Made action-ledger publication include every transactional import binding,
+  added pre-dispatch apply and retry receipts with conservative unknown-outcome
+  recovery, failed active apply items on runtime yield, preserved skipped apply
+  outcomes independently from incidental mutations, separated durable comment
+  writes from metadata reconciliation, propagated ambiguous retry dispatches
+  and final Codex retryability exactly, and ordered every apply mutation attempt
+  and outcome with monotonic causal phases.
+- Dual-write review batches, items, retries, Codex log publications, durable
+  review comments, apply actions, apply batches, and apply reports into the
+  immutable action ledger, including partial, interrupted, timeout, and failed
+  executions.
+- Dual-write comment-router command receipt, classification, durable claim,
+  claim refresh, receipt-aware command-side GitHub mutation attempts and
+  outcomes, dispatch, wait, recovery, completion, skip, and failure transition,
+  status-comment progress, and report-only repair requeues into immutable
+  per-attempt action chains. Each retried request receives its own causal
+  receipt pair while retaining stable business idempotency; forced replays use
+  production-wired durable attempt identities through dispatch claims and worker
+  receipt keys; and bounded requeues dispatch the same original source path
+  bound to their digest and depth before fail-closed immutable publication from
+  the setup-provided action-ledger output root to the state repository. Each
+  command lane binds publication to a canonical, run-scoped finalized-shard
+  manifest and rejects any missing producer path before state import.
 - Short-circuited authenticated duplicate comment deliveries when their exact
   body version is already terminal in the durable router ledger, while edited,
   retryable, and state-drifted commands retain the full routing path.
@@ -182,22 +103,9 @@ checkpoint, and status-only commits are intentionally omitted.
 
 ### Fixed
 
-- Pinned GitHub Actions repair planning to Codex's read-only sandbox and removed
-  the dispatch-time override that could widen planning privileges.
-- Restored secret redaction for executor Codex last-message artifacts and kept
-  edit and review subprocesses in workspace-write and read-only sandboxes.
 - Stopped narrow OpenClaw automerge repairs from chasing unrelated full-repository lint and typecheck failures.
 - Removed the synthetic Codex write preflight that could block repair before Codex saw the real task.
 - Kept exact-review handoff health live when the dashboard serves a stale fleet snapshot, so recovered claims no longer leave the operator rail stuck in a delayed or stalled state.
-- Made commit-review matrix ledger producers unique per commit SHA, preserved
-  all legs through merged artifact publication, kept review and optional check
-  publication in one causal lifecycle, and removed state-write credentials from
-  the danger-full-access Codex job. Requested checks must now publish
-  successfully before that lifecycle completes. Added typed final repair
-  attempts, action-specific operation, event, and idempotency identities,
-  complete digest receipts for every durable repair Codex action, separate hook
-  and status-dashboard delivery outcomes, and primary-error preservation when
-  publication or dashboard failure receipt recording also fails.
 - Restored exact-review intake by deriving cancellation from `job.status`, avoiding an unsupported status-check function in step environment expressions that made GitHub reject the sweep workflow, and added checksum-pinned workflow-semantic linting to CI.
 - Made comment-router ledger updates retain refreshed claims at the bounded
   history limit, publish through fsynced atomic replacement, and fail closed on
