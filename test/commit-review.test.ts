@@ -67,6 +67,7 @@ test("commit report publication accepts only exact current-attempt bundles", () 
 
 test("commit review materializes private clone data before removing review credentials", () => {
   const workflow = fs.readFileSync(".github/workflows/commit-review.yml", "utf8");
+  const prompt = fs.readFileSync("prompts/review-commit.md", "utf8");
   const review = workflow.slice(workflow.indexOf("\n  review:"), workflow.indexOf("\n  publish:"));
   const checkout = review.slice(
     review.indexOf("      - name: Check out target main"),
@@ -76,8 +77,8 @@ test("commit review materializes private clone data before removing review crede
     review.indexOf("      - name: Review commit"),
     review.indexOf("      - name: Upload commit review diagnostic"),
   );
-  const hydrateIdentities = review.slice(
-    review.indexOf("      - name: Hydrate commit identities"),
+  const hydrateContext = review.slice(
+    review.indexOf("      - name: Hydrate bounded commit GitHub context"),
     review.indexOf("      - name: Review commit"),
   );
   const materializeCommit =
@@ -88,15 +89,151 @@ test("commit review materializes private clone data before removing review crede
   assert.match(checkout, /TARGET_TOKEN: \$\{\{ steps\.target-read-token\.outputs\.token \}\}/);
   assert.ok(checkout.includes(materializeCommit));
   assert.ok(checkout.indexOf(materializeCommit) < checkout.indexOf(removePromisorCredential));
-  assert.match(hydrateIdentities, /GH_TOKEN: \$\{\{ steps\.target-read-token\.outputs\.token \}\}/);
-  assert.match(hydrateIdentities, /gh api "repos\/\$TARGET_REPO\/commits\/\$COMMIT_SHA"/);
+  assert.match(hydrateContext, /GH_TOKEN: \$\{\{ steps\.target-read-token\.outputs\.token \}\}/);
+  assert.match(hydrateContext, /hydrate-github-context/);
+  assert.match(hydrateContext, /--target-dir "\$TARGET_NAME"/);
+  assert.match(hydrateContext, /context_path="commit-github-context-\$\{COMMIT_SHA\}\.json"/);
   assert.doesNotMatch(reviewCommit, /GH_TOKEN|GITHUB_TOKEN|TARGET_TOKEN/);
-  assert.match(reviewCommit, /--prehydrated-github-metadata/);
   assert.match(
     reviewCommit,
-    /--github-author "\$\{\{ steps\.commit-identities\.outputs\.github_author \}\}"/,
+    /--github-context "\.\.\/\$\{\{ steps\.commit-context\.outputs\.context_path \}\}"/,
   );
   assert.doesNotMatch(reviewCommit, /COMMIT_SWEEPER_TARGET_GH_TOKEN/);
+  assert.match(prompt, /prehydrated GitHub context bundle/);
+  assert.match(prompt, /do not run `gh`/);
+  assert.doesNotMatch(prompt, /receive only a read-scoped target repository token/);
+});
+
+test("commit review prehydrates bounded linked items, checks, statuses, and workflow runs", () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "commit-review-context-")));
+  const targetDir = path.join(root, "target");
+  const binDir = path.join(root, "bin");
+  const contextPath = path.join(root, "context.json");
+  fs.mkdirSync(targetDir);
+  fs.mkdirSync(binDir);
+
+  try {
+    git(targetDir, "init", "-q");
+    git(targetDir, "config", "user.name", "Test Author");
+    git(targetDir, "config", "user.email", "test@example.com");
+    git(targetDir, "config", "commit.gpgsign", "false");
+    fs.writeFileSync(path.join(targetDir, "review.txt"), "base\n");
+    git(targetDir, "add", "review.txt");
+    git(targetDir, "commit", "-q", "-m", "base");
+    fs.writeFileSync(
+      path.join(targetDir, "review.txt"),
+      "See https://github.com/openclaw/clawsweeper/pull/43\n",
+    );
+    git(targetDir, "commit", "-qam", "fix review context\n\nFixes #42");
+    const sha = git(targetDir, "rev-parse", "HEAD");
+
+    const ghPath = path.join(binDir, "gh.js");
+    fs.writeFileSync(
+      ghPath,
+      `#!/usr/bin/env node
+const args = process.argv.slice(2);
+if (process.env.GH_TOKEN !== "context-token") {
+  process.stderr.write("missing hydration token");
+  process.exit(2);
+}
+const path = args[1] || "";
+const issue = (number, pull) => ({
+  number,
+  title: "Item " + number,
+  state: "open",
+  html_url: "https://github.com/openclaw/clawsweeper/" + (pull ? "pull/" : "issues/") + number,
+  user: { login: "reporter" },
+  labels: [{ name: "bug" }],
+  body: "Context body " + number,
+  comments: 1,
+  ...(pull ? { pull_request: { url: "https://api.github.com/pulls/" + number } } : {})
+});
+let value;
+if (/\\/commits\\/[0-9a-f]{40}$/.test(path)) {
+  value = { author: { login: "hydrated-author" }, committer: { login: "hydrated-committer" } };
+} else if (/\\/commits\\/[0-9a-f]{40}\\/pulls\\?/.test(path)) {
+  value = [{ number: 44 }];
+} else if (/\\/issues\\/(42|43|44)$/.test(path)) {
+  const number = Number(path.match(/(42|43|44)$/)[1]);
+  value = issue(number, number !== 42);
+} else if (/\\/pulls\\/(43|44)$/.test(path)) {
+  const number = Number(path.match(/(43|44)$/)[1]);
+  value = { draft: false, merged: number === 44, base: { ref: "main" }, head: { ref: "fix-" + number } };
+} else if (/\\/check-runs\\?/.test(path)) {
+  value = { check_runs: [{ name: "unit", status: "completed", conclusion: "success", details_url: "https://github.com/openclaw/clawsweeper/actions/runs/99", app: { slug: "github-actions" }, started_at: "2026-07-13T10:00:00Z", completed_at: "2026-07-13T10:01:00Z" }] };
+} else if (/\\/status$/.test(path)) {
+  value = { statuses: [{ context: "legacy-ci", state: "success", description: "passed", target_url: "https://github.com/openclaw/clawsweeper/actions/runs/98", creator: { login: "ci-bot" }, updated_at: "2026-07-13T10:01:00Z" }] };
+} else if (/\\/actions\\/runs\\?/.test(path)) {
+  value = { workflow_runs: [{ id: 99, name: "CI", display_title: "CI run", event: "push", status: "completed", conclusion: "success", html_url: "https://github.com/openclaw/clawsweeper/actions/runs/99", run_attempt: 1, created_at: "2026-07-13T10:00:00Z", updated_at: "2026-07-13T10:01:00Z" }] };
+} else {
+  process.stderr.write("unexpected gh path: " + path);
+  process.exit(3);
+}
+process.stdout.write(JSON.stringify(value));
+`,
+      { mode: 0o755 },
+    );
+
+    const result = spawnSync(
+      process.execPath,
+      [
+        CLI,
+        "hydrate-github-context",
+        "--target-repo",
+        "openclaw/clawsweeper",
+        "--target-dir",
+        targetDir,
+        "--commit-sha",
+        sha,
+        "--output",
+        contextPath,
+      ],
+      {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          GH_BIN: process.execPath,
+          GH_BIN_ARGS: JSON.stringify([ghPath]),
+          GH_TOKEN: "context-token",
+        },
+      },
+    );
+
+    assert.equal(result.status, 0, result.stderr);
+    const context = JSON.parse(fs.readFileSync(contextPath, "utf8")) as {
+      github_author: string;
+      github_committer: string;
+      references: Array<{ number: number; kind: string; merged: boolean | null }>;
+      checks: Array<{ name: string }>;
+      statuses: Array<{ context: string }>;
+      workflow_runs: Array<{ id: number }>;
+    };
+    assert.equal(context.github_author, "hydrated-author");
+    assert.equal(context.github_committer, "hydrated-committer");
+    assert.deepEqual(
+      context.references.map((entry) => [entry.number, entry.kind, entry.merged]),
+      [
+        [44, "pull_request", true],
+        [42, "issue", null],
+        [43, "pull_request", false],
+      ],
+    );
+    assert.deepEqual(
+      context.checks.map((entry) => entry.name),
+      ["unit"],
+    );
+    assert.deepEqual(
+      context.statuses.map((entry) => entry.context),
+      ["legacy-ci"],
+    );
+    assert.deepEqual(
+      context.workflow_runs.map((entry) => entry.id),
+      [99],
+    );
+    assert.doesNotMatch(fs.readFileSync(contextPath, "utf8"), /context-token/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("commit review retains only content-safe diagnostics", () => {
@@ -124,6 +261,61 @@ test("commit review retains only content-safe diagnostics", () => {
     fs.writeFileSync(path.join(targetDir, "review.txt"), `${sourceSecret}\n`);
     git(targetDir, "commit", "-qam", "review target");
     const sha = git(targetDir, "rev-parse", "HEAD");
+    const githubContextPath = path.join(root, "github-context.json");
+    fs.writeFileSync(
+      githubContextPath,
+      JSON.stringify({
+        schema_version: 1,
+        repository: "openclaw/clawsweeper",
+        commit_sha: sha,
+        github_author: "hydrated-author",
+        github_committer: "hydrated-committer",
+        references: [
+          {
+            number: 42,
+            kind: "issue",
+            title: "Linked issue context",
+            state: "open",
+            url: "https://github.com/openclaw/clawsweeper/issues/42",
+            author: "reporter",
+            labels: ["bug"],
+            body_excerpt: "Observed behavior from the linked issue.",
+            comments: 2,
+            draft: null,
+            merged: null,
+            base_ref: "",
+            head_ref: "",
+          },
+        ],
+        checks: [
+          {
+            name: "unit",
+            status: "completed",
+            conclusion: "success",
+            details_url: "https://github.com/openclaw/clawsweeper/actions/runs/99",
+            app: "github-actions",
+            started_at: "2026-07-13T10:00:00Z",
+            completed_at: "2026-07-13T10:01:00Z",
+          },
+        ],
+        statuses: [],
+        workflow_runs: [
+          {
+            id: 99,
+            name: "CI",
+            display_title: "CI for linked context",
+            event: "push",
+            status: "completed",
+            conclusion: "success",
+            url: "https://github.com/openclaw/clawsweeper/actions/runs/99",
+            run_attempt: 1,
+            created_at: "2026-07-13T10:00:00Z",
+            updated_at: "2026-07-13T10:01:00Z",
+          },
+        ],
+        limitations: [],
+      }),
+    );
     const codexHome = path.join(root, "codex-home");
     fs.mkdirSync(codexHome);
     fs.writeFileSync(path.join(codexHome, "config.toml"), 'model = "private-model-name"\n');
@@ -173,6 +365,14 @@ if (
 if (!prompt.includes("- GitHub author: hydrated-author")) {
   process.stderr.write("GitHub author was not hydrated");
   process.exit(7);
+}
+if (
+  !prompt.includes("## Prehydrated GitHub Context") ||
+  !prompt.includes("Linked issue context") ||
+  !prompt.includes("CI for linked context")
+) {
+  process.stderr.write("GitHub context was not forwarded");
+  process.exit(9);
 }
 if (!prompt.includes(${JSON.stringify(promptSecret)})) {
   process.stderr.write("additional prompt was not forwarded");
@@ -246,11 +446,8 @@ fs.writeFileSync(outputPath, [
         "--codex-timeout-ms",
         "10000",
         "--require-publishable-report",
-        "--prehydrated-github-metadata",
-        "--github-author",
-        "hydrated-author",
-        "--github-committer",
-        "hydrated-committer",
+        "--github-context",
+        githubContextPath,
       ],
       {
         encoding: "utf8",

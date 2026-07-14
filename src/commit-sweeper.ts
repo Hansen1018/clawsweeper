@@ -36,6 +36,13 @@ import {
   type CodexProcessResult,
 } from "./codex-process.js";
 import { redactCodexText } from "./codex-output-capture.js";
+import {
+  hydrateCommitReviewGitHubContext,
+  readCommitReviewGitHubContext,
+  renderCommitReviewGitHubContext,
+  writeCommitReviewGitHubContext,
+  type CommitReviewGitHubContext,
+} from "./commit-review-context.js";
 import { runText } from "./command.js";
 import {
   configuredRepositoryProfileFor,
@@ -254,6 +261,7 @@ function promptForCommit(options: {
   sha: string;
   baseSha: string;
   metadata: CommitMetadata;
+  githubContext: CommitReviewGitHubContext | null;
   additionalPrompt: string;
 }): string {
   const prompt = readFileSync(join(ROOT, "prompts", "review-commit.md"), "utf8");
@@ -262,6 +270,9 @@ function promptForCommit(options: {
     : "- none";
   const additionalPrompt = options.additionalPrompt.trim()
     ? `\n## Additional Manual Prompt\n\n${options.additionalPrompt.trim()}\n`
+    : "";
+  const githubContext = options.githubContext
+    ? `\n${renderCommitReviewGitHubContext(options.githubContext)}\n`
     : "";
   return `${prompt}
 
@@ -281,6 +292,7 @@ function promptForCommit(options: {
 - Co-authors:
 ${coAuthors}
 
+${githubContext}
 ${commitDiffSummary(options.targetDir, options.baseSha, options.sha)}
 ${additionalPrompt}`;
 }
@@ -353,6 +365,7 @@ function runCodex(options: {
   sha: string;
   baseSha: string;
   metadata: CommitMetadata;
+  githubContext: CommitReviewGitHubContext | null;
   model: string;
   reasoningEffort: string;
   sandboxMode: string;
@@ -375,6 +388,7 @@ function runCodex(options: {
     sha: options.sha,
     baseSha: options.baseSha,
     metadata: options.metadata,
+    githubContext: options.githubContext,
     additionalPrompt: options.additionalPrompt,
   });
   const codexConfig = [
@@ -544,9 +558,20 @@ function reviewCommand(args: Args): void {
   const deferWorkflowCompletion = argBool(args, "defer_workflow_completion");
   recordCommitWorkflowEvent(lifecycle, "started");
   try {
-    const prehydratedGitHubMetadata = argBool(args, "prehydrated_github_metadata");
+    const githubContextPath = argString(args, "github_context", "");
+    const githubContext = githubContextPath
+      ? readCommitReviewGitHubContext(resolve(githubContextPath), {
+          targetRepo,
+          sha,
+        })
+      : null;
+    const prehydratedGitHubMetadata =
+      argBool(args, "prehydrated_github_metadata") || githubContext !== null;
     const metadata = commitMetadata(targetDir, targetRepo, sha, prehydratedGitHubMetadata);
-    if (prehydratedGitHubMetadata) {
+    if (githubContext) {
+      metadata.githubAuthor = githubContext.github_author;
+      metadata.githubCommitter = githubContext.github_committer;
+    } else if (prehydratedGitHubMetadata) {
       metadata.githubAuthor = prehydratedGitHubLogin(
         argString(args, "github_author", ""),
         "GitHub author login",
@@ -574,6 +599,7 @@ function reviewCommand(args: Args): void {
         sha,
         baseSha,
         metadata,
+        githubContext,
         model: argString(args, "codex_model", DEFAULT_CODEX_MODEL),
         reasoningEffort: argString(args, "codex_reasoning_effort", DEFAULT_REASONING_EFFORT),
         sandboxMode: argString(args, "codex_sandbox", "danger-full-access"),
@@ -609,6 +635,25 @@ function reviewCommand(args: Args): void {
     }
     throw error;
   }
+}
+
+function hydrateGitHubContextCommand(args: Args): void {
+  const targetRepo = argString(args, "target_repo", DEFAULT_TARGET_REPO);
+  const targetDir = resolve(
+    argString(args, "target_dir", repositoryProfileFor(targetRepo).checkoutDir),
+  );
+  const sha = assertSha(argString(args, "commit_sha", ""));
+  const outputPath = resolve(argString(args, "output", `${sha}.github-context.json`));
+  ensureDir(dirname(outputPath));
+  writeCommitReviewGitHubContext(
+    outputPath,
+    hydrateCommitReviewGitHubContext({
+      targetDir,
+      targetRepo,
+      sha,
+    }),
+  );
+  console.log(outputPath);
 }
 
 // GitHub credential env vars scrubbed before the offline local-review engine runs.
@@ -735,6 +780,7 @@ function localReviewCommand(args: Args): void {
       sha: headSha,
       baseSha,
       metadata,
+      githubContext: null,
       model: argString(args, "codex_model", DEFAULT_CODEX_MODEL),
       reasoningEffort: argString(args, "codex_reasoning_effort", DEFAULT_REASONING_EFFORT),
       sandboxMode: argString(args, "codex_sandbox", "read-only"),
@@ -1414,6 +1460,7 @@ export function main(argv = process.argv.slice(2)): void {
   const args = parseArgs(argv);
   const command = args._[0] ?? "review";
   if (command === "review") reviewCommand(args);
+  else if (command === "hydrate-github-context") hydrateGitHubContextCommand(args);
   else if (command === "classify") classifyCommand(args);
   else if (command === "publish-check") publishCheckCommand(args);
   else if (command === "finish-review") finishReviewCommand(args);

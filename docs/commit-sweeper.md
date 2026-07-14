@@ -151,6 +151,13 @@ Codex reviews the provided commit range and is expected to read beyond the diff:
 - general web sources when current external facts matter
 - focused live tests or smoke checks when feasible
 
+Before Codex starts, the workflow uses its read-only target token to build a
+bounded context bundle for the commit. The bundle contains associated or
+explicitly linked issues and pull requests, check runs, commit statuses, and
+workflow runs. The reviewer validates and embeds that bundle as untrusted
+evidence, then launches Codex without GitHub or Actions credentials. Codex must
+use the bundle rather than calling `gh` itself.
+
 The time budget is 30 minutes per commit.
 
 Codex returns markdown only. The front matter is small and stable so tooling can
