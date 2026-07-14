@@ -38,6 +38,10 @@ For the complete architecture and operator guide covering issue-to-PR work, PR
 repair, GitCrawl intake, durable Codex threads, CrabFleet steering, completion
 gates, quotas, dashboards, and recovery, see
 [`docs/steerable-repair-automation.md`](docs/steerable-repair-automation.md).
+For the numbered algorithmic design covering semantic reuse, dependency-ordered
+closure, admission scheduling, action/review receipts, mutation recovery, and
+Gitcrawl local/cloud/parity evidence, see
+[`docs/algorithmic-closure-system.md`](docs/algorithmic-closure-system.md).
 
 ClawSweeper is not a generic auto-close bot. Review is proposal-only, apply is
 guarded, Codex never gets write credentials during review, and every GitHub

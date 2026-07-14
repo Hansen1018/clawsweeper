@@ -14,6 +14,9 @@ ClawSweeper should stay simple at the orchestration boundary:
 5. Comments, records, ledgers, and dashboards are generated status surfaces,
    not independent sources of truth.
 
+The optimization layers beneath this boundary are documented in
+[Algorithmic Closure System](algorithmic-closure-system.md).
+
 ## Canonical Job Intent
 
 Repair jobs carry `job_intent` in frontmatter. This is the durable routing
