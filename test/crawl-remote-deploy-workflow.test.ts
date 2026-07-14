@@ -3197,7 +3197,9 @@ test("production proof polls semantic state and binds both responses to the rele
   assert.match(run, /"POST"/);
   assert.match(run, /gitcrawl-query-safety-v3/);
   assert.match(run, /gitcrawl\.query-canary\.permanent\.v1/);
+  assert.match(run, /gitcrawl\.query-canary\.permanent-runtime\.v1/);
   assert.match(run, /missing permanent query canary support/);
+  assert.match(run, /missing permanent runtime query canary support/);
   assert.match(run, /read-only POST query route/);
   assert.match(run, /safe read-only Gitcrawl query/);
   assert.match(run, /CF-Access-Client-Id/);
@@ -3264,6 +3266,8 @@ test("production semantic validator requires workers.dev and the Access route", 
   const observationCapability = "gitcrawl.observation-order.v1";
   const snapshotProvenanceCapability = "gitcrawl.snapshot.provenance.v1";
   const querySafetyCapability = "gitcrawl-query-safety-v3";
+  const permanentCanaryCapability = "gitcrawl.query-canary.permanent.v1";
+  const permanentRuntimeCanaryCapability = "gitcrawl.query-canary.permanent-runtime.v1";
   const observationFenceNote =
     "Gitcrawl observation ordering requires the D1 migration, explicit publisher capability, and operator cutover fence before it is advertised or activated.";
   const snapshotProvenanceNote =
@@ -3566,7 +3570,8 @@ test("production semantic validator requires workers.dev and the Access route", 
   ) {
     const defaultCapabilities = [
       querySafetyCapability,
-      "gitcrawl.query-canary.permanent.v1",
+      permanentCanaryCapability,
+      permanentRuntimeCanaryCapability,
       ...(observationState === "active" ? [observationCapability] : []),
       ...(snapshotState === "active" ? [snapshotProvenanceCapability] : []),
     ];
@@ -3660,6 +3665,17 @@ test("production semantic validator requires workers.dev and the Access route", 
 
   try {
     assert.equal(validate("dormant", "dormant").status, 0);
+    assert.notEqual(
+      validate(
+        "dormant",
+        "dormant",
+        {
+          capabilities: [querySafetyCapability, permanentCanaryCapability],
+        },
+        {},
+      ).status,
+      0,
+    );
     assert.equal(validate("active", "active").status, 0);
     assert.equal(validate("active", "dormant").status, 0);
     assert.notEqual(validate("dormant", "dormant", { healthSha: "b".repeat(40) }).status, 0);

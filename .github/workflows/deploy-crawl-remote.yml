@@ -2904,6 +2904,15 @@ jobs:
               ) {
                 throw new Error(`${label} contract is missing permanent query canary support`);
               }
+              if (
+                !gitcrawl.capabilities.includes(
+                  'gitcrawl.query-canary.permanent-runtime.v1',
+                )
+              ) {
+                throw new Error(
+                  `${label} contract is missing permanent runtime query canary support`,
+                );
+              }
               if (!Array.isArray(gitcrawl.queries)) {
                 throw new Error(`${label} Gitcrawl queries are malformed`);
               }
