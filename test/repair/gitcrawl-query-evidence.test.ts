@@ -228,6 +228,14 @@ test("query evidence fails closed on source, relation, review, and packet drift"
     await adapter.close();
   });
 
+  await t.test("replayed canonical threads cannot hide behind provider row ids", async () => {
+    const adapter = await adapterFor({
+      "gitcrawl.threads.search": [memberRow(), memberRow({ thread_id: 43 })],
+    });
+    await assert.rejects(adapter.searchOpenPullRequests(), /duplicate row identity/);
+    await adapter.close();
+  });
+
   await t.test("related results point back to themselves", async () => {
     const adapter = await adapterFor({
       "gitcrawl.clusters.related": [{ source_number: 42, ...memberRow() }],

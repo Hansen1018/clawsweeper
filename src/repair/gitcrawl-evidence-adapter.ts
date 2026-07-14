@@ -947,7 +947,7 @@ async function queryAll(
       throw new Error(`Gitcrawl ${name} returned more rows than requested`);
     }
     for (const row of envelope.values) {
-      const identity = queryRowIdentity(name, row);
+      const identity = queryRowIdentity(state.repository, name, args, row);
       if (seenRows.has(identity)) {
         throw new Error(`Gitcrawl ${name} returned duplicate row identity ${identity}`);
       }
@@ -970,23 +970,32 @@ async function queryAll(
   throw new Error(`Gitcrawl ${name} pagination exceeded ${maxPages} pages`);
 }
 
-function queryRowIdentity(name: GitcrawlQueryName, row: Record<string, unknown>): string {
+function queryRowIdentity(
+  repository: string,
+  name: GitcrawlQueryName,
+  args: Record<string, unknown>,
+  row: Record<string, unknown>,
+): string {
   switch (name) {
     case "gitcrawl.coverage":
       return `dataset:${String(row.dataset ?? "")}`;
     case "gitcrawl.clusters.list":
       return `cluster:${String(row.cluster_id ?? "")}`;
     case "gitcrawl.clusters.members":
-      return `cluster-thread:${String(row.cluster_id ?? "")}:${String(row.thread_id ?? "")}`;
+      return `cluster-thread:${String(row.cluster_id ?? "")}:${canonicalThreadRowIdentity(repository, row)}`;
     case "gitcrawl.clusters.related":
-      return `related-thread:${String(row.thread_id ?? "")}`;
+      return `related-thread:${canonicalThreadRowIdentity(repository, row)}`;
     case "gitcrawl.pull_requests.review_context":
       return row.row_kind === "file"
-        ? `review-file:${String(row.thread_id ?? "")}:${String(row.file_position ?? "")}`
-        : `review-context:${String(row.thread_id ?? "")}`;
+        ? `review-file:${repository}:pull_request:${safePositive(args.number, "review request number")}:${String(row.file_position ?? "")}`
+        : `review-context:${canonicalThreadRowIdentity(repository, row)}`;
     case "gitcrawl.threads.search":
-      return `thread:${String(row.thread_id ?? "")}`;
+      return `thread:${canonicalThreadRowIdentity(repository, row)}`;
   }
+}
+
+function canonicalThreadRowIdentity(repository: string, row: Record<string, unknown>): string {
+  return `${repository}:${supportedThreadKind(row.kind)}:${safePositive(row.number, "thread number")}`;
 }
 
 function bindEnvelope(
