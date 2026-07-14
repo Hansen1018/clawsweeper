@@ -371,6 +371,44 @@ test("repair review baselines reuse only state records reviewed before the repai
   }
 });
 
+test("repair review baselines accept only trusted exact-head post-repair verdicts", () => {
+  const reviewedCursor = `v2:2:${"c".repeat(64)}`;
+  const expectedHeadSha = "a".repeat(40);
+  const comments = [
+    {
+      user: { login: "contributor" },
+      body: `<!-- clawsweeper-verdict:pass sha=${expectedHeadSha} reviewed_at=2020-01-01T00:00:00Z review_activity_cursor=${reviewedCursor} -->`,
+    },
+    {
+      user: { login: "openclaw-clawsweeper[bot]" },
+      body: `<!-- clawsweeper-verdict:pass sha=${expectedHeadSha} reviewed_at=2020-01-01T00:01:00Z review_activity_cursor=${reviewedCursor} -->`,
+    },
+  ];
+
+  assert.equal(
+    resolveRepairMutationReviewActivityCursor({
+      repository: "openclaw/openclaw",
+      number: 123,
+      targetKind: "pull_request",
+      expectedUpdatedAt: "2026-07-14T10:00:00Z",
+      expectedHeadSha,
+      readIssueComments: () => comments,
+    }),
+    reviewedCursor,
+  );
+  assert.equal(
+    resolveRepairMutationReviewActivityCursor({
+      repository: "openclaw/openclaw",
+      number: 123,
+      targetKind: "pull_request",
+      expectedUpdatedAt: "2026-07-14T10:00:00Z",
+      expectedHeadSha: "d".repeat(40),
+      readIssueComments: () => comments,
+    }),
+    EMPTY_REVIEW_ACTIVITY_CURSOR,
+  );
+});
+
 test("repair freshness rejects concurrent target activity after an owned comment", () => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "repair-mutation-owned-")));
   const previous = { ...process.env };
@@ -434,9 +472,73 @@ test("repair freshness rejects concurrent target activity after an owned comment
   }
 });
 
+test("repair freshness rejects concurrent PR identity drift after an owned comment", () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "repair-mutation-pr-drift-")));
+  const previous = { ...process.env };
+  Object.assign(process.env, repairActionLedgerEnv(root));
+
+  try {
+    let activity = targetActivity();
+    const freshness = createRepairMutationFreshnessGuard({
+      repository: "openclaw/openclaw",
+      number: 123,
+      targetKind: "pull_request",
+      expectedUpdatedAt: activity.updatedAt,
+      expectedReviewActivityCursor: EMPTY_REVIEW_ACTIVITY_CURSOR,
+      readTargetActivity: () => activity,
+      readReviewActivityCursor: () => EMPTY_REVIEW_ACTIVITY_CURSOR,
+    });
+    const body = "ClawSweeper closeout";
+    const bodySha256 = createHash("sha256").update(body).digest("hex");
+
+    assert.throws(
+      () =>
+        runRepairMutation(
+          {
+            phase: "apply_result",
+            repository: "openclaw/openclaw",
+            clusterId: "repair-openclaw-openclaw-123",
+            number: 123,
+            targetKind: "pull_request",
+            operationKey: "repair-pr-drift-test",
+          },
+          {
+            kind: "comment_create",
+            identity: { repository: "openclaw/openclaw", number: 123, bodySha256 },
+            freshness,
+            operation: () => {
+              activity = {
+                ...targetActivity("2026-07-14T10:01:00Z"),
+                metadataSha256: "b".repeat(64),
+                comments: [
+                  {
+                    id: "9001",
+                    author: "clawsweeper[bot]",
+                    authorAssociation: "CONTRIBUTOR",
+                    createdAt: "2026-07-14T10:01:00Z",
+                    updatedAt: "2026-07-14T10:01:00Z",
+                    bodySha256,
+                    metadataSha256: "c".repeat(64),
+                  },
+                ],
+              };
+              return { id: 9001, body };
+            },
+            acceptedChange: (created) => repairCreatedCommentChange(created, bodySha256),
+          },
+        ),
+      /target activity changed concurrently with the ClawSweeper mutation/,
+    );
+  } finally {
+    restoreEnv(previous);
+    fs.rmSync(root, { force: true, recursive: true });
+  }
+});
+
 test("repair executors route authoritative GitHub writes through the mutation boundary", () => {
   const applySource = fs.readFileSync("src/repair/apply-result.ts", "utf8");
   const postFlightSource = fs.readFileSync("src/repair/post-flight.ts", "utf8");
+  const activitySource = fs.readFileSync("src/repair/repair-mutation-activity.ts", "utf8");
   const safetySource = fs.readFileSync("src/repair/repair-mutation-safety.ts", "utf8");
   const reviewBaselineSource = fs.readFileSync(
     "src/repair/repair-mutation-review-baseline.ts",
@@ -462,6 +564,9 @@ test("repair executors route authoritative GitHub writes through the mutation bo
   assert.match(safetySource, /reviewed pull request activity cursor is unavailable/);
   assert.match(reviewBaselineSource, /item_updated_at/);
   assert.match(reviewBaselineSource, /reviewedAt > options\.reviewedBefore/);
+  assert.match(reviewBaselineSource, /clawsweeper-verdict:pass/);
+  assert.match(activitySource, /requestedReviewers/);
+  assert.match(activitySource, /compactPullRequestRef\(pull\.head\)/);
   assert.match(applySource, /resolveRepairMutationReviewActivityCursor/);
   assert.match(postFlightSource, /resolveRepairMutationReviewActivityCursor/);
   assert.match(applySource, /finally \{\s+await flushRepairMutationActionEvents\(\)/);

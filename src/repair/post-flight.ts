@@ -228,8 +228,8 @@ function finalizeFixPr(action: LooseRecord) {
             explicitCursor:
               action.review_activity_cursor ?? action.merge_preflight?.review_activity_cursor,
             expectedUpdatedAt: pull.updated_at ?? view.updatedAt,
-            reviewedBefore:
-              fixReport?.executed_at ?? clusterPlan?.generated_at ?? result.generated_at,
+            expectedHeadSha: action.commit,
+            reviewedBefore: report.post_flight_at,
           }),
         });
       } catch (error) {

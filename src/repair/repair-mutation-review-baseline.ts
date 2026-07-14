@@ -2,7 +2,8 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
-import { isReviewedPrActivityCursor } from "../review-activity-cursor.js";
+import { MAX_REVIEWED_PR_ACTIVITY, isReviewedPrActivityCursor } from "../review-activity-cursor.js";
+import { ghPagedLimitWithRetry as ghPagedLimit } from "./github-cli.js";
 import type { RepairMutationTargetKind } from "./repair-mutation-activity.js";
 
 export const EMPTY_REPAIR_REVIEW_ACTIVITY_CURSOR = `v2:0:${createHash("sha256")
@@ -15,9 +16,20 @@ type RepairMutationReviewBaselineOptions = {
   targetKind: RepairMutationTargetKind;
   explicitCursor?: unknown;
   expectedUpdatedAt?: unknown;
+  expectedHeadSha?: unknown;
   reviewedBefore?: unknown;
   stateRoot?: string | null;
+  readIssueComments?: () => unknown[];
 };
+
+const DEFAULT_TRUSTED_REVIEW_AUTHORS = new Set(
+  [
+    "clawsweeper",
+    "clawsweeper[bot]",
+    "openclaw-clawsweeper[bot]",
+    process.env.CLAWSWEEPER_COMMENT_AUTHOR_LOGIN,
+  ].filter((value): value is string => typeof value === "string" && value.length > 0),
+);
 
 export function resolveRepairMutationReviewActivityCursor(
   options: RepairMutationReviewBaselineOptions,
@@ -26,6 +38,11 @@ export function resolveRepairMutationReviewActivityCursor(
 
   const explicitCursor = stringValue(options.explicitCursor);
   if (explicitCursor) return explicitCursor;
+
+  if (stringValue(options.expectedHeadSha)) {
+    const trustedCursor = trustedRepairReviewActivityCursor(options);
+    return trustedCursor ?? EMPTY_REPAIR_REVIEW_ACTIVITY_CURSOR;
+  }
 
   const storedCursor = storedRepairReviewActivityCursor(options);
   return storedCursor ?? EMPTY_REPAIR_REVIEW_ACTIVITY_CURSOR;
@@ -92,6 +109,62 @@ function cursorFromStateRecord(options: {
   return cursor;
 }
 
+function trustedRepairReviewActivityCursor(
+  options: RepairMutationReviewBaselineOptions,
+): string | null {
+  const expectedHeadSha = stringValue(options.expectedHeadSha);
+  if (!/^[a-f0-9]{40}$/i.test(expectedHeadSha)) return null;
+
+  let comments: unknown[];
+  try {
+    comments =
+      options.readIssueComments?.() ??
+      ghPagedLimit<unknown>(
+        `repos/${options.repository}/issues/${options.number}/comments`,
+        MAX_REVIEWED_PR_ACTIVITY + 1,
+      );
+  } catch {
+    return null;
+  }
+  if (comments.length > MAX_REVIEWED_PR_ACTIVITY) return null;
+
+  const candidates = comments
+    .map(trustedVerdictCursor)
+    .filter(
+      (
+        candidate,
+      ): candidate is {
+        cursor: string;
+        reviewedAt: number;
+      } => Boolean(candidate),
+    )
+    .filter((candidate) => candidate.reviewedAt <= Date.now())
+    .sort((left, right) => right.reviewedAt - left.reviewedAt);
+  return candidates.find((candidate) => candidate.cursor)?.cursor ?? null;
+
+  function trustedVerdictCursor(value: unknown): {
+    cursor: string;
+    reviewedAt: number;
+  } | null {
+    const comment = record(value);
+    const author = stringValue(record(comment.user).login);
+    if (!DEFAULT_TRUSTED_REVIEW_AUTHORS.has(author)) return null;
+    const body = typeof comment.body === "string" ? comment.body : "";
+    const marker = body.match(/<!--\s*clawsweeper-verdict:pass\b([^>]*)-->/i);
+    if (!marker) return null;
+    const attributes = markerAttributes(marker[1] ?? "");
+    const reviewedAt = timestamp(attributes.reviewed_at);
+    if (
+      attributes.sha !== expectedHeadSha ||
+      reviewedAt === null ||
+      !isReviewedPrActivityCursor(attributes.review_activity_cursor)
+    ) {
+      return null;
+    }
+    return { cursor: attributes.review_activity_cursor, reviewedAt };
+  }
+}
+
 function parseFrontmatter(markdown: string): Record<string, string> {
   const match = markdown.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
   if (!match) return {};
@@ -103,6 +176,21 @@ function parseFrontmatter(markdown: string): Record<string, string> {
     values[entry[1] ?? ""] = raw.startsWith('"') && raw.endsWith('"') ? raw.slice(1, -1) : raw;
   }
   return values;
+}
+
+function markerAttributes(input: string): Record<string, string> {
+  const values: Record<string, string> = {};
+  for (const match of input.matchAll(/([a-z0-9_-]+)=("[^"]*"|'[^']*'|[^\s>]+)/gi)) {
+    const raw = match[2] ?? "";
+    values[(match[1] ?? "").toLowerCase()] = raw.replace(/^["']|["']$/g, "");
+  }
+  return values;
+}
+
+function record(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
 }
 
 function repositorySlug(repository: string): string {

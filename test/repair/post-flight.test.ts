@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
+import { createReviewedPrActivityCursor } from "../../dist/review-activity-cursor.js";
 import { mockGhBinEnv } from "../helpers.ts";
 
 const repoRoot = process.cwd();
@@ -253,6 +254,20 @@ test("merge post-flight leaves dependency-gated closeouts to the second apply pa
   const reportPath = path.join(runDir, "post-flight-report.json");
   const mergeFlagPath = path.join(tmp, "merged.txt");
   const viewCountPath = path.join(tmp, "view-count.txt");
+  const existingReview = {
+    id: 77,
+    user: { login: "maintainer" },
+    state: "COMMENTED",
+    body: "Reviewed before repair",
+    submitted_at: "2026-05-23T23:40:00Z",
+    commit_id: "9".repeat(40),
+  };
+  const reviewCursor = createReviewedPrActivityCursor({
+    reviews: [existingReview],
+    inlineComments: [],
+    reviewThreads: [],
+  });
+  assert.ok(reviewCursor);
 
   fs.mkdirSync(fakeBin, { recursive: true });
   fs.mkdirSync(runDir, { recursive: true });
@@ -275,11 +290,16 @@ test("merge post-flight leaves dependency-gated closeouts to the second apply pa
       "  process.exit(0);",
       "}",
       "if (args[0] === 'api' && /^repos\\/openclaw\\/openclaw\\/pulls\\/123\\/(reviews|comments)\\?/.test(args[1])) {",
-      "  process.stdout.write('[]');",
+      "  process.stdout.write(args[1].includes('/reviews?') ? process.env.FAKE_GH_EXISTING_REVIEW : '[]');",
       "  process.exit(0);",
       "}",
       "if (args[0] === 'api' && /^repos\\/openclaw\\/openclaw\\/issues\\/123\\/comments\\?/.test(args[1])) {",
-      "  process.stdout.write('[]');",
+      "  process.stdout.write(JSON.stringify([{",
+      "    id: 501, node_id: 'IC_501', user: { login: 'openclaw-clawsweeper[bot]' },",
+      "    author_association: 'CONTRIBUTOR', created_at: '2026-05-24T00:39:50Z',",
+      "    updated_at: '2026-05-24T00:39:50Z',",
+      "    body: `review passed\\n<!-- clawsweeper-verdict:pass sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa reviewed_at=2026-05-24T00:39:50Z review_activity_cursor=${process.env.FAKE_GH_REVIEW_CURSOR} -->`,",
+      "  }]));",
       "  process.exit(0);",
       "}",
       "if (args[0] === 'api' && args[1] === 'graphql') {",
@@ -327,7 +347,10 @@ test("merge post-flight leaves dependency-gated closeouts to the second apply pa
       candidate_fix: "#123",
       depends_on: null,
     },
-  ]);
+  ], {
+    action: "repair_contributor_branch",
+    commit: "a".repeat(40),
+  });
 
   try {
     execFileSync(process.execPath, ["dist/repair/post-flight.js", jobPath, resultPath], {
@@ -342,6 +365,8 @@ test("merge post-flight leaves dependency-gated closeouts to the second apply pa
         CLAWSWEEPER_POST_FLIGHT_POLL_MS: "1",
         FAKE_GH_MERGED_FILE: mergeFlagPath,
         FAKE_GH_VIEW_COUNT_FILE: viewCountPath,
+        FAKE_GH_EXISTING_REVIEW: JSON.stringify([existingReview]),
+        FAKE_GH_REVIEW_CURSOR: reviewCursor,
         ...mockGhBinEnv(path.join(fakeBin, "gh"), fakeBin),
       },
       stdio: "pipe",
@@ -645,6 +670,7 @@ function writeMergeReports(
   runDir: string,
   resultPath: string,
   actions: Record<string, unknown>[] = [],
+  options: { action?: string; commit?: string } = {},
 ) {
   fs.writeFileSync(
     resultPath,
@@ -665,10 +691,11 @@ function writeMergeReports(
       {
         actions: [
           {
-            action: "open_fix_pr",
-            status: "opened",
+            action: options.action ?? "open_fix_pr",
+            status: options.action === "repair_contributor_branch" ? "pushed" : "opened",
             pr_url: "https://github.com/openclaw/openclaw/pull/123",
             branch: "clawsweeper/automerge-openclaw-openclaw-123",
+            ...(options.commit ? { commit: options.commit } : {}),
             merge_preflight: {
               security_status: "cleared",
               security_evidence: ["no security signal"],

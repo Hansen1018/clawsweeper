@@ -193,7 +193,10 @@ function fetchRepairTargetActivityOnce(
       authorAssociation: scalar(issue.author_association ?? issue.authorAssociation),
       assignees: normalizeActors(issue.assignees),
       milestone: compactMilestone(issue.milestone),
-      pullRequest: compactPullRequest(issue.pull_request ?? issue.pullRequest),
+      pullRequest:
+        targetKind === "pull_request"
+          ? compactPullRequestTarget(issue)
+          : compactPullRequestLink(issue.pull_request ?? issue.pullRequest),
     }),
     comments: comments.map(compactTargetComment),
   });
@@ -316,7 +319,7 @@ function compactMilestone(value: unknown) {
   };
 }
 
-function compactPullRequest(value: unknown) {
+function compactPullRequestLink(value: unknown) {
   const pull = record(value);
   return {
     url: scalar(pull.url),
@@ -324,6 +327,41 @@ function compactPullRequest(value: unknown) {
     diffUrl: scalar(pull.diff_url ?? pull.diffUrl),
     patchUrl: scalar(pull.patch_url ?? pull.patchUrl),
   };
+}
+
+function compactPullRequestTarget(value: unknown) {
+  const pull = record(value);
+  return {
+    id: scalar(pull.id),
+    nodeId: scalar(pull.node_id ?? pull.nodeId),
+    number: scalar(pull.number),
+    draft: pull.draft === true,
+    head: compactPullRequestRef(pull.head),
+    base: compactPullRequestRef(pull.base),
+    requestedReviewers: normalizeActors(pull.requested_reviewers ?? pull.requestedReviewers),
+    requestedTeams: normalizeTeams(pull.requested_teams ?? pull.requestedTeams),
+  };
+}
+
+function compactPullRequestRef(value: unknown) {
+  const ref = record(value);
+  const repository = record(ref.repo);
+  return {
+    sha: scalar(ref.sha),
+    ref: scalar(ref.ref),
+    label: scalar(ref.label),
+    repositoryId: scalar(repository.id),
+    repositoryNodeId: scalar(repository.node_id ?? repository.nodeId),
+    repositoryName: scalar(repository.full_name ?? repository.fullName),
+  };
+}
+
+function normalizeTeams(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((entry) => scalar(record(entry).slug))
+    .filter((entry): entry is string => entry !== null)
+    .sort(codeUnitOrder);
 }
 
 function record(value: unknown): Record<string, unknown> {
