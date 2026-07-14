@@ -82,6 +82,29 @@ bounded. Every query shape for one thread must produce the same safety
 projection. Nested HTML comments are removed completely from prompt-facing
 values, and sanitized object-key collisions are rejected.
 
+## Action Receipts
+
+Callers can prepare, record, and flush immutable Gitcrawl action receipts with
+`prepareGitcrawlActionReceipt`, `recordGitcrawlActionReceipt`, and
+`flushGitcrawlActionReceipts`.
+
+The receipt surface records:
+
+- one `gitcrawl.snapshot` selection with bounded capability identifiers and a
+  coverage digest;
+- one `gitcrawl.query` binding for each named query, containing only argument,
+  result, parity-result, and combined binding digests plus row and claim counts;
+- `gitcrawl.binding` coverage and parity summaries with bounded counts and
+  completion state;
+- failed snapshot, query, or binding attempts reduced to a finite failure class
+  and SHA-256 digest.
+
+Receipts may include provider and query names, machine-safe snapshot and
+capability identifiers, and a public GitHub Actions run URL. They never include
+raw rows, SQL, query arguments, prompts, logs, tokens, local paths, bodies, or
+provider response text. The API is not wired into repair intake, job
+publication, lifecycle transactions, or GitHub mutation.
+
 ## Fail-Closed Rules
 
 The query core rejects:
@@ -113,4 +136,6 @@ The query core rejects:
 
 This core does not include repair-action-ledger events, job publication
 transactions, importer state, durable scan cursors, workflow activation,
-GitHub mutation, PR lifecycle handling, or raw provider logs.
+GitHub mutation, PR lifecycle handling, or raw provider logs. The optional
+digest-only action receipt API observes validated outcomes without changing
+those boundaries.
