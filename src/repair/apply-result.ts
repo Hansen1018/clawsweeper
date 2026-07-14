@@ -2007,13 +2007,7 @@ function closeIssueOrPullRequest(
       },
       freshness,
       operation: () =>
-        ghOneShot([
-          "pr",
-          "close",
-          String(context.number),
-          "--repo",
-          context.repository,
-        ]),
+        ghOneShot(["pr", "close", String(context.number), "--repo", context.repository]),
       knownNoMutation: isLockedConversationCommentError,
     });
     return;

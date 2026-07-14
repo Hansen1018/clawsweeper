@@ -86,14 +86,8 @@ test("repair mutation receipts distinguish accepted and unknown outcomes without
     );
     assert.equal(events[1]?.parent_event_id, events[0]?.event_id);
     assert.equal(events[3]?.parent_event_id, events[2]?.event_id);
-    assert.equal(
-      events[0]?.idempotency_key_sha256,
-      events[1]?.idempotency_key_sha256,
-    );
-    assert.equal(
-      events[2]?.idempotency_key_sha256,
-      events[3]?.idempotency_key_sha256,
-    );
+    assert.equal(events[0]?.idempotency_key_sha256, events[1]?.idempotency_key_sha256);
+    assert.equal(events[2]?.idempotency_key_sha256, events[3]?.idempotency_key_sha256);
     assert.doesNotMatch(JSON.stringify(events), /PRIVATE_REVIEW_BODY/);
   } finally {
     restoreEnv(previous);

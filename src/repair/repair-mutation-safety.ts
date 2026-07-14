@@ -240,9 +240,7 @@ function fetchRepairReviewActivityCursorOnce(repository: string, number: number)
   if (inlineComments.length > remaining) return null;
   remaining -= inlineComments.length;
   const reviewThreads =
-    inlineComments.length === 0
-      ? []
-      : fetchRepairReviewThreads(repository, number, remaining + 1);
+    inlineComments.length === 0 ? [] : fetchRepairReviewThreads(repository, number, remaining + 1);
   if (reviewThreads.length > remaining) return null;
   return createReviewedPrActivityCursor({ reviews, inlineComments, reviewThreads });
 }
@@ -457,9 +455,7 @@ function knownRejectedOutcome(
   }
 }
 
-function mutationOutcomeStatus(
-  outcome: RepairMutationOutcome | "attempted",
-): ActionEventStatus {
+function mutationOutcomeStatus(outcome: RepairMutationOutcome | "attempted"): ActionEventStatus {
   if (outcome === "attempted") return ACTION_EVENT_STATUSES.started;
   if (outcome === "accepted") return ACTION_EVENT_STATUSES.executed;
   if (outcome === "rejected") return ACTION_EVENT_STATUSES.skipped;
@@ -523,5 +519,7 @@ function positiveInteger(value: unknown): number | null {
 }
 
 function digestText(value: unknown): string {
-  return createHash("sha256").update(String(value ?? "")).digest("hex");
+  return createHash("sha256")
+    .update(String(value ?? ""))
+    .digest("hex");
 }
