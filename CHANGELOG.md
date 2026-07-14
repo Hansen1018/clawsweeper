@@ -58,6 +58,9 @@ checkpoint, and status-only commits are intentionally omitted.
 
 ### Changed
 
+- Rebuilt immutable action-ledger race candidates directly from Git trees and
+  temporary indexes, avoiding repeated state-worktree reset, checkout, stage,
+  and commit work so hot state branches can converge within their deadline.
 - Bounded immutable action-ledger publishers' priority yield to exclusive state
   leases so a valid long-lived lease cannot starve a shorter immutable
   publication deadline; exclusive publishers still rebuild around branch races.

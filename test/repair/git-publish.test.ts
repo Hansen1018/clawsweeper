@@ -3778,30 +3778,57 @@ test("immutable publisher converges through unrelated mutable branch updates", (
   cloneState(fixture.origin, other);
   fs.mkdirSync(source);
   write(path.join(source, publishPath), '{"event":"storm"}\n');
-  installRepeatedStateRaceHook(state, other, 3);
+  installRepeatedStateRaceHook(state, other, 12);
 
-  const result = withEnv(
-    leasedPublishEnv({
-      CLAWSWEEPER_STATE_DIR: state,
-      CLAWSWEEPER_PUBLISH_DEADLINE_MS: "5000",
-      CLAWSWEEPER_PUBLISH_COMMAND_TIMEOUT_MS: "2000",
-    }),
-    () =>
-      withCwd(source, () =>
-        publishMainCommit({
-          message: "chore: append immutable event through mutable storm",
-          paths: [publishPath],
-          coordination: "immutable",
-        }),
-      ),
-  );
+  let result;
+  const lines = captureConsoleLog(() => {
+    result = withEnv(
+      leasedPublishEnv({
+        CLAWSWEEPER_STATE_DIR: state,
+        CLAWSWEEPER_PUBLISH_DEADLINE_MS: "15000",
+        CLAWSWEEPER_PUBLISH_COMMAND_TIMEOUT_MS: "2000",
+      }),
+      () =>
+        withCwd(source, () =>
+          publishMainCommit({
+            message: "chore: append immutable event through mutable storm",
+            paths: [publishPath],
+            coordination: "immutable",
+          }),
+        ),
+    );
+  });
 
   assert.equal(result, "committed");
+  assert.equal(
+    lines.filter((line) => line.startsWith("$ git reset ")).length,
+    2,
+    "immutable retries should only reset during initial sync and final adoption",
+  );
+  assert.equal(
+    lines.filter((line) => line.startsWith("$ git add ")).length,
+    1,
+    "immutable retries should not restage the worktree",
+  );
+  assert.equal(
+    lines.filter((line) => line.startsWith("$ git commit ")).length,
+    1,
+    "immutable retries should not create worktree commits",
+  );
+  assert.equal(
+    lines.filter((line) => line.startsWith("$ git checkout ")).length,
+    0,
+    "immutable retries should not restore paths through the worktree",
+  );
+  assert.ok(
+    lines.filter((line) => line.startsWith("$ git commit-tree ")).length >= 13,
+    "each raced candidate should be rebuilt directly from Git objects",
+  );
   assert.equal(
     run("git", ["--git-dir", fixture.origin, "show", `state:${publishPath}`], fixture.root),
     '{"event":"storm"}\n',
   );
-  for (let race = 1; race <= 3; race += 1) {
+  for (let race = 1; race <= 12; race += 1) {
     assert.equal(
       run(
         "git",

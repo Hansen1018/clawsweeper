@@ -59,6 +59,7 @@ export type GitRunOptions = {
   allowFailure?: boolean;
   deadlineAtMs?: number;
   displayArgs?: readonly string[];
+  env?: NodeJS.ProcessEnv;
   ignorePublishDeadline?: boolean;
   input?: string;
   quiet?: boolean;
@@ -123,6 +124,12 @@ type ObservedStatePublishLease = {
   expiresAtMs: number;
 };
 
+type GitTreeEntry = {
+  mode: string;
+  oid: string;
+  type: string;
+};
+
 let activeGitPublishMetrics: GitPublishMetrics | null = null;
 
 validateStatePublishTimingDefaults();
@@ -167,7 +174,7 @@ export function spawnGit(args: readonly string[], options: GitRunOptions = {}): 
   const timeout = gitCommandTimeoutMs(options);
   const child = spawnSync("git", [...args], {
     cwd: publishRoot(),
-    env: process.env,
+    env: options.env ? { ...process.env, ...options.env } : process.env,
     encoding: "utf8",
     ...(options.input !== undefined ? { input: options.input } : {}),
     maxBuffer: 16 * 1024 * 1024,
@@ -247,8 +254,11 @@ function safeGitDisplayAction(action: string | undefined): string {
     case "fetch":
     case "checkout":
     case "cat-file":
+    case "commit-tree":
     case "ls-files":
+    case "ls-tree":
     case "push":
+    case "read-tree":
     case "rebase":
     case "remote":
     case "restore":
@@ -256,6 +266,8 @@ function safeGitDisplayAction(action: string | undefined): string {
     case "rev-parse":
     case "rm":
     case "status":
+    case "update-index":
+    case "write-tree":
       return action;
     default:
       return "command";
@@ -452,6 +464,7 @@ function convergeImmutablePublish(options: {
 }): PublishResult {
   const observedLeases = new Map<string, ObservedStatePublishLease>();
   const exclusiveLeasePriorityDeadlineMs = immutableExclusiveLeasePriorityDeadlineMs();
+  const sourceEntries = gitTreeEntries(options.sourceCommit, options.paths);
   let exclusiveLeasePriorityExhausted = false;
   let exclusiveLeaseObserved = false;
   for (let attempt = 1; attempt <= options.maxAttempts; attempt += 1) {
@@ -472,6 +485,7 @@ function convergeImmutablePublish(options: {
       branch: options.branch,
       paths: options.paths,
       sourceCommit: options.sourceCommit,
+      sourceEntries,
     });
     if (compatibility.missing.length === 0) {
       verifyRemoteImmutablePaths(
@@ -482,13 +496,26 @@ function convergeImmutablePublish(options: {
       );
       return "unchanged";
     }
-    const expectedCommit = runGit(["rev-parse", "HEAD"], { quiet: true }).trim();
+    const expectedCommit = buildImmutablePublishCommit({
+      remoteCommit: compatibility.remoteCommit,
+      missing: compatibility.missing,
+      message: options.message,
+      sourceEntries,
+    });
     let pushed = false;
     try {
       pushed =
-        spawnGit(["push", options.remote, `HEAD:${options.branch}`], {
-          allowFailure: true,
-        }).status === 0;
+        spawnGit(
+          [
+            "push",
+            `--force-with-lease=refs/heads/${options.branch}:${compatibility.remoteCommit}`,
+            options.remote,
+            `${expectedCommit}:refs/heads/${options.branch}`,
+          ],
+          {
+            allowFailure: true,
+          },
+        ).status === 0;
     } catch (error) {
       if (!isGitTimeoutError(error)) throw error;
       console.log(
@@ -501,23 +528,6 @@ function convergeImmutablePublish(options: {
     ) {
       verifyRemoteImmutablePaths(expectedCommit, options.remote, options.branch, options.paths);
       return "committed";
-    }
-
-    const rebuild = rebuildImmutablePublishCommit({
-      remote: options.remote,
-      branch: options.branch,
-      paths: options.paths,
-      message: options.message,
-      sourceCommit: options.sourceCommit,
-    });
-    if (rebuild === "unchanged") {
-      verifyRemoteImmutablePaths(
-        options.sourceCommit,
-        options.remote,
-        options.branch,
-        options.paths,
-      );
-      return "unchanged";
     }
     if (attempt === options.maxAttempts) break;
     const waitMs = immutablePublishRetryWaitMs(attempt);
@@ -550,31 +560,39 @@ function verifyRemoteImmutablePaths(
   adoptVerifiedRemoteHead(remote, branch);
 }
 
-function rebuildImmutablePublishCommit(options: {
-  remote: string;
-  branch: string;
-  paths: readonly string[];
+function buildImmutablePublishCommit(options: {
+  remoteCommit: string;
+  missing: readonly string[];
   message: string;
-  sourceCommit: string;
-}): PublishResult {
-  const compatibility = immutableRemoteCompatibility(options);
-  const remoteCommit = compatibility.remoteCommit;
-  const missing = compatibility.missing;
-
-  runGit(["reset", "--hard", remoteCommit]);
-  if (missing.length === 0) {
-    console.log("Immutable action ledger paths are already published");
-    return "unchanged";
+  sourceEntries: ReadonlyMap<string, GitTreeEntry>;
+}): string {
+  const indexRoot = mkdtempSync(join(tmpdir(), "clawsweeper-immutable-index-"));
+  const indexFile = join(indexRoot, "index");
+  const env = { GIT_INDEX_FILE: indexFile };
+  try {
+    runGit(["read-tree", options.remoteCommit], { env });
+    const indexInfo = options.missing
+      .map((path) => {
+        const entry = options.sourceEntries.get(path);
+        if (!entry || entry.type !== "blob") {
+          throw new Error(`Immutable action ledger source path is missing: ${path}`);
+        }
+        return `${entry.mode} ${entry.oid}\t${path}\0`;
+      })
+      .join("");
+    runGit(["update-index", "-z", "--index-info"], {
+      env,
+      input: indexInfo,
+    });
+    const tree = runGit(["write-tree"], { env, quiet: true }).trim();
+    return runGit(["commit-tree", tree, "-p", options.remoteCommit, "-F", "-"], {
+      env,
+      input: `${options.message.trimEnd()}\n`,
+      quiet: true,
+    }).trim();
+  } finally {
+    rmSync(indexRoot, { force: true, recursive: true });
   }
-  for (const batch of chunked(missing, GIT_PATHSPEC_BATCH_SIZE)) {
-    runGit(["checkout", options.sourceCommit, "--", ...batch]);
-  }
-  stagePaths(missing);
-  if (!hasStagedChanges()) {
-    throw new Error("Immutable action ledger rebuild produced no candidate changes");
-  }
-  runGit(["commit", "-m", options.message]);
-  return "committed";
 }
 
 function immutableRemoteCompatibility(options: {
@@ -582,14 +600,15 @@ function immutableRemoteCompatibility(options: {
   branch: string;
   paths: readonly string[];
   sourceCommit: string;
+  sourceEntries?: ReadonlyMap<string, GitTreeEntry>;
 }): { remoteCommit: string; missing: string[] } {
   runGit(["fetch", options.remote, options.branch]);
   const remoteCommit = runGit(["rev-parse", `${options.remote}/${options.branch}`], {
     quiet: true,
   }).trim();
-  const sourceObjects = gitObjectOids(
-    options.paths.map((path) => ({ commit: options.sourceCommit, path })),
-  );
+  const sourceObjects = options.sourceEntries
+    ? null
+    : gitObjectOids(options.paths.map((path) => ({ commit: options.sourceCommit, path })));
   const remoteObjects = gitObjectOids(
     options.paths.map((path) => ({ commit: remoteCommit, path })),
   );
@@ -598,7 +617,7 @@ function immutableRemoteCompatibility(options: {
   for (const path of options.paths) {
     const sourceSpec = gitObjectSpec(options.sourceCommit, path);
     const remoteSpec = gitObjectSpec(remoteCommit, path);
-    const sourceOid = sourceObjects.get(sourceSpec);
+    const sourceOid = options.sourceEntries?.get(path)?.oid ?? sourceObjects?.get(sourceSpec);
     if (!sourceOid) {
       throw new Error(`Immutable action ledger source path is missing: ${path}`);
     }
@@ -633,6 +652,30 @@ function immutableRemoteCompatibility(options: {
     }
   }
   return { remoteCommit, missing };
+}
+
+function gitTreeEntries(commit: string, paths: readonly string[]): Map<string, GitTreeEntry> {
+  const entries = new Map<string, GitTreeEntry>();
+  for (const batch of chunked(uniqueNonEmpty(paths), GIT_PATHSPEC_BATCH_SIZE)) {
+    const output = runGit(["ls-tree", "-z", commit, "--", ...batch], { quiet: true });
+    for (const record of output.split("\0").filter(Boolean)) {
+      const separator = record.indexOf("\t");
+      const metadata = separator >= 0 ? record.slice(0, separator) : "";
+      const path = separator >= 0 ? record.slice(separator + 1) : "";
+      const [mode, type, oid] = metadata.split(" ");
+      if (!mode || !type || !oid || !path) {
+        throw new Error(`Failed to inspect immutable action ledger source tree at ${commit}`);
+      }
+      entries.set(path, { mode, oid, type });
+    }
+  }
+  for (const path of uniqueNonEmpty(paths)) {
+    const entry = entries.get(path);
+    if (!entry || entry.type !== "blob") {
+      throw new Error(`Immutable action ledger source path is missing: ${path}`);
+    }
+  }
+  return entries;
 }
 
 function waitForExclusiveStatePublishLeaseGap(
