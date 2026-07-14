@@ -609,6 +609,9 @@ function parseWorkflowStep(lines, firstEntry) {
       block = "with";
     } else if (key === "run" && /^[|>][+-]?$/.test(rawValue)) {
       block = "run";
+    } else if (/^[|>][+-]?$/.test(rawValue)) {
+      fields.set(key, rawValue);
+      block = "field";
     } else {
       fields.set(key, parseYamlScalar(rawValue));
     }
@@ -656,6 +659,9 @@ function parseWorkflowStep(lines, firstEntry) {
     }
     if (block === "run" && line.startsWith("          ")) {
       run.push(line.slice(10));
+      continue;
+    }
+    if (block === "field" && line.startsWith("          ")) {
       continue;
     }
     throw new Error(`crawl-remote deploy workflow has invalid step syntax: ${line.trim()}`);

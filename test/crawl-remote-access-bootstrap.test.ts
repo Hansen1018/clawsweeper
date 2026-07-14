@@ -237,6 +237,20 @@ test("deploy consumer gate rejects comment-only claims and accepts a structural 
     '          test -n "$CF_ACCESS_CLIENT_SECRET"',
   ].join("\n");
   assert.doesNotThrow(() => assertCrawlRemoteDeployConsumerContract(validSource));
+  assert.doesNotThrow(() =>
+    assertCrawlRemoteDeployConsumerContract(
+      validSource.replace(
+        "      - name: Validate protected production proof credentials\n        env:",
+        [
+          "      - name: Validate protected production proof credentials",
+          "        if: >-",
+          "          github.event_name == 'workflow_dispatch' &&",
+          "          github.run_attempt == 1",
+          "        env:",
+        ].join("\n"),
+      ),
+    ),
+  );
   assert.throws(
     () =>
       assertCrawlRemoteDeployConsumerContract(
