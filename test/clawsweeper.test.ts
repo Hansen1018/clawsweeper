@@ -2692,7 +2692,7 @@ test("sweep failed-review retry lane defaults to dry-run exact-item dispatch", (
   assert.ok(uploadIndex > publishIndex);
   assert.match(
     retryBlock.slice(publishIndex, uploadIndex),
-    /if: \$\{\{ always\(\) && vars\.CLAWSWEEPER_FAILED_REVIEW_RETRY_ENABLED == '1' && hashFiles\('results\/failed-review-retries\/openclaw-openclaw\/\*\.json'\) != '' \}\}/,
+    /if: \$\{\{ always\(\) && steps\.failed-review-action-ledger\.outcome == 'success' && vars\.CLAWSWEEPER_FAILED_REVIEW_RETRY_ENABLED == '1' && hashFiles\('results\/failed-review-retries\/openclaw-openclaw\/\*\.json'\) != '' \}\}/,
   );
   assert.match(
     retryBlock.slice(uploadIndex, retryBlock.indexOf("\n\n", uploadIndex)),
