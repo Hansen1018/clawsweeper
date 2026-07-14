@@ -177,19 +177,10 @@ function trustedRepairReviewActivityCursor(
     if (!isAuthorizedReviewVerdict(options.authorization, verdict)) return null;
     const attributes = markerAttributes(marker[2] ?? "");
     const reviewedAt = timestamp(attributes.reviewed_at);
-    const reviewedUpdatedAt = timestamp(attributes.updated_at);
-    const expectedUpdatedAtMs = timestamp(expectedUpdatedAt);
-    const trustedCommentUpdatedAt = stringValue(comment.updated_at ?? comment.created_at);
-    const updatedAtMatches =
-      attributes.updated_at === expectedUpdatedAt ||
-      (reviewedUpdatedAt !== null &&
-        expectedUpdatedAtMs !== null &&
-        reviewedUpdatedAt < expectedUpdatedAtMs &&
-        trustedCommentUpdatedAt === expectedUpdatedAt);
     if (
       attributes.item !== String(options.number) ||
       attributes.sha !== expectedHeadSha ||
-      !updatedAtMatches ||
+      attributes.updated_at !== expectedUpdatedAt ||
       reviewedAt === null ||
       !isReviewedPrActivityCursor(attributes.review_activity_cursor)
     ) {

@@ -574,27 +574,19 @@ test("repair review baselines accept only trusted exact-head post-repair verdict
   const reviewedCursor = `v2:2:${"c".repeat(64)}`;
   const laterCursor = `v2:3:${"d".repeat(64)}`;
   const expectedHeadSha = "a".repeat(40);
-  const reviewedUpdatedAt = "2026-07-14T10:00:00Z";
-  const commentCreatedAt = "2026-07-14T10:01:00Z";
-  const liveUpdatedAt = "2026-07-14T10:02:00Z";
+  const expectedUpdatedAt = "2026-07-14T10:00:00Z";
   const comments = [
     {
       user: { login: "contributor" },
-      created_at: commentCreatedAt,
-      updated_at: liveUpdatedAt,
-      body: `<!-- clawsweeper-verdict:pass item=123 sha=${expectedHeadSha} updated_at=${reviewedUpdatedAt} reviewed_at=2020-01-01T00:00:00Z review_activity_cursor=${reviewedCursor} -->`,
+      body: `<!-- clawsweeper-verdict:pass item=123 sha=${expectedHeadSha} updated_at=${expectedUpdatedAt} reviewed_at=2020-01-01T00:00:00Z review_activity_cursor=${reviewedCursor} -->`,
     },
     {
       user: { login: "openclaw-clawsweeper[bot]" },
-      created_at: commentCreatedAt,
-      updated_at: liveUpdatedAt,
-      body: `<!-- clawsweeper-verdict:pass item=123 sha=${expectedHeadSha} updated_at=${reviewedUpdatedAt} reviewed_at=2020-01-01T00:01:00Z review_activity_cursor=${reviewedCursor} -->`,
+      body: `<!-- clawsweeper-verdict:pass item=123 sha=${expectedHeadSha} updated_at=${expectedUpdatedAt} reviewed_at=2020-01-01T00:01:00Z review_activity_cursor=${reviewedCursor} -->`,
     },
     {
       user: { login: "openclaw-clawsweeper[bot]" },
-      created_at: commentCreatedAt,
-      updated_at: liveUpdatedAt,
-      body: `<!-- clawsweeper-verdict:pass item=123 sha=${expectedHeadSha} updated_at=${reviewedUpdatedAt} reviewed_at=2026-07-14T10:03:00Z review_activity_cursor=${laterCursor} -->`,
+      body: `<!-- clawsweeper-verdict:pass item=123 sha=${expectedHeadSha} updated_at=${expectedUpdatedAt} reviewed_at=2026-07-14T10:03:00Z review_activity_cursor=${laterCursor} -->`,
     },
   ];
 
@@ -604,7 +596,7 @@ test("repair review baselines accept only trusted exact-head post-repair verdict
       number: 123,
       targetKind: "pull_request",
       authorization: "merge",
-      expectedUpdatedAt: liveUpdatedAt,
+      expectedUpdatedAt,
       expectedHeadSha,
       reviewedBefore: "2026-07-14T10:02:00Z",
       readIssueComments: () => comments,
@@ -617,7 +609,7 @@ test("repair review baselines accept only trusted exact-head post-repair verdict
       number: 123,
       targetKind: "pull_request",
       authorization: "merge",
-      expectedUpdatedAt: liveUpdatedAt,
+      expectedUpdatedAt,
       expectedHeadSha: "d".repeat(40),
       reviewedBefore: "2026-07-14T10:02:00Z",
       readIssueComments: () => comments,
@@ -630,13 +622,99 @@ test("repair review baselines accept only trusted exact-head post-repair verdict
       number: 123,
       targetKind: "pull_request",
       authorization: "merge",
-      expectedUpdatedAt: "2026-07-14T10:02:01Z",
+      expectedUpdatedAt: "2026-07-14T10:00:01Z",
       expectedHeadSha,
       reviewedBefore: "2026-07-14T10:02:00Z",
       readIssueComments: () => comments,
     }),
     null,
   );
+});
+
+test("repair review baselines fail closed when a bot edit masks unrelated target activity", () => {
+  const reviewedCursor = `v2:2:${"c".repeat(64)}`;
+  const expectedHeadSha = "a".repeat(40);
+  const reviewedUpdatedAt = "2026-07-14T10:00:00Z";
+  const unrelatedChangedAt = "2026-07-14T10:01:00Z";
+  const liveUpdatedAt = "2026-07-14T10:02:00Z";
+
+  assert.equal(
+    resolveRepairMutationReviewActivityCursor({
+      repository: "openclaw/openclaw",
+      number: 123,
+      targetKind: "pull_request",
+      authorization: "merge",
+      expectedUpdatedAt: liveUpdatedAt,
+      expectedHeadSha,
+      reviewedBefore: "2026-07-14T10:03:00Z",
+      readIssueComments: () => [
+        {
+          user: { login: "contributor" },
+          created_at: unrelatedChangedAt,
+          updated_at: unrelatedChangedAt,
+          body: "unrelated target activity after review",
+        },
+        {
+          user: { login: "openclaw-clawsweeper[bot]" },
+          created_at: "2026-07-14T09:59:00Z",
+          updated_at: liveUpdatedAt,
+          body: `<!-- clawsweeper-verdict:pass item=123 sha=${expectedHeadSha} updated_at=${reviewedUpdatedAt} reviewed_at=2026-07-14T10:00:30Z review_activity_cursor=${reviewedCursor} -->`,
+        },
+      ],
+    }),
+    null,
+  );
+});
+
+test("repair review baselines use explicit authorization after owned verdict comment drift", () => {
+  const reviewedCursor = `v2:2:${"c".repeat(64)}`;
+  const expectedHeadSha = "a".repeat(40);
+  const reviewedUpdatedAt = "2026-07-14T10:00:00Z";
+  const commentCreatedAt = "2026-07-14T10:01:00Z";
+  const liveUpdatedAt = "2026-07-14T10:02:00Z";
+  const comments = [
+    {
+      user: { login: "openclaw-clawsweeper[bot]" },
+      created_at: commentCreatedAt,
+      updated_at: liveUpdatedAt,
+      body: `<!-- clawsweeper-verdict:pass item=123 sha=${expectedHeadSha} updated_at=${reviewedUpdatedAt} reviewed_at=2026-07-14T10:00:30Z review_activity_cursor=${reviewedCursor} -->`,
+    },
+  ];
+
+  assert.equal(
+    resolveRepairMutationReviewActivityCursor({
+      repository: "openclaw/openclaw",
+      number: 123,
+      targetKind: "pull_request",
+      authorization: "merge",
+      expectedUpdatedAt: liveUpdatedAt,
+      expectedHeadSha,
+      reviewedBefore: "2026-07-14T10:03:00Z",
+      readIssueComments: () => comments,
+    }),
+    null,
+  );
+
+  let fallbackReads = 0;
+  assert.equal(
+    resolveRepairMutationReviewActivityCursor({
+      repository: "openclaw/openclaw",
+      number: 123,
+      targetKind: "pull_request",
+      authorization: "merge",
+      explicitCursor: reviewedCursor,
+      explicitVerdict: "pass",
+      expectedUpdatedAt: liveUpdatedAt,
+      expectedHeadSha,
+      reviewedBefore: "2026-07-14T10:03:00Z",
+      readIssueComments: () => {
+        fallbackReads += 1;
+        return comments;
+      },
+    }),
+    reviewedCursor,
+  );
+  assert.equal(fallbackReads, 0);
 });
 
 test("repair review baselines require action-specific authorization", () => {
@@ -850,7 +928,8 @@ test("repair executors route authoritative GitHub writes through the mutation bo
   assert.match(reviewBaselineSource, /item_updated_at/);
   assert.match(reviewBaselineSource, /reviewedAt > options\.reviewedBefore/);
   assert.match(reviewBaselineSource, /candidate\.reviewedAt <= reviewedBefore/);
-  assert.match(reviewBaselineSource, /trustedCommentUpdatedAt === expectedUpdatedAt/);
+  assert.match(reviewBaselineSource, /attributes\.updated_at !== expectedUpdatedAt/);
+  assert.doesNotMatch(reviewBaselineSource, /trustedCommentUpdatedAt/);
   assert.match(reviewBaselineSource, /AUTHORIZED_REVIEW_VERDICTS/);
   assert.doesNotMatch(reviewBaselineSource, /needs-changes|needs-human/);
   assert.match(applySource, /authorization: "merge"/);
