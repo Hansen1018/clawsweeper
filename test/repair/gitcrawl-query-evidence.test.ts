@@ -130,6 +130,24 @@ test("query evidence fails closed on source, relation, review, and packet drift"
     await adapter.close();
   });
 
+  await t.test("source initialization surfaces cleanup failures", async () => {
+    const source = new FixtureSource({
+      closeError: new Error("fixture close failed"),
+    });
+    await assert.rejects(
+      GitcrawlEvidenceAdapter.fromSources({
+        repository,
+        provider: "cloud",
+        primarySource: source,
+        expectedSnapshotId: "d".repeat(64),
+        now: () => now,
+      }),
+      (error: unknown) =>
+        error instanceof AggregateError &&
+        error.errors.some((entry) => String(entry).includes("fixture close failed")),
+    );
+  });
+
   await t.test("cluster members escape the requested cluster", async () => {
     const adapter = await adapterFor({
       "gitcrawl.clusters.members": [memberRow({ cluster_id: 8 })],
@@ -138,6 +156,14 @@ test("query evidence fails closed on source, relation, review, and packet drift"
       adapter.clusterMembers(7),
       /cluster 7 returned a member from another cluster/,
     );
+    await adapter.close();
+  });
+
+  await t.test("cluster members belong to a non-active cluster", async () => {
+    const adapter = await adapterFor({
+      "gitcrawl.clusters.members": [memberRow({ cluster_status: "closed" })],
+    });
+    await assert.rejects(adapter.clusterMembers(7), /returned a non-active cluster/);
     await adapter.close();
   });
 
@@ -555,6 +581,15 @@ test("query evidence fails closed on source, relation, review, and packet drift"
     await threads.close();
   });
 
+  await t.test("non-active cluster scopes are not certified", async () => {
+    const adapter = await adapterFor({ "gitcrawl.clusters.list": [clusterRow()] });
+    await assert.rejects(
+      adapter.listClusters({ status: "all" }),
+      /certifies only active cluster queries/,
+    );
+    await adapter.close();
+  });
+
   await t.test("thread kind is unknown", async () => {
     const adapter = await adapterFor({
       "gitcrawl.clusters.related": [
@@ -853,6 +888,117 @@ test("local coverage rejects active clusters without valid memberships", async (
   }
 });
 
+test("local cluster coverage requires the latest successful run", async (t) => {
+  for (const scenario of ["missing", "stale"] as const) {
+    await t.test(scenario, async () => {
+      const directory = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-query-run-"));
+      const dbPath = path.join(directory, "gitcrawl.db");
+      seedLocalDatabase(dbPath);
+      const db = new DatabaseSync(dbPath);
+      if (scenario === "missing") {
+        db.exec("delete from cluster_runs");
+      } else {
+        db.prepare("insert into cluster_runs values (?, ?, ?, ?, ?, ?, ?)").run(
+          2,
+          1,
+          "open",
+          "success",
+          generatedAt,
+          generatedAt,
+          "{}",
+        );
+      }
+      db.close();
+      const source = await LocalGitcrawlQuerySource.open({
+        dbPath,
+        repository,
+        allowLegacy: false,
+      });
+      const adapter = await GitcrawlEvidenceAdapter.fromSources({
+        repository,
+        provider: "local",
+        primarySource: source,
+        now: () => now,
+      });
+      try {
+        await assert.rejects(adapter.listClusters(), /cluster_groups coverage is incomplete/);
+      } finally {
+        await adapter.close();
+        fs.rmSync(directory, { force: true, recursive: true });
+      }
+    });
+  }
+});
+
+test("local evidence follows accepted observation order at equal timestamps", async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-query-observation-"));
+  const dbPath = path.join(directory, "gitcrawl.db");
+  seedLocalDatabase(dbPath);
+  const db = new DatabaseSync(dbPath);
+  db.exec(`
+    update threads
+    set observation_sequence = 2,
+        evidence_observation_sequence = 2
+    where id = 42
+  `);
+  db.close();
+  const source = await LocalGitcrawlQuerySource.open({
+    dbPath,
+    repository,
+    allowLegacy: false,
+  });
+  const adapter = await GitcrawlEvidenceAdapter.fromSources({
+    repository,
+    provider: "local",
+    primarySource: source,
+    now: () => now,
+  });
+  try {
+    const thread = (await adapter.searchOpenPullRequests()).rows[0]!;
+    assert.deepEqual(thread.sourceRevision, { updated_at: generatedAt });
+    assert.equal(thread.threadFingerprint, undefined);
+    assert.equal(thread.keySummary, "");
+    await assert.rejects(adapter.reviewContext(42), /pull_request_details coverage is incomplete/);
+  } finally {
+    await adapter.close();
+    fs.rmSync(directory, { force: true, recursive: true });
+  }
+});
+
+test("local PR file coverage requires its own current child reservation", async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-query-files-"));
+  const dbPath = path.join(directory, "gitcrawl.db");
+  seedLocalDatabase(dbPath);
+  const db = new DatabaseSync(dbPath);
+  db.exec(`
+    update threads
+    set observation_sequence = 2,
+        evidence_observation_sequence = 2
+    where id = 42;
+    update thread_child_observation_reservations
+    set observation_sequence = 2
+    where thread_id = 42 and family = 'pull_request_details';
+  `);
+  db.close();
+  const source = await LocalGitcrawlQuerySource.open({
+    dbPath,
+    repository,
+    allowLegacy: false,
+  });
+  const adapter = await GitcrawlEvidenceAdapter.fromSources({
+    repository,
+    provider: "local",
+    primarySource: source,
+    now: () => now,
+  });
+  try {
+    await assert.rejects(adapter.reviewContext(42), /pull_request_files coverage is incomplete/);
+  } finally {
+    await adapter.close();
+    fs.rmSync(directory, { force: true, recursive: true });
+  }
+});
+
 test("local related query ignores memberships in closed clusters", async () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-query-closed-related-"));
   const dbPath = path.join(directory, "gitcrawl.db");
@@ -987,6 +1133,7 @@ class FixtureSource implements GitcrawlQuerySource {
   private readonly rows: Partial<Record<GitcrawlQueryRequest["name"], Record<string, unknown>[]>>;
   private readonly snapshotForQuery: (request: GitcrawlQueryRequest) => string;
   private readonly overlapSecondPageFor: GitcrawlQueryRequest["name"] | undefined;
+  private readonly closeError: Error | undefined;
 
   constructor(
     options: {
@@ -994,12 +1141,14 @@ class FixtureSource implements GitcrawlQuerySource {
       rows?: Partial<Record<GitcrawlQueryRequest["name"], Record<string, unknown>[]>>;
       snapshotForQuery?: (request: GitcrawlQueryRequest) => string;
       overlapSecondPageFor?: GitcrawlQueryRequest["name"];
+      closeError?: Error;
     } = {},
   ) {
     this.provider = options.provider ?? "cloud";
     this.rows = options.rows ?? {};
     this.snapshotForQuery = options.snapshotForQuery ?? (() => snapshotId);
     this.overlapSecondPageFor = options.overlapSecondPageFor;
+    this.closeError = options.closeError;
   }
 
   async query(request: GitcrawlQueryRequest): Promise<GitcrawlQueryEnvelope> {
@@ -1033,6 +1182,7 @@ class FixtureSource implements GitcrawlQuerySource {
 
   async close(): Promise<void> {
     this.closeCount += 1;
+    if (this.closeError !== undefined) throw this.closeError;
   }
 }
 
@@ -1243,6 +1393,9 @@ function seedLocalDatabase(dbPath: string): void {
       closed_at_gh text not null,
       merged_at_gh text not null,
       last_pulled_at text not null,
+      observation_sequence integer not null,
+      evidence_observation_sequence integer not null,
+      evidence_source_updated_at text not null,
       updated_at text not null
     );
     create table thread_revisions (
@@ -1250,6 +1403,7 @@ function seedLocalDatabase(dbPath: string): void {
       thread_id integer not null,
       source_updated_at text not null,
       content_hash text not null,
+      observation_sequence integer not null,
       created_at text not null
     );
     create table thread_fingerprints (
@@ -1286,6 +1440,8 @@ function seedLocalDatabase(dbPath: string): void {
       role text not null,
       state text not null,
       score_to_representative real,
+      first_seen_run_id integer,
+      last_seen_run_id integer,
       created_at text not null,
       updated_at text not null
     );
@@ -1322,6 +1478,22 @@ function seedLocalDatabase(dbPath: string): void {
       finished_at text not null,
       stats_json text not null
     );
+    create table cluster_runs (
+      id integer primary key,
+      repo_id integer not null,
+      scope text not null,
+      status text not null,
+      started_at text not null,
+      finished_at text not null,
+      stats_json text not null
+    );
+    create table thread_child_observation_reservations (
+      thread_id integer not null,
+      family text not null,
+      source_updated_at text not null,
+      observation_sequence integer not null,
+      primary key (thread_id, family)
+    );
     create table portable_metadata (key text primary key, value text not null);
   `);
   db.prepare("insert into repositories values (?, ?, ?, ?)").run(
@@ -1334,8 +1506,9 @@ function seedLocalDatabase(dbPath: string): void {
     `insert into threads(
        id, repo_id, number, kind, state, title, body, author_login, author_type,
        author_association, html_url, labels_json, assignees_json, is_draft,
-       created_at_gh, updated_at_gh, closed_at_gh, merged_at_gh, last_pulled_at, updated_at
-     ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       created_at_gh, updated_at_gh, closed_at_gh, merged_at_gh, last_pulled_at,
+       observation_sequence, evidence_observation_sequence, evidence_source_updated_at, updated_at
+     ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     42,
     1,
@@ -1356,13 +1529,17 @@ function seedLocalDatabase(dbPath: string): void {
     "",
     "",
     generatedAt,
+    1,
+    1,
+    generatedAt,
     generatedAt,
   );
-  db.prepare("insert into thread_revisions values (?, ?, ?, ?, ?)").run(
+  db.prepare("insert into thread_revisions values (?, ?, ?, ?, ?, ?)").run(
     9,
     42,
     generatedAt,
     revision,
+    1,
     generatedAt,
   );
   db.prepare("insert into thread_fingerprints values (?, ?, ?, ?, ?, ?)").run(
@@ -1393,11 +1570,13 @@ function seedLocalDatabase(dbPath: string): void {
     "",
     1,
   );
-  db.prepare("insert into cluster_memberships values (?, ?, ?, ?, ?, ?, ?)").run(
+  db.prepare("insert into cluster_memberships values (?, ?, ?, ?, ?, ?, ?, ?, ?)").run(
     7,
     42,
     "representative",
     "active",
+    1,
+    1,
     1,
     generatedAt,
     generatedAt,
@@ -1427,6 +1606,27 @@ function seedLocalDatabase(dbPath: string): void {
     generatedAt,
   );
   db.prepare("insert into portable_metadata values ('exported_at', ?)").run(generatedAt);
+  db.prepare("insert into cluster_runs values (?, ?, ?, ?, ?, ?, ?)").run(
+    1,
+    1,
+    "open",
+    "success",
+    generatedAt,
+    generatedAt,
+    "{}",
+  );
+  db.prepare("insert into thread_child_observation_reservations values (?, ?, ?, ?)").run(
+    42,
+    "pull_request_details",
+    generatedAt,
+    1,
+  );
+  db.prepare("insert into thread_child_observation_reservations values (?, ?, ?, ?)").run(
+    42,
+    "pull_request_files",
+    generatedAt,
+    1,
+  );
   db.prepare("insert into sync_runs values (?, ?, ?, ?, ?, ?, ?)").run(
     1,
     1,
@@ -1453,12 +1653,13 @@ function seedDuplicateRelatedMemberships(dbPath: string): void {
            author_login, author_type, author_association,
            'https://github.com/openclaw/openclaw/issues/43',
            labels_json, assignees_json, is_draft, created_at_gh, updated_at_gh,
-           closed_at_gh, merged_at_gh, last_pulled_at, updated_at
+           closed_at_gh, merged_at_gh, last_pulled_at, observation_sequence,
+           evidence_observation_sequence, evidence_source_updated_at, updated_at
     from threads where id = 42;
 
     update cluster_groups set member_count = 2 where id = 7;
     insert into cluster_memberships
-    values (7, 43, 'member', 'active', 0.8, '${generatedAt}', '${generatedAt}');
+    values (7, 43, 'member', 'active', 0.8, 1, 1, '${generatedAt}', '${generatedAt}');
 
     insert into cluster_groups
     values (
@@ -1466,9 +1667,9 @@ function seedDuplicateRelatedMemberships(dbPath: string): void {
       'Second provider cluster', '${generatedAt}', '${generatedAt}', '', 2
     );
     insert into cluster_memberships
-    values (8, 42, 'representative', 'active', 1, '${generatedAt}', '${generatedAt}');
+    values (8, 42, 'representative', 'active', 1, 1, 1, '${generatedAt}', '${generatedAt}');
     insert into cluster_memberships
-    values (8, 43, 'member', 'active', 0.7, '${generatedAt}', '${generatedAt}');
+    values (8, 43, 'member', 'active', 0.7, 1, 1, '${generatedAt}', '${generatedAt}');
   `);
   db.close();
 }
@@ -1477,11 +1678,12 @@ function seedClosedRelatedMembership(dbPath: string): void {
   const db = new DatabaseSync(dbPath);
   db.exec(`
     insert into threads
-    select 43, repo_id, 43, 'issue', state, 'Related provider issue', body,
+    select 43, repo_id, 43, 'issue', 'closed', 'Related provider issue', body,
            author_login, author_type, author_association,
            'https://github.com/openclaw/openclaw/issues/43',
            labels_json, assignees_json, is_draft, created_at_gh, updated_at_gh,
-           closed_at_gh, merged_at_gh, last_pulled_at, updated_at
+           closed_at_gh, merged_at_gh, last_pulled_at, observation_sequence,
+           evidence_observation_sequence, evidence_source_updated_at, updated_at
     from threads where id = 42;
 
     insert into cluster_groups
@@ -1490,9 +1692,9 @@ function seedClosedRelatedMembership(dbPath: string): void {
       'Closed provider cluster', '${generatedAt}', '${generatedAt}', '${generatedAt}', 2
     );
     insert into cluster_memberships
-    values (8, 42, 'representative', 'active', 1, '${generatedAt}', '${generatedAt}');
+    values (8, 42, 'representative', 'active', 1, 1, 1, '${generatedAt}', '${generatedAt}');
     insert into cluster_memberships
-    values (8, 43, 'member', 'active', 0.7, '${generatedAt}', '${generatedAt}');
+    values (8, 43, 'member', 'active', 0.7, 1, 1, '${generatedAt}', '${generatedAt}');
   `);
   db.close();
 }

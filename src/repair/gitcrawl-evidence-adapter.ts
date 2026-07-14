@@ -321,7 +321,21 @@ export class GitcrawlEvidenceAdapter {
         maxPages,
       });
     } catch (error) {
-      await Promise.allSettled([options.primarySource.close(), options.paritySource?.close()]);
+      const cleanup = await Promise.allSettled(
+        [options.primarySource, options.paritySource]
+          .filter((source): source is GitcrawlQuerySource => source !== undefined)
+          .map((source) => source.close()),
+      );
+      const cleanupErrors = cleanup.flatMap((result) =>
+        result.status === "rejected" ? [result.reason] : [],
+      );
+      if (cleanupErrors.length > 0) {
+        throw new AggregateError(
+          [error, ...cleanupErrors],
+          "failed to initialize and clean up Gitcrawl evidence sources",
+          { cause: error },
+        );
+      }
       throw error;
     }
   }
@@ -444,6 +458,9 @@ export class GitcrawlEvidenceAdapter {
         throw new Error(
           `Gitcrawl cluster ${clusterId} returned member #${row.number} with non-active membership`,
         );
+      }
+      if (row.clusterStatus !== "active") {
+        throw new Error(`Gitcrawl cluster ${clusterId} returned a non-active cluster`);
       }
     }
     const declaredCounts = new Set(
@@ -1144,6 +1161,9 @@ function clusterListQueryArgs(
   const status = boundedString(requestedStatus, 64);
   if (!status || status !== requestedStatus) {
     throw new Error("Gitcrawl cluster status must be a canonical bounded value");
+  }
+  if (status !== "active") {
+    throw new Error("Gitcrawl evidence currently certifies only active cluster queries");
   }
   return {
     ...ownerRepo(repository),

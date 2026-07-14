@@ -3,7 +3,7 @@ import fs, { createReadStream } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { DatabaseSync, type SQLOutputValue } from "node:sqlite";
+import { DatabaseSync, type SQLInputValue, type SQLOutputValue } from "node:sqlite";
 import {
   GITCRAWL_QUERY_COVERAGE,
   GITCRAWL_QUERY_CONTRACT_VERSION,
@@ -14,6 +14,7 @@ import {
   type GitcrawlQueryRequest,
   type GitcrawlQuerySource,
   gitcrawlQueryDigest,
+  parseRfc3339Timestamp,
 } from "./gitcrawl-evidence-contract.js";
 
 export type LocalGitcrawlQuerySourceOptions = {
@@ -58,6 +59,11 @@ export class LocalGitcrawlQuerySource implements GitcrawlQuerySource {
     this.portable = input.portable;
     this.legacy = input.legacy;
     this.sourceSyncAt = input.sourceSyncAt;
+    this.db.function(
+      "clawsweeper_observation_at_or_after",
+      { deterministic: true },
+      observationAtOrAfterSql,
+    );
     this.datasetGeneratedAt = this.resolveDatasetGeneratedAt();
     this.coverage = this.buildCoverage();
   }
@@ -133,13 +139,29 @@ export class LocalGitcrawlQuerySource implements GitcrawlQuerySource {
       snapshotDb = undefined;
       return opened;
     } catch (error) {
+      const cleanupErrors: unknown[] = [];
       try {
         source?.close();
-      } catch {}
+      } catch (cleanupError) {
+        cleanupErrors.push(cleanupError);
+      }
       try {
         snapshotDb?.close();
-      } catch {}
-      await rm(tempDir, { force: true, recursive: true }).catch(() => undefined);
+      } catch (cleanupError) {
+        cleanupErrors.push(cleanupError);
+      }
+      try {
+        await rm(tempDir, { force: true, recursive: true });
+      } catch (cleanupError) {
+        cleanupErrors.push(cleanupError);
+      }
+      if (cleanupErrors.length > 0) {
+        throw new AggregateError(
+          [error, ...cleanupErrors],
+          "failed to open and clean up the local Gitcrawl snapshot",
+          { cause: error },
+        );
+      }
       throw error;
     }
   }
@@ -607,152 +629,162 @@ export class LocalGitcrawlQuerySource implements GitcrawlQuerySource {
       ),
     );
 
+    rows.push(...this.clusterCoverage(generatedAt));
+    rows.push(...this.pullRequestCoverage(generatedAt));
+    return rows;
+  }
+
+  private clusterCoverage(generatedAt: string): GitcrawlCoverageRow[] {
     const clusterTable = this.portable ? "cluster_groups" : "clusters";
     const membershipTable = this.portable ? "cluster_memberships" : "cluster_members";
-    const membershipWhere = this.portable ? "cm.state = 'active'" : "1 = 1";
-    const activeClusterWhere = this.portable ? "c.status = 'active'" : "c.closed_at_local is null";
     const clusterRows = tableExists(this.db, clusterTable)
       ? this.scalarNumber(
           `select count(*) as value from ${clusterTable} where repo_id = ?`,
           this.repoId,
         )
       : 0;
-    const clusterEligible = tableExists(this.db, clusterTable)
-      ? this.scalarNumber(
-          `select count(*) as value
-           from ${clusterTable} c
-           where c.repo_id = ? and ${activeClusterWhere}`,
-          this.repoId,
-        )
-      : 0;
-    const clusterCovered =
-      tableExists(this.db, clusterTable) && tableExists(this.db, membershipTable)
-        ? this.scalarNumber(
-            `select count(*) as value
-             from ${clusterTable} c
-             where c.repo_id = ?
-               and ${activeClusterWhere}
-               and exists (
-                 select 1
-                 from ${membershipTable} cm
-                 join threads t on t.id = cm.thread_id and t.repo_id = c.repo_id
-                 where cm.cluster_id = c.id and ${membershipWhere}
-               )
-               and not exists (
-                 select 1
-                 from ${membershipTable} cm
-                 left join threads t on t.id = cm.thread_id and t.repo_id = c.repo_id
-                 where cm.cluster_id = c.id and ${membershipWhere}
-                   and t.id is null
-               )`,
-            this.repoId,
-          )
-        : 0;
-    rows.push(
-      metric(
-        this.snapshotId,
-        "cluster_groups",
-        clusterRows,
-        clusterEligible,
-        clusterCovered,
-        this.repositoryTableMax(
-          clusterTable,
-          columnExists(this.db, clusterTable, "updated_at") ? "updated_at" : "created_at",
-        ),
-        generatedAt,
-      ),
-    );
     const membershipRows =
-      tableExists(this.db, clusterTable) && tableExists(this.db, membershipTable)
-        ? this.scalarNumber(
-            `select count(*) as value
-           from ${membershipTable} cm
-           join ${clusterTable} c on c.id = cm.cluster_id
-           where c.repo_id = ?`,
-            this.repoId,
-          )
-        : 0;
-    const membershipEligible =
       tableExists(this.db, clusterTable) && tableExists(this.db, membershipTable)
         ? this.scalarNumber(
             `select count(*) as value
              from ${membershipTable} cm
              join ${clusterTable} c on c.id = cm.cluster_id
-             where c.repo_id = ? and ${activeClusterWhere} and ${membershipWhere}`,
+             where c.repo_id = ?`,
             this.repoId,
           )
         : 0;
-    const membershipCovered =
-      tableExists(this.db, clusterTable) && tableExists(this.db, membershipTable)
-        ? this.scalarNumber(
-            `select count(*) as value
-           from ${membershipTable} cm
-           join ${clusterTable} c on c.id = cm.cluster_id
-           join threads t on t.id = cm.thread_id and t.repo_id = c.repo_id
-           where c.repo_id = ? and ${activeClusterWhere} and ${membershipWhere}`,
-            this.repoId,
-          )
-        : 0;
-    rows.push(
+    const maxSourceAt = this.repositoryTableMax(
+      clusterTable,
+      columnExists(this.db, clusterTable, "updated_at") ? "updated_at" : "created_at",
+    );
+    const currentSchema =
+      this.portable &&
+      tableExists(this.db, "cluster_runs") &&
+      columnExists(this.db, "cluster_runs", "finished_at") &&
+      columnExists(this.db, "cluster_memberships", "last_seen_run_id");
+    if (!currentSchema) {
+      return [
+        metric(
+          this.snapshotId,
+          "cluster_groups",
+          clusterRows,
+          0,
+          0,
+          maxSourceAt,
+          generatedAt,
+          false,
+        ),
+        metric(
+          this.snapshotId,
+          "cluster_memberships",
+          membershipRows,
+          0,
+          0,
+          maxSourceAt,
+          generatedAt,
+          false,
+        ),
+      ];
+    }
+
+    const latestRun = this.db
+      .prepare(
+        `select id, finished_at
+         from cluster_runs
+         where repo_id = ? and status in ('success', 'completed') and finished_at is not null
+         order by id desc
+         limit 1`,
+      )
+      .get(this.repoId);
+    const latestRunId = Number(latestRun?.id ?? 0);
+    const latestRunAt = String(latestRun?.finished_at ?? "");
+    const hasLatestRun = Number.isSafeInteger(latestRunId) && latestRunId > 0 && latestRunAt !== "";
+    const groupEligible = this.scalarNumber(
+      "select count(*) as value from cluster_groups where repo_id = ? and status = 'active'",
+      this.repoId,
+    );
+    const groupCovered = hasLatestRun
+      ? this.scalarNumber(
+          `select count(*) as value
+           from cluster_groups c
+           where c.repo_id = ? and c.status = 'active'
+             and exists (
+               select 1
+               from cluster_memberships cm
+               join threads t on t.id = cm.thread_id and t.repo_id = c.repo_id
+               where cm.cluster_id = c.id and cm.state = 'active'
+             )
+             and not exists (
+               select 1
+               from cluster_memberships cm
+               left join threads t on t.id = cm.thread_id and t.repo_id = c.repo_id
+               where cm.cluster_id = c.id and cm.state = 'active'
+                 and (t.id is null or coalesce(cm.last_seen_run_id, 0) != ?)
+             )`,
+          this.repoId,
+          latestRunId,
+        )
+      : 0;
+    const openThreadWhere = columnExists(this.db, "threads", "closed_at_local")
+      ? "t.state = 'open' and t.closed_at_local is null"
+      : "t.state = 'open'";
+    const membershipEligible = this.scalarNumber(
+      `select count(*) as value from threads t where t.repo_id = ? and ${openThreadWhere}`,
+      this.repoId,
+    );
+    const membershipCovered = hasLatestRun
+      ? this.scalarNumber(
+          `select count(*) as value
+           from threads t
+           where t.repo_id = ? and ${openThreadWhere}
+             and exists (
+               select 1
+               from cluster_memberships cm
+               join cluster_groups c on c.id = cm.cluster_id
+               where cm.thread_id = t.id
+                 and cm.state = 'active'
+                 and cm.last_seen_run_id = ?
+                 and c.repo_id = t.repo_id
+                 and c.status = 'active'
+             )`,
+          this.repoId,
+          latestRunId,
+        )
+      : 0;
+    return [
+      metric(
+        this.snapshotId,
+        "cluster_groups",
+        clusterRows,
+        groupEligible,
+        groupCovered,
+        latestRunAt || maxSourceAt,
+        generatedAt,
+        hasLatestRun && groupCovered === groupEligible,
+      ),
       metric(
         this.snapshotId,
         "cluster_memberships",
         membershipRows,
         membershipEligible,
         membershipCovered,
-        this.repositoryTableMax(
-          membershipTable,
-          columnExists(this.db, membershipTable, "updated_at") ? "updated_at" : "created_at",
-        ),
+        latestRunAt || maxSourceAt,
         generatedAt,
+        hasLatestRun && membershipCovered === membershipEligible,
       ),
-    );
+    ];
+  }
 
-    const prEligible = this.scalarNumber(
+  private pullRequestCoverage(generatedAt: string): GitcrawlCoverageRow[] {
+    const eligible = this.scalarNumber(
       "select count(*) as value from threads where repo_id = ? and kind = 'pull_request'",
       this.repoId,
     );
-    const prRows = tableExists(this.db, "pull_request_details")
+    const detailRows = tableExists(this.db, "pull_request_details")
       ? this.scalarNumber(
           `select count(*) as value
-           from pull_request_details pr
-           join threads t on t.id = pr.thread_id
-           where t.repo_id = ?`,
-          this.repoId,
-        )
-      : 0;
-    const prFreshness = this.pullRequestFreshness("pr");
-    const prCovered =
-      tableExists(this.db, "pull_request_details") && prFreshness !== "''"
-        ? this.scalarNumber(
-            `select count(*) as value
-           from pull_request_details pr
-           join threads t on t.id = pr.thread_id
-           where t.repo_id = ?
-             and julianday(${prFreshness})
-                 >= julianday(${this.threadUpdatedAt("t")})`,
-            this.repoId,
-          )
-        : 0;
-    rows.push(
-      metric(
-        this.snapshotId,
-        "pull_request_details",
-        prRows,
-        prEligible,
-        prCovered,
-        this.repositoryTableMax("pull_request_details", "fetched_at"),
-        generatedAt,
-      ),
-    );
-    const hasChangedFiles =
-      tableExists(this.db, "pull_request_details") &&
-      columnExists(this.db, "pull_request_details", "changed_files");
-    const fileEligible = hasChangedFiles
-      ? this.scalarNumber(
-          `select coalesce(sum(pr.changed_files), 0) as value
-           from pull_request_details pr
-           join threads t on t.id = pr.thread_id
+           from pull_request_details detail
+           join threads t on t.id = detail.thread_id
            where t.repo_id = ?`,
           this.repoId,
         )
@@ -760,73 +792,213 @@ export class LocalGitcrawlQuerySource implements GitcrawlQuerySource {
     const fileRows = tableExists(this.db, "pull_request_files")
       ? this.scalarNumber(
           `select count(*) as value
-           from pull_request_files pf
-           join threads t on t.id = pf.thread_id
+           from pull_request_files file
+           join threads t on t.id = file.thread_id
            where t.repo_id = ?`,
           this.repoId,
         )
       : 0;
-    const fileCovered =
-      tableExists(this.db, "pull_request_files") &&
+    const detailSupport =
       tableExists(this.db, "pull_request_details") &&
-      hasChangedFiles &&
+      columnExists(this.db, "pull_request_details", "thread_id") &&
+      columnExists(this.db, "pull_request_details", "fetched_at");
+    const fileSupport =
+      detailSupport &&
+      columnExists(this.db, "pull_request_details", "changed_files") &&
+      tableExists(this.db, "pull_request_files") &&
+      columnExists(this.db, "pull_request_files", "thread_id") &&
       columnExists(this.db, "pull_request_files", "position") &&
-      columnExists(this.db, "pull_request_files", "fetched_at") &&
-      prFreshness !== "''"
-        ? this.scalarNumber(
-            `select coalesce(sum(pr.changed_files), 0) as value
-             from pull_request_details pr
-             join threads t on t.id = pr.thread_id
-             where t.repo_id = ?
-               and (
-                 select count(*)
-                 from pull_request_files pf
-                 where pf.thread_id = pr.thread_id
-               ) = pr.changed_files
-               and (
-                 select count(distinct pf.position)
-                 from pull_request_files pf
-                 where pf.thread_id = pr.thread_id
-               ) = pr.changed_files
-               and (
-                 pr.changed_files = 0 or (
-                   select min(pf.position) = 0 and max(pf.position) = pr.changed_files - 1
-                   from pull_request_files pf
-                   where pf.thread_id = pr.thread_id
-                 )
-               )
-               and julianday(${prFreshness}) is not null
-               and not exists (
-                 select 1
-                 from pull_request_files pf
-                 where pf.thread_id = pr.thread_id
-                   and (
-                     julianday(pf.fetched_at) is null
-                     or julianday(pf.fetched_at)
-                        < julianday(${prFreshness})
-                   )
-               )`,
-            this.repoId,
-          )
-        : 0;
-    const fileCoverage = metric(
-      this.snapshotId,
-      "pull_request_files",
-      fileRows,
-      fileEligible,
-      fileCovered,
-      this.repositoryTableMax("pull_request_files", "fetched_at"),
-      generatedAt,
+      columnExists(this.db, "pull_request_files", "fetched_at");
+    const reservationSupport = this.hasObservationReservations();
+    const observationAware =
+      columnExists(this.db, "threads", "observation_sequence") &&
+      columnExists(this.db, "threads", "evidence_observation_sequence") &&
+      columnExists(this.db, "threads", "evidence_source_updated_at");
+    const detailMaxSourceAt = this.repositoryTableMax("pull_request_details", "fetched_at");
+    const fileMaxSourceAt = this.repositoryTableMax("pull_request_files", "fetched_at");
+    if (!detailSupport || (observationAware && !reservationSupport)) {
+      return [
+        metric(
+          this.snapshotId,
+          "pull_request_details",
+          detailRows,
+          eligible,
+          0,
+          detailMaxSourceAt,
+          generatedAt,
+          false,
+        ),
+        metric(
+          this.snapshotId,
+          "pull_request_files",
+          fileRows,
+          0,
+          0,
+          fileMaxSourceAt,
+          generatedAt,
+          false,
+        ),
+      ];
+    }
+
+    const accepted = this.acceptedThreadObservation("t");
+    const detailReservationJoin = reservationSupport
+      ? `left join thread_child_observation_reservations detail_reservation
+           on detail_reservation.thread_id = t.id
+          and detail_reservation.family = 'pull_request_details'`
+      : "";
+    const detailRecords = this.all(
+      `select case when detail.thread_id is null then 0 else 1 end as has_detail,
+              coalesce(detail.fetched_at, '') as detail_fetched_at,
+              ${accepted.source} as accepted_source_at,
+              ${accepted.sequence} as accepted_sequence,
+              ${
+                reservationSupport
+                  ? "case when detail_reservation.thread_id is null then 0 else 1 end"
+                  : "0"
+              } as has_detail_reservation,
+              ${
+                reservationSupport ? "coalesce(detail_reservation.source_updated_at, '')" : "''"
+              } as detail_reserved_source_at,
+              ${
+                reservationSupport ? "coalesce(detail_reservation.observation_sequence, 0)" : "0"
+              } as detail_reserved_sequence
+       from threads t
+       left join pull_request_details detail on detail.thread_id = t.id
+       ${detailReservationJoin}
+       where t.repo_id = ? and t.kind = 'pull_request'`,
+      this.repoId,
     );
-    fileCoverage.complete =
-      hasChangedFiles &&
-      columnExists(this.db, "pull_request_files", "position") &&
-      columnExists(this.db, "pull_request_files", "fetched_at") &&
-      prFreshness !== "''" &&
-      fileRows === fileEligible &&
-      fileCovered === fileEligible;
-    rows.push(fileCoverage);
-    return rows;
+    let detailCovered = 0;
+    for (const row of detailRecords) {
+      if (Number(row.has_detail) !== 1) continue;
+      const fresh = reservationSupport
+        ? Number(row.has_detail_reservation) === 1 &&
+          observationAtOrAfter(
+            row.detail_reserved_source_at,
+            row.detail_reserved_sequence,
+            row.accepted_source_at,
+            row.accepted_sequence,
+          )
+        : timestampAtOrAfter(row.detail_fetched_at, row.accepted_source_at);
+      if (fresh) detailCovered += 1;
+    }
+    const detailCoverage = metric(
+      this.snapshotId,
+      "pull_request_details",
+      detailRows,
+      eligible,
+      detailCovered,
+      detailMaxSourceAt,
+      generatedAt,
+      detailRecords.length === eligible && detailCovered === eligible,
+    );
+
+    if (!fileSupport) {
+      return [
+        detailCoverage,
+        metric(
+          this.snapshotId,
+          "pull_request_files",
+          fileRows,
+          0,
+          0,
+          fileMaxSourceAt,
+          generatedAt,
+          false,
+        ),
+      ];
+    }
+    const fileReservationJoin = reservationSupport
+      ? `left join thread_child_observation_reservations file_reservation
+           on file_reservation.thread_id = t.id
+          and file_reservation.family = 'pull_request_files'`
+      : "";
+    const fileRecords = this.all(
+      `select case when detail.thread_id is null then 0 else 1 end as has_detail,
+              coalesce(detail.changed_files, 0) as changed_files,
+              coalesce(detail.fetched_at, '') as detail_fetched_at,
+              coalesce(files.file_count, 0) as file_count,
+              coalesce(files.distinct_positions, 0) as distinct_positions,
+              coalesce(files.minimum_position, -1) as minimum_position,
+              coalesce(files.maximum_position, -1) as maximum_position,
+              coalesce(files.oldest_fetched_at, '') as oldest_fetched_at,
+              ${accepted.source} as accepted_source_at,
+              ${accepted.sequence} as accepted_sequence,
+              ${
+                reservationSupport
+                  ? "case when file_reservation.thread_id is null then 0 else 1 end"
+                  : "0"
+              } as has_file_reservation,
+              ${
+                reservationSupport ? "coalesce(file_reservation.source_updated_at, '')" : "''"
+              } as file_reserved_source_at,
+              ${
+                reservationSupport ? "coalesce(file_reservation.observation_sequence, 0)" : "0"
+              } as file_reserved_sequence
+       from threads t
+       left join pull_request_details detail on detail.thread_id = t.id
+       left join (
+         select thread_id,
+                count(*) as file_count,
+                count(distinct position) as distinct_positions,
+                min(position) as minimum_position,
+                max(position) as maximum_position,
+                min(fetched_at) as oldest_fetched_at
+         from pull_request_files
+         group by thread_id
+       ) files on files.thread_id = t.id
+       ${fileReservationJoin}
+       where t.repo_id = ? and t.kind = 'pull_request'`,
+      this.repoId,
+    );
+    let fileEligible = 0;
+    let fileCovered = 0;
+    let freshPullRequests = 0;
+    for (const row of fileRecords) {
+      const changedFiles = Number(row.changed_files);
+      if (Number(row.has_detail) !== 1 || !Number.isSafeInteger(changedFiles) || changedFiles < 0) {
+        continue;
+      }
+      fileEligible += changedFiles;
+      const exactFiles =
+        Number(row.file_count) === changedFiles &&
+        Number(row.distinct_positions) === changedFiles &&
+        (changedFiles === 0 ||
+          (Number(row.minimum_position) === 0 &&
+            Number(row.maximum_position) === changedFiles - 1));
+      const detailFresh = timestampAtOrAfter(row.detail_fetched_at, row.accepted_source_at);
+      const filesFresh =
+        changedFiles === 0 || timestampAtOrAfter(row.oldest_fetched_at, row.accepted_source_at);
+      const reservationFresh =
+        !reservationSupport ||
+        (Number(row.has_file_reservation) === 1 &&
+          observationAtOrAfter(
+            row.file_reserved_source_at,
+            row.file_reserved_sequence,
+            row.accepted_source_at,
+            row.accepted_sequence,
+          ));
+      if (!exactFiles || !detailFresh || !filesFresh || !reservationFresh) continue;
+      freshPullRequests += 1;
+      fileCovered += changedFiles;
+    }
+    return [
+      detailCoverage,
+      metric(
+        this.snapshotId,
+        "pull_request_files",
+        fileRows,
+        fileEligible,
+        fileCovered,
+        fileMaxSourceAt,
+        generatedAt,
+        fileRecords.length === eligible &&
+          freshPullRequests === eligible &&
+          fileRows === fileEligible &&
+          fileCovered === fileEligible,
+      ),
+    ];
   }
 
   private threadChildCoverage(
@@ -840,17 +1012,15 @@ export class LocalGitcrawlQuerySource implements GitcrawlQuerySource {
        where t.repo_id = ? ${condition}`,
       this.repoId,
     );
-    const covered = this.scalarNumber(
-      `select count(*) as value
-       from threads t
-       where t.repo_id = ? and exists (
-         select 1 from ${table} child
-         where child.thread_id = t.id ${condition}
-           and julianday(coalesce(nullif(child.source_updated_at, ''), child.created_at))
-               >= julianday(${this.threadUpdatedAt("t")})
-       )`,
-      this.repoId,
-    );
+    const covered =
+      table === "thread_revisions"
+        ? this.scalarNumber(
+            `select count(*) as value
+             from threads t
+             where t.repo_id = ? and ${this.acceptedRevisionId("t")} is not null`,
+            this.repoId,
+          )
+        : 0;
     return { rows, covered, latest: this.repositoryTableMax(table, "created_at") };
   }
 
@@ -869,16 +1039,14 @@ export class LocalGitcrawlQuerySource implements GitcrawlQuerySource {
        where t.repo_id = ? ${condition}`,
       this.repoId,
     );
+    const acceptedRevision = this.acceptedRevisionId("t");
     const covered = this.scalarNumber(
       `select count(*) as value
        from threads t
        where t.repo_id = ? and exists (
          select 1
-         from thread_revisions revision
-         join ${table} child on child.thread_revision_id = revision.id
-         where revision.thread_id = t.id ${condition}
-           and julianday(coalesce(nullif(revision.source_updated_at, ''), revision.created_at))
-               >= julianday(${this.threadUpdatedAt("t")})
+         from ${table} child
+         where child.thread_revision_id = ${acceptedRevision} ${condition}
        )`,
       this.repoId,
     );
@@ -908,10 +1076,7 @@ export class LocalGitcrawlQuerySource implements GitcrawlQuerySource {
               '' as revision_source_updated_at, '' as key_summary,
               '' as fingerprint_algorithm, '' as fingerprint_hash, '' as fingerprint_slug`;
     }
-    const latestRevision = `(select revision.id from thread_revisions revision
-      where revision.thread_id = ${alias}.id
-      order by julianday(coalesce(nullif(revision.source_updated_at, ''), revision.created_at)) desc,
-               revision.id desc limit 1)`;
+    const latestRevision = this.acceptedRevisionId(alias);
     const revisionId = latestRevision;
     const revisionHash = `(select revision.content_hash from thread_revisions revision
       where revision.id = ${latestRevision})`;
@@ -950,6 +1115,99 @@ export class LocalGitcrawlQuerySource implements GitcrawlQuerySource {
             ${fingerprintSlug} as fingerprint_slug`;
   }
 
+  private acceptedRevisionId(threadAlias: string): string {
+    const revisionFresh = this.revisionFreshnessPredicate("revision", threadAlias);
+    const sequenceOrder = columnExists(this.db, "thread_revisions", "observation_sequence")
+      ? "revision.observation_sequence desc,"
+      : "";
+    return `(select revision.id
+      from thread_revisions revision
+      where revision.thread_id = ${threadAlias}.id
+        and (${revisionFresh})
+      order by ${sequenceOrder}
+               revision.id desc
+      limit 1)`;
+  }
+
+  private revisionFreshnessPredicate(revisionAlias: string, threadAlias: string): string {
+    const revisionSource = columnExists(this.db, "thread_revisions", "source_updated_at")
+      ? `coalesce(nullif(${revisionAlias}.source_updated_at, ''), ${revisionAlias}.created_at)`
+      : `${revisionAlias}.created_at`;
+    const revisionSequence = columnExists(this.db, "thread_revisions", "observation_sequence")
+      ? `coalesce(${revisionAlias}.observation_sequence, 0)`
+      : "0";
+    const legacyFresh = `clawsweeper_observation_at_or_after(
+      ${revisionSource},
+      0,
+      ${this.threadUpdatedAt(threadAlias)},
+      0
+    ) = 1`;
+    if (
+      columnExists(this.db, "thread_revisions", "observation_sequence") &&
+      columnExists(this.db, "threads", "evidence_observation_sequence") &&
+      columnExists(this.db, "threads", "evidence_source_updated_at")
+    ) {
+      return `(case
+        when coalesce(${threadAlias}.evidence_observation_sequence, 0) > 0
+          then ${revisionSequence} = ${threadAlias}.evidence_observation_sequence
+            and clawsweeper_observation_at_or_after(
+              ${revisionSource},
+              ${revisionSequence},
+              coalesce(${threadAlias}.evidence_source_updated_at, ''),
+              ${threadAlias}.evidence_observation_sequence
+            ) = 1
+        else ${legacyFresh}
+      end)`;
+    }
+    if (
+      columnExists(this.db, "thread_revisions", "observation_sequence") &&
+      columnExists(this.db, "threads", "observation_sequence")
+    ) {
+      return `${revisionSequence} = ${threadAlias}.observation_sequence
+        and clawsweeper_observation_at_or_after(
+          ${revisionSource},
+          ${revisionSequence},
+          ${this.threadUpdatedAt(threadAlias)},
+          ${threadAlias}.observation_sequence
+        ) = 1`;
+    }
+    return legacyFresh;
+  }
+
+  private acceptedThreadObservation(alias: string): { source: string; sequence: string } {
+    const fallbackSource = this.threadUpdatedAt(alias);
+    const fallbackSequence = columnExists(this.db, "threads", "observation_sequence")
+      ? `coalesce(${alias}.observation_sequence, 0)`
+      : "0";
+    if (
+      columnExists(this.db, "threads", "evidence_observation_sequence") &&
+      columnExists(this.db, "threads", "evidence_source_updated_at")
+    ) {
+      return {
+        source: `case
+          when coalesce(${alias}.evidence_observation_sequence, 0) > 0
+            then coalesce(${alias}.evidence_source_updated_at, '')
+          else ${fallbackSource}
+        end`,
+        sequence: `case
+          when coalesce(${alias}.evidence_observation_sequence, 0) > 0
+            then ${alias}.evidence_observation_sequence
+          else ${fallbackSequence}
+        end`,
+      };
+    }
+    return { source: fallbackSource, sequence: fallbackSequence };
+  }
+
+  private hasObservationReservations(): boolean {
+    return (
+      tableExists(this.db, "thread_child_observation_reservations") &&
+      ["thread_id", "family", "source_updated_at", "observation_sequence"].every((column) =>
+        columnExists(this.db, "thread_child_observation_reservations", column),
+      )
+    );
+  }
+
   private threadColumn(alias: string, column: string, fallback: string): string {
     return columnExists(this.db, "threads", column) ? `${alias}.${column}` : fallback;
   }
@@ -966,13 +1224,6 @@ export class LocalGitcrawlQuerySource implements GitcrawlQuerySource {
     return columnExists(this.db, table, column) ? `${alias}.${column}` : fallback;
   }
 
-  private pullRequestFreshness(alias: string): string {
-    const candidates = ["fetched_at", "updated_at"]
-      .filter((column) => columnExists(this.db, "pull_request_details", column))
-      .map((column) => `nullif(${alias}.${column}, '')`);
-    return candidates.length === 0 ? "''" : `coalesce(${candidates.join(", ")}, '')`;
-  }
-
   private reviewClusterContext(): { select: string; joins: string } {
     if (this.portable) {
       return {
@@ -986,6 +1237,7 @@ export class LocalGitcrawlQuerySource implements GitcrawlQuerySource {
                     join cluster_groups candidate_group on candidate_group.id = candidate.cluster_id
                     where candidate.thread_id = t.id and candidate.state = 'active'
                       and candidate_group.repo_id = t.repo_id
+                      and candidate_group.status = 'active'
                     order by case candidate.role
                                when 'canonical' then 0
                                when 'representative' then 1
@@ -995,7 +1247,7 @@ export class LocalGitcrawlQuerySource implements GitcrawlQuerySource {
                     limit 1
                   )
                 left join cluster_groups cg
-                  on cg.id = cm.cluster_id and cg.repo_id = t.repo_id`,
+                  on cg.id = cm.cluster_id and cg.repo_id = t.repo_id and cg.status = 'active'`,
       };
     }
     return {
@@ -1158,6 +1410,7 @@ function metric(
   coveredCount: number,
   maxSourceAt: string,
   generatedAt: string,
+  complete = eligibleCount === coveredCount,
 ): GitcrawlCoverageRow {
   return {
     snapshot_id: snapshotId,
@@ -1167,8 +1420,71 @@ function metric(
     covered_count: coveredCount,
     max_source_at: maxSourceAt,
     dataset_generated_at: generatedAt,
-    complete: eligibleCount === coveredCount,
+    complete,
   };
+}
+
+function observationAtOrAfterSql(
+  observedSource: SQLInputValue,
+  observedSequence: SQLInputValue,
+  acceptedSource: SQLInputValue,
+  acceptedSequence: SQLInputValue,
+): number {
+  return observationAtOrAfter(observedSource, observedSequence, acceptedSource, acceptedSequence)
+    ? 1
+    : 0;
+}
+
+function observationAtOrAfter(
+  observedSourceValue: unknown,
+  observedSequenceValue: unknown,
+  acceptedSourceValue: unknown,
+  acceptedSequenceValue: unknown,
+): boolean {
+  const observedSource = String(observedSourceValue ?? "").trim();
+  const acceptedSource = String(acceptedSourceValue ?? "").trim();
+  const observedTimestamp = timestampOrderKey(observedSource);
+  const acceptedTimestamp = timestampOrderKey(acceptedSource);
+  const observedSequence = safeObservationSequence(observedSequenceValue);
+  const acceptedSequence = safeObservationSequence(acceptedSequenceValue);
+  if (observedSequence === null || acceptedSequence === null) return false;
+  if (observedTimestamp !== null && acceptedTimestamp !== null) {
+    if (observedTimestamp > acceptedTimestamp) return true;
+    if (observedTimestamp < acceptedTimestamp) return false;
+    return observedSequence >= acceptedSequence;
+  }
+  if (observedTimestamp !== null || acceptedTimestamp !== null) return false;
+  return observedSource === acceptedSource && observedSequence >= acceptedSequence;
+}
+
+function timestampAtOrAfter(observedValue: unknown, acceptedValue: unknown): boolean {
+  const observed = timestampOrderKey(String(observedValue ?? "").trim());
+  const acceptedText = String(acceptedValue ?? "").trim();
+  if (observed === null) return false;
+  if (!acceptedText) return true;
+  const accepted = timestampOrderKey(acceptedText);
+  return accepted !== null && observed >= accepted;
+}
+
+function timestampOrderKey(value: string): bigint | null {
+  try {
+    parseRfc3339Timestamp(value, "Gitcrawl observation timestamp");
+  } catch {
+    return null;
+  }
+  const match = /^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2})(?:\.(\d{1,9}))?(Z|[+-]\d{2}:\d{2})$/.exec(
+    value,
+  );
+  if (!match) return null;
+  const milliseconds = Date.parse(`${match[1]}T${match[2]}${match[4]}`);
+  if (!Number.isFinite(milliseconds)) return null;
+  const fraction = BigInt((match[3] ?? "").padEnd(9, "0"));
+  return BigInt(milliseconds) * 1_000_000n + fraction;
+}
+
+function safeObservationSequence(value: unknown): number | null {
+  const sequence = Number(value);
+  return Number.isSafeInteger(sequence) && sequence >= 0 ? sequence : null;
 }
 
 function sliceRows(
