@@ -612,6 +612,62 @@ test("repair apply executes PR duplicate close when coverage proof says covered"
   }
 });
 
+test("repair apply stops before close when review activity changes after its comment", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-apply-result-"));
+  try {
+    const reviewChangePath = path.join(tmp, "review-changed");
+    const paths = writeApplyFixture(tmp, {
+      action: "close_duplicate",
+      classification: "duplicate",
+      canonical: "#202",
+    });
+    writeFakeGh(paths.binDir, {
+      issues: {
+        101: issue({ number: 101, title: "Add config validation", pullRequest: true }),
+        202: issue({
+          number: 202,
+          title: "Rewrite config validation",
+          pullRequest: true,
+          labels: ["proof: sufficient"],
+        }),
+      },
+      pulls: {
+        101: pull({ number: 101, title: "Add config validation" }),
+        202: pull({ number: 202, title: "Rewrite config validation" }),
+      },
+      comments: {
+        101: [comment("alice", "PR A keeps legacy config behavior intact.")],
+        202: [comment("bob", "PR B carries forward the legacy config behavior.")],
+      },
+      reviewChangePath,
+      postMutationReviews: {
+        101: [
+          {
+            id: 77,
+            user: { login: "maintainer" },
+            state: "COMMENTED",
+            body: "Please hold this close.",
+            submitted_at: "2026-05-25T00:00:01Z",
+            commit_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          },
+        ],
+      },
+      logPath: paths.ghLogPath,
+    });
+    writeFakeCodex(paths.binDir);
+
+    runApplyResult(paths, { proofDecision: "covered" });
+
+    const report = JSON.parse(fs.readFileSync(paths.reportPath, "utf8"));
+    assert.equal(report.actions[0].status, "blocked");
+    assert.match(report.actions[0].reason, /review activity changed after repair validation/);
+    assert.equal(hasCommentPostCall(paths.ghLogPath), true);
+    assert.equal(hasPrCloseCall(paths.ghLogPath), false);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
 for (const scenario of [
   {
     name: "superseded",
@@ -1473,6 +1529,10 @@ type FakeGhData = {
   issues: Record<number, Record<string, unknown>>;
   pulls: Record<number, Record<string, unknown>>;
   comments: Record<number, Record<string, unknown>[]>;
+  reviews?: Record<number, Record<string, unknown>[]>;
+  inlineComments?: Record<number, Record<string, unknown>[]>;
+  reviewChangePath?: string;
+  postMutationReviews?: Record<number, Record<string, unknown>[]>;
   omitIssueCommentCounts?: number[];
   prViewFailure?: { number: number; message: string };
   afterProofPath?: string;
@@ -1657,6 +1717,7 @@ if (args[0] === "api") {
       const input = args[args.indexOf("--input") + 1];
       const body = JSON.parse(fs.readFileSync(input, "utf8")).body;
       fs.appendFileSync(data.logPath, JSON.stringify({ args: ["comment-body", String(body)] }) + "\\n");
+      if (data.reviewChangePath) fs.writeFileSync(data.reviewChangePath, "changed");
       write({ id: 9000 + number, body });
     } else if (args.includes("--slurp")) {
       write([data.comments[number] || []]);
@@ -1714,6 +1775,21 @@ if (args[0] === "api") {
 		  });
 	  process.exit(0);
 	}
+  match = url.pathname.match(/\\/pulls\\/(\\d+)\\/(reviews|comments)$/);
+  if (match) {
+    const number = Number(match[1]);
+    const entries =
+      match[2] === "reviews"
+        ? (data.reviewChangePath &&
+            fs.existsSync(data.reviewChangePath) &&
+            data.postMutationReviews &&
+            data.postMutationReviews[number]) ||
+          (data.reviews && data.reviews[number]) ||
+          []
+        : (data.inlineComments && data.inlineComments[number]) || [];
+    write(entries);
+    process.exit(0);
+  }
   match = url.pathname.match(/\\/pulls\\/(\\d+)$/);
   if (match) {
     const number = Number(match[1]);
@@ -1906,4 +1982,13 @@ function issueCloseTargets(logPath: string): string[] {
         /\/issues\/\d+$/.test(call.args[1] ?? ""),
     )
     .map((call) => call.args[1]?.match(/\/issues\/(\d+)$/)?.[1] ?? "");
+}
+
+function hasCommentPostCall(logPath: string): boolean {
+  return ghCalls(logPath).some(
+    (call) =>
+      call.args[0] === "api" &&
+      call.args.some((arg) => /\/issues\/\d+\/comments$/.test(arg)) &&
+      call.args.includes("POST"),
+  );
 }
