@@ -16,9 +16,11 @@ import {
   importActionEventShards,
   interruptOpenWorkflowActionEvents,
   postActionEventToCrabFleet,
+  prepareWorkflowActionEvent,
   recordWorkflowActionEvent,
   recordWorkflowPhaseEvent,
   workflowActionProducer,
+  type WorkflowActionEventInput,
 } from "../dist/action-ledger-runtime.js";
 import {
   ACTION_EVENT_PHASE_TYPES,
@@ -2267,6 +2269,48 @@ test("imports preserve first-writer shard bytes across fresh-root recorded-at dr
     fs.readFileSync(path.join(destination, firstPath!), "utf8"),
     fs.readFileSync(path.join(firstOutput, firstPath!), "utf8"),
   );
+});
+
+test("prepared workflow events persist their validated input snapshot", () => {
+  const root = tempRoot();
+  const subject = {
+    repository: "openclaw/openclaw",
+    kind: "pull_request" as const,
+    number: 42,
+  };
+  const action = {
+    name: "review",
+    status: "completed",
+    retryable: false,
+    mutation: false,
+  };
+  const evidence = [{ kind: "review_log", reportPath: "results/reviews/42.json" }];
+  const attributes = { queue_depth: 1 };
+  const input: WorkflowActionEventInput = {
+    scope: "review.completed",
+    identity: { number: 42 },
+    type: ACTION_EVENT_TYPES.reviewCompleted,
+    component: "review",
+    subject,
+    action,
+    evidence,
+    attributes,
+  };
+  const prepared = prepareWorkflowActionEvent(root, input, {
+    env: workflowEnv(),
+    now: () => new Date("2026-07-12T10:01:00.000Z"),
+  });
+  assert.ok(prepared.event);
+
+  subject.repository = "openclaw/changed";
+  action.status = "failed";
+  evidence[0]!.reportPath = "results/reviews/changed.json";
+  attributes.queue_depth = 99;
+
+  const committed = prepared.commit();
+  assert.deepEqual(committed, prepared.event);
+  assert.deepEqual(readAllSpooledActionEvents(root), [prepared.event]);
+  assert.deepEqual(prepared.commit(), committed);
 });
 
 test("historical producer partitions survive later-run flush environments", async () => {

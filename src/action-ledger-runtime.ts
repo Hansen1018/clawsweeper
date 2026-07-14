@@ -132,6 +132,11 @@ export type WorkflowActionEventOptions = {
   fetchImpl?: typeof fetch;
 };
 
+export type PreparedWorkflowActionEvent = {
+  event: ActionEvent | null;
+  commit: () => ActionEvent | null;
+};
+
 export type WorkflowActionPhaseEventInput = Omit<
   WorkflowActionEventInput,
   "scope" | "type" | "action"
@@ -268,8 +273,18 @@ export function recordWorkflowActionEvent(
   input: WorkflowActionEventInput,
   options: WorkflowActionEventOptions = {},
 ): ActionEvent | null {
+  return prepareWorkflowActionEvent(root, input, options).commit();
+}
+
+export function prepareWorkflowActionEvent(
+  root: string,
+  input: WorkflowActionEventInput,
+  options: WorkflowActionEventOptions = {},
+): PreparedWorkflowActionEvent {
   const env = options.env ?? process.env;
-  if (!workflowActionEventsEnabled(env)) return null;
+  if (!workflowActionEventsEnabled(env)) {
+    return { event: null, commit: () => null };
+  }
   if (input.action.mutation && input.idempotencyIdentity === undefined) {
     throw new Error("mutation action events require an explicit idempotencyIdentity");
   }
@@ -321,18 +336,37 @@ export function recordWorkflowActionEvent(
     ...(input.privacy ? { privacy: input.privacy } : {}),
     ...(input.occurredAt === undefined ? {} : { occurredAt: input.occurredAt }),
   };
+  const eventInputSnapshot = structuredClone(eventInput);
   const recordedAt = options.now ? options.now() : new Date();
   const writeOptions = { now: () => recordedAt };
-  const candidate = createActionEvent(eventInput, writeOptions);
+  const candidate = createActionEvent(eventInputSnapshot, writeOptions);
   const partitionDate = workflowPartitionDate(env);
-  const event = withWorkflowProducerLock(root, candidate.producer, () => {
-    assertWorkflowProducerAcceptsEvent(root, candidate);
-    ensureWorkflowPartitionDateValue(root, persistedWorkflowProducer(producer), partitionDate);
-    const persisted = writeActionEvent(root, eventInput, writeOptions).event;
-    queueCrabFleetEvent(root, persisted, env, options.fetchImpl ?? fetch);
-    return persisted;
-  });
-  return event;
+  let committed: ActionEvent | undefined;
+  let committing = false;
+  return {
+    event: candidate,
+    commit() {
+      if (committed !== undefined) return committed;
+      if (committing) throw new Error("workflow action event commit is already in progress");
+      committing = true;
+      try {
+        committed = withWorkflowProducerLock(root, candidate.producer, () => {
+          assertWorkflowProducerAcceptsEvent(root, candidate);
+          ensureWorkflowPartitionDateValue(
+            root,
+            persistedWorkflowProducer(producer),
+            partitionDate,
+          );
+          const persisted = writeActionEvent(root, eventInputSnapshot, writeOptions).event;
+          queueCrabFleetEvent(root, persisted, env, options.fetchImpl ?? fetch);
+          return persisted;
+        });
+        return committed;
+      } finally {
+        committing = false;
+      }
+    },
+  };
 }
 
 export function recordWorkflowPhaseEvent(
@@ -340,6 +374,14 @@ export function recordWorkflowPhaseEvent(
   input: WorkflowActionPhaseEventInput,
   options: WorkflowActionEventOptions = {},
 ): ActionEvent | null {
+  return prepareWorkflowPhaseEvent(root, input, options).commit();
+}
+
+export function prepareWorkflowPhaseEvent(
+  root: string,
+  input: WorkflowActionPhaseEventInput,
+  options: WorkflowActionEventOptions = {},
+): PreparedWorkflowActionEvent {
   const phase = String(input.phase);
   const status = String(input.status);
   const reasonCode = input.reasonCode === undefined ? undefined : String(input.reasonCode);
@@ -352,7 +394,7 @@ export function recordWorkflowPhaseEvent(
   if (reasonCode !== undefined && !isActionEventReasonCode(reasonCode)) {
     throw new Error(`unknown action event reason code: ${reasonCode}`);
   }
-  return recordWorkflowActionEvent(
+  return prepareWorkflowActionEvent(
     root,
     {
       scope: phase,
