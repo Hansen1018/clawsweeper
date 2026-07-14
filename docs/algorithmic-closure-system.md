@@ -20,14 +20,14 @@ the only issue/PR closure authority.
 
 ## Authority Boundaries
 
-| Layer | May decide | Must not decide |
-| --- | --- | --- |
-| Semantic identity | Whether a prior keep-open review is reusable | Whether an item should close |
-| Closure graph | Whether proposed close actions have one safe dependency order | Whether a proposed close is factually correct |
-| Admission scheduler | Which bounded work runs next | Whether a mutation is allowed |
-| Action ledger | What was attempted, observed, accepted, rejected, or left unknown | Whether replaying an unknown mutation is safe without reconciliation |
-| Mutation guard | Whether reviewed state is still current at the request boundary | Product direction or canonical ownership |
-| Gitcrawl evidence | Which bounded graph claims are available and mutually consistent | Whether graph similarity alone proves duplication |
+| Layer               | May decide                                                        | Must not decide                                                      |
+| ------------------- | ----------------------------------------------------------------- | -------------------------------------------------------------------- |
+| Semantic identity   | Whether a prior keep-open review is reusable                      | Whether an item should close                                         |
+| Closure graph       | Whether proposed close actions have one safe dependency order     | Whether a proposed close is factually correct                        |
+| Admission scheduler | Which bounded work runs next                                      | Whether a mutation is allowed                                        |
+| Action ledger       | What was attempted, observed, accepted, rejected, or left unknown | Whether replaying an unknown mutation is safe without reconciliation |
+| Mutation guard      | Whether reviewed state is still current at the request boundary   | Product direction or canonical ownership                             |
+| Gitcrawl evidence   | Which bounded graph claims are available and mutually consistent  | Whether graph similarity alone proves duplication                    |
 
 The practical rule is simple: algorithms may save work and reject unsafe work.
 They may not promote weak evidence into a close.
@@ -184,17 +184,17 @@ idempotent. Reusing an identity for different content is a hard conflict.
 
 The same receipt model covers all ClawSweeper work:
 
-| Family | Lifecycle that must be represented |
-| --- | --- |
-| Review | selection, lease, structural probe, hydration, semantic/content cache decision, Codex start/result, report write, public comment sync, history update, label projection, failed-review retry |
-| Commit review | range expansion, code-bearing selection, Codex review, report publication, optional finding dispatch |
-| Commands | receive, authorize, parse, acknowledge, classify, status/explain, review dispatch, repair dispatch, approve, stop, requeue, terminal result |
-| Dispatch | target fanout, workflow dispatch, webhook intake, self-heal, spam intake, sweep continuation, commit-finding intake |
-| Repair | job creation, immutable input capture, planning, edit attempt, validation, internal review, review fix, base reconcile, checkpoint, publication, exact-head re-review |
-| Apply | comment sync, label sync, decision packet, close, source-PR supersession, merge, post-flight |
-| Proof | contributor nudge, bot-proof decision, Mantis request, comment/label mutation, reconciliation |
-| Evidence | Gitcrawl snapshot, six queries, coverage, graph packet, parity result, import, job publication |
-| Projection | state shard publication, dashboard projection, notification delivery, CrabFleet projection |
+| Family        | Lifecycle that must be represented                                                                                                                                                           |
+| ------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Review        | selection, lease, structural probe, hydration, semantic/content cache decision, Codex start/result, report write, public comment sync, history update, label projection, failed-review retry |
+| Commit review | range expansion, code-bearing selection, Codex review, report publication, optional finding dispatch                                                                                         |
+| Commands      | receive, authorize, parse, acknowledge, classify, status/explain, review dispatch, repair dispatch, approve, stop, requeue, terminal result                                                  |
+| Dispatch      | target fanout, workflow dispatch, webhook intake, self-heal, spam intake, sweep continuation, commit-finding intake                                                                          |
+| Repair        | job creation, immutable input capture, planning, edit attempt, validation, internal review, review fix, base reconcile, checkpoint, publication, exact-head re-review                        |
+| Apply         | comment sync, label sync, decision packet, close, source-PR supersession, merge, post-flight                                                                                                 |
+| Proof         | contributor nudge, bot-proof decision, Mantis request, comment/label mutation, reconciliation                                                                                                |
+| Evidence      | Gitcrawl snapshot, six queries, coverage, graph packet, parity result, import, job publication                                                                                               |
+| Projection    | state shard publication, dashboard projection, notification delivery, CrabFleet projection                                                                                                   |
 
 Workflow-owned publication terminalizes any still-open attempt as unknown when
 the process or workflow is interrupted. Unknown is not failure and not success;
@@ -235,11 +235,18 @@ Every mutation path follows the same compare-and-set shape:
 1. capture reviewed target state and bounded review activity;
 2. prepare an immutable action and idempotency identity;
 3. refresh live target and activity state;
-4. durably publish the attempt receipt;
-5. refresh again at the request boundary;
-6. make at most one GitHub request;
-7. publish accepted, rejected-before-write, or unknown;
-8. reconcile unknown outcomes before retry.
+4. durably open the attempt receipt;
+5. publish the immutable recovery intent and state;
+6. refresh again at the request boundary;
+7. make at most one GitHub request;
+8. publish accepted, rejected-before-write, or unknown;
+9. reconcile unknown outcomes before retry.
+
+Recovery-state publication is part of the pre-request transaction. If it fails,
+the attempt closes as rejected-before-write and no scan cursor or checkpoint may
+advance. After an accepted transport result, later receipt-flush failure is
+reported as a durability fault but must not cause the external request to be
+replayed.
 
 ### Review Activity Cursor
 
@@ -265,11 +272,18 @@ Repair validation binds:
 - allowed validation commands;
 - the pinned base and final reconciled base;
 - isolated Git configuration and network publication;
+- dependency setup and validation inside a disposable Linux user, PID, mount,
+  and network namespace with loopback brought up explicitly;
+- a read-only host view plus bounded writable roots enforced by mounts and
+  Landlock, followed by clearing every inherited, permitted, effective,
+  bounding, and ambient capability;
 - contained process-tree completion.
 
 The executor commits and pushes the validated SHA, not a mutable `HEAD`.
 Recovery materializes the saved commit before continuing. Rebase, continuation,
-hooks, filters, askpass, and publication remain inside the isolated boundary.
+hooks, filters, askpass, dependency lifecycle scripts, and publication remain
+inside the isolated boundary. Any surviving descendant is killed and reaped
+before the validation result can be accepted.
 
 ## 6. Gitcrawl Local, Cloud, And Parity Evidence
 
@@ -336,14 +350,14 @@ more permissive interpretation.
 
 ## Complexity And Performance
 
-| Operation | Bound | Expected benefit |
-| --- | --- | --- |
-| Structural identity | `O(M)` bounded metadata | Avoid full hydration |
-| Compiler/Tree-sitter semantic identity | `O(P)` patch bytes | Avoid repeated model review |
-| Tarjan SCC + Kahn layering | `O(V + E)` | Parallel safe layers, no cyclic closeout |
-| Admission selection | `O(N log N)` with stable ranking | Protect priority latency and reduce idle capacity |
-| Receipt append/finalization | `O(A log A)` for bounded canonical ordering | Crash-safe replay and reconciliation |
-| Gitcrawl packet verification | `O(R + G)` rows plus graph | Reuse existing cluster/review data without live recrawl |
+| Operation                              | Bound                                       | Expected benefit                                        |
+| -------------------------------------- | ------------------------------------------- | ------------------------------------------------------- |
+| Structural identity                    | `O(M)` bounded metadata                     | Avoid full hydration                                    |
+| Compiler/Tree-sitter semantic identity | `O(P)` patch bytes                          | Avoid repeated model review                             |
+| Tarjan SCC + Kahn layering             | `O(V + E)`                                  | Parallel safe layers, no cyclic closeout                |
+| Admission selection                    | `O(N log N)` with stable ranking            | Protect priority latency and reduce idle capacity       |
+| Receipt append/finalization            | `O(A log A)` for bounded canonical ordering | Crash-safe replay and reconciliation                    |
+| Gitcrawl packet verification           | `O(R + G)` rows plus graph                  | Reuse existing cluster/review data without live recrawl |
 
 `M`, `P`, `V`, `E`, `N`, `A`, `R`, and `G` are all explicitly bounded. The
 system rejects rather than silently truncates authoritative evidence.
