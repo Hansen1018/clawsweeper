@@ -110,6 +110,7 @@ export function recordRepairMutationReceipt(
   if (!workflowActionEventsEnabled()) return null;
   const chain = repairMutationChain(context);
   const phaseSeq = chain.phaseSeq + 1;
+  const operationDigest = actionIdempotencyKey(options.mutationIdentity.operation).slice(0, 12);
   const eventType =
     context.phase === "apply_result"
       ? ACTION_EVENT_TYPES.repairExecute
@@ -128,7 +129,7 @@ export function recordRepairMutationReceipt(
     phaseSeq,
     idempotencyIdentity: options.mutationIdentity,
     type: eventType,
-    component: `${context.phase}.${options.kind}.${options.outcome}.${options.mutationIdentity.requestSha256.slice(0, 12)}`,
+    component: `${context.phase}.${options.kind}.${options.outcome}.${operationDigest}.${phaseSeq}.${options.mutationIdentity.requestSha256.slice(0, 12)}`,
     subject: {
       repository: context.repository,
       kind: context.targetKind,

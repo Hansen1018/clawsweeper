@@ -175,10 +175,34 @@ test("repair mutation receipts commit the attempt before the request and the out
     );
 
     assert.equal(Number(git(["rev-list", "--count", "HEAD"], stateRoot)), 3);
+    runRepairMutation(
+      {
+        phase: "apply_result",
+        repository: "openclaw/openclaw",
+        clusterId: "repair-openclaw-openclaw-124",
+        number: 124,
+        targetKind: "issue",
+        operationKey: "second-durable-receipt-test",
+      },
+      {
+        kind: "label_create",
+        identity: {
+          repository: "openclaw/openclaw",
+          label: "clawsweeper",
+        },
+        freshness,
+        operation: () => {
+          assert.equal(Number(git(["rev-list", "--count", "HEAD"], stateRoot)), 4);
+          return "accepted";
+        },
+      },
+    );
+
+    assert.equal(Number(git(["rev-list", "--count", "HEAD"], stateRoot)), 5);
     const eventText = walkFiles(path.join(stateRoot, "ledger", "v1", "events"))
       .map((file) => fs.readFileSync(file, "utf8"))
       .join("");
-    assert.equal(eventText.trim().split("\n").length, 2);
+    assert.equal(eventText.trim().split("\n").length, 4);
     assert.doesNotMatch(eventText, /PRIVATE_REVIEW_BODY|ClawSweeper closeout/);
   } finally {
     process.chdir(previousCwd);
@@ -377,11 +401,11 @@ test("repair review baselines accept only trusted exact-head post-repair verdict
   const comments = [
     {
       user: { login: "contributor" },
-      body: `<!-- clawsweeper-verdict:pass sha=${expectedHeadSha} reviewed_at=2020-01-01T00:00:00Z review_activity_cursor=${reviewedCursor} -->`,
+      body: `<!-- clawsweeper-verdict:pass item=123 sha=${expectedHeadSha} updated_at=2026-07-14T10:00:00Z reviewed_at=2020-01-01T00:00:00Z review_activity_cursor=${reviewedCursor} -->`,
     },
     {
       user: { login: "openclaw-clawsweeper[bot]" },
-      body: `<!-- clawsweeper-verdict:pass sha=${expectedHeadSha} reviewed_at=2020-01-01T00:01:00Z review_activity_cursor=${reviewedCursor} -->`,
+      body: `<!-- clawsweeper-verdict:pass item=123 sha=${expectedHeadSha} updated_at=2026-07-14T10:00:00Z reviewed_at=2020-01-01T00:01:00Z review_activity_cursor=${reviewedCursor} -->`,
     },
   ];
 
@@ -405,7 +429,18 @@ test("repair review baselines accept only trusted exact-head post-repair verdict
       expectedHeadSha: "d".repeat(40),
       readIssueComments: () => comments,
     }),
-    EMPTY_REVIEW_ACTIVITY_CURSOR,
+    null,
+  );
+  assert.equal(
+    resolveRepairMutationReviewActivityCursor({
+      repository: "openclaw/openclaw",
+      number: 123,
+      targetKind: "pull_request",
+      expectedUpdatedAt: "2026-07-14T10:00:01Z",
+      expectedHeadSha,
+      readIssueComments: () => comments,
+    }),
+    null,
   );
 });
 
@@ -564,9 +599,12 @@ test("repair executors route authoritative GitHub writes through the mutation bo
   assert.match(safetySource, /reviewed pull request activity cursor is unavailable/);
   assert.match(reviewBaselineSource, /item_updated_at/);
   assert.match(reviewBaselineSource, /reviewedAt > options\.reviewedBefore/);
-  assert.match(reviewBaselineSource, /clawsweeper-verdict:pass/);
+  assert.match(reviewBaselineSource, /attributes\.updated_at !== expectedUpdatedAt/);
+  assert.match(reviewBaselineSource, /allowedVerdicts/);
   assert.match(activitySource, /requestedReviewers/);
   assert.match(activitySource, /compactPullRequestRef\(pull\.head\)/);
+  assert.match(activitySource, /autoMerge: compactAutoMerge/);
+  assert.match(postFlightSource, /fix PR head changed after repair validation/);
   assert.match(applySource, /resolveRepairMutationReviewActivityCursor/);
   assert.match(postFlightSource, /resolveRepairMutationReviewActivityCursor/);
   assert.match(applySource, /finally \{\s+await flushRepairMutationActionEvents\(\)/);

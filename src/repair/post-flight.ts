@@ -50,6 +50,7 @@ const FIX_PR_MERGE_STATES = new Set(["CLEAN", "HAS_HOOKS", "UNSTABLE"]);
 const FIX_PR_ACTIONS = new Set(["open_fix_pr", "repair_contributor_branch"]);
 const FIX_PR_READY_STATUSES = new Set(["opened", "pushed"]);
 const DEFAULT_IGNORED_CHECKS = ["auto-response", "Labeler", "Stale"];
+const REVIEW_BASELINE_VERDICTS = ["pass", "close", "needs-changes", "needs-human"] as const;
 const POST_FLIGHT_WAIT_MS = numberEnv("CLAWSWEEPER_POST_FLIGHT_WAIT_MS", 10 * 60 * 1000);
 const POST_FLIGHT_POLL_MS = numberEnv("CLAWSWEEPER_POST_FLIGHT_POLL_MS", 15 * 1000);
 
@@ -210,6 +211,27 @@ function finalizeFixPr(action: LooseRecord) {
         reason: "already merged",
         merged_at: mergedAt,
         merge_commit_sha: pull.merge_commit_sha ?? view.mergeCommit?.oid ?? null,
+        waited_ms: waitedMs,
+      };
+    }
+    const validatedCommit = String(action.commit ?? "").trim();
+    const liveHeadSha = String(pull.head?.sha ?? "").trim();
+    if (!/^[a-f0-9]{40}$/i.test(validatedCommit)) {
+      return {
+        ...prBase,
+        status: "blocked",
+        reason: "validated repair commit is unavailable",
+        waited_ms: waitedMs,
+      };
+    }
+    if (liveHeadSha !== validatedCommit) {
+      return {
+        ...prBase,
+        status: "blocked",
+        reason: "fix PR head changed after repair validation",
+        expected_head_sha: validatedCommit,
+        live_head_sha: liveHeadSha || null,
+        retry_recommended: true,
         waited_ms: waitedMs,
       };
     }
@@ -512,7 +534,9 @@ function finalizePostMergeCloseout({
           targetKind: live.pull_request ? "pull_request" : "issue",
           explicitCursor: action.target_review_activity_cursor,
           expectedUpdatedAt,
+          expectedHeadSha: clusterPlanPullHeadSha(target),
           reviewedBefore: clusterPlan?.generated_at ?? result.generated_at,
+          allowedVerdicts: REVIEW_BASELINE_VERDICTS,
         }),
       });
     } catch (error) {
@@ -1032,6 +1056,17 @@ function writePayload(name: string, value: JsonValue) {
 
 function normalizeIssueRef(value: JsonValue) {
   return issueNumberFromRef(value);
+}
+
+function clusterPlanPullHeadSha(number: number): string | null {
+  for (const item of clusterPlan?.items ?? []) {
+    if (normalizeIssueRef(item?.ref ?? item?.number) !== number) continue;
+    const headSha = String(
+      item?.pull_request?.head_sha ?? item?.pull_request?.headSha ?? "",
+    ).trim();
+    return /^[a-f0-9]{40}$/i.test(headSha) ? headSha : null;
+  }
+  return null;
 }
 
 function postFlightMutationContext({

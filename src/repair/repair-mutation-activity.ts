@@ -338,8 +338,25 @@ function compactPullRequestTarget(value: unknown) {
     draft: pull.draft === true,
     head: compactPullRequestRef(pull.head),
     base: compactPullRequestRef(pull.base),
+    autoMerge: compactAutoMerge(pull.auto_merge ?? pull.autoMerge),
     requestedReviewers: normalizeActors(pull.requested_reviewers ?? pull.requestedReviewers),
     requestedTeams: normalizeTeams(pull.requested_teams ?? pull.requestedTeams),
+  };
+}
+
+function compactAutoMerge(value: unknown) {
+  const autoMerge = record(value);
+  const enabledBy = record(autoMerge.enabled_by ?? autoMerge.enabledBy);
+  return {
+    enabledBy: {
+      id: scalar(enabledBy.id),
+      login: scalar(enabledBy.login),
+      nodeId: scalar(enabledBy.node_id ?? enabledBy.nodeId),
+      type: scalar(enabledBy.type),
+    },
+    mergeMethod: scalar(autoMerge.merge_method ?? autoMerge.mergeMethod),
+    commitTitleSha256: digestScalar(autoMerge.commit_title ?? autoMerge.commitTitle),
+    commitMessageSha256: digestScalar(autoMerge.commit_message ?? autoMerge.commitMessage),
   };
 }
 

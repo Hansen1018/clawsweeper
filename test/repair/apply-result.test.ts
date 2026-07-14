@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
+import { createReviewedPrActivityCursor } from "../../dist/review-activity-cursor.js";
 import { mockGhBinEnv } from "../helpers.ts";
 
 const repoRoot = process.cwd();
@@ -613,6 +614,86 @@ test("repair apply executes PR duplicate close when coverage proof says covered"
   }
 });
 
+test("repair apply recovers the reviewed cursor from the bound ClawSweeper verdict", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-apply-result-"));
+  try {
+    const reviewedHeadSha = "a".repeat(40);
+    const reviewedUpdatedAt = "2026-05-25T00:00:00Z";
+    const existingReview = {
+      id: 77,
+      user: { login: "maintainer" },
+      state: "COMMENTED",
+      body: "Reviewed before repair",
+      submitted_at: "2026-05-24T23:59:00Z",
+      commit_id: reviewedHeadSha,
+    };
+    const reviewCursor = createReviewedPrActivityCursor({
+      reviews: [existingReview],
+      inlineComments: [],
+      reviewThreads: [],
+    });
+    assert.ok(reviewCursor);
+    const paths = writeApplyFixture(tmp, {
+      action: "close_duplicate",
+      classification: "duplicate",
+      canonical: "#202",
+    });
+    fs.writeFileSync(
+      path.join(path.dirname(paths.resultPath), "cluster-plan.json"),
+      JSON.stringify(
+        {
+          generated_at: "2026-05-25T00:00:30Z",
+          items: [
+            {
+              ref: "#101",
+              number: 101,
+              pull_request: { head_sha: reviewedHeadSha },
+            },
+          ],
+        },
+        null,
+        2,
+      ),
+    );
+    writeFakeGh(paths.binDir, {
+      issues: {
+        101: issue({ number: 101, title: "Add config validation", pullRequest: true }),
+        202: issue({
+          number: 202,
+          title: "Rewrite config validation",
+          pullRequest: true,
+          labels: ["proof: sufficient"],
+        }),
+      },
+      pulls: {
+        101: pull({ number: 101, title: "Add config validation" }),
+        202: pull({ number: 202, title: "Rewrite config validation" }),
+      },
+      comments: {
+        101: [
+          comment("alice", "PR A keeps legacy config behavior intact."),
+          {
+            ...comment("openclaw-clawsweeper[bot]", "review marker"),
+            body: `<!-- clawsweeper-verdict:close item=101 sha=${reviewedHeadSha} updated_at=${reviewedUpdatedAt} reviewed_at=2026-05-25T00:00:15Z review_activity_cursor=${reviewCursor} -->`,
+          },
+        ],
+        202: [comment("bob", "PR B carries forward the legacy config behavior.")],
+      },
+      reviews: { 101: [existingReview] },
+      logPath: paths.ghLogPath,
+    });
+    writeFakeCodex(paths.binDir);
+
+    runApplyResult(paths, { proofDecision: "covered" });
+
+    const report = JSON.parse(fs.readFileSync(paths.reportPath, "utf8"));
+    assert.equal(report.actions[0].status, "executed");
+    assert.equal(hasPrCloseCall(paths.ghLogPath), true);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
 test("repair apply stops before close when review activity changes after its comment", () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-apply-result-"));
   try {
@@ -699,6 +780,63 @@ test("repair apply rejects a concurrent security label after its comment", () =>
       reviewChangePath: activityChangePath,
       postMutationPulls: {
         101: { labels: [{ name: "security" }] },
+      },
+      logPath: paths.ghLogPath,
+    });
+    writeFakeCodex(paths.binDir);
+
+    runApplyResult(paths, { proofDecision: "covered" });
+
+    const report = JSON.parse(fs.readFileSync(paths.reportPath, "utf8"));
+    assert.equal(report.actions[0].status, "blocked");
+    assert.match(
+      report.actions[0].reason,
+      /target activity changed concurrently with the ClawSweeper mutation/,
+    );
+    assert.equal(hasCommentPostCall(paths.ghLogPath), true);
+    assert.equal(hasPrCloseCall(paths.ghLogPath), false);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("repair apply rejects concurrent auto-merge enablement after its comment", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-apply-result-"));
+  try {
+    const activityChangePath = path.join(tmp, "activity-changed");
+    const paths = writeApplyFixture(tmp, {
+      action: "close_duplicate",
+      classification: "duplicate",
+      canonical: "#202",
+    });
+    writeFakeGh(paths.binDir, {
+      issues: {
+        101: issue({ number: 101, title: "Add config validation", pullRequest: true }),
+        202: issue({
+          number: 202,
+          title: "Rewrite config validation",
+          pullRequest: true,
+          labels: ["proof: sufficient"],
+        }),
+      },
+      pulls: {
+        101: pull({ number: 101, title: "Add config validation" }),
+        202: pull({ number: 202, title: "Rewrite config validation" }),
+      },
+      comments: {
+        101: [comment("alice", "PR A keeps legacy config behavior intact.")],
+        202: [comment("bob", "PR B carries forward the legacy config behavior.")],
+      },
+      reviewChangePath: activityChangePath,
+      postMutationPulls: {
+        101: {
+          auto_merge: {
+            enabled_by: { id: 7, login: "maintainer", node_id: "U_7", type: "User" },
+            merge_method: "squash",
+            commit_title: "Enable merge",
+            commit_message: "Merge after checks pass",
+          },
+        },
       },
       logPath: paths.ghLogPath,
     });
@@ -2020,6 +2158,7 @@ function pull(options: { number: number; title: string; mergedAt?: string }) {
     merged_at: options.mergedAt ?? null,
     body: `${options.title} body.`,
     updated_at: "2026-05-25T00:00:00Z",
+    head: { sha: "a".repeat(40) },
   };
 }
 

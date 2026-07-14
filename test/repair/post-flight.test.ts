@@ -298,7 +298,7 @@ test("merge post-flight leaves dependency-gated closeouts to the second apply pa
       "    id: 501, node_id: 'IC_501', user: { login: 'openclaw-clawsweeper[bot]' },",
       "    author_association: 'CONTRIBUTOR', created_at: '2026-05-24T00:39:50Z',",
       "    updated_at: '2026-05-24T00:39:50Z',",
-      "    body: `review passed\\n<!-- clawsweeper-verdict:pass sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa reviewed_at=2026-05-24T00:39:50Z review_activity_cursor=${process.env.FAKE_GH_REVIEW_CURSOR} -->`,",
+      "    body: `review passed\\n<!-- clawsweeper-verdict:pass item=123 sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa updated_at=2026-05-24T00:40:00Z reviewed_at=2026-05-24T00:39:50Z review_activity_cursor=${process.env.FAKE_GH_REVIEW_CURSOR} -->`,",
       "  }]));",
       "  process.exit(0);",
       "}",
@@ -392,6 +392,78 @@ test("merge post-flight leaves dependency-gated closeouts to the second apply pa
   }
 });
 
+test("post-flight rejects a fix PR head that advanced after repair validation", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-post-flight-"));
+  const fakeBin = path.join(tmp, "bin");
+  const jobPath = path.join(tmp, "job.md");
+  const runDir = path.join(tmp, "run");
+  const resultPath = path.join(runDir, "result.json");
+  const reportPath = path.join(runDir, "post-flight-report.json");
+  const mergeFlagPath = path.join(tmp, "merged.txt");
+
+  fs.mkdirSync(fakeBin, { recursive: true });
+  fs.mkdirSync(runDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(fakeBin, "gh"),
+    [
+      "#!/usr/bin/env node",
+      "const fs = require('node:fs');",
+      "const args = process.argv.slice(2);",
+      "if (args[0] === 'api' && args[1] === 'repos/openclaw/openclaw/pulls/123') {",
+      "  process.stdout.write(JSON.stringify({",
+      "    number: 123, state: 'open', title: 'fix(ui): preserve source config',",
+      "    draft: false, labels: [], base: { ref: 'main' }, merged_at: null,",
+      "    updated_at: '2026-05-24T00:40:00Z',",
+      "    head: { sha: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' },",
+      "  }));",
+      "  process.exit(0);",
+      "}",
+      "if (args[0] === 'pr' && args[1] === 'view') {",
+      "  process.stdout.write(JSON.stringify({",
+      "    baseRefName: 'main', isDraft: false, mergeable: 'MERGEABLE',",
+      "    mergeStateStatus: 'CLEAN', reviewDecision: null, state: 'OPEN',",
+      "    statusCheckRollup: [], title: 'fix(ui): preserve source config',",
+      "    updatedAt: '2026-05-24T00:40:00Z',",
+      "  }));",
+      "  process.exit(0);",
+      "}",
+      "if (args[0] === 'pr' && args[1] === 'merge') {",
+      "  fs.writeFileSync(process.env.FAKE_GH_MERGED_FILE, '1');",
+      "  process.exit(0);",
+      "}",
+      "process.stderr.write(`unexpected gh args: ${args.join(' ')}\\n`);",
+      "process.exit(1);",
+    ].join("\n"),
+    { mode: 0o755 },
+  );
+
+  writeMergeJob(jobPath);
+  writeMergeReports(runDir, resultPath, { commit: "a".repeat(40) });
+
+  try {
+    execFileSync(process.execPath, ["dist/repair/post-flight.js", jobPath, resultPath], {
+      cwd: repoRoot,
+      env: {
+        ...process.env,
+        CLAWSWEEPER_ALLOW_EXECUTE: "1",
+        CLAWSWEEPER_ALLOWED_OWNER: "openclaw",
+        CLAWSWEEPER_ALLOW_MERGE: "1",
+        FAKE_GH_MERGED_FILE: mergeFlagPath,
+        ...mockGhBinEnv(path.join(fakeBin, "gh"), fakeBin),
+      },
+      stdio: "pipe",
+    });
+
+    const report = JSON.parse(fs.readFileSync(reportPath, "utf8"));
+    assert.equal(report.actions[0]?.status, "blocked");
+    assert.equal(report.actions[0]?.reason, "fix PR head changed after repair validation");
+    assert.equal(report.actions[0]?.retry_recommended, true);
+    assert.equal(fs.existsSync(mergeFlagPath), false);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
 test("post-flight blocks merge when review activity changes after validation", () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-post-flight-"));
   const fakeBin = path.join(tmp, "bin");
@@ -401,6 +473,12 @@ test("post-flight blocks merge when review activity changes after validation", (
   const reportPath = path.join(runDir, "post-flight-report.json");
   const reviewCountPath = path.join(tmp, "review-count.txt");
   const mergeFlagPath = path.join(tmp, "merged.txt");
+  const reviewCursor = createReviewedPrActivityCursor({
+    reviews: [],
+    inlineComments: [],
+    reviewThreads: [],
+  });
+  assert.ok(reviewCursor);
 
   fs.mkdirSync(fakeBin, { recursive: true });
   fs.mkdirSync(runDir, { recursive: true });
@@ -435,7 +513,12 @@ test("post-flight blocks merge when review activity changes after validation", (
       "  process.exit(0);",
       "}",
       "if (args[0] === 'api' && /^repos\\/openclaw\\/openclaw\\/issues\\/123\\/comments\\?/.test(args[1])) {",
-      "  process.stdout.write('[]');",
+      "  process.stdout.write(JSON.stringify([{",
+      "    id: 501, node_id: 'IC_501', user: { login: 'openclaw-clawsweeper[bot]' },",
+      "    author_association: 'CONTRIBUTOR', created_at: '2026-05-24T00:39:50Z',",
+      "    updated_at: '2026-05-24T00:39:50Z',",
+      "    body: `review passed\\n<!-- clawsweeper-verdict:pass item=123 sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa updated_at=2026-05-24T00:40:00Z reviewed_at=2026-05-24T00:39:50Z review_activity_cursor=${process.env.FAKE_GH_REVIEW_CURSOR} -->`,",
+      "  }]));",
       "  process.exit(0);",
       "}",
       "if (args[0] === 'api' && args[1] === 'graphql') {",
@@ -475,6 +558,7 @@ test("post-flight blocks merge when review activity changes after validation", (
         CLAWSWEEPER_ALLOW_MERGE: "1",
         FAKE_GH_MERGED_FILE: mergeFlagPath,
         FAKE_GH_REVIEW_COUNT_FILE: reviewCountPath,
+        FAKE_GH_REVIEW_CURSOR: reviewCursor,
         ...mockGhBinEnv(path.join(fakeBin, "gh"), fakeBin),
       },
       stdio: "pipe",
@@ -695,7 +779,7 @@ function writeMergeReports(
             status: options.action === "repair_contributor_branch" ? "pushed" : "opened",
             pr_url: "https://github.com/openclaw/openclaw/pull/123",
             branch: "clawsweeper/automerge-openclaw-openclaw-123",
-            ...(options.commit ? { commit: options.commit } : {}),
+            commit: options.commit ?? "a".repeat(40),
             merge_preflight: {
               security_status: "cleared",
               security_evidence: ["no security signal"],

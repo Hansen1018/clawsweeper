@@ -82,6 +82,7 @@ const CLEAN_MERGE_STATES = new Set(["CLEAN"]);
 const VIABLE_COVERING_PR_MERGE_STATES = new Set(["CLEAN", "BEHIND"]);
 const PR_CLOSE_COVERAGE_PROOF_COMMENT_LIMIT = 50;
 const GITHUB_MAX_PAGE_SIZE = 100;
+const REVIEW_BASELINE_VERDICTS = ["pass", "close", "needs-changes", "needs-human"] as const;
 const CLAWSWEEPER_COMMAND_ONLY_PATTERN = /^@clawsweeper\s+(?:re-review|re-run|review)\s*$/i;
 const CLAWSWEEPER_BOT_AUTHORS = new Set(
   [
@@ -630,7 +631,9 @@ function applyCloseAction({
         targetKind: kind,
         explicitCursor: action.review_activity_cursor ?? action.target_review_activity_cursor,
         expectedUpdatedAt,
+        expectedHeadSha: clusterPlanPullHeadSha(target),
         reviewedBefore: clusterPlan?.generated_at ?? result.generated_at,
+        allowedVerdicts: REVIEW_BASELINE_VERDICTS,
       }),
     });
     if (!existingComment) {
@@ -746,7 +749,9 @@ function applyMergeAction({
           targetKind: "pull_request",
           explicitCursor: action.review_activity_cursor ?? action.target_review_activity_cursor,
           expectedUpdatedAt,
+          expectedHeadSha: clusterPlanPullHeadSha(target),
           reviewedBefore: clusterPlan?.generated_at ?? result.generated_at,
+          allowedVerdicts: REVIEW_BASELINE_VERDICTS,
         }),
       });
     } catch (error) {
@@ -1833,6 +1838,34 @@ function normalizeRepairClosureRef(value: JsonValue): string {
 
 function normalizeIssueRef(value: JsonValue, expectedRepo: JsonValue = "") {
   return issueNumberFromRef(value, String(expectedRepo ?? ""));
+}
+
+function clusterPlanPullHeadSha(number: number): string | null {
+  for (const item of clusterPlan?.items ?? []) {
+    if (normalizeIssueRef(item?.ref ?? item?.number, result.repo) !== number) continue;
+    const headSha = String(
+      item?.pull_request?.head_sha ?? item?.pull_request?.headSha ?? "",
+    ).trim();
+    return /^[a-f0-9]{40}$/i.test(headSha) ? headSha : null;
+  }
+  return null;
+}
+
+function normalizeClassification(action: LooseRecord) {
+  const raw = String(
+    action.classification ?? action.close_reason ?? action.reason ?? "",
+  ).toLowerCase();
+  if (raw.includes("low_signal") || raw.includes("low-signal") || raw.includes("low signal"))
+    return "low_signal";
+  if (raw.includes("fixed") || raw.includes("candidate")) return "fixed_by_candidate";
+  if (raw.includes("superseded") || raw.includes("supersede")) return "superseded";
+  if (raw.includes("duplicate") || raw.includes("dupe")) return "duplicate";
+  if (action.action === "close_fixed_by_candidate") return "fixed_by_candidate";
+  if (action.action === "close_low_signal") return "low_signal";
+  if (action.action === "close_superseded") return "superseded";
+  if (action.action === "close_duplicate") return "duplicate";
+  if (action.action === "post_merge_close") return "fixed_by_candidate";
+  return raw;
 }
 
 function defaultIdempotencyKey(

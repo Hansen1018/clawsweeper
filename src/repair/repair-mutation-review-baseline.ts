@@ -20,6 +20,7 @@ type RepairMutationReviewBaselineOptions = {
   reviewedBefore?: unknown;
   stateRoot?: string | null;
   readIssueComments?: () => unknown[];
+  allowedVerdicts?: readonly string[];
 };
 
 const DEFAULT_TRUSTED_REVIEW_AUTHORS = new Set(
@@ -40,8 +41,7 @@ export function resolveRepairMutationReviewActivityCursor(
   if (explicitCursor) return explicitCursor;
 
   if (stringValue(options.expectedHeadSha)) {
-    const trustedCursor = trustedRepairReviewActivityCursor(options);
-    return trustedCursor ?? EMPTY_REPAIR_REVIEW_ACTIVITY_CURSOR;
+    return trustedRepairReviewActivityCursor(options);
   }
 
   const storedCursor = storedRepairReviewActivityCursor(options);
@@ -113,7 +113,12 @@ function trustedRepairReviewActivityCursor(
   options: RepairMutationReviewBaselineOptions,
 ): string | null {
   const expectedHeadSha = stringValue(options.expectedHeadSha);
-  if (!/^[a-f0-9]{40}$/i.test(expectedHeadSha)) return null;
+  const expectedUpdatedAt = stringValue(options.expectedUpdatedAt);
+  if (!/^[a-f0-9]{40}$/i.test(expectedHeadSha) || timestamp(expectedUpdatedAt) === null)
+    return null;
+  const allowedVerdicts = new Set(
+    (options.allowedVerdicts ?? ["pass"]).map((value) => value.trim().toLowerCase()),
+  );
 
   let comments: unknown[];
   try {
@@ -150,12 +155,16 @@ function trustedRepairReviewActivityCursor(
     const author = stringValue(record(comment.user).login);
     if (!DEFAULT_TRUSTED_REVIEW_AUTHORS.has(author)) return null;
     const body = typeof comment.body === "string" ? comment.body : "";
-    const marker = body.match(/<!--\s*clawsweeper-verdict:pass\b([^>]*)-->/i);
+    const marker = body.match(/<!--\s*clawsweeper-verdict:([a-z-]+)\b([^>]*)-->/i);
     if (!marker) return null;
-    const attributes = markerAttributes(marker[1] ?? "");
+    const verdict = (marker[1] ?? "").toLowerCase();
+    if (!allowedVerdicts.has(verdict)) return null;
+    const attributes = markerAttributes(marker[2] ?? "");
     const reviewedAt = timestamp(attributes.reviewed_at);
     if (
+      attributes.item !== String(options.number) ||
       attributes.sha !== expectedHeadSha ||
+      attributes.updated_at !== expectedUpdatedAt ||
       reviewedAt === null ||
       !isReviewedPrActivityCursor(attributes.review_activity_cursor)
     ) {
