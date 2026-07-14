@@ -140,6 +140,12 @@ test("legacy repair payloads are rebound to one state commit and forced plan-onl
 test("commit finding intake keeps legacy reports audit-only", () => {
   const workflow = readWorkflow(commitFindingWorkflowPath);
   const inputs = workflow.on.workflow_dispatch.inputs;
+  assert.deepEqual(inputs.dispatch_key, {
+    description: "Stable commit finding dispatch idempotency key",
+    required: false,
+    default: "",
+    type: "string",
+  });
   assert.equal(inputs.report_revision.required, false);
   assert.equal(inputs.report_sha256.required, false);
   assert.equal(inputs.report_revision.default, "");

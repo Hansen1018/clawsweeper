@@ -52,6 +52,8 @@ test("commit report publication accepts only exact current-attempt bundles", () 
   assert.match(publisher, /--expected-run-attempt "\$GITHUB_RUN_ATTEMPT"/);
   assert.match(publisher, /--commit-report "\$\{report_files\[0\]\}"/);
   assert.match(publisher, /cmp -s "\$expected_shas_file" "\$actual_shas_file"/);
+  assert.match(publisher, /COMMIT_SWEEPER_ADDITIONAL_PROMPT:/);
+  assert.doesNotMatch(publisher, /--additional-prompt "\$ADDITIONAL_PROMPT"/);
   assert.match(publisher, /Attest current-attempt commit review reports/);
   assert.ok(
     publisher.indexOf("- name: Attest current-attempt commit review reports") <

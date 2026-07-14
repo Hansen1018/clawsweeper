@@ -19,6 +19,11 @@ on:
         description: "Commit SHA with a ClawSweeper finding"
         required: true
         type: string
+      dispatch_key:
+        description: "Stable commit finding dispatch idempotency key"
+        required: false
+        default: ""
+        type: string
       payload_version:
         description: "Dispatch payload contract; new producers send 2"
         required: false

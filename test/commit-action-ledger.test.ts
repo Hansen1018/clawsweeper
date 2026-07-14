@@ -1232,6 +1232,7 @@ test("commit range continuation dispatch records its own request and outcome", a
     ...process.env,
     ...workflowEnv(root, outputRoot),
     ...mockGhBinEnv(ghPath, path.dirname(ghPath)),
+    COMMIT_SWEEPER_ADDITIONAL_PROMPT: "--commit-offset",
     GITHUB_ACTION: "continue_commit_review",
     GITHUB_JOB: "publish",
     MOCK_GH_LOG: ghLog,
@@ -1265,6 +1266,8 @@ test("commit range continuation dispatch records its own request and outcome", a
       ghArgs.find((arg: string) => arg.startsWith("continuation_key=")) ?? "",
       /^continuation_key=commit-review-continuation-[a-f0-9]{24}$/,
     );
+    assert.ok(ghArgs.includes("commit_offset=20"));
+    assert.ok(ghArgs.includes("additional_prompt=--commit-offset"));
     const events = readEvents(outputRoot).filter(
       (event) => event.attributes?.publication_kind === "commit_review_continuation_dispatch",
     );

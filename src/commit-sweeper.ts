@@ -1337,7 +1337,11 @@ function dispatchContinuationCommand(args: Args): void {
     throw new Error("Invalid --commit-offset");
   }
   const createChecks = argBool(args, "create_checks");
-  const additionalPrompt = argString(args, "additional_prompt", "");
+  const additionalPrompt = argString(
+    args,
+    "additional_prompt",
+    process.env.COMMIT_SWEEPER_ADDITIONAL_PROMPT ?? "",
+  );
   const continuationIdentity = {
     repository,
     workflow,

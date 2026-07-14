@@ -812,7 +812,7 @@ jobs:
           AFTER_SHA: ${{ github.event.inputs.commit_sha || github.event.client_payload.after_sha || github.event.client_payload.commit_sha || '' }}
           NEXT_OFFSET: ${{ needs.plan.outputs.next_offset }}
           CREATE_CHECKS: ${{ needs.plan.outputs.create_checks }}
-          ADDITIONAL_PROMPT: ${{ github.event.inputs.additional_prompt || github.event.client_payload.additional_prompt || '' }}
+          COMMIT_SWEEPER_ADDITIONAL_PROMPT: ${{ github.event.inputs.additional_prompt || github.event.client_payload.additional_prompt || '' }}
         run: |
           set -euo pipefail
           node dist/commit-sweeper.js dispatch-continuation \
@@ -822,8 +822,7 @@ jobs:
             --after-sha "$AFTER_SHA" \
             --before-sha "$BEFORE_SHA" \
             --commit-offset "$NEXT_OFFSET" \
-            --create-checks "$CREATE_CHECKS" \
-            --additional-prompt "$ADDITIONAL_PROMPT"
+            --create-checks "$CREATE_CHECKS"
 
       - name: Finalize commit publication action ledger
         id: finalize-publication-action-ledger
