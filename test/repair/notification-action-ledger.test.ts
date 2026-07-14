@@ -287,6 +287,56 @@ test("retrying hook delivery records every wire request as its own attempt", asy
   }
 });
 
+test("retried delivery remains unknown after an ambiguous attempt precedes rejection", async () => {
+  const root = fs.realpathSync(
+    fs.mkdtempSync(path.join(os.tmpdir(), "notification-ambiguous-retry-")),
+  );
+  const outputRoot = path.join(root, "output");
+  fs.mkdirSync(outputRoot);
+  const previous = { ...process.env };
+  Object.assign(process.env, workflowEnv(root, outputRoot));
+  const input: NotificationLedgerInput = {
+    repository: "openclaw/clawsweeper",
+    key: "notification:test:ambiguous-retry",
+    number: 47,
+  };
+
+  try {
+    await assert.rejects(
+      deliverRetriedNotification(input, async (attemptRunner) => {
+        await assert.rejects(
+          attemptRunner(async () => {
+            throw new Error("connection reset after delivery");
+          }),
+          /connection reset/,
+        );
+        return attemptRunner(async () => {
+          throw new OpenClawHookHttpError(422, "invalid request");
+        });
+      }),
+      /OpenClaw hook returned 422/,
+    );
+    await flushRepairActionEvents();
+
+    const events = readEvents(outputRoot);
+    assert.deepEqual(
+      events
+        .filter((event) => event.event_type === ACTION_EVENT_TYPES.repairMutation)
+        .map((event) => event.attributes?.completion_reason),
+      ["mutation_attempted", "mutation_outcome_unknown", "mutation_attempted", "mutation_rejected"],
+    );
+    const terminal = events.find(
+      (event) => event.event_type === ACTION_EVENT_TYPES.notificationFailed,
+    );
+    assert.equal(terminal?.attributes?.completion_reason, "mutation_outcome_unknown");
+    assert.equal(terminal?.action.mutation, true);
+    assert.equal(terminal?.action.retryable, true);
+  } finally {
+    restoreEnv(previous);
+    fs.rmSync(root, { force: true, recursive: true });
+  }
+});
+
 test("all shared OpenClaw notification callers use per-wire attempt runners", () => {
   for (const file of [
     "src/repair/notify-events.ts",

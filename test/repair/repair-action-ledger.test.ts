@@ -455,6 +455,20 @@ test(
         eventIdentity: { kind: "foreign_branch_push", requestAttempt: 1, outcome: "accepted" },
         idempotencyIdentity: { mutation: "foreign_branch_push", request: "other" },
       });
+      recordRepairLifecycleEvent(lifecycle, {
+        type: ACTION_EVENT_TYPES.repairMutation,
+        status: ACTION_EVENT_STATUSES.failed,
+        reasonCode: ACTION_EVENT_REASON_CODES.unavailable,
+        mutation: true,
+        retryable: true,
+        component: "repair_mutation",
+        operation: "repair",
+        parentEventId: attempt.event_id,
+        state: "mutation_unknown",
+        completionReason: "mutation_outcome_unknown",
+        eventIdentity: { kind, requestAttempt: 1, outcome: "unknown" },
+        idempotencyIdentity,
+      });
 
       recoverRepairMutationOutcomes();
       await flushRepairActionEvents();
@@ -468,6 +482,15 @@ test(
       );
       assert.equal(exactTerminal.length, 1);
       assert.equal(exactTerminal[0]?.action.status, ACTION_EVENT_STATUSES.executed);
+      assert.equal(
+        events.filter(
+          (event) =>
+            event.parent_event_id === attempt.event_id &&
+            event.idempotency_key_sha256 === attempt.idempotency_key_sha256 &&
+            event.attributes?.completion_reason === "mutation_outcome_unknown",
+        ).length,
+        1,
+      );
       assert.equal(
         walk(outputRoot).some((file) =>
           file.includes(`${path.sep}.mutation-recovery${path.sep}repair${path.sep}`),

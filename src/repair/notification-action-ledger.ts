@@ -191,21 +191,29 @@ export async function deliverRetriedNotification<T>(
   operation: (attemptRunner: NotificationAttemptRunner) => Promise<T>,
 ): Promise<T> {
   recordNotificationPhase(input, "planned");
+  let ambiguousAttemptObserved = false;
   let result: T;
   try {
-    result = await operation((attempt) =>
-      deliverNotificationAttempt(input, {
-        kind: "notification_delivery",
-        destination: "openclaw_hook",
-        operation: attempt,
-      }),
-    );
+    result = await operation(async (attempt) => {
+      try {
+        return await deliverNotificationAttempt(input, {
+          kind: "notification_delivery",
+          destination: "openclaw_hook",
+          operation: attempt,
+        });
+      } catch (error) {
+        if (!isRejectedOpenClawHookError(error)) ambiguousAttemptObserved = true;
+        throw error;
+      }
+    });
   } catch (error) {
     recordNotificationPhaseSafely(
       input,
       "failed",
       error instanceof Error ? error.name : typeof error,
-      isRejectedOpenClawHookError(error) ? "mutation_rejected" : "mutation_outcome_unknown",
+      !ambiguousAttemptObserved && isRejectedOpenClawHookError(error)
+        ? "mutation_rejected"
+        : "mutation_outcome_unknown",
     );
     throw error;
   }

@@ -1043,13 +1043,27 @@ function repairMutationOutcomeRecorded(
   context: RepairActionLedgerContext,
 ): boolean {
   const idempotencyKeySha256 = actionIdempotencyKey(payload.options.idempotencyIdentity);
-  return repairAttemptEvents(payload.input, payload.options.operation, context).some(
-    (event) =>
+  return repairAttemptEvents(payload.input, payload.options.operation, context).some((event) => {
+    const completionReason = String(event.attributes?.completion_reason ?? "");
+    return (
       event.parent_event_id === (payload.options.parentEventId ?? null) &&
       event.event_type === ACTION_EVENT_TYPES.repairMutation &&
       event.idempotency_key_sha256 === idempotencyKeySha256 &&
-      TERMINAL_MUTATION_COMPLETION_REASONS.has(String(event.attributes?.completion_reason ?? "")),
-  );
+      repairMutationOutcomeSatisfies(payload.options.outcome, completionReason)
+    );
+  });
+}
+
+function repairMutationOutcomeSatisfies(
+  expected: RepairMutationOutcome,
+  completionReason: string,
+): boolean {
+  if (!TERMINAL_MUTATION_COMPLETION_REASONS.has(completionReason)) return false;
+  if (expected === "unknown") return true;
+  if (expected === "accepted") {
+    return completionReason === "mutation_accepted" || completionReason === "mutation_observed";
+  }
+  return completionReason === "mutation_rejected";
 }
 
 function repairProducerMatches(
