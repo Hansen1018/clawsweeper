@@ -6,6 +6,11 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
+import {
+  readCommitReviewGitHubContext,
+  renderCommitReviewGitHubContext,
+} from "../dist/commit-review-context.js";
+
 const CLI = fileURLToPath(new URL("../dist/commit-sweeper.js", import.meta.url));
 
 test("commit review emits current-attempt report and receipt bundles without write credentials", () => {
@@ -330,10 +335,11 @@ process.stdout.write(JSON.stringify(value));
 
     assert.equal(result.status, 0, result.stderr);
     assert.ok(fs.statSync(contextPath).size <= 64 * 1024);
-    const context = JSON.parse(fs.readFileSync(contextPath, "utf8")) as {
-      references: Array<{ body_excerpt: string }>;
-      limitations: string[];
-    };
+    const context = readCommitReviewGitHubContext(contextPath, {
+      targetRepo: "openclaw/clawsweeper",
+      sha,
+    });
+    assert.ok(Buffer.byteLength(renderCommitReviewGitHubContext(context), "utf8") <= 64 * 1024);
     assert.ok(context.references.length > 0);
     assert.ok(
       context.references.length < 12 ||

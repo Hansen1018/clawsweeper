@@ -445,7 +445,7 @@ function fitCommitReviewGitHubContext(
 }
 
 function commitReviewGitHubContextBytes(context: CommitReviewGitHubContext): number {
-  return Buffer.byteLength(`${JSON.stringify(context, null, 2)}\n`, "utf8");
+  return Buffer.byteLength(renderCommitReviewGitHubContext(context), "utf8");
 }
 
 export function readCommitReviewGitHubContext(
@@ -484,10 +484,6 @@ function validateCommitReviewGitHubContext(
   if (context.repository !== expected.targetRepo || context.commit_sha !== expected.sha) {
     throw new Error("commit review GitHub context does not match the requested commit");
   }
-  const serialized = JSON.stringify(context);
-  if (Buffer.byteLength(serialized) > CONTEXT_MAX_BYTES) {
-    throw new Error(`commit review GitHub context exceeds ${CONTEXT_MAX_BYTES} bytes`);
-  }
   if (
     !Array.isArray(context.references) ||
     context.references.length > MAX_REFERENCES ||
@@ -502,7 +498,7 @@ function validateCommitReviewGitHubContext(
   ) {
     throw new Error("commit review GitHub context exceeds collection bounds");
   }
-  return {
+  const normalized: CommitReviewGitHubContext = {
     schema_version: CONTEXT_SCHEMA_VERSION,
     repository: expected.targetRepo,
     commit_sha: expected.sha,
@@ -514,6 +510,10 @@ function validateCommitReviewGitHubContext(
     workflow_runs: context.workflow_runs.map(parseWorkflowRun),
     limitations: context.limitations.map((entry) => requiredText(entry, 500, "limitation")),
   };
+  if (commitReviewGitHubContextBytes(normalized) > CONTEXT_MAX_BYTES) {
+    throw new Error(`commit review GitHub context exceeds ${CONTEXT_MAX_BYTES} bytes`);
+  }
+  return normalized;
 }
 
 function prehydratedLogin(value: unknown, label: string): string {
