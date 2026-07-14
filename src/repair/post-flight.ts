@@ -15,9 +15,11 @@ import { stripAnsi } from "./comment-router-utils.js";
 import {
   ghErrorText,
   ghJsonWithRetry as ghJson,
+  ghPagedLimitWithRetry as ghPagedLimit,
   ghText as ghOneShot,
   ghTextWithRetry as ghWithRetry,
 } from "./github-cli.js";
+import { MAX_REVIEWED_PR_ACTIVITY } from "../review-activity-cursor.js";
 import { parsePullRequestUrl } from "./github-ref.js";
 import { sleepMs } from "./timing.js";
 import {
@@ -45,7 +47,7 @@ import {
   type RepairMutationContext,
   type RepairMutationFreshnessGuard,
 } from "./repair-mutation-safety.js";
-import { resolveRepairMutationReviewActivityCursor } from "./repair-mutation-review-baseline.js";
+import { mintRepairMutationReviewAuthorizations } from "./repair-mutation-review-baseline.js";
 import { repairRequiredCheckRollupSnapshot } from "./repair-mutation-checks.js";
 import { compactText as compactPlainText } from "./text-utils.js";
 
@@ -240,32 +242,19 @@ function finalizeFixPr(action: LooseRecord) {
       };
     }
 
-    if (!dryRun) {
-      try {
-        freshness = createRepairMutationFreshnessGuard({
-          repository: result.repo,
-          number: parsed.number,
-          targetKind: "pull_request",
-          expectedUpdatedAt: pull.updated_at ?? view.updatedAt,
-          expectedReviewActivityCursor: resolveRepairMutationReviewActivityCursor({
-            repository: result.repo,
-            number: parsed.number,
-            targetKind: "pull_request",
-            authorization: "merge",
-            explicitCursor:
-              action.review_activity_cursor ?? action.merge_preflight?.review_activity_cursor,
-            explicitVerdict: action.review_verdict ?? action.merge_preflight?.review_verdict,
-            expectedUpdatedAt: pull.updated_at ?? view.updatedAt,
-            expectedHeadSha: action.commit,
-            reviewedBefore: report.post_flight_at,
-          }),
-        });
-      } catch (error) {
-        if (error instanceof RepairMutationFreshnessError) {
-          return postFlightFreshnessBlock(prBase, error, waitedMs);
-        }
-        throw error;
+    try {
+      freshness = createPostFlightMergeFreshnessGuard({
+        action,
+        number: parsed.number,
+        pull,
+        view,
+        validatedCommit,
+      });
+    } catch (error) {
+      if (error instanceof RepairMutationFreshnessError) {
+        return postFlightFreshnessBlock(prBase, error, waitedMs);
       }
+      throw error;
     }
 
     mergeBlock = validateMergeableFixPr({ pull, view, preflight: action.merge_preflight });
@@ -836,6 +825,89 @@ function validateResolvedReviewThreads(repo: string, number: JsonValue) {
 
 function fetchPullRequest(repo: string, number: JsonValue) {
   return ghJson(["api", `repos/${repo}/pulls/${number}`]);
+}
+
+function repairAuthorizationComments(repo: string, number: number) {
+  return ghPagedLimit<unknown>(
+    `repos/${repo}/issues/${number}/comments`,
+    MAX_REVIEWED_PR_ACTIVITY + 1,
+  );
+}
+
+function createPostFlightMergeFreshnessGuard({
+  action,
+  number,
+  pull,
+  view,
+  validatedCommit,
+}: {
+  action: LooseRecord;
+  number: number;
+  pull: LooseRecord;
+  view: LooseRecord;
+  validatedCommit: string;
+}): RepairMutationFreshnessGuard {
+  const carriedAuthorization =
+    action.review_authorization ?? action.automerge_shepherd?.review_authorization ?? null;
+  if (carriedAuthorization) {
+    try {
+      return postFlightMergeFreshnessGuard({
+        number,
+        pull,
+        view,
+        validatedCommit,
+        reviewAuthorization: carriedAuthorization,
+      });
+    } catch (error) {
+      if (!(error instanceof RepairMutationFreshnessError)) throw error;
+    }
+  }
+
+  const reviewAuthorization =
+    mintRepairMutationReviewAuthorizations({
+      repository: result.repo,
+      number,
+      targetKind: "pull_request",
+      target: pull,
+      comments: repairAuthorizationComments(result.repo, number),
+      expectedHeadSha: validatedCommit,
+      reviewedBefore: report.post_flight_at,
+    }).find((candidate) => candidate.authorization === "merge") ?? null;
+  return postFlightMergeFreshnessGuard({
+    number,
+    pull,
+    view,
+    validatedCommit,
+    reviewAuthorization,
+  });
+}
+
+function postFlightMergeFreshnessGuard({
+  number,
+  pull,
+  view,
+  validatedCommit,
+  reviewAuthorization,
+}: {
+  number: number;
+  pull: LooseRecord;
+  view: LooseRecord;
+  validatedCommit: string;
+  reviewAuthorization: LooseRecord | null;
+}): RepairMutationFreshnessGuard {
+  return createRepairMutationFreshnessGuard({
+    repository: result.repo,
+    number,
+    targetKind: "pull_request",
+    expectedUpdatedAt: pull.updated_at ?? view.updatedAt,
+    reviewAuthorization: {
+      snapshot: reviewAuthorization,
+      authorization: "merge",
+      expectedHeadSha: validatedCommit,
+      expectedReviewedUpdatedAt: reviewAuthorization?.reviewed_updated_at,
+      reviewedBefore: report.post_flight_at,
+    },
+  });
 }
 
 function fetchPullRequestView(repo: string, number: JsonValue) {

@@ -1,19 +1,23 @@
 import { actionIdempotencyKey, type ActionEvent } from "../action-ledger.js";
-import {
-  ReviewedPrActivityChangedDuringReadError,
-  isReviewedPrActivityCursor,
-} from "../review-activity-cursor.js";
+import { ReviewedPrActivityChangedDuringReadError } from "../review-activity-cursor.js";
 import {
   fetchStableRepairReviewActivityCursor,
   fetchStableRepairTargetActivity,
+  fetchStableRepairTargetActivityEvidence,
   normalizeRepairTargetActivitySnapshot,
   repairCreatedCommentChange,
   repairTargetActivityMatchesOwnedChange,
   sameRepairTargetActivity,
   type RepairMutationOwnedChange,
   type RepairMutationTargetKind,
+  type RepairTargetActivityEvidence,
   type RepairTargetActivitySnapshot,
 } from "./repair-mutation-activity.js";
+import {
+  validateRepairMutationReviewAuthorization,
+  type RepairMutationReviewAuthorization,
+  type RepairMutationReviewAuthorizationSnapshot,
+} from "./repair-mutation-review-baseline.js";
 import {
   ensureRepairMutationActionLedger,
   flushRepairMutationReceipts,
@@ -52,8 +56,15 @@ type RepairMutationFreshnessOptions = {
   number: number;
   targetKind: RepairMutationTargetKind;
   expectedUpdatedAt?: string | null;
-  expectedReviewActivityCursor?: string | null;
+  reviewAuthorization?: {
+    snapshot: RepairMutationReviewAuthorizationSnapshot | unknown;
+    authorization: RepairMutationReviewAuthorization;
+    expectedHeadSha?: string | null;
+    expectedReviewedUpdatedAt?: string | null;
+    reviewedBefore?: string | null;
+  } | null;
   readTargetActivity?: () => RepairTargetActivitySnapshot | null;
+  readTargetActivityEvidence?: () => RepairTargetActivityEvidence | null;
   readReviewActivityCursor?: () => string | null;
 };
 
@@ -93,10 +104,27 @@ export class RepairMutationOutcomeUnknownError extends Error {
 export function createRepairMutationFreshnessGuard(
   options: RepairMutationFreshnessOptions,
 ): RepairMutationFreshnessGuard {
+  const readTargetActivityEvidence =
+    options.readTargetActivityEvidence ??
+    (options.readTargetActivity
+      ? () => {
+          const snapshot = options.readTargetActivity?.();
+          return snapshot ? { snapshot, comments: [] } : null;
+        }
+      : () =>
+          fetchStableRepairTargetActivityEvidence(
+            options.repository,
+            options.number,
+            options.targetKind,
+          ));
   const readTargetActivity =
     options.readTargetActivity ??
     (() => fetchStableRepairTargetActivity(options.repository, options.number, options.targetKind));
-  let expectedTargetActivity = readRequiredTargetActivity(readTargetActivity, "freshness baseline");
+  const expectedTargetEvidence = readRequiredTargetActivityEvidence(
+    readTargetActivityEvidence,
+    "freshness baseline",
+  );
+  let expectedTargetActivity = expectedTargetEvidence.snapshot;
   const expectedUpdatedAt = normalizedTimestamp(options.expectedUpdatedAt);
   if (expectedUpdatedAt && expectedUpdatedAt !== expectedTargetActivity.updatedAt) {
     throw new RepairMutationFreshnessError(
@@ -108,10 +136,37 @@ export function createRepairMutationFreshnessGuard(
   const readReviewActivityCursor =
     options.readReviewActivityCursor ??
     (() => fetchStableRepairReviewActivityCursor(options.repository, options.number));
-  const expectedReviewActivityCursor =
-    options.targetKind === "pull_request"
-      ? requiredReviewActivityCursor(options.expectedReviewActivityCursor)
-      : null;
+  let expectedReviewActivityCursor: string | null = null;
+  if (options.targetKind === "pull_request") {
+    const authorization = options.reviewAuthorization;
+    if (!authorization) {
+      throw new RepairMutationFreshnessError(
+        "freshness_baseline",
+        "trusted repair review authorization is unavailable",
+        false,
+      );
+    }
+    try {
+      expectedReviewActivityCursor = validateRepairMutationReviewAuthorization({
+        snapshot: authorization.snapshot,
+        repository: options.repository,
+        number: options.number,
+        targetKind: options.targetKind,
+        authorization: authorization.authorization,
+        expectedHeadSha: authorization.expectedHeadSha,
+        expectedReviewedUpdatedAt: authorization.expectedReviewedUpdatedAt,
+        reviewedBefore: authorization.reviewedBefore,
+        targetActivity: expectedTargetActivity,
+        comments: expectedTargetEvidence.comments,
+      });
+    } catch {
+      throw new RepairMutationFreshnessError(
+        "freshness_baseline",
+        "trusted repair review authorization is unavailable or stale",
+        false,
+      );
+    }
+  }
 
   const assertReviewActivityFresh = (mutationKind: string) => {
     if (options.targetKind !== "pull_request") return;
@@ -331,22 +386,39 @@ function readRequiredTargetActivity(
   }
 }
 
-function requiredReviewActivityCursor(expected: string | null | undefined): string {
-  if (!expected) {
+function readRequiredTargetActivityEvidence(
+  readTargetActivityEvidence: () => RepairTargetActivityEvidence | null,
+  mutationKind: string,
+): RepairTargetActivityEvidence {
+  let value: RepairTargetActivityEvidence | null;
+  try {
+    value = readTargetActivityEvidence();
+  } catch {
     throw new RepairMutationFreshnessError(
-      "freshness_baseline",
-      "reviewed pull request activity cursor is unavailable",
+      mutationKind,
+      "target activity snapshot could not be refreshed",
+      true,
+    );
+  }
+  if (!value) {
+    throw new RepairMutationFreshnessError(
+      mutationKind,
+      "target activity exceeds the bounded repair snapshot",
       false,
     );
   }
-  if (!isReviewedPrActivityCursor(expected)) {
+  try {
+    return {
+      snapshot: normalizeRepairTargetActivitySnapshot(value.snapshot),
+      comments: Array.isArray(value.comments) ? value.comments : [],
+    };
+  } catch {
     throw new RepairMutationFreshnessError(
-      "freshness_baseline",
-      "stored repair review activity cursor is invalid",
-      false,
+      mutationKind,
+      "target activity snapshot is malformed",
+      true,
     );
   }
-  return expected;
 }
 
 function knownRejectedOutcome(

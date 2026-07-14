@@ -13,6 +13,8 @@ import {
 } from "./lib.js";
 import { ghJson, ghPaged, ghPagedLimit, ghText } from "./github-cli.js";
 import { hasSecurityRepairOptInLabel } from "./security-boundary.js";
+import { MAX_REVIEWED_PR_ACTIVITY } from "../review-activity-cursor.js";
+import { mintRepairMutationReviewAuthorizations } from "./repair-mutation-review-baseline.js";
 
 function readNonNegativeIntegerEnv(name: string, fallback: number): number {
   const raw = process.env[name];
@@ -160,6 +162,9 @@ const plan = {
     max_files_per_pr: MAX_FILES_PER_PR,
     max_commits_per_pr: MAX_COMMITS_PER_PR,
   },
+  review_authorizations: itemList.flatMap(
+    (item: JsonValue) => item.repair_review_authorizations ?? [],
+  ),
   items: itemList.map((item: JsonValue) => summarizeItem(item, job)),
   canonical_candidates: canonicalCandidates(itemList, job),
   safety_gates: [
@@ -200,8 +205,13 @@ function hydrateItem(repo: string, number: JsonValue) {
   } catch (error) {
     return unavailableItem(repo, number, error);
   }
-  const comments = HYDRATE_COMMENTS ? ghPaged(`repos/${repo}/issues/${number}/comments`) : [];
   const pullRequest = issue.pull_request ? ghJson(["api", `repos/${repo}/pulls/${number}`]) : null;
+  const comments = HYDRATE_COMMENTS ? ghPaged(`repos/${repo}/issues/${number}/comments`) : [];
+  const authorizationComments = pullRequest
+    ? HYDRATE_COMMENTS
+      ? comments
+      : ghPagedLimit(`repos/${repo}/issues/${number}/comments`, MAX_REVIEWED_PR_ACTIVITY + 1)
+    : [];
   const files = pullRequest
     ? ghPagedLimit(`repos/${repo}/pulls/${number}/files`, MAX_FILES_PER_PR)
     : [];
@@ -239,6 +249,17 @@ function hydrateItem(repo: string, number: JsonValue) {
       body: comment.body ?? "",
       body_excerpt: excerpt(comment.body),
     })),
+    repair_review_authorizations: pullRequest
+      ? mintRepairMutationReviewAuthorizations({
+          repository: repo,
+          number: Number(number),
+          targetKind: "pull_request",
+          target: pullRequest,
+          comments: authorizationComments,
+          expectedHeadSha: pullRequest.head?.sha,
+          reviewedBefore: new Date().toISOString(),
+        })
+      : [],
     pull_request: pullRequest
       ? {
           draft: pullRequest.draft,

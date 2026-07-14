@@ -232,6 +232,12 @@ export function reportFrontMatter(overrides = {}) {
   if (values.type === "pull_request" && !Object.hasOwn(values, "review_activity_cursor")) {
     Object.assign(values, { review_activity_cursor: emptyReviewedPrActivityCursor });
   }
+  if (
+    values.type === "pull_request" &&
+    !Object.hasOwn(values, "review_authorization_target_digest")
+  ) {
+    Object.assign(values, { review_authorization_target_digest: "e".repeat(64) });
+  }
   return `---
 ${Object.entries(values)
   .map(([key, value]) => `${key}: ${value}`)
@@ -348,6 +354,12 @@ export function workPlanCandidateReport(overrides = {}) {
     !Object.hasOwn(frontmatter, "review_activity_cursor")
   ) {
     Object.assign(frontmatter, { review_activity_cursor: emptyReviewedPrActivityCursor });
+  }
+  if (
+    frontmatter.type === "pull_request" &&
+    !Object.hasOwn(frontmatter, "review_authorization_target_digest")
+  ) {
+    Object.assign(frontmatter, { review_authorization_target_digest: "e".repeat(64) });
   }
   return `---
 ${Object.entries(frontmatter)

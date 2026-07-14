@@ -110,6 +110,46 @@ test("repair branch pushes settle and re-check the exact source head", () => {
   assert.match(settle, /requeue_required: true/);
 });
 
+test("automerge shepherd does not mutate target status after a trusted ready verdict", () => {
+  const sourcePath = path.join(process.cwd(), "src/repair/execute-fix-artifact.ts");
+  const source = readText(sourcePath);
+  const waitStart = source.indexOf("function waitForAutomergeAfterBranchRepair(");
+  const waitEnd = source.indexOf("function dispatchAutomergeCommentRouter(", waitStart);
+  assert.notEqual(waitStart, -1);
+  assert.notEqual(waitEnd, -1);
+  const wait = source.slice(waitStart, waitEnd);
+  const mintIndex = wait.indexOf("mintRepairMutationReviewAuthorizations({");
+  const guardedUpdateIndex = wait.indexOf('if (readiness.status !== "ready") {', mintIndex);
+  const terminalUpdateIndex = wait.indexOf("updateAutomergeProgressStatus({", guardedUpdateIndex);
+
+  assert.notEqual(mintIndex, -1);
+  assert.notEqual(guardedUpdateIndex, -1);
+  assert.notEqual(terminalUpdateIndex, -1);
+  assert.ok(
+    mintIndex < guardedUpdateIndex && guardedUpdateIndex < terminalUpdateIndex,
+    "the ready path must mint without a later target status mutation",
+  );
+});
+
+test("repair completion does not mutate target status after carrying trusted authorization", () => {
+  const sourcePath = path.join(process.cwd(), "src/repair/execute-fix-artifact.ts");
+  const source = readText(sourcePath);
+  const reportWriteIndex = source.indexOf("writeReport(report, resultPath);");
+  const guardedUpdateIndex = source.indexOf(
+    "if (!outcome.review_authorization && !outcome.automerge_shepherd?.review_authorization) {",
+    reportWriteIndex,
+  );
+  const finishedUpdateIndex = source.indexOf('id: "repair-finished"', guardedUpdateIndex);
+
+  assert.notEqual(reportWriteIndex, -1);
+  assert.notEqual(guardedUpdateIndex, -1);
+  assert.notEqual(finishedUpdateIndex, -1);
+  assert.ok(
+    reportWriteIndex < guardedUpdateIndex && guardedUpdateIndex < finishedUpdateIndex,
+    "trusted authorization must suppress the final target status mutation",
+  );
+});
+
 test("merged source replacement skip runs before publishing replacement PRs", () => {
   const sourcePath = path.join(process.cwd(), "src/repair/execute-fix-artifact.ts");
   const source = readText(sourcePath);

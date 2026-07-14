@@ -124,6 +124,10 @@ import {
   freshExactHeadReviewStartLease,
 } from "./repair/comment-router-core.js";
 import {
+  repairTargetActivityDigest,
+  repairTargetActivitySnapshotFromTarget,
+} from "./repair/repair-mutation-activity.js";
+import {
   AUTOMERGE_LABEL,
   AUTOFIX_LABEL,
   CLOSE_PROTECTED_LABEL_NAMES,
@@ -758,6 +762,7 @@ interface ItemContext {
   pullReviewComments?: unknown[];
   pullReviewCommentsRevision?: string;
   pullReviewActivityCursor?: string;
+  pullReviewTargetActivityDigest?: string;
   pullChecks?: unknown;
   counts?: {
     comments: number;
@@ -8753,6 +8758,16 @@ function collectItemContext(
   }
   if (item.kind === "pull_request") {
     pullRequest = ghJson<unknown>(["api", `repos/${targetRepo()}/pulls/${item.number}`]);
+    try {
+      const previousReviewCommentId =
+        stringOrUndefined(asRecord(previousClawSweeperReview).commentId)?.trim() ?? "";
+      context.pullReviewTargetActivityDigest = repairTargetActivityDigest(
+        repairTargetActivitySnapshotFromTarget(pullRequest, sourceRevisionComments, "pull_request"),
+        previousReviewCommentId || null,
+      );
+    } catch {
+      // A missing bounded target digest leaves the review non-authorizing for repair mutations.
+    }
     const pullRecord = asRecord(pullRequest);
     const pullFilesWindow = ghPagedContextWindow<unknown>(
       `repos/${targetRepo()}/pulls/${item.number}/files`,
@@ -18910,6 +18925,8 @@ function reviewVersionMarkerFromReport(markdown: string): string {
   const headSha = pullHeadShaFromReport(markdown) ?? "na";
   const sourceRevision = frontMatterValue(markdown, "item_source_revision") ?? "unknown";
   const reviewActivityCursor = frontMatterValue(markdown, "review_activity_cursor") ?? "unknown";
+  const targetActivityDigest =
+    frontMatterValue(markdown, "review_authorization_target_digest") ?? "unknown";
   const leaseOwner = frontMatterValue(markdown, "review_lease_owner") ?? "unknown";
   const leaseCommentId = frontMatterValue(markdown, "review_lease_comment_id") ?? "unknown";
   const attrs = [
@@ -18918,6 +18935,7 @@ function reviewVersionMarkerFromReport(markdown: string): string {
     `sha=${markerAttributeValue(headSha)}`,
     `source_revision=${markerAttributeValue(sourceRevision)}`,
     `review_activity_cursor=${markerAttributeValue(reviewActivityCursor)}`,
+    `target_activity_digest=${markerAttributeValue(targetActivityDigest)}`,
     `lease_owner=${markerAttributeValue(leaseOwner)}`,
     `lease_comment_id=${markerAttributeValue(leaseCommentId)}`,
     "v=1",
@@ -18956,6 +18974,8 @@ export function reviewAutomationMarkersFromReport(markdown: string): string {
   const reviewLeaseCommentId = frontMatterValue(markdown, "review_lease_comment_id") ?? "unknown";
   const sourceRevision = frontMatterValue(markdown, "item_source_revision") ?? "unknown";
   const reviewActivityCursor = frontMatterValue(markdown, "review_activity_cursor") ?? "unknown";
+  const targetActivityDigest =
+    frontMatterValue(markdown, "review_authorization_target_digest") ?? "unknown";
   const baseAttrs = [
     `item=${markerAttributeValue(number)}`,
     `sha=${markerAttributeValue(headSha)}`,
@@ -18966,6 +18986,7 @@ export function reviewAutomationMarkersFromReport(markdown: string): string {
     `lease_comment_id=${markerAttributeValue(reviewLeaseCommentId)}`,
     `source_revision=${markerAttributeValue(sourceRevision)}`,
     `review_activity_cursor=${markerAttributeValue(reviewActivityCursor)}`,
+    `target_activity_digest=${markerAttributeValue(targetActivityDigest)}`,
   ].join(" ");
   const securityNeedsAttention = reportSecurityReview(markdown).status === "needs_attention";
   const humanReviewMarkers = (): string => {
@@ -20733,6 +20754,7 @@ review_semantic_eligibility_reason: ${options.semanticRecord?.eligibilityReason 
 review_semantic_cache_hit: false
 item_source_revision: ${options.context.sourceRevision ?? "unknown"}
 review_activity_cursor: ${options.context.pullReviewActivityCursor ?? "unknown"}
+review_authorization_target_digest: ${options.context.pullReviewTargetActivityDigest ?? "unknown"}
 close_comment_sha256: ${options.action.closeComment ? sha256(options.action.closeComment) : "none"}
 review_comment_sha256: none
 review_comment_id: unknown

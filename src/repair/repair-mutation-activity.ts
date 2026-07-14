@@ -23,7 +23,7 @@ export type RepairMutationOwnedChange =
       label: string;
     };
 
-type RepairTargetActivityComment = {
+export type RepairTargetActivityComment = {
   id: string;
   author: string | null;
   authorAssociation: string | null;
@@ -39,6 +39,11 @@ export type RepairTargetActivitySnapshot = {
   labels: string[];
   metadataSha256: string;
   comments: RepairTargetActivityComment[];
+};
+
+export type RepairTargetActivityEvidence = {
+  snapshot: RepairTargetActivitySnapshot;
+  comments: unknown[];
 };
 
 const MAX_REPAIR_TARGET_COMMENTS = 1_000;
@@ -70,9 +75,19 @@ export function fetchStableRepairTargetActivity(
   number: number,
   targetKind: RepairMutationTargetKind = "issue",
 ): RepairTargetActivitySnapshot | null {
-  const first = fetchRepairTargetActivityOnce(repository, number, targetKind);
-  const second = fetchRepairTargetActivityOnce(repository, number, targetKind);
-  if (actionIdempotencyKey(first) !== actionIdempotencyKey(second)) {
+  return fetchStableRepairTargetActivityEvidence(repository, number, targetKind)?.snapshot ?? null;
+}
+
+export function fetchStableRepairTargetActivityEvidence(
+  repository: string,
+  number: number,
+  targetKind: RepairMutationTargetKind = "issue",
+): RepairTargetActivityEvidence | null {
+  const first = fetchRepairTargetActivityEvidenceOnce(repository, number, targetKind);
+  const second = fetchRepairTargetActivityEvidenceOnce(repository, number, targetKind);
+  if (
+    actionIdempotencyKey(first?.snapshot ?? null) !== actionIdempotencyKey(second?.snapshot ?? null)
+  ) {
     throw new Error("target activity changed while the bounded repair snapshot was captured");
   }
   return second;
@@ -124,6 +139,53 @@ export function normalizeRepairTargetActivitySnapshot(
   return { updatedAt, state, labels, metadataSha256, comments };
 }
 
+export function repairTargetActivitySnapshotFromTarget(
+  target: unknown,
+  comments: unknown[],
+  targetKind: RepairMutationTargetKind,
+): RepairTargetActivitySnapshot {
+  const targetRecord = record(target);
+  const updatedAt = normalizedTimestamp(targetRecord.updated_at ?? targetRecord.updatedAt);
+  if (!updatedAt) throw new Error("target activity timestamp is unavailable");
+  return normalizeRepairTargetActivitySnapshot({
+    updatedAt,
+    state: String(targetRecord.state ?? "")
+      .trim()
+      .toLowerCase(),
+    labels: normalizeLabels(targetRecord.labels),
+    metadataSha256: actionIdempotencyKey({
+      titleSha256: digestScalar(targetRecord.title),
+      bodySha256: digestScalar(targetRecord.body),
+      locked: targetRecord.locked === true,
+      stateReason: scalar(targetRecord.state_reason ?? targetRecord.stateReason),
+      authorAssociation: scalar(targetRecord.author_association ?? targetRecord.authorAssociation),
+      assignees: normalizeActors(targetRecord.assignees),
+      milestone: compactMilestone(targetRecord.milestone),
+      pullRequest:
+        targetKind === "pull_request"
+          ? compactPullRequestTarget(targetRecord)
+          : compactPullRequestLink(targetRecord.pull_request ?? targetRecord.pullRequest),
+    }),
+    comments: comments.map(compactTargetComment),
+  });
+}
+
+export function repairTargetActivityDigest(
+  value: RepairTargetActivitySnapshot,
+  excludedCommentId?: string | null,
+): string {
+  const snapshot = normalizeRepairTargetActivitySnapshot(value);
+  const excludedId = scalarId(excludedCommentId);
+  return actionIdempotencyKey({
+    state: snapshot.state,
+    labels: snapshot.labels,
+    metadataSha256: snapshot.metadataSha256,
+    comments: excludedId
+      ? snapshot.comments.filter((comment) => comment.id !== excludedId)
+      : snapshot.comments,
+  });
+}
+
 export function sameRepairTargetActivity(
   left: RepairTargetActivitySnapshot,
   right: RepairTargetActivitySnapshot,
@@ -162,44 +224,25 @@ export function repairTargetActivityMatchesOwnedChange(
   return actionIdempotencyKey(retained) === actionIdempotencyKey(before.comments);
 }
 
-function fetchRepairTargetActivityOnce(
+function fetchRepairTargetActivityEvidenceOnce(
   repository: string,
   number: number,
   targetKind: RepairMutationTargetKind,
-): RepairTargetActivitySnapshot | null {
+): RepairTargetActivityEvidence | null {
   const endpoint =
     targetKind === "pull_request"
       ? `repos/${repository}/pulls/${number}`
       : `repos/${repository}/issues/${number}`;
   const issue = record(ghJson<unknown>(["api", endpoint]));
-  const updatedAt = normalizedTimestamp(issue.updated_at ?? issue.updatedAt);
-  if (!updatedAt) throw new Error("target activity timestamp is unavailable");
   const comments = ghPagedLimit<unknown>(
     `repos/${repository}/issues/${number}/comments`,
     MAX_REPAIR_TARGET_COMMENTS + 1,
   );
   if (comments.length > MAX_REPAIR_TARGET_COMMENTS) return null;
-  return normalizeRepairTargetActivitySnapshot({
-    updatedAt,
-    state: String(issue.state ?? "")
-      .trim()
-      .toLowerCase(),
-    labels: normalizeLabels(issue.labels),
-    metadataSha256: actionIdempotencyKey({
-      titleSha256: digestScalar(issue.title),
-      bodySha256: digestScalar(issue.body),
-      locked: issue.locked === true,
-      stateReason: scalar(issue.state_reason ?? issue.stateReason),
-      authorAssociation: scalar(issue.author_association ?? issue.authorAssociation),
-      assignees: normalizeActors(issue.assignees),
-      milestone: compactMilestone(issue.milestone),
-      pullRequest:
-        targetKind === "pull_request"
-          ? compactPullRequestTarget(issue)
-          : compactPullRequestLink(issue.pull_request ?? issue.pullRequest),
-    }),
-    comments: comments.map(compactTargetComment),
-  });
+  return {
+    snapshot: repairTargetActivitySnapshotFromTarget(issue, comments, targetKind),
+    comments,
+  };
 }
 
 function fetchRepairReviewActivityCursorOnce(repository: string, number: number): string | null {

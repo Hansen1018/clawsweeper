@@ -48,6 +48,7 @@ import {
   automergeShepherdWaitConfig,
   canUseAutomergeFastRebase,
 } from "./automerge-shepherd.js";
+import { mintRepairMutationReviewAuthorizations } from "./repair-mutation-review-baseline.js";
 import { automergeOutcomeReviewedShaFromResult } from "./automerge-outcome.js";
 import { isCanonicalLandingNeedsHumanText } from "./comment-router-core.js";
 import { parsePullRequestUrl, pullRequestNumberFromUrl } from "./github-ref.js";
@@ -688,13 +689,15 @@ if (Array.isArray(outcome.needs_human) && outcome.needs_human.length > 0) {
 report.actions.push(outcome);
 writeReport(report, resultPath);
 if (outcome.requeue_required === true) process.exitCode = 1;
-updateAutomergeProgressStatus({
-  id: "repair-finished",
-  label: "repair finished",
-  status: outcome.status,
-  details: compactText(String(outcome.reason ?? outcome.action ?? "done"), 240),
-  headSha: outcome.commit ?? null,
-});
+if (!outcome.review_authorization && !outcome.automerge_shepherd?.review_authorization) {
+  updateAutomergeProgressStatus({
+    id: "repair-finished",
+    label: "repair finished",
+    status: outcome.status,
+    details: compactText(String(outcome.reason ?? outcome.action ?? "done"), 240),
+    headSha: outcome.commit ?? null,
+  });
+}
 
 function isRetryableCodexFailure(...values: JsonValue[]) {
   const messages = values.flat().map(String);
@@ -1116,6 +1119,7 @@ function pushRepairBranchAndUpdateStatus({
     commit: prep.commit,
     fast_rebase: fastRepair?.status === "ready" ? fastRepair : null,
     automerge_shepherd: shepherd,
+    review_authorization: shepherd.review_authorization ?? null,
     status_comment_updated: statusCommentUpdated,
     merge_preflight: prep.merge_preflight,
     review_threads: threadResolution,
@@ -4204,13 +4208,42 @@ function waitForAutomergeAfterBranchRepair({ target, commit }: LooseRecord) {
   });
   while (waitedMs <= config.maxWaitMs) {
     const view = fetchPullRequestViewForRepo({ repo: result.repo, number: target });
+    const comments = issueCommentsFor(target);
     const readiness = automergeShepherdReadiness({
       view,
-      comments: issueCommentsFor(target),
+      comments,
       headSha: String(commit),
     });
     lastReason = readiness.reason;
     if (["ready", "merged", "stopped", "blocked", "human"].includes(String(readiness.status))) {
+      let reviewAuthorization = null;
+      if (readiness.status === "ready") {
+        const pull = fetchPullRequestForRepo({ repo: result.repo, number: target });
+        const updatedComments = issueCommentsFor(target);
+        reviewAuthorization =
+          mintRepairMutationReviewAuthorizations({
+            repository: result.repo,
+            number: Number(target),
+            targetKind: "pull_request",
+            target: pull,
+            comments: updatedComments,
+            expectedHeadSha: commit,
+            reviewedBefore: new Date().toISOString(),
+          }).find((candidate) => candidate.authorization === "merge") ?? null;
+        if (!reviewAuthorization) {
+          readiness.status = "blocked";
+          readiness.reason = "trusted exact-head review lacks target activity authorization";
+        }
+      }
+      if (readiness.status !== "ready") {
+        updateAutomergeProgressStatus({
+          id: `automerge-wait-${commit}`,
+          label: "automerge wait",
+          status: readiness.status,
+          details: readiness.reason,
+          headSha: commit,
+        });
+      }
       const dispatch =
         readiness.status === "ready" || readiness.status === "blocked"
           ? dispatchAutomergeCommentRouter({ target, reason: readiness.reason })
@@ -4221,18 +4254,12 @@ function waitForAutomergeAfterBranchRepair({ target, commit }: LooseRecord) {
         waited_ms: waitedMs,
         dispatch_status: dispatch?.status ?? null,
       });
-      updateAutomergeProgressStatus({
-        id: `automerge-wait-${commit}`,
-        label: "automerge wait",
-        status: readiness.status,
-        details: readiness.reason,
-        headSha: commit,
-      });
       return {
         status: readiness.status,
         reason: readiness.reason,
         waited_ms: waitedMs,
         router_dispatch: dispatch,
+        review_authorization: reviewAuthorization,
       };
     }
     if (waitedMs >= config.maxWaitMs) break;
@@ -4445,6 +4472,16 @@ function issueCommentsFor(number: JsonValue) {
   );
   const parsed = JSON.parse(raw || "[]");
   return Array.isArray(parsed) ? parsed : [];
+}
+
+function fetchPullRequestForRepo({ repo, number }: LooseRecord) {
+  return JSON.parse(
+    run("gh", ["api", `repos/${repo}/pulls/${number}`], {
+      cwd: repoRoot(),
+      env: ghEnv(),
+      timeoutMs: currentNetworkCommandTimeoutMs(),
+    }),
+  );
 }
 
 function fetchPullRequestViewForRepo({ repo, number }: LooseRecord) {

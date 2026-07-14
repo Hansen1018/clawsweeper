@@ -66,7 +66,15 @@ import {
   type RepairMutationFreshnessGuard,
 } from "./repair-mutation-safety.js";
 import { repairRequiredCheckRollupSnapshot } from "./repair-mutation-checks.js";
-import { resolveRepairMutationReviewActivityCursor } from "./repair-mutation-review-baseline.js";
+import {
+  validateRepairMutationReviewAuthorizationAfterMerge,
+  type RepairMutationReviewAuthorization,
+  type RepairMutationReviewAuthorizationSnapshot,
+} from "./repair-mutation-review-baseline.js";
+import {
+  fetchStableRepairReviewActivityCursor,
+  fetchStableRepairTargetActivityEvidence,
+} from "./repair-mutation-activity.js";
 
 const MAINTAINER_AUTHOR_ASSOCIATIONS = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
 const CLOSE_ACTIONS = new Set([
@@ -543,6 +551,8 @@ function applyCloseAction({
   }
 
   const expectedUpdatedAt = action.target_updated_at ?? action.live_updated_at;
+  const reviewAuthorization =
+    kind === "pull_request" ? clusterPlanReviewAuthorization(target, "close") : null;
   if (!expectedUpdatedAt && !allowMissingUpdatedAt) {
     return {
       ...base,
@@ -552,7 +562,11 @@ function applyCloseAction({
       live_updated_at: live.updated_at,
     };
   }
-  if (expectedUpdatedAt && expectedUpdatedAt !== live.updated_at) {
+  if (
+    expectedUpdatedAt &&
+    expectedUpdatedAt !== live.updated_at &&
+    !(kind === "pull_request" && reviewAuthorization)
+  ) {
     return {
       ...base,
       status: "blocked",
@@ -594,7 +608,11 @@ function applyCloseAction({
       live_state: live.state,
     };
   }
-  if (expectedUpdatedAt && expectedUpdatedAt !== live.updated_at) {
+  if (
+    expectedUpdatedAt &&
+    expectedUpdatedAt !== live.updated_at &&
+    !(kind === "pull_request" && reviewAuthorization)
+  ) {
     return {
       ...base,
       status: "blocked",
@@ -657,6 +675,42 @@ function applyCloseAction({
     };
   }
 
+  let mutationContext: RepairMutationContext | null = null;
+  let freshness: RepairMutationFreshnessGuard;
+  try {
+    freshness = createRepairMutationFreshnessGuard({
+      repository: result.repo,
+      number: target,
+      targetKind: kind,
+      expectedUpdatedAt: live.updated_at,
+      reviewAuthorization:
+        kind === "pull_request"
+          ? {
+              snapshot: reviewAuthorization,
+              authorization: "close",
+              expectedHeadSha: fetchPullRequest(result.repo, target).head?.sha,
+              expectedReviewedUpdatedAt: reviewAuthorization?.reviewed_updated_at ?? null,
+              reviewedBefore: clusterPlan?.generated_at ?? result.generated_at,
+            }
+          : null,
+    });
+    if (!dryRun) {
+      mutationContext = repairMutationContext({
+        result,
+        action,
+        target,
+        targetKind: kind,
+        operationKey: idempotencyKey,
+        sourceRevision: expectedUpdatedAt,
+      });
+    }
+  } catch (error) {
+    if (error instanceof RepairMutationFreshnessError) {
+      return repairFreshnessBlock(base, live, error);
+    }
+    throw error;
+  }
+
   if (dryRun) {
     return {
       ...base,
@@ -668,33 +722,11 @@ function applyCloseAction({
       comment,
     };
   }
+  if (!mutationContext) {
+    throw new Error("repair close mutation context was not initialized");
+  }
 
   try {
-    const mutationContext = repairMutationContext({
-      result,
-      action,
-      target,
-      targetKind: kind,
-      operationKey: idempotencyKey,
-      sourceRevision: expectedUpdatedAt,
-    });
-    const freshness = createRepairMutationFreshnessGuard({
-      repository: result.repo,
-      number: target,
-      targetKind: kind,
-      expectedUpdatedAt,
-      expectedReviewActivityCursor: resolveRepairMutationReviewActivityCursor({
-        repository: result.repo,
-        number: target,
-        targetKind: kind,
-        authorization: "close",
-        explicitCursor: action.review_activity_cursor ?? action.target_review_activity_cursor,
-        explicitVerdict: action.review_verdict ?? action.target_review_verdict,
-        expectedUpdatedAt,
-        expectedHeadSha: clusterPlanPullHeadSha(target),
-        reviewedBefore: clusterPlan?.generated_at ?? result.generated_at,
-      }),
-    });
     const coveringBoundaryGuard = coveringAuthorizationSnapshot
       ? createRepairMutationBoundaryGuard({
           expectedState: coveringAuthorizationSnapshot,
@@ -784,6 +816,7 @@ function applyMergeAction({
   }
 
   const expectedUpdatedAt = action.target_updated_at ?? action.live_updated_at;
+  const reviewAuthorization = clusterPlanReviewAuthorization(target, "merge");
   if (!expectedUpdatedAt && !allowMissingUpdatedAt) {
     return {
       ...base,
@@ -793,7 +826,7 @@ function applyMergeAction({
       live_updated_at: live.updated_at,
     };
   }
-  if (expectedUpdatedAt && expectedUpdatedAt !== live.updated_at) {
+  if (expectedUpdatedAt && expectedUpdatedAt !== live.updated_at && !reviewAuthorization) {
     return {
       ...base,
       status: "blocked",
@@ -804,47 +837,41 @@ function applyMergeAction({
     };
   }
 
-  let mutationContext: RepairMutationContext | null = null;
-  let freshness: RepairMutationFreshnessGuard | null = null;
-  if (!dryRun) {
-    try {
-      mutationContext = repairMutationContext({
-        result,
-        action,
-        target,
-        targetKind: "pull_request",
-        operationKey: base.idempotency_key,
-        sourceRevision: result.reviewed_sha ?? result.head_sha ?? expectedUpdatedAt,
-      });
-      freshness = createRepairMutationFreshnessGuard({
-        repository: result.repo,
-        number: target,
-        targetKind: "pull_request",
-        expectedUpdatedAt,
-        expectedReviewActivityCursor: resolveRepairMutationReviewActivityCursor({
-          repository: result.repo,
-          number: target,
-          targetKind: "pull_request",
-          authorization: "merge",
-          explicitCursor: action.review_activity_cursor ?? action.target_review_activity_cursor,
-          explicitVerdict: action.review_verdict ?? action.target_review_verdict,
-          expectedUpdatedAt,
-          expectedHeadSha: clusterPlanPullHeadSha(target),
-          reviewedBefore: clusterPlan?.generated_at ?? result.generated_at,
-        }),
-      });
-    } catch (error) {
-      if (error instanceof RepairMutationFreshnessError) {
-        return repairFreshnessBlock(base, live, error);
-      }
-      throw error;
-    }
-  }
-
   const pullRequest = fetchPullRequest(result.repo, target);
   const view = fetchPullRequestView(result.repo, target);
   const mergedAt = pullRequest.merged_at ?? view.mergedAt ?? null;
   if (mergedAt) {
+    try {
+      const targetActivity = fetchStableRepairTargetActivityEvidence(
+        result.repo,
+        target,
+        "pull_request",
+      );
+      if (!targetActivity) {
+        throw new Error("merged pull request target activity exceeds the bounded repair snapshot");
+      }
+      validateRepairMutationReviewAuthorizationAfterMerge({
+        snapshot: reviewAuthorization,
+        repository: result.repo,
+        number: target,
+        targetKind: "pull_request",
+        authorization: "merge",
+        expectedHeadSha: pullRequest.head?.sha,
+        expectedReviewedUpdatedAt: reviewAuthorization?.reviewed_updated_at ?? null,
+        reviewedBefore: clusterPlan?.generated_at ?? result.generated_at,
+        targetActivity: targetActivity.snapshot,
+        comments: targetActivity.comments,
+        reviewActivityCursor: fetchStableRepairReviewActivityCursor(result.repo, target),
+      });
+    } catch {
+      return {
+        ...base,
+        status: "blocked",
+        reason: "trusted repair review authorization is unavailable or stale",
+        live_state: live.state,
+        live_updated_at: live.updated_at,
+      };
+    }
     return {
       ...base,
       status: "executed",
@@ -855,6 +882,40 @@ function applyMergeAction({
       merge_commit_sha: pullRequest.merge_commit_sha ?? view.mergeCommit?.oid ?? null,
     };
   }
+
+  let mutationContext: RepairMutationContext | null = null;
+  let freshness: RepairMutationFreshnessGuard;
+  try {
+    freshness = createRepairMutationFreshnessGuard({
+      repository: result.repo,
+      number: target,
+      targetKind: "pull_request",
+      expectedUpdatedAt: live.updated_at,
+      reviewAuthorization: {
+        snapshot: reviewAuthorization,
+        authorization: "merge",
+        expectedHeadSha: pullRequest.head?.sha,
+        expectedReviewedUpdatedAt: reviewAuthorization?.reviewed_updated_at ?? null,
+        reviewedBefore: clusterPlan?.generated_at ?? result.generated_at,
+      },
+    });
+    if (!dryRun) {
+      mutationContext = repairMutationContext({
+        result,
+        action,
+        target,
+        targetKind: "pull_request",
+        operationKey: base.idempotency_key,
+        sourceRevision: result.reviewed_sha ?? result.head_sha ?? expectedUpdatedAt,
+      });
+    }
+  } catch (error) {
+    if (error instanceof RepairMutationFreshnessError) {
+      return repairFreshnessBlock(base, live, error);
+    }
+    throw error;
+  }
+
   const lockedSkip = lockedConversationSkipIfLocked(base, live);
   if (lockedSkip) return { ...lockedSkip, merge_method: "squash" };
 
@@ -882,7 +943,7 @@ function applyMergeAction({
   const requiredChecks = repairRequiredCheckRollupSnapshot(view.statusCheckRollup ?? []);
 
   if (process.env.CLAWSWEEPER_ALLOW_MERGE !== "1") {
-    if (!dryRun && mutationContext && freshness) {
+    if (!dryRun && mutationContext) {
       try {
         labelForClawSweeperReview(mutationContext, freshness);
       } catch (error) {
@@ -912,7 +973,7 @@ function applyMergeAction({
       merge_method: "squash",
     };
   }
-  if (!mutationContext || !freshness) {
+  if (!mutationContext) {
     throw new Error("repair merge mutation guard was not initialized");
   }
 
@@ -2032,13 +2093,19 @@ function normalizeIssueRef(value: JsonValue, expectedRepo: JsonValue = "") {
   return issueNumberFromRef(value, String(expectedRepo ?? ""));
 }
 
-function clusterPlanPullHeadSha(number: number): string | null {
-  for (const item of clusterPlan?.items ?? []) {
-    if (normalizeIssueRef(item?.ref ?? item?.number, result.repo) !== number) continue;
-    const headSha = String(
-      item?.pull_request?.head_sha ?? item?.pull_request?.headSha ?? "",
-    ).trim();
-    return /^[a-f0-9]{40}$/i.test(headSha) ? headSha : null;
+function clusterPlanReviewAuthorization(
+  number: number,
+  authorization: RepairMutationReviewAuthorization,
+): RepairMutationReviewAuthorizationSnapshot | null {
+  for (const candidate of clusterPlan?.review_authorizations ?? []) {
+    if (
+      Number(candidate?.number) === number &&
+      candidate?.repository === result.repo &&
+      candidate?.target_kind === "pull_request" &&
+      candidate?.authorization === authorization
+    ) {
+      return candidate as RepairMutationReviewAuthorizationSnapshot;
+    }
   }
   return null;
 }

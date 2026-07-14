@@ -40,6 +40,14 @@ const MUTATING_ACTIONS = new Set([
   "post_merge_close",
 ]);
 const FIX_ACTIONS = new Set(["fix_needed", "build_fix_artifact", "open_fix_pr"]);
+const FORBIDDEN_MODEL_AUTHORIZATION_FIELDS = [
+  "review_activity_cursor",
+  "target_review_activity_cursor",
+  "review_verdict",
+  "target_review_verdict",
+  "review_authorization",
+  "review_authorizations",
+] as const;
 
 const args = parseArgs(process.argv.slice(2));
 const inputs = args._;
@@ -99,6 +107,7 @@ function reviewResult(resultPath: string): JsonValue {
   if (!result.repo) failures.push("result.repo is required");
   if (!result.cluster_id) failures.push("result.cluster_id is required");
   if (!result.mode) failures.push("result.mode is required");
+  rejectModelAuthorizationFields(result, "result", failures);
   const actions = Array.isArray(result.actions) ? result.actions : [];
   if (!plan && actions.length > 0) {
     failures.push("missing cluster-plan.json preflight artifact");
@@ -326,6 +335,28 @@ function reviewResult(resultPath: string): JsonValue {
     failures,
     warnings,
   };
+}
+
+function rejectModelAuthorizationFields(
+  value: unknown,
+  location: string,
+  failures: string[],
+): void {
+  if (Array.isArray(value)) {
+    value.forEach((entry, index) =>
+      rejectModelAuthorizationFields(entry, `${location}[${index}]`, failures),
+    );
+    return;
+  }
+  if (!value || typeof value !== "object") return;
+  for (const field of FORBIDDEN_MODEL_AUTHORIZATION_FIELDS) {
+    if (Object.hasOwn(value, field)) {
+      failures.push(`${location} must not supply ${field}`);
+    }
+  }
+  for (const [key, entry] of Object.entries(value)) {
+    rejectModelAuthorizationFields(entry, `${location}.${key}`, failures);
+  }
 }
 
 function validateCalibratedPrFinalization({

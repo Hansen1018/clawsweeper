@@ -5,6 +5,11 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
+import { createReviewedPrActivityCursor } from "../../dist/review-activity-cursor.js";
+import {
+  repairTargetActivityDigest,
+  repairTargetActivitySnapshotFromTarget,
+} from "../../dist/repair/repair-mutation-activity.js";
 import { mockGhBinEnv } from "../helpers.ts";
 
 test("plan-cluster carries worker target checkout into artifacts", () => {
@@ -97,6 +102,106 @@ test("plan-cluster hydrates the repository default branch instead of hard-coding
     sha: "master-sha",
     url: "https://github.com/openclaw/openclaw/tree/master",
   });
+});
+
+test("plan-cluster carries trusted review authorization outside the model result", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-plan-authorization-"));
+  const binDir = path.join(tmp, "bin");
+  const jobPath = path.join(tmp, "job.md");
+  const runDir = path.join(tmp, "run");
+  const pullTarget = {
+    number: 74134,
+    state: "open",
+    title: "PR #74134",
+    body: "",
+    draft: false,
+    labels: [],
+    locked: false,
+    author_association: "CONTRIBUTOR",
+    assignees: [],
+    milestone: null,
+    updated_at: "2026-04-30T00:00:00Z",
+    merged: false,
+    merged_at: null,
+    merge_commit_sha: null,
+    mergeable: true,
+    mergeable_state: "clean",
+    base: { ref: "main" },
+    head: {
+      ref: "branch-74134",
+      sha: "a".repeat(40),
+      repo: { full_name: "openclaw/openclaw", owner: { login: "openclaw" } },
+    },
+    maintainer_can_modify: true,
+    requested_reviewers: [],
+    requested_teams: [],
+    additions: 1,
+    deletions: 0,
+    changed_files: 1,
+    commits: 1,
+    review_comments: 0,
+  };
+  const cursor = createReviewedPrActivityCursor({
+    reviews: [],
+    inlineComments: [],
+    reviewThreads: [],
+  });
+  assert.ok(cursor);
+  const targetActivityDigest = repairTargetActivityDigest(
+    repairTargetActivitySnapshotFromTarget(pullTarget, [], "pull_request"),
+  );
+  const reviewComment = {
+    id: 501,
+    user: { login: "openclaw-clawsweeper[bot]" },
+    author_association: "CONTRIBUTOR",
+    created_at: "2026-04-30T00:00:10Z",
+    updated_at: "2026-04-30T00:00:10Z",
+    body: [
+      "<!-- clawsweeper-review item=74134 -->",
+      `<!-- clawsweeper-verdict:pass item=74134 sha=${"a".repeat(40)} updated_at=2026-04-30T00:00:00Z reviewed_at=2026-04-30T00:00:05Z source_revision=${"f".repeat(64)} review_activity_cursor=${cursor} target_activity_digest=${targetActivityDigest} -->`,
+    ].join("\n"),
+  };
+
+  fs.mkdirSync(binDir);
+  fs.writeFileSync(path.join(binDir, "gh"), fakeGhScript(), { mode: 0o755 });
+  fs.writeFileSync(
+    jobPath,
+    [
+      "---",
+      "repo: openclaw/openclaw",
+      "cluster_id: automerge-openclaw-openclaw-74134",
+      "mode: autonomous",
+      "allowed_actions:",
+      "  - merge",
+      "canonical:",
+      "  - #74134",
+      "candidates:",
+      "  - #74134",
+      "allow_merge: true",
+      "security_policy: central_security_only",
+      "security_sensitive: false",
+      "---",
+      "Plan this reviewed PR.",
+      "",
+    ].join("\n"),
+  );
+
+  execFileSync(process.execPath, ["dist/repair/plan-cluster.js", jobPath, "--run-dir", runDir], {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      ...mockGhBinEnv(path.join(binDir, "gh"), binDir),
+      CLAWSWEEPER_HYDRATE_COMMENTS: "1",
+      FAKE_GH_PULL_74134: JSON.stringify(pullTarget),
+      FAKE_GH_AUTH_COMMENT: JSON.stringify(reviewComment),
+    },
+    stdio: "pipe",
+  });
+
+  const clusterPlan = JSON.parse(fs.readFileSync(path.join(runDir, "cluster-plan.json"), "utf8"));
+  assert.equal(clusterPlan.review_authorizations.length, 1);
+  assert.equal(clusterPlan.review_authorizations[0].authorization, "merge");
+  assert.equal(clusterPlan.review_authorizations[0].provenance.comment_id, "501");
 });
 
 test("plan-cluster offline mode does not pretend the default branch is main", () => {
@@ -493,7 +598,7 @@ if (endpoint === "repos/openclaw/openclaw/issues/74742") {
   process.exit(0);
 }
 if (endpoint === "repos/openclaw/openclaw/pulls/74134") {
-  write(pull(74134, "cca706a"));
+  write(process.env.FAKE_GH_PULL_74134 ? JSON.parse(process.env.FAKE_GH_PULL_74134) : pull(74134, "${"a".repeat(40)}"));
   process.exit(0);
 }
 if (endpoint === "repos/openclaw/openclaw/pulls/74742") {
@@ -521,6 +626,16 @@ function pull(number, sha) {
   const large = process.env.FAKE_GH_LARGE_PR === "1";
   const largeCount = Number(process.env.FAKE_GH_LARGE_PR_COUNT || 120);
   return {
+    number,
+    state: "open",
+    title: "PR #" + number,
+    body: "",
+    labels: [],
+    locked: false,
+    author_association: "CONTRIBUTOR",
+    assignees: [],
+    milestone: null,
+    updated_at: "2026-04-30T00:00:00Z",
     draft: false,
     merged: false,
     merged_at: null,
@@ -545,6 +660,9 @@ function pull(number, sha) {
 }
 function pagedResponse(endpoint) {
   const [endpointPath, query = ""] = endpoint.split("?");
+  if (endpointPath.endsWith("/issues/74134/comments") && process.env.FAKE_GH_AUTH_COMMENT) {
+    return [JSON.parse(process.env.FAKE_GH_AUTH_COMMENT)];
+  }
   const params = new URLSearchParams(query);
   const limit = Math.max(1, Number(params.get("per_page") || 1));
   const page = Math.max(1, Number(params.get("page") || 1));

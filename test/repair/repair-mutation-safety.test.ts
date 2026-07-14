@@ -16,11 +16,14 @@ import {
   runRepairMutation,
 } from "../../dist/repair/repair-mutation-safety.js";
 import {
-  EMPTY_REPAIR_REVIEW_ACTIVITY_CURSOR,
-  resolveRepairMutationReviewActivityCursor,
+  mintRepairMutationReviewAuthorizations,
+  validateRepairMutationReviewAuthorization,
+  validateRepairMutationReviewAuthorizationAfterMerge,
 } from "../../dist/repair/repair-mutation-review-baseline.js";
-
-const EMPTY_REVIEW_ACTIVITY_CURSOR = EMPTY_REPAIR_REVIEW_ACTIVITY_CURSOR;
+import {
+  repairTargetActivityDigest,
+  repairTargetActivitySnapshotFromTarget,
+} from "../../dist/repair/repair-mutation-activity.js";
 
 test("repair mutation receipts distinguish accepted and unknown outcomes without raw content", () => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "repair-mutation-ledger-")));
@@ -31,18 +34,16 @@ test("repair mutation receipts distinguish accepted and unknown outcomes without
     const freshness = createRepairMutationFreshnessGuard({
       repository: "openclaw/openclaw",
       number: 123,
-      targetKind: "pull_request",
+      targetKind: "issue",
       expectedUpdatedAt: "2026-07-14T10:00:00Z",
-      expectedReviewActivityCursor: EMPTY_REVIEW_ACTIVITY_CURSOR,
       readTargetActivity: () => targetActivity(),
-      readReviewActivityCursor: () => EMPTY_REVIEW_ACTIVITY_CURSOR,
     });
     const context = {
       phase: "post_flight" as const,
       repository: "openclaw/openclaw",
       clusterId: "repair-openclaw-openclaw-123",
       number: 123,
-      targetKind: "pull_request" as const,
+      targetKind: "issue" as const,
       operationKey: "repair-mutation-test",
       sourceRevision: "a".repeat(40),
     };
@@ -223,12 +224,10 @@ test("repair freshness drift blocks before an attempt receipt or request", () =>
     const freshness = createRepairMutationFreshnessGuard({
       repository: "openclaw/openclaw",
       number: 123,
-      targetKind: "pull_request",
+      targetKind: "issue",
       expectedUpdatedAt: "2026-07-14T10:00:00Z",
-      expectedReviewActivityCursor: EMPTY_REVIEW_ACTIVITY_CURSOR,
       readTargetActivity: () =>
         targetActivity(reads++ === 0 ? "2026-07-14T10:00:00Z" : "2026-07-14T10:01:00Z"),
-      readReviewActivityCursor: () => EMPTY_REVIEW_ACTIVITY_CURSOR,
     });
 
     assert.throws(
@@ -239,7 +238,7 @@ test("repair freshness drift blocks before an attempt receipt or request", () =>
             repository: "openclaw/openclaw",
             clusterId: "repair-openclaw-openclaw-123",
             number: 123,
-            targetKind: "pull_request",
+            targetKind: "issue",
             operationKey: "repair-drift-test",
           },
           {
@@ -272,12 +271,10 @@ test("repair freshness rechecks after the attempt receipt and before the request
     const freshness = createRepairMutationFreshnessGuard({
       repository: "openclaw/openclaw",
       number: 123,
-      targetKind: "pull_request",
+      targetKind: "issue",
       expectedUpdatedAt: "2026-07-14T10:00:00Z",
-      expectedReviewActivityCursor: EMPTY_REVIEW_ACTIVITY_CURSOR,
       readTargetActivity: () =>
         targetActivity(reads++ < 4 ? "2026-07-14T10:00:00Z" : "2026-07-14T10:01:00Z"),
-      readReviewActivityCursor: () => EMPTY_REVIEW_ACTIVITY_CURSOR,
     });
 
     assert.throws(
@@ -288,7 +285,7 @@ test("repair freshness rechecks after the attempt receipt and before the request
             repository: "openclaw/openclaw",
             clusterId: "repair-openclaw-openclaw-123",
             number: 123,
-            targetKind: "pull_request",
+            targetKind: "issue",
             operationKey: "repair-boundary-test",
           },
           {
@@ -319,20 +316,26 @@ test("repair freshness rechecks after the attempt receipt and before the request
 });
 
 test("repair freshness rereads target activity after review pagination", () => {
-  let activity = targetActivity();
+  const authorization = reviewAuthorizationFixture();
+  let activity = authorization.targetActivity;
   const freshness = createRepairMutationFreshnessGuard({
     repository: "openclaw/openclaw",
     number: 123,
     targetKind: "pull_request",
-    expectedUpdatedAt: activity.updatedAt,
-    expectedReviewActivityCursor: EMPTY_REVIEW_ACTIVITY_CURSOR,
+    expectedUpdatedAt: null,
+    reviewAuthorization: authorization.guard,
+    readTargetActivityEvidence: () => ({
+      snapshot: authorization.targetActivity,
+      comments: authorization.comments,
+    }),
     readTargetActivity: () => activity,
     readReviewActivityCursor: () => {
       activity = {
-        ...targetActivity("2026-07-14T10:01:00Z"),
+        ...authorization.targetActivity,
+        updatedAt: "2026-07-14T10:01:00Z",
         labels: ["security"],
       };
-      return EMPTY_REVIEW_ACTIVITY_CURSOR;
+      return authorization.cursor;
     },
   });
 
@@ -344,10 +347,13 @@ test("repair freshness rereads target activity after review pagination", () => {
 
 test("owned mutation acceptance advances only after the post-review target reread", () => {
   const bodySha256 = createHash("sha256").update("ClawSweeper closeout").digest("hex");
-  const baseline = targetActivity();
+  const authorization = reviewAuthorizationFixture();
+  const baseline = authorization.targetActivity;
   const ownedActivity = {
-    ...targetActivity("2026-07-14T10:01:00Z"),
+    ...authorization.targetActivity,
+    updatedAt: "2026-07-14T10:01:00Z",
     comments: [
+      ...authorization.targetActivity.comments,
       {
         id: "9001",
         author: "clawsweeper[bot]",
@@ -365,8 +371,12 @@ test("owned mutation acceptance advances only after the post-review target rerea
     repository: "openclaw/openclaw",
     number: 123,
     targetKind: "pull_request",
-    expectedUpdatedAt: baseline.updatedAt,
-    expectedReviewActivityCursor: EMPTY_REVIEW_ACTIVITY_CURSOR,
+    expectedUpdatedAt: null,
+    reviewAuthorization: authorization.guard,
+    readTargetActivityEvidence: () => ({
+      snapshot: authorization.targetActivity,
+      comments: authorization.comments,
+    }),
     readTargetActivity: () => activity,
     readReviewActivityCursor: () => {
       if (injectConcurrentChange) {
@@ -375,7 +385,7 @@ test("owned mutation acceptance advances only after the post-review target rerea
           labels: ["security"],
         };
       }
-      return EMPTY_REVIEW_ACTIVITY_CURSOR;
+      return authorization.cursor;
     },
   });
   activity = ownedActivity;
@@ -454,315 +464,250 @@ test("repair boundary guards reject drift after the attempt receipt", () => {
   }
 });
 
-test("repair review baselines do not absorb unbound live review activity", () => {
-  const reviewedCursor = `v2:1:${"b".repeat(64)}`;
-  assert.equal(
-    resolveRepairMutationReviewActivityCursor({
-      repository: "openclaw/openclaw",
-      number: 123,
-      targetKind: "pull_request",
-      authorization: "merge",
-      explicitCursor: reviewedCursor,
-      explicitVerdict: "close",
-    }),
-    EMPTY_REVIEW_ACTIVITY_CURSOR,
-  );
-  assert.equal(
-    resolveRepairMutationReviewActivityCursor({
-      repository: "openclaw/openclaw",
-      number: 123,
-      targetKind: "pull_request",
-      authorization: "merge",
-      explicitCursor: reviewedCursor,
-      explicitVerdict: "pass",
-    }),
-    reviewedCursor,
-  );
-  const expectedReviewActivityCursor = resolveRepairMutationReviewActivityCursor({
-    repository: "openclaw/openclaw",
-    number: 123,
-    targetKind: "pull_request",
-    authorization: "merge",
-    expectedUpdatedAt: "2026-07-14T10:00:00Z",
-  });
-  assert.equal(expectedReviewActivityCursor, EMPTY_REVIEW_ACTIVITY_CURSOR);
-
-  const freshness = createRepairMutationFreshnessGuard({
-    repository: "openclaw/openclaw",
-    number: 123,
-    targetKind: "pull_request",
-    expectedUpdatedAt: "2026-07-14T10:00:00Z",
-    expectedReviewActivityCursor,
-    readTargetActivity: () => targetActivity(),
-    readReviewActivityCursor: () => reviewedCursor,
-  });
-  assert.throws(
-    () => freshness.assertFresh("pull_request_merge"),
-    /review activity changed after repair validation/,
-  );
-});
-
-test("repair review baselines reuse only state records reviewed before the repair plan", () => {
-  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "repair-review-baseline-")));
-  const recordPath = path.join(root, "records", "openclaw-openclaw", "items", "123.md");
-  const reviewedCursor = `v2:1:${"b".repeat(64)}`;
-  fs.mkdirSync(path.dirname(recordPath), { recursive: true });
-  fs.writeFileSync(
-    recordPath,
-    [
-      "---",
-      "number: 123",
-      "repository: openclaw/openclaw",
-      "type: pull_request",
-      "state_at_review: open",
-      "item_updated_at: 2026-07-14T10:00:00Z",
-      "reviewed_at: 2026-07-14T10:01:00Z",
-      "review_status: complete",
-      "review_terminal_failure: false",
-      "review_verdict: pass",
-      "local_checkout_access: verified",
-      `review_activity_cursor: ${reviewedCursor}`,
-      "---",
-      "PRIVATE_REVIEW_BODY",
-      "",
-    ].join("\n"),
-  );
-
-  try {
-    assert.equal(
-      resolveRepairMutationReviewActivityCursor({
-        repository: "openclaw/openclaw",
-        number: 123,
-        targetKind: "pull_request",
-        authorization: "merge",
-        expectedUpdatedAt: "2026-07-14T10:00:00Z",
-        reviewedBefore: "2026-07-14T10:02:00Z",
-        stateRoot: root,
-      }),
-      reviewedCursor,
+test("repair review authorization rejects forged carried fields", () => {
+  const authorization = reviewAuthorizationFixture();
+  for (const forged of [
+    { ...authorization.snapshot, authorization: "close" },
+    { ...authorization.snapshot, review_activity_cursor: `v2:0:${"b".repeat(64)}` },
+    { ...authorization.snapshot, head_sha: "b".repeat(40) },
+    { ...authorization.snapshot, target_activity_digest: "b".repeat(64) },
+  ]) {
+    assert.throws(
+      () =>
+        validateRepairMutationReviewAuthorization({
+          snapshot: forged,
+          repository: "openclaw/openclaw",
+          number: 123,
+          targetKind: "pull_request",
+          authorization: "merge",
+          expectedHeadSha: authorization.headSha,
+          expectedReviewedUpdatedAt: "2026-07-14T10:00:00Z",
+          reviewedBefore: "2026-07-14T10:05:00Z",
+          targetActivity: authorization.targetActivity,
+          comments: authorization.comments,
+        }),
+      /authorization is unavailable or stale/,
     );
-    assert.equal(
-      resolveRepairMutationReviewActivityCursor({
-        repository: "openclaw/openclaw",
-        number: 123,
-        targetKind: "pull_request",
-        authorization: "close",
-        expectedUpdatedAt: "2026-07-14T10:00:00Z",
-        reviewedBefore: "2026-07-14T10:02:00Z",
-        stateRoot: root,
-      }),
-      EMPTY_REVIEW_ACTIVITY_CURSOR,
-    );
-    assert.equal(
-      resolveRepairMutationReviewActivityCursor({
-        repository: "openclaw/openclaw",
-        number: 123,
-        targetKind: "pull_request",
-        authorization: "merge",
-        expectedUpdatedAt: "2026-07-14T10:00:00Z",
-        reviewedBefore: "2026-07-14T10:00:30Z",
-        stateRoot: root,
-      }),
-      EMPTY_REVIEW_ACTIVITY_CURSOR,
-    );
-  } finally {
-    fs.rmSync(root, { force: true, recursive: true });
   }
 });
 
-test("repair review baselines accept only trusted exact-head post-repair verdicts", () => {
-  const reviewedCursor = `v2:2:${"c".repeat(64)}`;
-  const laterCursor = `v2:3:${"d".repeat(64)}`;
-  const expectedHeadSha = "a".repeat(40);
-  const expectedUpdatedAt = "2026-07-14T10:00:00Z";
-  const comments = [
-    {
-      user: { login: "contributor" },
-      body: `<!-- clawsweeper-verdict:pass item=123 sha=${expectedHeadSha} updated_at=${expectedUpdatedAt} reviewed_at=2020-01-01T00:00:00Z review_activity_cursor=${reviewedCursor} -->`,
-    },
-    {
-      user: { login: "openclaw-clawsweeper[bot]" },
-      body: `<!-- clawsweeper-verdict:pass item=123 sha=${expectedHeadSha} updated_at=${expectedUpdatedAt} reviewed_at=2020-01-01T00:01:00Z review_activity_cursor=${reviewedCursor} -->`,
-    },
-    {
-      user: { login: "openclaw-clawsweeper[bot]" },
-      body: `<!-- clawsweeper-verdict:pass item=123 sha=${expectedHeadSha} updated_at=${expectedUpdatedAt} reviewed_at=2026-07-14T10:03:00Z review_activity_cursor=${laterCursor} -->`,
-    },
-  ];
-
-  assert.equal(
-    resolveRepairMutationReviewActivityCursor({
+test("repair review authorization rejects legacy verdicts without a target digest", () => {
+  const authorization = reviewAuthorizationFixture();
+  const comments = authorization.comments.map((comment) => ({
+    ...comment,
+    body: String(comment.body).replace(/\s+target_activity_digest=[a-f0-9]{64}/, ""),
+  }));
+  assert.deepEqual(
+    mintRepairMutationReviewAuthorizations({
       repository: "openclaw/openclaw",
       number: 123,
       targetKind: "pull_request",
-      authorization: "merge",
-      expectedUpdatedAt,
-      expectedHeadSha,
-      reviewedBefore: "2026-07-14T10:02:00Z",
-      readIssueComments: () => comments,
-    }),
-    reviewedCursor,
-  );
-  assert.equal(
-    resolveRepairMutationReviewActivityCursor({
-      repository: "openclaw/openclaw",
-      number: 123,
-      targetKind: "pull_request",
-      authorization: "merge",
-      expectedUpdatedAt,
-      expectedHeadSha: "d".repeat(40),
-      reviewedBefore: "2026-07-14T10:02:00Z",
-      readIssueComments: () => comments,
-    }),
-    null,
-  );
-  assert.equal(
-    resolveRepairMutationReviewActivityCursor({
-      repository: "openclaw/openclaw",
-      number: 123,
-      targetKind: "pull_request",
-      authorization: "merge",
-      expectedUpdatedAt: "2026-07-14T10:00:01Z",
-      expectedHeadSha,
-      reviewedBefore: "2026-07-14T10:02:00Z",
-      readIssueComments: () => comments,
-    }),
-    null,
-  );
-});
-
-test("repair review baselines fail closed when a bot edit masks unrelated target activity", () => {
-  const reviewedCursor = `v2:2:${"c".repeat(64)}`;
-  const expectedHeadSha = "a".repeat(40);
-  const reviewedUpdatedAt = "2026-07-14T10:00:00Z";
-  const unrelatedChangedAt = "2026-07-14T10:01:00Z";
-  const liveUpdatedAt = "2026-07-14T10:02:00Z";
-
-  assert.equal(
-    resolveRepairMutationReviewActivityCursor({
-      repository: "openclaw/openclaw",
-      number: 123,
-      targetKind: "pull_request",
-      authorization: "merge",
-      expectedUpdatedAt: liveUpdatedAt,
-      expectedHeadSha,
-      reviewedBefore: "2026-07-14T10:03:00Z",
-      readIssueComments: () => [
-        {
-          user: { login: "contributor" },
-          created_at: unrelatedChangedAt,
-          updated_at: unrelatedChangedAt,
-          body: "unrelated target activity after review",
-        },
-        {
-          user: { login: "openclaw-clawsweeper[bot]" },
-          created_at: "2026-07-14T09:59:00Z",
-          updated_at: liveUpdatedAt,
-          body: `<!-- clawsweeper-verdict:pass item=123 sha=${expectedHeadSha} updated_at=${reviewedUpdatedAt} reviewed_at=2026-07-14T10:00:30Z review_activity_cursor=${reviewedCursor} -->`,
-        },
-      ],
-    }),
-    null,
-  );
-});
-
-test("repair review baselines use explicit authorization after owned verdict comment drift", () => {
-  const reviewedCursor = `v2:2:${"c".repeat(64)}`;
-  const expectedHeadSha = "a".repeat(40);
-  const reviewedUpdatedAt = "2026-07-14T10:00:00Z";
-  const commentCreatedAt = "2026-07-14T10:01:00Z";
-  const liveUpdatedAt = "2026-07-14T10:02:00Z";
-  const comments = [
-    {
-      user: { login: "openclaw-clawsweeper[bot]" },
-      created_at: commentCreatedAt,
-      updated_at: liveUpdatedAt,
-      body: `<!-- clawsweeper-verdict:pass item=123 sha=${expectedHeadSha} updated_at=${reviewedUpdatedAt} reviewed_at=2026-07-14T10:00:30Z review_activity_cursor=${reviewedCursor} -->`,
-    },
-  ];
-
-  assert.equal(
-    resolveRepairMutationReviewActivityCursor({
-      repository: "openclaw/openclaw",
-      number: 123,
-      targetKind: "pull_request",
-      authorization: "merge",
-      expectedUpdatedAt: liveUpdatedAt,
-      expectedHeadSha,
-      reviewedBefore: "2026-07-14T10:03:00Z",
-      readIssueComments: () => comments,
-    }),
-    null,
-  );
-
-  let fallbackReads = 0;
-  assert.equal(
-    resolveRepairMutationReviewActivityCursor({
-      repository: "openclaw/openclaw",
-      number: 123,
-      targetKind: "pull_request",
-      authorization: "merge",
-      explicitCursor: reviewedCursor,
-      explicitVerdict: "pass",
-      expectedUpdatedAt: liveUpdatedAt,
-      expectedHeadSha,
-      reviewedBefore: "2026-07-14T10:03:00Z",
-      readIssueComments: () => {
-        fallbackReads += 1;
-        return comments;
-      },
-    }),
-    reviewedCursor,
-  );
-  assert.equal(fallbackReads, 0);
-});
-
-test("repair review baselines require action-specific authorization", () => {
-  const expectedHeadSha = "a".repeat(40);
-  const passCursor = `v2:1:${"b".repeat(64)}`;
-  const closeCursor = `v2:2:${"c".repeat(64)}`;
-  const blockedCursor = `v2:3:${"d".repeat(64)}`;
-  const verdictComment = (verdict: string, cursor: string, reviewedAt: string) => ({
-    user: { login: "openclaw-clawsweeper[bot]" },
-    body: `<!-- clawsweeper-verdict:${verdict} item=123 sha=${expectedHeadSha} updated_at=2026-07-14T10:00:00Z reviewed_at=${reviewedAt} review_activity_cursor=${cursor} -->`,
-  });
-  const resolve = (
-    authorization: "merge" | "close",
-    comments: ReturnType<typeof verdictComment>[],
-  ) =>
-    resolveRepairMutationReviewActivityCursor({
-      repository: "openclaw/openclaw",
-      number: 123,
-      targetKind: "pull_request",
-      authorization,
-      expectedUpdatedAt: "2026-07-14T10:00:00Z",
-      expectedHeadSha,
+      target: authorization.target,
+      comments,
+      expectedHeadSha: authorization.headSha,
       reviewedBefore: "2026-07-14T10:05:00Z",
-      readIssueComments: () => comments,
-    });
+    }),
+    [],
+  );
+});
 
+test("repair review authorization binds trusted verdicts to the exact head", () => {
+  const authorization = reviewAuthorizationFixture();
   assert.equal(
-    resolve("merge", [
-      verdictComment("pass", passCursor, "2026-07-14T10:01:00Z"),
-      verdictComment("close", closeCursor, "2026-07-14T10:02:00Z"),
-    ]),
-    passCursor,
+    validateRepairMutationReviewAuthorization({
+      snapshot: authorization.snapshot,
+      repository: "openclaw/openclaw",
+      number: 123,
+      targetKind: "pull_request",
+      authorization: "merge",
+      expectedHeadSha: authorization.headSha,
+      expectedReviewedUpdatedAt: "2026-07-14T10:00:00Z",
+      reviewedBefore: "2026-07-14T10:05:00Z",
+      targetActivity: authorization.targetActivity,
+      comments: authorization.comments,
+    }),
+    authorization.cursor,
+  );
+  assert.throws(
+    () =>
+      validateRepairMutationReviewAuthorization({
+        snapshot: authorization.snapshot,
+        repository: "openclaw/openclaw",
+        number: 123,
+        targetKind: "pull_request",
+        authorization: "merge",
+        expectedHeadSha: "b".repeat(40),
+        expectedReviewedUpdatedAt: "2026-07-14T10:00:00Z",
+        reviewedBefore: "2026-07-14T10:05:00Z",
+        targetActivity: authorization.targetActivity,
+        comments: authorization.comments,
+      }),
+    /authorization is unavailable or stale/,
+  );
+});
+
+test("repair review authorization permits only the expected merge-state transition", () => {
+  const authorization = reviewAuthorizationFixture();
+  const mergedActivity = {
+    ...authorization.targetActivity,
+    updatedAt: "2026-07-14T10:03:00Z",
+    state: "closed",
+  };
+  assert.equal(
+    validateRepairMutationReviewAuthorizationAfterMerge({
+      snapshot: authorization.snapshot,
+      repository: "openclaw/openclaw",
+      number: 123,
+      targetKind: "pull_request",
+      authorization: "merge",
+      expectedHeadSha: authorization.headSha,
+      expectedReviewedUpdatedAt: "2026-07-14T10:00:00Z",
+      reviewedBefore: "2026-07-14T10:05:00Z",
+      targetActivity: mergedActivity,
+      comments: authorization.comments,
+      reviewActivityCursor: authorization.cursor,
+    }),
+    authorization.cursor,
+  );
+  assert.throws(
+    () =>
+      validateRepairMutationReviewAuthorizationAfterMerge({
+        snapshot: authorization.snapshot,
+        repository: "openclaw/openclaw",
+        number: 123,
+        targetKind: "pull_request",
+        authorization: "merge",
+        expectedHeadSha: authorization.headSha,
+        expectedReviewedUpdatedAt: "2026-07-14T10:00:00Z",
+        reviewedBefore: "2026-07-14T10:05:00Z",
+        targetActivity: { ...mergedActivity, labels: ["security"] },
+        comments: authorization.comments,
+        reviewActivityCursor: authorization.cursor,
+      }),
+    /authorization is unavailable or stale/,
+  );
+  assert.throws(
+    () =>
+      validateRepairMutationReviewAuthorizationAfterMerge({
+        snapshot: authorization.snapshot,
+        repository: "openclaw/openclaw",
+        number: 123,
+        targetKind: "pull_request",
+        authorization: "merge",
+        expectedHeadSha: authorization.headSha,
+        expectedReviewedUpdatedAt: "2026-07-14T10:00:00Z",
+        reviewedBefore: "2026-07-14T10:05:00Z",
+        targetActivity: mergedActivity,
+        comments: authorization.comments,
+        reviewActivityCursor: `v2:0:${"b".repeat(64)}`,
+      }),
+    /authorization is unavailable or stale/,
+  );
+});
+
+test("repair review authorization rejects unrelated activity followed by a bot edit", () => {
+  const authorization = reviewAuthorizationFixture();
+  const unrelatedComment = {
+    id: "9001",
+    user: { login: "contributor" },
+    author_association: "CONTRIBUTOR",
+    created_at: "2026-07-14T10:01:30Z",
+    updated_at: "2026-07-14T10:01:30Z",
+    body: "unrelated target activity after review",
+  };
+  const editedComments = [
+    unrelatedComment,
+    {
+      ...authorization.comments[0],
+      updated_at: "2026-07-14T10:02:30Z",
+    },
+  ];
+  assert.deepEqual(
+    mintRepairMutationReviewAuthorizations({
+      repository: "openclaw/openclaw",
+      number: 123,
+      targetKind: "pull_request",
+      target: { ...authorization.target, updated_at: "2026-07-14T10:02:30Z" },
+      comments: editedComments,
+      expectedHeadSha: authorization.headSha,
+      reviewedBefore: "2026-07-14T10:05:00Z",
+    }),
+    [],
+  );
+});
+
+test("repair review authorization permits owned verdict-comment timestamp drift", () => {
+  const authorization = reviewAuthorizationFixture({
+    reviewedUpdatedAt: "2026-07-14T10:00:00Z",
+    liveUpdatedAt: "2026-07-14T10:02:00Z",
+  });
+  assert.notEqual(
+    authorization.snapshot.reviewed_updated_at,
+    authorization.targetActivity.updatedAt,
   );
   assert.equal(
-    resolve("close", [
-      verdictComment("pass", passCursor, "2026-07-14T10:01:00Z"),
-      verdictComment("close", closeCursor, "2026-07-14T10:02:00Z"),
-    ]),
-    closeCursor,
+    validateRepairMutationReviewAuthorization({
+      snapshot: authorization.snapshot,
+      repository: "openclaw/openclaw",
+      number: 123,
+      targetKind: "pull_request",
+      authorization: "merge",
+      expectedHeadSha: authorization.headSha,
+      expectedReviewedUpdatedAt: "2026-07-14T10:00:00Z",
+      reviewedBefore: "2026-07-14T10:05:00Z",
+      targetActivity: authorization.targetActivity,
+      comments: authorization.comments,
+    }),
+    authorization.cursor,
   );
-  for (const verdict of ["needs-changes", "needs-human"]) {
-    assert.equal(
-      resolve("merge", [verdictComment(verdict, blockedCursor, "2026-07-14T10:03:00Z")]),
-      null,
-    );
-    assert.equal(
-      resolve("close", [verdictComment(verdict, blockedCursor, "2026-07-14T10:03:00Z")]),
-      null,
+});
+
+test("repair review authorization rejects target timestamp drift after minting", () => {
+  const authorization = reviewAuthorizationFixture({
+    reviewedUpdatedAt: "2026-07-14T10:00:00Z",
+    liveUpdatedAt: "2026-07-14T10:02:00Z",
+  });
+  assert.throws(
+    () =>
+      validateRepairMutationReviewAuthorization({
+        snapshot: authorization.snapshot,
+        repository: "openclaw/openclaw",
+        number: 123,
+        targetKind: "pull_request",
+        authorization: "merge",
+        expectedHeadSha: authorization.headSha,
+        expectedReviewedUpdatedAt: "2026-07-14T10:00:00Z",
+        reviewedBefore: "2026-07-14T10:05:00Z",
+        targetActivity: {
+          ...authorization.targetActivity,
+          updatedAt: "2026-07-14T10:03:00Z",
+        },
+        comments: authorization.comments,
+      }),
+    /authorization is unavailable or stale/,
+  );
+});
+
+test("repair review authorization is action-specific", () => {
+  for (const authorizationKind of ["merge", "close"] as const) {
+    const authorization = reviewAuthorizationFixture({ authorization: authorizationKind });
+    assert.equal(authorization.snapshot.authorization, authorizationKind);
+    const wrongKind = authorizationKind === "merge" ? "close" : "merge";
+    assert.throws(
+      () =>
+        validateRepairMutationReviewAuthorization({
+          snapshot: authorization.snapshot,
+          repository: "openclaw/openclaw",
+          number: 123,
+          targetKind: "pull_request",
+          authorization: wrongKind,
+          expectedHeadSha: authorization.headSha,
+          expectedReviewedUpdatedAt: "2026-07-14T10:00:00Z",
+          reviewedBefore: "2026-07-14T10:05:00Z",
+          targetActivity: authorization.targetActivity,
+          comments: authorization.comments,
+        }),
+      /authorization is unavailable or stale/,
     );
   }
 });
@@ -773,15 +718,20 @@ test("repair freshness rejects concurrent target activity after an owned comment
   Object.assign(process.env, repairActionLedgerEnv(root));
 
   try {
-    let activity = targetActivity();
+    const authorization = reviewAuthorizationFixture();
+    let activity = authorization.targetActivity;
     const freshness = createRepairMutationFreshnessGuard({
       repository: "openclaw/openclaw",
       number: 123,
       targetKind: "pull_request",
-      expectedUpdatedAt: activity.updatedAt,
-      expectedReviewActivityCursor: EMPTY_REVIEW_ACTIVITY_CURSOR,
+      expectedUpdatedAt: null,
+      reviewAuthorization: authorization.guard,
+      readTargetActivityEvidence: () => ({
+        snapshot: authorization.targetActivity,
+        comments: authorization.comments,
+      }),
       readTargetActivity: () => activity,
-      readReviewActivityCursor: () => EMPTY_REVIEW_ACTIVITY_CURSOR,
+      readReviewActivityCursor: () => authorization.cursor,
     });
     const body = "ClawSweeper closeout";
     const bodySha256 = createHash("sha256").update(body).digest("hex");
@@ -803,9 +753,11 @@ test("repair freshness rejects concurrent target activity after an owned comment
             freshness,
             operation: () => {
               activity = {
-                ...targetActivity("2026-07-14T10:01:00Z"),
+                ...authorization.targetActivity,
+                updatedAt: "2026-07-14T10:01:00Z",
                 labels: ["security"],
                 comments: [
+                  ...authorization.targetActivity.comments,
                   {
                     id: "9001",
                     author: "clawsweeper[bot]",
@@ -836,15 +788,20 @@ test("repair freshness rejects concurrent PR identity drift after an owned comme
   Object.assign(process.env, repairActionLedgerEnv(root));
 
   try {
-    let activity = targetActivity();
+    const authorization = reviewAuthorizationFixture();
+    let activity = authorization.targetActivity;
     const freshness = createRepairMutationFreshnessGuard({
       repository: "openclaw/openclaw",
       number: 123,
       targetKind: "pull_request",
-      expectedUpdatedAt: activity.updatedAt,
-      expectedReviewActivityCursor: EMPTY_REVIEW_ACTIVITY_CURSOR,
+      expectedUpdatedAt: null,
+      reviewAuthorization: authorization.guard,
+      readTargetActivityEvidence: () => ({
+        snapshot: authorization.targetActivity,
+        comments: authorization.comments,
+      }),
       readTargetActivity: () => activity,
-      readReviewActivityCursor: () => EMPTY_REVIEW_ACTIVITY_CURSOR,
+      readReviewActivityCursor: () => authorization.cursor,
     });
     const body = "ClawSweeper closeout";
     const bodySha256 = createHash("sha256").update(body).digest("hex");
@@ -866,9 +823,11 @@ test("repair freshness rejects concurrent PR identity drift after an owned comme
             freshness,
             operation: () => {
               activity = {
-                ...targetActivity("2026-07-14T10:01:00Z"),
+                ...authorization.targetActivity,
+                updatedAt: "2026-07-14T10:01:00Z",
                 metadataSha256: "b".repeat(64),
                 comments: [
+                  ...authorization.targetActivity.comments,
                   {
                     id: "9001",
                     author: "clawsweeper[bot]",
@@ -924,14 +883,14 @@ test("repair executors route authoritative GitHub writes through the mutation bo
   assert.match(receiptSource, /publishMainCommit/);
   assert.match(receiptSource, /importActionEventShards/);
   assert.match(receiptSource, /CLAWSWEEPER_STATE_DIR/);
-  assert.match(safetySource, /reviewed pull request activity cursor is unavailable/);
-  assert.match(reviewBaselineSource, /item_updated_at/);
+  assert.match(safetySource, /trusted repair review authorization is unavailable/);
+  assert.match(reviewBaselineSource, /target_activity_digest/);
+  assert.match(reviewBaselineSource, /snapshot_sha256/);
+  assert.match(reviewBaselineSource, /trusted_comment/);
   assert.match(reviewBaselineSource, /reviewedAt > options\.reviewedBefore/);
-  assert.match(reviewBaselineSource, /candidate\.reviewedAt <= reviewedBefore/);
-  assert.match(reviewBaselineSource, /attributes\.updated_at !== expectedUpdatedAt/);
-  assert.doesNotMatch(reviewBaselineSource, /trustedCommentUpdatedAt/);
   assert.match(reviewBaselineSource, /AUTHORIZED_REVIEW_VERDICTS/);
   assert.doesNotMatch(reviewBaselineSource, /needs-changes|needs-human/);
+  assert.doesNotMatch(reviewBaselineSource, /explicitCursor|explicitVerdict/);
   assert.match(applySource, /authorization: "merge"/);
   assert.match(applySource, /authorization: "close"/);
   assert.match(postFlightSource, /authorization: "merge"/);
@@ -940,8 +899,12 @@ test("repair executors route authoritative GitHub writes through the mutation bo
   assert.match(activitySource, /autoMerge: compactAutoMerge/);
   assert.match(postFlightSource, /fix PR head changed after repair validation/);
   assert.doesNotMatch(postFlightSource, /CLAWSWEEPER_POST_FLIGHT_REQUIRE_PR_CHECKS/);
-  assert.match(applySource, /resolveRepairMutationReviewActivityCursor/);
-  assert.match(postFlightSource, /resolveRepairMutationReviewActivityCursor/);
+  assert.match(applySource, /clusterPlanReviewAuthorization/);
+  assert.match(postFlightSource, /mintRepairMutationReviewAuthorizations/);
+  assert.doesNotMatch(
+    `${applySource}\n${postFlightSource}`,
+    /action\.(?:target_)?review_(?:activity_cursor|verdict)/,
+  );
   assert.match(applySource, /finally \{\s+await flushRepairMutationActionEvents\(\)/);
   assert.match(postFlightSource, /finally \{\s+await flushRepairMutationActionEvents\(\)/);
 });
@@ -1020,6 +983,80 @@ function targetActivity(updatedAt = "2026-07-14T10:00:00Z") {
     labels: [],
     metadataSha256: "a".repeat(64),
     comments: [],
+  };
+}
+
+function reviewAuthorizationFixture(
+  options: {
+    authorization?: "merge" | "close";
+    reviewedUpdatedAt?: string;
+    liveUpdatedAt?: string;
+    extraComments?: Record<string, unknown>[];
+  } = {},
+) {
+  const authorization = options.authorization ?? "merge";
+  const verdict = authorization === "merge" ? "pass" : "close";
+  const reviewedUpdatedAt = options.reviewedUpdatedAt ?? "2026-07-14T10:00:00Z";
+  const liveUpdatedAt = options.liveUpdatedAt ?? "2026-07-14T10:02:00Z";
+  const headSha = "a".repeat(40);
+  const cursor = `v2:0:${createHash("sha256").update("[]").digest("hex")}`;
+  const target = {
+    number: 123,
+    state: "open",
+    title: "Repair target",
+    body: "Target body",
+    updated_at: liveUpdatedAt,
+    locked: false,
+    labels: [],
+    author_association: "CONTRIBUTOR",
+    assignees: [],
+    milestone: null,
+    head: { sha: headSha, ref: "repair", repo: { full_name: "openclaw/openclaw" } },
+    base: { sha: "b".repeat(40), ref: "main", repo: { full_name: "openclaw/openclaw" } },
+    requested_reviewers: [],
+    requested_teams: [],
+  };
+  const priorComments = options.extraComments ?? [];
+  const targetActivityDigest = repairTargetActivityDigest(
+    repairTargetActivitySnapshotFromTarget(target, priorComments, "pull_request"),
+  );
+  const comment = {
+    id: "9000",
+    user: { login: "openclaw-clawsweeper[bot]" },
+    author_association: "CONTRIBUTOR",
+    created_at: "2026-07-14T10:01:00Z",
+    updated_at: liveUpdatedAt,
+    body: [
+      `<!-- clawsweeper-review item=123 -->`,
+      `<!-- clawsweeper-verdict:${verdict} item=123 sha=${headSha} updated_at=${reviewedUpdatedAt} reviewed_at=2026-07-14T10:00:30Z source_revision=${"f".repeat(64)} review_activity_cursor=${cursor} target_activity_digest=${targetActivityDigest} -->`,
+    ].join("\n"),
+  };
+  const comments = [...priorComments, comment];
+  const targetActivity = repairTargetActivitySnapshotFromTarget(target, comments, "pull_request");
+  const snapshot = mintRepairMutationReviewAuthorizations({
+    repository: "openclaw/openclaw",
+    number: 123,
+    targetKind: "pull_request",
+    target,
+    comments,
+    expectedHeadSha: headSha,
+    reviewedBefore: "2026-07-14T10:05:00Z",
+  }).find((candidate) => candidate.authorization === authorization);
+  assert.ok(snapshot);
+  return {
+    comments,
+    cursor,
+    headSha,
+    snapshot,
+    target,
+    targetActivity,
+    guard: {
+      snapshot,
+      authorization,
+      expectedHeadSha: headSha,
+      expectedReviewedUpdatedAt: reviewedUpdatedAt,
+      reviewedBefore: "2026-07-14T10:05:00Z",
+    },
   };
 }
 

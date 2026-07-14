@@ -1,30 +1,73 @@
 import { createHash } from "node:crypto";
-import fs from "node:fs";
-import path from "node:path";
 
 import { MAX_REVIEWED_PR_ACTIVITY, isReviewedPrActivityCursor } from "../review-activity-cursor.js";
-import { ghPagedLimitWithRetry as ghPagedLimit } from "./github-cli.js";
-import type { RepairMutationTargetKind } from "./repair-mutation-activity.js";
+import {
+  normalizeRepairTargetActivitySnapshot,
+  repairTargetActivityDigest,
+  repairTargetActivitySnapshotFromTarget,
+  type RepairMutationTargetKind,
+  type RepairTargetActivitySnapshot,
+} from "./repair-mutation-activity.js";
 
-export const EMPTY_REPAIR_REVIEW_ACTIVITY_CURSOR = `v2:0:${createHash("sha256")
-  .update("[]")
-  .digest("hex")}`;
+export type RepairMutationReviewAuthorization = "merge" | "close";
 
-type RepairMutationReviewBaselineOptions = {
+export type RepairMutationReviewAuthorizationSnapshot = {
+  version: 1;
+  repository: string;
+  number: number;
+  target_kind: "pull_request";
+  authorization: RepairMutationReviewAuthorization;
+  verdict: "pass" | "close";
+  head_sha: string;
+  reviewed_updated_at: string;
+  observed_updated_at: string;
+  reviewed_at: string;
+  review_activity_cursor: string;
+  source_revision: string;
+  target_activity_digest: string;
+  provenance: {
+    kind: "trusted_comment";
+    comment_id: string;
+    author: string;
+    comment_updated_at: string;
+    body_sha256: string;
+  };
+  snapshot_sha256: string;
+};
+
+type MintRepairMutationReviewAuthorizationOptions = {
+  repository: string;
+  number: number;
+  targetKind: RepairMutationTargetKind;
+  target: unknown;
+  comments: unknown[];
+  expectedHeadSha?: unknown;
+  reviewedBefore?: unknown;
+};
+
+type ValidateRepairMutationReviewAuthorizationOptions = {
+  snapshot: unknown;
   repository: string;
   number: number;
   targetKind: RepairMutationTargetKind;
   authorization: RepairMutationReviewAuthorization;
-  explicitCursor?: unknown;
-  explicitVerdict?: unknown;
-  expectedUpdatedAt?: unknown;
   expectedHeadSha?: unknown;
+  expectedReviewedUpdatedAt?: unknown;
   reviewedBefore?: unknown;
-  stateRoot?: string | null;
-  readIssueComments?: () => unknown[];
+  targetActivity: RepairTargetActivitySnapshot;
+  comments: unknown[];
 };
 
-export type RepairMutationReviewAuthorization = "merge" | "close";
+type ValidateRepairMutationReviewAuthorizationProvenanceOptions = Omit<
+  ValidateRepairMutationReviewAuthorizationOptions,
+  "targetActivity"
+>;
+
+type ValidateRepairMutationReviewAuthorizationAfterMergeOptions =
+  ValidateRepairMutationReviewAuthorizationProvenanceOptions & {
+    targetActivity: RepairTargetActivitySnapshot;
+    reviewActivityCursor: unknown;
+  };
 
 const DEFAULT_TRUSTED_REVIEW_AUTHORS = new Set(
   [
@@ -39,155 +82,270 @@ const AUTHORIZED_REVIEW_VERDICTS: Record<RepairMutationReviewAuthorization, Read
   close: new Set(["close"]),
 };
 
-export function resolveRepairMutationReviewActivityCursor(
-  options: RepairMutationReviewBaselineOptions,
-): string | null {
-  if (options.targetKind !== "pull_request") return null;
-
-  const explicitCursor = stringValue(options.explicitCursor);
-  if (
-    explicitCursor &&
-    isAuthorizedReviewVerdict(options.authorization, stringValue(options.explicitVerdict))
-  ) {
-    return explicitCursor;
-  }
-
-  if (stringValue(options.expectedHeadSha)) {
-    return trustedRepairReviewActivityCursor(options);
-  }
-
-  const storedCursor = storedRepairReviewActivityCursor(options);
-  return storedCursor ?? EMPTY_REPAIR_REVIEW_ACTIVITY_CURSOR;
-}
-
-function storedRepairReviewActivityCursor(
-  options: RepairMutationReviewBaselineOptions,
-): string | null {
-  const stateRoot = stringValue(options.stateRoot ?? process.env.CLAWSWEEPER_STATE_DIR);
-  const expectedUpdatedAt = stringValue(options.expectedUpdatedAt);
+export function mintRepairMutationReviewAuthorizations(
+  options: MintRepairMutationReviewAuthorizationOptions,
+): RepairMutationReviewAuthorizationSnapshot[] {
+  if (options.targetKind !== "pull_request") return [];
+  if (options.comments.length > MAX_REVIEWED_PR_ACTIVITY) return [];
+  const expectedHeadSha = stringValue(options.expectedHeadSha);
   const reviewedBefore = timestamp(options.reviewedBefore);
-  if (!stateRoot || !expectedUpdatedAt || reviewedBefore === null) return null;
+  if (!/^[a-f0-9]{40}$/i.test(expectedHeadSha) || reviewedBefore === null) return [];
 
-  const slug = repositorySlug(options.repository);
-  const records = [
-    path.join(stateRoot, "records", slug, "items", `${options.number}.md`),
-    path.join(stateRoot, "records", slug, "items", `${slug}-${options.number}.md`),
-  ];
-  for (const recordPath of records) {
-    const cursor = cursorFromStateRecord({
-      recordPath,
-      repository: options.repository,
-      number: options.number,
-      authorization: options.authorization,
-      expectedUpdatedAt,
-      reviewedBefore,
-    });
-    if (cursor) return cursor;
+  let targetActivity: RepairTargetActivitySnapshot;
+  try {
+    targetActivity = repairTargetActivitySnapshotFromTarget(
+      options.target,
+      options.comments,
+      options.targetKind,
+    );
+  } catch {
+    return [];
   }
-  return null;
+
+  const candidates = options.comments
+    .flatMap((comment) =>
+      snapshotFromTrustedComment({
+        comment,
+        repository: options.repository,
+        number: options.number,
+        expectedHeadSha,
+        reviewedBefore,
+        targetActivity,
+      }),
+    )
+    .sort((left, right) => timestamp(right.reviewed_at)! - timestamp(left.reviewed_at)!);
+
+  const snapshots: RepairMutationReviewAuthorizationSnapshot[] = [];
+  for (const authorization of ["merge", "close"] as const) {
+    const candidate = candidates.find((entry) => entry.authorization === authorization);
+    if (candidate) snapshots.push(candidate);
+  }
+  return snapshots;
 }
 
-function cursorFromStateRecord(options: {
-  recordPath: string;
+export function validateRepairMutationReviewAuthorization(
+  options: ValidateRepairMutationReviewAuthorizationOptions,
+): string {
+  const snapshot = validateRepairMutationReviewAuthorizationProvenance(options);
+  const targetActivity = normalizeRepairTargetActivitySnapshot(options.targetActivity);
+  if (
+    snapshot.observed_updated_at !== targetActivity.updatedAt ||
+    repairTargetActivityDigest(targetActivity, snapshot.provenance.comment_id) !==
+      snapshot.target_activity_digest
+  ) {
+    throw new Error("trusted repair review authorization is unavailable or stale");
+  }
+  return snapshot.review_activity_cursor;
+}
+
+export function validateRepairMutationReviewAuthorizationProvenance(
+  options: ValidateRepairMutationReviewAuthorizationProvenanceOptions,
+): RepairMutationReviewAuthorizationSnapshot {
+  const snapshot = parseSnapshot(options.snapshot);
+  const expectedHeadSha = stringValue(options.expectedHeadSha);
+  const expectedReviewedUpdatedAt = stringValue(options.expectedReviewedUpdatedAt);
+  const reviewedBefore = timestamp(options.reviewedBefore);
+  const currentComment = options.comments
+    .map(record)
+    .find((comment) => scalarId(comment.id) === snapshot.provenance.comment_id);
+  const currentBody = typeof currentComment?.body === "string" ? currentComment.body : "";
+  const currentAuthor = stringValue(record(currentComment?.user).login);
+  const currentCommentUpdatedAt = stringValue(
+    currentComment?.updated_at ?? currentComment?.updatedAt,
+  );
+  const marker = trustedVerdictMarker(currentBody, options.number);
+  const attributes = marker ? markerAttributes(marker.attributes) : {};
+
+  if (
+    options.comments.length > MAX_REVIEWED_PR_ACTIVITY ||
+    snapshot.version !== 1 ||
+    snapshot.repository !== options.repository ||
+    snapshot.number !== options.number ||
+    options.targetKind !== "pull_request" ||
+    snapshot.target_kind !== options.targetKind ||
+    snapshot.authorization !== options.authorization ||
+    !isAuthorizedReviewVerdict(snapshot.authorization, snapshot.verdict) ||
+    !/^[a-f0-9]{40}$/i.test(expectedHeadSha) ||
+    snapshot.head_sha !== expectedHeadSha ||
+    (expectedReviewedUpdatedAt && snapshot.reviewed_updated_at !== expectedReviewedUpdatedAt) ||
+    reviewedBefore === null ||
+    timestamp(snapshot.reviewed_at) === null ||
+    timestamp(snapshot.reviewed_at)! > reviewedBefore ||
+    timestamp(snapshot.observed_updated_at) === null ||
+    !isReviewedPrActivityCursor(snapshot.review_activity_cursor) ||
+    !/^[a-f0-9]{64}$/.test(snapshot.source_revision) ||
+    !/^[a-f0-9]{64}$/.test(snapshot.target_activity_digest) ||
+    snapshot.snapshot_sha256 !== snapshotDigest(snapshot) ||
+    snapshot.provenance.kind !== "trusted_comment" ||
+    !DEFAULT_TRUSTED_REVIEW_AUTHORS.has(snapshot.provenance.author) ||
+    currentAuthor !== snapshot.provenance.author ||
+    currentCommentUpdatedAt !== snapshot.provenance.comment_updated_at ||
+    digestText(currentBody) !== snapshot.provenance.body_sha256 ||
+    !marker ||
+    marker.verdict !== snapshot.verdict ||
+    attributes.item !== String(options.number) ||
+    attributes.sha !== snapshot.head_sha ||
+    attributes.updated_at !== snapshot.reviewed_updated_at ||
+    attributes.reviewed_at !== snapshot.reviewed_at ||
+    attributes.source_revision !== snapshot.source_revision ||
+    attributes.review_activity_cursor !== snapshot.review_activity_cursor ||
+    attributes.target_activity_digest !== snapshot.target_activity_digest
+  ) {
+    throw new Error("trusted repair review authorization is unavailable or stale");
+  }
+  return snapshot;
+}
+
+export function validateRepairMutationReviewAuthorizationAfterMerge(
+  options: ValidateRepairMutationReviewAuthorizationAfterMergeOptions,
+): string {
+  const snapshot = validateRepairMutationReviewAuthorizationProvenance(options);
+  const targetActivity = normalizeRepairTargetActivitySnapshot(options.targetActivity);
+  const reviewActivityCursor = stringValue(options.reviewActivityCursor);
+  const preMergeActivity = { ...targetActivity, state: "open" };
+  if (
+    targetActivity.state !== "closed" ||
+    reviewActivityCursor !== snapshot.review_activity_cursor ||
+    repairTargetActivityDigest(preMergeActivity, snapshot.provenance.comment_id) !==
+      snapshot.target_activity_digest
+  ) {
+    throw new Error("trusted repair review authorization is unavailable or stale");
+  }
+  return snapshot.review_activity_cursor;
+}
+
+export function repairMutationReviewAuthorizationSnapshotDigest(
+  value: Omit<RepairMutationReviewAuthorizationSnapshot, "snapshot_sha256">,
+): string {
+  return digestText(JSON.stringify(value));
+}
+
+function snapshotFromTrustedComment(options: {
+  comment: unknown;
   repository: string;
   number: number;
-  authorization: RepairMutationReviewAuthorization;
-  expectedUpdatedAt: string;
+  expectedHeadSha: string;
   reviewedBefore: number;
-}): string | null {
-  let markdown: string;
-  try {
-    markdown = fs.readFileSync(options.recordPath, "utf8");
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
-    throw error;
-  }
-  const frontmatter = parseFrontmatter(markdown);
-  const reviewedAt = timestamp(frontmatter.reviewed_at);
-  const cursor = frontmatter.review_activity_cursor;
+  targetActivity: RepairTargetActivitySnapshot;
+}): RepairMutationReviewAuthorizationSnapshot[] {
+  const comment = record(options.comment);
+  const commentId = scalarId(comment.id);
+  const author = stringValue(record(comment.user).login);
+  const body = typeof comment.body === "string" ? comment.body : "";
+  const marker = trustedVerdictMarker(body, options.number);
+  if (!commentId || !DEFAULT_TRUSTED_REVIEW_AUTHORS.has(author) || !marker) return [];
+  const attributes = markerAttributes(marker.attributes);
+  const reviewedAt = timestamp(attributes.reviewed_at);
+  const reviewedUpdatedAt = stringValue(attributes.updated_at);
+  const reviewedAtValue = stringValue(attributes.reviewed_at);
+  const reviewActivityCursor = stringValue(attributes.review_activity_cursor);
+  const sourceRevision = stringValue(attributes.source_revision);
+  const targetActivityDigest = stringValue(attributes.target_activity_digest);
+  const commentUpdatedAt = stringValue(comment.updated_at ?? comment.updatedAt);
+  const authorization = authorizationForVerdict(marker.verdict);
+  const targetActivityComment = options.targetActivity.comments.find(
+    (entry) => entry.id === commentId,
+  );
   if (
-    frontmatter.repository !== options.repository ||
-    frontmatter.number !== String(options.number) ||
-    frontmatter.type !== "pull_request" ||
-    frontmatter.state_at_review !== "open" ||
-    frontmatter.item_updated_at !== options.expectedUpdatedAt ||
-    frontmatter.review_status !== "complete" ||
-    frontmatter.review_terminal_failure !== "false" ||
-    frontmatter.local_checkout_access !== "verified" ||
-    !isAuthorizedReviewVerdict(options.authorization, stringValue(frontmatter.review_verdict)) ||
+    !authorization ||
+    attributes.item !== String(options.number) ||
+    attributes.sha !== options.expectedHeadSha ||
+    timestamp(reviewedUpdatedAt) === null ||
     reviewedAt === null ||
     reviewedAt > options.reviewedBefore ||
-    !isReviewedPrActivityCursor(cursor)
+    !/^[a-f0-9]{64}$/.test(sourceRevision) ||
+    !isReviewedPrActivityCursor(reviewActivityCursor) ||
+    !/^[a-f0-9]{64}$/.test(targetActivityDigest) ||
+    !commentUpdatedAt ||
+    targetActivityComment?.author !== author ||
+    targetActivityComment.bodySha256 !== digestText(body) ||
+    repairTargetActivityDigest(options.targetActivity, commentId) !== targetActivityDigest
   ) {
-    return null;
+    return [];
   }
-  return cursor;
+
+  const unsigned = {
+    version: 1 as const,
+    repository: options.repository,
+    number: options.number,
+    target_kind: "pull_request" as const,
+    authorization,
+    verdict: marker.verdict as "pass" | "close",
+    head_sha: options.expectedHeadSha,
+    reviewed_updated_at: reviewedUpdatedAt,
+    observed_updated_at: options.targetActivity.updatedAt,
+    reviewed_at: reviewedAtValue,
+    review_activity_cursor: reviewActivityCursor,
+    source_revision: sourceRevision,
+    target_activity_digest: targetActivityDigest,
+    provenance: {
+      kind: "trusted_comment" as const,
+      comment_id: commentId,
+      author,
+      comment_updated_at: commentUpdatedAt,
+      body_sha256: digestText(body),
+    },
+  };
+  return [
+    { ...unsigned, snapshot_sha256: repairMutationReviewAuthorizationSnapshotDigest(unsigned) },
+  ];
 }
 
-function trustedRepairReviewActivityCursor(
-  options: RepairMutationReviewBaselineOptions,
-): string | null {
-  const expectedHeadSha = stringValue(options.expectedHeadSha);
-  const expectedUpdatedAt = stringValue(options.expectedUpdatedAt);
-  const reviewedBefore = timestamp(options.reviewedBefore);
-  if (
-    !/^[a-f0-9]{40}$/i.test(expectedHeadSha) ||
-    timestamp(expectedUpdatedAt) === null ||
-    reviewedBefore === null
-  )
-    return null;
-  let comments: unknown[];
-  try {
-    comments =
-      options.readIssueComments?.() ??
-      ghPagedLimit<unknown>(
-        `repos/${options.repository}/issues/${options.number}/comments`,
-        MAX_REVIEWED_PR_ACTIVITY + 1,
-      );
-  } catch {
+function parseSnapshot(value: unknown): RepairMutationReviewAuthorizationSnapshot {
+  const snapshot = record(value);
+  const provenance = record(snapshot.provenance);
+  return {
+    version: snapshot.version === 1 ? 1 : (0 as 1),
+    repository: stringValue(snapshot.repository),
+    number: Number(snapshot.number),
+    target_kind: stringValue(snapshot.target_kind) as "pull_request",
+    authorization: stringValue(snapshot.authorization) as RepairMutationReviewAuthorization,
+    verdict: stringValue(snapshot.verdict) as "pass" | "close",
+    head_sha: stringValue(snapshot.head_sha),
+    reviewed_updated_at: stringValue(snapshot.reviewed_updated_at),
+    observed_updated_at: stringValue(snapshot.observed_updated_at),
+    reviewed_at: stringValue(snapshot.reviewed_at),
+    review_activity_cursor: stringValue(snapshot.review_activity_cursor),
+    source_revision: stringValue(snapshot.source_revision),
+    target_activity_digest: stringValue(snapshot.target_activity_digest),
+    provenance: {
+      kind: stringValue(provenance.kind) as "trusted_comment",
+      comment_id: stringValue(provenance.comment_id),
+      author: stringValue(provenance.author),
+      comment_updated_at: stringValue(provenance.comment_updated_at),
+      body_sha256: stringValue(provenance.body_sha256),
+    },
+    snapshot_sha256: stringValue(snapshot.snapshot_sha256),
+  };
+}
+
+function snapshotDigest(snapshot: RepairMutationReviewAuthorizationSnapshot): string {
+  const { snapshot_sha256: _snapshotSha256, ...unsigned } = snapshot;
+  return repairMutationReviewAuthorizationSnapshotDigest(unsigned);
+}
+
+function trustedVerdictMarker(
+  body: string,
+  number: number,
+): { verdict: string; attributes: string } | null {
+  if (!new RegExp(`<!--\\s*clawsweeper-review\\s+item=${number}\\s*-->`, "i").test(body)) {
     return null;
   }
-  if (comments.length > MAX_REVIEWED_PR_ACTIVITY) return null;
+  const match = body.match(/<!--\s*clawsweeper-verdict:([a-z-]+)\b([^>]*)-->/i);
+  if (!match) return null;
+  return {
+    verdict: String(match[1] ?? "")
+      .trim()
+      .toLowerCase(),
+    attributes: match[2] ?? "",
+  };
+}
 
-  const candidates = comments
-    .map(trustedVerdictCursor)
-    .filter(
-      (
-        candidate,
-      ): candidate is {
-        cursor: string;
-        reviewedAt: number;
-      } => Boolean(candidate),
-    )
-    .filter((candidate) => candidate.reviewedAt <= reviewedBefore)
-    .sort((left, right) => right.reviewedAt - left.reviewedAt);
-  return candidates.find((candidate) => candidate.cursor)?.cursor ?? null;
-
-  function trustedVerdictCursor(value: unknown): {
-    cursor: string;
-    reviewedAt: number;
-  } | null {
-    const comment = record(value);
-    const author = stringValue(record(comment.user).login);
-    if (!DEFAULT_TRUSTED_REVIEW_AUTHORS.has(author)) return null;
-    const body = typeof comment.body === "string" ? comment.body : "";
-    const marker = body.match(/<!--\s*clawsweeper-verdict:([a-z-]+)\b([^>]*)-->/i);
-    if (!marker) return null;
-    const verdict = (marker[1] ?? "").toLowerCase();
-    if (!isAuthorizedReviewVerdict(options.authorization, verdict)) return null;
-    const attributes = markerAttributes(marker[2] ?? "");
-    const reviewedAt = timestamp(attributes.reviewed_at);
-    if (
-      attributes.item !== String(options.number) ||
-      attributes.sha !== expectedHeadSha ||
-      attributes.updated_at !== expectedUpdatedAt ||
-      reviewedAt === null ||
-      !isReviewedPrActivityCursor(attributes.review_activity_cursor)
-    ) {
-      return null;
-    }
-    return { cursor: attributes.review_activity_cursor, reviewedAt };
+function authorizationForVerdict(verdict: string): RepairMutationReviewAuthorization | null {
+  for (const authorization of ["merge", "close"] as const) {
+    if (isAuthorizedReviewVerdict(authorization, verdict)) return authorization;
   }
+  return null;
 }
 
 function isAuthorizedReviewVerdict(
@@ -195,19 +353,6 @@ function isAuthorizedReviewVerdict(
   verdict: string,
 ): boolean {
   return AUTHORIZED_REVIEW_VERDICTS[authorization].has(verdict.trim().toLowerCase());
-}
-
-function parseFrontmatter(markdown: string): Record<string, string> {
-  const match = markdown.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
-  if (!match) return {};
-  const values: Record<string, string> = {};
-  for (const line of (match[1] ?? "").split(/\r?\n/)) {
-    const entry = line.match(/^([A-Za-z0-9_-]+):\s*(.*)$/);
-    if (!entry) continue;
-    const raw = (entry[2] ?? "").trim();
-    values[entry[1] ?? ""] = raw.startsWith('"') && raw.endsWith('"') ? raw.slice(1, -1) : raw;
-  }
-  return values;
 }
 
 function markerAttributes(input: string): Record<string, string> {
@@ -225,18 +370,21 @@ function record(value: unknown): Record<string, unknown> {
     : {};
 }
 
-function repositorySlug(repository: string): string {
-  return repository
-    .toLowerCase()
-    .replace(/[^a-z0-9_.-]+/g, "-")
-    .replace(/^-+|-+$/g, "");
-}
-
 function stringValue(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
+}
+
+function scalarId(value: unknown): string {
+  if (typeof value === "string") return value.trim();
+  if (typeof value === "number" && Number.isFinite(value)) return String(value);
+  return "";
 }
 
 function timestamp(value: unknown): number | null {
   const parsed = Date.parse(stringValue(value));
   return Number.isFinite(parsed) ? parsed : null;
+}
+
+function digestText(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
 }

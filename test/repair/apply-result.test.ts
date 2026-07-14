@@ -7,6 +7,11 @@ import path from "node:path";
 import test from "node:test";
 
 import { createReviewedPrActivityCursor } from "../../dist/review-activity-cursor.js";
+import {
+  repairTargetActivityDigest,
+  repairTargetActivitySnapshotFromTarget,
+} from "../../dist/repair/repair-mutation-activity.js";
+import { mintRepairMutationReviewAuthorizations } from "../../dist/repair/repair-mutation-review-baseline.js";
 import { mockGhBinEnv } from "../helpers.ts";
 
 const repoRoot = process.cwd();
@@ -614,7 +619,7 @@ test("repair apply executes PR duplicate close when coverage proof says covered"
   }
 });
 
-test("repair apply recovers the reviewed cursor from the bound ClawSweeper verdict", () => {
+test("repair apply closes after owned verdict-comment timestamp drift", () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-apply-result-"));
   try {
     const reviewedHeadSha = "a".repeat(40);
@@ -637,6 +642,7 @@ test("repair apply recovers the reviewed cursor from the bound ClawSweeper verdi
       action: "close_duplicate",
       classification: "duplicate",
       canonical: "#202",
+      target_updated_at: "2026-05-25T00:02:00Z",
     });
     fs.writeFileSync(
       path.join(path.dirname(paths.resultPath), "cluster-plan.json"),
@@ -657,7 +663,12 @@ test("repair apply recovers the reviewed cursor from the bound ClawSweeper verdi
     );
     writeFakeGh(paths.binDir, {
       issues: {
-        101: issue({ number: 101, title: "Add config validation", pullRequest: true }),
+        101: issue({
+          number: 101,
+          title: "Add config validation",
+          pullRequest: true,
+          updatedAt: "2026-05-25T00:02:00Z",
+        }),
         202: issue({
           number: 202,
           title: "Rewrite config validation",
@@ -666,7 +677,11 @@ test("repair apply recovers the reviewed cursor from the bound ClawSweeper verdi
         }),
       },
       pulls: {
-        101: pull({ number: 101, title: "Add config validation" }),
+        101: pull({
+          number: 101,
+          title: "Add config validation",
+          updatedAt: "2026-05-25T00:02:00Z",
+        }),
         202: pull({ number: 202, title: "Rewrite config validation" }),
       },
       comments: {
@@ -680,6 +695,7 @@ test("repair apply recovers the reviewed cursor from the bound ClawSweeper verdi
         202: [comment("bob", "PR B carries forward the legacy config behavior.")],
       },
       reviews: { 101: [existingReview] },
+      reviewedUpdatedAt: { 101: reviewedUpdatedAt },
       logPath: paths.ghLogPath,
     });
     writeFakeCodex(paths.binDir);
@@ -689,6 +705,105 @@ test("repair apply recovers the reviewed cursor from the bound ClawSweeper verdi
     const report = JSON.parse(fs.readFileSync(paths.reportPath, "utf8"));
     assert.equal(report.actions[0].status, "executed");
     assert.equal(hasPrCloseCall(paths.ghLogPath), true);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("repair apply dry-run rejects stale close authorization", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-apply-result-"));
+  try {
+    const paths = writeApplyFixture(tmp, {
+      action: "close_duplicate",
+      classification: "duplicate",
+      canonical: "#202",
+      target_updated_at: "2026-05-25T00:02:00Z",
+    });
+    writeFakeGh(paths.binDir, {
+      issues: {
+        101: issue({
+          number: 101,
+          title: "Add config validation",
+          pullRequest: true,
+          updatedAt: "2026-05-25T00:02:00Z",
+        }),
+        202: issue({
+          number: 202,
+          title: "Rewrite config validation",
+          pullRequest: true,
+          labels: ["proof: sufficient"],
+        }),
+      },
+      pulls: {
+        101: pull({
+          number: 101,
+          title: "Add config validation",
+          updatedAt: "2026-05-25T00:02:00Z",
+        }),
+        202: pull({ number: 202, title: "Rewrite config validation" }),
+      },
+      authorizationTargets: {
+        101: pull({ number: 101, title: "Add config validation" }),
+      },
+      reviewedUpdatedAt: { 101: "2026-05-25T00:00:00Z" },
+      comments: {
+        101: [comment("alice", "PR A keeps legacy config behavior intact.")],
+        202: [comment("bob", "PR B carries forward the legacy config behavior.")],
+      },
+      logPath: paths.ghLogPath,
+    });
+    writeFakeCodex(paths.binDir);
+
+    runApplyResult(paths, { proofDecision: "covered", dryRun: true });
+
+    const report = JSON.parse(fs.readFileSync(paths.reportPath, "utf8"));
+    assert.equal(report.actions[0].status, "blocked");
+    assert.match(report.actions[0].reason, /trusted repair review authorization/);
+    assert.equal(hasPrCloseCall(paths.ghLogPath), false);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("repair apply rejects forged model authorization fields", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-apply-result-"));
+  try {
+    const paths = writeApplyFixture(tmp, {
+      action: "close_duplicate",
+      classification: "duplicate",
+      canonical: "#202",
+      review_activity_cursor: `v2:0:${"b".repeat(64)}`,
+      review_verdict: "close",
+    });
+    writeFakeGh(paths.binDir, {
+      issues: {
+        101: issue({ number: 101, title: "Forged close target", pullRequest: true }),
+        202: issue({
+          number: 202,
+          title: "Canonical replacement",
+          pullRequest: true,
+          labels: ["proof: sufficient"],
+        }),
+      },
+      pulls: {
+        101: pull({ number: 101, title: "Forged close target" }),
+        202: pull({ number: 202, title: "Canonical replacement" }),
+      },
+      comments: {
+        101: [comment("contributor", "No trusted review authorization.")],
+        202: [comment("maintainer", "Canonical replacement.")],
+      },
+      omitReviewAuthorization: [101],
+      logPath: paths.ghLogPath,
+    });
+    writeFakeCodex(paths.binDir);
+
+    runApplyResult(paths, { proofDecision: "covered" });
+
+    const report = JSON.parse(fs.readFileSync(paths.reportPath, "utf8"));
+    assert.equal(report.actions[0].status, "blocked");
+    assert.match(report.actions[0].reason, /trusted repair review authorization/);
+    assert.equal(hasPrCloseCall(paths.ghLogPath), false);
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
@@ -1052,9 +1167,7 @@ test("repair apply rechecks target freshness after coverage proof passes", () =>
 
     const report = JSON.parse(fs.readFileSync(paths.reportPath, "utf8"));
     assert.equal(report.actions[0].status, "blocked");
-    assert.equal(report.actions[0].reason, "target changed since worker review");
-    assert.equal(report.actions[0].expected_updated_at, "2026-05-25T00:00:00Z");
-    assert.equal(report.actions[0].live_updated_at, "2026-05-25T00:05:00Z");
+    assert.match(report.actions[0].reason, /target activity changed after repair validation/);
     assert.equal(hasPrCloseCall(paths.ghLogPath), false);
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
@@ -1502,6 +1615,9 @@ test("repair apply does not let an unrelated merge authorize a fix-first close",
           mergedAt: "2026-05-25T00:01:00Z",
         }),
       },
+      authorizationTargets: {
+        303: pull({ number: 303, title: "Unrelated fix" }),
+      },
       comments: { 101: [], 202: [], 303: [] },
       logPath: paths.ghLogPath,
     });
@@ -1525,6 +1641,147 @@ test("repair apply does not let an unrelated merge authorize a fix-first close",
       ],
     );
     assert.deepEqual(issueCloseTargets(paths.ghLogPath), []);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("repair apply reconciles an already-merged exact reviewed head", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-apply-result-"));
+  try {
+    const paths = writeApplyMergeFixture(tmp);
+    writeFakeGh(paths.binDir, {
+      issues: {
+        101: issue({
+          number: 101,
+          title: "Fix config validation",
+          pullRequest: true,
+          state: "closed",
+          updatedAt: "2026-05-25T00:05:00Z",
+        }),
+      },
+      pulls: {
+        101: pull({
+          number: 101,
+          title: "Fix config validation",
+          mergedAt: "2026-05-25T00:05:00Z",
+          updatedAt: "2026-05-25T00:05:00Z",
+        }),
+      },
+      authorizationTargets: {
+        101: pull({ number: 101, title: "Fix config validation" }),
+      },
+      comments: { 101: [] },
+      logPath: paths.ghLogPath,
+    });
+
+    runApplyResult(paths, {});
+
+    const report = JSON.parse(fs.readFileSync(paths.reportPath, "utf8"));
+    assert.equal(report.actions[0].status, "executed");
+    assert.equal(report.actions[0].reason, "already merged");
+    assert.equal(report.actions[0].merged_at, "2026-05-25T00:05:00Z");
+    assert.equal(hasPrMergeCall(paths.ghLogPath), false);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("repair apply rejects already-merged reconciliation after new review activity", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-apply-result-"));
+  try {
+    const paths = writeApplyMergeFixture(tmp);
+    writeFakeGh(paths.binDir, {
+      issues: {
+        101: issue({
+          number: 101,
+          title: "Fix config validation",
+          pullRequest: true,
+          state: "closed",
+          updatedAt: "2026-05-25T00:05:00Z",
+        }),
+      },
+      pulls: {
+        101: pull({
+          number: 101,
+          title: "Fix config validation",
+          mergedAt: "2026-05-25T00:05:00Z",
+          updatedAt: "2026-05-25T00:05:00Z",
+        }),
+      },
+      authorizationTargets: {
+        101: pull({ number: 101, title: "Fix config validation" }),
+      },
+      authorizationReviews: { 101: [] },
+      reviews: {
+        101: [
+          {
+            id: 88,
+            user: { login: "maintainer" },
+            state: "COMMENTED",
+            body: "New review after authorization.",
+            submitted_at: "2026-05-25T00:04:00Z",
+            commit_id: "a".repeat(40),
+          },
+        ],
+      },
+      comments: { 101: [] },
+      logPath: paths.ghLogPath,
+    });
+
+    runApplyResult(paths, {});
+
+    const report = JSON.parse(fs.readFileSync(paths.reportPath, "utf8"));
+    assert.equal(report.actions[0].status, "blocked");
+    assert.equal(
+      report.actions[0].reason,
+      "trusted repair review authorization is unavailable or stale",
+    );
+    assert.equal(hasPrMergeCall(paths.ghLogPath), false);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("repair apply rejects an already-merged head outside trusted provenance", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-apply-result-"));
+  try {
+    const paths = writeApplyMergeFixture(tmp);
+    writeFakeGh(paths.binDir, {
+      issues: {
+        101: issue({
+          number: 101,
+          title: "Fix config validation",
+          pullRequest: true,
+          state: "closed",
+          updatedAt: "2026-05-25T00:05:00Z",
+        }),
+      },
+      pulls: {
+        101: pull({
+          number: 101,
+          title: "Fix config validation",
+          mergedAt: "2026-05-25T00:05:00Z",
+          updatedAt: "2026-05-25T00:05:00Z",
+          headSha: "b".repeat(40),
+        }),
+      },
+      authorizationTargets: {
+        101: pull({ number: 101, title: "Fix config validation" }),
+      },
+      comments: { 101: [] },
+      logPath: paths.ghLogPath,
+    });
+
+    runApplyResult(paths, {});
+
+    const report = JSON.parse(fs.readFileSync(paths.reportPath, "utf8"));
+    assert.equal(report.actions[0].status, "blocked");
+    assert.equal(
+      report.actions[0].reason,
+      "trusted repair review authorization is unavailable or stale",
+    );
+    assert.equal(hasPrMergeCall(paths.ghLogPath), false);
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
@@ -1892,17 +2149,28 @@ test("repair apply blocks when GitHub accepts merge without completing it", () =
   }
 });
 
-test("repair apply executes only after GitHub reports the merge complete", () => {
+test("repair apply merges after owned verdict-comment timestamp drift", () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-apply-result-"));
   try {
     const mergeCommandPath = path.join(tmp, "merge-command");
-    const paths = writeApplyMergeFixture(tmp);
+    const paths = writeApplyMergeFixture(tmp, {
+      target_updated_at: "2026-05-25T00:02:00Z",
+    });
     writeFakeGh(paths.binDir, {
       issues: {
-        101: issue({ number: 101, title: "Fix config validation", pullRequest: true }),
+        101: issue({
+          number: 101,
+          title: "Fix config validation",
+          pullRequest: true,
+          updatedAt: "2026-05-25T00:02:00Z",
+        }),
       },
       pulls: {
-        101: pull({ number: 101, title: "Fix config validation" }),
+        101: pull({
+          number: 101,
+          title: "Fix config validation",
+          updatedAt: "2026-05-25T00:02:00Z",
+        }),
       },
       comments: { 101: [] },
       mergeCommandPath,
@@ -1913,6 +2181,7 @@ test("repair apply executes only after GitHub reports the merge complete", () =>
           merge_commit_sha: "b".repeat(40),
         },
       },
+      reviewedUpdatedAt: { 101: "2026-05-25T00:00:00Z" },
       logPath: paths.ghLogPath,
     });
 
@@ -1944,6 +2213,47 @@ test("repair apply executes only after GitHub reports the merge complete", () =>
   }
 });
 
+test("repair apply dry-run rejects stale merge authorization", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-apply-result-"));
+  try {
+    const paths = writeApplyMergeFixture(tmp, {
+      target_updated_at: "2026-05-25T00:02:00Z",
+    });
+    writeFakeGh(paths.binDir, {
+      issues: {
+        101: issue({
+          number: 101,
+          title: "Fix config validation",
+          pullRequest: true,
+          updatedAt: "2026-05-25T00:02:00Z",
+        }),
+      },
+      pulls: {
+        101: pull({
+          number: 101,
+          title: "Fix config validation",
+          updatedAt: "2026-05-25T00:02:00Z",
+        }),
+      },
+      authorizationTargets: {
+        101: pull({ number: 101, title: "Fix config validation" }),
+      },
+      reviewedUpdatedAt: { 101: "2026-05-25T00:00:00Z" },
+      comments: { 101: [] },
+      logPath: paths.ghLogPath,
+    });
+
+    runApplyResult(paths, { dryRun: true, allowMerge: true });
+
+    const report = JSON.parse(fs.readFileSync(paths.reportPath, "utf8"));
+    assert.equal(report.actions[0].status, "blocked");
+    assert.match(report.actions[0].reason, /trusted repair review authorization/);
+    assert.equal(hasPrMergeCall(paths.ghLogPath), false);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
 type ApplyFixturePaths = {
   binDir: string;
   jobPath: string;
@@ -1967,6 +2277,9 @@ type ApplyFixtureAction = {
   depends_on?: string[] | null;
   idempotency_key?: string;
   reason?: string;
+  review_activity_cursor?: string;
+  review_verdict?: string;
+  target_updated_at?: string;
   omitTargetUpdatedAt?: boolean;
 };
 
@@ -1975,6 +2288,7 @@ type FakeGhData = {
   pulls: Record<number, Record<string, unknown>>;
   comments: Record<number, Record<string, unknown>[]>;
   reviews?: Record<number, Record<string, unknown>[]>;
+  authorizationReviews?: Record<number, Record<string, unknown>[]>;
   inlineComments?: Record<number, Record<string, unknown>[]>;
   reviewChangePath?: string;
   postMutationReviews?: Record<number, Record<string, unknown>[]>;
@@ -1990,6 +2304,9 @@ type FakeGhData = {
   mergeFailure?: string;
   mergeCommandPath?: string;
   postMergePulls?: Record<number, Record<string, unknown>>;
+  omitReviewAuthorization?: number[];
+  reviewedUpdatedAt?: Record<number, string>;
+  authorizationTargets?: Record<number, Record<string, unknown>>;
   logPath: string;
 };
 
@@ -2047,7 +2364,11 @@ function writeApplyFixture(
       ...resultAction,
       target: resultAction.target ?? "#101",
       target_kind: resultAction.target_kind ?? "pull_request",
-      ...(omitTargetUpdatedAt ? {} : { target_updated_at: "2026-05-25T00:00:00Z" }),
+      ...(omitTargetUpdatedAt
+        ? {}
+        : {
+            target_updated_at: resultAction.target_updated_at ?? "2026-05-25T00:00:00Z",
+          }),
       status: resultAction.status ?? "planned",
       evidence: ["PR B is referenced as the canonical replacement for PR A."],
       idempotency_key:
@@ -2099,7 +2420,10 @@ function enableFixFirstMerges(jobPath: string): void {
   fs.writeFileSync(jobPath, job);
 }
 
-function writeApplyMergeFixture(tmp: string): ApplyFixturePaths {
+function writeApplyMergeFixture(
+  tmp: string,
+  actionOverrides: Pick<ApplyFixtureAction, "target_updated_at"> = {},
+): ApplyFixturePaths {
   const binDir = path.join(tmp, "bin");
   const runDir = path.join(tmp, "run");
   const jobPath = path.join(tmp, "job.md");
@@ -2146,7 +2470,7 @@ function writeApplyMergeFixture(tmp: string): ApplyFixturePaths {
             action: "merge_canonical",
             target: "#101",
             target_kind: "pull_request",
-            target_updated_at: "2026-05-25T00:00:00Z",
+            target_updated_at: actionOverrides.target_updated_at ?? "2026-05-25T00:00:00Z",
             status: "planned",
             idempotency_key: "merge-boundary-101",
           },
@@ -2180,22 +2504,26 @@ function writeApplyMergeFixture(tmp: string): ApplyFixturePaths {
 function runApplyResult(
   paths: ApplyFixturePaths,
   options: {
-    proofDecision: "covered" | "keep_open";
+    proofDecision?: "covered" | "keep_open";
     expectedPromptIncludes?: string;
     unexpectedPromptIncludes?: string;
     failIfProofRuns?: boolean;
     proofFailureMessage?: string;
     afterProofPath?: string;
     allowMissingUpdatedAt?: boolean;
+    dryRun?: boolean;
+    allowMerge?: boolean;
   },
 ) {
   const args = ["dist/repair/apply-result.js", paths.jobPath, paths.resultPath];
   if (options.allowMissingUpdatedAt) args.push("--allow-missing-updated-at");
+  if (options.dryRun) args.push("--dry-run");
   execFileSync(process.execPath, args, {
     cwd: repoRoot,
     env: {
       ...process.env,
       CLAWSWEEPER_ALLOW_EXECUTE: "1",
+      CLAWSWEEPER_ALLOW_MERGE: options.allowMerge ? "1" : "",
       CLAWSWEEPER_ALLOWED_OWNER: "openclaw",
       CLAWSWEEPER_GH_RETRY_ATTEMPTS: "1",
       CLAWSWEEPER_MODEL: "model-test",
@@ -2205,7 +2533,7 @@ function runApplyResult(
       GH_TOKEN: "write-token",
       ...mockGhBinEnv(path.join(paths.binDir, "gh.js")),
       PATH: `${paths.binDir}${path.delimiter}${process.env.PATH ?? ""}`,
-      PR_CLOSE_COVERAGE_PROOF_DECISION: options.proofDecision,
+      PR_CLOSE_COVERAGE_PROOF_DECISION: options.proofDecision ?? "covered",
       PR_CLOSE_COVERAGE_PROOF_EXPECT_PROMPT: options.expectedPromptIncludes ?? "",
       PR_CLOSE_COVERAGE_PROOF_UNEXPECTED_PROMPT: options.unexpectedPromptIncludes ?? "",
       PR_CLOSE_COVERAGE_PROOF_FAIL_IF_INVOKED: options.failIfProofRuns ? "1" : "",
@@ -2217,6 +2545,7 @@ function runApplyResult(
 }
 
 function writeFakeGh(binDir: string, data: FakeGhData) {
+  installApplyReviewAuthorizations(binDir, data);
   fs.writeFileSync(
     path.join(binDir, "gh.js"),
     `#!/usr/bin/env node
@@ -2430,6 +2759,70 @@ process.exit(1);
   );
 }
 
+function installApplyReviewAuthorizations(binDir: string, data: FakeGhData): void {
+  const resultPath = path.join(path.dirname(binDir), "run", "result.json");
+  if (!fs.existsSync(resultPath)) return;
+  const result = JSON.parse(fs.readFileSync(resultPath, "utf8"));
+  const planPath = path.join(path.dirname(resultPath), "cluster-plan.json");
+  const plan = fs.existsSync(planPath)
+    ? JSON.parse(fs.readFileSync(planPath, "utf8"))
+    : { generated_at: "2026-05-25T00:00:30Z", items: [] };
+  const authorizations = Array.isArray(plan.review_authorizations)
+    ? [...plan.review_authorizations]
+    : [];
+
+  for (const action of result.actions ?? []) {
+    const number = Number(String(action.target ?? "").replace(/^#/, ""));
+    const pullTarget = data.authorizationTargets?.[number] ?? data.pulls[number];
+    if (
+      !Number.isSafeInteger(number) ||
+      !pullTarget ||
+      data.omitReviewAuthorization?.includes(number)
+    ) {
+      continue;
+    }
+    const authorization = String(action.action ?? "").startsWith("merge") ? "merge" : "close";
+    const verdict = authorization === "merge" ? "pass" : "close";
+    const comments = [...(data.comments[number] ?? [])];
+    const cursor = createReviewedPrActivityCursor({
+      reviews: data.authorizationReviews?.[number] ?? data.reviews?.[number] ?? [],
+      inlineComments: data.inlineComments?.[number] ?? [],
+      reviewThreads: [],
+    });
+    assert.ok(cursor);
+    const targetActivityDigest = repairTargetActivityDigest(
+      repairTargetActivitySnapshotFromTarget(pullTarget, comments, "pull_request"),
+    );
+    const reviewComment = {
+      id: `review-${number}-${authorization}`,
+      user: { login: "openclaw-clawsweeper[bot]" },
+      author_association: "CONTRIBUTOR",
+      created_at: "2026-05-25T00:00:10Z",
+      updated_at: String(pullTarget.updated_at ?? "2026-05-25T00:00:10Z"),
+      body: [
+        `<!-- clawsweeper-review item=${number} -->`,
+        `<!-- clawsweeper-verdict:${verdict} item=${number} sha=${String(pullTarget.head?.sha ?? "")} updated_at=${String(data.reviewedUpdatedAt?.[number] ?? action.target_updated_at ?? data.issues[number]?.updated_at ?? "")} reviewed_at=2026-05-25T00:00:15Z source_revision=${"f".repeat(64)} review_activity_cursor=${cursor} target_activity_digest=${targetActivityDigest} -->`,
+      ].join("\n"),
+    };
+    comments.push(reviewComment);
+    data.comments[number] = comments;
+    const snapshot = mintRepairMutationReviewAuthorizations({
+      repository: result.repo,
+      number,
+      targetKind: "pull_request",
+      target: pullTarget,
+      comments,
+      expectedHeadSha: pullTarget.head?.sha,
+      reviewedBefore: plan.generated_at ?? "2026-05-25T00:00:30Z",
+    }).find((candidate) => candidate.authorization === authorization);
+    assert.ok(snapshot);
+    authorizations.push(snapshot);
+  }
+
+  plan.review_authorizations = authorizations;
+  fs.writeFileSync(planPath, `${JSON.stringify(plan, null, 2)}\n`);
+}
+
 function writeFakeCodex(binDir: string) {
   fs.writeFileSync(
     path.join(binDir, "codex"),
@@ -2509,7 +2902,13 @@ function issue(options: {
   };
 }
 
-function pull(options: { number: number; title: string; mergedAt?: string }) {
+function pull(options: {
+  number: number;
+  title: string;
+  mergedAt?: string;
+  updatedAt?: string;
+  headSha?: string;
+}) {
   return {
     number: options.number,
     title: options.title,
@@ -2518,8 +2917,24 @@ function pull(options: { number: number; title: string; mergedAt?: string }) {
     state: options.mergedAt ? "closed" : "open",
     merged_at: options.mergedAt ?? null,
     body: `${options.title} body.`,
-    updated_at: "2026-05-25T00:00:00Z",
-    head: { sha: "a".repeat(40) },
+    updated_at: options.updatedAt ?? "2026-05-25T00:00:00Z",
+    locked: false,
+    labels: [],
+    author_association: "CONTRIBUTOR",
+    assignees: [],
+    milestone: null,
+    head: {
+      sha: options.headSha ?? "a".repeat(40),
+      ref: `repair-${options.number}`,
+      repo: { full_name: "openclaw/openclaw" },
+    },
+    base: {
+      sha: "b".repeat(40),
+      ref: "main",
+      repo: { full_name: "openclaw/openclaw" },
+    },
+    requested_reviewers: [],
+    requested_teams: [],
   };
 }
 
