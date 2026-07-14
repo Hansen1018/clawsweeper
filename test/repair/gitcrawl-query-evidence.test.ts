@@ -558,6 +558,40 @@ test("query evidence fails closed on source, relation, review, and packet drift"
     );
   });
 
+  await t.test("packets reject duplicate canonical claims", () => {
+    const base = {
+      provider: "cloud" as const,
+      repository,
+      snapshotId,
+      queryName: "gitcrawl.threads.search" as const,
+      queryArgs: { owner: "openclaw", repo: "openclaw" },
+      subject: `${repository}#pull:42`,
+    };
+    const claim = createGitcrawlEvidenceClaim({
+      ...base,
+      data: memberRow(),
+    });
+    const conflicting = createGitcrawlEvidenceClaim({
+      ...base,
+      data: memberRow({ title: "Conflicting title" }),
+    });
+    const packetInput = {
+      provider: "cloud" as const,
+      repository,
+      snapshotId,
+      coverage: completeCoverage(),
+      generatedAt,
+    };
+    assert.throws(
+      () => buildGitcrawlEvidencePacket({ ...packetInput, claims: [claim, claim] }),
+      /repeats claim/,
+    );
+    assert.throws(
+      () => buildGitcrawlEvidencePacket({ ...packetInput, claims: [claim, conflicting] }),
+      /conflicting claims/,
+    );
+  });
+
   await t.test("packet repository is relabeled", async () => {
     const adapter = await adapterFor({ "gitcrawl.clusters.list": [clusterRow()] });
     const claim = (await adapter.listClusters()).claims[0]!;

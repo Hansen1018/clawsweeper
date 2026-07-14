@@ -457,8 +457,20 @@ function validatePacketBindings(input: {
   } else if (input.paritySnapshotId !== undefined) {
     throw new Error("Gitcrawl non-parity evidence packet has a parity snapshot");
   }
+  const claimHashes = new Set<string>();
+  const canonicalClaims = new Map<string, string>();
   for (const claim of input.claims) {
     verifyGitcrawlEvidenceClaim(claim);
+    if (claimHashes.has(claim.sha256)) {
+      throw new Error(`Gitcrawl evidence packet repeats claim ${claim.sha256}`);
+    }
+    claimHashes.add(claim.sha256);
+    const canonicalIdentity = `${claim.subject}:${claim.query.name}`;
+    const previousClaim = canonicalClaims.get(canonicalIdentity);
+    if (previousClaim !== undefined) {
+      throw new Error(`Gitcrawl evidence packet has conflicting claims for ${canonicalIdentity}`);
+    }
+    canonicalClaims.set(canonicalIdentity, claim.sha256);
     if (
       claim.provider !== input.provider ||
       claim.repository !== input.repository ||
