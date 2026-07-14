@@ -127,13 +127,15 @@ test("operator docs preserve the dormant consumer and no-deploy boundaries", () 
   assert.match(docs, /does not activate scheduled\s+actionable intake or publication/);
   assert.match(docs, /GITCRAWL_CLOUD_STAGE_ONLY=1/);
   assert.match(docs, /marker-selected existing token IDs plus the newly minted token ID/);
-  assert.match(docs, /node scripts\/resolve-crawl-remote-access-credentials\.mjs --verify-access/);
-  assert.match(docs, /writes and reads back both\s+Gitcrawl kill switches/);
-  assert.match(docs, /generation marker and selects the matching slot/);
   assert.match(
     docs,
-    /Comments, unrelated\s+declarations, unnamed intervening steps, extra checkout or resolver controls/,
+    /node scripts\/resolve-crawl-remote-access-credentials\.mjs\s+--resolve-and-verify-access/,
   );
+  assert.match(docs, /writes and reads back both\s+Gitcrawl kill\s+switches/);
+  assert.match(docs, /generation marker and selects the matching slot/);
+  assert.match(docs, /fresh protected-environment job has only a pinned sparse checkout/);
+  assert.match(docs, /emits no credential outputs/);
+  assert.match(docs, /exact approved release SHA, both rollout states/);
   assert.match(docs, /fails\s+closed before\s+privileged\s+work/);
   assert.match(docs, /never prints returned service credentials/);
 });

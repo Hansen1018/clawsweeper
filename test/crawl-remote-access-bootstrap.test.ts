@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import test from "node:test";
 import {
@@ -8,6 +9,7 @@ import {
   credentialGenerationMarker,
   createCloudflareClient,
   createGitHubClient,
+  parseBareSwitch,
 } from "../scripts/bootstrap-crawl-remote-access.mjs";
 
 const quietLogger = { log() {} };
@@ -177,27 +179,23 @@ function variableValue(variables: VariableTarget[], name: string, repository: st
     ?.value;
 }
 
-test("deploy consumer gate rejects comment-only claims and accepts a structural resolver", () => {
-  assert.throws(
-    () =>
-      assertCrawlRemoteDeployConsumerContract(
-        [
-          "jobs:",
-          "  deploy:",
-          "    steps:",
-          "      - name: Placeholder",
-          "        run: |",
-          "          # - name: Resolve crawl-remote Access credentials",
-          "          # node scripts/resolve-crawl-remote-access-credentials.mjs",
-        ].join("\n"),
-      ),
-    /requires exactly one "Resolve crawl-remote Access credentials" step/,
-  );
-
-  const validSource = [
+function validDeployConsumerSource() {
+  return [
     "jobs:",
+    "  preflight:",
+    "    runs-on: ubuntu-latest",
+    "    steps:",
+    "      - run: echo preflight",
     "  deploy:",
     "    runs-on: ubuntu-latest",
+    "    steps:",
+    "      - run: echo deploy",
+    "  crawl_remote_access_verify:",
+    "    name: Verify crawl-remote Access credentials",
+    "    needs: [preflight, deploy]",
+    "    permissions: {}",
+    "    runs-on: ubuntu-latest",
+    "    timeout-minutes: 2",
     "    environment:",
     "      name: crawl-remote-production",
     "    defaults:",
@@ -213,10 +211,11 @@ test("deploy consumer gate rejects comment-only claims and accepts a structural 
     "        with:",
     "          fetch-depth: 1",
     "          persist-credentials: false",
+    "          ref: ${{ github.sha }}",
+    "          repository: ${{ github.repository }}",
     "          sparse-checkout: scripts/resolve-crawl-remote-access-credentials.mjs",
     "          sparse-checkout-cone-mode: false",
-    "      - name: Resolve crawl-remote Access credentials",
-    "        id: crawl-remote-access-credentials",
+    "      - name: Resolve and verify crawl-remote Access credentials",
     "        env:",
     '          BASH_ENV: ""',
     "          CRAWL_REMOTE_ACCESS_CREDENTIAL_GENERATION: ${{ vars.CRAWL_REMOTE_ACCESS_CREDENTIAL_GENERATION }}",
@@ -224,262 +223,124 @@ test("deploy consumer gate rejects comment-only claims and accepts a structural 
     "          CRAWL_REMOTE_ACCESS_BLUE_CLIENT_SECRET: ${{ secrets.CRAWL_REMOTE_ACCESS_BLUE_CLIENT_SECRET }}",
     "          CRAWL_REMOTE_ACCESS_GREEN_CLIENT_ID: ${{ secrets.CRAWL_REMOTE_ACCESS_GREEN_CLIENT_ID }}",
     "          CRAWL_REMOTE_ACCESS_GREEN_CLIENT_SECRET: ${{ secrets.CRAWL_REMOTE_ACCESS_GREEN_CLIENT_SECRET }}",
+    "          CRAWL_REMOTE_ACCESS_EXPECTED_OBSERVATION_ORDER_STATE: ${{ needs.preflight.outputs.observation_order_state }}",
+    "          CRAWL_REMOTE_ACCESS_EXPECTED_RELEASE_SHA: ${{ needs.preflight.outputs.deploy_sha }}",
+    "          CRAWL_REMOTE_ACCESS_EXPECTED_SNAPSHOT_PROVENANCE_STATE: ${{ needs.preflight.outputs.snapshot_provenance_state }}",
+    "          CRAWL_REMOTE_ACCESS_PROBE_URL: https://reports.openclaw.ai/crawl-remote",
     '          ENV: ""',
     '          NODE_OPTIONS: ""',
-    "        run: |",
-    "          node scripts/resolve-crawl-remote-access-credentials.mjs",
-    "      - name: Verify crawl-remote Access credentials",
-    "        env:",
-    "          CF_ACCESS_CLIENT_ID: ${{ steps.crawl-remote-access-credentials.outputs.client_id }}",
-    "          CF_ACCESS_CLIENT_SECRET: ${{ steps.crawl-remote-access-credentials.outputs.client_secret }}",
-    "          CRAWL_REMOTE_ACCESS_PROBE_URL: https://reports.openclaw.ai/crawl-remote",
-    "        run: |",
-    "          node scripts/resolve-crawl-remote-access-credentials.mjs --verify-access",
+    "        run: node scripts/resolve-crawl-remote-access-credentials.mjs --resolve-and-verify-access",
   ].join("\n");
+}
+
+test("deploy consumer gate accepts only the isolated resolve-and-verify job", () => {
+  const validSource = validDeployConsumerSource();
   assert.doesNotThrow(() => assertCrawlRemoteDeployConsumerContract(validSource));
+
+  for (const source of [
+    validSource.replace("    needs: [preflight, deploy]", "    needs: deploy"),
+    validSource.replace("    permissions: {}", "    permissions:\n      contents: read"),
+    validSource.replace(
+      "    permissions: {}\n    runs-on: ubuntu-latest",
+      "    permissions: {}\n    runs-on: self-hosted",
+    ),
+    validSource.replace("          ref: ${{ github.sha }}", "          ref: refs/heads/main"),
+    validSource.replace(
+      "      - name: Resolve and verify crawl-remote Access credentials",
+      [
+        "      - run: echo unreviewed",
+        "      - name: Resolve and verify crawl-remote Access credentials",
+      ].join("\n"),
+    ),
+    validSource.replace(
+      "        run: node scripts/resolve-crawl-remote-access-credentials.mjs --resolve-and-verify-access",
+      "        run: node scripts/resolve-crawl-remote-access-credentials.mjs",
+    ),
+    validSource.replace(
+      '          NODE_OPTIONS: ""',
+      '          NODE_OPTIONS: "--import ./unreviewed.mjs"',
+    ),
+  ]) {
+    assert.throws(
+      () => assertCrawlRemoteDeployConsumerContract(source),
+      /must use the exact isolated job contract/,
+    );
+  }
+});
+
+test("deploy consumer gate rejects encoded and out-of-job credential access", () => {
+  const validSource = validDeployConsumerSource();
+  assert.throws(
+    () =>
+      assertCrawlRemoteDeployConsumerContract(
+        validSource.replace("jobs:", ['"e\\u006ev": "--import ./bad.mjs"', "jobs:"].join("\n")),
+      ),
+    /canonical unescaped scalar values/,
+  );
   assert.throws(
     () =>
       assertCrawlRemoteDeployConsumerContract(
         validSource.replace(
-          "jobs:",
-          ['"e\\u006ev":', '  NODE_OPTIONS: "--import ./bad.mjs"', "jobs:"].join("\n"),
+          "      - run: echo deploy",
+          "      - run: echo ${{ secrets.CRAWL_REMOTE_ACCESS_GREEN_CLIENT_SECRET }}",
         ),
       ),
-    /must use canonical unescaped mapping keys/,
+    /must reference CRAWL_REMOTE_ACCESS_GREEN_CLIENT_SECRET only in the isolated verifier job/,
   );
   assert.throws(
     () =>
       assertCrawlRemoteDeployConsumerContract(
         validSource.replace(
-          "      - name: Verify crawl-remote Access credentials\n        env:",
-          [
-            "      - name: Verify crawl-remote Access credentials",
-            "        if: >-",
-            "          github.event_name == 'workflow_dispatch' &&",
-            "          github.run_attempt == 1",
-            "        env:",
-          ].join("\n"),
+          "      - run: echo deploy",
+          '      - run: "${{ secrets.CRAWL_REMOTE_ACCESS_GREEN_CLIENT_\\u0049D }}"',
         ),
       ),
-    /must use the exact Access verification helper/,
+    /canonical unescaped scalar values/,
   );
   assert.throws(
     () =>
       assertCrawlRemoteDeployConsumerContract(
         validSource.replace(
-          "          fetch-depth: 1",
-          [
-            "          fetch-depth: 1",
-            "          repository: untrusted/example",
-            "          ref: unreviewed",
-          ].join("\n"),
-        ),
-      ),
-    /requires its pinned sparse checkout immediately before it/,
-  );
-  assert.throws(
-    () =>
-      assertCrawlRemoteDeployConsumerContract(
-        validSource.replace(
-          "          CRAWL_REMOTE_ACCESS_CREDENTIAL_GENERATION:",
-          [
-            "          NODE_PATH: ./unreviewed",
-            "          CRAWL_REMOTE_ACCESS_CREDENTIAL_GENERATION:",
-          ].join("\n"),
-        ),
-      ),
-    /unsafe step contract/,
-  );
-  assert.throws(
-    () =>
-      assertCrawlRemoteDeployConsumerContract(
-        validSource.replace(
-          "        id: crawl-remote-access-credentials",
-          ['        "if": false', "        id: crawl-remote-access-credentials"].join("\n"),
-        ),
-      ),
-    /invalid step syntax/,
-  );
-  assert.throws(
-    () =>
-      assertCrawlRemoteDeployConsumerContract(
-        validSource.replace('      NODE_OPTIONS: ""', '      NODE_OPTIONS: "--import ./bad.mjs"'),
-      ),
-    /unsafe inherited NODE_OPTIONS binding/,
-  );
-  assert.throws(
-    () =>
-      assertCrawlRemoteDeployConsumerContract(
-        validSource.replace(
-          "        shell: bash --noprofile --norc -euo pipefail {0}",
-          "        shell: bash",
-        ),
-      ),
-    /unsafe inherited run controls/,
-  );
-  assert.throws(
-    () =>
-      assertCrawlRemoteDeployConsumerContract(
-        validSource
-          .replace("    env:", "    env :")
-          .replace(
-            '      NODE_OPTIONS: ""',
-            ['      NODE_OPTIONS: ""', "      PATH: /tmp"].join("\n"),
-          ),
-      ),
-    /unsafe inherited PATH binding/,
-  );
-  assert.throws(
-    () =>
-      assertCrawlRemoteDeployConsumerContract(
-        validSource
-          .replace("    defaults:", "    defaults :")
-          .replace(
-            "        shell: bash --noprofile --norc -euo pipefail {0}",
-            [
-              "        shell: bash --noprofile --norc -euo pipefail {0}",
-              "        working-directory: /tmp",
-            ].join("\n"),
-          ),
-      ),
-    /unsafe inherited run controls/,
-  );
-  assert.throws(
-    () =>
-      assertCrawlRemoteDeployConsumerContract(
-        validSource.replace("    runs-on: ubuntu-latest", "    runs-on: self-hosted"),
-      ),
-    /unsafe inherited run controls/,
-  );
-  assert.throws(
-    () =>
-      assertCrawlRemoteDeployConsumerContract(
-        validSource.replace(
-          "    runs-on: ubuntu-latest",
-          ["    runs-on: ubuntu-latest", "    container: untrusted/image"].join("\n"),
-        ),
-      ),
-    /unsafe inherited run controls/,
-  );
-  assert.throws(
-    () =>
-      assertCrawlRemoteDeployConsumerContract(
-        validSource.replace(
-          '          NODE_OPTIONS: ""',
-          ['          NODE_OPTIONS: "--import ./bad.mjs"', '          NODE_OPTIONS: ""'].join("\n"),
-        ),
-      ),
-    /duplicate step env field: NODE_OPTIONS/,
-  );
-  assert.throws(
-    () =>
-      assertCrawlRemoteDeployConsumerContract(
-        validSource.replace(
-          "      - name: Resolve crawl-remote Access credentials",
-          [
-            "      - run: |",
-            "          printf unreviewed > scripts/resolve-crawl-remote-access-credentials.mjs",
-            "      - name: Resolve crawl-remote Access credentials",
-          ].join("\n"),
-        ),
-      ),
-    /requires its pinned sparse checkout immediately before it/,
-  );
-  assert.throws(
-    () =>
-      assertCrawlRemoteDeployConsumerContract(
-        validSource.replace(
-          "${{ steps.crawl-remote-access-credentials.outputs.client_id }}",
-          "${{ secrets.CRAWL_REMOTE_ACCESS_BLUE_CLIENT_ID }}",
-        ),
-      ),
-    /must reference CRAWL_REMOTE_ACCESS_BLUE_CLIENT_ID only in the resolver/,
-  );
-  assert.throws(
-    () =>
-      assertCrawlRemoteDeployConsumerContract(
-        validSource.replace(
-          "      - name: Verify crawl-remote Access credentials",
-          [
-            "      - name: Unrelated direct slot access",
-            "        env:",
-            "          UNRELATED_SECRET: ${{ secrets.CRAWL_REMOTE_ACCESS_GREEN_CLIENT_SECRET }}",
-            "        run: echo unrelated",
-            "      - name: Verify crawl-remote Access credentials",
-          ].join("\n"),
-        ),
-      ),
-    /must reference CRAWL_REMOTE_ACCESS_GREEN_CLIENT_SECRET only in the resolver/,
-  );
-  assert.throws(
-    () =>
-      assertCrawlRemoteDeployConsumerContract(
-        validSource.replace(
-          "      - name: Verify crawl-remote Access credentials",
-          [
-            "      - name: Unrelated resolver output access",
-            "        env:",
-            "          UNRELATED_SECRET: ${{ steps.crawl-remote-access-credentials.outputs.client_secret }}",
-            "        run: echo unrelated",
-            "      - name: Verify crawl-remote Access credentials",
-          ].join("\n"),
-        ),
-      ),
-    /must use the exact Access verification helper/,
-  );
-  assert.throws(
-    () =>
-      assertCrawlRemoteDeployConsumerContract(
-        validSource.replace(
-          "      - name: Verify crawl-remote Access credentials",
-          [
-            "      - name: Alternate resolver output access",
-            "        env:",
-            "          UNRELATED_SECRET: ${{ steps['crawl-remote-access-credentials'].outputs['client_secret'] }}",
-            "        run: echo unrelated",
-            "      - name: Verify crawl-remote Access credentials",
-          ].join("\n"),
-        ),
-      ),
-    /must use the exact Access verification helper/,
-  );
-  assert.throws(
-    () =>
-      assertCrawlRemoteDeployConsumerContract(
-        validSource.replace(
-          "      - name: Verify crawl-remote Access credentials",
-          [
-            "      - name: Legacy credential audit",
-            "        run: echo CRAWL_REMOTE_ACCESS_CLIENT_ID CRAWL_REMOTE_ACCESS_CLIENT_SECRET",
-            "      - name: Verify crawl-remote Access credentials",
-          ].join("\n"),
+          "      - run: echo deploy",
+          "      - run: echo CRAWL_REMOTE_ACCESS_CLIENT_ID CRAWL_REMOTE_ACCESS_CLIENT_SECRET",
         ),
       ),
     /legacy unversioned references/,
   );
-  assert.throws(
-    () =>
-      assertCrawlRemoteDeployConsumerContract(
-        validSource.replace(
-          "          node scripts/resolve-crawl-remote-access-credentials.mjs --verify-access",
-          "          : # $CF_ACCESS_CLIENT_ID $CF_ACCESS_CLIENT_SECRET",
-        ),
-      ),
-    /must use the exact Access verification helper/,
-  );
-  assert.throws(
-    () =>
-      assertCrawlRemoteDeployConsumerContract(
-        validSource.replace(
-          "          node scripts/resolve-crawl-remote-access-credentials.mjs --verify-access",
-          [
-            "          printf -v CF_ACCESS_CLIENT_ID unreviewed",
-            "          node scripts/resolve-crawl-remote-access-credentials.mjs --verify-access",
-          ].join("\n"),
-        ),
-      ),
-    /must use the exact Access verification helper/,
-  );
+});
+
+test("rotation requires an exact bare CLI switch", () => {
+  assert.equal(parseBareSwitch(undefined, "rotate-service-token"), false);
+  assert.equal(parseBareSwitch(true, "rotate-service-token"), true);
+  for (const value of [false, "false", "0", "1"]) {
+    assert.throws(
+      () => parseBareSwitch(value, "rotate-service-token"),
+      /must be supplied as a bare switch/,
+    );
+  }
+});
+
+test("bootstrap CLI rejects valued rotation switches before any contract or API work", () => {
+  for (const value of ["false", "0"]) {
+    const result = spawnSync(
+      process.execPath,
+      [
+        "scripts/bootstrap-crawl-remote-access.mjs",
+        "--confirm",
+        BOOTSTRAP_CONTRACT.confirmation,
+        "--rotate-service-token",
+        value,
+      ],
+      {
+        cwd: process.cwd(),
+        encoding: "utf8",
+        env: {},
+      },
+    );
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /--rotate-service-token must be supplied as a bare switch/);
+    assert.doesNotMatch(result.stderr, /consumer contract|Cloudflare|GitHub/);
+  }
 });
 
 test("optional Gitcrawl consumers remain dormant before Cloudflare reads", async () => {

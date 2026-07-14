@@ -37,39 +37,25 @@ const DEPLOY_CONSUMER_CONTRACT = Object.freeze({
   checkoutWith: {
     "fetch-depth": "1",
     "persist-credentials": "false",
+    ref: "${{ github.sha }}",
+    repository: "${{ github.repository }}",
     "sparse-checkout": "scripts/resolve-crawl-remote-access-credentials.mjs",
     "sparse-checkout-cone-mode": "false",
   },
-  command: "node scripts/resolve-crawl-remote-access-credentials.mjs",
-  consumerCommand: "node scripts/resolve-crawl-remote-access-credentials.mjs --verify-access",
+  command: "node scripts/resolve-crawl-remote-access-credentials.mjs --resolve-and-verify-access",
   inheritedEnvironment: {
     BASH_ENV: "",
     ENV: "",
     NODE_OPTIONS: "",
   },
-  forbiddenInheritedEnvironment: [
-    "BASHOPTS",
-    "DYLD_INSERT_LIBRARIES",
-    "DYLD_LIBRARY_PATH",
-    "LD_LIBRARY_PATH",
-    "LD_PRELOAD",
-    "NODE_PATH",
-    "PATH",
-    "SHELLOPTS",
-  ],
-  job: "deploy",
+  job: "crawl_remote_access_verify",
+  jobName: "Verify crawl-remote Access credentials",
+  jobNeeds: "[preflight, deploy]",
   jobEnvironment: "crawl-remote-production",
   jobRunsOn: "ubuntu-latest",
   jobShell: "bash --noprofile --norc -euo pipefail {0}",
-  consumerEnvironment: {
-    CF_ACCESS_CLIENT_ID: "${{ steps.crawl-remote-access-credentials.outputs.client_id }}",
-    CF_ACCESS_CLIENT_SECRET: "${{ steps.crawl-remote-access-credentials.outputs.client_secret }}",
-    CRAWL_REMOTE_ACCESS_PROBE_URL: BOOTSTRAP_CONTRACT.cloudEndpoint,
-  },
-  consumerStepName: "Verify crawl-remote Access credentials",
   path: ".github/workflows/deploy-crawl-remote.yml",
-  stepId: "crawl-remote-access-credentials",
-  stepName: "Resolve crawl-remote Access credentials",
+  stepName: "Resolve and verify crawl-remote Access credentials",
   requiredEnvironment: {
     BASH_ENV: "",
     CRAWL_REMOTE_ACCESS_CREDENTIAL_GENERATION:
@@ -79,6 +65,12 @@ const DEPLOY_CONSUMER_CONTRACT = Object.freeze({
     CRAWL_REMOTE_ACCESS_GREEN_CLIENT_ID: "${{ secrets.CRAWL_REMOTE_ACCESS_GREEN_CLIENT_ID }}",
     CRAWL_REMOTE_ACCESS_GREEN_CLIENT_SECRET:
       "${{ secrets.CRAWL_REMOTE_ACCESS_GREEN_CLIENT_SECRET }}",
+    CRAWL_REMOTE_ACCESS_EXPECTED_OBSERVATION_ORDER_STATE:
+      "${{ needs.preflight.outputs.observation_order_state }}",
+    CRAWL_REMOTE_ACCESS_EXPECTED_RELEASE_SHA: "${{ needs.preflight.outputs.deploy_sha }}",
+    CRAWL_REMOTE_ACCESS_EXPECTED_SNAPSHOT_PROVENANCE_STATE:
+      "${{ needs.preflight.outputs.snapshot_provenance_state }}",
+    CRAWL_REMOTE_ACCESS_PROBE_URL: BOOTSTRAP_CONTRACT.cloudEndpoint,
     ENV: "",
     NODE_OPTIONS: "",
   },
@@ -110,7 +102,10 @@ export async function bootstrapCrawlRemoteAccess(options, dependencies) {
   const runtimeProvider = normalizeRuntimeProvider(options.runtimeProvider);
   const publisherEnabled = normalizeBinaryFlag(options.publisherEnabled, "publisher enabled");
   assertStagedCloudConfiguration({ runtimeProvider, publisherEnabled });
-  const rotateServiceToken = Boolean(options.rotateServiceToken);
+  const rotateServiceToken = normalizeBooleanOption(
+    options.rotateServiceToken,
+    "rotate service token",
+  );
   const rotationLabel = normalizeRotationLabel(options.rotationLabel);
   const cloudflare = dependencies.cloudflare;
   const github = dependencies.github;
@@ -254,157 +249,62 @@ export function assertCrawlRemoteDeployConsumerContract(source) {
   if (typeof source !== "string") {
     throw new Error("crawl-remote deploy consumer source is unavailable");
   }
-  const {
-    steps: deploySteps,
-    jobEnvironment,
-    jobDeploymentEnvironment,
-    jobRunDefaults,
-    jobRunsOn,
-    hasJobContainer,
-    hasJobServices,
-    hasWorkflowDefaults,
-    hasWorkflowEnvironment,
-  } = parseWorkflowJobSteps(source, DEPLOY_CONSUMER_CONTRACT.job);
-  const matchingSteps = deploySteps.filter(
-    (step) => step.name === DEPLOY_CONSUMER_CONTRACT.stepName,
-  );
-  if (matchingSteps.length !== 1) {
-    throw new Error(
-      `crawl-remote deploy consumer requires exactly one "${DEPLOY_CONSUMER_CONTRACT.stepName}" ` +
-        `step in the ${DEPLOY_CONSUMER_CONTRACT.job} job`,
-    );
-  }
-  const resolver = matchingSteps[0];
-  if (
-    resolver.fields.size !== 1 ||
-    resolver.fields.get("id") !== DEPLOY_CONSUMER_CONTRACT.stepId ||
-    resolver.configuration.size !== 0 ||
-    resolver.environment.size !== Object.keys(DEPLOY_CONSUMER_CONTRACT.requiredEnvironment).length
-  ) {
-    throw new Error("crawl-remote deploy credential resolver has an unsafe step contract");
-  }
-  if (
-    hasWorkflowDefaults ||
-    hasWorkflowEnvironment ||
-    hasJobContainer ||
-    hasJobServices ||
-    jobRunsOn !== DEPLOY_CONSUMER_CONTRACT.jobRunsOn ||
-    jobDeploymentEnvironment.get("name") !== DEPLOY_CONSUMER_CONTRACT.jobEnvironment ||
-    jobRunDefaults.size !== 1 ||
-    jobRunDefaults.get("shell") !== DEPLOY_CONSUMER_CONTRACT.jobShell
-  ) {
-    throw new Error("crawl-remote deploy credential resolver has unsafe inherited run controls");
-  }
-  for (const [name, value] of Object.entries(DEPLOY_CONSUMER_CONTRACT.inheritedEnvironment)) {
-    if (jobEnvironment.get(name) !== value) {
-      throw new Error(
-        `crawl-remote deploy credential resolver has unsafe inherited ${name} binding`,
-      );
-    }
-  }
-  for (const name of DEPLOY_CONSUMER_CONTRACT.forbiddenInheritedEnvironment) {
-    if (jobEnvironment.has(name)) {
-      throw new Error(
-        `crawl-remote deploy credential resolver has unsafe inherited ${name} binding`,
-      );
-    }
-  }
-  const resolverIndex = deploySteps.indexOf(resolver);
-  const checkout = deploySteps[resolverIndex - 1];
-  if (
-    checkout?.name !== DEPLOY_CONSUMER_CONTRACT.checkoutStepName ||
-    checkout.fields.size !== 1 ||
-    checkout.fields.get("uses") !== DEPLOY_CONSUMER_CONTRACT.checkoutUses ||
-    checkout.environment.size !== 0 ||
-    checkout.configuration.size !== Object.keys(DEPLOY_CONSUMER_CONTRACT.checkoutWith).length ||
-    checkout.run.length !== 0
-  ) {
-    throw new Error(
-      "crawl-remote deploy credential resolver requires its pinned sparse checkout immediately before it",
-    );
-  }
-  for (const [name, value] of Object.entries(DEPLOY_CONSUMER_CONTRACT.checkoutWith)) {
-    if (checkout.configuration.get(name) !== value) {
-      throw new Error(`crawl-remote deploy resolver checkout has invalid ${name}`);
-    }
-  }
-  for (const [name, value] of Object.entries(DEPLOY_CONSUMER_CONTRACT.requiredEnvironment)) {
-    if (resolver.environment.get(name) !== value) {
-      throw new Error(`crawl-remote deploy credential resolver has invalid ${name} binding`);
-    }
-  }
-  const protectedBindings = Object.keys(DEPLOY_CONSUMER_CONTRACT.requiredEnvironment).filter(
-    (name) => name.startsWith("CRAWL_REMOTE_ACCESS_"),
-  );
   const normalizedSource = source.replace(/\r\n?/g, "\n");
-  if (!normalizedSource.includes(resolver.source)) {
-    throw new Error("crawl-remote deploy credential resolver source cannot be isolated");
+  if (normalizedSource.includes("\t")) {
+    throw new Error("crawl-remote deploy workflow must not contain tab indentation");
   }
-  const sourceOutsideResolver = normalizedSource.replace(resolver.source, "").toUpperCase();
-  for (const name of protectedBindings) {
-    if (sourceOutsideResolver.includes(name)) {
-      throw new Error(`crawl-remote deploy consumer must reference ${name} only in the resolver`);
+  if (/\\(?:x[0-9a-f]{2}|u[0-9a-f]{4}|U[0-9a-f]{8})/i.test(normalizedSource)) {
+    throw new Error("crawl-remote deploy workflow must use canonical unescaped scalar values");
+  }
+  if (/^(?:"(?:defaults|env)"|'(?:defaults|env)'|defaults|env)\s*:/m.test(normalizedSource)) {
+    throw new Error("crawl-remote deploy credential verifier has unsafe workflow run controls");
+  }
+  if ((normalizedSource.match(/^jobs:\s*$/gm) ?? []).length !== 1) {
+    throw new Error("crawl-remote deploy workflow must have exactly one jobs mapping");
+  }
+  for (const dependency of ["preflight", "deploy"]) {
+    if ((normalizedSource.match(new RegExp(`^  ${dependency}:\\s*$`, "gm")) ?? []).length !== 1) {
+      throw new Error(
+        `crawl-remote deploy workflow must have exactly one ${dependency} dependency job`,
+      );
     }
   }
-  const executableLines = resolver.run
-    .map((line) => line.trim())
-    .filter((line) => line.length > 0 && !line.startsWith("#"));
-  if (executableLines.length !== 1 || executableLines[0] !== DEPLOY_CONSUMER_CONTRACT.command) {
-    throw new Error("crawl-remote deploy credential resolver does not invoke the tested artifact");
-  }
-  const credentialConsumerCandidates = deploySteps
-    .map((step, index) => ({ index, step }))
-    .filter(({ step }) => containsResolverOutputReference(step.source));
-  const credentialConsumers = credentialConsumerCandidates.filter(({ step }) =>
-    isExactCredentialConsumer(step),
+  const verifierJobDeclarations = normalizedSource.match(
+    /^  (?:"crawl_remote_access_verify"|'crawl_remote_access_verify'|crawl_remote_access_verify)\s*:/gm,
   );
   if (
-    credentialConsumers.length === 0 ||
-    credentialConsumers.length !== credentialConsumerCandidates.length ||
-    credentialConsumers.some(({ index }) => index <= resolverIndex)
+    verifierJobDeclarations?.length !== 1 ||
+    verifierJobDeclarations[0] !== `  ${DEPLOY_CONSUMER_CONTRACT.job}:`
   ) {
     throw new Error(
-      "crawl-remote deploy credential consumers must use the exact Access verification helper " +
-        "after the generation-slot resolver",
+      `crawl-remote deploy workflow must have exactly one ${DEPLOY_CONSUMER_CONTRACT.job} job`,
     );
   }
-  for (const [name, value] of Object.entries(DEPLOY_CONSUMER_CONTRACT.consumerEnvironment)) {
-    if (!name.startsWith("CF_ACCESS_CLIENT_")) continue;
-    if (countOccurrences(source, value) !== credentialConsumers.length) {
-      throw new Error(
-        "crawl-remote deploy resolver outputs must be scoped to credential consumers",
-      );
-    }
+  const verifierJobSource = extractWorkflowJobSource(
+    normalizedSource,
+    DEPLOY_CONSUMER_CONTRACT.job,
+  );
+  const expectedVerifierJobSource = expectedDeployConsumerJobSource();
+  if (verifierJobSource !== expectedVerifierJobSource) {
+    throw new Error(
+      "crawl-remote deploy credential verifier must use the exact isolated job contract",
+    );
   }
-  for (const step of deploySteps) {
-    let unapprovedSource = step.source;
-    if (credentialConsumers.some((consumer) => consumer.step === step)) {
-      for (const value of Object.values(DEPLOY_CONSUMER_CONTRACT.consumerEnvironment)) {
-        unapprovedSource = unapprovedSource.replace(value, "");
-      }
-    }
-    if (containsResolverOutputReference(unapprovedSource)) {
+  const sourceOutsideVerifier = normalizedSource.replace(verifierJobSource, "").toUpperCase();
+  const protectedBindings = Object.keys(DEPLOY_CONSUMER_CONTRACT.requiredEnvironment).filter(
+    (name) =>
+      name === "CRAWL_REMOTE_ACCESS_CREDENTIAL_GENERATION" ||
+      /^CRAWL_REMOTE_ACCESS_(?:BLUE|GREEN)_CLIENT_(?:ID|SECRET)$/.test(name),
+  );
+  for (const name of protectedBindings) {
+    if (sourceOutsideVerifier.includes(name)) {
       throw new Error(
-        "crawl-remote deploy resolver outputs must use only allowlisted consumer bindings",
+        `crawl-remote deploy consumer must reference ${name} only in the isolated verifier job`,
       );
     }
-  }
-  const hasAccessOverride =
-    jobEnvironment.has("CF_ACCESS_CLIENT_ID") ||
-    jobEnvironment.has("CF_ACCESS_CLIENT_SECRET") ||
-    deploySteps.some((step) => {
-      const hasAccessEnvironment =
-        step.environment.has("CF_ACCESS_CLIENT_ID") ||
-        step.environment.has("CF_ACCESS_CLIENT_SECRET");
-      return (
-        hasAccessEnvironment && !credentialConsumers.some((consumer) => consumer.step === step)
-      );
-    });
-  if (hasAccessOverride) {
-    throw new Error("crawl-remote deploy consumers must not override resolved Access credentials");
   }
   const legacyReferences = DEPLOY_CONSUMER_CONTRACT.forbiddenReferences.filter((reference) =>
-    source.includes(reference),
+    normalizedSource.toUpperCase().includes(reference),
   );
   if (legacyReferences.length > 0) {
     throw new Error(
@@ -414,313 +314,60 @@ export function assertCrawlRemoteDeployConsumerContract(source) {
   }
 }
 
-function isExactCredentialConsumer(step) {
-  const executableLines = step.run
-    .map((line) => line.trim())
-    .filter((line) => line.length > 0 && !line.startsWith("#"));
-  if (
-    step.name !== DEPLOY_CONSUMER_CONTRACT.consumerStepName ||
-    step.fields.size !== 0 ||
-    step.configuration.size !== 0 ||
-    step.environment.size !== Object.keys(DEPLOY_CONSUMER_CONTRACT.consumerEnvironment).length ||
-    executableLines.length !== 1 ||
-    executableLines[0] !== DEPLOY_CONSUMER_CONTRACT.consumerCommand
-  ) {
-    return false;
+function expectedDeployConsumerJobSource() {
+  const lines = [
+    `  ${DEPLOY_CONSUMER_CONTRACT.job}:`,
+    `    name: ${DEPLOY_CONSUMER_CONTRACT.jobName}`,
+    `    needs: ${DEPLOY_CONSUMER_CONTRACT.jobNeeds}`,
+    "    permissions: {}",
+    `    runs-on: ${DEPLOY_CONSUMER_CONTRACT.jobRunsOn}`,
+    "    timeout-minutes: 2",
+    "    environment:",
+    `      name: ${DEPLOY_CONSUMER_CONTRACT.jobEnvironment}`,
+    "    defaults:",
+    "      run:",
+    `        shell: ${DEPLOY_CONSUMER_CONTRACT.jobShell}`,
+    "    env:",
+  ];
+  for (const [name, value] of Object.entries(DEPLOY_CONSUMER_CONTRACT.inheritedEnvironment)) {
+    lines.push(`      ${name}: ${formatContractScalar(value)}`);
   }
-  return Object.entries(DEPLOY_CONSUMER_CONTRACT.consumerEnvironment).every(
-    ([name, value]) => step.environment.get(name) === value,
+  lines.push(
+    "    steps:",
+    `      - name: ${DEPLOY_CONSUMER_CONTRACT.checkoutStepName}`,
+    `        uses: ${DEPLOY_CONSUMER_CONTRACT.checkoutUses}`,
+    "        with:",
   );
+  for (const [name, value] of Object.entries(DEPLOY_CONSUMER_CONTRACT.checkoutWith)) {
+    lines.push(`          ${name}: ${formatContractScalar(value)}`);
+  }
+  lines.push(`      - name: ${DEPLOY_CONSUMER_CONTRACT.stepName}`, "        env:");
+  for (const [name, value] of Object.entries(DEPLOY_CONSUMER_CONTRACT.requiredEnvironment)) {
+    lines.push(`          ${name}: ${formatContractScalar(value)}`);
+  }
+  lines.push(`        run: ${DEPLOY_CONSUMER_CONTRACT.command}`);
+  return lines.join("\n");
 }
 
-function countOccurrences(source, value) {
-  let count = 0;
-  let offset = 0;
-  while (true) {
-    const index = source.indexOf(value, offset);
-    if (index < 0) return count;
-    count += 1;
-    offset = index + value.length;
-  }
-}
-
-function containsResolverOutputReference(source) {
-  const normalized = source.replace(/\s+/g, "").toLowerCase();
-  return (
-    normalized.includes(DEPLOY_CONSUMER_CONTRACT.stepId.toLowerCase()) &&
-    normalized.includes("outputs") &&
-    (normalized.includes("client_id") || normalized.includes("client_secret"))
-  );
-}
-
-function parseWorkflowJobSteps(source, expectedJob) {
-  const lines = source.replace(/\r\n?/g, "\n").split("\n");
-  if (lines.some((line) => line.includes("\t"))) {
-    throw new Error("crawl-remote deploy workflow must not contain tab indentation");
-  }
-  if (lines.some(hasEscapedDoubleQuotedMappingKey)) {
-    throw new Error("crawl-remote deploy workflow must use canonical unescaped mapping keys");
-  }
-  const jobsIndexes = lines.flatMap((line, index) => (line === "jobs:" ? [index] : []));
-  if (jobsIndexes.length !== 1) {
-    throw new Error("crawl-remote deploy workflow has no jobs mapping");
-  }
-  const jobsIndex = jobsIndexes[0];
-  const hasWorkflowDefaults = lines.some(
-    (line) => matchYamlMappingLine(line, 0, "defaults") !== null,
-  );
-  const hasWorkflowEnvironment = lines.some(
-    (line) => matchYamlMappingLine(line, 0, "env") !== null,
-  );
-  const jobIndexes = lines.flatMap((line, index) =>
-    index > jobsIndex && line === `  ${expectedJob}:` ? [index] : [],
-  );
-  if (jobIndexes.length !== 1) {
-    throw new Error(`crawl-remote deploy workflow must have exactly one ${expectedJob} job`);
-  }
-  const jobStart = jobIndexes[0];
-  let jobEnd = lines.length;
-  for (let index = jobStart + 1; index < lines.length; index += 1) {
-    if (/^  [A-Za-z0-9_-]+:\s*$/.test(lines[index])) {
-      jobEnd = index;
+function extractWorkflowJobSource(source, job) {
+  const lines = source.split("\n");
+  const start = lines.findIndex((line) => line === `  ${job}:`);
+  if (start < 0) return "";
+  let end = lines.length;
+  for (let index = start + 1; index < lines.length; index += 1) {
+    if (/^  (?:"[^"]+"|'[^']+'|[A-Za-z0-9_-]+)\s*:\s*$/.test(lines[index])) {
+      end = index;
       break;
     }
   }
-  const stepsIndexes = lines.flatMap((line, index) =>
-    index > jobStart && index < jobEnd && line === "    steps:" ? [index] : [],
-  );
-  if (stepsIndexes.length !== 1) {
-    throw new Error(`crawl-remote deploy ${expectedJob} job must have exactly one steps sequence`);
+  while (end > start + 1 && lines[end - 1].trim().length === 0) {
+    end -= 1;
   }
-  const stepsIndex = stepsIndexes[0];
-  const jobEnvironment = parseJobMapping(lines, jobStart, stepsIndex, "env");
-  const jobDeploymentEnvironment = parseJobMapping(lines, jobStart, stepsIndex, "environment");
-  const jobRunDefaults = parseJobRunDefaults(lines, jobStart, stepsIndex);
-  const jobRunsOnEntries = lines
-    .slice(jobStart + 1, stepsIndex)
-    .map((line) => matchYamlMappingLine(line, 4, "runs-on"))
-    .filter((value) => value !== null);
-  const jobRunsOn = jobRunsOnEntries.length === 1 ? parseYamlScalar(jobRunsOnEntries[0]) : null;
-  const hasJobContainer = lines
-    .slice(jobStart + 1, stepsIndex)
-    .some((line) => matchYamlMappingLine(line, 4, "container") !== null);
-  const hasJobServices = lines
-    .slice(jobStart + 1, stepsIndex)
-    .some((line) => matchYamlMappingLine(line, 4, "services") !== null);
-
-  const steps = [];
-  for (let index = stepsIndex + 1; index < jobEnd; index += 1) {
-    const stepMatch = /^      - (.+?)\s*$/.exec(lines[index]);
-    if (!stepMatch) {
-      if (/^      -(?:\s|$)/.test(lines[index])) {
-        throw new Error(`crawl-remote deploy workflow has invalid step syntax: ${lines[index]}`);
-      }
-      continue;
-    }
-    let stepEnd = jobEnd;
-    for (let cursor = index + 1; cursor < jobEnd; cursor += 1) {
-      if (lines[cursor].startsWith("      - ")) {
-        stepEnd = cursor;
-        break;
-      }
-    }
-    steps.push(parseWorkflowStep(lines.slice(index, stepEnd), stepMatch[1]));
-    index = stepEnd - 1;
-  }
-  return {
-    steps,
-    jobEnvironment,
-    jobDeploymentEnvironment,
-    jobRunDefaults,
-    jobRunsOn,
-    hasJobContainer,
-    hasJobServices,
-    hasWorkflowDefaults,
-    hasWorkflowEnvironment,
-  };
+  return lines.slice(start, end).join("\n");
 }
 
-function hasEscapedDoubleQuotedMappingKey(line) {
-  let index = 0;
-  while (line[index] === " ") index += 1;
-  if (line.startsWith("- ", index)) index += 2;
-  if (line[index] !== '"') return false;
-  index += 1;
-  let escaped = false;
-  while (index < line.length) {
-    if (line[index] === "\\") {
-      escaped = true;
-      index += 2;
-      continue;
-    }
-    if (line[index] === '"') {
-      return escaped && /^\s*:/.test(line.slice(index + 1));
-    }
-    index += 1;
-  }
-  return false;
-}
-
-function parseJobMapping(lines, jobStart, stepsIndex, key) {
-  const indexes = lines.flatMap((line, index) => {
-    if (index <= jobStart || index >= stepsIndex) return [];
-    const value = matchYamlMappingLine(line, 4, key);
-    return value === "" ? [index] : [];
-  });
-  if (indexes.length !== 1) {
-    return new Map();
-  }
-  const values = new Map();
-  for (let index = indexes[0] + 1; index < stepsIndex; index += 1) {
-    const line = lines[index];
-    if (/^\s*$/.test(line) || /^\s*#/.test(line)) continue;
-    if (isYamlMappingAtIndent(line, 4)) break;
-    const match = /^      ([A-Za-z_][A-Za-z0-9_-]*):\s*(.*?)\s*$/.exec(line);
-    if (!match || values.has(match[1])) {
-      throw new Error(`crawl-remote deploy workflow has invalid inherited ${key} syntax`);
-    }
-    values.set(match[1], parseYamlScalar(match[2]));
-  }
-  return values;
-}
-
-function parseJobRunDefaults(lines, jobStart, stepsIndex) {
-  const indexes = lines.flatMap((line, index) => {
-    if (index <= jobStart || index >= stepsIndex) return [];
-    const value = matchYamlMappingLine(line, 4, "defaults");
-    return value === "" ? [index] : [];
-  });
-  if (indexes.length !== 1) {
-    return new Map();
-  }
-  const values = new Map();
-  let foundRun = false;
-  for (let index = indexes[0] + 1; index < stepsIndex; index += 1) {
-    const line = lines[index];
-    if (/^\s*$/.test(line) || /^\s*#/.test(line)) continue;
-    if (isYamlMappingAtIndent(line, 4)) break;
-    if (matchYamlMappingLine(line, 6, "run") === "") {
-      if (foundRun) {
-        throw new Error("crawl-remote deploy workflow has duplicate inherited run defaults");
-      }
-      foundRun = true;
-      continue;
-    }
-    const match = /^        ([A-Za-z0-9_-]+):\s*(.*?)\s*$/.exec(line);
-    if (!foundRun || !match || values.has(match[1])) {
-      throw new Error("crawl-remote deploy workflow has invalid inherited run defaults");
-    }
-    values.set(match[1], parseYamlScalar(match[2]));
-  }
-  return foundRun ? values : new Map();
-}
-
-function matchYamlMappingLine(line, indentation, key) {
-  const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const pattern = new RegExp(
-    `^ {${indentation}}(?:"${escapedKey}"|'${escapedKey}'|${escapedKey})\\s*:\\s*(.*?)\\s*$`,
-  );
-  return pattern.exec(line)?.[1] ?? null;
-}
-
-function isYamlMappingAtIndent(line, indentation) {
-  const pattern = new RegExp(`^ {${indentation}}(?:"[^"]+"|'[^']+'|[A-Za-z0-9_-]+)\\s*:`);
-  return pattern.test(line);
-}
-
-function parseWorkflowStep(lines, firstEntry) {
-  let name = null;
-  const fields = new Map();
-  const environment = new Map();
-  const configuration = new Map();
-  const run = [];
-  const stepKeys = new Set();
-  let block = null;
-
-  const setField = (key, rawValue) => {
-    if (stepKeys.has(key)) {
-      throw new Error(`crawl-remote deploy workflow has duplicate step field: ${key}`);
-    }
-    stepKeys.add(key);
-    block = null;
-    if (key === "name") {
-      name = parseYamlScalar(rawValue);
-    } else if (key === "env" && rawValue.length === 0) {
-      block = "env";
-    } else if (key === "with" && rawValue.length === 0) {
-      block = "with";
-    } else if (key === "run" && /^[|>][+-]?$/.test(rawValue)) {
-      block = "run";
-    } else if (/^[|>][+-]?$/.test(rawValue)) {
-      fields.set(key, rawValue);
-      block = "field";
-    } else {
-      fields.set(key, parseYamlScalar(rawValue));
-    }
-  };
-
-  const firstField = /^([A-Za-z0-9_-]+):(?:\s*(.*))?$/.exec(firstEntry);
-  if (!firstField) {
-    throw new Error(`crawl-remote deploy workflow has invalid step syntax: ${firstEntry}`);
-  }
-  setField(firstField[1], firstField[2] ?? "");
-
-  for (const line of lines.slice(1)) {
-    if (/^\s*$/.test(line) || /^\s*#/.test(line)) continue;
-    const fieldMatch = /^        ([A-Za-z0-9_-]+):(?:\s*(.*))?$/.exec(line);
-    if (fieldMatch) {
-      const [, key, rawValue = ""] = fieldMatch;
-      setField(key, rawValue);
-      continue;
-    }
-    if (block === "env") {
-      const environmentMatch = /^          ([A-Za-z_][A-Za-z0-9_]*):\s*(.+?)\s*$/.exec(line);
-      if (!environmentMatch) {
-        throw new Error(`crawl-remote deploy resolver has invalid env syntax: ${line.trim()}`);
-      }
-      if (environment.has(environmentMatch[1])) {
-        throw new Error(
-          `crawl-remote deploy workflow has duplicate step env field: ${environmentMatch[1]}`,
-        );
-      }
-      environment.set(environmentMatch[1], parseYamlScalar(environmentMatch[2]));
-      continue;
-    }
-    if (block === "with") {
-      const configurationMatch = /^          ([A-Za-z0-9_-]+):\s*(.+?)\s*$/.exec(line);
-      if (!configurationMatch) {
-        throw new Error(`crawl-remote deploy resolver has invalid with syntax: ${line.trim()}`);
-      }
-      if (configuration.has(configurationMatch[1])) {
-        throw new Error(
-          `crawl-remote deploy workflow has duplicate step with field: ${configurationMatch[1]}`,
-        );
-      }
-      configuration.set(configurationMatch[1], parseYamlScalar(configurationMatch[2]));
-      continue;
-    }
-    if (block === "run" && line.startsWith("          ")) {
-      run.push(line.slice(10));
-      continue;
-    }
-    if (block === "field" && line.startsWith("          ")) {
-      continue;
-    }
-    throw new Error(`crawl-remote deploy workflow has invalid step syntax: ${line.trim()}`);
-  }
-  return { name, fields, environment, configuration, run, source: lines.join("\n") };
-}
-
-function parseYamlScalar(value) {
-  const trimmed = value.trim();
-  if (
-    trimmed.length >= 2 &&
-    ((trimmed.startsWith('"') && trimmed.endsWith('"')) ||
-      (trimmed.startsWith("'") && trimmed.endsWith("'")))
-  ) {
-    return trimmed.slice(1, -1);
-  }
-  return trimmed;
+function formatContractScalar(value) {
+  return value === "" ? '""' : value;
 }
 
 function assertLocalDeployConsumerContract() {
@@ -1398,6 +1045,13 @@ function normalizeBinaryFlag(value, label) {
   return normalized;
 }
 
+function normalizeBooleanOption(value, label) {
+  if (typeof value !== "boolean") {
+    throw new Error(`${label} must be a boolean`);
+  }
+  return value;
+}
+
 function normalizeRotationLabel(value) {
   const label = String(value ?? Date.now()).trim();
   if (!/^[0-9]+(?:-[0-9]+)?$/.test(label)) {
@@ -1418,8 +1072,13 @@ function parseArgs(argv) {
   const result = {};
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
-    if (!argument.startsWith("--")) continue;
+    if (!argument.startsWith("--") || argument.length === 2) {
+      throw new Error(`unsupported crawl-remote bootstrap argument: ${argument}`);
+    }
     const name = argument.slice(2);
+    if (Object.hasOwn(result, name)) {
+      throw new Error(`duplicate crawl-remote bootstrap argument: --${name}`);
+    }
     const next = argv[index + 1];
     if (!next || next.startsWith("--")) {
       result[name] = true;
@@ -1431,9 +1090,37 @@ function parseArgs(argv) {
   return result;
 }
 
+export function parseBareSwitch(value, name) {
+  if (value === undefined) return false;
+  if (value !== true) {
+    throw new Error(`--${name} must be supplied as a bare switch`);
+  }
+  return true;
+}
+
 async function main() {
   const args = parseArgs(process.argv.slice(2));
-  if (args["check-consumer-contract"]) {
+  const supportedArguments = new Set([
+    "check-consumer-contract",
+    "confirm",
+    "publisher-enabled",
+    "rotate-service-token",
+    "rotation-label",
+    "runtime-provider",
+  ]);
+  for (const name of Object.keys(args)) {
+    if (!supportedArguments.has(name)) {
+      throw new Error(`unsupported crawl-remote bootstrap argument: --${name}`);
+    }
+  }
+  const checkConsumerContract = parseBareSwitch(
+    args["check-consumer-contract"],
+    "check-consumer-contract",
+  );
+  if (checkConsumerContract) {
+    if (Object.keys(args).length !== 1) {
+      throw new Error("--check-consumer-contract cannot be combined with mutation arguments");
+    }
     assertLocalDeployConsumerContract();
     console.log("verified crawl-remote generation-slot deploy consumer contract");
     return;
@@ -1441,6 +1128,7 @@ async function main() {
   if (args.confirm !== BOOTSTRAP_CONTRACT.confirmation) {
     throw new Error(`--confirm must equal "${BOOTSTRAP_CONTRACT.confirmation}"`);
   }
+  const rotateServiceToken = parseBareSwitch(args["rotate-service-token"], "rotate-service-token");
   assertLocalDeployConsumerContract();
   const cloudflare = createCloudflareClient({
     token: process.env.OPENCLAW_CLOUDFLARE_CONFIG_API_TOKEN,
@@ -1456,7 +1144,7 @@ async function main() {
   await bootstrapCrawlRemoteAccess(
     {
       publisherEnabled: args["publisher-enabled"] ?? "0",
-      rotateServiceToken: Boolean(args["rotate-service-token"]),
+      rotateServiceToken,
       rotationLabel: args["rotation-label"],
       runtimeProvider: args["runtime-provider"] ?? "cloud",
       workersApiToken: process.env.OPENCLAW_CLOUDFLARE_WORKERS_API_TOKEN,

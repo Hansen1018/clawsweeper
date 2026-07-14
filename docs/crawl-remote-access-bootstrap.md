@@ -5,32 +5,36 @@ does not deploy crawl-remote, alter deployment protection, or provide a fallback
 Cloudflare token to the deploy workflow.
 
 The workflow is intentionally inert until the separately owned deploy consumer
-adds an unconditional `Resolve crawl-remote Access credentials` step to its
-protected `deploy` job. A pinned sparse checkout containing the resolver must
-immediately precede that step. The resolver step binds the generation marker
-and all four slot secrets, then invokes the tested
-`scripts/resolve-crawl-remote-access-credentials.mjs` artifact. The bootstrap
-parses that exact step contract before minting privileged GitHub tokens and
-again before any Cloudflare or GitHub mutation. Comments, unrelated
-declarations, unnamed intervening steps, extra checkout or resolver controls,
-conditional steps, and legacy unversioned secret references do not satisfy the
-gate. Each downstream credential consumer must be an unconditional `Verify
-crawl-remote Access credentials` step that binds the resolver's step-scoped
-`client_id` and `client_secret` outputs and directly invokes
-`node scripts/resolve-crawl-remote-access-credentials.mjs --verify-access`.
-That helper sends both Access headers to the canonical `/health` and
-`/v1/contract` endpoints and verifies one consistent release. Direct slot-secret
-references, extra resolver-output references, shell wrappers, and fixed-slot
-credential overrides are rejected. Until the consumer change lands, every
-dispatch fails closed before privileged work.
+adds one exact `crawl_remote_access_verify` job after `preflight` and `deploy`.
+That fresh protected-environment job has only a pinned sparse checkout at the
+workflow SHA followed by an unconditional
+`Resolve and verify crawl-remote Access credentials` step. No earlier run step,
+package install, mutable workspace, `GITHUB_ENV`, or `GITHUB_PATH` state can
+cross the job boundary.
 
-The deploy job must keep its reviewed no-profile Bash default, and both the job
-and resolver step must bind `BASH_ENV`, `ENV`, and `NODE_OPTIONS` to empty
-values. The bootstrap rechecks the live ClawSweeper `main` SHA before token
-minting, immediately before its first mutation, and again before narrowing
-Access policy or revoking an old service token. It writes and reads back both
-Gitcrawl kill switches before creating a token, changing Access policy, or
-publishing any credential generation.
+The single resolver process binds the generation marker and all four slot
+secrets, selects the matching pair in memory, and directly invokes
+`node scripts/resolve-crawl-remote-access-credentials.mjs
+--resolve-and-verify-access`. It emits no credential outputs. The same process
+sends both Access headers to the canonical `/health` and `/v1/contract`
+endpoints, then requires the exact approved release SHA, both rollout states,
+the observation-order and snapshot-provenance notes, both Gitcrawl capability
+fences, and the required routes.
+
+The bootstrap compares the complete verifier job against this exact contract
+before minting privileged GitHub tokens and again before any Cloudflare or
+GitHub mutation. Extra steps or controls, encoded YAML scalar values, workflow
+run defaults, direct slot-secret references outside the verifier, and legacy
+unversioned secret references fail closed. The verifier job and step both bind
+`BASH_ENV`, `ENV`, and `NODE_OPTIONS` to empty values. Until the separately
+owned consumer change lands, every dispatch fails closed before privileged
+work.
+
+The bootstrap rechecks the live ClawSweeper `main` SHA before token minting,
+immediately before its first mutation, and again before narrowing Access policy
+or revoking an old service token. It writes and reads back both Gitcrawl kill
+switches before creating a token, changing Access policy, or publishing any
+credential generation.
 
 Bootstrap and production deploy runs share one non-cancelling concurrency group,
 so rotation cannot revoke a credential held by an in-flight deploy. During

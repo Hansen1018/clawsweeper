@@ -1,11 +1,14 @@
 #!/usr/bin/env node
 import { randomUUID } from "node:crypto";
-import { appendFileSync } from "node:fs";
 import process from "node:process";
 import { pathToFileURL } from "node:url";
 
 const CRAWL_REMOTE_ACCESS_PROBE_URL = "https://reports.openclaw.ai/crawl-remote";
 const MAX_PROBE_RESPONSE_BYTES = 1024 * 1024;
+const OBSERVATION_FENCE_NOTE =
+  "Gitcrawl observation ordering requires the D1 migration, explicit publisher capability, and operator cutover fence before it is advertised or activated.";
+const SNAPSHOT_PROVENANCE_NOTE =
+  "Gitcrawl content-addressed snapshots bind manifest.source_sha256, status, queries, and SQLite bundle manifests to one source image.";
 
 export function resolveCrawlRemoteAccessCredentials(environment) {
   const marker = String(environment.CRAWL_REMOTE_ACCESS_CREDENTIAL_GENERATION ?? "");
@@ -42,6 +45,21 @@ export async function verifyCrawlRemoteAccessCredentials(
   if (probeUrl !== CRAWL_REMOTE_ACCESS_PROBE_URL) {
     throw new Error("CRAWL_REMOTE_ACCESS_PROBE_URL must use the canonical crawl-remote route");
   }
+  const expectedReleaseSha = requiredSingleLineValue(
+    environment.CRAWL_REMOTE_ACCESS_EXPECTED_RELEASE_SHA,
+    "CRAWL_REMOTE_ACCESS_EXPECTED_RELEASE_SHA",
+  );
+  if (!/^[0-9a-f]{40}$/.test(expectedReleaseSha)) {
+    throw new Error("CRAWL_REMOTE_ACCESS_EXPECTED_RELEASE_SHA must be a full lowercase commit SHA");
+  }
+  const expectedObservationOrderState = requiredRolloutState(
+    environment.CRAWL_REMOTE_ACCESS_EXPECTED_OBSERVATION_ORDER_STATE,
+    "CRAWL_REMOTE_ACCESS_EXPECTED_OBSERVATION_ORDER_STATE",
+  );
+  const expectedSnapshotProvenanceState = requiredRolloutState(
+    environment.CRAWL_REMOTE_ACCESS_EXPECTED_SNAPSHOT_PROVENANCE_STATE,
+    "CRAWL_REMOTE_ACCESS_EXPECTED_SNAPSHOT_PROVENANCE_STATE",
+  );
   const probeNonce = requiredSingleLineValue(String(nonce), "crawl-remote Access probe nonce");
   const headers = {
     accept: "application/json",
@@ -73,26 +91,57 @@ export async function verifyCrawlRemoteAccessCredentials(
 
   const health = await request("/health");
   const contract = await request("/v1/contract");
-  const releaseSha = health?.release_sha;
   if (
     health?.ok !== true ||
-    typeof releaseSha !== "string" ||
-    !/^[0-9a-f]{40}$/.test(releaseSha) ||
+    health?.release_sha !== expectedReleaseSha ||
     contract?.service !== "crawl-remote" ||
     contract?.protocol_version !== "v1" ||
-    contract?.release_sha !== releaseSha
+    contract?.release_sha !== expectedReleaseSha
   ) {
-    throw new Error(
-      "crawl-remote Access verification did not reach one consistent crawl-remote release",
-    );
+    throw new Error("crawl-remote Access verification did not reach the approved release");
   }
+  const notes = Array.isArray(contract.notes) ? contract.notes : [];
+  if (!notes.includes(OBSERVATION_FENCE_NOTE)) {
+    throw new Error("crawl-remote Access verification is missing the observation-order fence");
+  }
+  if (!notes.includes(SNAPSHOT_PROVENANCE_NOTE)) {
+    throw new Error("crawl-remote Access verification is missing snapshot provenance");
+  }
+  const apps = Array.isArray(contract.apps) ? contract.apps : [];
+  const gitcrawl = apps.find((app) => app?.app === "gitcrawl");
+  if (!Array.isArray(gitcrawl?.capabilities)) {
+    throw new Error("crawl-remote Access verification has malformed Gitcrawl capabilities");
+  }
+  assertCapabilityState(
+    gitcrawl.capabilities,
+    "gitcrawl.observation-order.v1",
+    expectedObservationOrderState,
+  );
+  assertCapabilityState(
+    gitcrawl.capabilities,
+    "gitcrawl.snapshot.provenance.v1",
+    expectedSnapshotProvenanceState,
+  );
   const routes = Array.isArray(contract.routes) ? contract.routes : [];
   for (const path of ["/health", "/v1/contract"]) {
     if (!routes.some((route) => route?.method === "GET" && route?.path === path)) {
       throw new Error(`crawl-remote Access verification is missing GET ${path}`);
     }
   }
-  return { releaseSha };
+  return { releaseSha: expectedReleaseSha };
+}
+
+export async function resolveAndVerifyCrawlRemoteAccessCredentials(environment, options = {}) {
+  const credentials = resolveCrawlRemoteAccessCredentials(environment);
+  const result = await verifyCrawlRemoteAccessCredentials(
+    {
+      ...environment,
+      CF_ACCESS_CLIENT_ID: credentials.clientId,
+      CF_ACCESS_CLIENT_SECRET: credentials.clientSecret,
+    },
+    options,
+  );
+  return { ...result, slot: credentials.slot };
 }
 
 function requiredSingleLineValue(value, name) {
@@ -102,28 +151,32 @@ function requiredSingleLineValue(value, name) {
   return value;
 }
 
-function writeGitHubOutputs(path, credentials) {
-  const outputPath = requiredSingleLineValue(path, "GITHUB_OUTPUT");
-  appendFileSync(
-    outputPath,
-    `client_id=${credentials.clientId}\n` + `client_secret=${credentials.clientSecret}\n`,
-    "utf8",
-  );
+function requiredRolloutState(value, name) {
+  const state = requiredSingleLineValue(value, name);
+  if (state !== "dormant" && state !== "active") {
+    throw new Error(`${name} must be dormant or active`);
+  }
+  return state;
+}
+
+function assertCapabilityState(capabilities, capability, expectedState) {
+  const active = capabilities.includes(capability);
+  if ((expectedState === "active" && !active) || (expectedState === "dormant" && active)) {
+    throw new Error(
+      `crawl-remote Access verification does not match expected ${expectedState} ${capability} state`,
+    );
+  }
 }
 
 async function main() {
   const argumentsList = process.argv.slice(2);
-  if (argumentsList.length > 0) {
-    if (argumentsList.length !== 1 || argumentsList[0] !== "--verify-access") {
-      throw new Error("unsupported crawl-remote Access resolver arguments");
-    }
-    const result = await verifyCrawlRemoteAccessCredentials(process.env);
-    console.log(`verified crawl-remote Access release ${result.releaseSha}`);
-    return;
+  if (argumentsList.length !== 1 || argumentsList[0] !== "--resolve-and-verify-access") {
+    throw new Error("crawl-remote Access resolver requires --resolve-and-verify-access");
   }
-  const credentials = resolveCrawlRemoteAccessCredentials(process.env);
-  writeGitHubOutputs(process.env.GITHUB_OUTPUT, credentials);
-  console.log(`selected crawl-remote Access ${credentials.slot} credential generation`);
+  const result = await resolveAndVerifyCrawlRemoteAccessCredentials(process.env);
+  console.log(
+    `verified crawl-remote Access ${result.slot} generation for release ${result.releaseSha}`,
+  );
 }
 
 const isMain =
