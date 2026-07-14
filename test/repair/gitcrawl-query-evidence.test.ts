@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 
@@ -1061,6 +1062,53 @@ test("local SQLite source snapshots and serves the six-query contract", async ()
     assert.equal(adapter.coverage.length, GITCRAWL_DATASETS.length);
   } finally {
     await adapter.close();
+    fs.rmSync(directory, { force: true, recursive: true });
+  }
+});
+
+test("cluster importer consumes the snapshot-bound adapter and records provenance", () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-cluster-import-"));
+  const dbPath = path.join(directory, "gitcrawl.db");
+  const outDir = path.join(directory, "jobs");
+  const provenancePath = path.join(directory, "provenance.json");
+  seedLocalDatabase(dbPath);
+
+  try {
+    const output = execFileSync(
+      process.execPath,
+      [
+        "dist/repair/import-gitcrawl-clusters.js",
+        "--from-gitcrawl",
+        "--repo",
+        repository,
+        "--db",
+        dbPath,
+        "--out",
+        outDir,
+        "--mode",
+        "plan",
+        "--min-size",
+        "1",
+        "--provenance-out",
+        provenancePath,
+      ],
+      { cwd: process.cwd(), encoding: "utf8" },
+    ).trim();
+    const generatedPath = path.join(outDir, "gitcrawl-7-fix-provider-refresh.md");
+    const job = fs.readFileSync(generatedPath, "utf8");
+    const provenance = JSON.parse(fs.readFileSync(provenancePath, "utf8"));
+
+    assert.match(output, /gitcrawl-7-fix-provider-refresh\.md$/);
+    assert.match(job, /gitcrawl_provider: "local"/);
+    assert.match(job, /gitcrawl_snapshot_id: "local:[a-f0-9]{64}"/);
+    assert.match(job, /gitcrawl_source_identity_sha256: "[a-f0-9]{64}"/);
+    assert.match(job, /Generated from local Gitcrawl snapshot/);
+    assert.equal(provenance.schema, "clawsweeper-gitcrawl-cluster-import-v1");
+    assert.equal(provenance.provider, "local");
+    assert.match(provenance.snapshot_id, /^local:[a-f0-9]{64}$/);
+    assert.deepEqual(provenance.selected_cluster_ids, [7]);
+    assert.deepEqual(provenance.generated, [path.relative(process.cwd(), generatedPath)]);
+  } finally {
     fs.rmSync(directory, { force: true, recursive: true });
   }
 });
