@@ -432,7 +432,15 @@ test("exact event publish and routing require a successful fresh review artifact
   assert.match(releaseUnsuccessfulStep, /owner=\$LEASE_OWNER/);
   assert.match(releaseUnsuccessfulStep, /sweep-mutation-cli\.js comment delete/);
   assert.match(releaseUnsuccessfulStep, /--comment-id "\$lease_id"/);
-  assert.doesNotMatch(releaseUnsuccessfulStep, /gh api -X DELETE|--method DELETE/);
+  assert.match(releaseUnsuccessfulStep, /reactions\?content=eyes/);
+  assert.match(releaseUnsuccessfulStep, /sweep-mutation-cli\.js reaction delete/);
+  assert.match(releaseUnsuccessfulStep, /--reaction-id "\$reaction_id"/);
+  assert.match(releaseUnsuccessfulStep, /Removed unsuccessful eyes reaction/);
+  assert.doesNotMatch(releaseUnsuccessfulStep, /issues\/comments\/\$lease_id/);
+  assert.doesNotMatch(
+    releaseUnsuccessfulStep,
+    /issues\/\$ITEM_NUMBER\/reactions\/\$reaction_id" --method DELETE/,
+  );
   assert.match(publisher, /"--event-apply-proof"/);
   assert.match(publisher, /exactEventApplyProof\(/);
   assert.match(publisher, /const requeueLatestExpected = applyDisposition === "source_drift"/);
@@ -612,7 +620,10 @@ test("exact event publish and routing require a successful fresh review artifact
     eventReviewJob,
     /React to target item completion[\s\S]*steps\.publish-event-result\.outputs\.policy_noop == 'true'/,
   );
-  assert.match(eventReviewJob, /if \[ "\$POLICY_NOOP" != "true" \]; then/);
+  assert.match(
+    eventReviewJob,
+    /if \[ "\$POLICY_NOOP" != "true" \] && \[ "\$REVIEW_ONLY" != "true" \]; then/,
+  );
 });
 
 test("exact event workflow binds all work to the canonical queue claim", () => {
@@ -2052,20 +2063,50 @@ test("sweep review continuations stay workflow-dispatch compatible", () => {
     workflow.indexOf("- name: Continue sweep"),
     workflow.indexOf("- name: Finalize sweep caller action ledger"),
   );
+  assert.match(continueBlock, /sweep-mutation-cli\.js workflow dispatch/);
+  assert.match(continueBlock, /--workflow sweep\.yml/);
+  assert.match(continueBlock, /--target-repo "\$\{\{ needs\.plan\.outputs\.target_repo \}\}"/);
+  assert.match(
+    continueBlock,
+    /--field target_repo="\$\{\{ needs\.plan\.outputs\.target_repo \}\}"/,
+  );
+  assert.match(
+    continueBlock,
+    /--field target_branch="\$\{\{ needs\.plan\.outputs\.target_branch \}\}"/,
+  );
+  assert.match(continueBlock, /--business-key "sweep-continuation:\$GITHUB_RUN_ID"/);
+});
+
+test("failed review recovery waits for durable exact-review queue acknowledgement", () => {
+  const workflow = readText(".github/workflows/sweep.yml");
+  const queue = readText("src/repair/exact-review-action-ledger.ts");
+  const publisher = readText("src/repair/publish-event-result.ts");
   const recoveryBlock = workflow.slice(
-    workflow.indexOf("- name: Requeue planned review items once"),
-    workflow.indexOf("- name: Finalize review recovery action ledger"),
+    workflow.indexOf("\n  recover-review-failures:"),
+    workflow.indexOf("\n\n  retry-failed-reviews:"),
   );
 
-  for (const block of [continueBlock, recoveryBlock]) {
-    assert.match(block, /sweep-mutation-cli\.js workflow dispatch/);
-    assert.match(block, /--workflow sweep\.yml/);
-    assert.match(block, /--target-repo "\$\{\{ needs\.plan\.outputs\.target_repo \}\}"/);
-    assert.match(block, /--field target_repo="\$\{\{ needs\.plan\.outputs\.target_repo \}\}"/);
-    assert.match(block, /--field target_branch="\$\{\{ needs\.plan\.outputs\.target_branch \}\}"/);
-  }
-  assert.match(continueBlock, /--business-key "sweep-continuation:\$GITHUB_RUN_ID"/);
-  assert.match(recoveryBlock, /--business-key "review-recovery:\$GITHUB_RUN_ID"/);
+  assert.match(recoveryBlock, /--arg target_repo "\$\{\{ needs\.plan\.outputs\.target_repo \}\}"/);
+  assert.match(
+    recoveryBlock,
+    /--arg target_branch "\$\{\{ needs\.plan\.outputs\.target_branch \}\}"/,
+  );
+  assert.match(recoveryBlock, /source_action: "failed_review_shard_recovery"/);
+  assert.match(recoveryBlock, /dispatch_key: \$dispatch_key/);
+  assert.match(recoveryBlock, /exact-review-action-ledger-cli\.js enqueue/);
+  assert.match(recoveryBlock, /Finalize review recovery action ledger/);
+  assert.match(recoveryBlock, /Publish review recovery action ledger/);
+  assert.match(
+    publisher,
+    /options\.reviewOnly \? \["--sync-comments-only", "--suppress-automation-markers"\] : \[\]/,
+  );
+  assert.match(
+    queue,
+    /parsed\.ok !== true[\s\S]*parsed\.queued !== true[\s\S]*parsed\.deduped !== true[\s\S]*parsed\.accepted !== false/,
+  );
+  assert.doesNotMatch(recoveryBlock, /workflow run sweep\.yml/);
+  assert.doesNotMatch(recoveryBlock, /repos\/\$GITHUB_REPOSITORY\/dispatches/);
+  assert.doesNotMatch(recoveryBlock, /curl .*internal\/exact-review\/enqueue/);
 });
 
 test("target sweep dispatches preserve disabled ClawHub guard", () => {

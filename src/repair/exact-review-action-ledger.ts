@@ -131,14 +131,23 @@ function enqueueRequest(env: NodeJS.ProcessEnv): ExactReviewQueueRequest {
   };
   copyFiniteNumber(dispatch, decision, "codex_timeout_ms", "codexTimeoutMs");
   copyFiniteNumber(dispatch, decision, "media_proof_timeout_ms", "mediaProofTimeoutMs");
+  copyFiniteNumber(dispatch, decision, "source_comment_id", "sourceCommentId");
   copyPresent(dispatch, decision, "command_status_marker", "commandStatusMarker");
   copyPresent(dispatch, decision, "status_comment_id", "statusCommentId");
   copyPresent(dispatch, decision, "additional_prompt", "additionalPrompt");
   const payload = { delivery_id: deliveryId, decision };
-  return signedRequest("enqueue", env, payload, targetRepo, itemNumber, {
-    deliveryId,
-    itemKey: `${targetRepo}#${itemNumber}`,
-  });
+  return signedRequest(
+    "enqueue",
+    env,
+    payload,
+    targetRepo,
+    itemNumber,
+    {
+      deliveryId,
+      itemKey: `${targetRepo}#${itemNumber}`,
+    },
+    parseEnqueueResponse,
+  );
 }
 
 function claimRequest(env: NodeJS.ProcessEnv): ExactReviewQueueRequest {
@@ -266,15 +275,25 @@ function signedRequest(
   repository: string,
   number: number | null,
   businessIdentity: unknown,
+  parseAcceptedResponse?: (response: Response) => Promise<Record<string, string>>,
 ): ExactReviewQueueRequest {
   const body = JSON.stringify(payload);
   const signature = `sha256=${createHmac("sha256", requiredEnv(env, "CLAWSWEEPER_WEBHOOK_SECRET"))
     .update(body)
     .digest("hex")}`;
-  return request(command, env, payload, repository, number, businessIdentity, {
-    "content-type": "application/json",
-    "x-clawsweeper-exact-review-signature": signature,
-  });
+  return request(
+    command,
+    env,
+    payload,
+    repository,
+    number,
+    businessIdentity,
+    {
+      "content-type": "application/json",
+      "x-clawsweeper-exact-review-signature": signature,
+    },
+    parseAcceptedResponse,
+  );
 }
 
 function unsignedRequest(
@@ -354,6 +373,7 @@ async function parseClaimResponse(
   };
   copyFiniteNumber(reviewOptions, legacyDecision, "codex_timeout_ms", "codexTimeoutMs");
   copyFiniteNumber(reviewOptions, legacyDecision, "media_proof_timeout_ms", "mediaProofTimeoutMs");
+  copyFiniteNumber(reviewOptions, legacyDecision, "source_comment_id", "sourceCommentId");
   copyPresent(reviewOptions, legacyDecision, "command_status_marker", "commandStatusMarker");
   copyPresent(reviewOptions, legacyDecision, "status_comment_id", "statusCommentId");
   copyPresent(reviewOptions, legacyDecision, "additional_prompt", "additionalPrompt");
@@ -404,6 +424,17 @@ async function parseClaimResponse(
     protocol_version: String(responseProtocol),
     decision: JSON.stringify(decision),
   };
+}
+
+async function parseEnqueueResponse(response: Response): Promise<Record<string, string>> {
+  const parsed = parseObject(await boundedResponseText(response), "enqueue response");
+  if (
+    parsed.ok !== true ||
+    (parsed.queued !== true && parsed.deduped !== true && parsed.accepted !== false)
+  ) {
+    throw new Error("enqueue response was not acknowledged");
+  }
+  return {};
 }
 
 async function boundedResponseText(response: Response): Promise<string> {

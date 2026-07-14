@@ -3122,6 +3122,7 @@ function dispatchClawSweeperReview(command: LooseRecord): LooseRecord {
   const commandStatus = ["re_review", "autofix", "automerge"].includes(String(command.intent ?? ""))
     ? {
         command_status_marker: commandStatusMarker(command),
+        source_comment_id: Number(command.comment_id),
         ...(command.status_comment_id
           ? { status_comment_id: String(command.status_comment_id) }
           : {}),

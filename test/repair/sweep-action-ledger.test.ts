@@ -14,6 +14,7 @@ test("sweep caller mutations use the validated receipt CLI", () => {
   assert.doesNotMatch(source, /repos\/\$GITHUB_REPOSITORY\/dispatches/);
 
   let dispatchCount = 0;
+  let exactReviewEnqueueCount = 0;
   let reactionMutationCount = 0;
   for (const [jobId, job] of Object.entries(workflow.jobs) as Array<
     [string, { steps?: WorkflowStep[] }]
@@ -40,11 +41,14 @@ test("sweep caller mutations use the validated receipt CLI", () => {
         reactionMutationCount +=
           run.match(/sweep-mutation-cli\.js reaction (?:add|delete)/g)?.length ?? 0;
       }
+      exactReviewEnqueueCount +=
+        run.match(/exact-review-action-ledger-cli\.js enqueue/g)?.length ?? 0;
     }
   }
 
-  assert.equal(dispatchCount, 13);
-  assert.equal(reactionMutationCount, 4);
+  assert.equal(dispatchCount, 12);
+  assert.equal(exactReviewEnqueueCount, 2);
+  assert.equal(reactionMutationCount, 5);
   assert.match(source, /gh api -X GET[\s\S]*reactions/);
   assert.doesNotMatch(source, /for attempt in 1 2 3; do[\s\S]{0,500}sweep-mutation-cli/);
   assert.match(source, /hard runner loss[\s\S]{0,160}at-least-once safe/);
@@ -89,7 +93,13 @@ test("each sweep caller producer finalizes and publishes after its last mutation
       String(step.uses ?? "").includes("setup-action-ledger"),
     );
     const mutationIndexes = steps
-      .map((step, index) => (String(step.run ?? "").includes("sweep-mutation-cli.js") ? index : -1))
+      .map((step, index) =>
+        /(?:sweep-mutation-cli\.js|exact-review-action-ledger-cli\.js enqueue)/.test(
+          String(step.run ?? ""),
+        )
+          ? index
+          : -1,
+      )
       .filter((index) => index >= 0);
     const dispatchIndexes = steps
       .map((step, index) =>

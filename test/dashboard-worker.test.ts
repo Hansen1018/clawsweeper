@@ -10,9 +10,10 @@ import worker, {
   ExactReviewQueue,
   exactReviewQueueCapacity,
   exactReviewQueueStatusSnapshot,
+  mergeBayJourneyState,
   mergeBayTerminalState,
   StatusStore,
-  summarizeBayTimings,
+  summarizeBayJourneyTimings,
   workerWorkKind,
 } from "../dashboard/worker.ts";
 import {
@@ -137,8 +138,8 @@ test("OpenClaw Bay is an unlisted, hardened demo route", async () => {
   assert.match(body, /function terminalCapacity\(stage\)/);
   assert.match(body, /stage==="completed"&&terminalStack&&terminalStack\.clientWidth>=340\?20:12/);
   assert.match(body, /columns===4/);
-  assert.match(body, /Avg end-to-end/);
-  assert.match(body, /Awaiting a timed run/);
+  assert.match(body, /Avg trigger → final review/);
+  assert.match(body, /Awaiting a completed journey/);
   assert.match(body, /more in the tide buffer/);
   assert.match(body, /lane-nudge/);
   assert.match(body, /id="overall-average"/);
@@ -420,36 +421,383 @@ test("OpenClaw Bay shares a bounded 20-outcome tide buffer", () => {
   assert.equal(expiredWash.recently_washed.length, 0);
 });
 
-test("OpenClaw Bay averages only evidenced end-to-end timings from the last hour", () => {
+test("OpenClaw Bay averages completed trigger-to-summary journeys from the last hour", () => {
   const generatedAt = "2026-07-11T12:00:00.000Z";
-  const freshCompletedAt = "2026-07-11T11:45:00.000Z";
-  const timings = summarizeBayTimings(
+  const journeys = mergeBayJourneyState(
+    null,
     [
       {
-        outcome: "success",
-        terminal_outcome: "success",
-        completed_at: freshCompletedAt,
-        total_duration_ms: 180_000,
+        repository: "openclaw/openclaw",
+        number: 100,
+        source_comment_id: 1,
+        source_delivery_id: "delivery-1",
+        triggered_at: "2026-07-11T11:42:00.000Z",
       },
       {
-        outcome: "failure",
-        terminal_outcome: "failure",
+        repository: "openclaw/openclaw",
+        number: 200,
+        source_comment_id: 2,
+        source_delivery_id: "delivery-2",
+        triggered_at: "2026-07-11T11:26:00.000Z",
+      },
+      {
+        repository: "openclaw/openclaw",
+        number: 300,
+        source_comment_id: 3,
+        source_delivery_id: "delivery-3",
+        triggered_at: "2026-07-11T10:00:00.000Z",
+      },
+    ],
+    [
+      {
+        repository: "openclaw/openclaw",
+        number: 100,
+        source_comment_id: 1,
+        completed_at: "2026-07-11T11:45:00.000Z",
+        completion_kind: "final_command_status",
+        completion_comment_id: 11,
+      },
+      {
+        repository: "openclaw/openclaw",
+        number: 200,
+        source_comment_id: 2,
         completed_at: "2026-07-11T11:30:00.000Z",
-        total_duration_ms: 240_000,
+        completion_kind: "final_command_status",
+        completion_comment_id: 12,
       },
       {
-        outcome: "cancelled",
-        terminal_outcome: "cancelled",
+        repository: "openclaw/openclaw",
+        number: 300,
+        source_comment_id: 3,
         completed_at: "2026-07-11T10:59:59.000Z",
-        total_duration_ms: 9_999_999,
+        completion_kind: "final_command_status",
+        completion_comment_id: 13,
       },
     ],
     generatedAt,
   );
+  const timings = summarizeBayJourneyTimings(journeys.journeys, generatedAt);
 
   assert.equal(timings.window_minutes, 60);
   assert.equal("lanes" in timings, false);
   assert.deepEqual(timings.overall, { average_ms: 210_000, samples: 2 });
+  assert.equal(timings.sample_kind, "completed_review_journeys");
+});
+
+test("OpenClaw Bay retains pre-delivery journey records during normalization", () => {
+  const state = mergeBayJourneyState(
+    {
+      schema_version: 1,
+      journeys: [
+        {
+          id: "openclaw/openclaw#540:command:456",
+          item_key: "openclaw/openclaw#540",
+          repository: "openclaw/openclaw",
+          number: 540,
+          source_comment_id: 456,
+          triggered_at: "2026-07-13T11:56:00Z",
+          completed_at: "2026-07-13T11:59:00Z",
+          completion_kind: "final_command_status",
+          completion_comment_id: 790,
+        },
+      ],
+    },
+    [],
+    [],
+    "2026-07-13T12:00:00Z",
+  );
+
+  assert.equal(state.journeys.length, 1);
+  assert.equal(state.journeys[0]?.triggered_at, "2026-07-13T11:56:00Z");
+  assert.deepEqual(summarizeBayJourneyTimings(state.journeys, "2026-07-13T12:00:00Z").overall, {
+    average_ms: 180_000,
+    samples: 1,
+  });
+});
+
+test("OpenClaw Bay retains a completed journey for each edit of the same command", () => {
+  const first = mergeBayJourneyState(
+    null,
+    [
+      {
+        repository: "openclaw/openclaw",
+        number: 540,
+        source_comment_id: 456,
+        source_delivery_id: "first-edit",
+        triggered_at: "2026-07-13T12:00:00Z",
+      },
+    ],
+    [
+      {
+        repository: "openclaw/openclaw",
+        number: 540,
+        source_comment_id: 456,
+        completed_at: "2026-07-13T12:05:00Z",
+        completion_comment_id: 790,
+      },
+    ],
+    "2026-07-13T12:06:00Z",
+  );
+  const second = mergeBayJourneyState(
+    first,
+    [
+      {
+        repository: "openclaw/openclaw",
+        number: 540,
+        source_comment_id: 456,
+        source_delivery_id: "second-edit",
+        triggered_at: "2026-07-13T12:10:00Z",
+      },
+    ],
+    [
+      {
+        repository: "openclaw/openclaw",
+        number: 540,
+        source_comment_id: 456,
+        completed_at: "2026-07-13T12:14:00Z",
+        completion_comment_id: 790,
+      },
+    ],
+    "2026-07-13T12:15:00Z",
+  );
+
+  assert.equal(second.journeys.length, 2);
+  assert.notEqual(second.journeys[0]?.id, second.journeys[1]?.id);
+  assert.deepEqual(summarizeBayJourneyTimings(second.journeys, "2026-07-13T12:15:00Z").overall, {
+    average_ms: 270_000,
+    samples: 2,
+  });
+});
+
+test("OpenClaw Bay retains same-second command edits from separate GitHub deliveries", () => {
+  const journeys = mergeBayJourneyState(
+    null,
+    [
+      {
+        repository: "openclaw/openclaw",
+        number: 540,
+        source_comment_id: 456,
+        source_delivery_id: "edit-one",
+        triggered_at: "2026-07-13T12:00:00Z",
+      },
+      {
+        repository: "openclaw/openclaw",
+        number: 540,
+        source_comment_id: 456,
+        source_delivery_id: "edit-two",
+        triggered_at: "2026-07-13T12:00:00Z",
+      },
+    ],
+    [
+      {
+        repository: "openclaw/openclaw",
+        number: 540,
+        source_comment_id: 456,
+        completed_at: "2026-07-13T12:05:00Z",
+        completion_comment_id: 790,
+      },
+      {
+        repository: "openclaw/openclaw",
+        number: 540,
+        source_comment_id: 456,
+        completed_at: "2026-07-13T12:06:00Z",
+        completion_comment_id: 790,
+      },
+    ],
+    "2026-07-13T12:07:00Z",
+  );
+
+  assert.equal(journeys.journeys.length, 2);
+  assert.notEqual(journeys.journeys[0]?.id, journeys.journeys[1]?.id);
+  assert.deepEqual(summarizeBayJourneyTimings(journeys.journeys, "2026-07-13T12:07:00Z").overall, {
+    average_ms: 330_000,
+    samples: 2,
+  });
+});
+
+test("OpenClaw Bay joins an out-of-order reused status completion to its later trigger", () => {
+  const first = mergeBayJourneyState(
+    null,
+    [
+      {
+        repository: "openclaw/openclaw",
+        number: 540,
+        source_comment_id: 456,
+        source_delivery_id: "first-edit",
+        triggered_at: "2026-07-13T12:00:00Z",
+      },
+    ],
+    [
+      {
+        repository: "openclaw/openclaw",
+        number: 540,
+        source_comment_id: 456,
+        completed_at: "2026-07-13T12:05:00Z",
+        completion_comment_id: 790,
+      },
+    ],
+    "2026-07-13T12:06:00Z",
+  );
+  const completionBeforeTrigger = mergeBayJourneyState(
+    first,
+    [],
+    [
+      {
+        repository: "openclaw/openclaw",
+        number: 540,
+        source_comment_id: 456,
+        completed_at: "2026-07-13T12:14:00Z",
+        completion_comment_id: 790,
+      },
+    ],
+    "2026-07-13T12:14:00Z",
+  );
+  assert.equal(completionBeforeTrigger.journeys.length, 2);
+  assert.equal(
+    completionBeforeTrigger.journeys.filter((journey) => !journey.triggered_at).length,
+    1,
+  );
+
+  const completed = mergeBayJourneyState(
+    completionBeforeTrigger,
+    [
+      {
+        repository: "openclaw/openclaw",
+        number: 540,
+        source_comment_id: 456,
+        source_delivery_id: "second-edit",
+        triggered_at: "2026-07-13T12:10:00Z",
+      },
+    ],
+    [],
+    "2026-07-13T12:15:00Z",
+  );
+
+  assert.equal(completed.journeys.length, 2);
+  assert.equal(completed.journeys.filter((journey) => !journey.triggered_at).length, 0);
+  assert.deepEqual(summarizeBayJourneyTimings(completed.journeys, "2026-07-13T12:15:00Z").overall, {
+    average_ms: 270_000,
+    samples: 2,
+  });
+});
+
+test("hosted webhook records an edited review command without trusting optimistic status updates", async () => {
+  const statusStore = new MemoryKv();
+  const env = {
+    CLAWSWEEPER_WEBHOOK_SECRET: "test-secret",
+    STATUS_STORE: statusStore,
+  };
+  const trigger = await worker.fetch(
+    signedGithubWebhookRequest({
+      event: "issue_comment",
+      secret: "test-secret",
+      payload: {
+        action: "edited",
+        repository: {
+          full_name: "openclaw/openclaw",
+          private: false,
+          archived: false,
+          fork: false,
+          has_issues: true,
+        },
+        issue: { number: 540 },
+        installation: { id: 123 },
+        comment: {
+          id: 456,
+          body: "@clawsweeper review",
+          author_association: "MEMBER",
+          created_at: "2026-07-12T18:03:07Z",
+          updated_at: "2026-07-13T18:03:07Z",
+          user: { login: "brokemac79" },
+        },
+      },
+    }),
+    env,
+  );
+  assert.equal(trigger.status, 503);
+
+  const durableSummary = await worker.fetch(
+    signedGithubWebhookRequest({
+      event: "issue_comment",
+      secret: "test-secret",
+      payload: {
+        action: "edited",
+        repository: {
+          full_name: "openclaw/openclaw",
+          private: false,
+          archived: false,
+          fork: false,
+          has_issues: true,
+        },
+        issue: { number: 540 },
+        comment: {
+          id: 789,
+          body: [
+            "<!-- clawsweeper-verdict:needs-human item=540 sha=abc reviewed_at=2026-07-13T19:21:05Z -->",
+          ].join("\n"),
+          created_at: "2026-07-13T19:23:12Z",
+          updated_at: "2026-07-13T19:23:12Z",
+          user: { login: "clawsweeper[bot]" },
+        },
+      },
+    }),
+    env,
+  );
+  assert.equal(durableSummary.status, 202);
+
+  const completion = await worker.fetch(
+    signedGithubWebhookRequest({
+      event: "issue_comment",
+      secret: "test-secret",
+      payload: {
+        action: "edited",
+        repository: {
+          full_name: "openclaw/openclaw",
+          private: false,
+          archived: false,
+          fork: false,
+          has_issues: true,
+        },
+        issue: { number: 540 },
+        comment: {
+          id: 790,
+          body: [
+            "<!-- clawsweeper-command-ack:456 -->",
+            "<!-- clawsweeper-command-status:540:re_review:abc -->",
+            "<!-- clawsweeper-command-progress:start -->",
+            "Re-review progress:",
+            "- State: Complete",
+            "<!-- clawsweeper-command-progress:end -->",
+          ].join("\n"),
+          created_at: "2026-07-13T18:03:10Z",
+          updated_at: "2026-07-13T19:23:27Z",
+          user: { login: "clawsweeper[bot]" },
+        },
+      },
+    }),
+    env,
+  );
+  assert.equal(completion.status, 202);
+  assert.deepEqual(await completion.json(), {
+    ok: true,
+    accepted: false,
+    reason: "no routable ClawSweeper command",
+  });
+
+  const state = JSON.parse((await statusStore.get("openclaw-bay:journey-state:v1")) || "{}");
+  assert.deepEqual(state.journeys, [
+    {
+      id: "openclaw/openclaw#540:command:456:delivery:test-delivery",
+      item_key: "openclaw/openclaw#540",
+      repository: "openclaw/openclaw",
+      number: 540,
+      source_comment_id: 456,
+      source_delivery_id: "test-delivery",
+      triggered_at: "2026-07-13T18:03:07Z",
+    },
+  ]);
+  const timings = summarizeBayJourneyTimings(state.journeys, "2026-07-13T19:30:00Z");
+  assert.deepEqual(timings.overall, { average_ms: null, samples: 0 });
 });
 
 class MemoryKv {
@@ -985,7 +1333,7 @@ test("dashboard reuses a current Bay snapshot from the shared status store", asy
       generated_at: new Date().toISOString(),
       health: {},
       bay: {
-        timings: { sample_kind: "latest_completed_jobs" },
+        timings: { sample_kind: "completed_review_journeys" },
       },
       pipeline: [{ id: "shared-snapshot" }],
     }),
@@ -1028,7 +1376,7 @@ test("optional exact-review telemetry failures do not freeze an idle status snap
       schema_version: 1,
       generated_at: new Date().toISOString(),
       health: {},
-      bay: { timings: { sample_kind: "latest_completed_jobs" } },
+      bay: { timings: { sample_kind: "completed_review_journeys" } },
       pipeline: [],
       fleet: { active_workflow_runs: 0 },
       diagnostics: { errors: [] },
@@ -1137,6 +1485,7 @@ test("exact-review queue coalesces deliveries, dispatches a bound rollout snapsh
       "<!-- clawsweeper-command-status:597:re_review:0123456789abcdef0123456789abcdef01234567 -->";
     const first = buildExactReviewQueueRequest("delivery-1", 597, "opened", "issue", undefined, {
       commandStatusMarker,
+      sourceCommentId: 456,
       statusCommentId: 9001,
       additionalPrompt: "Check the maintainer-requested regression path.",
       codexTimeoutMs: 1_200_000,
@@ -1211,6 +1560,7 @@ test("exact-review queue coalesces deliveries, dispatches a bound rollout snapsh
         codex_timeout_ms: 1_200_000,
         media_proof_timeout_ms: 480_000,
         command_status_marker: commandStatusMarker,
+        source_comment_id: 456,
         status_comment_id: 9001,
         additional_prompt: "Check the maintainer-requested regression path.",
       },
@@ -1249,6 +1599,7 @@ test("exact-review queue coalesces deliveries, dispatches a bound rollout snapsh
         sourceAction: "edited",
         supersedesInProgress: true,
         commandStatusMarker,
+        sourceCommentId: 456,
         statusCommentId: 9001,
         additionalPrompt: "Check the maintainer-requested regression path.",
         codexTimeoutMs: 1_200_000,
@@ -2665,6 +3016,247 @@ test("exact-review queue requeues a cancelled claimed lease", async () => {
   assert.equal(state.items["openclaw/openclaw#710"].claimGeneration, undefined);
 });
 
+test("exact-review queue completes a failed shard recovery without a second retry", async () => {
+  const storage = new MemoryDurableStorage();
+  const item = leasedExactReviewQueueItem(710, "7101");
+  item.decision.sourceAction = "failed_review_shard_recovery";
+  item.leaseDecision.sourceAction = "failed_review_shard_recovery";
+  await storage.put("exact-review-queue", {
+    deliveries: {},
+    items: { "openclaw/openclaw#710": item },
+  });
+  const queue = new ExactReviewQueue({ storage }, {});
+
+  const response = await queue.fetch(
+    new Request("https://clawsweeper-exact-review-queue/complete", {
+      method: "POST",
+      body: JSON.stringify({
+        lease_id: "lease-710",
+        item_key: "openclaw/openclaw#710",
+        lease_revision: 1,
+        claim_generation: 1,
+        run_id: "7101",
+        run_attempt: 1,
+        outcome: "failure",
+      }),
+    }),
+  );
+
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { ok: true, requeued: false });
+  const state = (await storage.get("exact-review-queue")) as {
+    items: Record<string, Record<string, unknown>>;
+  };
+  assert.equal(Object.keys(state.items).length, 0);
+});
+
+test("failed shard recovery does not replace an already-pending ordinary event", async () => {
+  const storage = new MemoryDurableStorage();
+  const queue = new ExactReviewQueue({ storage }, {});
+  assert.equal(
+    (await queue.fetch(buildExactReviewQueueRequest("ordinary-event", 710, "edited"))).status,
+    202,
+  );
+  const beforeRecovery = (await storage.get("exact-review-queue")) as {
+    items: Record<string, { attempts: number; nextAttemptAt: number }>;
+  };
+  const ordinary = beforeRecovery.items["openclaw/gogcli#710"];
+  ordinary.attempts = 1;
+  ordinary.nextAttemptAt = Date.now() + 30_000;
+  await storage.put("exact-review-queue", beforeRecovery);
+  assert.equal(
+    (
+      await queue.fetch(
+        buildExactReviewQueueRequest("failed-shard-recovery", 710, "failed_review_shard_recovery"),
+      )
+    ).status,
+    202,
+  );
+
+  const state = (await storage.get("exact-review-queue")) as {
+    items: Record<
+      string,
+      {
+        attempts: number;
+        nextAttemptAt: number;
+        revision: number;
+        decision: { sourceAction: string; supersedesInProgress: boolean };
+      }
+    >;
+  };
+  assert.equal(state.items["openclaw/gogcli#710"].decision.sourceAction, "edited");
+  assert.equal(state.items["openclaw/gogcli#710"].decision.supersedesInProgress, true);
+  assert.equal(state.items["openclaw/gogcli#710"].revision, 1);
+  assert.equal(state.items["openclaw/gogcli#710"].attempts, 1);
+  assert.equal(state.items["openclaw/gogcli#710"].nextAttemptAt, ordinary.nextAttemptAt);
+});
+
+test("failed shard recovery does not replace an ordinary active lease", async () => {
+  const storage = new MemoryDurableStorage();
+  await storage.put("exact-review-queue", {
+    deliveries: {},
+    items: {
+      "openclaw/openclaw#710": leasedExactReviewQueueItem(710, "7102"),
+    },
+  });
+  const queue = new ExactReviewQueue({ storage }, {});
+
+  assert.equal(
+    (
+      await queue.fetch(
+        buildExactReviewQueueRequest(
+          "failed-shard-recovery-active-lease",
+          710,
+          "failed_review_shard_recovery",
+          "issue",
+          "openclaw/openclaw",
+        ),
+      )
+    ).status,
+    202,
+  );
+
+  const beforeComplete = (await storage.get("exact-review-queue")) as {
+    items: Record<
+      string,
+      {
+        state: string;
+        revision: number;
+        decision: { sourceAction: string };
+        leaseDecision?: { sourceAction: string };
+      }
+    >;
+  };
+  const ordinary = beforeComplete.items["openclaw/openclaw#710"];
+  assert.equal(ordinary.state, "leased");
+  assert.equal(ordinary.revision, 1);
+  assert.equal(ordinary.decision.sourceAction, "opened");
+  assert.equal(ordinary.leaseDecision?.sourceAction, "opened");
+
+  const response = await queue.fetch(
+    new Request("https://clawsweeper-exact-review-queue/reconcile", {
+      method: "POST",
+      body: JSON.stringify({
+        runs: [
+          {
+            run_id: "7102",
+            run_attempt: 1,
+            claimed_run_attempt: 1,
+            claim_generation: 1,
+            outcome: "success",
+          },
+        ],
+      }),
+    }),
+  );
+
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { ok: true, reconciled: 1, requeued: 0, completed: 1 });
+  const afterComplete = (await storage.get("exact-review-queue")) as {
+    items: Record<string, unknown>;
+  };
+  assert.equal(afterComplete.items["openclaw/openclaw#710"], undefined);
+});
+
+test("failed shard recovery does not replace an active recovery lease", async () => {
+  const storage = new MemoryDurableStorage();
+  const recovery = leasedExactReviewQueueItem(710, "7103");
+  recovery.decision.sourceAction = "failed_review_shard_recovery";
+  recovery.leaseDecision.sourceAction = "failed_review_shard_recovery";
+  await storage.put("exact-review-queue", {
+    deliveries: {},
+    items: { "openclaw/openclaw#710": recovery },
+  });
+  const queue = new ExactReviewQueue({ storage }, {});
+
+  assert.equal(
+    (
+      await queue.fetch(
+        buildExactReviewQueueRequest(
+          "failed-shard-recovery-active-recovery",
+          710,
+          "failed_review_shard_recovery",
+          "issue",
+          "openclaw/openclaw",
+        ),
+      )
+    ).status,
+    202,
+  );
+
+  const beforeComplete = (await storage.get("exact-review-queue")) as {
+    items: Record<string, { state: string; revision: number; decision: { sourceAction: string } }>;
+  };
+  const activeRecovery = beforeComplete.items["openclaw/openclaw#710"];
+  assert.equal(activeRecovery.state, "leased");
+  assert.equal(activeRecovery.revision, 1);
+  assert.equal(activeRecovery.decision.sourceAction, "failed_review_shard_recovery");
+
+  const response = await queue.fetch(
+    new Request("https://clawsweeper-exact-review-queue/reconcile", {
+      method: "POST",
+      body: JSON.stringify({
+        runs: [
+          {
+            run_id: "7103",
+            run_attempt: 1,
+            claimed_run_attempt: 1,
+            claim_generation: 1,
+            outcome: "success",
+          },
+        ],
+      }),
+    }),
+  );
+
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { ok: true, reconciled: 1, requeued: 0, completed: 1 });
+  const afterComplete = (await storage.get("exact-review-queue")) as {
+    items: Record<string, unknown>;
+  };
+  assert.equal(afterComplete.items["openclaw/openclaw#710"], undefined);
+});
+
+test("failed shard recovery replaces an expired recovery lease", async () => {
+  const storage = new MemoryDurableStorage();
+  const expiredRecovery = leasedExactReviewQueueItem(710, "7104");
+  expiredRecovery.decision.sourceAction = "failed_review_shard_recovery";
+  expiredRecovery.leaseDecision.sourceAction = "failed_review_shard_recovery";
+  expiredRecovery.leaseExpiresAt = Date.now() - 1;
+  await storage.put("exact-review-queue", {
+    deliveries: {},
+    items: { "openclaw/openclaw#710": expiredRecovery },
+  });
+  const queue = new ExactReviewQueue({ storage }, {});
+
+  assert.equal(
+    (
+      await queue.fetch(
+        buildExactReviewQueueRequest(
+          "failed-shard-recovery-expired-recovery",
+          710,
+          "failed_review_shard_recovery",
+          "issue",
+          "openclaw/openclaw",
+        ),
+      )
+    ).status,
+    202,
+  );
+
+  const state = (await storage.get("exact-review-queue")) as {
+    items: Record<
+      string,
+      { state: string; revision: number; decision: { sourceAction: string }; leaseId?: string }
+    >;
+  };
+  const replacement = state.items["openclaw/openclaw#710"];
+  assert.equal(replacement.state, "pending");
+  assert.equal(replacement.revision, 1);
+  assert.equal(replacement.decision.sourceAction, "failed_review_shard_recovery");
+  assert.equal(replacement.leaseId, undefined);
+});
+
 test("exact-review queue defers a coordination-held failure until the lease expires", async () => {
   const storage = new MemoryDurableStorage();
   const retryAt = Date.now() + 45 * 60_000;
@@ -2949,15 +3541,38 @@ test("exact-review completion rejects stale owners and is race-idempotent", asyn
 test("signed exact-review reconciliation releases only immutable terminal runs", async () => {
   const originalFetch = globalThis.fetch;
   const storage = new MemoryDurableStorage();
+  const statusStore = new MemoryKv();
+  await statusStore.put(
+    "openclaw-bay:journey-state:v1",
+    JSON.stringify(
+      mergeBayJourneyState(
+        null,
+        [
+          {
+            repository: "openclaw/openclaw",
+            number: 719,
+            source_comment_id: 456,
+            source_delivery_id: "test-delivery",
+            triggered_at: "2026-07-13T18:03:07Z",
+          },
+        ],
+        [],
+        "2026-07-13T18:03:07Z",
+      ),
+    ),
+  );
   await storage.put("exact-review-queue", {
     deliveries: {},
     items: {
       "openclaw/openclaw#711": leasedExactReviewQueueItem(711, "9001"),
       "openclaw/openclaw#712": leasedExactReviewQueueItem(712, "9002"),
-      "openclaw/openclaw#719": leasedExactReviewQueueItem(719, "9003"),
+      "openclaw/openclaw#719": leasedExactReviewQueueItem(719, "9003", 1, {
+        sourceCommentId: 456,
+        statusCommentId: 790,
+      }),
     },
   });
-  const queue = new ExactReviewQueue({ storage }, {});
+  const queue = new ExactReviewQueue({ storage }, { STATUS_STORE: statusStore });
   const { privateKey } = generateKeyPairSync("rsa", {
     modulusLength: 2048,
     privateKeyEncoding: { type: "pkcs8", format: "pem" },
@@ -2995,6 +3610,7 @@ test("signed exact-review reconciliation releases only immutable terminal runs",
         run_attempt: 1,
         status: "completed",
         conclusion: "success",
+        updated_at: "2026-07-13T19:23:27Z",
       });
     }
     throw new Error(`unexpected fetch ${url}`);
@@ -3066,6 +3682,29 @@ test("signed exact-review reconciliation releases only immutable terminal runs",
     assert.equal(state.items["openclaw/openclaw#712"].state, "leased");
     assert.equal(state.items["openclaw/openclaw#712"].claimedRunId, "9002");
     assert.equal(state.items["openclaw/openclaw#719"], undefined);
+    const bay = JSON.parse((await statusStore.get("openclaw-bay:journey-state:v1")) || "{}") as {
+      journeys: Array<Record<string, unknown>>;
+    };
+    assert.deepEqual(bay.journeys, [
+      {
+        id: "openclaw/openclaw#719:command:456:delivery:test-delivery",
+        item_key: "openclaw/openclaw#719",
+        repository: "openclaw/openclaw",
+        number: 719,
+        source_comment_id: 456,
+        source_delivery_id: "test-delivery",
+        triggered_at: "2026-07-13T18:03:07Z",
+        completed_at: "2026-07-13T19:23:27Z",
+        completion_kind: "exact_review_terminal",
+        completion_comment_id: 790,
+        completion_run_id: "9003",
+        completion_run_attempt: 1,
+      },
+    ]);
+    assert.deepEqual(summarizeBayJourneyTimings(bay.journeys, "2026-07-13T19:30:00Z").overall, {
+      average_ms: 4_820_000,
+      samples: 1,
+    });
     const staleFailure = await queue.fetch(
       new Request("https://clawsweeper-exact-review-queue/complete", {
         method: "POST",
@@ -3106,6 +3745,57 @@ test("signed exact-review reconciliation releases only immutable terminal runs",
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test("exact-review reconciliation retains the lease when Bay completion persistence fails", async () => {
+  const storage = new MemoryDurableStorage();
+  await storage.put("exact-review-queue", {
+    deliveries: {},
+    items: {
+      "openclaw/openclaw#720": leasedExactReviewQueueItem(720, "9004", 1, {
+        sourceCommentId: 457,
+        statusCommentId: 791,
+      }),
+    },
+  });
+  const queue = new ExactReviewQueue(
+    { storage },
+    {
+      STATUS_STORE: {
+        get: async () => null,
+        put: async () => {
+          throw new Error("status store unavailable");
+        },
+      },
+    },
+  );
+
+  await assert.rejects(
+    queue.fetch(
+      new Request("https://clawsweeper-exact-review-queue/reconcile", {
+        method: "POST",
+        body: JSON.stringify({
+          runs: [
+            {
+              run_id: "9004",
+              run_attempt: 1,
+              claimed_run_attempt: 1,
+              claim_generation: 1,
+              outcome: "success",
+              completed_at: "2026-07-13T19:24:27Z",
+            },
+          ],
+        }),
+      }),
+    ),
+    /status store unavailable/,
+  );
+
+  const state = (await storage.get("exact-review-queue")) as {
+    items: Record<string, Record<string, unknown>>;
+  };
+  assert.equal(state.items["openclaw/openclaw#720"].state, "leased");
+  assert.equal(state.items["openclaw/openclaw#720"].claimedRunId, "9004");
 });
 
 test("exact-review reconciliation targets leases beyond 64 entries without accepting stale claims", async () => {
@@ -3453,6 +4143,42 @@ test("exact-review stats heals a missing or stale alarm and expired lease", asyn
   await queue.fetch(new Request("https://clawsweeper-exact-review-queue/stats"));
   const rescheduledAlarm = await storage.getAlarm();
   assert.ok(rescheduledAlarm !== null && rescheduledAlarm > staleAlarmPollStartedAt);
+});
+
+test("exact-review queue drops an expired failed-shard recovery unless a newer revision superseded it", async () => {
+  const storage = new MemoryDurableStorage();
+  const expiredRecovery = leasedExactReviewQueueItem(702, "7020");
+  expiredRecovery.decision.sourceAction = "failed_review_shard_recovery";
+  expiredRecovery.leaseDecision.sourceAction = "failed_review_shard_recovery";
+  expiredRecovery.leaseExpiresAt = Date.now() - 1;
+
+  const supersededRecovery = leasedExactReviewQueueItem(703, "7030");
+  supersededRecovery.leaseDecision.sourceAction = "failed_review_shard_recovery";
+  supersededRecovery.decision.sourceAction = "edited";
+  supersededRecovery.decision.supersedesInProgress = true;
+  supersededRecovery.revision = 2;
+  supersededRecovery.leaseExpiresAt = Date.now() - 1;
+
+  await storage.put("exact-review-queue", {
+    deliveries: {},
+    items: {
+      "openclaw/openclaw#702": expiredRecovery,
+      "openclaw/openclaw#703": supersededRecovery,
+    },
+  });
+  const queue = new ExactReviewQueue({ storage }, {});
+
+  const stats = await (
+    await queue.fetch(new Request("https://clawsweeper-exact-review-queue/stats"))
+  ).json();
+  assert.equal(stats.pending, 1);
+  const state = (await storage.get("exact-review-queue")) as {
+    items: Record<string, { state: string; attempts: number; decision: { sourceAction: string } }>;
+  };
+  assert.equal(state.items["openclaw/openclaw#702"], undefined);
+  assert.equal(state.items["openclaw/openclaw#703"].state, "pending");
+  assert.equal(state.items["openclaw/openclaw#703"].attempts, 0);
+  assert.equal(state.items["openclaw/openclaw#703"].decision.sourceAction, "edited");
 });
 
 function isoAgo(ms: number) {
@@ -4385,7 +5111,7 @@ test("dashboard reports worker error and recovery rates from completed job steps
     assert.equal(status.bay.tide_generation, 0);
     assert.equal(status.bay.terminal_count, 3);
     assert.equal(status.bay.timings.lanes, undefined);
-    assert.deepEqual(status.bay.timings.overall, { average_ms: 10_000, samples: 4 });
+    assert.deepEqual(status.bay.timings.overall, { average_ms: null, samples: 0 });
     assert.deepEqual(
       status.bay.terminal_buffer.map((item: { number: number }) => item.number),
       [100, 200, 300],
@@ -7767,7 +8493,12 @@ function buildExactReviewQueueRequest(
   });
 }
 
-function leasedExactReviewQueueItem(itemNumber: number, runId: string, runAttempt = 1) {
+function leasedExactReviewQueueItem(
+  itemNumber: number,
+  runId: string,
+  runAttempt = 1,
+  decisionOverrides: Record<string, unknown> = {},
+) {
   const now = Date.now();
   const decision = {
     targetRepo: "openclaw/openclaw",
@@ -7777,6 +8508,7 @@ function leasedExactReviewQueueItem(itemNumber: number, runId: string, runAttemp
     sourceEvent: "issues",
     sourceAction: "opened",
     supersedesInProgress: false,
+    ...decisionOverrides,
   };
   return {
     key: `openclaw/openclaw#${itemNumber}`,

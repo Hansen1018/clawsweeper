@@ -32,6 +32,7 @@ test("exact-review enqueue retries preserve business identity and redact request
           source_event: "issues",
           source_action: "opened",
           dispatch_key: "delivery-private-42",
+          source_comment_id: 456,
           additional_prompt: prompt,
         }),
         CLAWSWEEPER_WEBHOOK_SECRET: secret,
@@ -47,7 +48,9 @@ test("exact-review enqueue retries preserve business identity and redact request
             body: String(init?.body),
           });
           call += 1;
-          return new Response("", { status: call === 1 ? 503 : 202 });
+          return call === 1
+            ? new Response("", { status: 503 })
+            : Response.json({ ok: true, queued: true }, { status: 202 });
         },
       },
     );
@@ -65,6 +68,7 @@ test("exact-review enqueue retries preserve business identity and redact request
         sourceEvent: "issues",
         sourceAction: "opened",
         supersedesInProgress: false,
+        sourceCommentId: 456,
         additionalPrompt: prompt,
       },
     });
@@ -90,6 +94,59 @@ test("exact-review enqueue retries preserve business identity and redact request
     for (const confidential of [secret, privateUrl, prompt, "delivery-private-42"]) {
       assert.doesNotMatch(serialized, new RegExp(escapeRegExp(confidential)));
     }
+  });
+});
+
+test("exact-review enqueue rejects unacknowledged success responses", async () => {
+  await withLedgerEnvironment(async () => {
+    await assert.rejects(
+      runExactReviewQueueCommand(
+        "enqueue",
+        {
+          ...process.env,
+          CLIENT_PAYLOAD: JSON.stringify({
+            target_repo: "openclaw/openclaw",
+            item_number: 42,
+            item_kind: "issue",
+            source_event: "issues",
+            source_action: "failed_review_shard_recovery",
+            dispatch_key: "recovery-42",
+          }),
+          CLAWSWEEPER_WEBHOOK_SECRET: "test-secret",
+          QUEUE_URL: "https://queue.private.example",
+        },
+        {
+          attempts: 1,
+          fetch: async () => Response.json({ ok: true }, { status: 202 }),
+        },
+      ),
+      /request failed after 1 attempts/,
+    );
+  });
+});
+
+test("exact-review enqueue accepts an explicit disabled-target acknowledgement", async () => {
+  await withLedgerEnvironment(async () => {
+    await runExactReviewQueueCommand(
+      "enqueue",
+      {
+        ...process.env,
+        CLIENT_PAYLOAD: JSON.stringify({
+          target_repo: "openclaw/openclaw",
+          item_number: 42,
+          item_kind: "issue",
+          source_event: "issues",
+          source_action: "failed_review_shard_recovery",
+          dispatch_key: "recovery-disabled-42",
+        }),
+        CLAWSWEEPER_WEBHOOK_SECRET: "test-secret",
+        QUEUE_URL: "https://queue.private.example",
+      },
+      {
+        attempts: 1,
+        fetch: async () => Response.json({ ok: true, accepted: false }, { status: 202 }),
+      },
+    );
   });
 });
 

@@ -1935,6 +1935,7 @@ test("label-sweep classification checks the exact-head review lease before dispa
       trustedVerdictGuard.indexOf("fetchPullRequestView(number)"),
   );
   assert.match(trustedVerdictGuard, /trustedAutomationPredatesReviewStartLease\(\{/);
+  assert.match(source, /source_comment_id: Number\(command\.comment_id\)/);
 });
 
 test("comment router durably claims dispatch commands and recovers exact workflow receipts", () => {
