@@ -14,6 +14,20 @@ layers:
 5. mutation safety and recovery; and
 6. Gitcrawl local/cloud/parity evidence.
 
+Implementation status on July 14, 2026, before this rollout finishes:
+
+| Layer                | Status                    | Operational boundary                                                                                                                                                                                    |
+| -------------------- | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1. Semantic identity | Partial, active           | Structural reuse and TypeScript/compiler-AST semantic identity are active. Tree-sitter language adapters remain planned.                                                                                |
+| 2. Closure graph     | In rollout                | The bounded planner and reviewed graph gate exist in the PR stack. Production review/apply must not rely on them until both land.                                                                       |
+| 3. Admission         | Partial, active           | Pressure telemetry and opt-in background yielding are active. Adaptive or bandit allocation remains planned.                                                                                            |
+| 4. Action ledger     | In rollout                | The core receipt ledger is active; broader review, dispatch, proof, and projection coverage is still landing. The family table below is the target contract, not a claim of complete coverage.          |
+| 5. Mutation safety   | In rollout                | Review-activity, immutable-retry, validation, repair, proof, and dispatch guards are being landed as a stack. Existing lanes keep their current guarantees until each owner lands.                      |
+| 6. Gitcrawl evidence | In rollout, cloud blocked | Local six-query, canary, receipt, import, and Cloudflare parity changes exist in reviewed branches. Cloud-primary use remains disabled until the protected production deployment and parity proof pass. |
+
+`In rollout` means reviewed code exists but is not yet a production guarantee.
+`Planned` behavior must not be used for admission, mutation, or close decisions.
+
 These layers optimize evidence collection, ordering, and resource use. They do
 not replace the policy decision. Review remains proposal-only, and apply remains
 the only issue/PR closure authority.
