@@ -113,6 +113,53 @@ test("dispatch receipt gate keeps a successfully executed worker as owner", () =
   );
 });
 
+test("dispatch receipt gate retries assist when comment publication fails", () => {
+  assert.equal(
+    runGate(
+      {
+        runs: [
+          { id: 102, display_title: EXPECTED_TITLE, status: "completed", conclusion: "failure" },
+        ],
+        jobs102: [
+          {
+            name: "Publish trusted assist comment",
+            conclusion: "failure",
+            steps: [{ name: "Revalidate and publish assist comment", conclusion: "failure" }],
+          },
+        ],
+      },
+      "Publish trusted assist comment",
+      "Revalidate and publish assist comment",
+    ),
+    "none",
+  );
+});
+
+test("dispatch receipt gate retains assist ownership after comment publication", () => {
+  assert.equal(
+    runGate(
+      {
+        runs: [
+          { id: 102, display_title: EXPECTED_TITLE, status: "completed", conclusion: "failure" },
+        ],
+        jobs102: [
+          {
+            name: "Publish trusted assist comment",
+            conclusion: "failure",
+            steps: [
+              { name: "Revalidate and publish assist comment", conclusion: "success" },
+              { name: "Finalize assist publication action ledger", conclusion: "failure" },
+            ],
+          },
+        ],
+      },
+      "Publish trusted assist comment",
+      "Revalidate and publish assist comment",
+    ),
+    "owner",
+  );
+});
+
 test("dispatch receipt gate retains ownership when later finalization fails", () => {
   assert.equal(
     runGate(

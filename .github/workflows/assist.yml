@@ -88,7 +88,8 @@ jobs:
           fi
           expected_title="Assist ${TARGET_REPO}#${ITEM_NUMBER} [${DISPATCH_KEY}]"
           owner="$(bash scripts/dispatch-receipt-owner.sh \
-            assist.yml "$expected_title" "$GITHUB_RUN_ID" assist)"
+            assist.yml "$expected_title" "$GITHUB_RUN_ID" \
+            "Publish trusted assist comment" "Revalidate and publish assist comment")"
           if [ "$owner" = "owner" ]; then
             echo "proceed=false" >> "$GITHUB_OUTPUT"
             echo "An older active or successfully executed command dispatch already exists; skipping duplicate assist."

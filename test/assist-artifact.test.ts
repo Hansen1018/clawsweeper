@@ -335,6 +335,10 @@ test("assist workflow isolates Codex generation from the fresh write-token publi
   assert.equal(workflow.match(/persist-credentials: false/g)?.length, 4);
   assert.equal(workflow.match(/REASONING_EFFORT: high/g)?.length, 3);
   assert.doesNotMatch(workflow, /inputs\.reasoning_effort|client_payload\.reasoning_effort/);
+  assert.match(
+    workflow,
+    /dispatch-receipt-owner\.sh \\\n\s+assist\.yml "\$expected_title" "\$GITHUB_RUN_ID" \\\n\s+"Publish trusted assist comment" "Revalidate and publish assist comment"/,
+  );
 
   assert.match(generation, /Create read-only GitHub App token/);
   assert.match(generation, /uses: \.\/\.github\/actions\/setup-action-ledger/);
