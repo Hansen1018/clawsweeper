@@ -239,6 +239,24 @@ test("query evidence fails closed on source, relation, review, and packet drift"
     await adapter.close();
   });
 
+  await t.test("thread rows require complete safety metadata", async () => {
+    for (const incomplete of [
+      { security_metadata_complete: 0 },
+      { body: undefined },
+      { labels_json: undefined },
+      { assignees_json: undefined },
+      { author_association: undefined },
+      { author_login: "" },
+      { author_type: "" },
+    ]) {
+      const adapter = await adapterFor({
+        "gitcrawl.threads.search": [memberRow(incomplete)],
+      });
+      await assert.rejects(adapter.searchOpenPullRequests(), /security metadata/);
+      await adapter.close();
+    }
+  });
+
   await t.test("packet claims are mutated after binding", () => {
     const packet = buildGitcrawlEvidencePacket({
       provider: "cloud",

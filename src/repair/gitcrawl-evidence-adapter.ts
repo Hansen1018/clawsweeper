@@ -1265,6 +1265,9 @@ function normalizeThread(row: Record<string, unknown>): GitcrawlThreadEvidence {
     hasAuthorAssociation &&
     authorLogin.length > 0 &&
     authorType.length > 0;
+  if (!securityMetadataComplete) {
+    throw new Error("Gitcrawl thread security metadata is incomplete");
+  }
   const securityProjection = {
     state: threadState,
     title: safetyTitle,
