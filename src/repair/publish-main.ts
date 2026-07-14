@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import path from "node:path";
 
+import { workflowActionEventsEnabled } from "../action-ledger-runtime.js";
 import { publishMainCommit, type GitPublishOptions, type RebaseStrategy } from "./git-publish.js";
 import { repairPublicationContentDigest, runRepairMutation } from "./repair-action-ledger.js";
 
@@ -17,6 +18,7 @@ type Args = {
 
 const args = parseArgs(process.argv.slice(2));
 assertPublicationReceipt(args.paths, args.receiptKind);
+assertPublicationActionLedgerEnabled(args.receiptKind);
 const publishOptions: GitPublishOptions = {
   message: args.message,
   paths: args.paths,
@@ -100,6 +102,17 @@ function assertPublicationReceipt(paths: readonly string[], receiptKind?: string
   throw new Error(
     "--receipt-kind is required for mutable state publication; only immutable ledger/ paths may be published without one",
   );
+}
+
+function assertPublicationActionLedgerEnabled(receiptKind?: string): void {
+  if (!receiptKind) return;
+  if (
+    !workflowActionEventsEnabled(process.env) ||
+    !String(process.env.CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT ?? "").trim() ||
+    !String(process.env.GITHUB_RUN_STARTED_AT ?? "").trim()
+  ) {
+    throw new Error("mutable state publication requires successful action-ledger setup");
+  }
 }
 
 function isImmutableLedgerPath(value: string): boolean {

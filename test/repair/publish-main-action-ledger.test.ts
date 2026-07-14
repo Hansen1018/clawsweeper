@@ -13,6 +13,9 @@ test("publish-main receipts every mutable durable Git push", () => {
   const source = readText("src/repair/publish-main.ts");
 
   assert.match(source, /assertPublicationReceipt\(args\.paths, args\.receiptKind\)/);
+  assert.match(source, /assertPublicationActionLedgerEnabled\(args\.receiptKind\)/);
+  assert.match(source, /workflowActionEventsEnabled\(process\.env\)/);
+  assert.match(source, /GITHUB_RUN_STARTED_AT/);
   assert.match(source, /if \(args\.receiptKind\)/);
   assert.match(source, /runRepairMutation\(/);
   assert.match(source, /operationName: "state_publication"/);
@@ -53,6 +56,30 @@ test("publish-main rejects receipt-free mutable and mixed path sets before Git m
     assert.notEqual(result.status, 0);
     assert.match(result.stderr, expectedError);
   }
+});
+
+test("publish-main rejects receipted state writes when action-ledger setup is unavailable", () => {
+  const env = { ...process.env };
+  delete env.CLAWSWEEPER_ACTION_LEDGER_FORCE;
+  delete env.CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT;
+  delete env.GITHUB_RUN_STARTED_AT;
+  const result = spawnSync(
+    process.execPath,
+    [
+      path.resolve("dist/repair/publish-main.js"),
+      "--message",
+      "chore: publish state",
+      "--path",
+      "results/status.json",
+      "--receipt-kind",
+      "test_state_publication",
+    ],
+    { cwd: os.tmpdir(), encoding: "utf8", env },
+  );
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /requires successful action-ledger setup/);
+  assert.doesNotMatch(result.stderr, /not a git repository/);
 });
 
 test("workflow state publications declare receipts before finalizing immutable action ledgers", () => {
