@@ -97,6 +97,18 @@ type SafeRoot = {
 
 function prepareRoot(input: string, label: string): SafeRoot {
   const resolved = path.resolve(input);
+  let resolvedStat;
+  try {
+    resolvedStat = lstatSync(resolved, { bigint: true });
+  } catch (error) {
+    if (isNotFoundError(error)) {
+      throw new Error(`${capitalize(label)} does not exist: ${resolved}`);
+    }
+    throw error;
+  }
+  if (resolvedStat.isSymbolicLink() || !resolvedStat.isDirectory()) {
+    throw new Error(`${capitalize(label)} is not a real directory: ${resolved}`);
+  }
   let realPath: string;
   try {
     realPath = realpathSync.native(resolved);
@@ -109,6 +121,9 @@ function prepareRoot(input: string, label: string): SafeRoot {
   const stat = lstatSync(realPath, { bigint: true });
   if (stat.isSymbolicLink() || !stat.isDirectory()) {
     throw new Error(`${capitalize(label)} is not a real directory: ${resolved}`);
+  }
+  if (stat.dev !== resolvedStat.dev || stat.ino !== resolvedStat.ino) {
+    throw new Error(`${capitalize(label)} changed while resolving: ${resolved}`);
   }
   return { dev: stat.dev, ino: stat.ino, path: realPath };
 }

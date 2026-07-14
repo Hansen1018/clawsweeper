@@ -90,6 +90,36 @@ test("hydrate-state hydrates only explicitly selected approved roots", () => {
   }
 });
 
+for (const linkedRoot of ["state directory", "worktree"] as const) {
+  test(`hydrate-state rejects a symlinked ${linkedRoot} root`, () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-hydrate-root-link-"));
+    const state = path.join(root, "state");
+    const worktree = path.join(root, "worktree");
+    const linked = path.join(root, "linked");
+    fs.mkdirSync(path.join(state, "records"), { recursive: true });
+    fs.mkdirSync(path.join(worktree, "records"), { recursive: true });
+    fs.writeFileSync(path.join(state, "records", "state.txt"), "state\n");
+    fs.writeFileSync(path.join(worktree, "records", "keep.txt"), "keep\n");
+    symlinkDirectory(linkedRoot === "state directory" ? state : worktree, linked);
+
+    try {
+      const result = runHydrate(
+        linkedRoot === "state directory" ? linked : state,
+        linkedRoot === "worktree" ? linked : worktree,
+        {},
+        ["--hydrate-paths", "records"],
+      );
+
+      assert.notEqual(result.status, 0);
+      assert.match(result.stderr, /is not a real directory/);
+      assert.equal(fs.readFileSync(path.join(state, "records", "state.txt"), "utf8"), "state\n");
+      assert.equal(fs.readFileSync(path.join(worktree, "records", "keep.txt"), "utf8"), "keep\n");
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+}
+
 for (const scenario of [
   { name: "source approved roots", location: "source-root" },
   { name: "source descendants", location: "source-descendant" },
