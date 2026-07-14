@@ -1512,8 +1512,10 @@ function validateStatusChecks(checks: LooseRecord[]) {
   const blockers: LooseRecord[] = [];
   for (const check of checks) {
     const name = check.name ?? check.context ?? "unknown check";
+    const state = String(check.state ?? "").toUpperCase();
     const status = String(check.status ?? check.state ?? "").toUpperCase();
     const conclusion = String(check.conclusion ?? "").toUpperCase();
+    if (!check.status && !conclusion && PASSING_CHECK_CONCLUSIONS.has(state)) continue;
     if (status && !["COMPLETED", "SUCCESS"].includes(status)) {
       blockers.push(`${name}: ${status}`);
       continue;

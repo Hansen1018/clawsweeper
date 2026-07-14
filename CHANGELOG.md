@@ -107,6 +107,7 @@ checkpoint, and status-only commits are intentionally omitted.
 
 ### Fixed
 
+- Kept legacy successful GitHub status contexts compatible with repair apply validation after the action-lifecycle rollback.
 - Stopped narrow OpenClaw automerge repairs from chasing unrelated full-repository lint and typecheck failures.
 - Removed the synthetic Codex write preflight that could block repair before Codex saw the real task.
 - Kept exact-review handoff health live when the dashboard serves a stale fleet snapshot, so recovered claims no longer leave the operator rail stuck in a delayed or stalled state.

@@ -599,7 +599,7 @@ test("repair apply blocks PR close when open covering PR lacks positive proof", 
   }
 });
 
-test("repair apply executes PR duplicate close when coverage proof says covered", () => {
+test("repair apply accepts a legacy successful status context for a covering PR", () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-apply-result-"));
   try {
     const paths = writeApplyFixture(tmp, {
@@ -625,6 +625,7 @@ test("repair apply executes PR duplicate close when coverage proof says covered"
         101: [comment("alice", "PR A keeps legacy config behavior intact.")],
         202: [comment("bob", "PR B carries forward the legacy config behavior.")],
       },
+      statusCheckRollup: [{ context: "test", state: "SUCCESS" }],
       logPath: paths.ghLogPath,
     });
     writeFakeCodex(paths.binDir);
@@ -1151,6 +1152,7 @@ type FakeGhData = {
   postProofIssueUpdates?: Record<number, string>;
   postProofPulls?: Record<number, Record<string, unknown>>;
   postProofPrViewFailure?: { number: number; message: string };
+  statusCheckRollup?: Record<string, unknown>[];
   logPath: string;
 };
 
@@ -1401,7 +1403,9 @@ if (args[0] === "pr" && args[1] === "view") {
     mergedAt: pull.merged_at || null,
     reviewDecision: null,
     state: String(pull.state || "open").toUpperCase(),
-    statusCheckRollup: [{ name: "test", status: "COMPLETED", conclusion: "SUCCESS" }],
+    statusCheckRollup: data.statusCheckRollup || [
+      { name: "test", status: "COMPLETED", conclusion: "SUCCESS" },
+    ],
     title: pull.title,
     updatedAt: pull.updated_at,
     url: pull.html_url,
