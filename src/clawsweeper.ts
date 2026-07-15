@@ -746,6 +746,7 @@ interface ItemContext {
   pullReviewCommentsRevision?: string;
   pullReviewActivityCursor?: string;
   pullChecks?: unknown;
+  pullBaseDrift?: unknown;
   counts?: {
     comments: number;
     commentsHydrated?: number;
@@ -3109,6 +3110,18 @@ function reviewTimelineDigestParts(entries: unknown): unknown {
     }));
 }
 
+function pullBaseDriftDigestParts(value: unknown): unknown {
+  if (value === undefined) return null;
+  const drift = asRecord(value);
+  // Age changes every day, but only the stale threshold and a new merge base
+  // change the review decision. Excluding raw age avoids daily cache churn.
+  return {
+    status: drift.status ?? null,
+    mergeBaseSha: drift.mergeBaseSha ?? null,
+    stale: drift.stale ?? null,
+  };
+}
+
 function itemContentDigest(item: Item, context: ItemContext, git?: GitInfo): string {
   const isPull = item.kind === "pull_request";
   const pull = asRecord(context.pullRequest);
@@ -3148,6 +3161,7 @@ function itemContentDigest(item: Item, context: ItemContext, git?: GitInfo): str
           reviewCommentDigestParts(context.pullReviewComments))
         : null,
       checks: isPull ? (context.pullChecks ?? null) : null,
+      baseDrift: isPull ? pullBaseDriftDigestParts(context.pullBaseDrift) : null,
     }),
   );
 }
@@ -5286,6 +5300,59 @@ function compactPullRequest(value: unknown): unknown {
 
 export function compactPullRequestForTest(value: unknown): unknown {
   return compactPullRequest(value);
+}
+
+const STALE_PULL_BASE_AGE_DAYS = 7;
+const MILLISECONDS_PER_DAY = 24 * 60 * 60 * 1000;
+
+function pullBaseDriftFromComparison(value: unknown, nowMs = Date.now()): unknown {
+  const comparison = asRecord(value);
+  const mergeBase = asRecord(comparison.merge_base_commit);
+  const commit = asRecord(mergeBase.commit);
+  const committedAt =
+    stringOrUndefined(asRecord(commit.committer).date) ??
+    stringOrUndefined(asRecord(commit.author).date) ??
+    null;
+  const committedAtMs = committedAt ? timestampValueMs(committedAt) : 0;
+  const baseAgeDays = committedAtMs
+    ? Math.max(0, Math.floor((nowMs - committedAtMs) / MILLISECONDS_PER_DAY))
+    : null;
+  return {
+    status: "behind",
+    behindCommits: githubCount(comparison.behind_by),
+    mergeBaseSha: stringOrUndefined(mergeBase.sha) ?? null,
+    mergeBaseAt: committedAt,
+    baseAgeDays,
+    stale: baseAgeDays !== null && baseAgeDays >= STALE_PULL_BASE_AGE_DAYS,
+    staleAfterDays: STALE_PULL_BASE_AGE_DAYS,
+    contributorActionRequired: false,
+  };
+}
+
+export function pullBaseDriftFromComparisonForTest(value: unknown, nowMs: number): unknown {
+  return pullBaseDriftFromComparison(value, nowMs);
+}
+
+function pullBaseDriftContext(number: number, pullRequest: unknown): unknown {
+  const pull = asRecord(pullRequest);
+  if (stringOrUndefined(pull.mergeable_state)?.toLowerCase() !== "behind") return null;
+  const baseSha = stringOrUndefined(asRecord(pull.base).sha);
+  const headSha = stringOrUndefined(asRecord(pull.head).sha);
+  if (!baseSha || !headSha) return null;
+  try {
+    const comparison = ghJson<unknown>([
+      "api",
+      `repos/${targetRepo()}/compare/${baseSha}...${headSha}`,
+    ]);
+    return pullBaseDriftFromComparison(comparison);
+  } catch (error) {
+    console.error(
+      `[review] ${new Date().toISOString()} base-drift=unavailable #${number}: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+    return null;
+  }
 }
 
 function compactCheckRun(value: unknown): unknown {
@@ -8369,6 +8436,8 @@ function collectItemContext(
         ? filteredPullReviewComments
         : filterReviewContextComments(fullPullReviewComments, item.number);
     context.pullRequest = compactPullRequest(pullRequest);
+    const pullBaseDrift = pullBaseDriftContext(item.number, pullRequest);
+    if (pullBaseDrift) context.pullBaseDrift = pullBaseDrift;
     context.pullFiles = compactMappedWindow(pullFiles, pullFilesWindow.total, 80, compactPullFile);
     context.semanticPullFiles =
       options.reviewCacheDigest &&
@@ -9696,6 +9765,34 @@ function runCodex(options: {
       throw combinedCodexReviewError(error, retryError, options.reasoningEffort);
     }
   }
+}
+
+function attachPullBaseDriftMetric(decision: Decision, context: ItemContext): Decision {
+  const drift = asRecord(context.pullBaseDrift);
+  const baseAgeDays = githubCount(drift.baseAgeDays);
+  if (drift.status !== "behind" || drift.stale !== true || baseAgeDays === null) return decision;
+  const reviewMetrics = decision.reviewMetrics.filter(
+    (metric) => metric.label.trim().toLowerCase() !== "base freshness",
+  );
+  return {
+    ...decision,
+    reviewMetrics: [
+      ...reviewMetrics,
+      {
+        label: "Base freshness",
+        value: `${baseAgeDays} days since merge base`,
+        reason:
+          "Maintainers or merge automation should refresh validation before landing; no contributor action is required.",
+      },
+    ],
+  };
+}
+
+export function attachPullBaseDriftMetricForTest(
+  decision: Decision,
+  context: ItemContext,
+): Decision {
+  return attachPullBaseDriftMetric(decision, context);
 }
 
 function stripTextFence(markdown: string): string {
@@ -17133,6 +17230,12 @@ function reviewContextLedger(context: ItemContext): ReviewContextLedgerEntry[] {
       entries: context.pullChecks === undefined ? 0 : 1,
     }),
     reviewContextLedgerEntry({
+      section: "pullBaseDrift",
+      label: "PR base freshness",
+      value: context.pullBaseDrift ?? null,
+      entries: context.pullBaseDrift === undefined ? 0 : 1,
+    }),
+    reviewContextLedgerEntry({
       section: "counts",
       label: "context counts",
       value: counts ?? {},
@@ -22459,6 +22562,7 @@ function reviewCommand(args: Args): void {
         codexElapsedMs = Date.now() - codexStartedAt;
       }
       decision = attachFixedPullRequest(decision, item, context);
+      decision = attachPullBaseDriftMetric(decision, context);
       const runtime = {
         model: PUBLIC_CODEX_MODEL,
         reasoningEffort,

@@ -234,13 +234,19 @@ or absent. Use it only when the PR diff changes automation behavior or
 plausibly causes CI, automerge, proof capture, label sync, or related automation
 to fail after merge.
 Do not treat a branch being behind the current base as proof that merging the
-PR will delete current-base-only files or commits. When GitHub reports the PR as
-mergeable or clean and the only concern is stale base drift, describe it as
-needing rebase or review refresh in `risks`, `workReason`, or `bestSolution`,
-but leave `reviewFindings` and `mergeRiskLabels` focused on defects or risks
-that survive the actual three-way merge result. Use deletion/drop wording for
-current-base behavior only when a merge result, merge ref, conflict, or concrete
-patch evidence shows that the merged PR would remove or regress it.
+PR will delete current-base-only files or commits. Ordinary `behind` state is
+not a contributor blocker: do not recommend rebase or base refresh in `risks`,
+`workReason`, `bestSolution`, `reviewFindings`, `mergeRiskLabels`, or
+`prRating.nextSteps`, and do not claim that rebasing will fix a failing check.
+Only ask the contributor to rebase or resolve the base when GitHub reports a
+real merge conflict (`dirty`/`conflicting`), a merge tree cannot be produced, or
+concrete merge-result evidence shows an integration failure. Describe failing
+checks independently by their actual failure. When `pullBaseDrift.stale` is
+true, ClawSweeper adds a non-blocking `Base freshness` review metric for
+maintainers or merge automation; do not repeat it elsewhere or lower the PR
+rating. Use deletion/drop wording for current-base behavior only when a merge
+result, merge ref, conflict, or concrete patch evidence shows that the merged PR
+would remove or regress it.
 When merge risk is present, explain it in `risks` in maintainer-facing language
 and make `bestSolution` the best end state. Fill `mergeRiskOptions` with 1-3
 risk-specific maintainer options. Do not use a fixed menu. Each option needs a

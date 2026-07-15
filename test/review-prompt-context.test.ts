@@ -3,7 +3,9 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import {
+  attachPullBaseDriftMetricForTest,
   compactPullRequestForTest,
+  pullBaseDriftFromComparisonForTest,
   renderReviewContextBudgetForTest,
   reviewContextLedgerForTest,
   reviewDecisionSchemaText,
@@ -12,7 +14,7 @@ import {
   reviewPromptTemplate,
 } from "../dist/clawsweeper.js";
 import { parseArgs as parseClawsweeperArgs } from "../dist/clawsweeper-args.js";
-import { git, item } from "./helpers.ts";
+import { closeDecision, git, item } from "./helpers.ts";
 
 test("review prompt assets match tracked files", () => {
   assert.equal(reviewPromptTemplate(), readFileSync("prompts/review-item.md", "utf8"));
@@ -137,7 +139,75 @@ test("review prompt includes merge state and guards clean behind-branch drift", 
   assert.deepEqual((compactPullRequest as { mergeableState?: unknown }).mergeableState, "clean");
   assert.match(prompt, /"mergeableState": "clean"/);
   assert.match(prompt, /Do not treat a branch being behind the current base as proof/);
-  assert.match(prompt, /actual three-way merge result/);
+  assert.match(prompt, /Ordinary\s+`behind` state is\s+not a contributor blocker/);
+  assert.match(prompt, /do not claim that rebasing will fix a failing check/);
+  assert.match(
+    prompt,
+    /Only ask the contributor to rebase or resolve the base when GitHub reports a/,
+  );
+  assert.match(prompt, /concrete merge-result evidence shows an integration failure/);
+});
+
+test("base drift becomes stale after seven days", () => {
+  const nowMs = Date.parse("2026-07-15T00:00:00Z");
+  const comparison = (mergeBaseAt: string) => ({
+    behind_by: 1200,
+    merge_base_commit: {
+      sha: "base123",
+      commit: { committer: { date: mergeBaseAt } },
+    },
+  });
+
+  assert.deepEqual(pullBaseDriftFromComparisonForTest(comparison("2026-07-13T00:00:00Z"), nowMs), {
+    status: "behind",
+    behindCommits: 1200,
+    mergeBaseSha: "base123",
+    mergeBaseAt: "2026-07-13T00:00:00Z",
+    baseAgeDays: 2,
+    stale: false,
+    staleAfterDays: 7,
+    contributorActionRequired: false,
+  });
+  assert.equal(
+    (
+      pullBaseDriftFromComparisonForTest(comparison("2026-07-05T00:00:00Z"), nowMs) as {
+        stale: boolean;
+      }
+    ).stale,
+    true,
+  );
+});
+
+test("stale base drift adds a non-blocking maintainer metric", () => {
+  const decision = attachPullBaseDriftMetricForTest(closeDecision(), {
+    issue: {},
+    comments: [],
+    timeline: [],
+    pullBaseDrift: { status: "behind", baseAgeDays: 10, stale: true },
+  });
+
+  assert.deepEqual(decision.reviewMetrics.at(-1), {
+    label: "Base freshness",
+    value: "10 days since merge base",
+    reason:
+      "Maintainers or merge automation should refresh validation before landing; no contributor action is required.",
+  });
+  assert.deepEqual(decision.risks, []);
+  assert.deepEqual(decision.prRating.nextSteps, []);
+});
+
+test("fresh base drift does not add a review metric", () => {
+  const decision = closeDecision();
+
+  assert.deepEqual(
+    attachPullBaseDriftMetricForTest(decision, {
+      issue: {},
+      comments: [],
+      timeline: [],
+      pullBaseDrift: { status: "behind", baseAgeDays: 6, stale: false },
+    }),
+    decision,
+  );
 });
 
 test("review context ledger records ordered section budgets", () => {
@@ -152,6 +222,7 @@ test("review context ledger records ordered section budgets", () => {
     },
     relatedItems: [{ number: 122, title: "Related issue" }],
     pullRequest: { number: 123, additions: 12 },
+    pullBaseDrift: { status: "behind", baseAgeDays: 10, stale: true },
     pullFiles: [
       { filename: "src/example.ts", patch: "line\n".repeat(20) },
       { filename: "test/example.test.ts", patch: "test\n".repeat(20) },
@@ -197,6 +268,7 @@ test("review context ledger records ordered section budgets", () => {
       ["pullRequest", 1, undefined, undefined, undefined],
       ["pullFiles", 2, 120, 2, true],
       ["pullCommits", 1, 1, 1, false],
+      ["pullBaseDrift", 1, undefined, undefined, undefined],
       ["counts", 16, undefined, undefined, undefined],
     ],
   );

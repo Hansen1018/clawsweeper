@@ -131,6 +131,38 @@ test("content digest busts when the PR base sha changes", () => {
   assert.notEqual(a, b);
 });
 
+test("content digest busts when base drift becomes stale", () => {
+  const pull = item({ kind: "pull_request", number: 200 });
+  const fresh = itemContentDigestForTest(
+    pull,
+    pullContext({ pullBaseDrift: { status: "behind", baseAgeDays: 6, stale: false } }),
+  );
+  const stale = itemContentDigestForTest(
+    pull,
+    pullContext({ pullBaseDrift: { status: "behind", baseAgeDays: 7, stale: true } }),
+  );
+
+  assert.notEqual(fresh, stale);
+});
+
+test("content digest ignores base drift age changes within the same freshness state", () => {
+  const pull = item({ kind: "pull_request", number: 200 });
+  const a = itemContentDigestForTest(
+    pull,
+    pullContext({
+      pullBaseDrift: { status: "behind", mergeBaseSha: "base-sha", baseAgeDays: 7, stale: true },
+    }),
+  );
+  const b = itemContentDigestForTest(
+    pull,
+    pullContext({
+      pullBaseDrift: { status: "behind", mergeBaseSha: "base-sha", baseAgeDays: 8, stale: true },
+    }),
+  );
+
+  assert.equal(a, b);
+});
+
 test("issue digest ignores pull-request-only fields", () => {
   const issue = item({ kind: "issue", number: 300 });
   const a = itemContentDigestForTest(
