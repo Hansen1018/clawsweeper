@@ -2928,11 +2928,11 @@ test("exact-review queue preserves a claimed lease after an ambiguous dispatch f
         }),
       }),
     );
-    assert.deepEqual(await completed.json(), { ok: true, requeued: false, deferred: true });
-    const retained = await (
+    assert.deepEqual(await completed.json(), { ok: true, requeued: false });
+    const released = await (
       await queue.fetch(new Request("https://clawsweeper-exact-review-queue/stats"))
     ).json();
-    assert.equal(retained.leased, 1);
+    assert.equal(released.leased, 0);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -3391,7 +3391,7 @@ test("exact-review queue requeues a verified source drift exactly once without f
   assert.equal(reconciledState.items["openclaw/openclaw#713"].state, "pending");
 });
 
-test("exact-review source-drift requeue preserves an already-enqueued latest decision", async () => {
+test("exact-review success preserves an already-enqueued newer decision", async () => {
   const storage = new MemoryDurableStorage();
   const item = leasedExactReviewQueueItem(714, "7140");
   item.revision = 2;
@@ -3413,7 +3413,6 @@ test("exact-review source-drift requeue preserves an already-enqueued latest dec
         run_id: "7140",
         run_attempt: 1,
         outcome: "success",
-        requeue_latest: true,
       }),
     }),
   );
@@ -3493,10 +3492,30 @@ test("exact-review completion rejects stale owners and is race-idempotent", asyn
 
   const completed = await complete(717, "lease-717", "9101", 1, "success");
   assert.equal(completed.status, 200);
-  assert.deepEqual(await completed.json(), { ok: true, requeued: false, deferred: true });
-  const failedAfterProvisionalSuccess = await complete(717, "lease-717", "9101", 1, "failure");
-  assert.equal(failedAfterProvisionalSuccess.status, 200);
-  assert.deepEqual(await failedAfterProvisionalSuccess.json(), { ok: true, requeued: true });
+  assert.deepEqual(await completed.json(), { ok: true, requeued: false });
+  assert.equal((await complete(717, "lease-717", "9101", 1, "failure")).status, 409);
+  const reconciledAfterSuccess = await queue.fetch(
+    new Request("https://clawsweeper-exact-review-queue/reconcile", {
+      method: "POST",
+      body: JSON.stringify({
+        runs: [
+          {
+            run_id: "9101",
+            run_attempt: 1,
+            claimed_run_attempt: 1,
+            claim_generation: 1,
+            outcome: "failure",
+          },
+        ],
+      }),
+    }),
+  );
+  assert.deepEqual(await reconciledAfterSuccess.json(), {
+    ok: true,
+    reconciled: 0,
+    requeued: 0,
+    completed: 0,
+  });
 
   const state = (await storage.get("exact-review-queue")) as {
     items: Record<string, Record<string, unknown>>;
@@ -3504,9 +3523,7 @@ test("exact-review completion rejects stale owners and is race-idempotent", asyn
   assert.equal(state.items["openclaw/openclaw#716"].state, "pending");
   assert.equal(state.items["openclaw/openclaw#716"].attempts, 1);
   assert.equal(state.items["openclaw/openclaw#716"].leaseId, undefined);
-  assert.equal(state.items["openclaw/openclaw#717"].state, "pending");
-  assert.equal(state.items["openclaw/openclaw#717"].attempts, 1);
-  assert.equal(state.items["openclaw/openclaw#717"].leaseId, undefined);
+  assert.equal(state.items["openclaw/openclaw#717"], undefined);
 });
 
 test("signed exact-review reconciliation releases only immutable terminal runs", async () => {

@@ -729,19 +729,9 @@ export class ExactReviewQueue {
         return json({ error: "lease_attempt_not_claimed" }, 409);
       }
 
-      // A successful finalizer still runs before GitHub records the workflow-run conclusion.
-      // Keep the claim until the signed workflow_run backstop verifies that exact attempt as
-      // terminal, otherwise cancellation or a failing post-action could be acknowledged as
-      // success. A newer revision is already known to need another review and can requeue now.
-      if (
-        outcome === "success" &&
-        !requeueLatest &&
-        item.revision <= Number(item.leaseRevision || 0)
-      ) {
-        await this.scheduleNext(state, now);
-        return json({ ok: true, requeued: false, deferred: true });
-      }
-
+      // The workflow reports success only after every primary review mutation has settled.
+      // Complete that revision now so a later auxiliary-step failure cannot make the
+      // workflow_run reconciler requeue review work that already succeeded.
       const requeued = finishExactReviewQueueItem(
         state,
         item,

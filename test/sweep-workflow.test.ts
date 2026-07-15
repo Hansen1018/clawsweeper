@@ -125,6 +125,8 @@ test("review and apply primary boundaries ignore ledger-only failures", () => {
   assert.doesNotMatch(exactPublish.if ?? "", /action-ledger/);
   const exactPrimary = step("event-review-apply", "Export exact review primary result");
   const exactQueue = step("event-review-apply", "Complete exact-review queue lease");
+  const exactLedger = step("event-review-apply", "Publish exact event action ledger");
+  const exactSteps = job("event-review-apply").steps;
   assert.equal(exactPrimary.env?.PRIMARY_JOB_STATUS, "${{ job.status }}");
   assert.equal(exactPrimary.env?.JOB_CANCELLED, undefined);
   assert.match(exactPrimary.run ?? "", /outcome=(?:failure|cancelled|success)/);
@@ -132,6 +134,8 @@ test("review and apply primary boundaries ignore ledger-only failures", () => {
   assert.match(exactPrimary.run ?? "", /PRIMARY_JOB_STATUS.*success/);
   assert.match(exactQueue.env?.PRIMARY_OUTCOME ?? "", /exact-review-primary-result/);
   assert.doesNotMatch(exactQueue.run ?? "", /JOB_STATUS|job\.status/);
+  assert.ok(exactSteps.indexOf(exactQueue) > exactSteps.indexOf(exactPrimary));
+  assert.ok(exactSteps.indexOf(exactLedger) > exactSteps.indexOf(exactQueue));
 
   const ledgerDownload = job("publish").steps.find(
     (candidate) => candidate.id === "download-review-action-ledger",
