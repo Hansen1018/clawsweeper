@@ -27,8 +27,10 @@ type WorkflowRunSummary = {
 };
 
 const FAILED_REVIEW_SHARD_RECOVERY_SOURCE_ACTION = "failed_review_shard_recovery";
+const EXACT_REVIEW_ARTIFACT_PUBLISH_SOURCE_ACTION = "exact_review_artifact_publish";
+const EXACT_REVIEW_ARTIFACT_RETENTION_RECOVERY_SOURCE_ACTION = "artifact_retention_recovery";
 
-type ExactReviewDecision = {
+type ExactReviewBaseDecision = {
   targetRepo: string;
   targetBranch: string;
   itemNumber: number;
@@ -41,6 +43,24 @@ type ExactReviewDecision = {
   commandStatusMarker?: string;
   statusCommentId?: number;
   additionalPrompt?: string;
+};
+type ExactReviewPublication = {
+  artifactName: string;
+  producerRunId: string;
+  producerRunAttempt: number;
+  sourceSha: string;
+  itemKey: string;
+  protocolVersion: 1 | 2;
+  leaseRevision: number | null;
+  claimGeneration: number | null;
+  liveProceeded: boolean;
+  liveTerminalNoop: boolean;
+  liveTerminalMissing: boolean;
+  liveGuardedOpen: boolean;
+  producerDecision: ExactReviewBaseDecision;
+};
+type ExactReviewDecision = ExactReviewBaseDecision & {
+  publication?: ExactReviewPublication;
 };
 type ExactReviewQueueItem = {
   key: string;
@@ -125,10 +145,14 @@ const DEFAULT_STALE_QUEUED_WORKFLOW_MS = 6 * 60 * 60 * 1000;
 const DEFAULT_EXACT_REVIEW_QUEUE_MAX_CONCURRENT = 64;
 const DEFAULT_EXACT_REVIEW_TARGET_MAX_CONCURRENT = 60;
 const DEFAULT_EXACT_REVIEW_DISPATCH_LEASE_MS = 6 * 60 * 1000;
+// Covers the global publisher lane's 100 queued 60-minute jobs plus scheduling margin.
+// Terminal-run reconciliation still releases failed or cancelled dispatches early.
+const DEFAULT_EXACT_REVIEW_PUBLICATION_DISPATCH_LEASE_MS = 7 * 24 * 60 * 60 * 1000;
 const DEFAULT_EXACT_REVIEW_EXECUTION_LEASE_MS = 130 * 60 * 1000;
 const DEFAULT_EXACT_REVIEW_RETRY_MS = 30_000;
 const DEFAULT_EXACT_REVIEW_WORKFLOW_PAUSED_RETRY_MS = 60_000;
 const EXACT_REVIEW_COMPLETION_RETRY_MAX_MS = 2 * 60 * 60 * 1000;
+const EXACT_REVIEW_ARTIFACT_RETRY_MAX_MS = 80 * 24 * 60 * 60 * 1000;
 const EXACT_REVIEW_RECONCILE_RUN_LIMIT = 128;
 const EXACT_REVIEW_RECONCILE_CLAIM_MATCH_LIMIT = EXACT_REVIEW_RECONCILE_RUN_LIMIT * 2;
 const EXACT_REVIEW_RECONCILE_CONCURRENCY = 8;
@@ -625,14 +649,12 @@ export class ExactReviewQueue {
             return json({ error: "claim_protocol_mismatch" }, 409);
           }
           const claimGeneration = Math.max(1, exactReviewClaimGeneration(item.claimGeneration));
-          if (
-            item.claimGeneration !== claimGeneration ||
-            item.claimProtocolVersion !== claimProtocolVersion
-          ) {
-            item.claimGeneration = claimGeneration;
-            item.claimProtocolVersion = claimProtocolVersion;
-            await this.writeState(state);
-          }
+          item.claimGeneration = claimGeneration;
+          item.claimProtocolVersion = claimProtocolVersion;
+          item.leaseExpiresAt = now + exactReviewExecutionLeaseMs(this.env);
+          item.updatedAt = now;
+          await this.writeState(state);
+          await this.scheduleNext(state, now);
           return json(exactReviewClaimResponse(item, claimProtocolVersion, claimGeneration));
         }
       } else if (item.claimedRunId && runAttempt === null) {
@@ -859,7 +881,9 @@ export class ExactReviewQueue {
       this.syncLegacyCompatibilitySync(this.readStateSync());
     });
     const snapshot = this.readStateSync();
-    const snapshotChanged = reclaimExpiredExactReviewLeases(snapshot, startedAt);
+    const reclaimedSnapshot = reclaimExpiredExactReviewLeases(snapshot, startedAt);
+    const expiredSnapshot = expireExactReviewPublicationItems(snapshot, startedAt);
+    const snapshotChanged = reclaimedSnapshot || expiredSnapshot;
     const capacity = exactReviewQueueCapacity(this.env);
     const targetCapacity = exactReviewTargetCapacity(this.env);
     const snapshotAdmission = exactReviewQueueAdmittedItems(
@@ -889,6 +913,7 @@ export class ExactReviewQueue {
     const now = Date.now();
     const state = this.readStateSync();
     reclaimExpiredExactReviewLeases(state, now);
+    expireExactReviewPublicationItems(state, now);
     const admitted = exactReviewQueueAdmittedItems(state, now, capacity, targetCapacity);
     if (!preflight.ok) {
       const retryAt = now + exactReviewWorkflowPausedRetryMs(this.env);
@@ -928,7 +953,14 @@ export class ExactReviewQueue {
       item.leaseId = crypto.randomUUID();
       item.leaseRevision = item.revision;
       item.leaseDecision = { ...item.decision };
-      item.leaseExpiresAt = now + exactReviewDispatchLeaseMs(this.env);
+      item.leaseExpiresAt =
+        now +
+        (item.decision.sourceAction === EXACT_REVIEW_ARTIFACT_PUBLISH_SOURCE_ACTION
+          ? Math.max(
+              exactReviewDispatchLeaseMs(this.env),
+              DEFAULT_EXACT_REVIEW_PUBLICATION_DISPATCH_LEASE_MS,
+            )
+          : exactReviewDispatchLeaseMs(this.env));
       item.claimedRunId = undefined;
       item.claimedRunAttempt = undefined;
       item.claimGeneration = undefined;
@@ -2342,6 +2374,32 @@ async function enqueueExactReview({
 }
 
 function exactReviewDecisionFrom(value): ExactReviewDecision | null {
+  const base = exactReviewBaseDecisionFrom(value);
+  if (!base) return null;
+  const decision = objectValue(value);
+  const hasPublication = Object.hasOwn(decision, "publication");
+  const publication = hasPublication ? exactReviewPublicationFrom(decision.publication) : undefined;
+  if (hasPublication && !publication) return null;
+  if (publication) {
+    if (base.sourceAction !== EXACT_REVIEW_ARTIFACT_PUBLISH_SOURCE_ACTION) return null;
+    if (
+      publication.producerDecision.sourceAction === EXACT_REVIEW_ARTIFACT_PUBLISH_SOURCE_ACTION ||
+      publication.producerDecision.targetRepo !== base.targetRepo ||
+      publication.producerDecision.targetBranch !== base.targetBranch ||
+      publication.producerDecision.itemNumber !== base.itemNumber ||
+      publication.producerDecision.itemKind !== base.itemKind ||
+      publication.producerDecision.sourceEvent !== base.sourceEvent ||
+      publication.itemKey !== `${base.targetRepo}#${base.itemNumber}`
+    ) {
+      return null;
+    }
+  } else if (base.sourceAction === EXACT_REVIEW_ARTIFACT_PUBLISH_SOURCE_ACTION) {
+    return null;
+  }
+  return { ...base, ...(publication ? { publication } : {}) };
+}
+
+function exactReviewBaseDecisionFrom(value): ExactReviewBaseDecision | null {
   const decision = objectValue(value);
   const targetRepo = String(decision.targetRepo || "").trim();
   const targetBranch = String(decision.targetBranch || "").trim();
@@ -2402,6 +2460,58 @@ function exactReviewDecisionFrom(value): ExactReviewDecision | null {
   };
 }
 
+function exactReviewPublicationFrom(value): ExactReviewPublication | null {
+  const publication = objectValue(value);
+  const artifactName = String(publication.artifactName || "").trim();
+  const producerRunId = String(publication.producerRunId || "").trim();
+  const producerRunAttempt = Number(publication.producerRunAttempt);
+  const sourceSha = String(publication.sourceSha || "").trim();
+  const itemKey = String(publication.itemKey || "").trim();
+  const protocolVersion = Number(publication.protocolVersion);
+  const leaseRevision =
+    publication.leaseRevision === null ? null : Number(publication.leaseRevision);
+  const claimGeneration =
+    publication.claimGeneration === null ? null : Number(publication.claimGeneration);
+  const producerDecision = exactReviewBaseDecisionFrom(publication.producerDecision);
+  const liveProceeded = publication.liveProceeded;
+  const liveTerminalNoop = publication.liveTerminalNoop;
+  const liveTerminalMissing = publication.liveTerminalMissing;
+  const liveGuardedOpen = publication.liveGuardedOpen;
+  if (!/^exact-review-\d{1,30}-[1-9]\d*$/.test(artifactName)) return null;
+  if (!/^\d{1,30}$/.test(producerRunId)) return null;
+  if (!Number.isSafeInteger(producerRunAttempt) || producerRunAttempt < 1) return null;
+  if (artifactName !== `exact-review-${producerRunId}-${producerRunAttempt}`) return null;
+  if (!/^[0-9a-f]{40}$/.test(sourceSha)) return null;
+  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+#[1-9]\d*$/.test(itemKey)) return null;
+  if (protocolVersion !== 1 && protocolVersion !== 2) return null;
+  if (
+    (leaseRevision !== null && (!Number.isSafeInteger(leaseRevision) || leaseRevision < 1)) ||
+    (claimGeneration !== null && (!Number.isSafeInteger(claimGeneration) || claimGeneration < 1))
+  ) {
+    return null;
+  }
+  if (protocolVersion === 2 && (leaseRevision === null || claimGeneration === null)) return null;
+  if (!producerDecision) return null;
+  const liveOutcomes = [liveProceeded, liveTerminalNoop, liveTerminalMissing, liveGuardedOpen];
+  if (liveOutcomes.some((outcome) => typeof outcome !== "boolean")) return null;
+  if (liveOutcomes.filter(Boolean).length !== 1) return null;
+  return {
+    artifactName,
+    producerRunId,
+    producerRunAttempt,
+    sourceSha,
+    itemKey,
+    protocolVersion,
+    leaseRevision,
+    claimGeneration,
+    liveProceeded,
+    liveTerminalNoop,
+    liveTerminalMissing,
+    liveGuardedOpen,
+    producerDecision,
+  };
+}
+
 function mergePendingExactReviewDecision(
   current: ExactReviewDecision,
   next: ExactReviewDecision,
@@ -2418,7 +2528,10 @@ function mergePendingExactReviewDecision(
 }
 
 function exactReviewItemKey(decision: ExactReviewDecision) {
-  return `${decision.targetRepo}#${decision.itemNumber}`;
+  const base = `${decision.targetRepo}#${decision.itemNumber}`;
+  return decision.publication
+    ? `${base}@publish:${decision.publication.producerRunId}:${decision.publication.producerRunAttempt}`
+    : base;
 }
 
 function isExactReviewQueueTargetEnabled(decision: ExactReviewDecision, env) {
@@ -2648,6 +2761,51 @@ function reclaimExpiredExactReviewLeases(state: ExactReviewQueueState, now: numb
   return changed;
 }
 
+function expireExactReviewPublicationItems(state: ExactReviewQueueState, now: number) {
+  let changed = false;
+  for (const [key, item] of Object.entries(state.items)) {
+    const publication = item.decision.publication;
+    if (
+      item.state !== "pending" ||
+      !publication ||
+      now < item.createdAt + EXACT_REVIEW_ARTIFACT_RETRY_MAX_MS
+    ) {
+      continue;
+    }
+    delete state.items[key];
+    const decision: ExactReviewDecision = {
+      ...publication.producerDecision,
+      sourceAction:
+        publication.producerDecision.sourceAction === FAILED_REVIEW_SHARD_RECOVERY_SOURCE_ACTION
+          ? FAILED_REVIEW_SHARD_RECOVERY_SOURCE_ACTION
+          : EXACT_REVIEW_ARTIFACT_RETENTION_RECOVERY_SOURCE_ACTION,
+      supersedesInProgress: true,
+    };
+    const recoveryKey = exactReviewItemKey(decision);
+    const current = state.items[recoveryKey];
+    if (current?.state === "pending") {
+      current.decision = mergePendingExactReviewDecision(current.decision, decision);
+      current.revision += 1;
+      current.updatedAt = now;
+      current.nextAttemptAt = exactReviewQueueEnqueueAttemptAt(state, now);
+      current.attempts = 0;
+    } else if (!current) {
+      state.items[recoveryKey] = {
+        key: recoveryKey,
+        decision,
+        state: "pending",
+        revision: 1,
+        createdAt: now,
+        updatedAt: now,
+        nextAttemptAt: exactReviewQueueEnqueueAttemptAt(state, now),
+        attempts: 0,
+      };
+    }
+    changed = true;
+  }
+  return changed;
+}
+
 function exactReviewQueueEnqueueAttemptAt(state: ExactReviewQueueState, now: number) {
   const retryAt = Number(state.dispatcher?.retryAt || 0);
   return (state.dispatcher?.state === "paused" || state.dispatcher?.state === "blocked") &&
@@ -2664,9 +2822,15 @@ function deferPausedExactReviewQueue(state: ExactReviewQueueState, now: number, 
   }
 }
 
-function exactReviewQueueActiveCount(state: ExactReviewQueueState) {
+function exactReviewQueueIsPublication(item: ExactReviewQueueItem) {
+  return item.decision.sourceAction === EXACT_REVIEW_ARTIFACT_PUBLISH_SOURCE_ACTION;
+}
+
+function exactReviewQueueActiveReviewCount(state: ExactReviewQueueState) {
   return Object.values(state.items).filter(
-    (item) => item.state === "dispatching" || item.state === "leased",
+    (item) =>
+      !exactReviewQueueIsPublication(item) &&
+      (item.state === "dispatching" || item.state === "leased"),
   ).length;
 }
 
@@ -2676,23 +2840,37 @@ function exactReviewQueueAdmittedItems(
   capacity: number,
   targetCapacity: number,
 ) {
-  const slots = Math.max(0, capacity - exactReviewQueueActiveCount(state));
+  const reviewSlots = Math.max(0, capacity - exactReviewQueueActiveReviewCount(state));
   const activeTargets = new Map<string, number>();
+  let activePublishers = 0;
   for (const item of Object.values(state.items)) {
     if (item.state !== "dispatching" && item.state !== "leased") continue;
+    if (exactReviewQueueIsPublication(item)) {
+      activePublishers += 1;
+      continue;
+    }
     const target = item.decision.targetRepo;
     activeTargets.set(target, (activeTargets.get(target) || 0) + 1);
   }
   const admitted: ExactReviewQueueItem[] = [];
+  let admittedReviews = 0;
   const pending = Object.values(state.items)
     .filter((item) => item.state === "pending" && item.nextAttemptAt <= now)
     .sort((left, right) => left.createdAt - right.createdAt || left.key.localeCompare(right.key));
   for (const item of pending) {
-    if (admitted.length >= slots) break;
+    const publication = exactReviewQueueIsPublication(item);
+    if (publication) {
+      if (activePublishers >= 1) continue;
+      activePublishers += 1;
+      admitted.push(item);
+      continue;
+    }
+    if (admittedReviews >= reviewSlots) continue;
     const target = item.decision.targetRepo;
     const active = activeTargets.get(target) || 0;
     if (active >= targetCapacity) continue;
     activeTargets.set(target, active + 1);
+    admittedReviews += 1;
     admitted.push(item);
   }
   return admitted;
@@ -2799,23 +2977,21 @@ function exactReviewQueueNextWakeAt(
   const activeItems = items.filter(
     (item) => item.state === "dispatching" || item.state === "leased",
   );
-  const activeLeaseWakeAt = activeItems
-    .map((item) => item.leaseExpiresAt)
-    .filter((value): value is number => Boolean(value && value > now));
   if (activeItems.some((item) => !item.leaseExpiresAt || item.leaseExpiresAt <= now)) {
     return now + 1_000;
   }
-  if (activeItems.length >= capacity && activeLeaseWakeAt.length) {
-    return Math.max(now + 1_000, Math.min(...activeLeaseWakeAt));
-  }
+  const activeReviews = activeItems.filter((item) => !exactReviewQueueIsPublication(item));
+  const activePublishers = activeItems.filter(exactReviewQueueIsPublication);
+  const activeReviewWakeAt = activeReviews
+    .map((item) => item.leaseExpiresAt)
+    .filter((value): value is number => Boolean(value && value > now));
+  const activePublisherWakeAt = activePublishers
+    .map((item) => item.leaseExpiresAt)
+    .filter((value): value is number => Boolean(value && value > now));
   const activeTargetWakeAt = new Map<string, number>();
   const activeTargetCounts = new Map<string, number>();
-  for (const item of items) {
-    if (
-      (item.state === "dispatching" || item.state === "leased") &&
-      item.leaseExpiresAt &&
-      item.leaseExpiresAt > now
-    ) {
+  for (const item of activeReviews) {
+    if (item.leaseExpiresAt && item.leaseExpiresAt > now) {
       const target = item.decision.targetRepo;
       activeTargetCounts.set(target, (activeTargetCounts.get(target) || 0) + 1);
       const current = activeTargetWakeAt.get(item.decision.targetRepo);
@@ -2827,12 +3003,28 @@ function exactReviewQueueNextWakeAt(
   }
   const times = items.flatMap((item) => {
     if (item.state === "pending") {
+      if (exactReviewQueueIsPublication(item)) {
+        const blockedUntil = activePublisherWakeAt.length
+          ? Math.min(...activePublisherWakeAt)
+          : item.nextAttemptAt;
+        return [Math.max(item.nextAttemptAt, blockedUntil)];
+      }
       const target = item.decision.targetRepo;
-      const blockedUntil =
-        (activeTargetCounts.get(target) || 0) >= targetCapacity
-          ? activeTargetWakeAt.get(target)
-          : undefined;
-      return [blockedUntil ?? item.nextAttemptAt];
+      const blockedUntil = [
+        ...(activeReviews.length >= capacity && activeReviewWakeAt.length
+          ? [Math.min(...activeReviewWakeAt)]
+          : []),
+        ...((activeTargetCounts.get(target) || 0) >= targetCapacity &&
+        activeTargetWakeAt.has(target)
+          ? [activeTargetWakeAt.get(target) as number]
+          : []),
+      ];
+      return [
+        Math.max(
+          item.nextAttemptAt,
+          blockedUntil.length ? Math.min(...blockedUntil) : item.nextAttemptAt,
+        ),
+      ];
     }
     return item.leaseExpiresAt ? [item.leaseExpiresAt] : [];
   });
@@ -3262,6 +3454,7 @@ async function dispatchClawsweeperItem({
       : {}),
     ...(decision.statusCommentId ? { status_comment_id: decision.statusCommentId } : {}),
     ...(decision.additionalPrompt ? { additional_prompt: decision.additionalPrompt } : {}),
+    ...(decision.publication ? { publication: decision.publication } : {}),
   };
   await githubTokenJson({
     token,
