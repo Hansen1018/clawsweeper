@@ -19,6 +19,7 @@ import {
   renderReviewCommentFromReport,
 } from "../dist/clawsweeper.js";
 import { reviewSemanticPriorReviewDigest } from "../dist/review-semantic-cache.js";
+import { renderDurableReviewRefreshProjection } from "../dist/review-comment-status.js";
 import {
   changelogReviewDecision,
   markedReviewCommentForTest,
@@ -564,6 +565,27 @@ test("keep-open PR comment carries the previous review as an earlier cycle", () 
   assert.equal(parsed.cycles.length, 1);
 });
 
+test("publishing after a refresh projection carries the displaced review exactly once", () => {
+  const projection = renderDurableReviewRefreshProjection(previousDurableComment(), {
+    itemNumber: 101,
+    targetRevision: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    startedAt: "2026-07-17T03:50:00.000Z",
+    leaseOwner: "github-run-123-1",
+    leaseCommentId: 987,
+    previousReviewedAt: "2026-06-20T10:00:00.000Z",
+    previousSha: "abc1234def",
+  });
+  assert.ok(projection);
+  const comment = renderReviewCommentFromReport(keepOpenPullReport(), "none", {
+    prStatusKind: "ready_for_maintainer_look",
+    previousReviewCommentBody: projection,
+  });
+  const parsed = parseReviewHistory(comment);
+  assert.equal(parsed.totalCompletedCycles, 1);
+  assert.equal(parsed.cycles.length, 1);
+  assert.equal(parsed.cycles[0]?.sha, "abc1234def");
+});
+
 test("re-syncing the same review does not add a duplicate cycle", () => {
   const reviewedAt = "2026-06-24T12:00:00.000Z";
   const comment = renderReviewCommentFromReport(
@@ -665,6 +687,46 @@ test("latest review extraction exposes earlier cycles and a cycle count", () => 
   assert.equal(review?.earlierReviewCycles.length, 1);
   assert.equal(review?.earlierReviewCycles[0]?.sha, "aaa111");
   assert.deepEqual(review?.findings, [
+    { priority: "P1", title: "Drop the stale cache before rebuild" },
+  ]);
+});
+
+test("refresh projections preserve prior review identity and history context", () => {
+  const previousBody = previousDurableComment({
+    reviewedAt: "2026-06-20T10:00:00.000Z",
+    sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  });
+  const projection = renderDurableReviewRefreshProjection(previousBody, {
+    itemNumber: 101,
+    targetRevision: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    startedAt: "2026-07-17T03:50:00.000Z",
+    leaseOwner: "github-run-123-1",
+    leaseCommentId: 987,
+    previousReviewedAt: "2026-06-20T10:00:00.000Z",
+    previousSha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  });
+  assert.ok(projection);
+  const review = extractLatestClawSweeperReviewForTest(
+    [
+      {
+        id: 11,
+        user: { login: "clawsweeper" },
+        body: projection,
+        created_at: "2026-06-20T10:05:00Z",
+        updated_at: "2026-07-17T03:50:00Z",
+      },
+    ],
+    101,
+  );
+  assert.ok(review);
+  assert.equal(
+    review.verdictDigest,
+    createHash("sha256").update(previousBody.trim()).digest("hex"),
+  );
+  assert.equal(review.reviewedAt, "2026-06-20T10:00:00.000Z");
+  assert.equal(review.reviewedSha, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+  assert.equal(review.completedReviewCycles, 1);
+  assert.deepEqual(review.findings, [
     { priority: "P1", title: "Drop the stale cache before rebuild" },
   ]);
 });

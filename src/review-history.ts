@@ -300,7 +300,10 @@ function commentBodyFindings(body: string): string[] {
   return [...new Set(findings)].slice(0, MAX_CYCLE_FINDINGS);
 }
 
-export function reviewHistoryCycleFromCommentBody(body: string): ReviewHistoryCycle | null {
+export function reviewHistoryCycleFromCommentBody(
+  body: string,
+  metadata: { reviewedAt?: string | null | undefined; sha?: string | null | undefined } = {},
+): ReviewHistoryCycle | null {
   if (
     !body.trim() ||
     body.includes(REVIEW_START_PLACEHOLDER) ||
@@ -322,7 +325,11 @@ export function reviewHistoryCycleFromCommentBody(body: string): ReviewHistoryCy
   if (freshnessIndex >= 0) verdict = verdict.slice(0, freshnessIndex).trim();
   if (!verdict || verdict === FAILED_REVIEW_VERDICT) return null;
   const inlineReviewedAt = body.match(/_reviewed ([^_]+?)\.?_/i)?.[1]?.trim();
-  const reviewedAt = reviewMarkerAttribute(body, "reviewed_at") ?? inlineReviewedAt ?? "unknown";
-  const sha = reviewMarkerAttribute(body, "sha") ?? "unknown";
+  const reviewedAt =
+    metadata.reviewedAt ??
+    reviewMarkerAttribute(body, "reviewed_at") ??
+    inlineReviewedAt ??
+    "unknown";
+  const sha = metadata.sha ?? reviewMarkerAttribute(body, "sha") ?? "unknown";
   return { reviewedAt, sha, verdict, findings: commentBodyFindings(body) };
 }
