@@ -300,6 +300,11 @@ test("spoofed durable markers cannot suppress a bot-owned start lease", () => {
   assert.match(postStart, /heldReviewStartStatusCommentResult\(initialLease\.expiresAt, false\)/);
   assert.match(postStart, /heldReviewStartStatusCommentResult\(winner\.expiresAt, true\)/);
   assert.match(postStart, /issues\/\$\{options\.item\.number\}\/comments/);
+  assert.match(postStart, /projectExistingDurableReviewForLease\(\{/);
+  assert.match(postStart, /durable_review_refresh/);
+  assert.match(postStart, /renderInterruptedDurableReviewProjection/);
+  assert.match(postStart, /If-Match/);
+  assert.match(postStart, /precondition failed/);
 });
 
 test("review start status comment is marker-backed and crustacean-friendly", () => {

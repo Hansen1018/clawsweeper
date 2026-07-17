@@ -1,4 +1,5 @@
 import type { JsonValue, LooseRecord } from "./json-types.js";
+import { isDurableReviewStatusProjection } from "../review-comment-status.js";
 import { clawsweeperCoAuthorKey, coAuthorKey } from "./co-author-credit.js";
 import {
   extractClawSweeperCommandLine,
@@ -1667,6 +1668,7 @@ export function parseTrustedAutomation(
 
   const body = String(comment?.body ?? "");
   if (canonicalReviewStartStatusMarker(body)) return null;
+  if (isDurableReviewStatusProjection(body)) return null;
   if (isProofNudgeCommentBody(body)) return null;
   const verdict = clawsweeperMarker(body, "verdict");
   const actionMarker = clawsweeperMarker(body, "action");

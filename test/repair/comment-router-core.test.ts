@@ -1301,6 +1301,41 @@ test("parseTrustedAutomation accepts only trusted ClawSweeper repair signals", (
   );
 });
 
+test("parseTrustedAutomation ignores durable review refresh projections", async () => {
+  const { renderDurableReviewRefreshProjection, renderInterruptedDurableReviewProjection } =
+    await import("../../dist/review-comment-status.js");
+  const trustedAuthors = new Set(["clawsweeper[bot]"]);
+  const projection = renderDurableReviewRefreshProjection(
+    [
+      "Codex review: needs changes before merge.",
+      "",
+      "- **[P1] Old finding:** must not trigger repair while stale.",
+      "",
+      "<!-- clawsweeper-verdict:needs-changes item=42 -->",
+      "<!-- clawsweeper-action:fix-required item=42 -->",
+      "<!-- clawsweeper-review item=42 -->",
+    ].join("\n"),
+    {
+      itemNumber: 42,
+      targetRevision: "0123456789abcdef0123456789abcdef01234567",
+      startedAt: "2026-07-17T03:50:00.000Z",
+      leaseOwner: "github-run-123-1",
+      leaseCommentId: 987,
+    },
+  );
+  assert.ok(projection);
+  const comment = { user: { login: "clawsweeper[bot]" }, body: projection };
+  assert.equal(parseTrustedAutomation(comment, { trustedAuthors }), null);
+  const interrupted = renderInterruptedDurableReviewProjection(projection, {
+    itemNumber: 42,
+    targetRevision: "0123456789abcdef0123456789abcdef01234567",
+    leaseOwner: "github-run-123-1",
+    leaseCommentId: 987,
+  });
+  assert.ok(interrupted);
+  assert.equal(parseTrustedAutomation({ ...comment, body: interrupted }, { trustedAuthors }), null);
+});
+
 test("parseRoutedCommentCommand ignores proof-nudge marker comments", () => {
   const trustedAuthors = new Set(["clawsweeper[bot]"]);
   const comment = {

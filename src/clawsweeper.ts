@@ -187,6 +187,11 @@ import {
   type ReviewHistoryCycle,
   type ReviewHistoryLedger,
 } from "./review-history.js";
+import {
+  parseDurableReviewStatusProjection,
+  renderDurableReviewRefreshProjection,
+  renderInterruptedDurableReviewProjection,
+} from "./review-comment-status.js";
 import { trailingHtmlComments } from "./review-comment-markers.js";
 import {
   MAX_REVIEWED_PR_ACTIVITY,
@@ -5683,29 +5688,41 @@ function extractLatestClawSweeperReview(
   if (!latest) return null;
   const comment = asRecord(latest);
   const body = rawCommentBody(latest);
-  const verdictMarker = htmlMarkerWithPrefix(body, "clawsweeper-verdict:");
-  const actionMarker = htmlMarkerWithPrefix(body, "clawsweeper-action:");
-  const history = parseReviewHistory(body);
-  const currentCycle = reviewHistoryCycleFromCommentBody(body);
+  const projection = parseDurableReviewStatusProjection(body, number);
+  const reviewBody = projection?.previousBody ?? body;
+  const verdictMarker = projection
+    ? null
+    : htmlMarkerWithPrefix(reviewBody, "clawsweeper-verdict:");
+  const actionMarker = projection ? null : htmlMarkerWithPrefix(reviewBody, "clawsweeper-action:");
+  const history = parseReviewHistory(reviewBody);
+  const currentCycle = reviewHistoryCycleFromCommentBody(reviewBody, {
+    reviewedAt: projection?.previousReviewedAt,
+    sha: projection?.previousSha,
+  });
   const latestCompletedCycle = currentCycle ?? history.cycles.at(-1);
   const earlierReviewCycles = currentCycle ? history.cycles : history.cycles.slice(0, -1);
   return {
-    status: previousReviewStatus(body),
-    verdictDigest: reviewCommentBodyDigest(body),
-    reviewedAt: previousReviewReviewedAt(body) ?? latestCompletedCycle?.reviewedAt ?? null,
+    status: previousReviewStatus(reviewBody),
+    verdictDigest: projection?.previousDigest ?? reviewCommentBodyDigest(reviewBody),
+    reviewedAt:
+      projection?.previousReviewedAt ??
+      previousReviewReviewedAt(reviewBody) ??
+      latestCompletedCycle?.reviewedAt ??
+      null,
     reviewedSha:
+      projection?.previousSha ??
       markerAttribute(verdictMarker, "sha") ??
       markerAttribute(actionMarker, "sha") ??
       latestCompletedCycle?.sha ??
       null,
     verdictMarker,
     actionMarker,
-    summary: firstNonEmptyLine(markdownSection(body, "Summary")),
-    proofStatus: previousReviewProofStatus(body),
-    rating: previousReviewRating(body),
+    summary: firstNonEmptyLine(markdownSection(reviewBody, "Summary")),
+    proofStatus: previousReviewProofStatus(reviewBody),
+    rating: previousReviewRating(reviewBody),
     nextStep:
-      firstNonEmptyLine(markdownSection(body, "Next step before merge")) ||
-      firstNonEmptyLine(markdownSection(body, "Next step")),
+      firstNonEmptyLine(markdownSection(reviewBody, "Next step before merge")) ||
+      firstNonEmptyLine(markdownSection(reviewBody, "Next step")),
     findings: reviewHistoryFindings(latestCompletedCycle),
     earlierReviewCycles,
     completedReviewCycles: history.totalCompletedCycles + (currentCycle ? 1 : 0),
@@ -18506,8 +18523,13 @@ function reviewHistoryForRender(
   }
   const body = previousReviewCommentBody ?? "";
   if (!body.trim()) return { cycles: [], totalCompletedCycles: 0 };
-  const history = parseReviewHistory(body);
-  const previousCycle = reviewHistoryCycleFromCommentBody(body);
+  const projection = parseDurableReviewStatusProjection(body);
+  const reviewBody = projection?.previousBody ?? body;
+  const history = parseReviewHistory(reviewBody);
+  const previousCycle = reviewHistoryCycleFromCommentBody(reviewBody, {
+    reviewedAt: projection?.previousReviewedAt,
+    sha: projection?.previousSha,
+  });
   if (!previousCycle) return history;
   const reviewedAt = frontMatterValue(markdown, "reviewed_at");
   if (reviewedAt && previousCycle.reviewedAt === reviewedAt) return history;
@@ -18518,8 +18540,16 @@ function reviewHistoryForStaleComment(
   previousReviewCommentBody: string | undefined,
 ): ReviewHistoryLedger {
   const body = previousReviewCommentBody ?? "";
-  const history = parseReviewHistory(body);
-  return appendReviewHistoryCycle(history, reviewHistoryCycleFromCommentBody(body));
+  const projection = parseDurableReviewStatusProjection(body);
+  const reviewBody = projection?.previousBody ?? body;
+  const history = parseReviewHistory(reviewBody);
+  return appendReviewHistoryCycle(
+    history,
+    reviewHistoryCycleFromCommentBody(reviewBody, {
+      reviewedAt: projection?.previousReviewedAt,
+      sha: projection?.previousSha,
+    }),
+  );
 }
 
 function renderKeepOpenCommentFromReport(
@@ -19848,6 +19878,18 @@ function durableReviewVersion(
   if (!canPatchReviewComment(comment)) return null;
   const body = commentBody(comment);
   if (!body) return null;
+  const projection = parseDurableReviewStatusProjection(body, number);
+  if (projection) {
+    // The projection's lease tuple is the publication fence: only the report
+    // produced by that exact refresh may replace the visible pending state.
+    return {
+      reviewedAt: projection.startedAt,
+      headSha: projection.targetRevision,
+      sourceRevision: projection.targetRevision,
+      leaseOwner: projection.state === "refreshing" ? projection.leaseOwner : null,
+      leaseCommentId: String(projection.leaseCommentId),
+    };
+  }
   const identity = reviewCommentMarker(number);
   const identityIndex = body.lastIndexOf(identity);
   if (identityIndex < 0 || body.slice(identityIndex + identity.length).trim()) return null;
@@ -20437,13 +20479,14 @@ function postReviewStartStatusComment(options: {
   bulkFilerLabelApplied?: boolean;
 }): ReviewStartStatusCommentResult {
   const startedAtMs = Date.now();
+  const startedAt = new Date(startedAtMs).toISOString();
   const leaseOwner = newReviewStartLeaseOwner();
   const leaseOptions: ReviewStartStatusCommentOptions = {
     number: options.item.number,
     kind: options.item.kind,
     title: options.item.title,
     ...(options.headSha ? { headSha: options.headSha } : {}),
-    startedAt: new Date(startedAtMs).toISOString(),
+    startedAt,
     leaseExpiresAt: new Date(startedAtMs + options.reviewTimeoutMs + 10 * 60 * 1000).toISOString(),
     leaseOwner,
     position: options.position,
@@ -20526,11 +20569,132 @@ function postReviewStartStatusComment(options: {
     deleteOwnedDedicatedReviewStartLease(options.item.number, acquired);
     return heldReviewStartStatusCommentResult(winner.expiresAt, true);
   }
+  projectExistingDurableReviewForLease({
+    itemNumber: options.item.number,
+    targetRevision: normalizedHead,
+    startedAt,
+    leaseOwner,
+    leaseCommentId: createdCommentId,
+  });
   return {
     status: "posted",
     lease: { ...acquired, comment: winner.comment },
     didMutate: true,
   };
+}
+
+function currentWorkflowRunUrl(): string | null {
+  const serverUrl = String(process.env.GITHUB_SERVER_URL ?? "https://github.com").replace(
+    /\/$/,
+    "",
+  );
+  const repository = String(process.env.GITHUB_REPOSITORY ?? "").trim();
+  const runId = String(process.env.GITHUB_RUN_ID ?? "").trim();
+  if (!/^https:\/\/[^\s]+$/.test(serverUrl) || !/^[\w.-]+\/[\w.-]+$/.test(repository)) {
+    return null;
+  }
+  return /^[1-9]\d*$/.test(runId) ? `${serverUrl}/${repository}/actions/runs/${runId}` : null;
+}
+
+function patchDurableReviewStatusBody(options: {
+  itemNumber: number;
+  comment: Record<string, unknown> | undefined;
+  nextBody: string | null;
+  identity: string;
+}): void {
+  const currentBody = commentBody(options.comment);
+  const id = commentId(options.comment);
+  if (!currentBody || id === null || !options.nextBody || options.nextBody === currentBody) return;
+  const endpoint = `repos/${targetRepo()}/issues/comments/${id}`;
+  const snapshot = ghWithRetry(["api", "--include", endpoint]);
+  const etag = snapshot.match(/^etag:\s*(.+)\r?$/im)?.[1]?.trim();
+  const jsonStart = snapshot.lastIndexOf("\n{");
+  const liveComment =
+    jsonStart >= 0 ? asRecord(JSON.parse(snapshot.slice(jsonStart + 1)) as unknown) : {};
+  if (!etag || commentBody(liveComment) !== currentBody) return;
+  const payload = writeCommentPayload(options.itemNumber, options.nextBody);
+  const args = [
+    "api",
+    endpoint,
+    "--method",
+    "PATCH",
+    "-H",
+    `If-Match: ${etag}`,
+    "--input",
+    payload,
+  ];
+  ghObservedMutationCommand({
+    identity: options.identity,
+    args,
+    knownNoMutation: (error) =>
+      /(?:\b412\b|precondition failed)/i.test(mutationErrorMessage(error)),
+  });
+}
+
+function projectExistingDurableReviewForLease(options: {
+  itemNumber: number;
+  targetRevision: string;
+  startedAt: string;
+  leaseOwner: string;
+  leaseCommentId: number;
+}): void {
+  try {
+    const durable = issueReviewCommentState(options.itemNumber).reviewComment;
+    const body = commentBody(durable);
+    if (!body || !canPatchReviewComment(durable) || commentId(durable) === options.leaseCommentId) {
+      return;
+    }
+    const previous = extractLatestClawSweeperReview([durable], options.itemNumber);
+    const nextBody = renderDurableReviewRefreshProjection(body, {
+      ...options,
+      previousReviewedAt: previous?.reviewedAt,
+      previousSha: previous?.reviewedSha,
+      workflowUrl: currentWorkflowRunUrl(),
+    });
+    patchDurableReviewStatusBody({
+      itemNumber: options.itemNumber,
+      comment: durable,
+      nextBody,
+      identity: `durable_review_refresh:${options.itemNumber}:${options.leaseCommentId}`,
+    });
+  } catch (error) {
+    // The dedicated lease remains authoritative. A presentation-only patch must
+    // never prevent the already-coordinated review from producing a new verdict.
+    console.error(
+      `[review] could not project durable review refresh for #${options.itemNumber}: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+  }
+}
+
+function interruptDurableReviewProjectionForLease(
+  itemNumber: number,
+  lease: Pick<AcquiredReviewStartLease, "owner" | "commentId" | "headSha">,
+): void {
+  try {
+    const durable = issueReviewCommentState(itemNumber).reviewComment;
+    const body = commentBody(durable);
+    if (!body || !canPatchReviewComment(durable)) return;
+    const nextBody = renderInterruptedDurableReviewProjection(body, {
+      itemNumber,
+      leaseOwner: lease.owner,
+      leaseCommentId: lease.commentId,
+      targetRevision: lease.headSha,
+    });
+    patchDurableReviewStatusBody({
+      itemNumber,
+      comment: durable,
+      nextBody,
+      identity: `durable_review_interrupted:${itemNumber}:${lease.commentId}`,
+    });
+  } catch (error) {
+    console.error(
+      `[review] could not mark durable review refresh interrupted for #${itemNumber}: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+  }
 }
 
 function patchOwnedBulkFilerReviewStartStatusComment(
@@ -20599,6 +20763,7 @@ function deleteOwnedDedicatedReviewStartLease(
         (commentBody(comment) ?? "").includes(`sha=${lease.headSha}`),
     );
     if (!matching) return false;
+    interruptDurableReviewProjectionForLease(itemNumber, lease);
     ghObservedMutationCommand({
       identity: `review_lease_delete:${itemNumber}:${lease.commentId}`,
       args: [
@@ -20635,6 +20800,20 @@ function reapExpiredDedicatedReviewStartLeases(
   });
   for (const lease of expired) {
     try {
+      const matchingComment = dedicatedLeaseComments.find(
+        (comment) => commentId(comment) === lease.commentId,
+      );
+      const owner = reviewStartLeaseOwner(matchingComment);
+      const headSha = (commentBody(matchingComment) ?? "").match(
+        /<!--\s*clawsweeper-review-status:started\b[^>]*\bsha=([^\s>]+)/i,
+      )?.[1];
+      if (owner && headSha) {
+        interruptDurableReviewProjectionForLease(itemNumber, {
+          owner,
+          commentId: lease.commentId,
+          headSha,
+        });
+      }
       ghObservedMutationCommand({
         identity: `review_lease_reap:${itemNumber}:${lease.commentId}`,
         args: [

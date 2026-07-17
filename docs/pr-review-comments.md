@@ -27,10 +27,16 @@ Each synced comment includes the durable identity marker:
 ClawSweeper edits that comment in place instead of posting repeated comments.
 Report front matter stores the synced comment id, URL, hash, and sync time.
 
-When review starts and no ClawSweeper-owned comment exists yet, the review
-shard posts a short status placeholder with the same durable identity marker.
-The placeholder is intentionally light and crustacean-friendly, then the final
-review sync edits that exact comment in place.
+The review shard uses a separate transient status comment as its coordination
+lease. When a durable review already exists, acquiring that lease also edits
+the durable comment to show that a fresh review is in progress, marks the old
+review stale, and collapses it as previous context. The status projection has
+no active verdict or action markers, so downstream automation cannot act on the
+displaced review. A matching apply run replaces the projection with the new
+completed review; an abandoned or expired lease marks the refresh interrupted.
+
+When no durable review exists yet, the transient lease comment remains the only
+start status until the first completed review is published.
 
 For a PR that needs work, the visible comment starts with:
 
