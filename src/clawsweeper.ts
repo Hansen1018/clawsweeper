@@ -16843,7 +16843,8 @@ function duplicateCanonicalPullRequestBlockReason(
       }
       const reason = unsafeCanonicalPullRequestReason(linkedPull, options);
       if (reason) return `${reason}; refusing duplicate/superseded auto-close`;
-    } catch {
+    } catch (error) {
+      if (error instanceof GitHubRuntimeBudgetError) throw error;
       if (ref.kind !== "pull_url" && shorthandRefIsIssue(number)) continue;
       return `linked canonical PR #${number} could not be read; refusing duplicate/superseded auto-close`;
     }
@@ -17130,6 +17131,7 @@ function prCloseCoverageProofGateResult(options: {
     try {
       covering = coveringView(linkedNumber);
     } catch (error) {
+      if (error instanceof GitHubRuntimeBudgetError) throw error;
       const hydrationBudgetBlock = prCloseCoverageRuntimeBudgetBlock(
         options.runtimeBudget,
         "while hydrating",
@@ -17230,6 +17232,7 @@ function prCloseCoverageProofGateResult(options: {
         reason: `PR close coverage proof kept this PR open against ${covering.url}: ${closeDecision.reason}`,
       };
     } catch (error) {
+      if (error instanceof GitHubRuntimeBudgetError) throw error;
       const proofBudgetBlock = prCloseCoverageRuntimeBudgetBlock(
         options.runtimeBudget,
         "while running",
