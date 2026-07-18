@@ -22166,6 +22166,17 @@ function actionLedgerFileEvidence(kind: string, filePath: string): ActionEventEv
   };
 }
 
+function actionLedgerFileDigestEvidence(
+  kind: string,
+  filePath: string,
+): ActionEventEvidence | null {
+  if (!existsSync(filePath)) return null;
+  return {
+    kind,
+    sha256: sha256(readFileSync(filePath, "utf8")),
+  };
+}
+
 function actionLedgerItemSubject(
   item: Item,
   options: { sourceRevision?: string; recordPath?: string } = {},
@@ -26502,7 +26513,9 @@ function recordApplyActionEvents(options: {
     },
     privacy: actionLedgerPrivacy(),
   });
-  const reportEvidence = actionLedgerFileEvidence("apply_report", options.reportPath);
+  // apply-report.json is a local workflow artifact, so only its digest is
+  // durable evidence; report_path is reserved for namespaced state data.
+  const reportEvidence = actionLedgerFileDigestEvidence("apply_report", options.reportPath);
   const reportPublicationPhaseSeq = nextApplyPhaseSeq(options.ledger);
   recordWorkflowPhaseEvent(ROOT, {
     phase: ACTION_EVENT_TYPES.applyPublish,
@@ -26525,9 +26538,8 @@ function recordApplyActionEvents(options: {
     subject: {
       repository: targetRepo(),
       kind: "publication",
-      // apply-report.json is a local workflow artifact, not a durable namespaced
-      // state path. Its evidence digest binds the publication without inventing a
-      // record path that the action-ledger schema must reject.
+      // Its evidence digest binds the publication without inventing a durable
+      // subject path that the action-ledger schema must reject.
     },
     evidence: [...workflowRunEvidence(), ...(reportEvidence ? [reportEvidence] : [])],
     attributes: {
