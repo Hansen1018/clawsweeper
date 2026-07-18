@@ -26525,9 +26525,9 @@ function recordApplyActionEvents(options: {
     subject: {
       repository: targetRepo(),
       kind: "publication",
-      ...(repoRelativePath(options.reportPath).startsWith("../")
-        ? {}
-        : { recordPath: repoRelativePath(options.reportPath) }),
+      // apply-report.json is a local workflow artifact, not a durable namespaced
+      // state path. Its evidence digest binds the publication without inventing a
+      // record path that the action-ledger schema must reject.
     },
     evidence: [...workflowRunEvidence(), ...(reportEvidence ? [reportEvidence] : [])],
     attributes: {
