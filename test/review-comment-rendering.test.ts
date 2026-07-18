@@ -183,7 +183,7 @@ test("structural cache probes before hydration but acquires a lease before carry
   const workflow = readFileSync(".github/workflows/sweep.yml", "utf8");
   assert.match(
     workflow,
-    /review-artifacts\/shard-\$\{\{ matrix\.shard \}\}\/review-cache-metrics\.json/,
+    /review-artifacts\/item-\$\{\{ matrix\.item_number \}\}\/review-cache-metrics\.json/,
   );
 });
 
@@ -303,8 +303,8 @@ test("spoofed durable markers cannot suppress a bot-owned start lease", () => {
   assert.match(postStart, /projectExistingDurableReviewForLease\(\{/);
   assert.match(postStart, /durable_review_refresh/);
   assert.match(postStart, /renderInterruptedDurableReviewProjection/);
-  assert.match(postStart, /If-Match/);
-  assert.match(postStart, /precondition failed/);
+  assert.doesNotMatch(postStart, /`If-Match:/);
+  assert.match(postStart, /per-item mutation permit/);
 });
 
 test("review start status comment is marker-backed and crustacean-friendly", () => {

@@ -72,6 +72,30 @@ test("exact review bundle binds immutable workflow and queue context", () => {
   );
 });
 
+test("exact review bundle binds protocol v3 generation and operation identity", () => {
+  const value = fixture();
+  const context: ExactReviewBundleContext = {
+    ...value.context,
+    protocolVersion: 3,
+    generation: 9,
+    operationId: "11111111-1111-4111-8111-111111111111",
+  };
+  const created = createExactReviewBundle({
+    bundleDir: value.bundleDir,
+    reviewPath: value.report,
+    createdAt: "2026-07-15T12:00:00Z",
+    context,
+  });
+
+  assert.equal(created.queue.generation, 9);
+  assert.equal(created.queue.operation_id, context.operationId);
+  assert.deepEqual(validateExactReviewBundle(value.bundleDir, context), created);
+  assert.throws(
+    () => validateExactReviewBundle(value.bundleDir, { ...context, generation: 10 }),
+    /trusted workflow context/,
+  );
+});
+
 test("exact review bundle rejects redirected and modified publication", () => {
   const value = fixture();
   createExactReviewBundle({

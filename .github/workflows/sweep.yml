@@ -137,7 +137,7 @@ on:
         required: false
         default: "20"
       batch_size:
-        description: "Items per worker job"
+        description: "Maximum items selected by the planner"
         required: false
         default: "3"
       codex_timeout_ms:
@@ -145,7 +145,7 @@ on:
         required: false
         default: "1200000"
       shard_count:
-        description: "Parallel shards (capped by config/automation-limits.json)"
+        description: "Parallel item jobs (capped by config/automation-limits.json)"
         required: false
         default: "89"
       item_number:
@@ -212,7 +212,7 @@ env:
   CLAWSWEEPER_MODEL: internal
 
 concurrency:
-  group: ${{ (github.event_name == 'schedule' && (github.event.schedule == '4/15 * * * *' || github.event.schedule == '41 * * * *' || github.event.schedule == '37 */6 * * *')) && format('clawsweeper-target-fanout-{0}', github.event.schedule || github.run_id) || github.event_name == 'repository_dispatch' && format('clawsweeper-event-{0}-{1}', github.event.client_payload.target_repo || 'openclaw/openclaw', github.event.client_payload.queue_lease_id || github.event.client_payload.item_number || github.run_id) || format('{0}-{1}', (github.event_name == 'schedule' && github.event.schedule == '13 * * * *') && 'clawsweeper-failed-review-retry' || (github.event_name == 'workflow_dispatch' && github.event.inputs.apply_existing == 'true' && github.event.inputs.apply_sync_comments_only == 'true') && format('clawsweeper-comment-sync-{0}', github.run_id) || (github.event_name == 'schedule' && github.event.schedule == '6,21,36,51 * * * *') && 'clawsweeper-comment-sync' || (github.event_name == 'workflow_dispatch' && github.event.inputs.apply_existing == 'true') && format('clawsweeper-apply-{0}', github.run_id) || (github.event_name == 'schedule' && (github.event.schedule == '3 * * * *' || github.event.schedule == '18 * * * *' || github.event.schedule == '33 * * * *' || github.event.schedule == '48 * * * *' || github.event.schedule == '8,23,38,53 * * * *')) && 'clawsweeper-apply' || (github.event_name == 'workflow_dispatch' && (github.event.inputs.item_number != '' || github.event.inputs.item_numbers != '')) && format('clawsweeper-intake-exact-{0}', github.event.inputs.item_number || github.event.inputs.item_numbers) || ((github.event_name == 'workflow_dispatch' && github.event.inputs.hot_intake == 'true') || (github.event_name == 'schedule' && (github.event.schedule == '*/5 * * * *' || github.event.schedule == '2/5 * * * *'))) && 'clawsweeper-intake-v2' || ((github.event_name == 'workflow_dispatch' && github.event.inputs.audit_dashboard == 'true') || (github.event_name == 'schedule' && (github.event.schedule == '7 */6 * * *' || github.event.schedule == '12 */6 * * *' || github.event.schedule == '17 */6 * * *'))) && 'clawsweeper-audit' || 'clawsweeper-review', github.event.inputs.target_repo || github.event.client_payload.target_repo || ((github.event.schedule == '17 */6 * * *') && 'openclaw/clawsweeper' || ((github.event.schedule == '2/5 * * * *' || github.event.schedule == '22 * * * *' || github.event.schedule == '8,23,38,53 * * * *' || github.event.schedule == '12 */6 * * *') && 'openclaw/clawhub' || 'openclaw/openclaw'))) }}
+  group: ${{ (github.event_name == 'schedule' && (github.event.schedule == '4/15 * * * *' || github.event.schedule == '41 * * * *' || github.event.schedule == '37 */6 * * *')) && format('clawsweeper-target-fanout-{0}', github.event.schedule || github.run_id) || github.event_name == 'repository_dispatch' && format('clawsweeper-event-{0}-{1}', github.event.client_payload.target_repo || 'openclaw/openclaw', github.event.client_payload.queue_lease_id || github.event.client_payload.item_number || github.run_id) || format('{0}-{1}', (github.event_name == 'schedule' && github.event.schedule == '13 * * * *') && 'clawsweeper-failed-review-retry' || (github.event_name == 'workflow_dispatch' && github.event.inputs.apply_existing == 'true' && github.event.inputs.apply_sync_comments_only == 'true') && format('clawsweeper-comment-sync-{0}', github.run_id) || (github.event_name == 'schedule' && github.event.schedule == '6,21,36,51 * * * *') && 'clawsweeper-comment-sync' || (github.event_name == 'workflow_dispatch' && github.event.inputs.apply_existing == 'true') && format('clawsweeper-apply-{0}', github.run_id) || (github.event_name == 'schedule' && (github.event.schedule == '3 * * * *' || github.event.schedule == '18 * * * *' || github.event.schedule == '33 * * * *' || github.event.schedule == '48 * * * *' || github.event.schedule == '8,23,38,53 * * * *')) && 'clawsweeper-apply' || (github.event_name == 'workflow_dispatch' && (github.event.inputs.item_number != '' || github.event.inputs.item_numbers != '')) && format('clawsweeper-intake-exact-run-{0}', github.run_id) || ((github.event_name == 'workflow_dispatch' && github.event.inputs.hot_intake == 'true') || (github.event_name == 'schedule' && (github.event.schedule == '*/5 * * * *' || github.event.schedule == '2/5 * * * *'))) && 'clawsweeper-intake-v2' || ((github.event_name == 'workflow_dispatch' && github.event.inputs.audit_dashboard == 'true') || (github.event_name == 'schedule' && (github.event.schedule == '7 */6 * * *' || github.event.schedule == '12 */6 * * *' || github.event.schedule == '17 */6 * * *'))) && 'clawsweeper-audit' || 'clawsweeper-review', github.event.inputs.target_repo || github.event.client_payload.target_repo || ((github.event.schedule == '17 */6 * * *') && 'openclaw/clawsweeper' || ((github.event.schedule == '2/5 * * * *' || github.event.schedule == '22 * * * *' || github.event.schedule == '8,23,38,53 * * * *' || github.event.schedule == '12 */6 * * *') && 'openclaw/clawhub' || 'openclaw/openclaw'))) }}
   cancel-in-progress: false
 
 jobs:
@@ -312,8 +312,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     concurrency:
-      group: clawsweeper-event-review-${{ github.event.client_payload.queue_claim.item_key || github.event.client_payload.item_key || github.run_id }}
-      cancel-in-progress: false
+      group: clawsweeper-review-${{ github.event.client_payload.repo_slug || github.event.client_payload.target_repo || 'unknown-repo' }}-${{ github.event.client_payload.item_number || github.run_id }}
+      cancel-in-progress: true
     permissions:
       actions: write
       checks: read
@@ -329,6 +329,8 @@ jobs:
           ITEM_KEY: ${{ github.event.client_payload.queue_claim.item_key || github.event.client_payload.item_key }}
           QUEUE_LEASE_ID: ${{ github.event.client_payload.queue_lease_id }}
           QUEUE_LEASE_REVISION: ${{ github.event.client_payload.queue_claim.lease_revision || github.event.client_payload.lease_revision }}
+          QUEUE_GENERATION: ${{ github.event.client_payload.queue_claim.generation || '' }}
+          QUEUE_OPERATION_ID: ${{ github.event.client_payload.queue_claim.operation_id || '' }}
           QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
           RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
@@ -343,12 +345,17 @@ jobs:
             const rawLeaseRevision = String(process.env.QUEUE_LEASE_REVISION || "").trim();
             const hasTuple = Boolean(itemKey || rawLeaseRevision);
             const leaseRevision = Number(rawLeaseRevision);
+            const generation = Number(process.env.QUEUE_GENERATION);
+            const operationId = String(process.env.QUEUE_OPERATION_ID || "").trim();
             if (hasTuple && (!itemKey || !Number.isInteger(leaseRevision) || leaseRevision < 1)) {
               process.exit(1);
             }
+            const hasGeneration = Boolean(process.env.QUEUE_GENERATION || operationId);
+            if (hasGeneration && (!Number.isInteger(generation) || generation < 1 || !operationId)) process.exit(1);
             process.stdout.write(JSON.stringify({
               lease_id: process.env.QUEUE_LEASE_ID,
               ...(hasTuple ? { item_key: itemKey, lease_revision: leaseRevision } : {}),
+              ...(hasGeneration ? { generation, operation_id: operationId } : {}),
               run_id: process.env.GITHUB_RUN_ID,
               run_attempt: runAttempt,
             }));
@@ -397,8 +404,10 @@ jobs:
                 const dispatch = JSON.parse(process.env.DISPATCH_PAYLOAD || "{}");
                 const requestedItemKey = String(process.env.ITEM_KEY || "").trim();
                 const requestedLeaseRevision = Number(process.env.QUEUE_LEASE_REVISION);
+                const requestedGeneration = Number(process.env.QUEUE_GENERATION);
+                const requestedOperationId = String(process.env.QUEUE_OPERATION_ID || "");
                 const responseProtocol = Number(response.protocol_version || 1);
-                if (responseProtocol !== 1 && responseProtocol !== 2) process.exit(1);
+                if (responseProtocol !== 1 && responseProtocol !== 2 && responseProtocol !== 3) process.exit(1);
                 if (response.claimed !== true) process.exit(1);
 
                 const reviewOptions =
@@ -437,7 +446,7 @@ jobs:
                 const itemNumber = Number(decision?.itemNumber);
                 const itemKey = `${targetRepo}#${itemNumber}`;
                 const leaseRevision =
-                  responseProtocol === 2
+                  responseProtocol >= 2
                     ? Number(response.lease_revision)
                     : Number(
                         response.revision ||
@@ -459,7 +468,7 @@ jobs:
                 if (response.item_key && response.item_key !== itemKey) process.exit(1);
                 if (requestedItemKey && requestedItemKey !== itemKey) process.exit(1);
                 if (
-                  responseProtocol === 2 &&
+                  responseProtocol >= 2 &&
                   (!response.decision ||
                     typeof response.decision !== "object" ||
                     response.item_key !== requestedItemKey ||
@@ -469,12 +478,19 @@ jobs:
                 ) {
                   process.exit(1);
                 }
+                if (
+                  responseProtocol === 3 &&
+                  (response.generation !== requestedGeneration ||
+                    response.operation_id !== requestedOperationId)
+                ) process.exit(1);
                 const output = [
                   "claimed=true",
                   `lease_id=${process.env.QUEUE_LEASE_ID}`,
                   `item_key=${itemKey}`,
                   `lease_revision=${Number.isInteger(leaseRevision) ? leaseRevision : ""}`,
-                  `claim_generation=${responseProtocol === 2 ? claimGeneration : ""}`,
+                  `claim_generation=${responseProtocol >= 2 ? claimGeneration : ""}`,
+                  `generation=${responseProtocol === 3 ? response.generation : ""}`,
+                  `operation_id=${responseProtocol === 3 ? response.operation_id : ""}`,
                   `protocol_version=${responseProtocol}`,
                   `decision=${JSON.stringify(decision)}`,
                 ];
@@ -785,6 +801,11 @@ jobs:
           ITEM_NUMBER: ${{ steps.target.outputs.item_number }}
           CODEX_TIMEOUT_MS: ${{ steps.target.outputs.codex_timeout_ms }}
           MEDIA_PROOF_TIMEOUT_MS: ${{ steps.target.outputs.media_proof_timeout_ms }}
+          CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
+          CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
+          CLAWSWEEPER_REQUIRE_MUTATION_PERMIT: "1"
+          EXACT_REVIEW_GENERATION: ${{ steps.claim-exact-review-queue.outputs.generation }}
+          EXACT_REVIEW_OPERATION_ID: ${{ steps.claim-exact-review-queue.outputs.operation_id }}
         run: |
           set -euo pipefail
           test -n "$GH_TOKEN"
@@ -849,6 +870,8 @@ jobs:
           EXACT_REVIEW_ITEM_KEY: ${{ steps.claim-exact-review-queue.outputs.item_key }}
           EXACT_REVIEW_LEASE_ID: ${{ steps.claim-exact-review-queue.outputs.lease_id }}
           EXACT_REVIEW_LEASE_REVISION: ${{ steps.claim-exact-review-queue.outputs.lease_revision }}
+          EXACT_REVIEW_GENERATION: ${{ steps.claim-exact-review-queue.outputs.generation }}
+          EXACT_REVIEW_OPERATION_ID: ${{ steps.claim-exact-review-queue.outputs.operation_id }}
           QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
           REVIEW_LEASE_OWNER: ${{ steps.reserve-exact-review-lease.outputs.owner }}
           REVIEW_LEASE_COMMENT_ID: ${{ steps.reserve-exact-review-lease.outputs.comment_id }}
@@ -877,12 +900,15 @@ jobs:
             # claim/complete), so this Codex-adjacent step never sees the webhook secret.
             heartbeat_payload="$(node -e '
               const leaseRevision = Number(process.env.EXACT_REVIEW_LEASE_REVISION);
+              const generation = Number(process.env.EXACT_REVIEW_GENERATION);
+              const operationId = String(process.env.EXACT_REVIEW_OPERATION_ID || "");
               if (!process.env.EXACT_REVIEW_ITEM_KEY || !process.env.EXACT_REVIEW_LEASE_ID) process.exit(1);
               if (!Number.isInteger(leaseRevision) || leaseRevision < 1) process.exit(1);
               process.stdout.write(JSON.stringify({
                 item_key: process.env.EXACT_REVIEW_ITEM_KEY,
                 lease_id: process.env.EXACT_REVIEW_LEASE_ID,
                 lease_revision: leaseRevision,
+                ...(operationId ? { generation, operation_id: operationId } : {}),
                 run_id: process.env.GITHUB_RUN_ID,
               }));
             ')" || return 0
@@ -987,6 +1013,7 @@ jobs:
           EXACT_REVIEW_CLAIM_GENERATION: ${{ steps.claim-exact-review-queue.outputs.claim_generation }}
           EXACT_REVIEW_DECISION: ${{ steps.claim-exact-review-queue.outputs.decision }}
           EXACT_REVIEW_GENERATION_ATTEMPT: ${{ github.run_attempt }}
+          EXACT_REVIEW_GENERATION: ${{ steps.claim-exact-review-queue.outputs.generation }}
           EXACT_REVIEW_ITEM_KEY: ${{ steps.claim-exact-review-queue.outputs.item_key }}
           EXACT_REVIEW_ITEM_KIND: ${{ fromJSON(steps.claim-exact-review-queue.outputs.decision).itemKind }}
           EXACT_REVIEW_ITEM_NUMBER: ${{ steps.target.outputs.item_number }}
@@ -995,6 +1022,7 @@ jobs:
           EXACT_REVIEW_LIVE_PROCEEDED: ${{ steps.review-exact-event-item.outputs.terminal_during_review == 'true' && 'false' || steps.live-item.outputs.proceed }}
           EXACT_REVIEW_LIVE_TERMINAL_MISSING: ${{ steps.live-item.outputs.terminal_missing }}
           EXACT_REVIEW_LIVE_TERMINAL_NOOP: ${{ steps.review-exact-event-item.outputs.terminal_during_review == 'true' && 'true' || steps.live-item.outputs.terminal_noop }}
+          EXACT_REVIEW_OPERATION_ID: ${{ steps.claim-exact-review-queue.outputs.operation_id }}
           EXACT_REVIEW_PRODUCER_JOB: event-review-apply
           EXACT_REVIEW_PROTOCOL_VERSION: ${{ steps.claim-exact-review-queue.outputs.protocol_version }}
           EXACT_REVIEW_REPORT_PATH: artifacts/event/${{ steps.target.outputs.item_number }}.md
@@ -1028,8 +1056,10 @@ jobs:
           ARTIFACT_NAME: ${{ steps.create-exact-review-bundle.outputs.artifact_name }}
           CLAIM_DECISION: ${{ steps.claim-exact-review-queue.outputs.decision }}
           CLAIM_GENERATION: ${{ steps.claim-exact-review-queue.outputs.claim_generation }}
+          GENERATION: ${{ steps.claim-exact-review-queue.outputs.generation }}
           ITEM_KEY: ${{ steps.claim-exact-review-queue.outputs.item_key }}
           LEASE_REVISION: ${{ steps.claim-exact-review-queue.outputs.lease_revision }}
+          OPERATION_ID: ${{ steps.claim-exact-review-queue.outputs.operation_id }}
           LIVE_GUARDED_OPEN: ${{ steps.live-item.outputs.guarded_open }}
           LIVE_PROCEEDED: ${{ steps.review-exact-event-item.outputs.terminal_during_review == 'true' && 'false' || steps.live-item.outputs.proceed }}
           LIVE_TERMINAL_MISSING: ${{ steps.live-item.outputs.terminal_missing }}
@@ -1047,6 +1077,8 @@ jobs:
           const protocolVersion = Number(process.env.PROTOCOL_VERSION);
           const leaseRevision = process.env.LEASE_REVISION ? Number(process.env.LEASE_REVISION) : null;
           const claimGeneration = process.env.CLAIM_GENERATION ? Number(process.env.CLAIM_GENERATION) : null;
+          const generation = process.env.GENERATION ? Number(process.env.GENERATION) : null;
+          const operationId = String(process.env.OPERATION_ID || "").trim();
           const flag = (name) => {
             const value = process.env[name];
             if (value === "true") return true;
@@ -1069,6 +1101,7 @@ jobs:
                 protocolVersion,
                 leaseRevision,
                 claimGeneration,
+                ...(protocolVersion === 3 ? { generation, operationId } : {}),
                 liveProceeded: flag("LIVE_PROCEEDED"),
                 liveTerminalNoop: flag("LIVE_TERMINAL_NOOP"),
                 liveTerminalMissing: flag("LIVE_TERMINAL_MISSING"),
@@ -1184,7 +1217,9 @@ jobs:
         env:
           PRIMARY_OUTCOME: ${{ steps.exact-review-generation-result.outputs.outcome || 'failure' }}
           CLAIM_GENERATION: ${{ steps.claim-exact-review-queue.outputs.claim_generation }}
+          GENERATION: ${{ steps.claim-exact-review-queue.outputs.generation }}
           ITEM_KEY: ${{ steps.claim-exact-review-queue.outputs.item_key }}
+          OPERATION_ID: ${{ steps.claim-exact-review-queue.outputs.operation_id }}
           PROTOCOL_VERSION: ${{ steps.claim-exact-review-queue.outputs.protocol_version }}
           QUEUE_LEASE_ID: ${{ steps.claim-exact-review-queue.outputs.lease_id }}
           QUEUE_LEASE_REVISION: ${{ steps.claim-exact-review-queue.outputs.lease_revision }}
@@ -1200,16 +1235,19 @@ jobs:
             const protocolVersion = Number(process.env.PROTOCOL_VERSION);
             const leaseRevision = Number(process.env.QUEUE_LEASE_REVISION);
             const claimGeneration = Number(process.env.CLAIM_GENERATION);
+            const generation = Number(process.env.GENERATION);
+            const operationId = String(process.env.OPERATION_ID || "");
             if (!Number.isInteger(runAttempt) || runAttempt < 1) process.exit(1);
-            if (protocolVersion !== 1 && protocolVersion !== 2) process.exit(1);
+            if (protocolVersion !== 1 && protocolVersion !== 2 && protocolVersion !== 3) process.exit(1);
             if (
-              protocolVersion === 2 &&
+              protocolVersion >= 2 &&
               (!process.env.ITEM_KEY ||
                 !Number.isInteger(leaseRevision) ||
                 leaseRevision < 1 ||
                 !Number.isInteger(claimGeneration) ||
                 claimGeneration < 1)
             ) process.exit(1);
+            if (protocolVersion === 3 && (!Number.isInteger(generation) || generation < 1 || !operationId)) process.exit(1);
             const primaryOutcome = String(process.env.PRIMARY_OUTCOME || "");
             const outcome = ["success", "cancelled", "failure"].includes(primaryOutcome)
               ? primaryOutcome
@@ -1217,13 +1255,14 @@ jobs:
             const retryAt = String(process.env.RETRY_AT || "").trim();
             process.stdout.write(JSON.stringify({
               lease_id: process.env.QUEUE_LEASE_ID,
-              ...(protocolVersion === 2
+              ...(protocolVersion >= 2
                 ? {
                     item_key: process.env.ITEM_KEY,
                     lease_revision: leaseRevision,
                     claim_generation: claimGeneration,
                   }
                 : {}),
+              ...(protocolVersion === 3 ? { generation, operation_id: operationId } : {}),
               run_id: process.env.GITHUB_RUN_ID,
               run_attempt: runAttempt,
               outcome,
@@ -1266,6 +1305,9 @@ jobs:
     if: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.queue_lease_id != '' && github.event.client_payload.source_action == 'exact_review_artifact_publish' }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    concurrency:
+      group: clawsweeper-mutation-${{ github.event.client_payload.repo_slug || github.event.client_payload.target_repo || 'unknown-repo' }}-${{ github.event.client_payload.item_number || github.run_id }}
+      cancel-in-progress: false
     permissions:
       actions: write
       contents: write
@@ -1279,6 +1321,8 @@ jobs:
           ITEM_KEY: ${{ github.event.client_payload.queue_claim.item_key }}
           QUEUE_LEASE_ID: ${{ github.event.client_payload.queue_lease_id }}
           QUEUE_LEASE_REVISION: ${{ github.event.client_payload.queue_claim.lease_revision }}
+          QUEUE_GENERATION: ${{ github.event.client_payload.queue_claim.generation || '' }}
+          QUEUE_OPERATION_ID: ${{ github.event.client_payload.queue_claim.operation_id || '' }}
           QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
           RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
@@ -1288,6 +1332,8 @@ jobs:
           payload="$(node -e '
             const leaseRevision = Number(process.env.QUEUE_LEASE_REVISION);
             const runAttempt = Number(process.env.RUN_ATTEMPT);
+            const generation = Number(process.env.QUEUE_GENERATION);
+            const operationId = String(process.env.QUEUE_OPERATION_ID || "");
             if (!process.env.QUEUE_LEASE_ID || !process.env.ITEM_KEY) process.exit(1);
             if (!Number.isInteger(leaseRevision) || leaseRevision < 1) process.exit(1);
             if (!Number.isInteger(runAttempt) || runAttempt < 1) process.exit(1);
@@ -1295,6 +1341,7 @@ jobs:
               lease_id: process.env.QUEUE_LEASE_ID,
               item_key: process.env.ITEM_KEY,
               lease_revision: leaseRevision,
+              ...(operationId ? { generation, operation_id: operationId } : {}),
               run_id: process.env.GITHUB_RUN_ID,
               run_attempt: runAttempt,
             }));
@@ -1346,7 +1393,7 @@ jobs:
                 const expectedItemKey = `${decision?.targetRepo}#${decision?.itemNumber}@publish:${publication?.producerRunId}:${publication?.producerRunAttempt}`;
                 if (
                   response.claimed !== true ||
-                  response.protocol_version !== 2 ||
+                  (response.protocol_version !== 2 && response.protocol_version !== 3) ||
                   response.item_key !== process.env.ITEM_KEY ||
                   response.item_key !== expectedItemKey ||
                   decision?.sourceAction !== "exact_review_artifact_publish" ||
@@ -1361,6 +1408,11 @@ jobs:
                 const claimGeneration = Number(response.claim_generation);
                 if (!Number.isInteger(leaseRevision) || leaseRevision < 1) process.exit(1);
                 if (!Number.isInteger(claimGeneration) || claimGeneration < 1) process.exit(1);
+                if (
+                  response.protocol_version === 3 &&
+                  (response.generation !== Number(process.env.QUEUE_GENERATION) ||
+                    response.operation_id !== process.env.QUEUE_OPERATION_ID)
+                ) process.exit(1);
                 const targetRepo = String(decision.targetRepo);
                 const [targetRepoOwner, targetRepoName] = targetRepo.split("/");
                 const values = {
@@ -1373,6 +1425,8 @@ jobs:
                   protocol_version: publication.protocolVersion,
                   lease_revision: publication.leaseRevision ?? "",
                   claim_generation: publication.claimGeneration ?? "",
+                  generation: publication.generation ?? "",
+                  operation_id: publication.operationId ?? "",
                   target_repo: targetRepo,
                   target_repo_owner: targetRepoOwner,
                   target_repo_name: targetRepoName,
@@ -1390,6 +1444,8 @@ jobs:
                   publisher_item_key: response.item_key,
                   publisher_lease_revision: leaseRevision,
                   publisher_claim_generation: claimGeneration,
+                  publisher_generation: response.generation ?? "",
+                  publisher_operation_id: response.operation_id ?? "",
                 };
                 fs.appendFileSync(process.env.GITHUB_OUTPUT, "claimed=true\n");
                 for (const [key, value] of Object.entries(values)) {
@@ -1536,8 +1592,58 @@ jobs:
           token: ${{ steps.state-token.outputs.token }}
           fetch-depth: 1
 
-      - name: Publish event result and apply safe close
+      - name: Acquire generation-bound mutation permit
+        id: mutation-permit
         if: ${{ steps.publication-context.outputs.claimed == 'true' && steps.validate-exact-review-bundle.outcome == 'success' && steps.legacy-exact-artifact.outputs.legacy_tupleless != 'true' }}
+        env:
+          ITEM_KEY: ${{ steps.publication-context.outputs.item_key }}
+          GENERATION: ${{ steps.publication-context.outputs.generation }}
+          OPERATION_ID: ${{ steps.publication-context.outputs.publisher_operation_id }}
+          PROTOCOL_VERSION: ${{ steps.publication-context.outputs.protocol_version }}
+          QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
+          CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
+        run: |
+          set -euo pipefail
+          if [ "$PROTOCOL_VERSION" != "3" ]; then
+            echo "acquired=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          test -n "$CLAWSWEEPER_WEBHOOK_SECRET"
+          owner="github-run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          payload="$(jq -cn \
+            --arg item_key "$ITEM_KEY" \
+            --argjson generation "$GENERATION" \
+            --arg operation_id "$OPERATION_ID" \
+            --arg owner "$owner" \
+            '{item_key:$item_key,generation:$generation,operation_id:$operation_id,owner:$owner,purpose:"review"}')"
+          signature="$(PAYLOAD="$payload" node -e 'const crypto=require("node:crypto"); process.stdout.write(`sha256=${crypto.createHmac("sha256", process.env.CLAWSWEEPER_WEBHOOK_SECRET).update(process.env.PAYLOAD).digest("hex")}`)')"
+          response_file="$(mktemp)"
+          status="$(curl --silent --show-error --connect-timeout 5 --max-time 20 \
+            --output "$response_file" \
+            --write-out '%{http_code}' \
+            --request POST \
+            --header "content-type: application/json" \
+            --header "x-clawsweeper-exact-review-signature: $signature" \
+            --data "$payload" \
+            "${QUEUE_URL%/}/internal/exact-review/mutation/acquire")"
+          if [ "$status" = "409" ]; then
+            reason="$(jq -r '.error // "mutation_busy"' "$response_file")"
+            echo "reason=$reason" >> "$GITHUB_OUTPUT"
+            echo "acquired=false" >> "$GITHUB_OUTPUT"
+            rm -f "$response_file"
+            exit 0
+          fi
+          if [ "$status" != "200" ]; then
+            cat "$response_file" >&2
+            rm -f "$response_file"
+            exit 1
+          fi
+          rm -f "$response_file"
+          echo "owner=$owner" >> "$GITHUB_OUTPUT"
+          echo "acquired=true" >> "$GITHUB_OUTPUT"
+
+      - name: Publish event result and apply safe close
+        if: ${{ steps.publication-context.outputs.claimed == 'true' && steps.validate-exact-review-bundle.outcome == 'success' && steps.legacy-exact-artifact.outputs.legacy_tupleless != 'true' && steps.mutation-permit.outputs.acquired == 'true' }}
         id: publish-event-result
         env:
           GH_TOKEN: ${{ steps.target-write-token.outputs.token }}
@@ -1934,6 +2040,8 @@ jobs:
           VALIDATE_OUTCOME: ${{ steps.validate-exact-review-bundle.outcome }}
           PUBLISH_COMPLETION_KIND: ${{ steps.publish-event-result.outputs.completion_kind }}
           PUBLISH_REASON_CODE: ${{ steps.publish-event-result.outputs.reason_code }}
+          MUTATION_ACQUIRED: ${{ steps.mutation-permit.outputs.acquired }}
+          MUTATION_REASON: ${{ steps.mutation-permit.outputs.reason }}
           ERROR_FINGERPRINT: ${{ steps.publish-event-result.outputs.error_fingerprint }}
           REVIEW_ONLY: ${{ fromJSON(steps.publication-context.outputs.decision).sourceAction == 'failed_review_shard_recovery' && 'true' || 'false' }}
         run: |
@@ -1941,7 +2049,15 @@ jobs:
           outcome=failure
           completion_kind=permanent_failure
           reason_code=unknown_failure
-          if [ "$PUBLISH_COMPLETION_KIND" = "superseded" ] && { [ "$PUBLISH_REASON_CODE" = "remote_newer_tuple" ] || [ "$PUBLISH_REASON_CODE" = "remote_closed" ]; }; then
+          if [ "$MUTATION_ACQUIRED" = "false" ] && [ "$MUTATION_REASON" = "generation_superseded" ]; then
+            outcome=success
+            completion_kind=superseded
+            reason_code=remote_newer_tuple
+          elif [ "$MUTATION_ACQUIRED" = "false" ] && [ "$MUTATION_REASON" = "mutation_busy" ]; then
+            outcome=failure
+            completion_kind=retryable_failure
+            reason_code=mutation_busy
+          elif [ "$PUBLISH_COMPLETION_KIND" = "superseded" ] && { [ "$PUBLISH_REASON_CODE" = "remote_newer_tuple" ] || [ "$PUBLISH_REASON_CODE" = "remote_closed" ]; }; then
             outcome=success
             completion_kind=superseded
             reason_code="$PUBLISH_REASON_CODE"
@@ -2004,14 +2120,48 @@ jobs:
             echo "failure_kind=$FAILURE_KIND" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Release generation-bound mutation permit
+        if: ${{ always() && steps.publication-context.outputs.claimed == 'true' && steps.mutation-permit.outputs.acquired == 'true' && steps.publication-context.outputs.protocol_version == '3' }}
+        env:
+          ITEM_KEY: ${{ steps.publication-context.outputs.item_key }}
+          GENERATION: ${{ steps.publication-context.outputs.generation }}
+          OPERATION_ID: ${{ steps.publication-context.outputs.publisher_operation_id }}
+          OWNER: ${{ steps.mutation-permit.outputs.owner }}
+          QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
+          CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
+        run: |
+          set -euo pipefail
+          payload="$(jq -cn \
+            --arg item_key "$ITEM_KEY" \
+            --argjson generation "$GENERATION" \
+            --arg operation_id "$OPERATION_ID" \
+            --arg owner "$OWNER" \
+            '{item_key:$item_key,generation:$generation,operation_id:$operation_id,owner:$owner,purpose:"review"}')"
+          signature="$(PAYLOAD="$payload" node -e 'const crypto=require("node:crypto"); process.stdout.write(`sha256=${crypto.createHmac("sha256", process.env.CLAWSWEEPER_WEBHOOK_SECRET).update(process.env.PAYLOAD).digest("hex")}`)')"
+          for attempt in 1 2 3; do
+            if curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
+              --request POST \
+              --header "content-type: application/json" \
+              --header "x-clawsweeper-exact-review-signature: $signature" \
+              --data "$payload" \
+              "${QUEUE_URL%/}/internal/exact-review/mutation/release" >/dev/null; then
+              exit 0
+            fi
+            [ "$attempt" -eq 3 ] || sleep "$((attempt * 5))"
+          done
+          exit 1
+
       - name: Complete durable exact review publication
         id: complete-exact-review-publication
         if: ${{ steps.publication-context.outputs.claimed == 'true' && always() }}
         continue-on-error: true
         env:
           CLAIM_GENERATION: ${{ steps.publication-context.outputs.publisher_claim_generation }}
+          GENERATION: ${{ steps.publication-context.outputs.publisher_generation }}
           ITEM_KEY: ${{ steps.publication-context.outputs.publisher_item_key }}
           LEASE_REVISION: ${{ steps.publication-context.outputs.publisher_lease_revision }}
+          OPERATION_ID: ${{ steps.publication-context.outputs.publisher_operation_id }}
+          PROTOCOL_VERSION: ${{ github.event.client_payload.queue_claim.protocol_version || '2' }}
           OUTCOME: ${{ steps.exact-review-publication-result.outputs.outcome || 'failure' }}
           FAILURE_KIND: ${{ steps.exact-review-publication-result.outputs.failure_kind }}
           COMPLETION_KIND: ${{ steps.exact-review-publication-result.outputs.completion_kind }}
@@ -2027,10 +2177,14 @@ jobs:
             const leaseRevision = Number(process.env.LEASE_REVISION);
             const claimGeneration = Number(process.env.CLAIM_GENERATION);
             const runAttempt = Number(process.env.RUN_ATTEMPT);
+            const protocolVersion = Number(process.env.PROTOCOL_VERSION);
+            const generation = Number(process.env.GENERATION);
+            const operationId = String(process.env.OPERATION_ID || "");
             if (!process.env.QUEUE_LEASE_ID || !process.env.ITEM_KEY) process.exit(1);
             if (!Number.isInteger(leaseRevision) || leaseRevision < 1) process.exit(1);
             if (!Number.isInteger(claimGeneration) || claimGeneration < 1) process.exit(1);
             if (!Number.isInteger(runAttempt) || runAttempt < 1) process.exit(1);
+            if (protocolVersion === 3 && (!Number.isInteger(generation) || generation < 1 || !operationId)) process.exit(1);
             const outcome = ["success", "failure", "cancelled"].includes(process.env.OUTCOME)
               ? process.env.OUTCOME
               : "failure";
@@ -2040,7 +2194,7 @@ jobs:
             const completionKind = ["published", "superseded", "deferred", "retryable_failure", "refresh_required", "permanent_failure"].includes(process.env.COMPLETION_KIND)
               ? process.env.COMPLETION_KIND
               : undefined;
-            const reasonCode = ["publication_applied", "remote_newer_tuple", "remote_closed", "live_terminal", "github_rate_limit", "github_transient", "workflow_cancelled", "artifact_unavailable", "artifact_expired", "close_coverage_retry", "close_coverage_deferred", "invalid_artifact", "missing_record_tuple", "tuple_protocol_invalid", "policy_invariant", "unknown_failure", "retry_exhausted"].includes(process.env.REASON_CODE)
+            const reasonCode = ["publication_applied", "remote_newer_tuple", "remote_closed", "live_terminal", "github_rate_limit", "github_transient", "workflow_cancelled", "artifact_unavailable", "artifact_expired", "close_coverage_retry", "close_coverage_deferred", "mutation_busy", "invalid_artifact", "missing_record_tuple", "tuple_protocol_invalid", "policy_invariant", "unknown_failure", "retry_exhausted"].includes(process.env.REASON_CODE)
               ? process.env.REASON_CODE
               : undefined;
             const errorFingerprint = /^[A-Za-z0-9:._-]{1,200}$/.test(process.env.ERROR_FINGERPRINT || "")
@@ -2052,6 +2206,7 @@ jobs:
               item_key: process.env.ITEM_KEY,
               lease_revision: leaseRevision,
               claim_generation: claimGeneration,
+              ...(protocolVersion === 3 ? { generation, operation_id: operationId } : {}),
               run_id: process.env.GITHUB_RUN_ID,
               run_attempt: runAttempt,
               outcome,
@@ -2319,10 +2474,10 @@ jobs:
               if [ "$status" = "in_progress" ]; then
                 jobs_json="$(gh run view "$id" --repo "${{ github.repository }}" --json jobs 2>/dev/null || printf '{"jobs":[]}')"
                 active_shards="$(printf '%s' "$jobs_json" \
-                  | jq '[.jobs[]? | select(.name | startswith("Review shard ")) | select(.status == "in_progress" or .status == "pending" or .status == "queued" or .status == "waiting" or .status == "requested")] | length' 2>/dev/null \
+                  | jq '[.jobs[]? | select(.name | startswith("Review item ")) | select(.status == "in_progress" or .status == "pending" or .status == "queued" or .status == "waiting" or .status == "requested")] | length' 2>/dev/null \
                   || printf '0')"
                 total_shards="$(printf '%s' "$jobs_json" \
-                  | jq '[.jobs[]? | select(.name | startswith("Review shard "))] | length' 2>/dev/null \
+                  | jq '[.jobs[]? | select(.name | startswith("Review item "))] | length' 2>/dev/null \
                   || printf '0')"
               fi
               if ! [[ "$active_shards" =~ ^[0-9]+$ ]]; then
@@ -2378,10 +2533,10 @@ jobs:
               if [ "$status" = "in_progress" ]; then
                 jobs_json="$(gh run view "$id" --repo "${{ github.repository }}" --json jobs 2>/dev/null || printf '{"jobs":[]}')"
                 active_shards="$(printf '%s' "$jobs_json" \
-                  | jq '[.jobs[]? | select(.name | startswith("Review shard ")) | select(.status == "in_progress" or .status == "pending" or .status == "queued" or .status == "waiting" or .status == "requested")] | length' 2>/dev/null \
+                  | jq '[.jobs[]? | select(.name | startswith("Review item ")) | select(.status == "in_progress" or .status == "pending" or .status == "queued" or .status == "waiting" or .status == "requested")] | length' 2>/dev/null \
                   || printf '0')"
                 total_shards="$(printf '%s' "$jobs_json" \
-                  | jq '[.jobs[]? | select(.name | startswith("Review shard "))] | length' 2>/dev/null \
+                  | jq '[.jobs[]? | select(.name | startswith("Review item "))] | length' 2>/dev/null \
                   || printf '0')"
               fi
               if ! [[ "$active_shards" =~ ^[0-9]+$ ]]; then
@@ -2589,11 +2744,16 @@ jobs:
             --rebase-strategy theirs || echo "::warning::Skipped slow in-progress dashboard publish so review shards can start."
 
   review:
-    name: Review shard ${{ matrix.shard }} · ${{ needs.plan.outputs.target_repo }}#${{ matrix.item_numbers }}
+    name: Review item ${{ matrix.shard }} · ${{ matrix.repo }}#${{ matrix.item_number }}
     needs: plan
     runs-on: ${{ vars.CLAWSWEEPER_REVIEW_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 75
     continue-on-error: true
+    concurrency:
+      group: clawsweeper-review-${{ matrix.repo_slug }}-${{ matrix.item_number }}
+      # Background matrix entries are not generation-claimed by the durable queue.
+      # They share the item group but only queue-backed exact work may cancel an owner.
+      cancel-in-progress: false
     permissions:
       actions: read
       checks: read
@@ -2603,9 +2763,14 @@ jobs:
       statuses: read
     strategy:
       fail-fast: false
+      max-parallel: ${{ fromJson(needs.plan.outputs.shard_count) }}
       matrix:
         include: ${{ fromJson(needs.plan.outputs.matrix) }}
     steps:
+      - name: Mark item job start
+        id: item-job-start
+        run: echo "started_at_ms=$(date +%s%3N)" >> "$GITHUB_OUTPUT"
+
       - uses: actions/checkout@v7
         with:
           path: clawsweeper
@@ -2711,11 +2876,17 @@ jobs:
           fi
           git -C "$checkout_dir" rev-parse --short HEAD
 
-      - name: Mark shard start
+      - name: Mark item setup start
         id: shard-start
-        run: echo "started_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_OUTPUT"
+        env:
+          JOB_STARTED_AT_MS: ${{ steps.item-job-start.outputs.started_at_ms }}
+        run: |
+          compute_started_at_ms="$(date +%s%3N)"
+          echo "started_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_OUTPUT"
+          echo "compute_started_at_ms=$compute_started_at_ms" >> "$GITHUB_OUTPUT"
+          echo "item_job_setup_ms=$((compute_started_at_ms - JOB_STARTED_AT_MS))" >> "$GITHUB_OUTPUT"
 
-      - name: Review shard
+      - name: Review item
         id: review-shard
         continue-on-error: true
         working-directory: clawsweeper
@@ -2743,34 +2914,57 @@ jobs:
             planned_automatic_review_arg=(--planned-automatic-review)
           fi
           codex_timeout_seconds=$(((${{ needs.plan.outputs.codex_timeout_ms }} + 999) / 1000))
-          review_timeout_seconds=$(((codex_timeout_seconds + 180) * ${{ needs.plan.outputs.batch_size }}))
+          review_timeout_seconds=$((codex_timeout_seconds + 180))
           if [ "$review_timeout_seconds" -lt 300 ]; then
             review_timeout_seconds=300
           fi
           if [ "$review_timeout_seconds" -gt 4200 ]; then
             review_timeout_seconds=4200
           fi
-          echo "::notice::Review shard timeout is ${review_timeout_seconds}s for batch size ${{ needs.plan.outputs.batch_size }} and per-item Codex timeout ${codex_timeout_seconds}s."
+          echo "::notice::Item review timeout is ${review_timeout_seconds}s for per-item Codex timeout ${codex_timeout_seconds}s."
+          cancellation_marker="../review-artifacts/metrics/cancel-${{ matrix.item_number }}.json"
+          mkdir -p "$(dirname "$cancellation_marker")"
+          review_pid=""
+          on_cancel() {
+            requested_at_ms="$(date +%s%3N)"
+            if [ -n "$review_pid" ]; then
+              kill -TERM "$review_pid" 2>/dev/null || true
+              wait "$review_pid" 2>/dev/null || true
+            fi
+            completed_at_ms="$(date +%s%3N)"
+            rm -rf "../review-artifacts/item-${{ matrix.item_number }}"
+            jq -n \
+              --argjson requested_at_ms "$requested_at_ms" \
+              --argjson completed_at_ms "$completed_at_ms" \
+              '{requested_at_ms:$requested_at_ms,completed_at_ms:$completed_at_ms,codex_cancel_latency_ms:($completed_at_ms-$requested_at_ms)}' \
+              > "$cancellation_marker"
+            exit 143
+          }
+          trap on_cancel TERM INT
           set +e
           timeout --kill-after=30s "${review_timeout_seconds}s" node dist/clawsweeper.js review \
             --target-repo "${{ needs.plan.outputs.target_repo }}" \
             --target-dir "../${{ needs.plan.outputs.target_checkout_dir }}" \
-            --artifact-dir ../review-artifacts/shard-${{ matrix.shard }} \
-            --batch-size ${{ needs.plan.outputs.batch_size }} \
+            --artifact-dir ../review-artifacts/item-${{ matrix.item_number }} \
+            --batch-size 1 \
             --max-pages ${{ needs.plan.outputs.max_pages }} \
             --codex-model internal \
             --codex-reasoning-effort high \
             --codex-sandbox read-only \
             --codex-timeout-ms ${{ needs.plan.outputs.codex_timeout_ms }} \
-            --item-numbers "${{ matrix.item_numbers }}" \
+            --item-numbers "${{ matrix.item_number }}" \
             "${planned_automatic_review_arg[@]}" \
             "${hot_intake_arg[@]}" \
             --readonly-openclaw \
-            --shard-index ${{ matrix.shard }} \
-            --shard-count ${{ needs.plan.outputs.planned_shards }} \
+            --shard-index 0 \
+            --shard-count 1 \
             "${additional_prompt_arg[@]}" \
-            "${expected_source_revision_arg[@]}"
+            "${expected_source_revision_arg[@]}" &
+          review_pid=$!
+          wait "$review_pid"
           review_exit_code=$?
+          review_pid=""
+          trap - TERM INT
           set -e
           echo "exit_code=$review_exit_code" >> "$GITHUB_OUTPUT"
           exit "$review_exit_code"
@@ -2793,16 +2987,24 @@ jobs:
           fi
           node dist/clawsweeper.js finalize-action-events "${args[@]}"
 
-      - name: Record shard metrics
+      - name: Record item metrics
         if: always()
         env:
-          ITEM_NUMBERS: ${{ matrix.item_numbers }}
+          ITEM_NUMBERS: ${{ matrix.item_number }}
           REVIEW_OUTCOME: ${{ steps.review-shard.outcome || 'not_started' }}
           STARTED_AT: ${{ steps.shard-start.outputs.started_at || '' }}
+          JOB_STARTED_AT_MS: ${{ steps.item-job-start.outputs.started_at_ms || '0' }}
+          ITEM_JOB_SETUP_MS: ${{ steps.shard-start.outputs.item_job_setup_ms || '0' }}
           TARGET_REPO: ${{ needs.plan.outputs.target_repo }}
         run: |
           set -euo pipefail
           mkdir -p review-artifacts/metrics
+          completed_at_ms="$(date +%s%3N)"
+          cancel_marker="review-artifacts/metrics/cancel-${{ matrix.item_number }}.json"
+          codex_cancel_latency_ms=null
+          if [ -f "$cancel_marker" ]; then
+            codex_cancel_latency_ms="$(jq -r '.codex_cancel_latency_ms' "$cancel_marker")"
+          fi
           jq -n \
             --arg shard "${{ matrix.shard }}" \
             --arg item_numbers "$ITEM_NUMBERS" \
@@ -2810,23 +3012,38 @@ jobs:
             --arg started_at "$STARTED_AT" \
             --arg completed_at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
             --arg target_repo "$TARGET_REPO" \
+            --arg kind "${{ matrix.kind }}" \
+            --arg source_revision "${{ matrix.source_revision }}" \
+            --arg generation "${{ matrix.generation }}" \
+            --argjson item_job_setup_ms "$ITEM_JOB_SETUP_MS" \
+            --argjson runner_duration_ms "$((completed_at_ms - JOB_STARTED_AT_MS))" \
+            --argjson codex_cancel_latency_ms "$codex_cancel_latency_ms" \
             '{
               shard: ($shard | tonumber),
               item_numbers: $item_numbers,
+              item_number: ($item_numbers | tonumber),
+              kind: $kind,
+              source_revision: $source_revision,
+              generation: ($generation | tonumber),
+              item_job_setup_ms: $item_job_setup_ms,
+              runner_duration_ms: $runner_duration_ms,
+              codex_cancel_latency_ms: $codex_cancel_latency_ms,
+              cancelled_review_consumed_tokens: null,
+              avoided_tokens: null,
               review_outcome: $review_outcome,
               started_at: $started_at,
               completed_at: $completed_at,
               target_repo: $target_repo
             }' > review-artifacts/metrics/shard-${{ matrix.shard }}.json
 
-      - name: Record failed review shard
+      - name: Record failed item review
         if: ${{ failure() || steps.review-shard.outcome == 'failure' }}
         run: |
           mkdir -p review-artifacts/failed-shards
           cat > review-artifacts/failed-shards/shard-${{ matrix.shard }}.json <<JSON
           {
             "shard": ${{ matrix.shard }},
-            "item_numbers": "${{ matrix.item_numbers }}"
+            "item_numbers": "${{ matrix.item_number }}"
           }
           JSON
 
@@ -2835,8 +3052,8 @@ jobs:
         with:
           name: review-shard-${{ matrix.shard }}
           path: |
-            review-artifacts/shard-${{ matrix.shard }}/*.md
-            review-artifacts/shard-${{ matrix.shard }}/review-cache-metrics.json
+            review-artifacts/item-${{ matrix.item_number }}/*.md
+            review-artifacts/item-${{ matrix.item_number }}/review-cache-metrics.json
           if-no-files-found: ignore
 
       - uses: actions/upload-artifact@v7
@@ -2865,7 +3082,7 @@ jobs:
         if: ${{ always() && github.event_name == 'repository_dispatch' && github.event.client_payload.expected_source_revision != '' }}
         with:
           name: review-source-revision-mismatch-${{ matrix.shard }}
-          path: review-artifacts/shard-${{ matrix.shard }}/source-revision-mismatch.json
+          path: review-artifacts/item-${{ matrix.item_number }}/source-revision-mismatch.json
           if-no-files-found: ignore
 
   requeue-source-revision-drift:
@@ -2943,6 +3160,10 @@ jobs:
       group: clawsweeper-target-review-publish-${{ needs.plan.outputs.target_repo }}
       cancel-in-progress: false
       queue: max
+    env:
+      CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
+      CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
+      CLAWSWEEPER_REQUIRE_MUTATION_PERMIT: "1"
     steps:
       - uses: actions/checkout@v7
         with:
@@ -3559,9 +3780,9 @@ jobs:
             failed_shards="$(
               gh run view "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --json jobs --jq '
                 .jobs[]
-                | select((.conclusion == "failure" or .conclusion == "cancelled") and (.name | startswith("Review shard ")))
+                | select((.conclusion == "failure" or .conclusion == "cancelled") and (.name | startswith("Review item ")))
                 | .name
-                | sub("^Review shard ([0-9]+).*$"; "\\1")
+                | sub("^Review item ([0-9]+).*$"; "\\1")
               ' | paste -sd, -
             )"
           fi
@@ -3931,6 +4152,9 @@ jobs:
       issues: read
       pull-requests: read
     env:
+      CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
+      CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
+      CLAWSWEEPER_REQUIRE_MUTATION_PERMIT: "1"
       CLAWSWEEPER_UNCONFIRMED_PRODUCT_DIRECTION_CLOSE_ENABLED: ${{ vars.CLAWSWEEPER_UNCONFIRMED_PRODUCT_DIRECTION_CLOSE_ENABLED || 'false' }}
       CLAWSWEEPER_UNSPONSORED_FEATURE_CLOSE_ENABLED: ${{ vars.CLAWSWEEPER_UNSPONSORED_FEATURE_CLOSE_ENABLED || 'false' }}
       CLAWSWEEPER_IDEA_REVIVAL_REACTIONS: ${{ vars.CLAWSWEEPER_IDEA_REVIVAL_REACTIONS || '5' }}

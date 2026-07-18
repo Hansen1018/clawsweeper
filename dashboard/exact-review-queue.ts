@@ -54,9 +54,11 @@ export type ExactReviewPublication = {
   producerRunAttempt: number;
   sourceSha: string;
   itemKey: string;
-  protocolVersion: 1 | 2;
+  protocolVersion: 1 | 2 | 3;
   leaseRevision: number | null;
   claimGeneration: number | null;
+  generation?: number;
+  operationId?: string;
   liveProceeded: boolean;
   liveTerminalNoop: boolean;
   liveTerminalMissing: boolean;
@@ -72,6 +74,8 @@ export type ExactReviewQueueItem = {
   leaseDecision?: ExactReviewDecision;
   state: "pending" | "dispatching" | "leased" | "parked";
   revision: number;
+  generation?: number;
+  supersededByGeneration?: number;
   createdAt: number;
   updatedAt: number;
   nextAttemptAt: number;
@@ -83,7 +87,9 @@ export type ExactReviewQueueItem = {
   claimedRunId?: string;
   claimedRunAttempt?: number;
   claimGeneration?: number;
-  claimProtocolVersion?: 1 | 2;
+  claimProtocolVersion?: 1 | 2 | 3;
+  leaseGeneration?: number;
+  operationId?: string;
   dispatchedAt?: number;
   claimedAt?: number;
   parkedReason?: "dead_letter_capacity";
@@ -112,6 +118,7 @@ type ExactReviewPublicationReasonCode =
   | "artifact_expired"
   | "close_coverage_retry"
   | "close_coverage_deferred"
+  | "mutation_busy"
   | "invalid_artifact"
   | "missing_record_tuple"
   | "tuple_protocol_invalid"
@@ -188,7 +195,7 @@ type ExactReviewQueueStorageMeta = {
   shed_since_reset?: number;
 };
 type ExactReviewQueueMetricTotals = {
-  review: { enqueued: number; completed: number };
+  review: { enqueued: number; completed: number; generationSuperseded: number };
   publication: {
     enqueued: number;
     completed: number;
@@ -204,6 +211,7 @@ type ExactReviewQueueMetricDelta = {
   reviewCompleted?: number;
   reviewRetried?: number;
   reviewShed?: number;
+  reviewGenerationSuperseded?: number;
   publicationEnqueued?: number;
   publicationCompleted?: number;
   publicationPublished?: number;
@@ -282,6 +290,8 @@ const EXACT_REVIEW_QUEUE_DEAD_LETTER_TABLE = "exact_review_queue_dead_letters";
 const EXACT_REVIEW_REVIEW_TELEMETRY_TABLE = "exact_review_review_telemetry";
 const EXACT_REVIEW_RUN_TELEMETRY_TABLE = "exact_review_run_telemetry";
 const REVIEW_OBSERVABILITY_SCAN_LIMIT = 10_000;
+const EXACT_REVIEW_GENERATION_TABLE = "exact_review_generations";
+const EXACT_REVIEW_MUTATION_LEASE_TABLE = "exact_review_mutation_leases";
 const EXACT_REVIEW_QUEUE_DEAD_LETTER_LIMIT = 5_000;
 const EXACT_REVIEW_QUEUE_DEAD_LETTER_RESOLVED_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const EXACT_REVIEW_QUEUE_METRIC_BUCKET_MS = 5 * 60 * 1000;
@@ -352,6 +362,7 @@ export class ExactReviewQueue {
         }
 
         const state = this.readStateSync();
+        let supersededCompute = false;
         // A delayed or lost alarm must not let an expired one-shot recovery
         // suppress the next failed shard's recovery delivery.
         reclaimExpiredExactReviewLeases(
@@ -361,7 +372,52 @@ export class ExactReviewQueue {
           exactReviewHeartbeatGraceMs(this.env),
         );
         const key = exactReviewItemKey(decision);
-        const current = state.items[key];
+        if (
+          decision.publication?.generation &&
+          this.currentReviewGenerationSync(decision.publication.itemKey) !==
+            decision.publication.generation
+        ) {
+          return { superseded: true as const };
+        }
+        let current = state.items[key];
+        const nextGeneration = decision.publication
+          ? decision.publication.generation
+          : this.reserveReviewGenerationSync(
+              key,
+              Boolean(!current || decision.supersedesInProgress),
+              now,
+            );
+        if (
+          current &&
+          !decision.publication &&
+          decision.supersedesInProgress &&
+          current.state === "dispatching" &&
+          Boolean(current.generation && current.operationId)
+        ) {
+          // A dispatched-but-unclaimed compute has no process to preserve. Revoke
+          // the tuple so its late claim fails, then reuse the canonical slot for
+          // the newer generation.
+          clearExactReviewLease(current);
+          current.state = "pending";
+          supersededCompute = true;
+        } else if (
+          current &&
+          !decision.publication &&
+          decision.supersedesInProgress &&
+          current.state === "leased" &&
+          current.claimProtocolVersion === 3
+        ) {
+          // Keep the old tuple addressable until its cancelled workflow reports a
+          // terminal outcome. The canonical key is immediately available for the
+          // replacement generation, which is what triggers GitHub job cancellation.
+          const supersededKey = `${key}@compute:${current.generation || 1}:${current.claimGeneration || 1}`;
+          delete state.items[key];
+          current.key = supersededKey;
+          current.supersededByGeneration = nextGeneration;
+          state.items[supersededKey] = current;
+          current = undefined;
+          supersededCompute = true;
+        }
         if (current) {
           const ignoredRecovery =
             decision.sourceAction === FAILED_REVIEW_SHARD_RECOVERY_SOURCE_ACTION;
@@ -370,12 +426,19 @@ export class ExactReviewQueue {
           // so can leave either ordinary work or another recovery as a stale follow-up revision.
           // Ordinary source events retain normal replacement behavior, including the
           // command-context merge for pending items.
-          if (!ignoredRecovery) {
+          if (
+            !ignoredRecovery &&
+            (decision.supersedesInProgress || Boolean(decision.publication))
+          ) {
             const mergeable = current.state === "pending" || current.state === "parked";
             current.decision = mergeable
               ? mergePendingExactReviewDecision(current.decision, decision)
               : decision;
             current.revision += 1;
+            // The active lease keeps its immutable generation in leaseGeneration.
+            // Advance the queue generation for the newer revision even during a
+            // v1/v2 lease so its eventual v3 requeue is not permanently fenced.
+            if (nextGeneration) current.generation = nextGeneration;
             current.updatedAt = now;
             // Immediacy must come from the merged decision: a pending explicit command
             // keeps its command marker through the merge, and a later plain webhook
@@ -413,6 +476,7 @@ export class ExactReviewQueue {
             decision,
             state: "pending",
             revision: 1,
+            ...(nextGeneration ? { generation: nextGeneration } : {}),
             createdAt: now,
             updatedAt: now,
             nextAttemptAt: exactReviewQueueDebouncedAttemptAt(state, decision, now, now, this.env),
@@ -420,10 +484,16 @@ export class ExactReviewQueue {
           };
         }
         this.writeStateSync(state);
+        if (supersededCompute) {
+          this.incrementQueueMetricsSync({ reviewGenerationSuperseded: 1 });
+        }
         return { deduped: false as const, key, state };
       });
       if (accepted.deduped) {
         return json({ ok: true, deduped: true, item_key: exactReviewItemKey(decision) }, 202);
+      }
+      if (accepted.superseded) {
+        return json({ error: "generation_superseded" }, 409);
       }
       if (accepted.shed) {
         return json({ ok: true, shed: true, reason: "backpressure" }, 202);
@@ -437,6 +507,8 @@ export class ExactReviewQueue {
       const leaseId = String(body.lease_id || "").trim();
       const itemKey = String(body.item_key || "").trim();
       const leaseRevision = Number(body.lease_revision);
+      const requestedGeneration = Number(body.generation);
+      const requestedOperationId = String(body.operation_id || "").trim();
       const runId = String(body.run_id || "").trim();
       if (!leaseId || !runId) return json({ error: "missing_lease_or_run" }, 400);
       if (!/^\d+$/.test(runId)) return json({ error: "invalid_run_id" }, 400);
@@ -444,7 +516,16 @@ export class ExactReviewQueue {
       if (tupleClaim && (!itemKey || !Number.isInteger(leaseRevision) || leaseRevision < 1)) {
         return json({ error: "invalid_lease_revision" }, 400);
       }
-      const claimProtocolVersion: 1 | 2 = tupleClaim ? 2 : 1;
+      const generationClaim = body.generation !== undefined || body.operation_id !== undefined;
+      if (
+        generationClaim &&
+        (!Number.isSafeInteger(requestedGeneration) ||
+          requestedGeneration < 1 ||
+          !/^[A-Za-z0-9-]{20,100}$/.test(requestedOperationId))
+      ) {
+        return json({ error: "invalid_generation_claim" }, 400);
+      }
+      const claimProtocolVersion: 1 | 2 | 3 = generationClaim ? 3 : tupleClaim ? 2 : 1;
       const runAttempt = exactReviewRunAttempt(body.run_attempt);
       if (body.run_attempt !== undefined && runAttempt === null) {
         return json({ error: "invalid_run_attempt" }, 400);
@@ -452,7 +533,9 @@ export class ExactReviewQueue {
 
       const now = Date.now();
       const state = this.readStateSync();
-      const item = tupleClaim ? state.items[itemKey] : exactReviewItemForLease(state, leaseId);
+      const item = tupleClaim
+        ? exactReviewItemForTuple(state, itemKey, leaseId)
+        : exactReviewItemForLease(state, leaseId);
       if (
         item &&
         reclaimExpiredExactReviewLease(
@@ -472,6 +555,8 @@ export class ExactReviewQueue {
         !item ||
         item.leaseId !== leaseId ||
         (tupleClaim && item.leaseRevision !== leaseRevision) ||
+        (generationClaim && item.leaseGeneration !== requestedGeneration) ||
+        (generationClaim && item.operationId !== requestedOperationId) ||
         !isLiveExactReviewLease(
           item,
           now,
@@ -554,6 +639,8 @@ export class ExactReviewQueue {
       const itemKey = String(body.item_key || "").trim();
       const leaseId = String(body.lease_id || "").trim();
       const leaseRevision = Number(body.lease_revision);
+      const generation = Number(body.generation);
+      const operationId = String(body.operation_id || "").trim();
       const runId = String(body.run_id || "").trim();
       if (!itemKey || !leaseId || !runId) return json({ error: "missing_lease_tuple" }, 400);
       if (!Number.isInteger(leaseRevision) || leaseRevision < 1) {
@@ -562,13 +649,20 @@ export class ExactReviewQueue {
       if (!/^\d+$/.test(runId)) return json({ error: "invalid_run_id" }, 400);
 
       const now = Date.now();
+      const generationHeartbeat = body.generation !== undefined || body.operation_id !== undefined;
+      if (
+        generationHeartbeat &&
+        (!Number.isSafeInteger(generation) || generation < 1 || !operationId)
+      ) {
+        return json({ error: "invalid_generation_tuple" }, 400);
+      }
       const state = this.readStateSync();
-      const item = state.items[itemKey];
+      const item = exactReviewItemForTuple(state, itemKey, leaseId);
       if (
         item &&
         reclaimExpiredExactReviewLease(
           state,
-          itemKey,
+          item.key,
           item,
           now,
           exactReviewPublicationDispatchLeaseMs(this.env),
@@ -584,6 +678,8 @@ export class ExactReviewQueue {
         item.state !== "leased" ||
         item.leaseId !== leaseId ||
         item.leaseRevision !== leaseRevision ||
+        (generationHeartbeat && item.leaseGeneration !== generation) ||
+        (generationHeartbeat && item.operationId !== operationId) ||
         item.claimedRunId !== runId ||
         !isLiveExactReviewLease(
           item,
@@ -607,6 +703,8 @@ export class ExactReviewQueue {
       const itemKey = String(body.item_key || "").trim();
       const leaseRevision = Number(body.lease_revision);
       const claimGeneration = Number(body.claim_generation);
+      const generation = Number(body.generation);
+      const operationId = String(body.operation_id || "").trim();
       const runId = String(body.run_id || "").trim();
       if (!leaseId || !runId) return json({ error: "missing_lease_or_run" }, 400);
       if (!/^\d+$/.test(runId)) return json({ error: "invalid_run_id" }, 400);
@@ -614,6 +712,7 @@ export class ExactReviewQueue {
         Boolean(itemKey) ||
         body.lease_revision !== undefined ||
         body.claim_generation !== undefined;
+      const generationCompletion = body.generation !== undefined || body.operation_id !== undefined;
       if (tupleCompletion) {
         if (!itemKey || !Number.isInteger(leaseRevision) || leaseRevision < 1) {
           return json({ error: "invalid_lease_revision" }, 400);
@@ -622,7 +721,17 @@ export class ExactReviewQueue {
           return json({ error: "invalid_claim_generation" }, 400);
         }
       }
-      const completionProtocolVersion: 1 | 2 = tupleCompletion ? 2 : 1;
+      if (
+        generationCompletion &&
+        (!Number.isSafeInteger(generation) || generation < 1 || !operationId)
+      ) {
+        return json({ error: "invalid_generation_tuple" }, 400);
+      }
+      const completionProtocolVersion: 1 | 2 | 3 = generationCompletion
+        ? 3
+        : tupleCompletion
+          ? 2
+          : 1;
       const runAttempt = exactReviewRunAttempt(body.run_attempt);
       if (body.run_attempt !== undefined && runAttempt === null) {
         return json({ error: "invalid_run_attempt" }, 400);
@@ -685,12 +794,16 @@ export class ExactReviewQueue {
         return json({ error: "invalid_retry_at" }, 400);
       }
       const state = this.readStateSync();
-      const item = tupleCompletion ? state.items[itemKey] : exactReviewItemForLease(state, leaseId);
+      const item = tupleCompletion
+        ? exactReviewItemForTuple(state, itemKey, leaseId)
+        : exactReviewItemForLease(state, leaseId);
       if (
         !item ||
         item.leaseId !== leaseId ||
         (tupleCompletion && item.leaseRevision !== leaseRevision) ||
         (tupleCompletion && exactReviewClaimGeneration(item.claimGeneration) !== claimGeneration) ||
+        (generationCompletion && item.leaseGeneration !== generation) ||
+        (generationCompletion && item.operationId !== operationId) ||
         item.claimedRunId !== runId
       ) {
         return json({ error: "lease_not_claimed" }, 409);
@@ -754,6 +867,7 @@ export class ExactReviewQueue {
               parked: false,
               deadLetter: undefined,
             };
+      this.releaseMutationLeaseForQueueItemSync(item);
       const { requeued } = completionResult;
       // A successful workflow can still request requeue_latest after source
       // drift. That work did not leave its lane, so it must not improve the
@@ -798,6 +912,136 @@ export class ExactReviewQueue {
       );
       await this.scheduleNext(state, now);
       return json({ ok: true, requeued });
+    }
+
+    if (request.method === "POST" && url.pathname === "/generation/check") {
+      const tuple = exactReviewGenerationTuple(await request.json().catch(() => null));
+      if (!tuple) return json({ error: "invalid_generation_tuple" }, 400);
+      const currentGeneration = this.currentReviewGenerationSync(tuple.itemKey);
+      if (currentGeneration !== tuple.generation) {
+        return json(
+          {
+            error: "generation_superseded",
+            item_key: tuple.itemKey,
+            generation: tuple.generation,
+            current_generation: currentGeneration,
+          },
+          409,
+        );
+      }
+      return json({ ok: true, current: true, current_generation: currentGeneration });
+    }
+
+    if (request.method === "POST" && url.pathname === "/mutation/acquire") {
+      const tuple = exactReviewMutationTuple(await request.json().catch(() => null));
+      if (!tuple) return json({ error: "invalid_mutation_tuple" }, 400);
+      const currentGeneration = this.currentReviewGenerationSync(tuple.itemKey);
+      if (tuple.purpose === "review" && currentGeneration !== tuple.generation) {
+        return json({ error: "generation_superseded", current_generation: currentGeneration }, 409);
+      }
+      if (tuple.purpose === "apply" && this.reviewComputeActiveSync(tuple.itemKey)) {
+        return json({ error: "review_active", current_generation: currentGeneration }, 409);
+      }
+      const now = Date.now();
+      const observedLease = this.mutationLeaseSync(tuple.itemKey);
+      const observedLeaseConflicts =
+        observedLease &&
+        (observedLease.generation !== tuple.generation ||
+          observedLease.operation_id !== tuple.operationId ||
+          observedLease.owner !== tuple.owner ||
+          observedLease.purpose !== tuple.purpose);
+      const observedApplyOwnerTerminal =
+        observedLeaseConflicts &&
+        observedLease.purpose === "apply" &&
+        (await exactReviewMutationOwnerTerminal(this.env, observedLease.owner));
+      const result = this.storage.transactionSync(() => {
+        let existing = this.mutationLeaseSync(tuple.itemKey);
+        if (existing) {
+          if (
+            existing.generation !== tuple.generation ||
+            existing.operation_id !== tuple.operationId ||
+            existing.owner !== tuple.owner ||
+            existing.purpose !== tuple.purpose
+          ) {
+            const observedLeaseStillOwns =
+              observedApplyOwnerTerminal &&
+              observedLease &&
+              existing.generation === observedLease.generation &&
+              existing.operation_id === observedLease.operation_id &&
+              existing.owner === observedLease.owner &&
+              existing.purpose === observedLease.purpose;
+            if (!observedLeaseStillOwns) return { acquired: false as const, existing };
+
+            // Mutation leases never expire by age: a slow GitHub write must retain
+            // exclusivity. Recovery is safe only after GitHub confirms the exact
+            // workflow attempt encoded by the apply owner has reached terminal state.
+            this.storage.sql.exec(
+              `DELETE FROM ${EXACT_REVIEW_MUTATION_LEASE_TABLE}
+                WHERE item_key = ? AND generation = ? AND operation_id = ? AND owner = ?
+                  AND purpose = 'apply'`,
+              tuple.itemKey,
+              existing.generation,
+              existing.operation_id,
+              existing.owner,
+            );
+            existing = undefined;
+          }
+          if (existing)
+            this.storage.sql.exec(
+              `UPDATE ${EXACT_REVIEW_MUTATION_LEASE_TABLE}
+                SET heartbeat_at = ? WHERE item_key = ?`,
+              now,
+              tuple.itemKey,
+            );
+          if (existing) return { acquired: true as const, resumed: true as const };
+        }
+        this.storage.sql.exec(
+          `INSERT INTO ${EXACT_REVIEW_MUTATION_LEASE_TABLE}
+             (item_key, generation, operation_id, owner, purpose, acquired_at, heartbeat_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          tuple.itemKey,
+          tuple.generation,
+          tuple.operationId,
+          tuple.owner,
+          tuple.purpose,
+          now,
+          now,
+        );
+        return { acquired: true as const, resumed: false as const };
+      });
+      if (!result.acquired) {
+        return json(
+          {
+            error: "mutation_busy",
+            owner: result.existing.owner,
+            purpose: result.existing.purpose,
+            generation: result.existing.generation,
+            acquired_at: new Date(result.existing.acquired_at).toISOString(),
+          },
+          409,
+        );
+      }
+      return json({ ok: true, acquired: true, resumed: result.resumed });
+    }
+
+    if (request.method === "POST" && url.pathname === "/mutation/release") {
+      const tuple = exactReviewMutationTuple(await request.json().catch(() => null));
+      if (!tuple) return json({ error: "invalid_mutation_tuple" }, 400);
+      const released = Array.from(
+        this.storage.sql.exec(
+          `DELETE FROM ${EXACT_REVIEW_MUTATION_LEASE_TABLE}
+            WHERE item_key = ? AND generation = ? AND operation_id = ? AND owner = ?
+              AND purpose = ?
+          RETURNING item_key`,
+          tuple.itemKey,
+          tuple.generation,
+          tuple.operationId,
+          tuple.owner,
+          tuple.purpose,
+        ),
+      ).length;
+      if (!released) return json({ error: "mutation_not_owned" }, 409);
+      return json({ ok: true, released: true });
     }
 
     if (request.method === "POST" && url.pathname === "/claimed-runs") {
@@ -957,6 +1201,7 @@ export class ExactReviewQueue {
         );
         if (matches.length !== 1) continue;
         const item = matches[0];
+        this.releaseMutationLeaseForQueueItemSync(item);
         const didRequeue = finishExactReviewQueueItem(state, item, now, run.outcome);
         reconciled += 1;
         if (didRequeue) {
@@ -1055,6 +1300,7 @@ export class ExactReviewQueue {
             ...stats.lanes.review,
             enqueued_total: metrics.review.enqueued,
             completed_total: metrics.review.completed,
+            generation_superseded_total: metrics.review.generationSuperseded,
             flow: reviewFlow,
           },
           publication: {
@@ -1206,6 +1452,8 @@ export class ExactReviewQueue {
       item.state = "dispatching";
       item.leaseId = crypto.randomUUID();
       item.leaseRevision = item.revision;
+      item.leaseGeneration = item.generation;
+      item.operationId = item.generation ? crypto.randomUUID() : undefined;
       item.leaseDecision = { ...item.decision };
       item.leaseExpiresAt =
         now +
@@ -1234,6 +1482,8 @@ export class ExactReviewQueue {
           itemKey: item.key,
           leaseId: item.leaseId,
           leaseRevision: item.leaseRevision,
+          generation: item.leaseGeneration,
+          operationId: item.operationId,
         });
       } catch {
         failures.push({ key: item.key, leaseId: String(item.leaseId || "") });
@@ -2181,6 +2431,7 @@ export class ExactReviewQueue {
     for (const column of [
       "review_enqueued_total",
       "review_completed_total",
+      "review_generation_superseded_total",
       "publication_enqueued_total",
       "publication_published_total",
       "publication_superseded_total",
@@ -2353,6 +2604,105 @@ export class ExactReviewQueue {
       `CREATE INDEX IF NOT EXISTS exact_review_run_telemetry_aggregate
          ON ${EXACT_REVIEW_RUN_TELEMETRY_TABLE}
          (trigger_lane, target_repo, completed_at, workflow_outcome)`,
+    );
+    this.storage.sql.exec(
+      `CREATE TABLE IF NOT EXISTS ${EXACT_REVIEW_GENERATION_TABLE} (
+         item_key TEXT PRIMARY KEY,
+         generation INTEGER NOT NULL CHECK (generation >= 1),
+         updated_at INTEGER NOT NULL
+       ) STRICT`,
+    );
+    this.storage.sql.exec(
+      `CREATE TABLE IF NOT EXISTS ${EXACT_REVIEW_MUTATION_LEASE_TABLE} (
+         item_key TEXT PRIMARY KEY,
+         generation INTEGER NOT NULL CHECK (generation >= 1),
+         operation_id TEXT NOT NULL,
+         owner TEXT NOT NULL,
+         purpose TEXT NOT NULL DEFAULT 'review' CHECK (purpose IN ('review', 'apply')),
+         acquired_at INTEGER NOT NULL,
+         heartbeat_at INTEGER NOT NULL
+       ) STRICT`,
+    );
+    const hasMutationPurpose = Array.from(
+      this.storage.sql.exec(
+        `SELECT name FROM pragma_table_info('${EXACT_REVIEW_MUTATION_LEASE_TABLE}')
+          WHERE name = 'purpose'`,
+      ),
+    ).length;
+    if (!hasMutationPurpose) {
+      this.storage.sql.exec(
+        `ALTER TABLE ${EXACT_REVIEW_MUTATION_LEASE_TABLE}
+           ADD COLUMN purpose TEXT NOT NULL DEFAULT 'review'
+             CHECK (purpose IN ('review', 'apply'))`,
+      );
+    }
+  }
+
+  private reserveReviewGenerationSync(itemKey: string, advance: boolean, now: number) {
+    const row = Array.from(
+      this.storage.sql.exec(
+        `SELECT generation FROM ${EXACT_REVIEW_GENERATION_TABLE} WHERE item_key = ?`,
+        itemKey,
+      ),
+    )[0] as { generation?: number } | undefined;
+    const current = Math.max(0, Number(row?.generation || 0));
+    const generation = current === 0 ? 1 : advance ? current + 1 : current;
+    this.storage.sql.exec(
+      `INSERT INTO ${EXACT_REVIEW_GENERATION_TABLE} (item_key, generation, updated_at)
+       VALUES (?, ?, ?)
+       ON CONFLICT(item_key) DO UPDATE SET
+         generation = excluded.generation,
+         updated_at = excluded.updated_at`,
+      itemKey,
+      generation,
+      now,
+    );
+    return generation;
+  }
+
+  private currentReviewGenerationSync(itemKey: string) {
+    const row = Array.from(
+      this.storage.sql.exec(
+        `SELECT generation FROM ${EXACT_REVIEW_GENERATION_TABLE} WHERE item_key = ?`,
+        itemKey,
+      ),
+    )[0] as { generation?: number } | undefined;
+    return Math.max(0, Number(row?.generation || 0));
+  }
+
+  private reviewComputeActiveSync(itemKey: string) {
+    const item = this.readStateSync().items[itemKey];
+    return Boolean(item && item.state !== "parked");
+  }
+
+  private mutationLeaseSync(itemKey: string) {
+    return Array.from(
+      this.storage.sql.exec(
+        `SELECT generation, operation_id, owner, purpose, acquired_at, heartbeat_at
+           FROM ${EXACT_REVIEW_MUTATION_LEASE_TABLE} WHERE item_key = ?`,
+        itemKey,
+      ),
+    )[0] as
+      | {
+          generation: number;
+          operation_id: string;
+          owner: string;
+          purpose: "review" | "apply";
+          acquired_at: number;
+          heartbeat_at: number;
+        }
+      | undefined;
+  }
+
+  private releaseMutationLeaseForQueueItemSync(item: ExactReviewQueueItem) {
+    if (!item.leaseGeneration || !item.operationId) return;
+    const itemKey = item.decision.publication?.itemKey || item.key.replace(/@compute:.*$/, "");
+    this.storage.sql.exec(
+      `DELETE FROM ${EXACT_REVIEW_MUTATION_LEASE_TABLE}
+        WHERE item_key = ? AND generation = ? AND operation_id = ? AND purpose = 'review'`,
+      itemKey,
+      item.leaseGeneration,
+      item.operationId,
     );
   }
 
@@ -2640,6 +2990,7 @@ export class ExactReviewQueue {
     const row = Array.from(
       this.storage.sql.exec(
         `SELECT review_enqueued_total, review_completed_total,
+                review_generation_superseded_total,
                 publication_enqueued_total, publication_completed_total,
                 publication_published_total, publication_superseded_total,
                 publication_retried_total, publication_dead_lettered_total,
@@ -2651,6 +3002,7 @@ export class ExactReviewQueue {
       | {
           review_enqueued_total?: number;
           review_completed_total?: number;
+          review_generation_superseded_total?: number;
           publication_enqueued_total?: number;
           publication_completed_total?: number;
           publication_published_total?: number;
@@ -2664,6 +3016,7 @@ export class ExactReviewQueue {
       review: {
         enqueued: exactReviewMetricTotal(row?.review_enqueued_total),
         completed: exactReviewMetricTotal(row?.review_completed_total),
+        generationSuperseded: exactReviewMetricTotal(row?.review_generation_superseded_total),
       },
       publication: {
         enqueued: exactReviewMetricTotal(row?.publication_enqueued_total),
@@ -2682,6 +3035,7 @@ export class ExactReviewQueue {
     const reviewCompleted = exactReviewMetricDelta(delta.reviewCompleted);
     const reviewRetried = exactReviewMetricDelta(delta.reviewRetried);
     const reviewShed = exactReviewMetricDelta(delta.reviewShed);
+    const reviewGenerationSuperseded = exactReviewMetricDelta(delta.reviewGenerationSuperseded);
     const publicationEnqueued = exactReviewMetricDelta(delta.publicationEnqueued);
     const publicationCompleted = exactReviewMetricDelta(delta.publicationCompleted);
     const publicationPublished = exactReviewMetricDelta(delta.publicationPublished);
@@ -2694,6 +3048,7 @@ export class ExactReviewQueue {
       !reviewCompleted &&
       !reviewRetried &&
       !reviewShed &&
+      !reviewGenerationSuperseded &&
       !publicationEnqueued &&
       !publicationCompleted &&
       !publicationPublished &&
@@ -2708,6 +3063,7 @@ export class ExactReviewQueue {
       `UPDATE ${EXACT_REVIEW_QUEUE_METRICS_TABLE}
           SET review_enqueued_total = review_enqueued_total + ?,
               review_completed_total = review_completed_total + ?,
+              review_generation_superseded_total = review_generation_superseded_total + ?,
               publication_enqueued_total = publication_enqueued_total + ?,
               publication_completed_total = publication_completed_total + ?,
               publication_published_total = publication_published_total + ?,
@@ -2718,6 +3074,7 @@ export class ExactReviewQueue {
         WHERE singleton_id = 1`,
       reviewEnqueued,
       reviewCompleted,
+      reviewGenerationSuperseded,
       publicationEnqueued,
       publicationCompleted,
       publicationPublished,
@@ -3337,6 +3694,8 @@ function exactReviewPublicationFrom(value): ExactReviewPublication | null {
     publication.leaseRevision === null ? null : Number(publication.leaseRevision);
   const claimGeneration =
     publication.claimGeneration === null ? null : Number(publication.claimGeneration);
+  const generation = Number(publication.generation);
+  const operationId = String(publication.operationId || "").trim();
   const producerDecision = exactReviewBaseDecisionFrom(publication.producerDecision);
   const liveProceeded = publication.liveProceeded;
   const liveTerminalNoop = publication.liveTerminalNoop;
@@ -3348,7 +3707,7 @@ function exactReviewPublicationFrom(value): ExactReviewPublication | null {
   if (artifactName !== `exact-review-${producerRunId}-${producerRunAttempt}`) return null;
   if (!/^[0-9a-f]{40}$/.test(sourceSha)) return null;
   if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+#[1-9]\d*$/.test(itemKey)) return null;
-  if (protocolVersion !== 1 && protocolVersion !== 2) return null;
+  if (protocolVersion !== 1 && protocolVersion !== 2 && protocolVersion !== 3) return null;
   if (
     (leaseRevision !== null && (!Number.isSafeInteger(leaseRevision) || leaseRevision < 1)) ||
     (claimGeneration !== null && (!Number.isSafeInteger(claimGeneration) || claimGeneration < 1))
@@ -3356,6 +3715,16 @@ function exactReviewPublicationFrom(value): ExactReviewPublication | null {
     return null;
   }
   if (protocolVersion === 2 && (leaseRevision === null || claimGeneration === null)) return null;
+  if (
+    protocolVersion === 3 &&
+    (leaseRevision === null ||
+      claimGeneration === null ||
+      !Number.isSafeInteger(generation) ||
+      generation < 1 ||
+      !/^[A-Za-z0-9-]{20,100}$/.test(operationId))
+  ) {
+    return null;
+  }
   if (!producerDecision) return null;
   const liveOutcomes = [liveProceeded, liveTerminalNoop, liveTerminalMissing, liveGuardedOpen];
   if (liveOutcomes.some((outcome) => typeof outcome !== "boolean")) return null;
@@ -3369,6 +3738,7 @@ function exactReviewPublicationFrom(value): ExactReviewPublication | null {
     protocolVersion,
     leaseRevision,
     claimGeneration,
+    ...(protocolVersion === 3 ? { generation, operationId } : {}),
     liveProceeded,
     liveTerminalNoop,
     liveTerminalMissing,
@@ -3410,9 +3780,16 @@ function exactReviewItemForLease(state: ExactReviewQueueState, leaseId: string) 
   return Object.values(state.items).find((item) => item.leaseId === leaseId) || null;
 }
 
+function exactReviewItemForTuple(state: ExactReviewQueueState, itemKey: string, leaseId: string) {
+  const direct = state.items[itemKey];
+  if (direct?.leaseId === leaseId) return direct;
+  const superseded = exactReviewItemForLease(state, leaseId);
+  return superseded?.key.startsWith(`${itemKey}@compute:`) ? superseded : null;
+}
+
 function exactReviewClaimResponse(
   item: ExactReviewQueueItem,
-  protocolVersion: 1 | 2,
+  protocolVersion: 1 | 2 | 3,
   claimGeneration: number,
 ) {
   return {
@@ -3423,6 +3800,9 @@ function exactReviewClaimResponse(
     ...(protocolVersion === 1 ? { revision: item.leaseRevision } : {}),
     lease_revision: item.leaseRevision,
     claim_generation: claimGeneration,
+    ...(protocolVersion === 3
+      ? { generation: item.leaseGeneration, operation_id: item.operationId }
+      : {}),
     decision: item.leaseDecision,
   };
 }
@@ -3471,6 +3851,7 @@ function exactReviewPublicationReasonCode(value): ExactReviewPublicationReasonCo
     "artifact_expired",
     "close_coverage_retry",
     "close_coverage_deferred",
+    "mutation_busy",
     "invalid_artifact",
     "missing_record_tuple",
     "tuple_protocol_invalid",
@@ -3501,6 +3882,7 @@ function exactReviewPublicationCompletion(
       "github_transient",
       "workflow_cancelled",
       "artifact_unavailable",
+      "mutation_busy",
       "unknown_failure",
     ]),
     // Accept the pre-deployment tuple while an old publisher can still finish.
@@ -3902,7 +4284,9 @@ function finishExactReviewQueueItem(
   // the queue, so only a newer source revision may supersede that recovery.
   const oneShotRecovery =
     item.leaseDecision?.sourceAction === FAILED_REVIEW_SHARD_RECOVERY_SOURCE_ACTION;
-  const requeued = (!oneShotRecovery && retryingFailure) || hasNewerRevision || requeueLatest;
+  const requeued =
+    !item.supersededByGeneration &&
+    ((!oneShotRecovery && retryingFailure) || hasNewerRevision || requeueLatest);
   if (requeued) {
     clearExactReviewLease(item);
     item.state = "pending";
@@ -3942,6 +4326,8 @@ function clearExactReviewLease(item: ExactReviewQueueItem) {
   item.claimedRunAttempt = undefined;
   item.claimGeneration = undefined;
   item.claimProtocolVersion = undefined;
+  item.leaseGeneration = undefined;
+  item.operationId = undefined;
   item.dispatchedAt = undefined;
   item.claimedAt = undefined;
 }
@@ -4562,6 +4948,7 @@ function exactReviewQueueLaneStats(
     parked: parkedItems.length,
     capacity,
     active,
+    permit_utilization: Number.isFinite(capacity) && capacity > 0 ? active / capacity : 0,
     available_slots: Math.max(0, capacity - active),
     oldest_pending_at: oldestPendingAt === null ? null : new Date(oldestPendingAt).toISOString(),
     oldest_pending_age_seconds:
@@ -5130,6 +5517,28 @@ export async function exactReviewActionsReadToken(env) {
   return exactReviewRepositoryToken(env, { actions: "read" });
 }
 
+export async function exactReviewMutationOwnerTerminal(env, owner: string) {
+  const match = /^github-run-(\d+)-([1-9]\d*)(?:-\d+)?$/.exec(owner);
+  if (!match) return false;
+  const [, runId, runAttemptText] = match;
+  const runAttempt = Number(runAttemptText);
+  try {
+    const token = await exactReviewActionsReadToken(env);
+    return Boolean(
+      await exactReviewTerminalRun(token, {
+        runId,
+        runAttempt,
+        requestedRunAttempt: runAttempt,
+        claimGeneration: 1,
+      }),
+    );
+  } catch {
+    // Unavailable credentials or Actions reads must fail closed. The existing
+    // mutation keeps ownership until a later request can prove its attempt terminal.
+    return false;
+  }
+}
+
 async function exactReviewRepositoryToken(env, permissions) {
   const credentials = githubAppCredentials(env);
   if (!credentials) throw new Error("github app is not configured");
@@ -5290,12 +5699,16 @@ async function dispatchClawsweeperItem({
   itemKey,
   leaseId,
   leaseRevision,
+  generation,
+  operationId,
 }: {
   token: string;
   decision: ExactReviewDecision;
   itemKey: string;
   leaseId: string;
   leaseRevision: number;
+  generation?: number;
+  operationId?: string;
 }) {
   // Keep the v1 fields during the rolling-upgrade window. Old workflows consume
   // this immutable dispatch snapshot, while v2 workflows ignore it after claim
@@ -5321,10 +5734,12 @@ async function dispatchClawsweeperItem({
       client_payload: {
         queue_lease_id: leaseId,
         queue_claim: {
-          protocol_version: 2,
+          protocol_version: generation && operationId ? 3 : 2,
           item_key: itemKey,
           lease_revision: leaseRevision,
+          ...(generation && operationId ? { generation, operation_id: operationId } : {}),
         },
+        repo_slug: decision.targetRepo.replace(/[^A-Za-z0-9_.-]+/g, "-"),
         target_repo: decision.targetRepo,
         target_branch: decision.targetBranch,
         item_number: decision.itemNumber,
@@ -5368,6 +5783,40 @@ async function githubTokenJson({ token, path, method = "GET", body, errorLabel }
 
 function objectValue(value) {
   return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+}
+
+function exactReviewGenerationTuple(value: unknown) {
+  const body = objectValue(value);
+  const itemKey = String(body.item_key || "").trim();
+  const generation = Number(body.generation);
+  if (
+    !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+#[1-9]\d*$/.test(itemKey) ||
+    !Number.isSafeInteger(generation) ||
+    generation < 1
+  ) {
+    return null;
+  }
+  return { itemKey, generation };
+}
+
+function exactReviewMutationTuple(value: unknown) {
+  const body = objectValue(value);
+  const itemKey = String(body.item_key || "").trim();
+  const purpose = body.purpose === "apply" ? "apply" : body.purpose === "review" ? "review" : null;
+  const generation = Number(body.generation);
+  const operationId = String(body.operation_id || "").trim();
+  const owner = String(body.owner || "").trim();
+  if (
+    !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+#[1-9]\d*$/.test(itemKey) ||
+    !purpose ||
+    !Number.isSafeInteger(generation) ||
+    generation < 1 ||
+    !/^[A-Za-z0-9:._-]{8,200}$/.test(operationId) ||
+    !/^[A-Za-z0-9:._-]{3,200}$/.test(owner)
+  ) {
+    return null;
+  }
+  return { itemKey, generation, operationId, owner, purpose };
 }
 
 function repoName(repo) {

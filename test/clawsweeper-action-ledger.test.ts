@@ -738,7 +738,7 @@ test("retry and review publication lanes finalize unexpected failures", () => {
 
 test("sweep publishes complete immutable shards for every review and apply producer", () => {
   const workflow = readText(".github/workflows/sweep.yml");
-  const reviewStep = workflow.indexOf("- name: Review shard");
+  const reviewStep = workflow.indexOf("- name: Review item");
   const reviewFinalizer = workflow.indexOf("- name: Finalize review action ledger");
   const reviewUpload = workflow.indexOf("name: action-ledger-review-${{ matrix.shard }}");
   const applyProofStep = workflow.indexOf("- name: Generate bound close coverage proofs");

@@ -25,6 +25,8 @@ import {
   itemNumbersArg,
   lockedConversationApplyReason,
   parseDecision,
+  planItemMatrix,
+  planItemReviewCapacity,
   relatedGitHubIssueSearchQueryForTest,
   relatedTitleSearchTerms,
   recordedLabelSyncCoversUpdate,
@@ -1266,6 +1268,20 @@ test("planned review shards stay within the Codex worker cap", () => {
   );
 });
 
+test("item-shard planning separates selection capacity from matrix parallelism", () => {
+  assert.equal(planItemReviewCapacity(3), 3);
+  assert.equal(planItemReviewCapacity(300), 256);
+
+  const candidates = Array.from({ length: 256 }, (_, index) => ({
+    repo: "openclaw/clawsweeper",
+    number: index + 1,
+    kind: "pull_request" as const,
+    updatedAt: "2026-07-18T00:00:00.000Z",
+  }));
+  assert.equal(planItemMatrix(candidates).length, 256);
+  assert.throws(() => planItemMatrix([...candidates, candidates[0]]), /at most 256 matrix jobs/);
+});
+
 test("apply mode prioritizes matching close proposals before comment sync", () => {
   const issueClose = reportFrontMatter({
     decision: "close",
@@ -2191,8 +2207,9 @@ test("sweep workflow executes only durable queue leases without runner-side admi
 
   assert.match(
     eventReviewBlock,
-    /group: clawsweeper-event-review-\$\{\{ github\.event\.client_payload\.queue_claim\.item_key \|\| github\.event\.client_payload\.item_key \|\| github\.run_id \}\}/,
+    /group: clawsweeper-review-\$\{\{ github\.event\.client_payload\.repo_slug \|\| github\.event\.client_payload\.target_repo \|\| 'unknown-repo' \}\}-\$\{\{ github\.event\.client_payload\.item_number \|\| github\.run_id \}\}/,
   );
+  assert.match(eventReviewBlock, /cancel-in-progress: true/);
   assert.match(eventReviewBlock, /github\.event\.client_payload\.queue_lease_id != ''/);
   assert.match(legacyIntakeBlock, /Queue legacy exact-review event/);
   assert.match(legacyIntakeBlock, /\/internal\/exact-review\/enqueue/);
@@ -2204,7 +2221,6 @@ test("sweep workflow executes only durable queue leases without runner-side admi
   assert.match(legacyIntakeBlock, /commandStatusMarker: payload\.command_status_marker/);
   assert.match(legacyIntakeBlock, /statusCommentId: payload\.status_comment_id/);
   assert.match(legacyIntakeBlock, /additionalPrompt: payload\.additional_prompt/);
-  assert.match(eventReviewBlock, /cancel-in-progress: false/);
   assert.match(exactReviewStep, /GH_TOKEN: \$\{\{ steps\.target-read-token\.outputs\.token \}\}/);
   assert.match(exactReviewStep, /--readonly-openclaw/);
   assert.match(exactReviewStep, /--skip-start-comment/);
@@ -2550,17 +2566,17 @@ test("sweep review recovery uses explicit failed shard artifacts", () => {
 
   assert.match(
     workflow,
-    /name: Review shard \$\{\{ matrix\.shard \}\} · \$\{\{ needs\.plan\.outputs\.target_repo \}\}#\$\{\{ matrix\.item_numbers \}\}/,
+    /name: Review item \$\{\{ matrix\.shard \}\} · \$\{\{ matrix\.repo \}\}#\$\{\{ matrix\.item_number \}\}/,
   );
   assert.match(
     workflow,
-    /- name: Review shard\r?\n\s+id: review-shard\r?\n\s+continue-on-error: true/,
+    /- name: Review item\r?\n\s+id: review-shard\r?\n\s+continue-on-error: true/,
   );
-  assert.match(workflow, /- name: Record failed review shard/);
+  assert.match(workflow, /- name: Record failed item review/);
   assert.match(workflow, /steps\.review-shard\.outcome == 'failure'/);
   assert.match(workflow, /name: review-failed-shard-\$\{\{ matrix\.shard \}\}/);
   assert.match(workflow, /pattern: review-failed-shard-\*/);
-  assert.ok(workflow.includes('sub("^Review shard ([0-9]+).*$"; "\\\\1")'));
+  assert.ok(workflow.includes('sub("^Review item ([0-9]+).*$"; "\\\\1")'));
   assert.match(workflow, /needs\.review\.result != 'skipped'/);
   assert.doesNotMatch(
     workflow,

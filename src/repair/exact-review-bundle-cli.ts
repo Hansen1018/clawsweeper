@@ -31,8 +31,8 @@ if (command === "create") {
 
 function contextFromEnv(env: NodeJS.ProcessEnv): ExactReviewBundleContext {
   const protocolVersion = positiveIntegerEnv(env, "EXACT_REVIEW_PROTOCOL_VERSION");
-  if (protocolVersion !== 1 && protocolVersion !== 2) {
-    throw new Error("EXACT_REVIEW_PROTOCOL_VERSION must be 1 or 2");
+  if (protocolVersion !== 1 && protocolVersion !== 2 && protocolVersion !== 3) {
+    throw new Error("EXACT_REVIEW_PROTOCOL_VERSION must be 1, 2, or 3");
   }
   return {
     repository: requiredEnv(env, "GITHUB_REPOSITORY"),
@@ -49,6 +49,12 @@ function contextFromEnv(env: NodeJS.ProcessEnv): ExactReviewBundleContext {
     protocolVersion,
     leaseRevision: optionalPositiveIntegerEnv(env, "EXACT_REVIEW_LEASE_REVISION"),
     claimGeneration: optionalPositiveIntegerEnv(env, "EXACT_REVIEW_CLAIM_GENERATION"),
+    ...(protocolVersion === 3
+      ? {
+          generation: positiveIntegerEnv(env, "EXACT_REVIEW_GENERATION"),
+          operationId: requiredEnv(env, "EXACT_REVIEW_OPERATION_ID"),
+        }
+      : {}),
     liveProceeded: booleanEnv(env, "EXACT_REVIEW_LIVE_PROCEEDED"),
     liveTerminalNoop: booleanEnv(env, "EXACT_REVIEW_LIVE_TERMINAL_NOOP"),
     liveTerminalMissing: booleanEnv(env, "EXACT_REVIEW_LIVE_TERMINAL_MISSING"),

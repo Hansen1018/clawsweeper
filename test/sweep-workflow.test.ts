@@ -434,7 +434,8 @@ test("exact event review hands immutable artifacts to the queue-bounded publishe
     step(publisher, "Claim durable exact review publication").run ?? "",
     /internal\/exact-review\/claim/,
   );
-  assert.equal(publisher.concurrency, undefined);
+  assert.equal(publisher.concurrency?.["cancel-in-progress"], false);
+  assert.match(publisher.concurrency?.group ?? "", /clawsweeper-mutation-/);
   assert.equal(publisher.permissions?.actions, "write");
   assert.equal(
     batchPublisher.concurrency?.group,
@@ -475,6 +476,13 @@ test("exact event review hands immutable artifacts to the queue-bounded publishe
   assert.match(stateSetup.if ?? "", /legacy-exact-artifact\.outputs\.legacy_tupleless != 'true'/);
 
   const publish = step(publisher, "Publish event result and apply safe close");
+  const mutationPermit = step(publisher, "Acquire generation-bound mutation permit");
+  const mutationRelease = step(publisher, "Release generation-bound mutation permit");
+  assert.match(mutationPermit.run ?? "", /internal\/exact-review\/mutation\/acquire/);
+  assert.match(mutationPermit.run ?? "", /generation_superseded|mutation_busy/);
+  assert.match(publish.if ?? "", /mutation-permit\.outputs\.acquired == 'true'/);
+  assert.match(mutationRelease.run ?? "", /internal\/exact-review\/mutation\/release/);
+  assert.ok(publisher.steps.indexOf(mutationPermit) < publisher.steps.indexOf(publish));
   assert.match(publish.run ?? "", /live_state=.*gh api/);
   assert.match(publish.run ?? "", /LIVE_TERMINAL_NOOP.*LIVE_TERMINAL_MISSING/);
   assert.match(publish.run ?? "", /LIVE_GUARDED_OPEN/);
@@ -550,6 +558,7 @@ test("exact event review hands immutable artifacts to the queue-bounded publishe
   assert.match(publishResult.env?.DOWNLOAD_OUTCOME ?? "", /download-exact-review-bundle/);
   assert.match(publishResult.env?.VALIDATE_OUTCOME ?? "", /validate-exact-review-bundle/);
   assert.match(publishResult.env?.PUBLISH_COMPLETION_KIND ?? "", /publish-event-result/);
+  assert.match(publishResult.env?.MUTATION_REASON ?? "", /mutation-permit/);
   assert.match(publicationPressure.if ?? "", /failure\(\)/);
   assert.match(publicationPressure.run ?? "", /gh api rate_limit/);
   assert.match(publicationPressure.run ?? "", /failure_kind=github_rate_limit/);
@@ -561,6 +570,9 @@ test("exact event review hands immutable artifacts to the queue-bounded publishe
   assert.match(publishResult.run ?? "", /completion_kind=superseded/);
   assert.match(publishResult.run ?? "", /completion_kind=deferred/);
   assert.match(publishResult.run ?? "", /completion_kind=refresh_required/);
+  assert.match(publishResult.run ?? "", /MUTATION_REASON.*generation_superseded/);
+  assert.match(publishResult.run ?? "", /completion_kind=retryable_failure/);
+  assert.match(publishResult.run ?? "", /reason_code=mutation_busy/);
   assert.match(publishResult.run ?? "", /reason_code=close_coverage_retry/);
   assert.match(publishResult.run ?? "", /reason_code=close_coverage_deferred/);
   assert.match(
@@ -632,7 +644,12 @@ test("exact event workflow binds all work to the canonical queue claim", () => {
   assert.match(claimStep, /response\.item_key !== requestedItemKey/);
   assert.match(claimStep, /response\.lease_revision !== requestedLeaseRevision/);
   assert.match(claimStep, /const itemKey = `\$\{targetRepo\}#\$\{itemNumber\}`/);
-  assert.match(claimStep, /claim_generation=\$\{responseProtocol === 2 \? claimGeneration : ""\}/);
+  assert.match(claimStep, /claim_generation=\$\{responseProtocol >= 2 \? claimGeneration : ""\}/);
+  assert.match(claimStep, /generation=\$\{responseProtocol === 3 \? response\.generation : ""\}/);
+  assert.match(
+    claimStep,
+    /operation_id=\$\{responseProtocol === 3 \? response\.operation_id : ""\}/,
+  );
   assert.match(claimStep, /protocol_version=\$\{responseProtocol\}/);
   assert.match(claimStep, /decision=\$\{JSON\.stringify\(decision\)\}/);
   assert.doesNotMatch(claimedWork, /github\.event\.client_payload/);
@@ -753,7 +770,7 @@ test("exact-review lease competition skips only known conflicts and gates both o
   }
 });
 
-test("exact event workflow keeps both queue protocol versions live during rolling deploys", () => {
+test("exact event workflow keeps queue protocol v1-v3 live during rolling deploys", () => {
   const workflow = readText(".github/workflows/sweep.yml");
   const eventStart = workflow.indexOf("\n  event-review-apply:");
   const eventEnd = workflow.indexOf("\n  target-fanout:", eventStart);
@@ -770,9 +787,13 @@ test("exact event workflow keeps both queue protocol versions live during rollin
   assert.match(claimStep, /const legacyDecision = \{/);
   assert.match(claimStep, /response\.decision && typeof response\.decision === "object"/);
   assert.match(claimStep, /reviewOptions\.command_status_marker/);
-  assert.match(claimStep, /responseProtocol === 2/);
-  assert.match(completeStep, /protocolVersion !== 1 && protocolVersion !== 2/);
-  assert.match(completeStep, /protocolVersion === 2/);
+  assert.match(claimStep, /responseProtocol !== 3/);
+  assert.match(
+    completeStep,
+    /protocolVersion !== 1 && protocolVersion !== 2 && protocolVersion !== 3/,
+  );
+  assert.match(completeStep, /protocolVersion >= 2/);
+  assert.match(completeStep, /protocolVersion === 3/);
   assert.match(completeStep, /: \{\}\),/);
 });
 
@@ -1996,7 +2017,7 @@ test("manual exact-item review dispatches reserve their live shard capacity", ()
 
   assert.match(
     workflow,
-    /github\.event_name == 'workflow_dispatch' && \(github\.event\.inputs\.item_number != '' \|\| github\.event\.inputs\.item_numbers != ''\)\) && format\('clawsweeper-intake-exact-\{0\}'/,
+    /github\.event_name == 'workflow_dispatch' && \(github\.event\.inputs\.item_number != '' \|\| github\.event\.inputs\.item_numbers != ''\)\) && format\('clawsweeper-intake-exact-run-\{0\}', github\.run_id\)/,
   );
   assert.doesNotMatch(
     workflow,
@@ -2354,6 +2375,28 @@ test("scheduled normal review uses one item per shard for lease coverage", () =>
   );
 });
 
+test("per-item review jobs expose setup, runner, and cancellation metrics", () => {
+  const workflow = readText(".github/workflows/sweep.yml");
+  const reviewJob = workflow.slice(
+    workflow.indexOf("\n  review:"),
+    workflow.indexOf("\n  requeue-source-revision-drift:"),
+  );
+
+  assert.match(reviewJob, /Mark item job start/);
+  assert.match(reviewJob, /item_job_setup_ms/);
+  assert.match(reviewJob, /runner_duration_ms/);
+  assert.match(reviewJob, /codex_cancel_latency_ms/);
+  assert.match(reviewJob, /cancelled_review_consumed_tokens/);
+  assert.match(reviewJob, /avoided_tokens/);
+  assert.match(reviewJob, /trap on_cancel TERM INT/);
+  assert.match(reviewJob, /rm -rf "\.\.\/review-artifacts\/item-/);
+  assert.match(
+    reviewJob,
+    /group: clawsweeper-review-\$\{\{ matrix\.repo_slug \}\}-\$\{\{ matrix\.item_number \}\}/,
+  );
+  assert.match(reviewJob, /cancel-in-progress: false/);
+});
+
 test("planned background reviews allow safe content-cache reuse without weakening exact reviews", () => {
   const workflow = readText(".github/workflows/sweep.yml");
   const eventReviewJobStart = workflow.indexOf("\n  event-review-apply:");
@@ -2371,7 +2414,7 @@ test("planned background reviews allow safe content-cache reuse without weakenin
   assert.match(reviewJob, /planned_automatic_review_arg=\(--planned-automatic-review\)/);
   assert.match(
     reviewJob,
-    /--item-numbers "\$\{\{ matrix\.item_numbers \}\}" \\\n+\s+"\$\{planned_automatic_review_arg\[@\]\}"/,
+    /--item-numbers "\$\{\{ matrix\.item_number \}\}" \\\n+\s+"\$\{planned_automatic_review_arg\[@\]\}"/,
   );
   assert.doesNotMatch(eventReviewJob, /--planned-automatic-review/);
 });
@@ -2391,14 +2434,14 @@ test("sweep event reviews and target fanout avoid storm amplification", () => {
   assert.match(eventBlock, /concurrency:/);
   assert.match(
     eventBlock,
-    /group: clawsweeper-event-review-\$\{\{ github\.event\.client_payload\.queue_claim\.item_key \|\| github\.event\.client_payload\.item_key \|\| github\.run_id \}\}/,
+    /group: clawsweeper-review-\$\{\{ github\.event\.client_payload\.repo_slug/,
   );
   assert.match(eventBlock, /queue_lease_id != ''/);
   assert.match(eventBlock, /item_key: process\.env\.ITEM_KEY/);
   assert.match(eventBlock, /lease_revision: leaseRevision/);
   assert.match(eventBlock, /claim_generation: claimGeneration/);
   assert.match(eventBlock, /decision=\$\{JSON\.stringify\(decision\)\}/);
-  assert.match(eventBlock, /cancel-in-progress: false/);
+  assert.match(eventBlock, /cancel-in-progress: true/);
   assert.match(legacyIntakeBlock, /legacy-event-queue-intake:/);
   assert.match(legacyIntakeBlock, /\/internal\/exact-review\/enqueue/);
   assert.match(legacyIntakeBlock, /gh api "repos\/\$target_repo" --jq \.default_branch/);

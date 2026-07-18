@@ -26,9 +26,11 @@ export interface ExactReviewBundleContext {
   itemNumber: number;
   itemKind: "issue" | "pull_request";
   itemKey: string;
-  protocolVersion: 1 | 2;
+  protocolVersion: 1 | 2 | 3;
   leaseRevision: number | null;
   claimGeneration: number | null;
+  generation?: number;
+  operationId?: string;
   liveProceeded: boolean;
   liveTerminalNoop: boolean;
   liveTerminalMissing: boolean;
@@ -53,9 +55,11 @@ export interface ExactReviewBundleManifest {
   };
   queue: {
     item_key: string;
-    protocol_version: 1 | 2;
+    protocol_version: 1 | 2 | 3;
     lease_revision: number | null;
     claim_generation: number | null;
+    generation?: number;
+    operation_id?: string;
   };
   target: {
     repo: string;
@@ -129,6 +133,9 @@ export function createExactReviewBundle(
       protocol_version: context.protocolVersion,
       lease_revision: context.leaseRevision,
       claim_generation: context.claimGeneration,
+      ...(context.protocolVersion === 3
+        ? { generation: context.generation, operation_id: context.operationId }
+        : {}),
     },
     target: {
       repo: context.targetRepo,
@@ -211,12 +218,18 @@ function assertExpectedManifest(
     protocolVersion: manifest.queue.protocol_version,
     leaseRevision: manifest.queue.lease_revision,
     claimGeneration: manifest.queue.claim_generation,
+    ...(manifest.queue.protocol_version === 3
+      ? {
+          generation: manifest.queue.generation,
+          operationId: manifest.queue.operation_id,
+        }
+      : {}),
     liveProceeded: manifest.review.live_proceeded,
     liveTerminalNoop: manifest.review.live_terminal_noop,
     liveTerminalMissing: manifest.review.live_terminal_missing,
     liveGuardedOpen: manifest.review.live_guarded_open,
   } satisfies ExactReviewBundleContext;
-  if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+  if (canonicalJson(actual) !== canonicalJson(expected)) {
     throw new Error("exact review bundle does not match the trusted workflow context");
   }
 }
@@ -244,16 +257,24 @@ function validateContext(value: ExactReviewBundleContext): ExactReviewBundleCont
   if (value.itemKey !== `${value.targetRepo}#${value.itemNumber}`) {
     throw new Error("item key does not match the target");
   }
-  if (value.protocolVersion !== 1 && value.protocolVersion !== 2) {
+  if (value.protocolVersion !== 1 && value.protocolVersion !== 2 && value.protocolVersion !== 3) {
     throw new Error("queue protocol version is invalid");
   }
   nullablePositiveInteger(value.leaseRevision, "lease revision");
   nullablePositiveInteger(value.claimGeneration, "claim generation");
   if (
-    value.protocolVersion === 2 &&
+    value.protocolVersion >= 2 &&
     (value.leaseRevision === null || value.claimGeneration === null)
   ) {
     throw new Error("queue protocol v2 requires the full claim tuple");
+  }
+  if (
+    value.protocolVersion === 3 &&
+    (!Number.isSafeInteger(value.generation) ||
+      Number(value.generation) < 1 ||
+      !/^[A-Za-z0-9-]{20,100}$/.test(value.operationId || ""))
+  ) {
+    throw new Error("queue protocol v3 requires generation and operation ID");
   }
   for (const [label, flag] of [
     ["live proceeded", value.liveProceeded],
@@ -292,7 +313,20 @@ function validateManifest(value: unknown): ExactReviewBundleManifest {
   const workflow = record(manifest.workflow, "workflow");
   exactKeys(workflow, ["repository", "source_sha", "run_id", "run_attempt", "producer_job"]);
   const queue = record(manifest.queue, "queue");
-  exactKeys(queue, ["item_key", "protocol_version", "lease_revision", "claim_generation"]);
+  const queueProtocolVersion = numberValue(queue.protocol_version, "queue.protocol_version");
+  exactKeys(
+    queue,
+    queueProtocolVersion === 3
+      ? [
+          "item_key",
+          "protocol_version",
+          "lease_revision",
+          "claim_generation",
+          "generation",
+          "operation_id",
+        ]
+      : ["item_key", "protocol_version", "lease_revision", "claim_generation"],
+  );
   const target = record(manifest.target, "target");
   exactKeys(target, ["repo", "branch", "item_number", "item_kind"]);
   const review = record(manifest.review, "review");
@@ -317,9 +351,15 @@ function validateManifest(value: unknown): ExactReviewBundleManifest {
     itemNumber: numberValue(target.item_number, "target.item_number"),
     itemKind: target.item_kind as "issue" | "pull_request",
     itemKey: stringValue(queue.item_key, "queue.item_key"),
-    protocolVersion: queue.protocol_version as 1 | 2,
+    protocolVersion: queueProtocolVersion as 1 | 2 | 3,
     leaseRevision: nullableNumber(queue.lease_revision, "queue.lease_revision"),
     claimGeneration: nullableNumber(queue.claim_generation, "queue.claim_generation"),
+    ...(queueProtocolVersion === 3
+      ? {
+          generation: numberValue(queue.generation, "queue.generation"),
+          operationId: stringValue(queue.operation_id, "queue.operation_id"),
+        }
+      : {}),
     liveProceeded: booleanValue(review.live_proceeded, "review.live_proceeded"),
     liveTerminalNoop: booleanValue(review.live_terminal_noop, "review.live_terminal_noop"),
     liveTerminalMissing: booleanValue(review.live_terminal_missing, "review.live_terminal_missing"),
@@ -375,6 +415,9 @@ function validateManifest(value: unknown): ExactReviewBundleManifest {
       protocol_version: context.protocolVersion,
       lease_revision: context.leaseRevision,
       claim_generation: context.claimGeneration,
+      ...(context.protocolVersion === 3
+        ? { generation: context.generation, operation_id: context.operationId }
+        : {}),
     },
     target: {
       repo: context.targetRepo,

@@ -507,6 +507,12 @@ export default {
       return exactReviewQueueRequest(env, "/heartbeat", request);
     if (url.pathname === "/internal/exact-review/complete" && request.method === "POST")
       return exactReviewQueueRequest(env, "/complete", request);
+    if (url.pathname === "/internal/exact-review/generation/check" && request.method === "POST")
+      return authenticatedExactReviewQueueRequest(request, env, "/generation/check");
+    if (url.pathname === "/internal/exact-review/mutation/acquire" && request.method === "POST")
+      return authenticatedExactReviewQueueRequest(request, env, "/mutation/acquire");
+    if (url.pathname === "/internal/exact-review/mutation/release" && request.method === "POST")
+      return authenticatedExactReviewQueueRequest(request, env, "/mutation/release");
     if (url.pathname === "/internal/exact-review/claimed-runs" && request.method === "POST")
       return authenticatedExactReviewQueueRequest(request, env, "/claimed-runs");
     if (url.pathname === "/internal/exact-review/dead-letters/list" && request.method === "POST")

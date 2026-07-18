@@ -29,9 +29,10 @@ not split reports into issue/PR subtrees.
   closing only unchanged, high-confidence proposals.
 - Repository-specific rules live in `src/repository-profiles.ts`; ClawHub apply
   may close only PRs that are certainly implemented on `main`.
-- Worker concurrency is shard-level: each shard processes its selected items
-  sequentially. Maximum parallel Codex sessions equals `shard_count`, not
-  `batch_size * shard_count`.
+- Review compute is item-sharded: every matrix job handles exactly one item.
+  `batch_size` limits planner selection, `shard_count` maps to matrix
+  `max-parallel`, and the durable queue permit is the authoritative cross-run
+  Codex concurrency limit.
 - `openclaw/clawsweeper-state` is the live status surface and generated state
   store. Check current Actions and that repo before trusting local generated
   timestamps.

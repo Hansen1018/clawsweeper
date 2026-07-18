@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawnSync } from "node:child_process";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, createHmac, randomUUID } from "node:crypto";
 import {
   chmodSync,
   closeSync,
@@ -1118,6 +1118,7 @@ interface PlanCandidateResult {
 const DEFAULT_PLAN_BATCH_SIZE = 3;
 const DEFAULT_PLAN_SHARD_COUNT = AUTOMATION_LIMITS.review_shards.normal_default;
 const MAX_PLAN_SHARD_COUNT = AUTOMATION_LIMITS.review_shards.hard_cap;
+const MAX_REVIEW_MATRIX_ITEMS = 256;
 
 type DueCandidate = SchedulerDueCandidate<Item, ExistingReview>;
 
@@ -2774,6 +2775,118 @@ class ApplyMutationReviewGuardError extends Error {
 
 let activeApplyMutationRunner: MutationRunner | null = null;
 let activeReviewMutationRunner: MutationRunner | null = null;
+
+type QueueMutationPurpose = "review" | "apply";
+
+type QueueMutationPermit = {
+  itemKey: string;
+  generation: number;
+  operationId: string;
+  owner: string;
+  purpose: QueueMutationPurpose;
+};
+
+type QueueMutationPermitResult =
+  | { status: "disabled" }
+  | { status: "acquired"; permit: QueueMutationPermit }
+  | { status: "deferred"; reason: string };
+
+function queueMutationRequest(
+  path: "/mutation/acquire" | "/mutation/release",
+  permit: QueueMutationPermit,
+): { status: number; body: Record<string, unknown> } {
+  const queueUrl = String(process.env.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL ?? "").replace(/\/$/, "");
+  const secret = String(process.env.CLAWSWEEPER_WEBHOOK_SECRET ?? "");
+  if (!/^https:\/\/[^\s]+$/.test(queueUrl) || !secret) {
+    throw new Error("mutation queue URL or webhook secret is missing");
+  }
+  const payload = JSON.stringify({
+    item_key: permit.itemKey,
+    generation: permit.generation,
+    operation_id: permit.operationId,
+    owner: permit.owner,
+    purpose: permit.purpose,
+  });
+  const signature = `sha256=${createHmac("sha256", secret).update(payload).digest("hex")}`;
+  const result = spawnSync(
+    "curl",
+    [
+      "--silent",
+      "--show-error",
+      "--connect-timeout",
+      "5",
+      "--max-time",
+      "20",
+      "--request",
+      "POST",
+      "--header",
+      "content-type: application/json",
+      "--header",
+      `x-clawsweeper-exact-review-signature: ${signature}`,
+      "--data-binary",
+      payload,
+      "--write-out",
+      "\n%{http_code}",
+      `${queueUrl}/internal/exact-review${path}`,
+    ],
+    { cwd: ROOT, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+  );
+  if (result.error) throw result.error;
+  if (result.status !== 0) {
+    throw new Error(
+      `mutation queue request failed: ${String(result.stderr || "curl failed").trim()}`,
+    );
+  }
+  const output = String(result.stdout ?? "");
+  const splitAt = output.lastIndexOf("\n");
+  const status = Number(output.slice(splitAt + 1));
+  if (splitAt < 0 || !Number.isInteger(status)) {
+    throw new Error("mutation queue returned an invalid HTTP response");
+  }
+  const responseText = output.slice(0, splitAt).trim();
+  const body = responseText ? asRecord(JSON.parse(responseText) as unknown) : {};
+  return { status, body };
+}
+
+function acquireQueueMutationPermit(options: {
+  repo: string;
+  number: number;
+  purpose: QueueMutationPurpose;
+  generation?: number;
+  operationId?: string;
+}): QueueMutationPermitResult {
+  const required = process.env.CLAWSWEEPER_REQUIRE_MUTATION_PERMIT === "1";
+  const configured = Boolean(
+    process.env.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL && process.env.CLAWSWEEPER_WEBHOOK_SECRET,
+  );
+  if (!configured) {
+    if (required) throw new Error("required per-item mutation queue is not configured");
+    return { status: "disabled" };
+  }
+  const generation = options.generation ?? 1;
+  const permit: QueueMutationPermit = {
+    itemKey: `${options.repo}#${options.number}`,
+    generation,
+    operationId: options.operationId ?? randomUUID(),
+    owner: `github-run-${process.env.GITHUB_RUN_ID || "local"}-${process.env.GITHUB_RUN_ATTEMPT || "1"}-${process.pid}`,
+    purpose: options.purpose,
+  };
+  const response = queueMutationRequest("/mutation/acquire", permit);
+  if (response.status === 200) return { status: "acquired", permit };
+  const reason =
+    typeof response.body.error === "string" ? response.body.error : `http_${response.status}`;
+  if (response.status === 409) return { status: "deferred", reason };
+  throw new Error(`mutation queue acquire failed with HTTP ${response.status}: ${reason}`);
+}
+
+function releaseQueueMutationPermit(permit: QueueMutationPermit | null): void {
+  if (!permit) return;
+  const response = queueMutationRequest("/mutation/release", permit);
+  if (response.status !== 200 && response.body.error !== "mutation_not_owned") {
+    const reason = typeof response.body.error === "string" ? response.body.error : "unknown";
+    throw new Error(`mutation queue release failed with HTTP ${response.status}: ${reason}`);
+  }
+}
 
 function mutationErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -8877,6 +8990,10 @@ function planCapacityReason(options: {
   return "under capacity: due backlog below planned capacity";
 }
 
+export function planItemReviewCapacity(batchSize: number): number {
+  return Math.min(MAX_REVIEW_MATRIX_ITEMS, Math.max(1, batchSize));
+}
+
 function planCandidates(options: {
   batchSize: number;
   maxPages: number;
@@ -8891,7 +9008,10 @@ function planCandidates(options: {
 }): PlanCandidateResult {
   const shardCount = planShardCount(options.shardCount);
   const batchSize = Math.max(1, options.batchSize);
-  const capacity = batchSize * shardCount;
+  // Item shards make batch size the total planner selection budget. Shard count
+  // now controls only matrix parallelism; multiplying them would exceed GitHub's
+  // 256-job matrix limit under the production defaults.
+  const capacity = planItemReviewCapacity(batchSize);
   const activeFloor =
     options.hotIntake || options.itemNumber || options.itemNumbers
       ? 0
@@ -20730,29 +20850,18 @@ function patchDurableReviewStatusBody(options: {
   const currentBody = commentBody(options.comment);
   const id = commentId(options.comment);
   if (!currentBody || id === null || !options.nextBody || options.nextBody === currentBody) return;
+  // GitHub's issue-comment PATCH endpoint does not implement If-Match. Re-read
+  // the durable comment immediately before the mutation instead; the caller's
+  // per-item mutation permit is what excludes another ClawSweeper writer from
+  // the check/write interval.
+  const liveComment = issueReviewCommentState(options.itemNumber).reviewComment;
+  if (commentId(liveComment) !== id || commentBody(liveComment) !== currentBody) return;
   const endpoint = `repos/${targetRepo()}/issues/comments/${id}`;
-  const snapshot = ghWithRetry(["api", "--include", endpoint]);
-  const etag = snapshot.match(/^etag:\s*(.+)\r?$/im)?.[1]?.trim();
-  const jsonStart = snapshot.lastIndexOf("\n{");
-  const liveComment =
-    jsonStart >= 0 ? asRecord(JSON.parse(snapshot.slice(jsonStart + 1)) as unknown) : {};
-  if (!etag || commentBody(liveComment) !== currentBody) return;
   const payload = writeCommentPayload(options.itemNumber, options.nextBody);
-  const args = [
-    "api",
-    endpoint,
-    "--method",
-    "PATCH",
-    "-H",
-    `If-Match: ${etag}`,
-    "--input",
-    payload,
-  ];
+  const args = ["api", endpoint, "--method", "PATCH", "--input", payload];
   ghObservedMutationCommand({
     identity: options.identity,
     args,
-    knownNoMutation: (error) =>
-      /(?:\b412\b|precondition failed)/i.test(mutationErrorMessage(error)),
   });
 }
 
@@ -21729,6 +21838,31 @@ ${renderReviewContextBudget(options.context)}
   `;
 }
 
+export function planItemMatrix(
+  candidates: readonly {
+    repo: string;
+    number: number;
+    kind: ItemKind;
+    updatedAt: string;
+  }[],
+) {
+  if (candidates.length > MAX_REVIEW_MATRIX_ITEMS) {
+    throw new UserFacingCommandError(
+      `Review plan selected ${candidates.length} items; GitHub Actions supports at most ${MAX_REVIEW_MATRIX_ITEMS} matrix jobs. Reduce --batch-size or the explicit item list.`,
+    );
+  }
+  return candidates.map((item, index) => ({
+    shard: index,
+    repo: item.repo,
+    repo_slug: item.repo.replace(/[^A-Za-z0-9_.-]+/g, "-"),
+    item_number: item.number,
+    item_numbers: String(item.number),
+    kind: item.kind,
+    source_revision: item.updatedAt,
+    generation: Math.max(1, Date.parse(item.updatedAt) || 1),
+  }));
+}
+
 function planCommand(args: Args): void {
   repoFromArgs(args);
   const itemsDir = resolve(stringArg(args.items_dir, defaultItemsDir()));
@@ -21760,15 +21894,17 @@ function planCommand(args: Args): void {
   if (hasItemNumbersInput || itemNumbers.length > 0) planOptions.itemNumbers = itemNumbers;
   if (hotIntake) planOptions.hotIntake = true;
   const plan = planCandidates(planOptions);
+  // The planner's list response does not expose a uniform exact revision for
+  // issues and pull requests. Keep its updated_at snapshot in the matrix for
+  // observability; the item job still binds the authoritative live revision
+  // immediately before review.
+  const matrix = planItemMatrix(plan.candidates);
   console.log(
     JSON.stringify(
       {
         ...plan,
         reviewPolicy,
-        matrix: plan.shards.map((shard) => ({
-          shard: shard.shard,
-          item_numbers: shard.itemNumbers.join(",") || "none",
-        })),
+        matrix,
       },
       null,
       2,
@@ -22657,15 +22793,40 @@ function reserveReviewLeaseCommand(args: Args): void {
       `Could not resolve the current review revision for #${itemNumber}.`,
     );
   }
-  const result = postReviewStartStatusComment({
-    item,
-    headSha: currentRevision,
-    reviewTimeoutMs,
-    position: 1,
-    total: 1,
-    shardIndex: 0,
-    shardCount: 1,
+  const generation = Number(process.env.EXACT_REVIEW_GENERATION);
+  const operationId = String(process.env.EXACT_REVIEW_OPERATION_ID ?? "").trim();
+  const queueResult = acquireQueueMutationPermit({
+    repo: targetRepo(),
+    number: itemNumber,
+    purpose: "review",
+    ...(Number.isSafeInteger(generation) && generation > 0 ? { generation } : {}),
+    ...(operationId ? { operationId } : {}),
   });
+  if (queueResult.status === "deferred") {
+    console.log(
+      JSON.stringify({
+        status: "held",
+        retryAt: new Date(Date.now() + 60_000).toISOString(),
+        reason: queueResult.reason,
+      }),
+    );
+    return;
+  }
+  const queuePermit = queueResult.status === "acquired" ? queueResult.permit : null;
+  let result: ReturnType<typeof postReviewStartStatusComment>;
+  try {
+    result = postReviewStartStatusComment({
+      item,
+      headSha: currentRevision,
+      reviewTimeoutMs,
+      position: 1,
+      total: 1,
+      shardIndex: 0,
+      shardCount: 1,
+    });
+  } finally {
+    releaseQueueMutationPermit(queuePermit);
+  }
   if (result.status === "held") {
     console.log(JSON.stringify({ status: "held", retryAt: result.retryAt }));
     return;
@@ -26620,6 +26781,7 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
   let activeApplyMutationLease: {
     itemNumber: number;
     lease: AcquiredReviewStartLease;
+    queuePermit: QueueMutationPermit | null;
   } | null = null;
   const releaseActiveApplyMutationLease = (): void => {
     const active = activeApplyMutationLease;
@@ -26633,6 +26795,14 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
       console.error(
         `[apply] could not delete owned review lease comment ${active.lease.commentId}: ${mutationErrorMessage(error)}`,
       );
+    } finally {
+      try {
+        releaseQueueMutationPermit(active.queuePermit);
+      } catch (error) {
+        console.error(
+          `[apply] could not release mutation permit for #${active.itemNumber}: ${mutationErrorMessage(error)}`,
+        );
+      }
     }
   };
   runtimeBudget.onFailure = (error: unknown): void => {
@@ -27159,34 +27329,47 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
       leaseState: ReturnType<typeof refreshReviewStartLeaseState>,
     ): string | null => {
       if (dryRun || !requiresApplyMutationLease) return null;
-      let lease: AcquiredReviewStartLease | null = null;
-      if (leaseState.lease && !leaseState.preserve) {
-        if (!leaseState.lease.owner || leaseState.lease.commentId === null) {
-          return "matching review lease lacks a server-confirmed owner and comment id";
-        }
-        lease = {
-          owner: leaseState.lease.owner,
-          commentId: leaseState.lease.commentId,
-          headSha: leaseState.headSha,
-        };
-      } else {
-        const posted = postReviewStartStatusComment({
-          item,
-          headSha: leaseState.headSha,
-          reviewTimeoutMs: Math.max(5 * 60 * 1000, closeDelayMs + 60 * 1000),
-          position: 1,
-          total: 1,
-          shardIndex: 1,
-          shardCount: 1,
-          purpose: "apply",
-        });
-        if (posted.status !== "posted") {
-          return `${item.kind === "pull_request" ? "same-head" : "same-revision"} ClawSweeper lease was acquired concurrently`;
-        }
-        lease = posted.lease;
+      const queueResult = acquireQueueMutationPermit({
+        repo,
+        number,
+        purpose: "apply",
+      });
+      if (queueResult.status === "deferred") {
+        return `per-item mutation lane deferred apply: ${queueResult.reason}`;
       }
-      activeApplyMutationLease = { itemNumber: number, lease };
-      return ownedApplyMutationLeaseBlockReason(lease);
+      const queuePermit = queueResult.status === "acquired" ? queueResult.permit : null;
+      let lease: AcquiredReviewStartLease | null = null;
+      try {
+        if (leaseState.lease && !leaseState.preserve) {
+          if (!leaseState.lease.owner || leaseState.lease.commentId === null) {
+            return "matching review lease lacks a server-confirmed owner and comment id";
+          }
+          lease = {
+            owner: leaseState.lease.owner,
+            commentId: leaseState.lease.commentId,
+            headSha: leaseState.headSha,
+          };
+        } else {
+          const posted = postReviewStartStatusComment({
+            item,
+            headSha: leaseState.headSha,
+            reviewTimeoutMs: Math.max(5 * 60 * 1000, closeDelayMs + 60 * 1000),
+            position: 1,
+            total: 1,
+            shardIndex: 1,
+            shardCount: 1,
+            purpose: "apply",
+          });
+          if (posted.status !== "posted") {
+            return `${item.kind === "pull_request" ? "same-head" : "same-revision"} ClawSweeper lease was acquired concurrently`;
+          }
+          lease = posted.lease;
+        }
+        activeApplyMutationLease = { itemNumber: number, lease, queuePermit };
+        return ownedApplyMutationLeaseBlockReason(lease);
+      } finally {
+        if (!activeApplyMutationLease) releaseQueueMutationPermit(queuePermit);
+      }
     };
     const currentApplyMutationLeaseBlockReason = (): string | null => {
       const reviewActivityBlock = currentReviewActivityBlock();

@@ -380,10 +380,14 @@ scheduling, capacity, and monitoring behavior is documented in
 
 Review is proposal-only. It never closes items.
 
-- A planner scans open issues and PRs, then assigns exact item numbers to shards.
+- A planner scans open issues and PRs, then emits one matrix entry and one
+  cancellable compute job per item. `batch_size` limits planner selection;
+  `shard_count` controls matrix `max-parallel`.
 - Manual runs can pass `item_number` or comma-separated `item_numbers` to review
   exact Audit Health findings without scanning for a normal batch.
-- Each shard checks out the selected target repository at `main`.
+- Each item job checks out the selected target repository at `main`. Jobs for
+  different items have distinct concurrency groups; a newer generation cancels
+  only the older compute job for the same item.
 - Codex reviews with the internal model, high reasoning, the default service tier, and a
   10-minute per-item timeout.
 - Each item becomes a flat report under
@@ -777,7 +781,7 @@ ClawSweeper has one main capacity knob:
 This is a Codex worker budget, not a GitHub Actions runner limit. Deterministic
 exact-review publishers, comment routers, and lease reconcilers are
 control-plane workflows and do not consume these 128 slots.
-Lane limits are derived from that number: normal review defaults to 89 shards
+Lane limits are derived from that number: normal review defaults to 89 parallel item jobs
 for manual/backstop and scheduled runs, hot intake up to 44 shards, commit
 review 6 commits per page, and existing repair/issue implementation lanes use
 40% of `workers.max`, currently 51 live
@@ -785,8 +789,10 @@ workers. Imported gitcrawl cluster repair allows 2 live workers by default.
 Exact-item review, repair, and issue implementation are priority work; normal
 review, hot intake, and commit review are background work and automatically
 yield when priority work is active. Exact-item runs use a durable Worker queue
-that coalesces item deliveries, leases at most 64 concurrent reviews, and admits
-up to 60 active exact reviews per target repository. Other lanes retain the
+that coalesces item deliveries and is the authoritative admission layer across
+batch, webhook, and re-review workflow runs. It leases at most 64 concurrent reviews
+and admits up to 60 active exact reviews per target repository; matrix
+`max-parallel` only bounds one workflow run. Other lanes retain the
 checked-in 128-worker scheduling model.
 Use `workers.max` first when turning total Codex usage up or down; use
 `lanes.repair.cluster_max_live_runs` to tune the imported legacy cluster-repair
