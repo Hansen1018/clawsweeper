@@ -3964,6 +3964,7 @@ test("exact-review terminal callbacks release matching review mutation leases", 
 
 test("exact-review mutation acquire reclaims only terminal apply owners", async () => {
   const originalFetch = globalThis.fetch;
+  let terminalReadHook: (() => void | Promise<void>) | undefined;
   const { privateKey } = generateKeyPairSync("rsa", {
     modulusLength: 2048,
     privateKeyEncoding: { type: "pkcs8", format: "pem" },
@@ -3982,6 +3983,8 @@ test("exact-review mutation acquire reclaims only terminal apply owners", async 
       return jsonResponse({ id: 7001, run_attempt: 1, status: "completed" });
     }
     if (url.pathname === "/repos/openclaw/clawsweeper/actions/runs/7001/attempts/1") {
+      await terminalReadHook?.();
+      terminalReadHook = undefined;
       return jsonResponse({ id: 7001, run_attempt: 1, status: "completed", conclusion: "failure" });
     }
     if (url.pathname === "/repos/openclaw/clawsweeper/actions/runs/7002") {
@@ -4015,7 +4018,7 @@ test("exact-review mutation acquire reclaims only terminal apply owners", async 
         Date.now(),
         Date.now(),
       );
-    const acquire = () =>
+    const acquire = (purpose: "review" | "apply" = "review") =>
       queue.fetch(
         new Request("https://clawsweeper-exact-review-queue/mutation/acquire", {
           method: "POST",
@@ -4024,14 +4027,51 @@ test("exact-review mutation acquire reclaims only terminal apply owners", async 
             generation: 1,
             operation_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
             owner: "github-run-7003-1",
-            purpose: "review",
+            purpose,
           }),
         }),
       );
 
     insertApplyLease("github-run-7001-1-42");
+    terminalReadHook = () => {
+      storage.sql.exec(
+        "UPDATE exact_review_generations SET generation = 2, updated_at = ? WHERE item_key = ?",
+        Date.now(),
+        itemKey,
+      );
+    };
+    const superseded = await acquire();
+    assert.equal(superseded.status, 409);
+    assert.equal((await superseded.json()).error, "generation_superseded");
+    assert.equal(
+      Array.from(
+        storage.sql.exec(
+          "SELECT owner FROM exact_review_mutation_leases WHERE item_key = ?",
+          itemKey,
+        ),
+      )[0].owner,
+      "github-run-7001-1-42",
+    );
+    storage.sql.exec(
+      "UPDATE exact_review_generations SET generation = 1, updated_at = ? WHERE item_key = ?",
+      Date.now(),
+      itemKey,
+    );
     assert.equal((await acquire()).status, 200);
     storage.sql.exec("DELETE FROM exact_review_mutation_leases WHERE item_key = ?", itemKey);
+
+    insertApplyLease("github-run-7001-1-42");
+    terminalReadHook = async () => {
+      await storage.put("exact-review-queue", {
+        deliveries: {},
+        items: { [itemKey]: leasedExactReviewQueueItem(629, "6290") },
+      });
+    };
+    const reviewActive = await acquire("apply");
+    assert.equal(reviewActive.status, 409);
+    assert.equal((await reviewActive.json()).error, "review_active");
+    storage.sql.exec("DELETE FROM exact_review_mutation_leases WHERE item_key = ?", itemKey);
+    await storage.put("exact-review-queue", { deliveries: {}, items: {} });
 
     insertApplyLease("github-run-7002-1-43");
     const active = await acquire();

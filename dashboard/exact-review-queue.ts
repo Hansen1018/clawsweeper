@@ -952,6 +952,24 @@ export class ExactReviewQueue {
         observedLease.purpose === "apply" &&
         (await exactReviewMutationOwnerTerminal(this.env, observedLease.owner));
       const result = this.storage.transactionSync(() => {
+        // The Actions owner lookup above yields the Durable Object. Revalidate
+        // both fences in this transaction so a newer enqueue cannot grant stale
+        // review publication or let apply overlap newly active review compute.
+        const transactionalGeneration = this.currentReviewGenerationSync(tuple.itemKey);
+        if (tuple.purpose === "review" && transactionalGeneration !== tuple.generation) {
+          return {
+            acquired: false as const,
+            error: "generation_superseded" as const,
+            currentGeneration: transactionalGeneration,
+          };
+        }
+        if (tuple.purpose === "apply" && this.reviewComputeActiveSync(tuple.itemKey)) {
+          return {
+            acquired: false as const,
+            error: "review_active" as const,
+            currentGeneration: transactionalGeneration,
+          };
+        }
         let existing = this.mutationLeaseSync(tuple.itemKey);
         if (existing) {
           if (
@@ -967,7 +985,9 @@ export class ExactReviewQueue {
               existing.operation_id === observedLease.operation_id &&
               existing.owner === observedLease.owner &&
               existing.purpose === observedLease.purpose;
-            if (!observedLeaseStillOwns) return { acquired: false as const, existing };
+            if (!observedLeaseStillOwns) {
+              return { acquired: false as const, error: "mutation_busy" as const, existing };
+            }
 
             // Mutation leases never expire by age: a slow GitHub write must retain
             // exclusivity. Recovery is safe only after GitHub confirms the exact
@@ -1007,6 +1027,9 @@ export class ExactReviewQueue {
         return { acquired: true as const, resumed: false as const };
       });
       if (!result.acquired) {
+        if (result.error !== "mutation_busy") {
+          return json({ error: result.error, current_generation: result.currentGeneration }, 409);
+        }
         return json(
           {
             error: "mutation_busy",
