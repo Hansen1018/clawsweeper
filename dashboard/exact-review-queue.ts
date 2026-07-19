@@ -426,10 +426,7 @@ export class ExactReviewQueue {
           // so can leave either ordinary work or another recovery as a stale follow-up revision.
           // Ordinary source events retain normal replacement behavior, including the
           // command-context merge for pending items.
-          if (
-            !ignoredRecovery &&
-            (decision.supersedesInProgress || Boolean(decision.publication))
-          ) {
+          if (!ignoredRecovery) {
             const mergeable = current.state === "pending" || current.state === "parked";
             current.decision = mergeable
               ? mergePendingExactReviewDecision(current.decision, decision)

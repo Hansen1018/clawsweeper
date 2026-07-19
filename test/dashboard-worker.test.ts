@@ -3449,6 +3449,54 @@ test("exact-review claim preserves its immutable decision across a newer enqueue
   assert.equal(requeued.items["openclaw/openclaw#620"].leaseDecision, undefined);
 });
 
+test("exact-review retains an ordinary non-superseding update behind an active lease", async () => {
+  const storage = new MemoryDurableStorage();
+  const item = unclaimedExactReviewQueueItem(621);
+  await storage.put("exact-review-queue", {
+    deliveries: {},
+    items: { "openclaw/openclaw#621": item },
+  });
+  const queue = new ExactReviewQueue({ storage }, {});
+
+  assert.equal(
+    (
+      await queue.fetch(
+        buildExactReviewQueueRequest(
+          "ordinary-newer-621",
+          621,
+          "reopened",
+          "pull_request",
+          "openclaw/openclaw",
+        ),
+      )
+    ).status,
+    202,
+  );
+
+  const state = (await storage.get("exact-review-queue")) as {
+    items: Record<
+      string,
+      {
+        revision: number;
+        decision: { sourceAction: string; supersedesInProgress: boolean };
+        leaseDecision: { sourceAction: string };
+      }
+    >;
+  };
+  const updated = state.items["openclaw/openclaw#621"];
+  assert.equal(updated.revision, 2);
+  assert.deepEqual(updated.decision, {
+    targetRepo: "openclaw/openclaw",
+    targetBranch: "main",
+    itemNumber: 621,
+    itemKind: "pull_request",
+    sourceEvent: "pull_request",
+    sourceAction: "reopened",
+    supersedesInProgress: false,
+  });
+  assert.equal(updated.leaseDecision.sourceAction, item.leaseDecision.sourceAction);
+});
+
 test("new exact-review queue serves legacy workflow claims during rolling deploys", async () => {
   const storage = new MemoryDurableStorage();
   const item = unclaimedExactReviewQueueItem(624);
