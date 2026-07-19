@@ -10392,6 +10392,59 @@ test("hosted webhook enqueues item events with the repository default branch", a
   });
 });
 
+test("hosted webhook preserves pull-request revision and body updates", async () => {
+  const storage = new MemoryDurableStorage();
+  const queue = new ExactReviewQueue({ storage }, {});
+  const env = {
+    CLAWSWEEPER_WEBHOOK_SECRET: "test-secret",
+    EXACT_REVIEW_QUEUE: new MemoryDurableNamespace(queue),
+  };
+  const repository = {
+    full_name: "openclaw/gogcli",
+    default_branch: "trunk",
+    private: false,
+    archived: false,
+    fork: false,
+    has_issues: true,
+  };
+
+  for (const [deliveryId, action] of [
+    ["pr-revision", "synchronize"],
+    ["pr-body", "edited"],
+  ] as const) {
+    const response = await worker.fetch(
+      signedGithubWebhookRequest({
+        event: "pull_request",
+        secret: "test-secret",
+        deliveryId,
+        payload: {
+          action,
+          repository,
+          pull_request: { number: 597 },
+          installation: { id: 123 },
+        },
+      }),
+      env,
+    );
+    assert.equal(response.status, 202);
+    assert.deepEqual(await response.json(), {
+      ok: true,
+      queued: true,
+      item_key: "openclaw/gogcli#597",
+    });
+  }
+
+  const state = (await storage.get("exact-review-queue")) as {
+    items: Record<
+      string,
+      { revision: number; decision: { sourceEvent: string; sourceAction: string } }
+    >;
+  };
+  assert.equal(state.items["openclaw/gogcli#597"].revision, 2);
+  assert.equal(state.items["openclaw/gogcli#597"].decision.sourceEvent, "pull_request");
+  assert.equal(state.items["openclaw/gogcli#597"].decision.sourceAction, "edited");
+});
+
 test("hosted webhook requeues unlocked and close-guard removal events", async () => {
   const closeGuardLabels = [
     "security",
@@ -11103,23 +11156,27 @@ function signedGithubWebhookRequest({
   event,
   secret,
   payload,
+  deliveryId,
 }: {
   event: string;
   secret: string;
   payload: unknown;
+  deliveryId?: string;
 }) {
   const body = JSON.stringify(payload);
-  return signedGithubWebhookBodyRequest({ event, secret, body });
+  return signedGithubWebhookBodyRequest({ event, secret, body, deliveryId });
 }
 
 function signedGithubWebhookBodyRequest({
   event,
   secret,
   body,
+  deliveryId = "test-delivery",
 }: {
   event: string;
   secret: string;
   body: string;
+  deliveryId?: string;
 }) {
   const signature = `sha256=${createHmac("sha256", secret).update(body).digest("hex")}`;
   return new Request("https://clawsweeper.openclaw.ai/github/webhook", {
@@ -11127,7 +11184,7 @@ function signedGithubWebhookBodyRequest({
     headers: {
       "content-type": "application/json",
       "x-github-event": event,
-      "x-github-delivery": "test-delivery",
+      "x-github-delivery": deliveryId,
       "x-hub-signature-256": signature,
     },
     body,

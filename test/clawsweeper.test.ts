@@ -2276,6 +2276,28 @@ test("sweep workflow executes only durable queue leases without runner-side admi
   assert.doesNotMatch(exactReviewStep, /--codex-timeout-ms 600000/);
 });
 
+test("sweep workflow suppresses only legacy pull_request_target PR duplicate ingress", () => {
+  const workflow = readText(".github/workflows/sweep.yml");
+  const legacyIntakeBlock = workflow.slice(
+    workflow.indexOf("\n  legacy-event-queue-intake:"),
+    workflow.indexOf("\n  event-review-apply:"),
+  );
+  const legacyIngressWouldQueue = (sourceEvent: string, itemKind: string) =>
+    sourceEvent !== "pull_request_target" || itemKind !== "pull_request";
+
+  assert.equal(legacyIngressWouldQueue("pull_request_target", "pull_request"), false);
+  assert.equal(legacyIngressWouldQueue("pull_request", "pull_request"), true);
+  assert.equal(legacyIngressWouldQueue("issues", "issue"), true);
+  assert.equal(legacyIngressWouldQueue("issue_comment", "pull_request"), true);
+  assert.match(
+    legacyIntakeBlock,
+    /github\.event\.client_payload\.source_event != 'pull_request_target' \|\| github\.event\.client_payload\.item_kind != 'pull_request'/,
+  );
+  assert.match(legacyIntakeBlock, /\/internal\/exact-review\/enqueue/);
+  assert.doesNotMatch(legacyIntakeBlock, /source_event != 'pull_request'/);
+  assert.doesNotMatch(legacyIntakeBlock, /source_event != 'issue_comment'/);
+});
+
 test("sweep workflow gives high-context Codex reviews twenty minutes by default", () => {
   const workflow = readText(".github/workflows/sweep.yml");
 

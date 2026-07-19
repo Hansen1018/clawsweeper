@@ -228,7 +228,10 @@ jobs:
 
   legacy-event-queue-intake:
     name: Queue legacy exact-review event
-    if: ${{ github.event_name == 'repository_dispatch' && github.event.action != 'clawsweeper_target_sweep' && github.event.client_payload.queue_lease_id == '' && !(github.event.client_payload.target_repo == 'openclaw/clawhub' && vars.CLAWSWEEPER_ENABLE_CLAWHUB != '1') }}
+    # Pull-request events arrive through the direct GitHub App webhook. The
+    # legacy pull_request_target dispatch is a compatibility duplicate and must
+    # not create a second durable exact-review intent.
+    if: ${{ github.event_name == 'repository_dispatch' && github.event.action != 'clawsweeper_target_sweep' && github.event.client_payload.queue_lease_id == '' && (github.event.client_payload.source_event != 'pull_request_target' || github.event.client_payload.item_kind != 'pull_request') && !(github.event.client_payload.target_repo == 'openclaw/clawhub' && vars.CLAWSWEEPER_ENABLE_CLAWHUB != '1') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
