@@ -1678,7 +1678,7 @@ jobs:
             --header "content-type: application/json" \
             --header "x-clawsweeper-exact-review-signature: $signature" \
             --data "$payload" \
-            "${QUEUE_URL%/}/internal/exact-review/mutation/acquire")"
+            "${QUEUE_URL%/}/internal/exact-review/mutation/acquire")" || status="000"
           if [ "$status" = "409" ]; then
             reason="$(jq -r '.error // "mutation_busy"' "$response_file")"
             echo "reason=$reason" >> "$GITHUB_OUTPUT"
@@ -1687,9 +1687,12 @@ jobs:
             exit 0
           fi
           if [ "$status" != "200" ]; then
-            cat "$response_file" >&2
+            echo "::warning::Mutation permit service returned HTTP $status; publication will retry."
+            cat "$response_file" >&2 || true
+            echo "reason=mutation_busy" >> "$GITHUB_OUTPUT"
+            echo "acquired=false" >> "$GITHUB_OUTPUT"
             rm -f "$response_file"
-            exit 1
+            exit 0
           fi
           rm -f "$response_file"
           echo "owner=$owner" >> "$GITHUB_OUTPUT"

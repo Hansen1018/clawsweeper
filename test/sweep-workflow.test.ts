@@ -481,6 +481,8 @@ test("exact event review hands immutable artifacts to the queue-bounded publishe
   const publicationTelemetry = step(publisher, "Complete exact item review telemetry");
   assert.match(mutationPermit.run ?? "", /internal\/exact-review\/mutation\/acquire/);
   assert.match(mutationPermit.run ?? "", /generation_superseded|mutation_busy/);
+  assert.match(mutationPermit.run ?? "", /\|\| status="000"/);
+  assert.match(mutationPermit.run ?? "", /publication will retry/);
   assert.match(publish.if ?? "", /mutation-permit\.outputs\.acquired == 'true'/);
   assert.match(mutationRelease.run ?? "", /internal\/exact-review\/mutation\/release/);
   assert.match(mutationRelease.run ?? "", /mutation_not_owned/);
