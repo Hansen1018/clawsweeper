@@ -312,7 +312,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     concurrency:
-      group: clawsweeper-review-${{ github.event.client_payload.repo_slug || github.event.client_payload.target_repo || 'unknown-repo' }}-${{ github.event.client_payload.item_number || github.run_id }}
+      group: clawsweeper-review-${{ github.event.client_payload.target_repo || 'unknown-repo' }}-${{ github.event.client_payload.item_number || github.run_id }}
       cancel-in-progress: true
     permissions:
       actions: write
@@ -1358,7 +1358,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     concurrency:
-      group: clawsweeper-mutation-${{ github.event.client_payload.repo_slug || github.event.client_payload.target_repo || 'unknown-repo' }}-${{ github.event.client_payload.item_number || github.run_id }}
+      group: clawsweeper-mutation-${{ github.event.client_payload.target_repo || 'unknown-repo' }}-${{ github.event.client_payload.item_number || github.run_id }}
       cancel-in-progress: false
     permissions:
       actions: write
@@ -2839,7 +2839,9 @@ jobs:
     timeout-minutes: 75
     continue-on-error: true
     concurrency:
-      group: clawsweeper-review-${{ matrix.repo_slug }}-${{ matrix.item_number }}
+      # GitHub accepts owner/repo in concurrency groups. Keep that canonical
+      # identity so lossy state-path slugs cannot collide across repositories.
+      group: clawsweeper-review-${{ matrix.repo }}-${{ matrix.item_number }}
       # Background matrix entries are not generation-claimed by the durable queue.
       # They share the item group but only queue-backed exact work may cancel an owner.
       cancel-in-progress: false

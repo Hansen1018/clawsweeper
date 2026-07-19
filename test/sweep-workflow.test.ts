@@ -2392,7 +2392,7 @@ test("per-item review jobs expose setup, runner, and cancellation metrics", () =
   assert.match(reviewJob, /rm -rf "\.\.\/review-artifacts\/item-/);
   assert.match(
     reviewJob,
-    /group: clawsweeper-review-\$\{\{ matrix\.repo_slug \}\}-\$\{\{ matrix\.item_number \}\}/,
+    /group: clawsweeper-review-\$\{\{ matrix\.repo \}\}-\$\{\{ matrix\.item_number \}\}/,
   );
   assert.match(reviewJob, /cancel-in-progress: false/);
 });
@@ -2466,7 +2466,7 @@ test("sweep event reviews and target fanout avoid storm amplification", () => {
   assert.match(eventBlock, /concurrency:/);
   assert.match(
     eventBlock,
-    /group: clawsweeper-review-\$\{\{ github\.event\.client_payload\.repo_slug/,
+    /group: clawsweeper-review-\$\{\{ github\.event\.client_payload\.target_repo/,
   );
   assert.match(eventBlock, /queue_lease_id != ''/);
   assert.match(eventBlock, /item_key: process\.env\.ITEM_KEY/);
