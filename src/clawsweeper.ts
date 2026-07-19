@@ -27380,6 +27380,8 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
         activeApplyMutationLease = { itemNumber: number, lease, queuePermit };
         return ownedApplyMutationLeaseBlockReason(lease);
       } finally {
+        // A block reason makes the caller skip this item before mutation. Only
+        // the successful path transfers permit cleanup to the active lease.
         if (!activeApplyMutationLease) releaseQueueMutationPermit(queuePermit);
       }
     };

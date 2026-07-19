@@ -215,6 +215,9 @@ function nowIso(now) {
 if (import.meta.url === `file://${process.argv[1]}`) {
   runReviewTelemetryProducer().catch((error) => {
     console.log(`::warning::Review telemetry producer skipped: ${error?.message || error}`);
-    process.exitCode = 0;
+    // Workflow steps use continue-on-error so telemetry remains fail-open for
+    // review, while a nonzero outcome prevents dependent heartbeats from
+    // pretending that the refreshing row exists.
+    process.exitCode = 1;
   });
 }

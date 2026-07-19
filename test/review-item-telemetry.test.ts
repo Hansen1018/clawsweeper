@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 import {
@@ -87,4 +89,15 @@ test("review telemetry heartbeat advances total wall-clock duration", () => {
   );
 
   assert.deepEqual(record.phase_durations_ms, { total: 2_000, queue: 120, review: 900 });
+});
+
+test("review telemetry CLI warns and reports a failed optional write", () => {
+  const script = fileURLToPath(new URL("../scripts/review-item-telemetry.mjs", import.meta.url));
+  const result = spawnSync(process.execPath, [script], {
+    encoding: "utf8",
+    env: {},
+  });
+
+  assert.equal(result.status, 1);
+  assert.match(result.stdout, /::warning::Review telemetry producer skipped:/);
 });
