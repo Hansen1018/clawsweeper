@@ -489,6 +489,7 @@ test("exact event review hands immutable artifacts to the queue-bounded publishe
   assert.match(mutationRelease.run ?? "", /--write-out '%\{http_code\}'/);
   assert.match(publicationTelemetry.run ?? "", /completion_kind.*retryable_failure/);
   assert.match(publicationTelemetry.run ?? "", /REVIEW_TELEMETRY_ACTION=heartbeat/);
+  assert.equal(publicationTelemetry.env?.REVIEW_TELEMETRY_LEASE_MS, "7200000");
   assert.ok(publisher.steps.indexOf(mutationPermit) < publisher.steps.indexOf(publish));
   assert.match(publish.run ?? "", /live_state=.*gh api/);
   assert.match(publish.run ?? "", /LIVE_TERMINAL_NOOP.*LIVE_TERMINAL_MISSING/);

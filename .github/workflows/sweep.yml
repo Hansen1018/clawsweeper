@@ -2193,6 +2193,7 @@ jobs:
           REVIEW_TELEMETRY_SOURCE_EVENT: ${{ fromJSON(steps.publication-context.outputs.decision).sourceEvent }}
           REVIEW_TELEMETRY_SOURCE_ACTION: ${{ fromJSON(steps.publication-context.outputs.decision).sourceAction }}
           REVIEW_TELEMETRY_PUBLICATION_STARTED_AT: ${{ steps.publication-context.outputs.publication_started_at }}
+          REVIEW_TELEMETRY_LEASE_MS: "7200000"
         run: |
           result="${{ steps.exact-review-publication-result.outputs.outcome || 'failure' }}"
           completion_kind="${{ steps.exact-review-publication-result.outputs.completion_kind || 'permanent_failure' }}"
