@@ -2227,13 +2227,24 @@ jobs:
             --arg owner "$OWNER" \
             '{item_key:$item_key,generation:$generation,operation_id:$operation_id,owner:$owner,purpose:"review"}')"
           signature="$(PAYLOAD="$payload" node -e 'const crypto=require("node:crypto"); process.stdout.write(`sha256=${crypto.createHmac("sha256", process.env.CLAWSWEEPER_WEBHOOK_SECRET).update(process.env.PAYLOAD).digest("hex")}`)')"
+          response_file="$RUNNER_TEMP/exact-review-mutation-release.json"
+          trap 'rm -f "$response_file"' EXIT
           for attempt in 1 2 3; do
-            if curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
+            http_status="$(curl --silent --show-error --connect-timeout 5 --max-time 20 \
+              --output "$response_file" \
+              --write-out '%{http_code}' \
               --request POST \
               --header "content-type: application/json" \
               --header "x-clawsweeper-exact-review-signature: $signature" \
               --data "$payload" \
-              "${QUEUE_URL%/}/internal/exact-review/mutation/release" >/dev/null; then
+              "${QUEUE_URL%/}/internal/exact-review/mutation/release")" || http_status="000"
+            if [[ "$http_status" == 2* ]]; then
+              exit 0
+            fi
+            # This step runs only after the same workflow acquired the tuple. A
+            # missing tuple on retry means the first response was lost or terminal
+            # reconciliation already performed the requested release.
+            if [ "$http_status" = "409" ] && [ "$(jq -r '.error // empty' "$response_file" 2>/dev/null)" = "mutation_not_owned" ]; then
               exit 0
             fi
             [ "$attempt" -eq 3 ] || sleep "$((attempt * 5))"

@@ -2207,7 +2207,7 @@ test("sweep workflow executes only durable queue leases without runner-side admi
 
   assert.match(
     eventReviewBlock,
-    /group: clawsweeper-review-\$\{\{ github\.event\.client_payload\.repo_slug \|\| github\.event\.client_payload\.target_repo \|\| 'unknown-repo' \}\}-\$\{\{ github\.event\.client_payload\.item_number \|\| github\.run_id \}\}/,
+    /group: clawsweeper-review-\$\{\{ github\.event\.client_payload\.target_repo \|\| 'unknown-repo' \}\}-\$\{\{ github\.event\.client_payload\.item_number \|\| github\.run_id \}\}/,
   );
   assert.match(eventReviewBlock, /cancel-in-progress: true/);
   assert.match(eventReviewBlock, /github\.event\.client_payload\.queue_lease_id != ''/);

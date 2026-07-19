@@ -482,6 +482,8 @@ test("exact event review hands immutable artifacts to the queue-bounded publishe
   assert.match(mutationPermit.run ?? "", /generation_superseded|mutation_busy/);
   assert.match(publish.if ?? "", /mutation-permit\.outputs\.acquired == 'true'/);
   assert.match(mutationRelease.run ?? "", /internal\/exact-review\/mutation\/release/);
+  assert.match(mutationRelease.run ?? "", /mutation_not_owned/);
+  assert.match(mutationRelease.run ?? "", /--write-out '%\{http_code\}'/);
   assert.ok(publisher.steps.indexOf(mutationPermit) < publisher.steps.indexOf(publish));
   assert.match(publish.run ?? "", /live_state=.*gh api/);
   assert.match(publish.run ?? "", /LIVE_TERMINAL_NOOP.*LIVE_TERMINAL_MISSING/);
