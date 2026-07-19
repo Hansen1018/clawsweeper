@@ -3,7 +3,12 @@ export function compactText(value: unknown, maxLength: number) {
     .replace(/\s+/g, " ")
     .trim();
   if (text.length <= maxLength) return text;
-  if (maxLength <= 16) return `${text.slice(0, Math.max(0, maxLength - 3))}...`;
+  // Below the ellipsis width there's no room for "..."; slicing to `maxLength-3` and always
+  // appending "..." overflowed the cap (e.g. maxLength 2 returned "..." of length 3).
+  if (maxLength <= 16) {
+    if (maxLength < 3) return text.slice(0, Math.max(0, maxLength));
+    return `${text.slice(0, maxLength - 3)}...`;
+  }
 
   const marker = " ... ";
   const available = Math.max(0, maxLength - marker.length);
