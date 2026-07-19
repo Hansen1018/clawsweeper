@@ -1019,6 +1019,12 @@ export class ExactReviewQueue {
             );
           if (existing) return { acquired: true as const, resumed: true as const };
         }
+        if (tuple.purpose === "apply") {
+          // Apply starts a newer GitHub mutation epoch. Advance the fence before
+          // granting ownership so a queued publication from the preceding review
+          // cannot acquire its review permit after apply completes.
+          this.reserveReviewGenerationSync(tuple.itemKey, true, now);
+        }
         this.storage.sql.exec(
           `INSERT INTO ${EXACT_REVIEW_MUTATION_LEASE_TABLE}
              (item_key, generation, operation_id, owner, purpose, acquired_at, heartbeat_at)

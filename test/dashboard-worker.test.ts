@@ -3756,7 +3756,7 @@ test("exact-review protocol v3 supersedes only the same item generation and fenc
     items: Record<string, { state: string; generation?: number; parkedReason?: string }>;
   };
   assert.equal(mutationBlocked.items[idleItemKey].state, "parked");
-  assert.equal(mutationBlocked.items[idleItemKey].generation, 1);
+  assert.equal(mutationBlocked.items[idleItemKey].generation, 2);
   assert.equal(mutationBlocked.items[idleItemKey].parkedReason, "mutation_active");
   assert.equal(
     Array.from(
@@ -3765,7 +3765,7 @@ test("exact-review protocol v3 supersedes only the same item generation and fenc
         idleItemKey,
       ),
     )[0].generation,
-    1,
+    2,
   );
   const reviewWhileApplyMutates = await mutationRequest("/mutation/acquire", {
     ...applyTuple,
@@ -3773,13 +3773,13 @@ test("exact-review protocol v3 supersedes only the same item generation and fenc
     operation_id: "66666666-6666-4666-8666-666666666666",
   });
   assert.equal(reviewWhileApplyMutates.status, 409);
-  assert.equal((await reviewWhileApplyMutates.json()).error, "mutation_busy");
+  assert.equal((await reviewWhileApplyMutates.json()).error, "generation_superseded");
   assert.equal((await mutationRequest("/mutation/release", applyTuple)).status, 200);
   const resumed = (await storage.get("exact-review-queue")) as {
     items: Record<string, { state: string; generation?: number; parkedReason?: string }>;
   };
   assert.equal(resumed.items[idleItemKey].state, "pending");
-  assert.equal(resumed.items[idleItemKey].generation, 2);
+  assert.equal(resumed.items[idleItemKey].generation, 3);
   assert.equal(resumed.items[idleItemKey].parkedReason, undefined);
   assert.equal(
     Array.from(
@@ -3788,7 +3788,7 @@ test("exact-review protocol v3 supersedes only the same item generation and fenc
         idleItemKey,
       ),
     )[0].generation,
-    2,
+    3,
   );
   assert.equal(
     (
@@ -4142,6 +4142,31 @@ test("exact-review mutation acquire reclaims only terminal apply owners", async 
     assert.equal(unknown.status, 409);
     assert.equal((await unknown.json()).error, "mutation_busy");
     storage.sql.exec("DELETE FROM exact_review_mutation_leases WHERE item_key = ?", itemKey);
+
+    const stalePublication = leasedExactReviewPublicationItem(629, "6999");
+    await storage.put("exact-review-queue", {
+      deliveries: {},
+      items: { [stalePublication.key]: stalePublication },
+    });
+    assert.equal((await acquire("apply")).status, 200);
+    assert.equal(
+      Array.from(
+        storage.sql.exec(
+          "SELECT generation FROM exact_review_generations WHERE item_key = ?",
+          itemKey,
+        ),
+      )[0].generation,
+      2,
+    );
+    const stalePublicationPermit = await acquire();
+    assert.equal(stalePublicationPermit.status, 409);
+    assert.equal((await stalePublicationPermit.json()).error, "generation_superseded");
+    storage.sql.exec("DELETE FROM exact_review_mutation_leases WHERE item_key = ?", itemKey);
+    storage.sql.exec(
+      "UPDATE exact_review_generations SET generation = 1, updated_at = ? WHERE item_key = ?",
+      Date.now(),
+      itemKey,
+    );
 
     const parked = unclaimedExactReviewQueueItem(629);
     Object.assign(parked, {
