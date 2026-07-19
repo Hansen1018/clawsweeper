@@ -2397,6 +2397,38 @@ test("per-item review jobs expose setup, runner, and cancellation metrics", () =
   assert.match(reviewJob, /cancel-in-progress: false/);
 });
 
+test("review producers publish attributed immutable item telemetry", () => {
+  const workflow = YAML.parse(readText(".github/workflows/sweep.yml")) as {
+    jobs: Record<
+      string,
+      { steps: Array<{ name?: string; run?: string; env?: Record<string, string>; if?: string }> }
+    >;
+  };
+  const namedStep = (jobName: string, name: string) => {
+    const value = workflow.jobs[jobName]?.steps.find((candidate) => candidate.name === name);
+    assert.ok(value, `missing ${jobName} step ${name}`);
+    return value;
+  };
+  const exactStart = namedStep("event-review-apply", "Start exact item review telemetry");
+  const exactTerminal = namedStep("event-review-publish", "Complete exact item review telemetry");
+  const matrixStart = namedStep("review", "Start matrix item review telemetry");
+  const matrixTerminal = namedStep("publish", "Complete matrix item review telemetry");
+
+  assert.equal(exactStart.env?.REVIEW_TELEMETRY_EXACT, "true");
+  assert.match(exactStart.if ?? "", /always\(\)/);
+  assert.match(exactStart.env?.REVIEW_TELEMETRY_GENERATION ?? "", /claim-exact-review-queue/);
+  assert.match(exactStart.env?.REVIEW_TELEMETRY_OPERATION_ID ?? "", /claim-exact-review-queue/);
+  assert.match(exactTerminal.run ?? "", /generation_superseded/);
+  assert.match(exactTerminal.run ?? "", /workflow_cancelled/);
+  assert.match(matrixStart.env?.REVIEW_TELEMETRY_HOT_INTAKE ?? "", /needs\.plan\.outputs/);
+  assert.match(matrixStart.env?.REVIEW_TELEMETRY_OPERATION_ID ?? "", /matrix-/);
+  assert.match(matrixTerminal.run ?? "", /publication_applied/);
+  assert.match(matrixTerminal.run ?? "", /publication_failed/);
+  for (const producer of [exactStart, exactTerminal, matrixStart, matrixTerminal]) {
+    assert.match(producer.run ?? "", /review-item-telemetry\.mjs/);
+  }
+});
+
 test("planned background reviews allow safe content-cache reuse without weakening exact reviews", () => {
   const workflow = readText(".github/workflows/sweep.yml");
   const eventReviewJobStart = workflow.indexOf("\n  event-review-apply:");

@@ -491,6 +491,9 @@ jobs:
                   `claim_generation=${responseProtocol >= 2 ? claimGeneration : ""}`,
                   `generation=${responseProtocol === 3 ? response.generation : ""}`,
                   `operation_id=${responseProtocol === 3 ? response.operation_id : ""}`,
+                  `queued_at=${String(dispatch.queue_claim?.queued_at || "")}`,
+                  `dispatched_at=${String(dispatch.queue_claim?.dispatched_at || "")}`,
+                  `claimed_at=${new Date().toISOString()}`,
                   `protocol_version=${responseProtocol}`,
                   `decision=${JSON.stringify(decision)}`,
                 ];
@@ -691,6 +694,33 @@ jobs:
         if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.live-item.outcome == 'success' }}
         with:
           build-script: ${{ steps.live-item.outputs.proceed == 'true' && 'build:all' || 'build:repair' }}
+
+      - name: Start exact item review telemetry
+        id: exact-review-telemetry-start
+        if: ${{ always() && steps.claim-exact-review-queue.outputs.claimed == 'true' }}
+        continue-on-error: true
+        env:
+          REVIEW_TELEMETRY_ACTION: start
+          REVIEW_TELEMETRY_QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
+          CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
+          REVIEW_TELEMETRY_REPO: ${{ steps.target.outputs.target_repo }}
+          REVIEW_TELEMETRY_ITEM_NUMBER: ${{ steps.target.outputs.item_number }}
+          REVIEW_TELEMETRY_RUN_ID: ${{ github.run_id }}
+          REVIEW_TELEMETRY_RUN_ATTEMPT: ${{ github.run_attempt }}
+          REVIEW_TELEMETRY_GENERATION: ${{ steps.claim-exact-review-queue.outputs.generation }}
+          REVIEW_TELEMETRY_OPERATION_ID: ${{ steps.claim-exact-review-queue.outputs.operation_id }}
+          REVIEW_TELEMETRY_EXACT: "true"
+          REVIEW_TELEMETRY_SOURCE_EVENT: ${{ fromJSON(steps.claim-exact-review-queue.outputs.decision).sourceEvent }}
+          REVIEW_TELEMETRY_SOURCE_ACTION: ${{ fromJSON(steps.claim-exact-review-queue.outputs.decision).sourceAction }}
+          REVIEW_TELEMETRY_QUEUED_AT: ${{ steps.claim-exact-review-queue.outputs.queued_at }}
+          REVIEW_TELEMETRY_DISPATCHED_AT: ${{ steps.claim-exact-review-queue.outputs.dispatched_at }}
+          REVIEW_TELEMETRY_CLAIMED_AT: ${{ steps.claim-exact-review-queue.outputs.claimed_at }}
+          REVIEW_TELEMETRY_LEASE_MS: "7200000"
+        run: |
+          review_started_at="$(date -u '+%Y-%m-%dT%H:%M:%S.%3NZ')"
+          echo "review_started_at=$review_started_at" >> "$GITHUB_OUTPUT"
+          REVIEW_TELEMETRY_REVIEW_STARTED_AT="$review_started_at" \
+            node scripts/review-item-telemetry.mjs
 
       - name: React to target item review start
         if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.live-item.outputs.proceed == 'true' }}
@@ -1003,6 +1033,28 @@ jobs:
             args=(--interrupt-open-attempts --reason workflow_failed)
           fi
           pnpm run --silent finalize-action-events -- "${args[@]}"
+
+      - name: Update exact item review telemetry
+        if: ${{ always() && steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.exact-review-telemetry-start.outcome == 'success' }}
+        continue-on-error: true
+        env:
+          REVIEW_TELEMETRY_ACTION: heartbeat
+          REVIEW_TELEMETRY_QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
+          CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
+          REVIEW_TELEMETRY_REPO: ${{ steps.target.outputs.target_repo }}
+          REVIEW_TELEMETRY_ITEM_NUMBER: ${{ steps.target.outputs.item_number }}
+          REVIEW_TELEMETRY_RUN_ID: ${{ github.run_id }}
+          REVIEW_TELEMETRY_RUN_ATTEMPT: ${{ github.run_attempt }}
+          REVIEW_TELEMETRY_GENERATION: ${{ steps.claim-exact-review-queue.outputs.generation }}
+          REVIEW_TELEMETRY_OPERATION_ID: ${{ steps.claim-exact-review-queue.outputs.operation_id }}
+          REVIEW_TELEMETRY_EXACT: "true"
+          REVIEW_TELEMETRY_SOURCE_EVENT: ${{ fromJSON(steps.claim-exact-review-queue.outputs.decision).sourceEvent }}
+          REVIEW_TELEMETRY_SOURCE_ACTION: ${{ fromJSON(steps.claim-exact-review-queue.outputs.decision).sourceAction }}
+          REVIEW_TELEMETRY_REVIEW_STARTED_AT: ${{ steps.exact-review-telemetry-start.outputs.review_started_at }}
+          REVIEW_TELEMETRY_LEASE_MS: "7200000"
+        run: |
+          REVIEW_TELEMETRY_REVIEW_COMPLETED_AT="$(date -u '+%Y-%m-%dT%H:%M:%S.%3NZ')" \
+            node scripts/review-item-telemetry.mjs
 
       - name: Create exact review artifact bundle
         id: create-exact-review-bundle
@@ -1446,6 +1498,7 @@ jobs:
                   publisher_claim_generation: claimGeneration,
                   publisher_generation: response.generation ?? "",
                   publisher_operation_id: response.operation_id ?? "",
+                  publication_started_at: new Date().toISOString(),
                 };
                 fs.appendFileSync(process.env.GITHUB_OUTPUT, "claimed=true\n");
                 for (const [key, value] of Object.entries(values)) {
@@ -2120,6 +2173,42 @@ jobs:
             echo "failure_kind=$FAILURE_KIND" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Complete exact item review telemetry
+        if: ${{ always() && steps.publication-context.outputs.claimed == 'true' }}
+        continue-on-error: true
+        env:
+          REVIEW_TELEMETRY_ACTION: terminal
+          REVIEW_TELEMETRY_QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
+          CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
+          REVIEW_TELEMETRY_REPO: ${{ steps.publication-context.outputs.target_repo }}
+          REVIEW_TELEMETRY_ITEM_NUMBER: ${{ steps.publication-context.outputs.item_number }}
+          REVIEW_TELEMETRY_RUN_ID: ${{ steps.publication-context.outputs.producer_run_id }}
+          REVIEW_TELEMETRY_RUN_ATTEMPT: ${{ steps.publication-context.outputs.generation_attempt }}
+          REVIEW_TELEMETRY_GENERATION: ${{ steps.publication-context.outputs.generation }}
+          REVIEW_TELEMETRY_OPERATION_ID: ${{ steps.publication-context.outputs.operation_id }}
+          REVIEW_TELEMETRY_EXACT: "true"
+          REVIEW_TELEMETRY_SOURCE_EVENT: ${{ fromJSON(steps.publication-context.outputs.decision).sourceEvent }}
+          REVIEW_TELEMETRY_SOURCE_ACTION: ${{ fromJSON(steps.publication-context.outputs.decision).sourceAction }}
+          REVIEW_TELEMETRY_PUBLICATION_STARTED_AT: ${{ steps.publication-context.outputs.publication_started_at }}
+        run: |
+          result="${{ steps.exact-review-publication-result.outputs.outcome || 'failure' }}"
+          completion_kind="${{ steps.exact-review-publication-result.outputs.completion_kind || 'permanent_failure' }}"
+          reason="${{ steps.exact-review-publication-result.outputs.reason_code || 'unknown_failure' }}"
+          if [ "$completion_kind" = "superseded" ]; then
+            export REVIEW_TELEMETRY_OUTCOME=superseded
+            export REVIEW_TELEMETRY_TERMINAL_REASON=generation_superseded
+          elif [ "$result" = "success" ]; then
+            export REVIEW_TELEMETRY_OUTCOME=succeeded
+            export REVIEW_TELEMETRY_TERMINAL_REASON="$reason"
+          elif [ "$result" = "cancelled" ]; then
+            export REVIEW_TELEMETRY_OUTCOME=cancelled
+            export REVIEW_TELEMETRY_TERMINAL_REASON=workflow_cancelled
+          else
+            export REVIEW_TELEMETRY_OUTCOME=failed
+            export REVIEW_TELEMETRY_TERMINAL_REASON="$reason"
+          fi
+          node scripts/review-item-telemetry.mjs
+
       - name: Release generation-bound mutation permit
         if: ${{ always() && steps.publication-context.outputs.claimed == 'true' && steps.mutation-permit.outputs.acquired == 'true' && steps.publication-context.outputs.protocol_version == '3' }}
         env:
@@ -2769,7 +2858,9 @@ jobs:
     steps:
       - name: Mark item job start
         id: item-job-start
-        run: echo "started_at_ms=$(date +%s%3N)" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "started_at_ms=$(date +%s%3N)" >> "$GITHUB_OUTPUT"
+          echo "started_at=$(date -u '+%Y-%m-%dT%H:%M:%S.%3NZ')" >> "$GITHUB_OUTPUT"
 
       - uses: actions/checkout@v7
         with:
@@ -2886,6 +2977,30 @@ jobs:
           echo "compute_started_at_ms=$compute_started_at_ms" >> "$GITHUB_OUTPUT"
           echo "item_job_setup_ms=$((compute_started_at_ms - JOB_STARTED_AT_MS))" >> "$GITHUB_OUTPUT"
 
+      - name: Start matrix item review telemetry
+        id: matrix-review-telemetry-start
+        continue-on-error: true
+        env:
+          REVIEW_TELEMETRY_ACTION: start
+          REVIEW_TELEMETRY_QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
+          CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
+          REVIEW_TELEMETRY_REPO: ${{ matrix.repo }}
+          REVIEW_TELEMETRY_ITEM_NUMBER: ${{ matrix.item_number }}
+          REVIEW_TELEMETRY_RUN_ID: ${{ github.run_id }}
+          REVIEW_TELEMETRY_RUN_ATTEMPT: ${{ github.run_attempt }}
+          REVIEW_TELEMETRY_GENERATION: ${{ matrix.generation }}
+          REVIEW_TELEMETRY_OPERATION_ID: matrix-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.item_number }}
+          REVIEW_TELEMETRY_EXACT: ${{ (github.event.inputs.item_number != '' || github.event.inputs.item_numbers != '') && 'true' || 'false' }}
+          REVIEW_TELEMETRY_HOT_INTAKE: ${{ needs.plan.outputs.hot_intake }}
+          REVIEW_TELEMETRY_SOURCE_EVENT: ${{ github.event.client_payload.source_event || github.event_name }}
+          REVIEW_TELEMETRY_SOURCE_ACTION: ${{ github.event.client_payload.source_action || github.event.action || '' }}
+          REVIEW_TELEMETRY_QUEUED_AT: ${{ steps.item-job-start.outputs.started_at }}
+          REVIEW_TELEMETRY_CLAIMED_AT: ${{ steps.shard-start.outputs.started_at }}
+          REVIEW_TELEMETRY_REVIEW_STARTED_AT: ${{ steps.shard-start.outputs.started_at }}
+          REVIEW_TELEMETRY_LEASE_MS: "4500000"
+        working-directory: clawsweeper
+        run: node scripts/review-item-telemetry.mjs
+
       - name: Review item
         id: review-shard
         continue-on-error: true
@@ -2987,6 +3102,30 @@ jobs:
           fi
           node dist/clawsweeper.js finalize-action-events "${args[@]}"
 
+      - name: Update matrix item review telemetry
+        if: ${{ always() && steps.matrix-review-telemetry-start.outcome == 'success' }}
+        continue-on-error: true
+        env:
+          REVIEW_TELEMETRY_ACTION: heartbeat
+          REVIEW_TELEMETRY_QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
+          CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
+          REVIEW_TELEMETRY_REPO: ${{ matrix.repo }}
+          REVIEW_TELEMETRY_ITEM_NUMBER: ${{ matrix.item_number }}
+          REVIEW_TELEMETRY_RUN_ID: ${{ github.run_id }}
+          REVIEW_TELEMETRY_RUN_ATTEMPT: ${{ github.run_attempt }}
+          REVIEW_TELEMETRY_GENERATION: ${{ matrix.generation }}
+          REVIEW_TELEMETRY_OPERATION_ID: matrix-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.item_number }}
+          REVIEW_TELEMETRY_EXACT: ${{ (github.event.inputs.item_number != '' || github.event.inputs.item_numbers != '') && 'true' || 'false' }}
+          REVIEW_TELEMETRY_HOT_INTAKE: ${{ needs.plan.outputs.hot_intake }}
+          REVIEW_TELEMETRY_SOURCE_EVENT: ${{ github.event.client_payload.source_event || github.event_name }}
+          REVIEW_TELEMETRY_SOURCE_ACTION: ${{ github.event.client_payload.source_action || github.event.action || '' }}
+          REVIEW_TELEMETRY_REVIEW_STARTED_AT: ${{ steps.shard-start.outputs.started_at }}
+          REVIEW_TELEMETRY_LEASE_MS: "4500000"
+        working-directory: clawsweeper
+        run: |
+          REVIEW_TELEMETRY_REVIEW_COMPLETED_AT="$(date -u '+%Y-%m-%dT%H:%M:%S.%3NZ')" \
+            node scripts/review-item-telemetry.mjs
+
       - name: Record item metrics
         if: always()
         env:
@@ -3025,6 +3164,7 @@ jobs:
               kind: $kind,
               source_revision: $source_revision,
               generation: ($generation | tonumber),
+              operation_id: ("matrix-${{ github.run_id }}-${{ github.run_attempt }}-" + $item_numbers),
               item_job_setup_ms: $item_job_setup_ms,
               runner_duration_ms: $runner_duration_ms,
               codex_cancel_latency_ms: $codex_cancel_latency_ms,
@@ -3374,6 +3514,46 @@ jobs:
             --message "chore: update sweep status" \
             --path "results/sweep-status/${target_slug}.json" \
             --rebase-strategy theirs
+
+      - name: Complete matrix item review telemetry
+        if: ${{ always() && steps.download-review-metrics.outcome == 'success' }}
+        continue-on-error: true
+        env:
+          REVIEW_TELEMETRY_ACTION: terminal
+          REVIEW_TELEMETRY_QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
+          CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
+          REVIEW_TELEMETRY_RUN_ID: ${{ github.run_id }}
+          REVIEW_TELEMETRY_RUN_ATTEMPT: ${{ github.run_attempt }}
+          REVIEW_TELEMETRY_EXACT: ${{ (github.event.inputs.item_number != '' || github.event.inputs.item_numbers != '') && 'true' || 'false' }}
+          REVIEW_TELEMETRY_HOT_INTAKE: ${{ needs.plan.outputs.hot_intake }}
+          REVIEW_TELEMETRY_SOURCE_EVENT: ${{ github.event.client_payload.source_event || github.event_name }}
+          REVIEW_TELEMETRY_SOURCE_ACTION: ${{ github.event.client_payload.source_action || github.event.action || '' }}
+          RECORDS_PUBLISHED: ${{ steps.commit-review-records.outputs.records_published || 'false' }}
+          ARTIFACTS_APPLIED: ${{ steps.apply-review-artifacts.outputs.artifacts_applied || 'false' }}
+        run: |
+          shopt -s nullglob
+          for metric in review-metrics/*.json; do
+            export REVIEW_TELEMETRY_REPO="$(jq -r '.target_repo' "$metric")"
+            export REVIEW_TELEMETRY_ITEM_NUMBER="$(jq -r '.item_number' "$metric")"
+            export REVIEW_TELEMETRY_GENERATION="$(jq -r '.generation' "$metric")"
+            export REVIEW_TELEMETRY_OPERATION_ID="$(jq -r '.operation_id' "$metric")"
+            export REVIEW_TELEMETRY_PUBLICATION_STARTED_AT="$(jq -r '.completed_at' "$metric")"
+            review_outcome="$(jq -r '.review_outcome' "$metric")"
+            if [ "$review_outcome" = "success" ] && [ "$RECORDS_PUBLISHED" = "true" ] && [ "$ARTIFACTS_APPLIED" = "true" ]; then
+              export REVIEW_TELEMETRY_OUTCOME=succeeded
+              export REVIEW_TELEMETRY_TERMINAL_REASON=publication_applied
+            elif [ "$review_outcome" = "cancelled" ]; then
+              export REVIEW_TELEMETRY_OUTCOME=cancelled
+              export REVIEW_TELEMETRY_TERMINAL_REASON=workflow_cancelled
+            elif [ "$review_outcome" != "success" ]; then
+              export REVIEW_TELEMETRY_OUTCOME=failed
+              export REVIEW_TELEMETRY_TERMINAL_REASON=review_failed
+            else
+              export REVIEW_TELEMETRY_OUTCOME=failed
+              export REVIEW_TELEMETRY_TERMINAL_REASON=publication_failed
+            fi
+            node scripts/review-item-telemetry.mjs
+          done
 
       - name: Dispatch reproducible bug implementation candidates
         if: ${{ always() && !cancelled() && steps.commit-review-records.outputs.records_published == 'true' && vars.CLAWSWEEPER_AUTO_IMPLEMENT_ISSUES == '1' && needs.plan.outputs.target_repo == 'openclaw/openclaw' && vars.CLAWSWEEPER_AUTO_IMPLEMENT_REPRO_BUGS == '1' }}

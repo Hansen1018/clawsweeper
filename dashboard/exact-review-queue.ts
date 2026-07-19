@@ -1484,6 +1484,8 @@ export class ExactReviewQueue {
           leaseRevision: item.leaseRevision,
           generation: item.leaseGeneration,
           operationId: item.operationId,
+          queuedAt: item.createdAt,
+          dispatchedAt: item.dispatchedAt ?? now,
         });
       } catch {
         failures.push({ key: item.key, leaseId: String(item.leaseId || "") });
@@ -1975,7 +1977,11 @@ export class ExactReviewQueue {
         ? attributableJob.conclusion === "success"
           ? "succeeded"
           : attributableJob.conclusion === "cancelled"
-            ? "cancelled"
+            ? record.generation !== undefined &&
+              this.currentReviewGenerationSync(`${record.repo}#${record.item_number}`) >
+                record.generation
+              ? "superseded"
+              : "cancelled"
             : "interrupted"
         : null;
       // A workflow terminal proves wave health, not which unattributed matrix
@@ -1991,9 +1997,11 @@ export class ExactReviewQueue {
         terminal_reason:
           outcome === "succeeded"
             ? "workflow_job_succeeded"
-            : outcome === "cancelled"
-              ? "workflow_cancelled"
-              : "workflow_terminal",
+            : outcome === "superseded"
+              ? "generation_superseded"
+              : outcome === "cancelled"
+                ? "workflow_cancelled"
+                : "workflow_terminal",
       };
       this.recordReviewTelemetrySync(terminal);
     }
@@ -5701,6 +5709,8 @@ async function dispatchClawsweeperItem({
   leaseRevision,
   generation,
   operationId,
+  queuedAt,
+  dispatchedAt,
 }: {
   token: string;
   decision: ExactReviewDecision;
@@ -5709,6 +5719,8 @@ async function dispatchClawsweeperItem({
   leaseRevision: number;
   generation?: number;
   operationId?: string;
+  queuedAt: number;
+  dispatchedAt: number;
 }) {
   // Keep the v1 fields during the rolling-upgrade window. Old workflows consume
   // this immutable dispatch snapshot, while v2 workflows ignore it after claim
@@ -5738,6 +5750,8 @@ async function dispatchClawsweeperItem({
           item_key: itemKey,
           lease_revision: leaseRevision,
           ...(generation && operationId ? { generation, operation_id: operationId } : {}),
+          queued_at: new Date(queuedAt).toISOString(),
+          dispatched_at: new Date(dispatchedAt).toISOString(),
         },
         repo_slug: decision.targetRepo.replace(/[^A-Za-z0-9_.-]+/g, "-"),
         target_repo: decision.targetRepo,

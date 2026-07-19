@@ -2748,8 +2748,11 @@ test("exact-review queue coalesces deliveries, dispatches a bound rollout snapsh
     const leaseId = String(payload.queue_lease_id || "");
     const queueClaim = payload.queue_claim as Record<string, unknown>;
     const operationId = String(queueClaim.operation_id || "");
+    const queuedAt = String(queueClaim.queued_at || "");
+    const dispatchedAt = String(queueClaim.dispatched_at || "");
     assert.match(leaseId, /^[0-9a-f-]{36}$/);
     assert.match(operationId, /^[0-9a-f-]{36}$/);
+    assert.ok(Date.parse(queuedAt) <= Date.parse(dispatchedAt));
     assert.deepEqual(payload, {
       queue_lease_id: leaseId,
       queue_claim: {
@@ -2758,6 +2761,8 @@ test("exact-review queue coalesces deliveries, dispatches a bound rollout snapsh
         lease_revision: 2,
         generation: 2,
         operation_id: operationId,
+        queued_at: queuedAt,
+        dispatched_at: dispatchedAt,
       },
       repo_slug: "openclaw-gogcli",
       target_repo: "openclaw/gogcli",
@@ -11941,6 +11946,79 @@ test("terminal workflow observer conservatively completes only unleased refreshi
   ).json()) as { reviews: Array<Record<string, unknown>> };
   assert.equal(reconciled.reviews[0].outcome, "cancelled");
   assert.equal(reconciled.reviews[0].terminal_reason, "workflow_cancelled");
+});
+
+test("terminal workflow observer classifies a cancelled stale generation as superseded", async () => {
+  const storage = new MemoryDurableStorage();
+  const queue = new ExactReviewQueue({ storage }, { REVIEW_OBSERVABILITY_REQUIRED: "1" });
+  const now = Date.now();
+  const record = {
+    repo: "openclaw/openclaw",
+    item_number: 674,
+    run_id: "57777",
+    run_attempt: 1,
+    status: "refreshing",
+    outcome: null,
+    started_at: new Date(now - 60_000).toISOString(),
+    updated_at: new Date(now - 30_000).toISOString(),
+    lease_expires_at: null,
+    phase_durations_ms: { queue: 100, claim: 100 },
+    generation: 1,
+    operation_id: "operation-12345678901234567890",
+    trigger_lane: "exact_event",
+    trigger_origin: "webhook",
+  };
+  assert.equal(
+    (
+      await queue.fetch(
+        new Request("https://queue/review-telemetry", {
+          method: "POST",
+          body: JSON.stringify(record),
+        }),
+      )
+    ).status,
+    200,
+  );
+  storage.sql.exec(
+    "INSERT INTO exact_review_generations (item_key, generation, updated_at) VALUES (?, ?, ?)",
+    "openclaw/openclaw#674",
+    2,
+    now,
+  );
+  assert.equal(
+    (
+      await queue.fetch(
+        new Request("https://queue/review-run-telemetry", {
+          method: "POST",
+          body: JSON.stringify({
+            run_id: "57777",
+            run_attempt: 1,
+            workflow_outcome: "cancelled",
+            trigger_lane: "exact_event",
+            trigger_origin: "webhook",
+            target_repo: "openclaw/openclaw",
+            started_at: record.started_at,
+            completed_at: new Date(now).toISOString(),
+            run_url: "https://github.com/openclaw/clawsweeper/actions/runs/57777",
+            plan_count: 1,
+            item_count: 1,
+            publication_count: 0,
+            review_jobs: [
+              { name: "Review exact event item", conclusion: "cancelled", item_number: 674 },
+            ],
+          }),
+        }),
+      )
+    ).status,
+    200,
+  );
+  const telemetry = (await (
+    await queue.fetch(
+      new Request("https://queue/review-telemetry?repo=openclaw%2Fopenclaw&item_number=674"),
+    )
+  ).json()) as { reviews: Array<Record<string, unknown>> };
+  assert.equal(telemetry.reviews[0].outcome, "superseded");
+  assert.equal(telemetry.reviews[0].terminal_reason, "generation_superseded");
 });
 
 test("terminal workflow evidence reconciles telemetry that arrives later", async () => {
