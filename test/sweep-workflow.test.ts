@@ -2399,7 +2399,7 @@ test("per-item review jobs expose setup, runner, and cancellation metrics", () =
   assert.match(reviewJob, /rm -rf "\.\.\/review-artifacts\/item-/);
   assert.match(
     reviewJob,
-    /group: clawsweeper-review-\$\{\{ matrix\.repo \}\}-\$\{\{ matrix\.item_number \}\}/,
+    /group: clawsweeper-background-review-\$\{\{ matrix\.repo \}\}-\$\{\{ matrix\.item_number \}\}/,
   );
   assert.match(reviewJob, /cancel-in-progress: false/);
 });

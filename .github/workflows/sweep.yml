@@ -2859,11 +2859,11 @@ jobs:
     timeout-minutes: 75
     continue-on-error: true
     concurrency:
-      # GitHub accepts owner/repo in concurrency groups. Keep that canonical
-      # identity so lossy state-path slugs cannot collide across repositories.
-      group: clawsweeper-review-${{ matrix.repo }}-${{ matrix.item_number }}
-      # Background matrix entries are not generation-claimed by the durable queue.
-      # They share the item group but only queue-backed exact work may cancel an owner.
+      # Background entries are not generation-claimed. Keep their canonical
+      # per-item group separate because GitHub replaces a pending same-group job
+      # even when cancel-in-progress is false; background work must not displace
+      # a queue-backed exact generation before it claims its durable lease.
+      group: clawsweeper-background-review-${{ matrix.repo }}-${{ matrix.item_number }}
       cancel-in-progress: false
     permissions:
       actions: read
