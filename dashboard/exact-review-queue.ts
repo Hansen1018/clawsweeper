@@ -92,7 +92,7 @@ export type ExactReviewQueueItem = {
   operationId?: string;
   dispatchedAt?: number;
   claimedAt?: number;
-  parkedReason?: "dead_letter_capacity";
+  parkedReason?: "dead_letter_capacity" | "mutation_active";
   lastFailureReason?: ExactReviewPublicationReasonCode;
   firstFailureAt?: number;
   publicationFailureAttempts?: number;
@@ -380,17 +380,22 @@ export class ExactReviewQueue {
           return { superseded: true as const };
         }
         let current = state.items[key];
+        // A mutation permit serializes the current GitHub write with intake for
+        // this item. Retain the newer decision, but do not advance or dispatch a
+        // generation until the permit owner releases its atomic mutation window.
+        const mutationBlocked = !decision.publication && Boolean(this.mutationLeaseSync(key));
+        const supersedesInProgress = decision.supersedesInProgress && !mutationBlocked;
         const nextGeneration = decision.publication
           ? decision.publication.generation
           : this.reserveReviewGenerationSync(
               key,
-              Boolean(!current || decision.supersedesInProgress),
+              Boolean(!current || supersedesInProgress) && !mutationBlocked,
               now,
             );
         if (
           current &&
           !decision.publication &&
-          decision.supersedesInProgress &&
+          supersedesInProgress &&
           current.state === "dispatching" &&
           Boolean(current.generation && current.operationId)
         ) {
@@ -403,7 +408,7 @@ export class ExactReviewQueue {
         } else if (
           current &&
           !decision.publication &&
-          decision.supersedesInProgress &&
+          supersedesInProgress &&
           current.state === "leased" &&
           current.claimProtocolVersion === 3
         ) {
@@ -450,8 +455,8 @@ export class ExactReviewQueue {
                 )
               : exactReviewQueueEnqueueAttemptAt(state, now);
             if (mergeable) {
-              current.state = "pending";
-              current.parkedReason = undefined;
+              current.state = mutationBlocked ? "parked" : "pending";
+              current.parkedReason = mutationBlocked ? "mutation_active" : undefined;
               current.attempts = 0;
               current.publicationFailureAttempts = 0;
               current.firstFailureAt = undefined;
@@ -471,7 +476,8 @@ export class ExactReviewQueue {
           state.items[key] = {
             key,
             decision,
-            state: "pending",
+            state: mutationBlocked ? "parked" : "pending",
+            ...(mutationBlocked ? { parkedReason: "mutation_active" } : {}),
             revision: 1,
             ...(nextGeneration ? { generation: nextGeneration } : {}),
             createdAt: now,
@@ -864,7 +870,7 @@ export class ExactReviewQueue {
               parked: false,
               deadLetter: undefined,
             };
-      this.releaseMutationLeaseForQueueItemSync(item);
+      this.releaseMutationLeaseForQueueItemSync(item, state, now);
       const { requeued } = completionResult;
       // A successful workflow can still request requeue_latest after source
       // drift. That work did not leave its lane, so it must not improve the
@@ -1061,6 +1067,12 @@ export class ExactReviewQueue {
         ),
       ).length;
       if (!released) return json({ error: "mutation_not_owned" }, 409);
+      const now = Date.now();
+      const state = this.readStateSync();
+      if (resumeMutationBlockedReview(state, tuple.itemKey, now)) {
+        await this.writeState(state);
+        await this.scheduleNext(state, now);
+      }
       return json({ ok: true, released: true });
     }
 
@@ -1221,7 +1233,7 @@ export class ExactReviewQueue {
         );
         if (matches.length !== 1) continue;
         const item = matches[0];
-        this.releaseMutationLeaseForQueueItemSync(item);
+        this.releaseMutationLeaseForQueueItemSync(item, state, now);
         const didRequeue = finishExactReviewQueueItem(state, item, now, run.outcome);
         reconciled += 1;
         if (didRequeue) {
@@ -2722,16 +2734,25 @@ export class ExactReviewQueue {
       | undefined;
   }
 
-  private releaseMutationLeaseForQueueItemSync(item: ExactReviewQueueItem) {
+  private releaseMutationLeaseForQueueItemSync(
+    item: ExactReviewQueueItem,
+    state?: ExactReviewQueueState,
+    now = Date.now(),
+  ) {
     if (!item.leaseGeneration || !item.operationId) return;
-    const itemKey = item.decision.publication?.itemKey || item.key.replace(/@compute:.*$/, "");
-    this.storage.sql.exec(
-      `DELETE FROM ${EXACT_REVIEW_MUTATION_LEASE_TABLE}
+    const publication = item.decision.publication;
+    const itemKey = publication?.itemKey || item.key.replace(/@compute:.*$/, "");
+    const generation = publication?.generation || item.leaseGeneration;
+    const released = Array.from(
+      this.storage.sql.exec(
+        `DELETE FROM ${EXACT_REVIEW_MUTATION_LEASE_TABLE}
         WHERE item_key = ? AND generation = ? AND operation_id = ? AND purpose = 'review'`,
-      itemKey,
-      item.leaseGeneration,
-      item.operationId,
-    );
+        itemKey,
+        generation,
+        item.operationId,
+      ),
+    ).length;
+    if (released && state) resumeMutationBlockedReview(state, itemKey, now);
   }
 
   private readStorageMetaSync() {
@@ -4358,6 +4379,16 @@ function clearExactReviewLease(item: ExactReviewQueueItem) {
   item.operationId = undefined;
   item.dispatchedAt = undefined;
   item.claimedAt = undefined;
+}
+
+function resumeMutationBlockedReview(state: ExactReviewQueueState, itemKey: string, now: number) {
+  const item = state.items[itemKey];
+  if (!item || item.state !== "parked" || item.parkedReason !== "mutation_active") return false;
+  item.state = "pending";
+  item.parkedReason = undefined;
+  item.nextAttemptAt = now;
+  item.updatedAt = now;
+  return true;
 }
 
 export function exactReviewEffectiveLeaseExpiresAt(

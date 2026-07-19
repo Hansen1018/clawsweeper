@@ -3738,6 +3738,35 @@ test("exact-review protocol v3 supersedes only the same item generation and fenc
     purpose: "apply",
   };
   assert.equal((await mutationRequest("/mutation/acquire", applyTuple)).status, 200);
+  assert.equal(
+    (
+      await queue.fetch(
+        buildExactReviewQueueRequest(
+          "edited-while-mutating-626",
+          626,
+          "edited",
+          "pull_request",
+          "openclaw/openclaw",
+        ),
+      )
+    ).status,
+    202,
+  );
+  const mutationBlocked = (await storage.get("exact-review-queue")) as {
+    items: Record<string, { state: string; generation?: number; parkedReason?: string }>;
+  };
+  assert.equal(mutationBlocked.items[idleItemKey].state, "parked");
+  assert.equal(mutationBlocked.items[idleItemKey].generation, 1);
+  assert.equal(mutationBlocked.items[idleItemKey].parkedReason, "mutation_active");
+  assert.equal(
+    Array.from(
+      storage.sql.exec(
+        "SELECT generation FROM exact_review_generations WHERE item_key = ?",
+        idleItemKey,
+      ),
+    )[0].generation,
+    1,
+  );
   const reviewWhileApplyMutates = await mutationRequest("/mutation/acquire", {
     ...applyTuple,
     purpose: "review",
@@ -3746,6 +3775,12 @@ test("exact-review protocol v3 supersedes only the same item generation and fenc
   assert.equal(reviewWhileApplyMutates.status, 409);
   assert.equal((await reviewWhileApplyMutates.json()).error, "mutation_busy");
   assert.equal((await mutationRequest("/mutation/release", applyTuple)).status, 200);
+  const resumed = (await storage.get("exact-review-queue")) as {
+    items: Record<string, { state: string; generation?: number; parkedReason?: string }>;
+  };
+  assert.equal(resumed.items[idleItemKey].state, "pending");
+  assert.equal(resumed.items[idleItemKey].generation, 1);
+  assert.equal(resumed.items[idleItemKey].parkedReason, undefined);
 
   const cancelled = await queue.fetch(
     new Request("https://clawsweeper-exact-review-queue/complete", {
@@ -3878,6 +3913,7 @@ test("exact-review terminal callbacks release matching review mutation leases", 
     operationId: publicationOperationId,
     claimProtocolVersion: 3,
   });
+  publication.decision.publication.generation = 7;
   await completeStorage.put("exact-review-queue", {
     deliveries: {},
     items: { [publication.key]: publication },
@@ -3886,7 +3922,7 @@ test("exact-review terminal callbacks release matching review mutation leases", 
   completeStorage.sql.exec(
     `INSERT INTO exact_review_mutation_leases
        (item_key, generation, operation_id, owner, purpose, acquired_at, heartbeat_at)
-     VALUES (?, 1, ?, 'github-run-6270-1', 'review', ?, ?)`,
+     VALUES (?, 7, ?, 'github-run-6270-1', 'review', ?, ?)`,
     publication.decision.publication.itemKey,
     publicationOperationId,
     Date.now(),
