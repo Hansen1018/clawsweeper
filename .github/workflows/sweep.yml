@@ -1357,9 +1357,6 @@ jobs:
     if: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.queue_lease_id != '' && github.event.client_payload.source_action == 'exact_review_artifact_publish' }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
-    concurrency:
-      group: clawsweeper-mutation-${{ github.event.client_payload.target_repo || 'unknown-repo' }}-${{ github.event.client_payload.item_number || github.run_id }}
-      cancel-in-progress: false
     permissions:
       actions: write
       contents: write

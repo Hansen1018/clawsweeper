@@ -360,6 +360,7 @@ test("exact event review hands immutable artifacts to the queue-bounded publishe
   assert.equal(reviewer.permissions?.contents, "read");
   assert.equal(reviewer["timeout-minutes"], 120);
   assert.equal(reviewer.permissions?.issues, "read");
+  assert.equal(publisher.concurrency, undefined);
   assert.equal(
     reviewer.steps.some((candidate) => candidate.uses?.endsWith("/setup-state")),
     false,
@@ -434,8 +435,6 @@ test("exact event review hands immutable artifacts to the queue-bounded publishe
     step(publisher, "Claim durable exact review publication").run ?? "",
     /internal\/exact-review\/claim/,
   );
-  assert.equal(publisher.concurrency?.["cancel-in-progress"], false);
-  assert.match(publisher.concurrency?.group ?? "", /clawsweeper-mutation-/);
   assert.equal(publisher.permissions?.actions, "write");
   assert.equal(
     batchPublisher.concurrency?.group,
