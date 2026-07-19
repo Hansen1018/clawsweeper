@@ -2194,7 +2194,13 @@ jobs:
           result="${{ steps.exact-review-publication-result.outputs.outcome || 'failure' }}"
           completion_kind="${{ steps.exact-review-publication-result.outputs.completion_kind || 'permanent_failure' }}"
           reason="${{ steps.exact-review-publication-result.outputs.reason_code || 'unknown_failure' }}"
-          if [ "$completion_kind" = "superseded" ]; then
+          if [ "$completion_kind" = "retryable_failure" ]; then
+            # The durable publication queue will retry this same review attempt.
+            # Keep its first terminal slot open for the eventual immutable result.
+            export REVIEW_TELEMETRY_ACTION=heartbeat
+            node scripts/review-item-telemetry.mjs
+            exit 0
+          elif [ "$completion_kind" = "superseded" ]; then
             export REVIEW_TELEMETRY_OUTCOME=superseded
             export REVIEW_TELEMETRY_TERMINAL_REASON=generation_superseded
           elif [ "$result" = "success" ]; then

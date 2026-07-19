@@ -478,12 +478,15 @@ test("exact event review hands immutable artifacts to the queue-bounded publishe
   const publish = step(publisher, "Publish event result and apply safe close");
   const mutationPermit = step(publisher, "Acquire generation-bound mutation permit");
   const mutationRelease = step(publisher, "Release generation-bound mutation permit");
+  const publicationTelemetry = step(publisher, "Complete exact item review telemetry");
   assert.match(mutationPermit.run ?? "", /internal\/exact-review\/mutation\/acquire/);
   assert.match(mutationPermit.run ?? "", /generation_superseded|mutation_busy/);
   assert.match(publish.if ?? "", /mutation-permit\.outputs\.acquired == 'true'/);
   assert.match(mutationRelease.run ?? "", /internal\/exact-review\/mutation\/release/);
   assert.match(mutationRelease.run ?? "", /mutation_not_owned/);
   assert.match(mutationRelease.run ?? "", /--write-out '%\{http_code\}'/);
+  assert.match(publicationTelemetry.run ?? "", /completion_kind.*retryable_failure/);
+  assert.match(publicationTelemetry.run ?? "", /REVIEW_TELEMETRY_ACTION=heartbeat/);
   assert.ok(publisher.steps.indexOf(mutationPermit) < publisher.steps.indexOf(publish));
   assert.match(publish.run ?? "", /live_state=.*gh api/);
   assert.match(publish.run ?? "", /LIVE_TERMINAL_NOOP.*LIVE_TERMINAL_MISSING/);
