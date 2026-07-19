@@ -3779,8 +3779,27 @@ test("exact-review protocol v3 supersedes only the same item generation and fenc
     items: Record<string, { state: string; generation?: number; parkedReason?: string }>;
   };
   assert.equal(resumed.items[idleItemKey].state, "pending");
-  assert.equal(resumed.items[idleItemKey].generation, 1);
+  assert.equal(resumed.items[idleItemKey].generation, 2);
   assert.equal(resumed.items[idleItemKey].parkedReason, undefined);
+  assert.equal(
+    Array.from(
+      storage.sql.exec(
+        "SELECT generation FROM exact_review_generations WHERE item_key = ?",
+        idleItemKey,
+      ),
+    )[0].generation,
+    2,
+  );
+  assert.equal(
+    (
+      await mutationRequest("/mutation/acquire", {
+        ...applyTuple,
+        purpose: "review",
+        operation_id: "77777777-7777-4777-8777-777777777777",
+      })
+    ).status,
+    409,
+  );
 
   const cancelled = await queue.fetch(
     new Request("https://clawsweeper-exact-review-queue/complete", {

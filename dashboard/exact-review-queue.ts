@@ -1053,26 +1053,29 @@ export class ExactReviewQueue {
     if (request.method === "POST" && url.pathname === "/mutation/release") {
       const tuple = exactReviewMutationTuple(await request.json().catch(() => null));
       if (!tuple) return json({ error: "invalid_mutation_tuple" }, 400);
-      const released = Array.from(
-        this.storage.sql.exec(
-          `DELETE FROM ${EXACT_REVIEW_MUTATION_LEASE_TABLE}
-            WHERE item_key = ? AND generation = ? AND operation_id = ? AND owner = ?
-              AND purpose = ?
-          RETURNING item_key`,
-          tuple.itemKey,
-          tuple.generation,
-          tuple.operationId,
-          tuple.owner,
-          tuple.purpose,
-        ),
-      ).length;
-      if (!released) return json({ error: "mutation_not_owned" }, 409);
       const now = Date.now();
-      const state = this.readStateSync();
-      if (resumeMutationBlockedReview(state, tuple.itemKey, now)) {
-        await this.writeState(state);
-        await this.scheduleNext(state, now);
-      }
+      const result = this.storage.transactionSync(() => {
+        const released = Array.from(
+          this.storage.sql.exec(
+            `DELETE FROM ${EXACT_REVIEW_MUTATION_LEASE_TABLE}
+              WHERE item_key = ? AND generation = ? AND operation_id = ? AND owner = ?
+                AND purpose = ?
+            RETURNING item_key`,
+            tuple.itemKey,
+            tuple.generation,
+            tuple.operationId,
+            tuple.owner,
+            tuple.purpose,
+          ),
+        ).length;
+        if (!released) return { released: false as const };
+        const state = this.readStateSync();
+        const resumed = this.resumeMutationBlockedReviewSync(state, tuple.itemKey, now);
+        if (resumed) this.writeStateSync(state);
+        return { released: true as const, resumed, state };
+      });
+      if (!result.released) return json({ error: "mutation_not_owned" }, 409);
+      if (result.resumed) await this.scheduleNext(result.state, now);
       return json({ ok: true, released: true });
     }
 
@@ -2710,6 +2713,24 @@ export class ExactReviewQueue {
     return Math.max(0, Number(row?.generation || 0));
   }
 
+  private resumeMutationBlockedReviewSync(
+    state: ExactReviewQueueState,
+    itemKey: string,
+    now: number,
+  ) {
+    const item = state.items[itemKey];
+    if (!item || item.state !== "parked" || item.parkedReason !== "mutation_active") return false;
+    // Intake deliberately leaves the mutation owner's generation current while
+    // its GitHub write is in flight. Advance the fence in the same transaction
+    // that releases that owner, before the retained revision can dispatch.
+    item.generation = this.reserveReviewGenerationSync(itemKey, true, now);
+    item.state = "pending";
+    item.parkedReason = undefined;
+    item.nextAttemptAt = now;
+    item.updatedAt = now;
+    return true;
+  }
+
   private reviewComputeActiveSync(itemKey: string) {
     const item = this.readStateSync().items[itemKey];
     return Boolean(item && item.state !== "parked");
@@ -2752,7 +2773,7 @@ export class ExactReviewQueue {
         item.operationId,
       ),
     ).length;
-    if (released && state) resumeMutationBlockedReview(state, itemKey, now);
+    if (released && state) this.resumeMutationBlockedReviewSync(state, itemKey, now);
   }
 
   private readStorageMetaSync() {
@@ -4379,16 +4400,6 @@ function clearExactReviewLease(item: ExactReviewQueueItem) {
   item.operationId = undefined;
   item.dispatchedAt = undefined;
   item.claimedAt = undefined;
-}
-
-function resumeMutationBlockedReview(state: ExactReviewQueueState, itemKey: string, now: number) {
-  const item = state.items[itemKey];
-  if (!item || item.state !== "parked" || item.parkedReason !== "mutation_active") return false;
-  item.state = "pending";
-  item.parkedReason = undefined;
-  item.nextAttemptAt = now;
-  item.updatedAt = now;
-  return true;
 }
 
 export function exactReviewEffectiveLeaseExpiresAt(
