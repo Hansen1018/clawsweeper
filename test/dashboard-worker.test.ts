@@ -4045,6 +4045,9 @@ test("exact-review mutation acquire reclaims only terminal apply owners", async 
     if (url.pathname === "/repos/openclaw/clawsweeper/actions/runs/7002") {
       return jsonResponse({ id: 7002, run_attempt: 1, status: "in_progress" });
     }
+    if (url.pathname === "/repos/openclaw/clawsweeper/actions/workflows/sweep.yml") {
+      return jsonResponse({ state: "disabled_manually" });
+    }
     throw new Error(`unexpected fetch ${url}`);
   };
 
@@ -4138,6 +4141,42 @@ test("exact-review mutation acquire reclaims only terminal apply owners", async 
     const unknown = await acquire();
     assert.equal(unknown.status, 409);
     assert.equal((await unknown.json()).error, "mutation_busy");
+    storage.sql.exec("DELETE FROM exact_review_mutation_leases WHERE item_key = ?", itemKey);
+
+    const parked = unclaimedExactReviewQueueItem(629);
+    Object.assign(parked, {
+      state: "parked",
+      parkedReason: "mutation_active",
+      generation: 1,
+      leaseId: undefined,
+      leaseRevision: undefined,
+      leaseDecision: undefined,
+      leaseExpiresAt: undefined,
+      leaseGeneration: undefined,
+      operationId: undefined,
+      dispatchedAt: undefined,
+    });
+    await storage.put("exact-review-queue", {
+      deliveries: {},
+      items: { [itemKey]: parked },
+    });
+    insertApplyLease("github-run-7001-1-44");
+    await queue.alarm();
+    const autonomouslyResumed = (await storage.get("exact-review-queue")) as {
+      items: Record<string, { state: string; generation?: number; parkedReason?: string }>;
+    };
+    assert.equal(autonomouslyResumed.items[itemKey].state, "pending");
+    assert.equal(autonomouslyResumed.items[itemKey].generation, 2);
+    assert.equal(autonomouslyResumed.items[itemKey].parkedReason, undefined);
+    assert.equal(
+      Array.from(
+        storage.sql.exec(
+          "SELECT owner FROM exact_review_mutation_leases WHERE item_key = ?",
+          itemKey,
+        ),
+      ).length,
+      0,
+    );
   } finally {
     globalThis.fetch = originalFetch;
   }

@@ -252,6 +252,7 @@ const DEFAULT_EXACT_REVIEW_EXECUTION_LEASE_MS = 130 * 60 * 1000;
 const DEFAULT_EXACT_REVIEW_HEARTBEAT_GRACE_MS = 20 * 60 * 1000;
 const DEFAULT_EXACT_REVIEW_RETRY_MS = 30_000;
 const DEFAULT_EXACT_REVIEW_WORKFLOW_PAUSED_RETRY_MS = 60_000;
+const DEFAULT_EXACT_REVIEW_MUTATION_RECONCILE_MS = 60_000;
 const DEFAULT_EXACT_REVIEW_DISPATCH_DEBOUNCE_MS = 45_000;
 const DEFAULT_EXACT_REVIEW_DISPATCH_DEBOUNCE_MAX_MS = 3 * 60_000;
 const DEFAULT_EXACT_REVIEW_PENDING_SOFT_LIMIT = 300;
@@ -1380,6 +1381,7 @@ export class ExactReviewQueue {
       this.reconcileStoredReviewRunsSync(startedAt);
       this.syncLegacyCompatibilitySync(this.readStateSync());
     });
+    await this.reconcileTerminalApplyMutationOwners(startedAt);
     const snapshot = this.readStateSync();
     const reclaimedSnapshot = reclaimExpiredExactReviewLeases(
       snapshot,
@@ -2711,6 +2713,57 @@ export class ExactReviewQueue {
       ),
     )[0] as { generation?: number } | undefined;
     return Math.max(0, Number(row?.generation || 0));
+  }
+
+  private async reconcileTerminalApplyMutationOwners(now: number) {
+    const snapshot = this.readStateSync();
+    const candidates = Object.values(snapshot.items)
+      .filter((item) => item.state === "parked" && item.parkedReason === "mutation_active")
+      .flatMap((item) => {
+        const lease = this.mutationLeaseSync(item.key);
+        return lease?.purpose === "apply" ? [{ itemKey: item.key, ...lease }] : [];
+      })
+      .slice(0, EXACT_REVIEW_RECONCILE_CONCURRENCY);
+    if (!candidates.length) return 0;
+
+    const terminal = await Promise.all(
+      candidates.map(async (candidate) => ({
+        candidate,
+        terminal: await exactReviewMutationOwnerTerminal(this.env, candidate.owner),
+      })),
+    );
+    return this.storage.transactionSync(() => {
+      const state = this.readStateSync();
+      let resumed = 0;
+      for (const { candidate, terminal: ownerTerminal } of terminal) {
+        if (!ownerTerminal) continue;
+        const current = this.mutationLeaseSync(candidate.itemKey);
+        if (
+          !current ||
+          current.generation !== candidate.generation ||
+          current.operation_id !== candidate.operation_id ||
+          current.owner !== candidate.owner ||
+          current.purpose !== "apply"
+        ) {
+          continue;
+        }
+        // The Actions lookup yields the Durable Object. Delete only the exact
+        // owner observed before that lookup, then advance the retained revision
+        // before it becomes dispatchable.
+        this.storage.sql.exec(
+          `DELETE FROM ${EXACT_REVIEW_MUTATION_LEASE_TABLE}
+            WHERE item_key = ? AND generation = ? AND operation_id = ? AND owner = ?
+              AND purpose = 'apply'`,
+          candidate.itemKey,
+          candidate.generation,
+          candidate.operation_id,
+          candidate.owner,
+        );
+        if (this.resumeMutationBlockedReviewSync(state, candidate.itemKey, now)) resumed += 1;
+      }
+      if (resumed) this.writeStateSync(state);
+      return resumed;
+    });
   }
 
   private resumeMutationBlockedReviewSync(
@@ -5123,6 +5176,11 @@ export function exactReviewQueueNextWakeAt(
     }
   }
   const times = items.flatMap((item) => {
+    if (item.state === "parked" && item.parkedReason === "mutation_active") {
+      // Apply permits have no TTL. Periodically prove their workflow owner
+      // terminal so a lost release response cannot strand retained intake.
+      return [now + DEFAULT_EXACT_REVIEW_MUTATION_RECONCILE_MS];
+    }
     if (item.state === "pending") {
       if (dispatcherPaused) return [dispatcherRetryAt];
       if (exactReviewQueueIsPublication(item)) {
