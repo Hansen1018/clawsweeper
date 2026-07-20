@@ -19863,6 +19863,7 @@ function issueReviewCommentState(
   number: number,
   fallbackBodies: readonly string[] = [],
 ): {
+  comments: Record<string, unknown>[];
   reviewComment: Record<string, unknown> | undefined;
   leaseComment: Record<string, unknown> | undefined;
   leaseComments: Record<string, unknown>[];
@@ -19885,6 +19886,7 @@ function issueReviewCommentState(
       : []),
   ];
   return {
+    comments,
     reviewComment,
     leaseComment: leaseComments[0],
     leaseComments,
@@ -20603,6 +20605,11 @@ function postReviewStartStatusComment(options: {
   );
   const body = renderReviewStartStatusComment(leaseOptions);
   const payload = writeCommentPayload(options.item.number, body);
+  // Every acquisition POSTs a fresh comment: the lowest-server-id election
+  // needs distinct ids per contender, so refreshing a leftover placeholder in
+  // place would let two racing workers both validate ownership of the same
+  // comment. Superseded placeholders are swept when the durable review
+  // comment is published instead.
   const createArgs = [
     "api",
     `repos/${targetRepo()}/issues/${options.item.number}/comments`,
@@ -20723,6 +20730,71 @@ function reapExpiredDedicatedReviewStartLeases(
       // A failed reap must never block acquiring the new lease.
       console.error(
         `[review] could not reap expired review lease comment ${lease.commentId} for #${itemNumber}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+}
+
+const REVIEW_PLACEHOLDER_BODY_PATTERN = /^ClawSweeper status: review started\./i;
+
+export function supersededReviewPlaceholderCommentIds(options: {
+  number: number;
+  comments: readonly Record<string, unknown>[];
+  keepCommentIds: ReadonlySet<number>;
+  nowMs?: number;
+}): number[] {
+  const nowMs = options.nowMs ?? Date.now();
+  const ids: number[] = [];
+  for (const comment of options.comments) {
+    const id = commentId(comment);
+    if (id === null || options.keepCommentIds.has(id)) continue;
+    if (!canPatchReviewComment(comment)) continue;
+    const body = (commentBody(comment) ?? "").trimStart();
+    // Placeholder bodies start with the status line; the durable review
+    // comment never does, and its marker is an extra guard against deletion.
+    if (!REVIEW_PLACEHOLDER_BODY_PATTERN.test(body)) continue;
+    if (body.includes(reviewCommentMarker(options.number))) continue;
+    // An unexpired lease may belong to a racing worker on a newer revision;
+    // only provably superseded placeholders (expired lease or marker-less
+    // legacy body) are swept after the durable review comment is published.
+    const marker = body.match(/<!--\s*clawsweeper-review-status:started\b([^>]*)-->/i);
+    if (marker) {
+      const expiresAtMs = Date.parse(marker[1]?.match(/\blease_expires_at=([^\s>]+)/i)?.[1] ?? "");
+      if (Number.isFinite(expiresAtMs) && expiresAtMs >= nowMs) continue;
+    }
+    ids.push(id);
+  }
+  return ids;
+}
+
+function cleanupSupersededReviewPlaceholderComments(options: {
+  number: number;
+  // Pre-mutation snapshot from the apply flow; the sweep must not refetch the
+  // comment list after the durable-comment mutation (API-budget invariant).
+  comments: readonly Record<string, unknown>[];
+  keepCommentIds: ReadonlySet<number>;
+}): void {
+  const ids = supersededReviewPlaceholderCommentIds({
+    number: options.number,
+    comments: options.comments,
+    keepCommentIds: options.keepCommentIds,
+  });
+  for (const id of ids) {
+    try {
+      ghObservedMutationCommand({
+        identity: `review_placeholder_sweep:${options.number}:${id}`,
+        args: ["api", `repos/${targetRepo()}/issues/comments/${id}`, "--method", "DELETE"],
+      });
+      console.error(
+        `[apply] deleted superseded review placeholder comment ${id} for #${options.number}`,
+      );
+    } catch (error) {
+      if (error instanceof GitHubRuntimeBudgetError) throw error;
+      // A failed sweep must never fail the publish; the next apply retries it.
+      console.error(
+        `[apply] could not delete superseded review placeholder comment ${id} for #${options.number}: ${
           error instanceof Error ? error.message : String(error)
         }`,
       );
@@ -26891,6 +26963,7 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
         if (!headBefore || headBefore !== headAfter || headAfter !== initialReviewHeadSha) {
           return {
             comment: refreshed.reviewComment,
+            comments: refreshed.comments,
             leaseComments: refreshed.leaseComments,
             headSha: headAfter,
             lease: null,
@@ -26901,6 +26974,7 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
         if (item.kind === "issue" && reportReviewRevision && headAfter !== reportReviewRevision) {
           return {
             comment: refreshed.reviewComment,
+            comments: refreshed.comments,
             leaseComments: refreshed.leaseComments,
             headSha: headAfter,
             lease: null,
@@ -26908,11 +26982,14 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
             blockReason: `live issue source revision ${headAfter} differs from reviewed revision ${reportReviewRevision}`,
           };
         }
-        return reviewStartLeaseStateForComments(
-          refreshed.leaseComments,
-          refreshed.reviewComment,
-          headAfter,
-        );
+        return {
+          ...reviewStartLeaseStateForComments(
+            refreshed.leaseComments,
+            refreshed.reviewComment,
+            headAfter,
+          ),
+          comments: refreshed.comments,
+        };
       } catch (error) {
         if (error instanceof GitHubRuntimeBudgetError) throw error;
         const detail = trimMiddle(
@@ -26921,6 +26998,7 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
         );
         return {
           comment: undefined,
+          comments: [] as Record<string, unknown>[],
           leaseComments: [],
           headSha: "",
           lease: null,
@@ -28902,6 +28980,25 @@ function applyDecisionsCommandInner(args: Args, runtimeBudget: GitHubRuntimeBudg
               allowedSelfMutationUpdatedAts.add(syncedCommentUpdatedAt);
             }
             syncReasons.push("updated durable Codex review comment");
+            // The durable review comment is now published, so stale "review
+            // started" placeholders from failed earlier attempts are clutter.
+            const placeholderKeepCommentIds = new Set<number>();
+            const syncedCommentId = commentId(syncedComment);
+            if (syncedCommentId !== null) placeholderKeepCommentIds.add(syncedCommentId);
+            // Closures assign the active lease, so read it through a cast to
+            // defeat TypeScript's stale null narrowing at this use site.
+            const heldMutationLease = activeApplyMutationLease as {
+              itemNumber: number;
+              lease: AcquiredReviewStartLease;
+            } | null;
+            if (heldMutationLease?.itemNumber === number) {
+              placeholderKeepCommentIds.add(heldMutationLease.lease.commentId);
+            }
+            cleanupSupersededReviewPlaceholderComments({
+              number,
+              comments: latestLeaseState.comments,
+              keepCommentIds: placeholderKeepCommentIds,
+            });
           } catch (error) {
             const commentAuthError = isGitHubRequiresAuthenticationError(error);
             if (!commentAuthError && !isLockedConversationCommentError(error)) throw error;
