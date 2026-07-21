@@ -676,13 +676,15 @@ function spawnBoundedFetch(args: readonly string[], timeoutMs: number): GitRunRe
 
 function gitObjectIdsAvailable(objectIds: readonly string[]): boolean {
   return objectIds.every(
-    (objectId) => spawnGit(["cat-file", "-e", objectId], { quiet: true }).status === 0,
+    (objectId) =>
+      spawnGit(["--no-lazy-fetch", "cat-file", "-e", objectId], { quiet: true }).status === 0,
   );
 }
 
 function assertGitObjectsAvailable(objectIds: readonly string[]): void {
   const missing = objectIds.find(
-    (objectId) => spawnGit(["cat-file", "-e", objectId], { quiet: true }).status !== 0,
+    (objectId) =>
+      spawnGit(["--no-lazy-fetch", "cat-file", "-e", objectId], { quiet: true }).status !== 0,
   );
   if (missing) throw new Error(`object ${missing} is unavailable after recovery`);
 }
