@@ -629,45 +629,60 @@ function unavailableGitObjectIds(value: unknown): string[] {
 
 function recoverUnavailableGitObjects(remote: string, branch: string, failure: unknown): void {
   const objectIds = unavailableGitObjectIds(failure);
-  console.log(
-    `Recovering ${objectIds.length || "unidentified"} unavailable Git object(s) from ${remote}`,
-  );
-  if (objectIds.length > 0) {
-    objectIds.every(
-      (objectId) =>
-        spawnGit(["fetch", remote, objectId], {
-          quiet: true,
-          timeout: PUBLISH_FETCH_TIMEOUT_MS,
-        }).status === 0,
-    );
+  if (objectIds.length === 0) {
+    throw new Error(`Cannot recover unidentified unavailable Git objects: ${errorMessage(failure)}`);
   }
+  console.log(`Recovering ${objectIds.length} unavailable Git object(s) from ${remote}`);
+  for (const objectId of objectIds) {
+    spawnBoundedFetch(["fetch", remote, objectId], PUBLISH_FETCH_TIMEOUT_MS);
+  }
+  if (gitObjectIdsAvailable(objectIds)) return;
 
   const shallow = isShallowRepository();
   const refetchDepth = shallow ? ["--depth=1"] : [];
-  const refetched = spawnGit(["fetch", "--refetch", ...refetchDepth, remote, branch], {
-    quiet: true,
-    timeout: RECOVERY_FETCH_TIMEOUT_MS,
-  });
+  const refetched = spawnBoundedFetch(
+    ["fetch", "--refetch", ...refetchDepth, remote, branch],
+    RECOVERY_FETCH_TIMEOUT_MS,
+  );
   if (refetched.status === 0 && gitObjectIdsAvailable(objectIds)) return;
-  if (!shallow) return;
-  const deepened = spawnGit(["fetch", "--deepen=1", remote, branch], {
-    quiet: true,
-    timeout: RECOVERY_FETCH_TIMEOUT_MS,
-  });
-  if (deepened.status === 0 && (objectIds.length === 0 || gitObjectIdsAvailable(objectIds))) {
+  if (!shallow) {
+    assertGitObjectsAvailable(objectIds);
     return;
   }
-  if (!isShallowRepository()) return;
-  spawnGit(["fetch", "--unshallow", remote, branch], {
-    quiet: true,
-    timeout: RECOVERY_FETCH_TIMEOUT_MS,
-  });
+  const deepened = spawnBoundedFetch(
+    ["fetch", "--deepen=1", remote, branch],
+    RECOVERY_FETCH_TIMEOUT_MS,
+  );
+  if (deepened.status === 0 && gitObjectIdsAvailable(objectIds)) return;
+  if (!isShallowRepository()) {
+    assertGitObjectsAvailable(objectIds);
+    return;
+  }
+  const unshallowed = spawnBoundedFetch(
+    ["fetch", "--unshallow", remote, branch],
+    RECOVERY_FETCH_TIMEOUT_MS,
+  );
+  if (unshallowed.status === 0 && gitObjectIdsAvailable(objectIds)) return;
+  assertGitObjectsAvailable(objectIds);
+}
+
+function spawnBoundedFetch(args: readonly string[], timeoutMs: number): GitRunResult {
+  const result = spawnGit(args, { quiet: true, timeout: timeoutMs });
+  if (result.timedOut) throw new GitCommandTimeoutError(args, timeoutMs);
+  return result;
 }
 
 function gitObjectIdsAvailable(objectIds: readonly string[]): boolean {
   return objectIds.every(
     (objectId) => spawnGit(["cat-file", "-e", objectId], { quiet: true }).status === 0,
   );
+}
+
+function assertGitObjectsAvailable(objectIds: readonly string[]): void {
+  const missing = objectIds.find(
+    (objectId) => spawnGit(["cat-file", "-e", objectId], { quiet: true }).status !== 0,
+  );
+  if (missing) throw new Error(`object ${missing} is unavailable after recovery`);
 }
 
 function immutableLedgerStateRepository(): string | null {

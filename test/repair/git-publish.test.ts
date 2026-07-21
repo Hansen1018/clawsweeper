@@ -3158,6 +3158,57 @@ test("publishMainCommit fails closed when a written ledger object is unavailable
   assert.throws(() => run("git", ["--git-dir", origin, "show", `main:${localPath}`], root));
 });
 
+test("publishMainCommit fails fast when unavailable ledger objects remain missing after recovery", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-publish-missing-persistent-"));
+  const origin = path.join(root, "origin.git");
+  const seed = path.join(root, "seed");
+  const work = path.join(root, "work");
+  const other = path.join(root, "other");
+  const fakeBin = path.join(root, "bin");
+  const localPath =
+    "ledger/v1/import-bindings/events/ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff.json";
+  const remotePath =
+    "ledger/v1/import-bindings/events/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json";
+  run("git", ["init", "--bare", origin], root);
+  run("git", ["clone", origin, seed], root);
+  configureUser(seed);
+  write(path.join(seed, "base.txt"), "base\n");
+  run("git", ["add", "."], seed);
+  run("git", ["commit", "-m", "initial"], seed);
+  run("git", ["push", "origin", "HEAD:main"], seed);
+  run("git", ["--git-dir", origin, "symbolic-ref", "HEAD", "refs/heads/main"], root);
+  run("git", ["clone", "--depth", "1", `file://${origin}`, work], root);
+  configureUser(work);
+  run("git", ["config", "fetch.unpackLimit", "9999"], work);
+
+  run("git", ["clone", origin, other], root);
+  configureUser(other);
+  write(path.join(other, remotePath), '{"remote":true}\n');
+  run("git", ["add", "."], other);
+  run("git", ["commit", "-m", "concurrent ledger event"], other);
+  const missingObject = run("git", ["rev-parse", `HEAD:${remotePath}`], other).trim();
+  installFirstPushRaceHook(work, other);
+  installPersistentMissingObjectFetchShim(fakeBin, work, [missingObject]);
+  write(path.join(work, localPath), '{"local":true}\n');
+
+  assert.throws(
+    () =>
+      withEnv({ PATH: `${fakeBin}:${process.env.PATH}` }, () =>
+        withCwd(work, () =>
+          publishMainCommit({
+            message: "chore: append command action ledger",
+            paths: [localPath],
+            maxAttempts: 1,
+            pushAttempts: 1,
+          }),
+        ),
+      ),
+    new RegExp(`object ${missingObject} is unavailable after recovery`),
+  );
+  assert.equal(fs.readFileSync(path.join(work, ".git/hooks/pre-push-count"), "utf8"), "1\n");
+  assert.throws(() => run("git", ["--git-dir", origin, "show", `main:${localPath}`], root));
+});
+
 test("publishMainCommit escapes sustained immutable ledger races through a server merge", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-publish-server-merge-"));
   const origin = path.join(root, "origin.git");
@@ -4342,6 +4393,32 @@ if test "$result" -eq 0 && test "$1" = fetch && test -e "${pushCounter}" && test
   test -f "$object_path"
   rm "$object_path"
   printf '%s\n' "$object_id" > "${marker}"
+fi
+exit "$result"
+`,
+  );
+  fs.chmodSync(git, 0o755);
+}
+
+function installPersistentMissingObjectFetchShim(fakeBin, work, objectIds) {
+  fs.mkdirSync(fakeBin, { recursive: true });
+  const git = path.join(fakeBin, "git");
+  const objectPaths = objectIds.map((objectId) =>
+    path.join(work, ".git", "objects", objectId.slice(0, 2), objectId.slice(2)),
+  );
+  const realGit = run("/usr/bin/env", ["which", "git"], process.cwd()).trim();
+  fs.writeFileSync(
+    git,
+    `#!/bin/sh
+set -eu
+if test "$1" = fetch && test "$3" = "${objectIds[0]}"; then
+  printf '%s\n' 'fatal: remote rejected direct object want' >&2
+  exit 128
+fi
+"${realGit}" "$@"
+result=$?
+if test "$result" -eq 0 && test "$1" = fetch; then
+${objectPaths.map((objectPath) => `  rm -f "${objectPath}"`).join("\n")}
 fi
 exit "$result"
 `,
