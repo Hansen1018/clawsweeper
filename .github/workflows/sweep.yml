@@ -3968,6 +3968,7 @@ jobs:
       issues: read
       pull-requests: read
     env:
+      CLAWSWEEPER_STATE_LEASE_ACQUIRE_TIMEOUT_MS: "900000"
       CLAWSWEEPER_UNCONFIRMED_PRODUCT_DIRECTION_CLOSE_ENABLED: ${{ vars.CLAWSWEEPER_UNCONFIRMED_PRODUCT_DIRECTION_CLOSE_ENABLED || 'false' }}
       CLAWSWEEPER_UNSPONSORED_FEATURE_CLOSE_ENABLED: ${{ vars.CLAWSWEEPER_UNSPONSORED_FEATURE_CLOSE_ENABLED || 'false' }}
       CLAWSWEEPER_IDEA_REVIVAL_REACTIONS: ${{ vars.CLAWSWEEPER_IDEA_REVIVAL_REACTIONS || '5' }}
@@ -4183,6 +4184,8 @@ jobs:
 
   publish-apply-proof-action-ledger:
     name: Publish immutable apply proof action ledger
+    env:
+      CLAWSWEEPER_STATE_LEASE_ACQUIRE_TIMEOUT_MS: "900000"
     needs: apply-proof
     if: ${{ always() && needs.apply-proof.result != 'skipped' }}
     runs-on: ubuntu-latest
@@ -4263,6 +4266,7 @@ jobs:
       cancel-in-progress: false
       queue: max
     env:
+      CLAWSWEEPER_STATE_LEASE_ACQUIRE_TIMEOUT_MS: "900000"
       CLAWSWEEPER_UNCONFIRMED_PRODUCT_DIRECTION_CLOSE_ENABLED: ${{ vars.CLAWSWEEPER_UNCONFIRMED_PRODUCT_DIRECTION_CLOSE_ENABLED || 'false' }}
       CLAWSWEEPER_UNSPONSORED_FEATURE_CLOSE_ENABLED: ${{ vars.CLAWSWEEPER_UNSPONSORED_FEATURE_CLOSE_ENABLED || 'false' }}
       CLAWSWEEPER_IDEA_REVIVAL_REACTIONS: ${{ vars.CLAWSWEEPER_IDEA_REVIVAL_REACTIONS || '5' }}
