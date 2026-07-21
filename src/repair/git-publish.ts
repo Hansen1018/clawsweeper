@@ -634,6 +634,7 @@ function recoverUnavailableGitObjects(remote: string, branch: string, failure: u
       `Cannot recover unidentified unavailable Git objects: ${errorMessage(failure)}`,
     );
   }
+  requireNoLazyFetchSupport();
   console.log(`Recovering ${objectIds.length} unavailable Git object(s) from ${remote}`);
   for (const objectId of objectIds) {
     spawnBoundedFetch(["fetch", remote, objectId], PUBLISH_FETCH_TIMEOUT_MS);
@@ -672,6 +673,13 @@ function spawnBoundedFetch(args: readonly string[], timeoutMs: number): GitRunRe
   const result = spawnGit(args, { quiet: true, timeout: timeoutMs });
   if (result.timedOut) throw new GitCommandTimeoutError(args, timeoutMs);
   return result;
+}
+
+function requireNoLazyFetchSupport(): void {
+  const probe = spawnGit(["--no-lazy-fetch", "rev-parse", "--git-dir"], { quiet: true });
+  if (probe.status !== 0) {
+    throw new Error("Git must support --no-lazy-fetch for bounded missing-object recovery");
+  }
 }
 
 function gitObjectIdsAvailable(objectIds: readonly string[]): boolean {

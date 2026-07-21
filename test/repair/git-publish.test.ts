@@ -3158,6 +3158,47 @@ test("publishMainCommit fails closed when a written ledger object is unavailable
   assert.throws(() => run("git", ["--git-dir", origin, "show", `main:${localPath}`], root));
 });
 
+test("publishMainCommit continues after a bounded fetch restores an unavailable object", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-publish-missing-recovered-"));
+  const origin = path.join(root, "origin.git");
+  const work = path.join(root, "work");
+  const fakeBin = path.join(root, "bin");
+  const objectFile = path.join(root, "missing-object.json");
+  const localPath =
+    "ledger/v1/import-bindings/events/ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff.json";
+  write(objectFile, '{"recovered":true}\n');
+  const missingObject = run("git", ["hash-object", objectFile], root).trim();
+  run("git", ["init", "--bare", origin], root);
+  run("git", ["clone", origin, work], root);
+  configureUser(work);
+  write(path.join(work, "base.txt"), "base\n");
+  run("git", ["add", "."], work);
+  run("git", ["commit", "-m", "initial"], work);
+  run("git", ["push", "origin", "HEAD:main"], work);
+  run("git", ["--git-dir", origin, "symbolic-ref", "HEAD", "refs/heads/main"], root);
+  run("git", ["checkout", "-B", "main", "origin/main"], work);
+  installRecoverableUnavailablePushShim(fakeBin, work, missingObject, objectFile);
+  write(path.join(work, localPath), '{"local":true}\n');
+
+  const result = withEnv({ PATH: `${fakeBin}:${process.env.PATH}` }, () =>
+    withCwd(work, () =>
+      publishMainCommit({
+        message: "chore: append command action ledger",
+        paths: [localPath],
+        maxAttempts: 1,
+        pushAttempts: 1,
+      }),
+    ),
+  );
+
+  assert.equal(result, "committed");
+  assert.equal(fs.readFileSync(path.join(work, ".git", "unavailable-push-count"), "utf8"), "2\n");
+  assert.equal(
+    run("git", ["--git-dir", origin, "show", `main:${localPath}`], root),
+    '{"local":true}\n',
+  );
+});
+
 test("publishMainCommit fails fast when unavailable ledger objects remain missing after recovery", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-publish-missing-persistent-"));
   const origin = path.join(root, "origin.git");
@@ -4382,6 +4423,36 @@ if test "$result" -eq 0 && test "$1" = fetch && test -e "${pushCounter}" && test
   printf '%s\n' "$object_id" > "${marker}"
 fi
 exit "$result"
+`,
+  );
+  fs.chmodSync(git, 0o755);
+}
+
+function installRecoverableUnavailablePushShim(fakeBin, work, objectId, objectFile) {
+  fs.mkdirSync(fakeBin, { recursive: true });
+  const git = path.join(fakeBin, "git");
+  const counter = path.join(work, ".git", "unavailable-push-count");
+  const realGit = run("/usr/bin/env", ["which", "git"], process.cwd()).trim();
+  fs.writeFileSync(
+    git,
+    `#!/bin/sh
+set -eu
+if test "$1" = push; then
+  count=0
+  if test -f "${counter}"; then count=$(cat "${counter}"); fi
+  count=$((count + 1))
+  printf '%s\n' "$count" > "${counter}"
+  if test "$count" -eq 1; then
+    printf '%s\n' "fatal: entry 'missing.json' object ${objectId} is unavailable" >&2
+    exit 128
+  fi
+fi
+if test "$1" = fetch && test "$3" = "${objectId}"; then
+  recovered=$("${realGit}" -C "${work}" hash-object -w "${objectFile}")
+  test "$recovered" = "${objectId}"
+  exit 0
+fi
+exec "${realGit}" "$@"
 `,
   );
   fs.chmodSync(git, 0o755);
