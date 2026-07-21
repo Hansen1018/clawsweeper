@@ -630,7 +630,9 @@ function unavailableGitObjectIds(value: unknown): string[] {
 function recoverUnavailableGitObjects(remote: string, branch: string, failure: unknown): void {
   const objectIds = unavailableGitObjectIds(failure);
   if (objectIds.length === 0) {
-    throw new Error(`Cannot recover unidentified unavailable Git objects: ${errorMessage(failure)}`);
+    throw new Error(
+      `Cannot recover unidentified unavailable Git objects: ${errorMessage(failure)}`,
+    );
   }
   console.log(`Recovering ${objectIds.length} unavailable Git object(s) from ${remote}`);
   for (const objectId of objectIds) {

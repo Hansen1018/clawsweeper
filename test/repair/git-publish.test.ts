@@ -3161,34 +3161,21 @@ test("publishMainCommit fails closed when a written ledger object is unavailable
 test("publishMainCommit fails fast when unavailable ledger objects remain missing after recovery", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-publish-missing-persistent-"));
   const origin = path.join(root, "origin.git");
-  const seed = path.join(root, "seed");
   const work = path.join(root, "work");
-  const other = path.join(root, "other");
   const fakeBin = path.join(root, "bin");
+  const missingObject = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
   const localPath =
     "ledger/v1/import-bindings/events/ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff.json";
-  const remotePath =
-    "ledger/v1/import-bindings/events/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json";
   run("git", ["init", "--bare", origin], root);
-  run("git", ["clone", origin, seed], root);
-  configureUser(seed);
-  write(path.join(seed, "base.txt"), "base\n");
-  run("git", ["add", "."], seed);
-  run("git", ["commit", "-m", "initial"], seed);
-  run("git", ["push", "origin", "HEAD:main"], seed);
-  run("git", ["--git-dir", origin, "symbolic-ref", "HEAD", "refs/heads/main"], root);
-  run("git", ["clone", "--depth", "1", `file://${origin}`, work], root);
+  run("git", ["clone", origin, work], root);
   configureUser(work);
-  run("git", ["config", "fetch.unpackLimit", "9999"], work);
-
-  run("git", ["clone", origin, other], root);
-  configureUser(other);
-  write(path.join(other, remotePath), '{"remote":true}\n');
-  run("git", ["add", "."], other);
-  run("git", ["commit", "-m", "concurrent ledger event"], other);
-  const missingObject = run("git", ["rev-parse", `HEAD:${remotePath}`], other).trim();
-  installFirstPushRaceHook(work, other);
-  installPersistentMissingObjectFetchShim(fakeBin, work, [missingObject]);
+  write(path.join(work, "base.txt"), "base\n");
+  run("git", ["add", "."], work);
+  run("git", ["commit", "-m", "initial"], work);
+  run("git", ["push", "origin", "HEAD:main"], work);
+  run("git", ["--git-dir", origin, "symbolic-ref", "HEAD", "refs/heads/main"], root);
+  run("git", ["checkout", "-B", "main", "origin/main"], work);
+  installUnavailablePushShim(fakeBin, work, missingObject);
   write(path.join(work, localPath), '{"local":true}\n');
 
   assert.throws(
@@ -3205,7 +3192,7 @@ test("publishMainCommit fails fast when unavailable ledger objects remain missin
       ),
     new RegExp(`object ${missingObject} is unavailable after recovery`),
   );
-  assert.equal(fs.readFileSync(path.join(work, ".git/hooks/pre-push-count"), "utf8"), "1\n");
+  assert.equal(fs.readFileSync(path.join(work, ".git", "unavailable-push-count"), "utf8"), "1\n");
   assert.throws(() => run("git", ["--git-dir", origin, "show", `main:${localPath}`], root));
 });
 
@@ -4400,27 +4387,30 @@ exit "$result"
   fs.chmodSync(git, 0o755);
 }
 
-function installPersistentMissingObjectFetchShim(fakeBin, work, objectIds) {
+function installUnavailablePushShim(fakeBin, work, objectId) {
   fs.mkdirSync(fakeBin, { recursive: true });
   const git = path.join(fakeBin, "git");
-  const objectPaths = objectIds.map((objectId) =>
-    path.join(work, ".git", "objects", objectId.slice(0, 2), objectId.slice(2)),
-  );
+  const counter = path.join(work, ".git", "unavailable-push-count");
   const realGit = run("/usr/bin/env", ["which", "git"], process.cwd()).trim();
   fs.writeFileSync(
     git,
     `#!/bin/sh
 set -eu
-if test "$1" = fetch && test "$3" = "${objectIds[0]}"; then
+if test "$1" = push; then
+  count=0
+  if test -f "${counter}"; then count=$(cat "${counter}"); fi
+  count=$((count + 1))
+  printf '%s\n' "$count" > "${counter}"
+  if test "$count" -eq 1; then
+    printf '%s\n' "fatal: entry 'missing.json' object ${objectId} is unavailable" >&2
+    exit 128
+  fi
+fi
+if test "$1" = fetch && test "$3" = "${objectId}"; then
   printf '%s\n' 'fatal: remote rejected direct object want' >&2
   exit 128
 fi
-"${realGit}" "$@"
-result=$?
-if test "$result" -eq 0 && test "$1" = fetch; then
-${objectPaths.map((objectPath) => `  rm -f "${objectPath}"`).join("\n")}
-fi
-exit "$result"
+exec "${realGit}" "$@"
 `,
   );
   fs.chmodSync(git, 0o755);
