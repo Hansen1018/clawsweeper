@@ -10,6 +10,7 @@ import {
   exactReviewHistorySample,
   mergeHealthHistorySample,
   normalizeHealthHistorySample,
+  stateWriterHistorySample,
   summarizeOperationalHealth,
 } from "./operational-health.ts";
 import { TRIAGE_ROUTING_GROUPS, triageRoutingGroupsForLabels } from "./triage-routing-groups.ts";
@@ -98,6 +99,9 @@ const HEALTH_HISTORY_KEY_PREFIX = "health-history:";
 const CLAWSWEEPER_REVIEW_REPO = "openclaw/clawsweeper";
 const CLAWSWEEPER_STATE_REPO = "openclaw/clawsweeper-state";
 const CLAWSWEEPER_STATE_REF = "state";
+const STATE_WRITER_LEASE_CACHE_MS = 20_000;
+const STATE_WRITER_LEASE_TTL_MAX_MS = 2 * 60_000;
+let stateWriterLeaseCache: { expiresAt: number; value: unknown } | null = null;
 const DEFAULT_CRABFLEET_URL = "https://crabfleet.openclaw.ai";
 const CLUSTER_REPAIR_INTAKE_WORKFLOW = "repair-cluster-intake.yml";
 const CLAWSWEEPER_ALLOWED_ASSOCIATIONS = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
@@ -506,6 +510,11 @@ export default {
     // the review job that runs Codex over untrusted content.
     if (url.pathname === "/internal/exact-review/heartbeat" && request.method === "POST")
       return exactReviewQueueRequest(env, "/heartbeat", request);
+    if (
+      url.pathname === "/internal/exact-review/state-writer-progress" &&
+      request.method === "POST"
+    )
+      return exactReviewQueueRequest(env, "/state-writer-progress", request);
     if (url.pathname === "/internal/exact-review/complete" && request.method === "POST")
       return exactReviewQueueRequest(env, "/complete", request);
     if (url.pathname === "/internal/exact-review/claimed-runs" && request.method === "POST")
@@ -645,6 +654,7 @@ async function recordScheduledHealthSample(env) {
   await appendHealthHistorySample(env, {
     at: new Date().toISOString(),
     exact_review: exactReviewHistorySample(queue),
+    state_writer: stateWriterHistorySample(objectValue(queue).state_writer),
   });
 }
 
@@ -2043,6 +2053,19 @@ async function attachExactReviewQueueStatus(snapshot, env) {
   } catch (error) {
     exactReviewQueueError = error instanceof Error ? error.message : String(error);
   }
+  if (
+    exactReviewQueue &&
+    typeof exactReviewQueue === "object" &&
+    exactReviewQueue.state_writer &&
+    typeof exactReviewQueue.state_writer === "object"
+  ) {
+    const stateWriterLease = await cachedStateWriterLeaseProbe(env);
+    const writer = objectValue(exactReviewQueue.state_writer);
+    exactReviewQueue = {
+      ...exactReviewQueue,
+      state_writer: { ...writer, global_lease: stateWriterLease },
+    };
+  }
   const attached = {
     ...snapshot,
     exact_review_queue: exactReviewQueue,
@@ -2052,6 +2075,68 @@ async function attachExactReviewQueueStatus(snapshot, env) {
     },
   };
   return { ...attached, dashboard_health: summarizeDashboardHealth(attached) };
+}
+
+async function cachedStateWriterLeaseProbe(env) {
+  if (stateWriterLeaseCache && stateWriterLeaseCache.expiresAt > Date.now()) {
+    return stateWriterLeaseCache.value;
+  }
+  const observedAt = new Date().toISOString();
+  let value: unknown;
+  try {
+    const repo = String(env.CLAWSWEEPER_STATE_REPO || CLAWSWEEPER_STATE_REPO);
+    const branch = String(env.CLAWSWEEPER_STATE_REF || CLAWSWEEPER_STATE_REF);
+    // Prove repository access before treating a lease-ref 404 as "free". GitHub
+    // also returns 404 for private repos the token cannot see.
+    await githubJson(env, `/repos/${repo}`);
+    const ref = `heads/clawsweeper-publish-lease/${branch}`;
+    let refPayload: unknown;
+    try {
+      refPayload = await githubJson(env, `/repos/${repo}/git/ref/${ref}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "";
+      if (/404|not found/i.test(message)) {
+        value = {
+          status: "free",
+          expires_at: null,
+          observed_at: observedAt,
+          freshness: "fresh",
+        };
+        stateWriterLeaseCache = { expiresAt: Date.now() + STATE_WRITER_LEASE_CACHE_MS, value };
+        return value;
+      }
+      throw error;
+    }
+    const sha = String(objectValue(objectValue(refPayload).object).sha || "");
+    if (!/^[a-f0-9]{40,64}$/i.test(sha)) throw new Error("invalid lease ref");
+    const commit = objectValue(await githubJson(env, `/repos/${repo}/git/commits/${sha}`));
+    const committedAt = Date.parse(String(objectValue(commit.committer).date || ""));
+    const message = String(objectValue(commit).message || "");
+    const advertised = Number(/^ttl_ms: (\d+)$/m.exec(message)?.[1] || "");
+    const ttlMs =
+      Number.isSafeInteger(advertised) && advertised > 0
+        ? Math.min(advertised, STATE_WRITER_LEASE_TTL_MAX_MS)
+        : STATE_WRITER_LEASE_TTL_MAX_MS;
+    const expiresAt = Number.isFinite(committedAt) ? committedAt + ttlMs : NaN;
+    value =
+      Number.isFinite(expiresAt) && expiresAt > Date.now()
+        ? {
+            status: "held",
+            expires_at: new Date(expiresAt).toISOString(),
+            observed_at: observedAt,
+            freshness: "fresh",
+          }
+        : {
+            status: "free",
+            expires_at: Number.isFinite(expiresAt) ? new Date(expiresAt).toISOString() : null,
+            observed_at: observedAt,
+            freshness: "stale",
+          };
+  } catch {
+    value = { status: "unknown", expires_at: null, observed_at: observedAt, freshness: "unknown" };
+  }
+  stateWriterLeaseCache = { expiresAt: Date.now() + STATE_WRITER_LEASE_CACHE_MS, value };
+  return value;
 }
 
 async function triageSnapshot(env) {
@@ -8176,6 +8261,7 @@ a.pill:hover { color: var(--claw); text-decoration: none; }
       </div>
     </div>
     <div class="exact-lanes" id="exact-review-lanes" aria-live="polite"></div>
+    <div id="state-writer-health" aria-live="polite"></div>
     <h3 class="overview-section-title">Handoff Health</h3>
     <div id="exact-review-handoff" aria-live="polite"></div>
     <div id="apply-health"></div>
@@ -8669,6 +8755,7 @@ function formatAgeMinutes(value) {
 async function loadHealthHistory(range, force) {
   if (!force && range === activeHealthRange && Date.now() - healthHistoryLoadedAt < 60000) {
     renderExactReviewLanes(lastData?.exact_review_queue);
+    renderStateWriter(lastData?.exact_review_queue?.state_writer);
     return;
   }
   activeHealthRange = range;
@@ -8685,6 +8772,7 @@ async function loadHealthHistory(range, force) {
     healthHistorySamples = [];
   }
   renderExactReviewLanes(lastData?.exact_review_queue);
+  renderStateWriter(lastData?.exact_review_queue?.state_writer);
 }
 
 function workerGroup(worker) {
@@ -8786,6 +8874,107 @@ function renderSystemMap(data) {
     ? "Live jobs with " + fallbacks + " workflow fallback" + (fallbacks === 1 ? "" : "s")
     : "Live GitHub job and step telemetry";
 }
+function stateWriterHistorySamples() {
+  return healthHistorySamples.flatMap((sample) => {
+    const writer = sample?.state_writer;
+    if (!writer || writer.collection_ok !== true) return [];
+    return [{
+      at: sample.at,
+      accepted: Number(writer.accepted_operations_total || 0),
+      commits: Number(writer.state_commits_total || 0),
+      items: Number(writer.materialized_items_total || 0),
+      wait: writer.wait_ms,
+      hold: writer.hold_ms,
+    }];
+  });
+}
+
+function stateWriterHistorySegment(samples, field) {
+  if (samples.length < 2) return null;
+  let startIndex = 0;
+  for (let index = 1; index < samples.length; index += 1) {
+    if (samples[index][field] < samples[index - 1][field]) startIndex = index;
+  }
+  if (samples.length - startIndex < 2) return null;
+  return samples.slice(startIndex);
+}
+
+function stateWriterRateFromHistory(samples, field) {
+  const segment = stateWriterHistorySegment(samples, field);
+  if (!segment) return null;
+  const start = segment[0];
+  const end = segment[segment.length - 1];
+  const elapsedHours = (Date.parse(end.at) - Date.parse(start.at)) / 3_600_000;
+  if (!(elapsedHours > 0) || end[field] < start[field]) return null;
+  return Math.round(((end[field] - start[field]) / elapsedHours) * 10) / 10;
+}
+
+function renderStateWriter(writer) {
+  const target = document.getElementById("state-writer-health");
+  if (!target) return;
+  if (!writer || !writer.collection) {
+    target.innerHTML = '<section class="exact-lane"><h3>State writer</h3><p class="muted">Unavailable — writer telemetry has not been collected.</p></section>';
+    return;
+  }
+  const collection = writer.collection || {};
+  const live = writer.live || {};
+  const lease = writer.global_lease || {};
+  const hour = writer.last_60_minutes || {};
+  const history = stateWriterHistorySamples();
+  const latestHistory = history.at(-1);
+  const itemsPerHour = stateWriterRateFromHistory(history, "items");
+  const commitsPerHour = stateWriterRateFromHistory(history, "commits");
+  const commitSegment = stateWriterHistorySegment(history, "commits");
+  const itemsPerCommit =
+    commitSegment &&
+    commitSegment.length >= 2 &&
+    commitSegment[commitSegment.length - 1].commits > commitSegment[0].commits
+      ? Math.round(
+          ((commitSegment[commitSegment.length - 1].items - commitSegment[0].items) /
+            (commitSegment[commitSegment.length - 1].commits - commitSegment[0].commits)) *
+            100,
+        ) / 100
+      : hour.items_per_commit;
+  const wait = latestHistory?.wait || hour.wait_ms;
+  const hold = latestHistory?.hold || hour.hold_ms;
+  const rangeLabel = activeHealthRange === "7d" ? "7d" : activeHealthRange;
+  const liveFresh =
+    collection.status === "fresh" &&
+    (live.freshness_seconds == null || Number(live.freshness_seconds) <= 90);
+  const mode =
+    writer.mode === "mixed"
+      ? "Mixed · legacy draining + batch active"
+      : writer.mode === "batch"
+        ? "Batch"
+        : writer.mode === "single_item"
+          ? "Single-item"
+          : "Unknown";
+  const metric = (value, fallback = "unknown") => value === null || value === undefined ? fallback : value;
+  const percentile = (value) =>
+    value?.samples ? "p50 " + metric(value.p50) + "ms · p95 " + metric(value.p95) + "ms · n=" + value.samples : "unknown";
+  const itemTrend = history.map((sample) => ({ at: sample.at, pending: sample.items }));
+  target.innerHTML =
+    '<section class="exact-lane">' +
+    '<h3>State writer <span class="muted">' + mode + " · " + metric(collection.status) + " · " + esc(rangeLabel) + "</span></h3>" +
+    '<p>Global state lease: <strong>' + metric(lease.status) + '</strong> · 1 writer maximum</p>' +
+    '<p>Tracked exact publishers: ' +
+    (liveFresh
+      ? metric(live.tracked_holding, "unknown") + " holding · " + metric(live.tracked_waiting, "unknown") + " waiting"
+      : "unknown holding · unknown waiting") +
+    "</p>" +
+    exactReviewTrend(itemTrend, "Materialized items") +
+    '<dl class="lane-metrics">' +
+    "<div><dt>Materialized</dt><dd>" + metric(itemsPerHour ?? hour.materialized_items) + " items/hour</dd></div>" +
+    "<div><dt>State commits</dt><dd>" + metric(commitsPerHour ?? hour.state_commits) + "/hour</dd></div>" +
+    "<div><dt>Items / commit</dt><dd>" + metric(itemsPerCommit) + "</dd></div>" +
+    "<div><dt>Lease wait</dt><dd>" + percentile(wait) + "</dd></div>" +
+    "<div><dt>Lease hold</dt><dd>" + percentile(hold) + "</dd></div>" +
+    "</dl>" +
+    '<p class="muted">Live holding/waiting require fresh progress. Throughput uses the selected ' + esc(rangeLabel) + " history when available; otherwise the rolling hour.</p>" +
+    '<p class="muted">Publication workflows can run concurrently, but they feed one serialized state-ref writer.</p>' +
+    "</section>";
+}
+
 function renderExactReviewLanes(queue) {
   const target = document.getElementById("exact-review-lanes");
   if (!target) return;
@@ -9105,6 +9294,7 @@ function renderDashboard(data, note) {
   populateReviewRepoFilter(data.source?.target_repositories || []);
   renderSystemMap(data);
   renderExactReviewLanes(data.exact_review_queue);
+  renderStateWriter(data.exact_review_queue?.state_writer);
   renderExactReviewHandoff(data.exact_review_queue);
   renderApplyHealth(data);
   renderAutomaticWork(data.automatic_work || []);

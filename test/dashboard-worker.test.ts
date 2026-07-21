@@ -11491,6 +11491,126 @@ function leasedExactReviewPublicationItem(itemNumber: number, runId: string) {
   };
 }
 
+test("state writer telemetry is optional, idempotent, and summary-safe", async () => {
+  const storage = new MemoryDurableStorage();
+  const items = Object.fromEntries(
+    Array.from({ length: 2 }, (_, index) => {
+      const item = leasedExactReviewPublicationItem(96_000 + index, `9600${index}`);
+      return [item.key, item];
+    }),
+  );
+  await storage.put("exact-review-queue", { deliveries: {}, items });
+  const queue = new ExactReviewQueue({ storage }, {});
+  const now = new Date().toISOString();
+  const telemetry = {
+    schema_version: 1,
+    operation_id: "batch:telemetry-test",
+    mode: "batch",
+    started_at: now,
+    finished_at: now,
+    wait_ms: 1,
+    acquire_attempts: 1,
+    acquired: true,
+    hold_ms: 2,
+    renewals: 0,
+    released: true,
+    git_duration_ms: 3,
+    git_processes: 4,
+    commit_count: 1,
+    materialized_items: 2,
+    configured_batch_size: 2,
+    actual_batch_size: 2,
+    batch_wait_ms: 1,
+    outcome: "materialized",
+  };
+  for (const item of Object.values(items)) {
+    const response = await queue.fetch(
+      new Request("https://clawsweeper-exact-review-queue/complete", {
+        method: "POST",
+        body: JSON.stringify({
+          lease_id: item.leaseId,
+          item_key: item.key,
+          lease_revision: 1,
+          claim_generation: 1,
+          run_id: item.claimedRunId,
+          run_attempt: 1,
+          outcome: "success",
+          completion_kind: "published",
+          reason_code: "publication_applied",
+          state_writer: telemetry,
+        }),
+      }),
+    );
+    assert.equal(response.status, 200);
+  }
+  const stats = await (
+    await queue.fetch(new Request("https://clawsweeper-exact-review-queue/stats"))
+  ).json();
+  assert.equal(stats.state_writer.last_15_minutes.operations, 1);
+  assert.equal(stats.state_writer.last_15_minutes.state_commits, 1);
+  assert.equal(stats.state_writer.last_15_minutes.materialized_items, 2);
+  assert.equal(stats.state_writer.last_15_minutes.items_per_commit, 2);
+  assert.equal(stats.state_writer.diagnostics.accepted_terminal_total, 1);
+  assert.equal(stats.state_writer.diagnostics.duplicate_terminal_total, 1);
+  assert.equal(stats.state_writer.diagnostics.state_commits_total, 1);
+  assert.equal(stats.state_writer.diagnostics.materialized_items_total, 2);
+
+  const malformed = leasedExactReviewPublicationItem(97_001, "97001");
+  await storage.put("exact-review-queue", {
+    deliveries: {},
+    items: { [malformed.key]: malformed },
+  });
+  const rejected = await queue.fetch(
+    new Request("https://clawsweeper-exact-review-queue/complete", {
+      method: "POST",
+      body: JSON.stringify({
+        lease_id: malformed.leaseId,
+        item_key: malformed.key,
+        lease_revision: 1,
+        claim_generation: 1,
+        run_id: malformed.claimedRunId,
+        run_attempt: 1,
+        outcome: "success",
+        completion_kind: "published",
+        reason_code: "publication_applied",
+        state_writer: { schema_version: 1, operation_id: "bad" },
+      }),
+    }),
+  );
+  assert.equal(rejected.status, 200);
+  const afterReject = await (
+    await queue.fetch(new Request("https://clawsweeper-exact-review-queue/stats"))
+  ).json();
+  assert.equal(afterReject.state_writer.diagnostics.rejected_terminal_total, 1);
+
+  const reviewOnly = leasedExactReviewQueueItem(97_002, "97002");
+  await storage.put("exact-review-queue", {
+    deliveries: {},
+    items: { [reviewOnly.key]: reviewOnly },
+  });
+  const ignored = await queue.fetch(
+    new Request("https://clawsweeper-exact-review-queue/complete", {
+      method: "POST",
+      body: JSON.stringify({
+        lease_id: reviewOnly.leaseId,
+        item_key: reviewOnly.key,
+        lease_revision: 1,
+        claim_generation: 1,
+        run_id: reviewOnly.claimedRunId,
+        run_attempt: 1,
+        outcome: "success",
+        state_writer: telemetry,
+      }),
+    }),
+  );
+  assert.equal(ignored.status, 200);
+  const afterIgnore = await (
+    await queue.fetch(new Request("https://clawsweeper-exact-review-queue/stats"))
+  ).json();
+  assert.equal(afterIgnore.state_writer.last_15_minutes.operations, 1);
+  assert.equal(afterIgnore.state_writer.diagnostics.rejected_terminal_total, 2);
+});
+
 function unclaimedExactReviewQueueItem(itemNumber: number) {
   return {
     ...leasedExactReviewQueueItem(itemNumber, "unclaimed"),

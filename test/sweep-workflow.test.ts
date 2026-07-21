@@ -22,6 +22,17 @@ test("sweep keeps optional media tooling out of review startup", () => {
   assert.doesNotMatch(workflow, /setup-media-proof-tools/);
 });
 
+test("exact publication forwards state writer telemetry through the Node payload builder", () => {
+  const workflow = readText(".github/workflows/sweep.yml");
+  assert.match(
+    workflow,
+    /STATE_WRITER_JSON: \$\{\{ steps\.exact-review-publication-result\.outputs\.state_writer_json \}\}/,
+  );
+  assert.match(workflow, /const parsed = JSON\.parse\(process\.env\.STATE_WRITER_JSON \|\| ""\)/);
+  assert.match(workflow, /\.\.\.\(stateWriter \? \{ state_writer: stateWriter \} : \{\}\)/);
+  assert.doesNotMatch(workflow, /--data .*STATE_WRITER_JSON/);
+});
+
 test("ledger-producing jobs initialize immutable workflow context", () => {
   const workflow = readText(".github/workflows/sweep.yml");
   for (const jobName of [
@@ -625,8 +636,10 @@ test("exact event review hands immutable artifacts to the queue-bounded publishe
   assert.match(publisherSource, /StatePublishContentionError\s*\? "state_contention"/);
   assert.match(
     publisherSource,
-    /const mutation = withStatePublishLease\(\(\) => \{\s*hardResetToRemoteMain\(\)/,
+    /const mutation = withStatePublishLease\(\s*\(\) => \{\s*hardResetToRemoteMain\(\)/,
   );
+  assert.match(publisherSource, /observer:\s*recorder/);
+  assert.match(publisherSource, /state_writer_json=/);
   assert.match(publisherSource, /retryable_failure/);
   assert.match(publisherSource, /error instanceof GitCommandTimeoutError/);
   assert.match(

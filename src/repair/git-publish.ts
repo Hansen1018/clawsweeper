@@ -31,6 +31,7 @@ import {
 import { mergeSweepStatusJson } from "./sweep-status-merge.js";
 import { mergeCommentRouterLedgers } from "./comment-router-ledger-merge.js";
 import { isActionEventPublishPath } from "../action-ledger-paths.js";
+import type { StateWriterTelemetryRecorder } from "./state-writer-telemetry-recorder.js";
 
 export type GitRunResult = {
   status: number;
@@ -136,10 +137,20 @@ export type StatePublishLeaseOptions = {
   acquireTimeoutMs?: number;
   ttlMs?: number;
   waitMs?: number;
+  observer?: StateWriterTelemetryRecorder;
 };
 
 let activeGitPublishMetrics: GitPublishMetrics | null = null;
 let activeStatePublishLease: StatePublishLease | null = null;
+let activeStateWriterTelemetry: StateWriterTelemetryRecorder | null = null;
+
+export function setStatePublishTelemetryObserver(observer: StateWriterTelemetryRecorder | null) {
+  const previous = activeStateWriterTelemetry;
+  activeStateWriterTelemetry = observer;
+  return () => {
+    activeStateWriterTelemetry = previous;
+  };
+}
 
 export function configureGitUser(): void {
   runGit(["config", "user.name", clawsweeperGitUserName()]);
@@ -214,6 +225,7 @@ export class StatePublishContentionError extends Error {
 }
 
 function recordGitProcess(action: string | undefined): void {
+  activeStateWriterTelemetry?.recordGitProcess();
   if (!activeGitPublishMetrics) return;
   const key = action || "command";
   activeGitPublishMetrics.processes += 1;
@@ -1466,15 +1478,31 @@ export function withStatePublishLease<T>(
   }
   const remote = options.remote ?? "origin";
   const branch = options.branch ?? publishDefaultBranch();
-  const lease = acquireStatePublishLease(remote, branch, options);
+  const previousTelemetry = activeStateWriterTelemetry;
+  activeStateWriterTelemetry = options.observer ?? previousTelemetry;
+  const telemetry = () => activeStateWriterTelemetry;
+  let lease: StatePublishLease;
+  try {
+    lease = acquireStatePublishLease(remote, branch, options);
+  } catch (error) {
+    telemetry()?.finalize(
+      error instanceof StatePublishContentionError ? "contention_timeout" : "failed",
+    );
+    activeStateWriterTelemetry = previousTelemetry;
+    throw error;
+  }
   lease.cleanup = startStatePublishLeaseCleanup(lease);
   activeStatePublishLease = lease;
   try {
     return operation();
   } finally {
     activeStatePublishLease = null;
-    releaseStatePublishLease(lease);
+    telemetry()?.enteredReleasing();
+    const released = releaseStatePublishLease(lease);
+    telemetry()?.releasedLease(released);
+    telemetry()?.finished();
     lease.cleanup?.close();
+    activeStateWriterTelemetry = previousTelemetry;
   }
 }
 
@@ -1511,6 +1539,7 @@ function acquireStatePublishLease(
   const deadlineAtMs = Date.now() + acquireTimeoutMs;
   const observedByOid = new Map<string, ObservedStatePublishLease>();
   let attempt = 0;
+  activeStateWriterTelemetry?.enteredWaiting();
 
   // Spread a newly admitted publisher cohort before any of them attempts the
   // empty-ref compare-and-swap. Once an owner exists, later contenders only
@@ -1519,6 +1548,7 @@ function acquireStatePublishLease(
 
   while (Date.now() < deadlineAtMs) {
     attempt += 1;
+    activeStateWriterTelemetry?.recordAcquireAttempt();
     const observed = observeStatePublishLease(remote, leaseRef, ttlMs, observedByOid);
     const now = Date.now();
     if (!observed || observed.expiresAtMs <= now) {
@@ -1531,6 +1561,7 @@ function acquireStatePublishLease(
           { allowFailure: true, quiet: true, timeout: PUBLISH_FETCH_TIMEOUT_MS },
         ).status === 0;
       if (acquired) {
+        activeStateWriterTelemetry?.acquiredLease();
         console.log(
           `Acquired state publish lease owner=${owner} attempt=${attempt} stale_recovery=${observed ? "true" : "false"} ttl_ms=${ttlMs}`,
         );
@@ -1694,7 +1725,7 @@ function startStatePublishLeaseCleanup(lease: StatePublishLease): StatePublishLe
   };
 }
 
-function releaseStatePublishLease(lease: StatePublishLease): void {
+function releaseStatePublishLease(lease: StatePublishLease): boolean {
   try {
     const released = spawnGit(
       ["push", `--force-with-lease=${lease.ref}:${lease.oid}`, lease.remote, `:${lease.ref}`],
@@ -1702,15 +1733,18 @@ function releaseStatePublishLease(lease: StatePublishLease): void {
     );
     if (released.status === 0) {
       console.log(`Released state publish lease owner=${lease.owner}`);
+      return true;
     } else {
       console.log(
         `State publish lease release skipped owner=${lease.owner}; ownership changed or cleanup failed`,
       );
+      return false;
     }
   } catch (error) {
     console.log(
       `State publish lease release failed owner=${lease.owner}; expiry will recover it: ${errorMessage(error)}`,
     );
+    return false;
   }
 }
 
@@ -1746,6 +1780,7 @@ function renewStatePublishLease(lease: StatePublishLease, reason: string): void 
   }
   lease.oid = renewedOid;
   lease.expiresAtMs = Date.now() + lease.ttlMs;
+  activeStateWriterTelemetry?.recordRenewal();
   console.log(`Renewed state publish lease owner=${lease.owner} ${reason}`);
 }
 
