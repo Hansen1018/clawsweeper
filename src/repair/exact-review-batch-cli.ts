@@ -8,6 +8,7 @@ import {
   ExactReviewBatchQueueClient,
   type ExactReviewBatchQueueItem,
 } from "./exact-review-batch-queue-client.js";
+import { StatePublishContentionError } from "./git-publish.js";
 import { commitPreparedStateBatch } from "./state-publication-batch.js";
 import {
   validatePreparedStateMutationPlans,
@@ -20,9 +21,15 @@ type BatchManifest = {
   items: Array<ExactReviewBatchQueueItem & { outcomePath: string }>;
 };
 
+type BatchReceipt = {
+  batchId: string;
+  publishedItemKeys: Set<string>;
+  stateCommitSha?: string;
+};
+
 const command = process.argv[2];
-if (!command || !["claim", "heartbeat", "commit", "complete"].includes(command)) {
-  throw new Error("usage: exact-review-batch-cli.ts <claim|heartbeat|commit|complete>");
+if (!command || !["claim", "heartbeat", "commit", "complete", "release"].includes(command)) {
+  throw new Error("usage: exact-review-batch-cli.ts <claim|heartbeat|commit|complete|release>");
 }
 
 const queueSecret = process.env.CLAWSWEEPER_WEBHOOK_SECRET;
@@ -36,7 +43,8 @@ const client = new ExactReviewBatchQueueClient({
 if (command === "claim") await claim();
 else if (command === "heartbeat") await heartbeat();
 else if (command === "commit") await commit();
-else await complete();
+else if (command === "complete") await complete();
+else await release();
 
 async function claim() {
   const leaseOwner = env("EXACT_REVIEW_BATCH_LEASE_OWNER");
@@ -98,6 +106,7 @@ async function commit() {
   });
   const active = new Map(fetched.items.map((item) => [item.itemKey, item]));
   const superseded: ExactReviewBatchCompletion[] = [];
+  const commitMembers: ExactReviewBatchQueueItem[] = [];
   const plans: PreparedStateMutationPlan[] = [];
   for (const manifestItem of manifest.items) {
     const current = active.get(manifestItem.itemKey);
@@ -121,6 +130,7 @@ async function commit() {
     ) {
       throw new Error(`Batch outcome identity does not match ${current.itemKey}`);
     }
+    commitMembers.push(current);
     plans.push(plan);
   }
 
@@ -133,7 +143,22 @@ async function commit() {
       }).commitSha;
     }
   } catch (error) {
-    await acknowledge(manifest, superseded, undefined, failureFingerprint(error));
+    const fingerprint = failureFingerprint(error);
+    const reasonCode =
+      error instanceof StatePublishContentionError ? "state_contention" : "unknown_failure";
+    const retryable = commitMembers.map((member) => ({
+      ...member,
+      terminalOutcome: "retryable_failure" as const,
+      reasonCode,
+      errorFingerprint: fingerprint,
+    }));
+    try {
+      await acknowledge(manifest, [...superseded, ...retryable], undefined, fingerprint);
+    } catch (releaseError) {
+      console.error(
+        `Failed to release batch after commit error: ${releaseError instanceof Error ? releaseError.message : String(releaseError)}`,
+      );
+    }
     throw error;
   }
   const receiptPath = batchReceiptPath();
@@ -164,13 +189,7 @@ async function commit() {
 
 async function complete() {
   const manifest = readManifest();
-  const receipt = objectValue(JSON.parse(readFileSync(batchReceiptPath(), "utf8")));
-  if (receipt.batchId !== manifest.batchId) throw new Error("Batch receipt identity mismatch");
-  const publishedKeys = new Set(
-    Array.isArray(receipt.publishedItemKeys)
-      ? receipt.publishedItemKeys.map((value) => stringValue(value, "publishedItemKey"))
-      : [],
-  );
+  const receipt = readBatchReceipt(manifest, true)!;
   const fetched = await client.fetch({
     batchId: manifest.batchId,
     leaseOwner: manifest.leaseOwner,
@@ -179,7 +198,11 @@ async function complete() {
   const completions: ExactReviewBatchCompletion[] = [];
   for (const manifestItem of manifest.items) {
     const current = active.get(manifestItem.itemKey);
-    if (!current || !existsSync(manifestItem.outcomePath)) continue;
+    if (!current) continue;
+    if (!existsSync(manifestItem.outcomePath)) {
+      completions.push(retryableCompletion(current, "unknown_failure"));
+      continue;
+    }
     const outcome = objectValue(JSON.parse(readFileSync(manifestItem.outcomePath, "utf8")));
     if (outcome.kind === "superseded") {
       if (
@@ -191,26 +214,71 @@ async function complete() {
       completions.push({ ...current, terminalOutcome: "superseded" });
       continue;
     }
-    if (outcome.kind !== "eligible" || !publishedKeys.has(current.itemKey)) continue;
-    const disposition = objectValue(outcome.disposition);
-    const requiresDeferredEffect =
-      disposition.requeueLatestExpected === true ||
-      disposition.deferredCloseCoverageExpected === true ||
-      disposition.routableSyncExpected === true;
-    if (requiresDeferredEffect && outcome.postEffectsComplete !== true) continue;
+    const failure = failureCompletion(current, outcome);
+    if (failure) {
+      completions.push(failure);
+      continue;
+    }
+    if (outcome.kind !== "eligible" || !receipt.publishedItemKeys.has(current.itemKey)) {
+      completions.push(retryableCompletion(current, "unknown_failure"));
+      continue;
+    }
+    if (hasPendingPostEffects(outcome)) continue;
     completions.push({ ...current, terminalOutcome: "published" });
   }
-  const stateCommitSha =
-    typeof receipt.stateCommitSha === "string" && receipt.stateCommitSha
-      ? receipt.stateCommitSha
-      : undefined;
-  const result = await acknowledge(manifest, completions, stateCommitSha);
+  const result = await acknowledge(manifest, completions, receipt.stateCommitSha);
+  const retryable = completions.filter(
+    (completion) =>
+      completion.terminalOutcome !== "published" && completion.terminalOutcome !== "superseded",
+  ).length;
   console.log(
     JSON.stringify({
       ok: true,
       batch_id: manifest.batchId,
       accepted: result?.accepted ?? 0,
-      retryable: fetched.items.length - completions.length,
+      retryable,
+    }),
+  );
+}
+
+async function release() {
+  const manifest = readManifest();
+  const receipt = readBatchReceipt(manifest, false);
+  // Cleanup must remain available when the queue fetch path is degraded. The
+  // claimed manifest already contains the exact revision and generation fences
+  // accepted by the complete route, so a fresh read adds availability risk but
+  // cannot strengthen ownership.
+  const completions: ExactReviewBatchCompletion[] = manifest.items.map((member) => {
+    if (existsSync(member.outcomePath)) {
+      const outcome = objectValue(JSON.parse(readFileSync(member.outcomePath, "utf8")));
+      if (
+        outcome.kind === "superseded" &&
+        (optionalObjectValue(outcome.disposition).requeueLatestExpected !== true ||
+          outcome.postEffectsComplete === true)
+      ) {
+        return { ...member, terminalOutcome: "superseded" };
+      }
+      const failure = failureCompletion(member, outcome);
+      if (failure) return failure;
+      // A receipt proves the state mutation committed. A member is safe to
+      // acknowledge as published only after every required post-commit effect
+      // is also durable; otherwise requeueing preserves that unfinished work.
+      if (
+        outcome.kind === "eligible" &&
+        receipt?.publishedItemKeys.has(member.itemKey) &&
+        !hasPendingPostEffects(outcome)
+      ) {
+        return { ...member, terminalOutcome: "published" };
+      }
+    }
+    return retryableCompletion(member, "workflow_cancelled");
+  });
+  const result = await acknowledge(manifest, completions, receipt?.stateCommitSha);
+  console.log(
+    JSON.stringify({
+      ok: true,
+      batch_id: manifest.batchId,
+      released: result?.accepted ?? 0,
     }),
   );
 }
@@ -229,6 +297,53 @@ async function acknowledge(
     ...(stateCommitSha ? { stateCommitSha } : {}),
     ...(failure ? { failureFingerprint: failure } : {}),
   });
+}
+
+function failureCompletion(
+  member: ExactReviewBatchQueueItem,
+  outcome: Record<string, unknown>,
+): ExactReviewBatchCompletion | null {
+  const terminalOutcome = String(outcome.kind || "");
+  if (
+    terminalOutcome !== "retryable_failure" &&
+    terminalOutcome !== "refresh_required" &&
+    terminalOutcome !== "permanent_failure"
+  ) {
+    return null;
+  }
+  const reasonCode = stringValue(outcome.reasonCode, "outcome.reasonCode");
+  const errorFingerprint =
+    typeof outcome.errorFingerprint === "string" && outcome.errorFingerprint
+      ? outcome.errorFingerprint
+      : undefined;
+  return {
+    ...member,
+    terminalOutcome,
+    reasonCode,
+    ...(errorFingerprint ? { errorFingerprint } : {}),
+  };
+}
+
+function retryableCompletion(
+  member: ExactReviewBatchQueueItem,
+  reasonCode: string,
+  errorFingerprint?: string,
+): ExactReviewBatchCompletion {
+  return {
+    ...member,
+    terminalOutcome: "retryable_failure",
+    reasonCode,
+    ...(errorFingerprint ? { errorFingerprint } : {}),
+  };
+}
+
+function hasPendingPostEffects(outcome: Record<string, unknown>): boolean {
+  const disposition = optionalObjectValue(outcome.disposition);
+  const requiresPostEffects =
+    disposition.requeueLatestExpected === true ||
+    disposition.deferredCloseCoverageExpected === true ||
+    disposition.routableSyncExpected === true;
+  return requiresPostEffects && outcome.postEffectsComplete !== true;
 }
 
 function readManifest(): BatchManifest {
@@ -255,6 +370,31 @@ function batchReceiptPath(): string {
     process.env.EXACT_REVIEW_BATCH_RECEIPT ||
     join(dirname(env("EXACT_REVIEW_BATCH_MANIFEST")), "state-receipt.json")
   );
+}
+
+function readBatchReceipt(manifest: BatchManifest, required: boolean): BatchReceipt | null {
+  const path = batchReceiptPath();
+  if (!existsSync(path)) {
+    if (required) throw new Error("Batch receipt is missing");
+    return null;
+  }
+  const receipt = objectValue(JSON.parse(readFileSync(path, "utf8")));
+  const batchId = stringValue(receipt.batchId, "receipt.batchId");
+  if (batchId !== manifest.batchId) throw new Error("Batch receipt identity mismatch");
+  const publishedItemKeys = new Set(
+    Array.isArray(receipt.publishedItemKeys)
+      ? receipt.publishedItemKeys.map((value) => stringValue(value, "publishedItemKey"))
+      : [],
+  );
+  const stateCommitSha =
+    typeof receipt.stateCommitSha === "string" && receipt.stateCommitSha
+      ? receipt.stateCommitSha
+      : undefined;
+  return {
+    batchId,
+    publishedItemKeys,
+    ...(stateCommitSha ? { stateCommitSha } : {}),
+  };
 }
 
 function output(name: string, value: string) {
