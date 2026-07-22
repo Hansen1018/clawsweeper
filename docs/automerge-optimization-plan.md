@@ -99,11 +99,61 @@ and replayable proof bundle, not a production fix.
 
 ## Current status
 
-The harness has confirmed the git-hooks runtime incident and both historical
-state-publication P1 tree-loss fingerprints. The canonical immutable-path
-control and deterministic recovery/drift models are stable. The process-leak
-fixture currently fails closed before the historical leak oracle because the
-pinned target's default `check:changed` ratchet exits non-zero; its historical
-workflow context must be reconstructed without bypassing that check. Flow
-repeat inventory also needs a stable fixture-digest representation that does
-not include per-run temporary Git metadata.
+This is a handoff record. The stable-red phase is **not complete** and no
+production Automerge behavior has been changed.
+
+### Completed and evidence-backed
+
+- The CLI supports explicit flow, publication, model, and runtime scenario
+  selection; candidate and reproducer exit semantics are distinct and
+  fail-closed.
+- Proof summaries bind the candidate `HEAD`, production `dist/` digest,
+  dependency digest, fixture identity, event/fault sequence, terminal state,
+  and child-process observation. Candidate identity is rechecked after every
+  scenario.
+- The real OpenClaw git-hooks incident is confirmed against pinned revisions:
+  `openclaw.unsafe-core-hookspath` at `target-setup-git-safety`.
+- Both historical publication P1 cases are confirmed 10/10 against
+  `5c28770b`: `state-publication.concurrent-sibling-lost` and
+  `state-publication.merge-tree-entry-lost` at `state-publication-rebuild`.
+- The immutable canonical-path conflict is safe 10/10: different bytes are
+  blocked and the original remote tree entry is preserved.
+- Pending-run replacement, duplicate command replay, both crash models, and
+  all modeled mutation-sensitive drift cases are deterministic 10/10. They
+  intentionally remain `evidence-only`, not a candidate-release pass.
+- Focused proof/candidate/gate/model tests (23), syntax checks, formatting, and
+  diff checks passed on Node 24.
+
+### Incomplete or explicitly blocked
+
+- The real process-leak case is **not confirmed**. With the pinned target tree,
+  the real `pnpm check:changed` exits at the max-lines ratchet before the
+  historical "exit 0 with four descendants" oracle. Its proof is correctly a
+  `harness-error`; do not skip the ratchet or relabel this as confirmed.
+- The flow 10/10 run completed but its inventory is `unstable`: flow fixture
+  digests currently include per-run temporary Git metadata. Fix the flow
+  fixture-digest contract before accepting repetition evidence; do not simply
+  remove fixture identity from the stability signature.
+- The full Node 24 `pnpm run check` was started in the shared workspace while
+  other independent checks were also active. Re-run it in a quiet workspace and
+  record the complete result before declaring the phase ready for repair.
+
+### Next owner checklist
+
+1. Reconstruct the historical process-leak workflow context from read-only
+   evidence and explain the ratchet discrepancy while retaining real setup and
+   `check:changed`; then require 3/3 warmup/final fingerprint agreement.
+2. Make the flow fixture digest represent stable fixture content rather than
+   generated commit metadata, add a focused regression test, and rerun flow
+   10/10. A stable signature must still bind the actual fixture inputs.
+3. Preserve the existing publication/model inventories, then compose a gate
+   inventory by fixed candidate revision rather than pretending one candidate
+   covers incompatible historical revisions.
+4. Run the complete Node 24 check in isolation. Do not repair unrelated apply
+   tests as part of this E2E-only phase.
+5. Only after every stable-red exit criterion has evidence may the next PR
+   begin a narrow production repair; retain every red reproducer as its oracle.
+
+Useful local proof roots from the latest run are `/tmp/clawsweeper-e2e-closeout-*`.
+They are disposable evidence, not repository fixtures; regenerate them rather
+than relying on their lifetime.
