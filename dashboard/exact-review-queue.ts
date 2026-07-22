@@ -730,7 +730,7 @@ export class ExactReviewQueue {
           }
         } else {
           if (
-            !incomingPublicationRevision &&
+            !decision.publication &&
             isLowPriorityExactReviewDecision(decision) &&
             exactReviewQueuePendingCount(state) >= exactReviewPendingSoftLimit(this.env)
           ) {
@@ -2751,6 +2751,16 @@ export class ExactReviewQueue {
     // shared helper counts candidate rows, so widen only its scan window by
     // requestedSize; passing +1 here would silently collapse every batch to one.
     const activePublishers = exactReviewQueueActivePublicationCount(state);
+    const excludedItemKeys = new Set<string>(batchOwnership.itemKeys);
+    for (const item of Object.values(state.items)) {
+      const revision = exactReviewPublicationRevision(item.decision);
+      if (
+        revision &&
+        revision.sourceRevision < this.publicationHeadRevisionSync(revision.targetKey)
+      ) {
+        excludedItemKeys.add(item.key);
+      }
+    }
     const readyCandidates =
       activePublishers >= publicationCapacity
         ? []
@@ -2760,10 +2770,18 @@ export class ExactReviewQueue {
             exactReviewQueueCapacity(this.env),
             exactReviewTargetCapacity(this.env),
             activePublishers + requestedSize,
-            new Set<string>(batchOwnership.itemKeys),
+            excludedItemKeys,
             false, // batching replaces legacy publication blocking at this admission point
             true, // one durable item path per commit; later events remain FIFO candidates
-          ).filter(exactReviewQueueIsPublication);
+          )
+            .filter(exactReviewQueueIsPublication)
+            .filter((item) => {
+              const revision = exactReviewPublicationRevision(item.decision);
+              return (
+                !revision ||
+                revision.sourceRevision >= this.publicationHeadRevisionSync(revision.targetKey)
+              );
+            });
     const firstOwner = readyCandidates[0]?.decision.targetRepo.split("/", 1)[0]?.toLowerCase();
     // One GitHub App installation token is scoped to one owner. Keeping a batch
     // owner-homogeneous lets the workflow retain least privilege without serially

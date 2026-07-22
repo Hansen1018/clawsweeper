@@ -417,7 +417,8 @@ function publicationRequest(
   number: number,
   producerRunId: string,
   targetRepo = "openclaw/openclaw",
-  leaseRevision = 1,
+  leaseRevision: number | null = 1,
+  protocolVersion: 1 | 2 = 2,
 ) {
   const producerDecision = {
     targetRepo,
@@ -442,9 +443,9 @@ function publicationRequest(
           producerRunAttempt: 1,
           sourceSha: "a".repeat(40),
           itemKey: `${targetRepo}#${number}`,
-          protocolVersion: 2,
-          leaseRevision,
-          claimGeneration: 1,
+          protocolVersion,
+          leaseRevision: protocolVersion === 2 ? leaseRevision : null,
+          claimGeneration: protocolVersion === 2 ? 1 : null,
           liveProceeded: true,
           liveTerminalNoop: false,
           liveTerminalMissing: false,
@@ -653,7 +654,14 @@ test("publication ingress is never shed by the review pending soft limit", async
     await queue.fetch(reviewRequest("delivery-review-cap", 108699));
     const response = await (
       await queue.fetch(
-        publicationRequest("delivery-publication-over-cap", 108699, "2099", "openclaw/openclaw", 2),
+        publicationRequest(
+          "delivery-publication-over-cap",
+          108699,
+          "2099",
+          "openclaw/openclaw",
+          null,
+          1,
+        ),
       )
     ).json();
 
@@ -689,6 +697,52 @@ test("newer publication revisions supersede unowned pending rows at enqueue", as
     assert.equal(stats.lanes.publication.pending, 1);
     assert.equal(stats.lanes.publication.completed_total, 1);
     assert.equal(stats.lanes.publication.superseded_total, 1);
+  } finally {
+    Date.now = originalNow;
+  }
+});
+
+test("bounded enqueue cleanup cannot leave obsolete rows eligible for a batch", async () => {
+  const originalNow = Date.now;
+  Date.now = () => 6_250_000;
+  try {
+    const queue = new ExactReviewQueue(
+      { storage: new TestStorage() },
+      {
+        EXACT_REVIEW_PUBLICATION_BATCHING_ENABLED: "1",
+        EXACT_REVIEW_PUBLICATION_BATCH_SIZE: "8",
+      },
+    );
+    for (let index = 0; index < 101; index += 1) {
+      await queue.fetch(
+        publicationRequest(
+          `delivery-many-old-${index}`,
+          108703,
+          String(2400 + index),
+          "openclaw/openclaw",
+          1,
+        ),
+      );
+    }
+    await queue.fetch(
+      publicationRequest("delivery-many-new", 108703, "2600", "openclaw/openclaw", 2),
+    );
+
+    const before = await (await queue.fetch(new Request("https://queue/stats"))).json();
+    assert.equal(before.lanes.publication.pending, 2);
+    const claim = await (
+      await queue.fetch(
+        batchRequest("/publication-batches/claim", {
+          claim_id: "claim-skips-obsolete-remainder",
+          lease_owner: "worker-1",
+          max_items: 32,
+        }),
+      )
+    ).json();
+    assert.deepEqual(
+      claim.batch.items.map((item: { item_key: string }) => item.item_key),
+      ["openclaw/openclaw#108703@publish:2600:1"],
+    );
   } finally {
     Date.now = originalNow;
   }
