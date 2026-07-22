@@ -8,7 +8,18 @@ import path from "node:path";
 const statePath = process.env.CLAWSWEEPER_E2E_GITHUB_STATE;
 if (!statePath) fail("CLAWSWEEPER_E2E_GITHUB_STATE is required");
 const args = process.argv.slice(2);
+const releaseStateLock = acquireStateLock(statePath);
+process.on("exit", releaseStateLock);
+for (const signal of ["SIGHUP", "SIGINT", "SIGTERM"]) {
+  process.on(signal, () => {
+    releaseStateLock();
+    process.exit(128 + signalNumber(signal));
+  });
+}
 const state = loadState();
+// Decision: these are synthetic capability labels consumed only by this fake gh
+// process. Keeping the GH_TOKEN/GITHUB_TOKEN surface lets production code run
+// unchanged while still failing closed before any real GitHub CLI can be used.
 const token = process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN ?? "";
 
 assertKnownToken(token);
@@ -459,7 +470,118 @@ function loadState() {
 }
 
 function saveState() {
-  fs.writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`);
+  // The process-wide lock serializes local fake-gh read/modify/write cycles.
+  // Atomic replace still prevents readers from observing torn JSON if a future
+  // code path narrows the lock around only mutation operations.
+  const temporary = path.join(
+    path.dirname(statePath),
+    `${path.basename(statePath)}.${process.pid}.${Date.now()}.tmp`,
+  );
+  fs.writeFileSync(temporary, `${JSON.stringify(state, null, 2)}\n`);
+  fs.renameSync(temporary, statePath);
+}
+
+function acquireStateLock(targetPath) {
+  const lock = `${targetPath}.lock`;
+  const owner = lockOwner();
+  const deadline = Date.now() + 10_000;
+  while (true) {
+    const temporary = `${lock}.${process.pid}.${Date.now()}.tmp`;
+    try {
+      fs.writeFileSync(temporary, `${JSON.stringify(owner)}\n`, { mode: 0o600 });
+      fs.linkSync(temporary, lock);
+      fs.unlinkSync(temporary);
+      return once(() => releaseLock(lock, owner));
+    } catch (error) {
+      fs.rmSync(temporary, { force: true });
+      if (error?.code !== "EEXIST") throw error;
+      reclaimStaleLock(lock);
+      if (Date.now() > deadline) fail(`timed out waiting for local fake-gh state lock: ${lock}`);
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+    }
+  }
+}
+
+function reclaimStaleLock(lock) {
+  const reclaimLock = `${lock}.reclaim`;
+  try {
+    fs.mkdirSync(reclaimLock);
+  } catch (error) {
+    if (error?.code === "EEXIST") return;
+    throw error;
+  }
+  try {
+    const owner = readLockOwner(lock);
+    if (owner && processIdentityExists(owner)) return;
+    if (!owner && !malformedLockIsOld(lock)) return;
+    try {
+      fs.unlinkSync(lock);
+    } catch {
+      // Another local fake-gh process won the recovery race; retry acquisition.
+    }
+  } finally {
+    fs.rmSync(reclaimLock, { recursive: true, force: true });
+  }
+}
+
+function releaseLock(lock, owner) {
+  const current = readLockOwner(lock);
+  if (JSON.stringify(current) !== JSON.stringify(owner)) return;
+  try {
+    fs.unlinkSync(lock);
+  } catch {
+    // Release is idempotent; the lock may already be gone during signal cleanup.
+  }
+}
+
+function once(fn) {
+  let called = false;
+  return () => {
+    if (called) return;
+    called = true;
+    fn();
+  };
+}
+
+function lockOwner() {
+  return { pid: process.pid, starttime: processStarttime(process.pid) };
+}
+
+function readLockOwner(lock) {
+  try {
+    return JSON.parse(fs.readFileSync(lock, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function malformedLockIsOld(lock) {
+  try {
+    return Date.now() - fs.statSync(lock).mtimeMs > 1_000;
+  } catch {
+    return false;
+  }
+}
+
+function processIdentityExists(owner) {
+  if (!owner?.pid || !owner?.starttime) return true;
+  return processStarttime(owner.pid) === owner.starttime;
+}
+
+function processStarttime(pid) {
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+    return stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19] ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function signalNumber(signal) {
+  if (signal === "SIGHUP") return 1;
+  if (signal === "SIGINT") return 2;
+  if (signal === "SIGTERM") return 15;
+  return 1;
 }
 
 function respondJson(value, { paged = false } = {}) {
