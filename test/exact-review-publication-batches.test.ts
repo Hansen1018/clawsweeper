@@ -582,6 +582,42 @@ test("batch claim serializes distinct publication events for the same durable it
   }
 });
 
+test("batch claim cannot exceed the configured rollout size", async () => {
+  const originalNow = Date.now;
+  Date.now = () => 6_500_000;
+  try {
+    const queue = new ExactReviewQueue(
+      { storage: new TestStorage() },
+      {
+        EXACT_REVIEW_PUBLICATION_BATCHING_ENABLED: "1",
+        EXACT_REVIEW_PUBLICATION_BATCH_SIZE: "4",
+      },
+    );
+    for (let itemNumber = 1; itemNumber <= 8; itemNumber += 1) {
+      await queue.fetch(
+        publicationRequest(`delivery-cap-${itemNumber}`, itemNumber, `${3000 + itemNumber}`),
+      );
+    }
+
+    const claim = await (
+      await queue.fetch(
+        batchRequest("/publication-batches/claim", {
+          claim_id: "claim-configured-cap",
+          lease_owner: "worker-1",
+          max_items: 32,
+        }),
+      )
+    ).json();
+
+    assert.equal(claim.claimed, true, JSON.stringify(claim));
+    assert.equal(claim.requested_max_items, 32);
+    assert.equal(claim.effective_max_items, 4);
+    assert.equal(claim.batch.items.length, 4);
+  } finally {
+    Date.now = originalNow;
+  }
+});
+
 test("rollout dispatches one full batch workflow without admitting legacy publishers", async () => {
   const originalFetch = globalThis.fetch;
   const originalNow = Date.now;
