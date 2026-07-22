@@ -417,6 +417,7 @@ function publicationRequest(
   number: number,
   producerRunId: string,
   targetRepo = "openclaw/openclaw",
+  leaseRevision = 1,
 ) {
   const producerDecision = {
     targetRepo,
@@ -442,7 +443,7 @@ function publicationRequest(
           sourceSha: "a".repeat(40),
           itemKey: `${targetRepo}#${number}`,
           protocolVersion: 2,
-          leaseRevision: 1,
+          leaseRevision,
           claimGeneration: 1,
           liveProceeded: true,
           liveTerminalNoop: false,
@@ -633,6 +634,131 @@ test("batch claim serializes distinct publication events for the same durable it
       claim.batch.items.map((item: { item_key: string }) => item.item_key),
       ["openclaw/openclaw#108676@publish:2001:1", "openclaw/openclaw#108677@publish:2003:1"],
     );
+  } finally {
+    Date.now = originalNow;
+  }
+});
+
+test("newer publication revisions supersede unowned pending rows at enqueue", async () => {
+  const originalNow = Date.now;
+  Date.now = () => 6_200_000;
+  try {
+    const queue = new ExactReviewQueue(
+      { storage: new TestStorage() },
+      { EXACT_REVIEW_PUBLICATION_BATCHING_ENABLED: "1" },
+    );
+    await queue.fetch(
+      publicationRequest("delivery-revision-1", 108700, "2101", "openclaw/openclaw", 1),
+    );
+    const response = await (
+      await queue.fetch(
+        publicationRequest("delivery-revision-2", 108700, "2102", "openclaw/openclaw", 2),
+      )
+    ).json();
+
+    assert.equal(response.queued, true);
+    assert.equal(response.superseded_publications, 1);
+    const stats = await (await queue.fetch(new Request("https://queue/stats"))).json();
+    assert.equal(stats.lanes.publication.pending, 1);
+    assert.equal(stats.lanes.publication.completed_total, 1);
+    assert.equal(stats.lanes.publication.superseded_total, 1);
+  } finally {
+    Date.now = originalNow;
+  }
+});
+
+test("stale publication ingress is acknowledged without replacing a newer revision", async () => {
+  const originalNow = Date.now;
+  Date.now = () => 6_300_000;
+  try {
+    const queue = new ExactReviewQueue(
+      { storage: new TestStorage() },
+      { EXACT_REVIEW_PUBLICATION_BATCHING_ENABLED: "1" },
+    );
+    await queue.fetch(publicationRequest("delivery-newer", 108701, "2202", "openclaw/openclaw", 2));
+    const removedNewer = await (
+      await queue.fetch(
+        batchRequest("/publications/supersede", {
+          items: [{ item_key: "openclaw/openclaw#108701@publish:2202:1", revision: 1 }],
+        }),
+      )
+    ).json();
+    assert.equal(removedNewer.superseded, 1);
+    const response = await (
+      await queue.fetch(
+        publicationRequest("delivery-stale", 108701, "2201", "openclaw/openclaw", 1),
+      )
+    ).json();
+
+    assert.equal(response.deduped, true);
+    assert.equal(response.superseded, true);
+    assert.equal(response.publication_revision, 1);
+    assert.equal(response.superseded_by_revision, 2);
+    const stats = await (await queue.fetch(new Request("https://queue/stats"))).json();
+    assert.equal(stats.lanes.publication.pending, 0);
+  } finally {
+    Date.now = originalNow;
+  }
+});
+
+test("publication reconcile preserves active batches and removes older revisions after expiry", async () => {
+  const originalNow = Date.now;
+  let now = 6_400_000;
+  Date.now = () => now;
+  try {
+    const queue = new ExactReviewQueue(
+      { storage: new TestStorage() },
+      {
+        EXACT_REVIEW_PUBLICATION_BATCHING_ENABLED: "1",
+        EXACT_REVIEW_PUBLICATION_BATCH_LEASE_MS: "60000",
+      },
+    );
+    await queue.fetch(
+      publicationRequest("delivery-owned-old", 108702, "2301", "openclaw/openclaw", 1),
+    );
+    const claim = await (
+      await queue.fetch(
+        batchRequest("/publication-batches/claim", {
+          claim_id: "claim-reconcile-protection",
+          lease_owner: "worker-1",
+          max_items: 1,
+        }),
+      )
+    ).json();
+    assert.equal(claim.claimed, true);
+    await queue.fetch(
+      publicationRequest("delivery-unowned-new", 108702, "2302", "openclaw/openclaw", 2),
+    );
+    const removedNewer = await (
+      await queue.fetch(
+        batchRequest("/publications/supersede", {
+          items: [{ item_key: "openclaw/openclaw#108702@publish:2302:1", revision: 1 }],
+        }),
+      )
+    ).json();
+    assert.equal(removedNewer.superseded, 1);
+
+    const protectedResult = await (
+      await queue.fetch(batchRequest("/publications/reconcile", { apply: true, max_items: 100 }))
+    ).json();
+    assert.equal(protectedResult.changed, 0);
+    assert.equal(protectedResult.eligible, 0);
+
+    now += 60_001;
+    const dryRun = await (
+      await queue.fetch(batchRequest("/publications/reconcile", { max_items: 100 }))
+    ).json();
+    assert.equal(dryRun.apply, false);
+    assert.equal(dryRun.eligible, 1);
+    assert.equal(dryRun.changed, 0);
+
+    const applied = await (
+      await queue.fetch(batchRequest("/publications/reconcile", { apply: true, max_items: 100 }))
+    ).json();
+    assert.equal(applied.changed, 1);
+    assert.equal(applied.eligible_remaining, 0);
+    const stats = await (await queue.fetch(new Request("https://queue/stats"))).json();
+    assert.equal(stats.lanes.publication.pending, 0);
   } finally {
     Date.now = originalNow;
   }
@@ -900,6 +1026,39 @@ test("batch protocol routes require the shared internal signature", async () => 
   );
   assert.equal(authorized.status, 200);
   assert.equal(forwardedPath, "/publication-batches/claim");
+});
+
+test("publication reconciliation route requires the shared internal signature", async () => {
+  const secret = "test-secret";
+  const body = JSON.stringify({ apply: false, max_items: 1 });
+  let forwardedPath = "";
+  const env = {
+    CLAWSWEEPER_WEBHOOK_SECRET: secret,
+    EXACT_REVIEW_QUEUE: {
+      idFromName: () => "global",
+      get: () => ({
+        fetch: async (request: Request) => {
+          forwardedPath = new URL(request.url).pathname;
+          return new Response(JSON.stringify({ ok: true }));
+        },
+      }),
+    },
+  };
+  const url = "https://clawsweeper.openclaw.ai/internal/exact-review/publications/reconcile";
+  const unauthorized = await worker.fetch(new Request(url, { method: "POST", body }), env);
+  assert.equal(unauthorized.status, 401);
+
+  const signature = `sha256=${createHmac("sha256", secret).update(body).digest("hex")}`;
+  const authorized = await worker.fetch(
+    new Request(url, {
+      method: "POST",
+      headers: { "x-clawsweeper-exact-review-signature": signature },
+      body,
+    }),
+    env,
+  );
+  assert.equal(authorized.status, 200);
+  assert.equal(forwardedPath, "/publications/reconcile");
 });
 
 test("queue fetch terminalizes a stale batch revision before dispatch", async () => {
