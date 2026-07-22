@@ -730,6 +730,7 @@ export class ExactReviewQueue {
           }
         } else {
           if (
+            !incomingPublicationRevision &&
             isLowPriorityExactReviewDecision(decision) &&
             exactReviewQueuePendingCount(state) >= exactReviewPendingSoftLimit(this.env)
           ) {

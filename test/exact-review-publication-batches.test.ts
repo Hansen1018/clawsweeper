@@ -639,6 +639,33 @@ test("batch claim serializes distinct publication events for the same durable it
   }
 });
 
+test("publication ingress is never shed by the review pending soft limit", async () => {
+  const originalNow = Date.now;
+  Date.now = () => 6_100_000;
+  try {
+    const queue = new ExactReviewQueue(
+      { storage: new TestStorage() },
+      {
+        EXACT_REVIEW_PUBLICATION_BATCHING_ENABLED: "1",
+        EXACT_REVIEW_PENDING_SOFT_LIMIT: "1",
+      },
+    );
+    await queue.fetch(reviewRequest("delivery-review-cap", 108699));
+    const response = await (
+      await queue.fetch(
+        publicationRequest("delivery-publication-over-cap", 108699, "2099", "openclaw/openclaw", 2),
+      )
+    ).json();
+
+    assert.equal(response.queued, true);
+    assert.equal(response.shed, undefined);
+    const stats = await (await queue.fetch(new Request("https://queue/stats"))).json();
+    assert.equal(stats.lanes.publication.pending, 1);
+  } finally {
+    Date.now = originalNow;
+  }
+});
+
 test("newer publication revisions supersede unowned pending rows at enqueue", async () => {
   const originalNow = Date.now;
   Date.now = () => 6_200_000;
