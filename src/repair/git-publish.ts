@@ -138,6 +138,7 @@ const STATE_PUBLISH_LEASE_ACQUIRE_TIMEOUT_MS = (() => {
 })();
 const STATE_PUBLISH_LEASE_WAIT_MS = 1_000;
 const STATE_PUBLISH_LEASE_MAX_WAIT_MS = 5_000;
+const STATE_PUBLISH_COMMIT_REFS_SINGLE_REF_ATTEMPTS = 3;
 const STATE_PUBLISH_PRIORITY_INTENT_ATTEMPT = 2;
 const STATE_PUBLISH_PRIORITY_INTENT_MAX_TTL_MS = 5 * 60_000;
 const STATE_PUBLISH_OWNER_PATTERN =
@@ -2241,42 +2242,57 @@ function releaseStatePublishLease(lease: StatePublishLease): boolean {
   }
 }
 
-function renewStatePublishLease(lease: StatePublishLease, reason: string): void {
-  lease.coordinator?.assertActive();
-  const renewedOid = createStatePublishLeaseCommit({
-    branch: lease.branch,
-    owner: lease.owner,
-    ttlMs: lease.ttlMs,
-    coordinator: lease.coordinator,
-  });
-  lease.cleanup?.track(renewedOid);
-  const renewed = spawnGit(
-    [
-      "push",
-      `--force-with-lease=${lease.ref}:${lease.oid}`,
-      lease.remote,
-      `${renewedOid}:${lease.ref}`,
-    ],
-    { allowFailure: true, quiet: true, timeout: PUBLISH_FETCH_TIMEOUT_MS },
-  );
-  if (renewed.timedOut) {
-    throw new GitCommandTimeoutError(["push"], PUBLISH_FETCH_TIMEOUT_MS);
-  }
-  if (renewed.status !== 0) {
-    const currentLeaseOid = remoteRefOid(lease.remote, lease.ref);
-    if (currentLeaseOid !== renewedOid) {
-      if (currentLeaseOid !== lease.oid) {
-        throw new StatePublishContentionError(
-          `State publish lease ownership changed while renewing ${reason}`,
-        );
-      }
-      throw new StatePublishContentionError(`Failed to renew state publish lease ${reason}`);
+function renewStatePublishLease(
+  lease: StatePublishLease,
+  reason: string,
+  options: { commitRefsAttempts?: number } = {},
+): void {
+  const attempts = Math.max(1, options.commitRefsAttempts ?? 1);
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    lease.coordinator?.assertActive();
+    const renewedOid = createStatePublishLeaseCommit({
+      branch: lease.branch,
+      owner: lease.owner,
+      ttlMs: lease.ttlMs,
+      coordinator: lease.coordinator,
+    });
+    lease.cleanup?.track(renewedOid);
+    const renewed = spawnGit(
+      [
+        "push",
+        `--force-with-lease=${lease.ref}:${lease.oid}`,
+        lease.remote,
+        `${renewedOid}:${lease.ref}`,
+      ],
+      { allowFailure: true, quiet: true, timeout: PUBLISH_FETCH_TIMEOUT_MS },
+    );
+    if (renewed.timedOut) {
+      throw new GitCommandTimeoutError(["push"], PUBLISH_FETCH_TIMEOUT_MS);
     }
+    if (renewed.status !== 0) {
+      const currentLeaseOid = remoteRefOid(lease.remote, lease.ref);
+      if (currentLeaseOid !== renewedOid) {
+        if (currentLeaseOid !== lease.oid) {
+          throw new StatePublishContentionError(
+            `State publish lease ownership changed while renewing ${reason}`,
+          );
+        }
+        if (attempt < attempts && isCommitRefsTransactionFailure(renewed)) {
+          console.log(
+            `State publish lease renewal hit GitHub commit_refs ${reason}; retrying attempt=${attempt + 1}/${attempts}`,
+          );
+          sleep(Math.min(STATE_PUBLISH_LEASE_WAIT_MS * attempt, STATE_PUBLISH_LEASE_MAX_WAIT_MS));
+          continue;
+        }
+        throw new StatePublishContentionError(`Failed to renew state publish lease ${reason}`);
+      }
+    }
+    lease.oid = renewedOid;
+    lease.expiresAtMs = Date.now() + lease.ttlMs;
+    activeStateWriterTelemetry?.recordRenewal();
+    console.log(`Renewed state publish lease owner=${lease.owner} ${reason}`);
+    return;
   }
-  lease.oid = renewedOid;
-  lease.expiresAtMs = Date.now() + lease.ttlMs;
-  activeStateWriterTelemetry?.recordRenewal();
-  console.log(`Renewed state publish lease owner=${lease.owner} ${reason}`);
 }
 
 function remoteRefOid(remote: string, ref: string): string | null {
@@ -2386,7 +2402,6 @@ function pushPublishedCommit(
       );
     }
     if (receiptRef && isCommitRefsTransactionFailure(pushed)) {
-      renewStatePublishLease(lease, "before commit_refs recovery");
       return pushStateAndReceiptAfterCommitRefsFailure(
         source,
         remote,
@@ -2436,33 +2451,69 @@ function pushStateAndReceiptAfterCommitRefsFailure(
       `State branch ${branchRef} changed before commit_refs recovery`,
     );
   }
-  if (lease.expiresAtMs - Date.now() <= STATE_PUBLISH_LEASE_RENEW_THRESHOLD_MS) {
-    renewStatePublishLease(lease, "before commit_refs receipt recovery");
-  }
   lease.coordinator?.assertActive();
 
   console.log(
     "State publish retrying GitHub commit_refs failure with fenced single-ref receipt and state updates",
   );
   if (remoteReceiptOid !== sourceCommit) {
-    const receiptPush = spawnGit(
-      [
-        "push",
-        `--force-with-lease=${receiptRef}:${remoteReceiptOid ?? ""}`,
-        remote,
-        `${source}:${receiptRef}`,
-      ],
-      { allowFailure: true },
-    );
-    if (receiptPush.status !== 0 && remoteRefOid(remote, receiptRef) !== sourceCommit) {
+    // A batch-specific receipt may safely outlive this lease. A later retry
+    // resumes only while state still equals sourceParent and otherwise fails
+    // closed, so persist that progress before renewing the shared-state fence.
+    for (let attempt = 1; attempt <= STATE_PUBLISH_COMMIT_REFS_SINGLE_REF_ATTEMPTS; attempt += 1) {
+      lease.coordinator?.assertActive();
+      const receiptPush = spawnGit(
+        [
+          "push",
+          `--force-with-lease=${receiptRef}:${remoteReceiptOid ?? ""}`,
+          remote,
+          `${source}:${receiptRef}`,
+        ],
+        { allowFailure: true },
+      );
+      if (receiptPush.status === 0) {
+        remoteReceiptOid = sourceCommit;
+        break;
+      }
+      const currentReceiptOid = remoteRefOid(remote, receiptRef);
+      if (currentReceiptOid === sourceCommit) {
+        remoteReceiptOid = sourceCommit;
+        break;
+      }
+      if (currentReceiptOid !== remoteReceiptOid) {
+        throw new StatePublishContentionError(
+          `State batch receipt ${receiptRef} changed during commit_refs recovery`,
+        );
+      }
+      if (
+        attempt < STATE_PUBLISH_COMMIT_REFS_SINGLE_REF_ATTEMPTS &&
+        isCommitRefsTransactionFailure(receiptPush)
+      ) {
+        console.log(
+          `State batch receipt push hit GitHub commit_refs; retrying attempt=${attempt + 1}/${STATE_PUBLISH_COMMIT_REFS_SINGLE_REF_ATTEMPTS}`,
+        );
+        sleep(Math.min(STATE_PUBLISH_LEASE_WAIT_MS * attempt, STATE_PUBLISH_LEASE_MAX_WAIT_MS));
+        continue;
+      }
       return receiptPush;
     }
-    remoteReceiptOid = sourceCommit;
   }
 
-  if (lease.expiresAtMs - Date.now() <= STATE_PUBLISH_LEASE_RENEW_THRESHOLD_MS) {
-    renewStatePublishLease(lease, "before commit_refs state recovery");
+  lease.coordinator?.assertActive();
+  remoteBranchOid = remoteRefOid(remote, branchRef);
+  if (remoteBranchOid === sourceCommit) {
+    console.log(`Recovered GitHub commit_refs failure for ${remote}/${branch}`);
+    return { status: 0, stdout: "", stderr: "", timedOut: false };
   }
+  if (remoteBranchOid !== sourceParent) {
+    throw new StatePublishContentionError(
+      `State branch ${branchRef} changed during commit_refs recovery`,
+    );
+  }
+
+  renewStatePublishLease(lease, "before commit_refs state recovery", {
+    commitRefsAttempts: STATE_PUBLISH_COMMIT_REFS_SINGLE_REF_ATTEMPTS,
+  });
   lease.coordinator?.assertActive();
   remoteBranchOid = remoteRefOid(remote, branchRef);
   if (remoteBranchOid === sourceCommit) {
