@@ -29,7 +29,7 @@ test("batch publisher is event-driven with one non-cancelling serial workflow", 
   assert.ok(workflow.on.workflow_dispatch);
   assert.match(workflow.jobs.publish!.if, /inputs\.execute/);
   assert.deepEqual(Object.keys(workflow.on.workflow_dispatch.inputs), ["execute"]);
-  assert.equal(workflow.jobs.publish!.env.EXACT_REVIEW_BATCH_MAX_ITEMS, "4");
+  assert.equal(workflow.jobs.publish!.env.EXACT_REVIEW_BATCH_MAX_ITEMS, "32");
   assert.equal(workflow.jobs.publish!.env.CLAWSWEEPER_APP_CLIENT_ID, "Iv23liOECG0slfuhz093");
   assert.equal(workflow.concurrency["cancel-in-progress"], false);
   assert.deepEqual(workflow.permissions, { actions: "write", contents: "read" });
@@ -87,6 +87,14 @@ test("batch claim treats an all-stale fetched batch as terminal", () => {
   assert.match(cliSource, /if \(!manifest\.items\.length\) return;/);
   assert.ok(
     cliSource.indexOf("if (!manifest.items.length) return;") < cliSource.indexOf("owners.size"),
+  );
+});
+
+test("batch manifest records the dashboard effective lease size", () => {
+  assert.match(cliSource, /configuredBatchSize: lease\.configuredBatchSize/);
+  assert.doesNotMatch(
+    cliSource,
+    /configuredBatchSize: positiveInteger\(env\("EXACT_REVIEW_BATCH_MAX_ITEMS"\)\)/,
   );
 });
 
