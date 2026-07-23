@@ -298,6 +298,7 @@ test("spoofed durable markers cannot suppress a bot-owned start lease", () => {
   );
   assert.match(postStart, /issueReviewCommentState\(options\.item\.number\)/);
   assert.match(postStart, /freshDedicatedReviewStartLeases\(\{/);
+  assert.match(postStart, /reapSupersededDedicatedReviewStartLeases\(/);
   assert.match(postStart, /heldReviewStartStatusCommentResult\(initialLease\.expiresAt, false\)/);
   assert.match(postStart, /heldReviewStartStatusCommentResult\(winner\.expiresAt, true\)/);
   assert.match(postStart, /issues\/\$\{options\.item\.number\}\/comments/);
@@ -600,6 +601,7 @@ Reason: Maintainers should review the tests after the targeted lane is green.
     comment,
     /\*\*Summary\*\*\nAdds regression coverage for session-scoped model overrides\./,
   );
+  assert.match(comment, /Reviewed head: `abc123def456`/);
   assert.doesNotMatch(comment, /\*\*Workflow note:\*\*/);
   assert.match(comment, /<summary>How this review workflow works<\/summary>/);
   assert.match(

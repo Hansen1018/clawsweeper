@@ -127,6 +127,7 @@ import {
 import {
   expiredReviewStartStatusLeases,
   freshExactHeadReviewStartLease,
+  supersededReviewStartStatusLeases,
 } from "./repair/comment-router-core.js";
 import {
   AUTOMERGE_LABEL,
@@ -515,6 +516,17 @@ type AcquiredReviewStartLease = {
   commentId: number;
   headSha: string;
   comment?: Record<string, unknown>;
+};
+
+type ExactReviewQueueAuthority = {
+  queueUrl: string;
+  itemKey: string;
+  leaseId: string;
+  leaseRevision: number;
+  claimGeneration: number;
+  runId: string;
+  runAttempt: number;
+  sourceHeadSha: string | null;
 };
 
 type ReviewStartStatusCommentResult =
@@ -18539,10 +18551,12 @@ function publicPrSummaryBody(
   summaryLine: string,
   reproductionAssessment: string,
   prSurfaceSummary: string,
+  reviewedHeadSha: string,
 ): string {
   return [
     summaryLine,
     prSurfaceSummary ? `PR surface: ${prSurfaceSummary}` : "",
+    reviewedHeadSha ? `Reviewed head: \`${reviewedHeadSha}\`` : "",
     publicReproducibilityLine(reproductionAssessment),
   ]
     .filter(Boolean)
@@ -18816,7 +18830,12 @@ function renderKeepOpenCommentFromReport(
     appendPublicSection(
       lines,
       "Summary",
-      publicPrSummaryBody(changeSummaryLine, reproductionAssessment, prSurfaceSummary),
+      publicPrSummaryBody(
+        changeSummaryLine,
+        reproductionAssessment,
+        prSurfaceSummary,
+        pullHeadShaFromReport(markdown) ?? "",
+      ),
     );
     lines.push(renderReviewMetricsDigest(reviewMetrics), "");
     const dataModelWarning = renderDataModelWarningFromReport(markdown);
@@ -20599,6 +20618,101 @@ export function newReviewStartLeaseOwnerForTest(
   return newReviewStartLeaseOwner(env, fallback);
 }
 
+function exactReviewQueueAuthorityFromEnv(
+  env: NodeJS.ProcessEnv = process.env,
+): ExactReviewQueueAuthority | null {
+  const raw = {
+    queueUrl: String(env.EXACT_REVIEW_QUEUE_URL ?? "")
+      .trim()
+      .replace(/\/$/, ""),
+    itemKey: String(env.EXACT_REVIEW_ITEM_KEY ?? "").trim(),
+    leaseId: String(env.EXACT_REVIEW_LEASE_ID ?? "").trim(),
+    leaseRevision: String(env.EXACT_REVIEW_LEASE_REVISION ?? "").trim(),
+    claimGeneration: String(env.EXACT_REVIEW_CLAIM_GENERATION ?? "").trim(),
+    runId: String(env.GITHUB_RUN_ID ?? "").trim(),
+    runAttempt: String(env.GITHUB_RUN_ATTEMPT ?? "").trim(),
+    sourceHeadSha: String(env.EXACT_REVIEW_SOURCE_HEAD_SHA ?? "")
+      .trim()
+      .toLowerCase(),
+  };
+  if (
+    ![raw.queueUrl, raw.itemKey, raw.leaseId, raw.leaseRevision, raw.claimGeneration].some(Boolean)
+  ) {
+    return null;
+  }
+
+  let queueUrl: URL;
+  try {
+    queueUrl = new URL(raw.queueUrl);
+  } catch {
+    throw new UserFacingCommandError("EXACT_REVIEW_QUEUE_URL must be an HTTP(S) URL.");
+  }
+  const leaseRevision = Number(raw.leaseRevision);
+  const claimGeneration = Number(raw.claimGeneration);
+  const runAttempt = Number(raw.runAttempt);
+  if (
+    !["http:", "https:"].includes(queueUrl.protocol) ||
+    !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+#[1-9]\d*$/.test(raw.itemKey) ||
+    !/^[A-Za-z0-9._:-]{1,200}$/.test(raw.leaseId) ||
+    !Number.isSafeInteger(leaseRevision) ||
+    leaseRevision < 1 ||
+    !Number.isSafeInteger(claimGeneration) ||
+    claimGeneration < 1 ||
+    !/^[1-9]\d{0,29}$/.test(raw.runId) ||
+    !Number.isSafeInteger(runAttempt) ||
+    runAttempt < 1 ||
+    (raw.sourceHeadSha !== "" && !/^[0-9a-f]{40}$/.test(raw.sourceHeadSha))
+  ) {
+    throw new UserFacingCommandError("Exact-review queue authority context is incomplete.");
+  }
+  return {
+    queueUrl: queueUrl.toString().replace(/\/$/, ""),
+    itemKey: raw.itemKey,
+    leaseId: raw.leaseId,
+    leaseRevision,
+    claimGeneration,
+    runId: raw.runId,
+    runAttempt,
+    sourceHeadSha: raw.sourceHeadSha || null,
+  };
+}
+
+function exactReviewQueueAuthorityIsLive(authority: ExactReviewQueueAuthority): boolean {
+  const payload = JSON.stringify({
+    item_key: authority.itemKey,
+    lease_id: authority.leaseId,
+    lease_revision: authority.leaseRevision,
+    claim_generation: authority.claimGeneration,
+    run_id: authority.runId,
+    run_attempt: authority.runAttempt,
+    ...(authority.sourceHeadSha ? { source_head_sha: authority.sourceHeadSha } : {}),
+  });
+  const result = spawnSync(
+    "curl",
+    [
+      "--silent",
+      "--show-error",
+      "--connect-timeout",
+      "5",
+      "--max-time",
+      "20",
+      "--output",
+      "/dev/null",
+      "--write-out",
+      "%{http_code}",
+      "--request",
+      "POST",
+      "--header",
+      "content-type: application/json",
+      "--data-binary",
+      payload,
+      `${authority.queueUrl}/internal/exact-review/heartbeat`,
+    ],
+    { encoding: "utf8" },
+  );
+  return result.status === 0 && result.stdout.trim() === "200";
+}
+
 function freshDedicatedReviewStartLeases(options: {
   comments: Record<string, unknown>[];
   itemNumber: number;
@@ -20656,6 +20770,8 @@ function postReviewStartStatusComment(options: {
   shardIndex: number;
   shardCount: number;
   purpose?: "review" | "apply";
+  queueAuthority?: ExactReviewQueueAuthority | null;
+  allowSupersededLeaseCleanup?: boolean;
 }): ReviewStartStatusCommentResult {
   const startedAtMs = Date.now();
   const leaseOwner = newReviewStartLeaseOwner();
@@ -20725,8 +20841,9 @@ function postReviewStartStatusComment(options: {
     );
   }
   const acquired = { owner: leaseOwner, commentId: createdCommentId, headSha: normalizedHead };
+  const confirmedState = issueReviewCommentState(options.item.number);
   const confirmed = freshDedicatedReviewStartLeases({
-    comments: issueReviewCommentState(options.item.number).leaseComments,
+    comments: confirmedState.leaseComments,
     itemNumber: options.item.number,
     headSha: normalizedHead,
     nowMs: Date.now(),
@@ -20750,6 +20867,38 @@ function postReviewStartStatusComment(options: {
   ) {
     deleteOwnedDedicatedReviewStartLease(options.item.number, acquired);
     return heldReviewStartStatusCommentResult(winner.expiresAt, true);
+  }
+  if (options.queueAuthority) {
+    const authoritativeHead = currentReviewRevision(options.item);
+    if (authoritativeHead !== normalizedHead) {
+      deleteOwnedDedicatedReviewStartLease(options.item.number, acquired);
+      throw new Error(
+        `review revision changed while reserving #${options.item.number}; retry required`,
+      );
+    }
+    if (!exactReviewQueueAuthorityIsLive(options.queueAuthority)) {
+      deleteOwnedDedicatedReviewStartLease(options.item.number, acquired);
+      throw new Error(
+        `exact-review queue authority changed while reserving #${options.item.number}; retry required`,
+      );
+    }
+    // The candidate snapshot predates both authority checks. A newer worker
+    // cannot be selected by a stale caller: if its lease is already present,
+    // the live revision/queue tuple has moved; if it starts later, it is absent
+    // from this immutable snapshot.
+    if (options.allowSupersededLeaseCleanup) {
+      reapSupersededDedicatedReviewStartLeases(
+        options.item.number,
+        confirmedState.dedicatedLeaseComments,
+        normalizedHead,
+        authoritativeHead,
+      );
+    } else if (pullRequestHeadSha(options.item.number) !== normalizedHead) {
+      deleteOwnedDedicatedReviewStartLease(options.item.number, acquired);
+      throw new Error(
+        `review revision changed while reserving #${options.item.number}; retry required`,
+      );
+    }
   }
   return {
     status: "posted",
@@ -20830,6 +20979,46 @@ function reapExpiredDedicatedReviewStartLeases(
   }
 }
 
+function reapSupersededDedicatedReviewStartLeases(
+  itemNumber: number,
+  dedicatedLeaseComments: Record<string, unknown>[],
+  currentHeadSha: string,
+  authoritativeHeadSha: string,
+): void {
+  const superseded = supersededReviewStartStatusLeases({
+    comments: dedicatedLeaseComments,
+    itemNumber,
+    headSha: currentHeadSha,
+    authoritativeHeadSha,
+    trustedAuthors: new Set(
+      [...PATCHABLE_REVIEW_COMMENT_AUTHORS].map((author) => author.toLowerCase()),
+    ),
+  });
+  for (const lease of superseded) {
+    try {
+      ghObservedMutationCommand({
+        identity: `review_lease_supersede:${itemNumber}:${lease.commentId}`,
+        args: [
+          "api",
+          `repos/${targetRepo()}/issues/comments/${lease.commentId}`,
+          "--method",
+          "DELETE",
+        ],
+      });
+      console.error(
+        `[review] deleted superseded review lease comment ${lease.commentId} for #${itemNumber} (reviewed head ${lease.headSha}, current head ${currentHeadSha})`,
+      );
+    } catch (error) {
+      // A failed cleanup must never block the current revision from acquiring its lease.
+      console.error(
+        `[review] could not delete superseded review lease comment ${lease.commentId} for #${itemNumber}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+}
+
 const REVIEW_PLACEHOLDER_BODY_PATTERN = /^ClawSweeper status: review started\./i;
 
 export function supersededReviewPlaceholderCommentIds(options: {
@@ -20899,6 +21088,12 @@ function pullRequestHeadSha(number: number): string {
   const pull = asRecord(ghJson<unknown>(["api", `repos/${targetRepo()}/pulls/${number}`]));
   const sha = asRecord(pull.head).sha;
   return typeof sha === "string" ? sha.trim().toLowerCase() : "";
+}
+
+function currentReviewRevision(item: Item): string {
+  if (item.kind === "pull_request") return pullRequestHeadSha(item.number);
+  const revision = collectItemContext(item, { fullTimelineForRelations: true }).sourceRevision;
+  return typeof revision === "string" ? revision : "";
 }
 
 function closeItem(options: { number: number; kind: ItemKind; reason: CloseReason }): void {
@@ -22634,15 +22829,30 @@ function reserveReviewLeaseCommand(args: Args): void {
       `Cannot reserve a review lease for #${itemNumber}: state is ${state}.`,
     );
   }
-  const currentRevision =
-    item.kind === "pull_request"
-      ? pullRequestHeadSha(itemNumber)
-      : collectItemContext(item, { fullTimelineForRelations: true }).sourceRevision;
+  const queueAuthority = exactReviewQueueAuthorityFromEnv();
+  const expectedItemKey = `${targetRepo()}#${itemNumber}`.toLowerCase();
+  if (queueAuthority && queueAuthority.itemKey.toLowerCase() !== expectedItemKey) {
+    throw new UserFacingCommandError("Exact-review queue authority item does not match target.");
+  }
+  const currentRevision = currentReviewRevision(item);
   if (!currentRevision || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(currentRevision)) {
     throw new UserFacingCommandError(
       `Could not resolve the current review revision for #${itemNumber}.`,
     );
   }
+  if (
+    queueAuthority?.sourceHeadSha &&
+    item.kind === "pull_request" &&
+    queueAuthority.sourceHeadSha !== currentRevision
+  ) {
+    throw new UserFacingCommandError(
+      "Exact-review queue authority source head does not match the current pull request.",
+    );
+  }
+  const reservationAuthority =
+    queueAuthority && item.kind === "pull_request" && !queueAuthority.sourceHeadSha
+      ? { ...queueAuthority, sourceHeadSha: currentRevision }
+      : queueAuthority;
   const result = postReviewStartStatusComment({
     item,
     headSha: currentRevision,
@@ -22651,6 +22861,9 @@ function reserveReviewLeaseCommand(args: Args): void {
     total: 1,
     shardIndex: 0,
     shardCount: 1,
+    queueAuthority: reservationAuthority,
+    allowSupersededLeaseCleanup:
+      item.kind !== "pull_request" || Boolean(queueAuthority?.sourceHeadSha),
   });
   if (result.status === "held") {
     console.log(JSON.stringify({ status: "held", retryAt: result.retryAt }));

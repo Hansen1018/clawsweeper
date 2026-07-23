@@ -71,6 +71,15 @@ class TestStorage {
     this.values.delete(key);
   }
 
+  async list(options?: { prefix?: string }) {
+    const prefix = options?.prefix || "";
+    return new Map(
+      [...this.values.entries()]
+        .filter(([key]) => key.startsWith(prefix))
+        .sort(([left], [right]) => left.localeCompare(right)),
+    );
+  }
+
   async getAlarm() {
     return this.alarmAt;
   }
