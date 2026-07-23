@@ -9,6 +9,10 @@ checkpoint, and status-only commits are intentionally omitted.
 
 ### Added
 
+- Redesigned PR review comments into a scan-first layout: outcome and merge readiness up top, ratings and verification as compact tables, before-merge work as native checklists, evidence folded into details — with hardened fence-aware section parsing and Mermaid sanitization. Thanks @Patrick-Erichsen! (#776)
+- Screenshot-only real-behavior proof (PNG/JPEG/WebP/GIF) is now hydrated through the bounded media path so sandboxed reviewers can assess it instead of marking it insufficient. Thanks @goutamadwant! (#595)
+- The repair owner policy (`CLAWSWEEPER_ALLOWED_OWNER`) accepts a multi-owner list enforced identically at intake and every execution gate; disallowed owners are rejected before a durable job is written. (#809)
+
 - Added review-time bulk-filer detection, transparent labeling, duplicate scrutiny, fix-lane suppression, and within-bucket scheduling de-prioritization for high-volume issue authors.
 - Added end-to-end exact-review handoff health with phase ages, delayed/stalled claim classification, and a phase-aware operator rail on the live dashboard.
 - Added a maintainer-only two-runner workflow that builds a hash-bound
@@ -113,6 +117,11 @@ checkpoint, and status-only commits are intentionally omitted.
 
 ### Fixed
 
+- State publishes rebase onto the live remote head after lease admission, the coordinator ticket poll has a hard deadline with a still-queued heartbeat, and network pushes carry timeouts — ending the materializer's stale-base rejections and silent hangs. (#805)
+- The state materializer is admitted through the publication-batch coordinator lane so the bulk writer no longer starves behind batch lease turns; queued state now drains on schedule. (#806)
+- The `@clawsweeper re-review` acknowledgement describes the durable review comment's real create-or-update behavior. Thanks @anagnorisis2peripeteia! (#587)
+- `normalizeGitHubActor` strips every trailing `[bot]` suffix, so stacked suffixes can no longer survive normalization and collide with a real bot identity. (#808)
+- Validation identity capture and near-exhausted command budgets fail with classified budget errors instead of raw few-millisecond subprocess timeouts on loaded machines. (#817)
 - Coalesced retried exact-review publication deliveries after provenance refresh without breaking same-producer revision handoff. Reported by @snowzlmbot automation.
 - Synchronized review-derived labels on high-activity pull requests when complete hydration proves omitted activity is automation-only, while continuing to fail closed on hidden human activity or incomplete hydration. Thanks @veteranbv.
 - Stopped stale "review started" placeholder comments from accumulating on reviewed items: publishing the durable review comment now sweeps superseded placeholders.
