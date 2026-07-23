@@ -131,9 +131,10 @@ Reason: ${duplicateRisk}
     "none",
   );
 
-  assert.ok(comment.includes(`**Next step before merge**\n- [P2] ${duplicateRisk}`));
+  assert.match(comment, /## Before merge/);
+  assert.ok(comment.includes(`- [ ] **Resolve merge risk (P1)** - ${duplicateRisk}`));
   assert.doesNotMatch(comment, /Remaining risk \/ open question:/);
-  assert.doesNotMatch(comment, /\*\*Risk before merge\*\*/);
+  assert.doesNotMatch(comment, /### Merge-risk options/);
   assert.equal(comment.split(duplicateRisk).length - 1, 1);
 });
 
@@ -168,10 +169,15 @@ Confirm both merge risks before merge.
     "none",
   );
 
-  assert.match(comment, /\*\*Risk before merge\*\*/);
-  assert.match(comment, /- \[P1\] Blocked workflow actions must render as P1\./);
-  assert.match(comment, /- \[P2\] Timeout fallback wording should remain scannable\./);
-  assert.doesNotMatch(comment, /- \[P1\] Blocked workflow actions.*\n- Timeout fallback/s);
+  assert.match(comment, /## Before merge/);
+  assert.match(
+    comment,
+    /- \[ \] \*\*Resolve merge risk \(P1\)\*\* - Blocked workflow actions must render as P1\./,
+  );
+  assert.match(
+    comment,
+    /- \[ \] \*\*Resolve merge risk \(P2\)\*\* - Timeout fallback wording should remain scannable\./,
+  );
 });
 
 test("pull request risk text does not priority-prefix routine CI noise", () => {
@@ -205,8 +211,11 @@ ${routineCiRisk}
     "none",
   );
 
-  assert.match(comment, /\*\*Risk before merge\*\*/);
-  assert.match(comment, new RegExp(`- ${routineCiRisk.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+  assert.match(comment, /## Before merge/);
+  // Routine CI noise stays visible in the collapsed details but is not counted as
+  // remaining merge work.
+  assert.doesNotMatch(comment, /- \[ \] \*\*Resolve merge risk\*\*/);
+  assert.ok(comment.includes(routineCiRisk));
   assert.doesNotMatch(
     comment,
     new RegExp(`\\[P[12]\\] ${routineCiRisk.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`),
@@ -259,11 +268,7 @@ ${routineStatusStep}
       "none",
     );
 
-    assert.match(comment, /\*\*Next step before merge\*\*/);
-    assert.match(
-      comment,
-      new RegExp(`- ${routineStatusStep.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`),
-    );
+    assert.match(comment, /## Before merge/);
     assert.doesNotMatch(
       comment,
       new RegExp(`\\[P[12]\\] ${routineStatusStep.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`),
@@ -302,11 +307,8 @@ ${actionableCiRisk}
     "none",
   );
 
-  assert.match(comment, /\*\*Risk before merge\*\*/);
-  assert.match(
-    comment,
-    new RegExp(`- \\[P1\\] ${actionableCiRisk.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`),
-  );
+  assert.match(comment, /## Before merge/);
+  assert.ok(comment.includes(`- [ ] **Resolve merge risk (P1)** - ${actionableCiRisk}`));
 });
 
 test("pull request risk text keeps diff-caused status-check risk actionable", () => {
@@ -340,11 +342,8 @@ ${actionableStatusRisk}
     "none",
   );
 
-  assert.match(comment, /\*\*Risk before merge\*\*/);
-  assert.match(
-    comment,
-    new RegExp(`- \\[P1\\] ${actionableStatusRisk.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`),
-  );
+  assert.match(comment, /## Before merge/);
+  assert.ok(comment.includes(`- [ ] **Resolve merge risk (P1)** - ${actionableStatusRisk}`));
 });
 
 test("pull request risk text keeps diff-caused required-check risk actionable", () => {
@@ -379,11 +378,8 @@ ${actionableRequiredRisk}
     "none",
   );
 
-  assert.match(comment, /\*\*Risk before merge\*\*/);
-  assert.match(
-    comment,
-    new RegExp(`- \\[P1\\] ${actionableRequiredRisk.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`),
-  );
+  assert.match(comment, /## Before merge/);
+  assert.ok(comment.includes(`- [ ] **Resolve merge risk (P1)** - ${actionableRequiredRisk}`));
 });
 
 test("pull request risk text keeps broken passing-check risk actionable", () => {
@@ -447,10 +443,12 @@ ${actionablePassingRisk}
       "none",
     );
 
-    assert.match(comment, /\*\*Risk before merge\*\*/);
+    assert.match(comment, /## Before merge/);
     assert.match(
       comment,
-      new RegExp(`- \\[P[01]\\] ${actionablePassingRisk.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`),
+      new RegExp(
+        `- \\[ \\] \\*\\*Resolve merge risk \\(P[01]\\)\\*\\* - ${actionablePassingRisk.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`,
+      ),
     );
   }
 });
@@ -484,16 +482,13 @@ Adds a small runtime change with tests and docs.
     "none",
   );
 
-  const evidenceDetails = detailsBody(comment, "Evidence reviewed");
+  const evidenceDetails = detailsBody(comment, "Agent review details");
   const visibleBeforeEvidence = comment.slice(
     0,
-    comment.indexOf("<summary>Evidence reviewed</summary>"),
+    comment.indexOf("<summary><strong>Agent review details</strong></summary>"),
   );
 
-  assert.match(
-    visibleBeforeEvidence,
-    /PR surface: Source \+8, Tests \+6, Docs \+4\. Total \+18 across 3 files\./,
-  );
+  assert.doesNotMatch(visibleBeforeEvidence, /PR surface:/);
   assert.doesNotMatch(visibleBeforeEvidence, /<summary>View PR surface stats<\/summary>/);
   assert.doesNotMatch(
     visibleBeforeEvidence,
@@ -501,16 +496,15 @@ Adds a small runtime change with tests and docs.
   );
   assert.match(
     evidenceDetails,
-    /PR surface:\n\nSource \+8, Tests \+6, Docs \+4\. Total \+18 across 3 files\./,
+    /### PR surface\n\nSource \+8, Tests \+6, Docs \+4\. Total \+18 across 3 files\./,
   );
   assert.match(evidenceDetails, /<summary>View PR surface stats<\/summary>/);
   assert.match(
     evidenceDetails,
     /\| \*\*Total\*\* \| \*\*3\*\* \| \*\*21\*\* \| \*\*3\*\* \| \*\*\+18\*\* \|/,
   );
-  assert.match(comment, /\*\*Review metrics:\*\* none identified\./);
-  assert.ok(comment.indexOf("PR surface:") < comment.indexOf("**Review metrics:**"));
-  assert.ok(comment.indexOf("**Review metrics:**") < comment.indexOf("**Merge readiness**"));
+  assert.match(evidenceDetails, /### Review metrics\n\nNone\./);
+  assert.ok(comment.indexOf("### PR surface") < comment.indexOf("### Review metrics"));
 });
 
 test("pull request comments render one review metric digest item", () => {
@@ -543,10 +537,10 @@ Updates repository automation.
     "none",
   );
 
-  assert.match(comment, /\*\*Review metrics:\*\* 1 noteworthy metric\./);
+  assert.match(comment, /### Review metrics/);
   assert.match(
     comment,
-    /- \*\*Workflow surfaces changed:\*\* 1 workflow changed\. The PR changes repository automation behavior that maintainers should review before merge\./,
+    /\| \*\*Workflow surfaces changed\*\* \| 1 workflow changed \| The PR changes repository automation behavior that maintainers should review before merge\. \|/,
   );
 });
 
@@ -588,14 +582,13 @@ Adds configuration behavior and proof updates.
     "none",
   );
 
-  assert.match(comment, /\*\*Review metrics:\*\* 2 noteworthy metrics\./);
+  assert.match(comment, /### Review metrics/);
   assert.match(
     comment,
-    /- \*\*Config\/default surfaces changed:\*\* 2 added, 1 changed, 0 removed\./,
+    /\| \*\*Config\/default surfaces changed\*\* \| 2 added, 1 changed, 0 removed \|/,
   );
-  assert.match(comment, /- \*\*Proof files affected:\*\* 3 files affected\./);
-  assert.ok(comment.indexOf("PR surface:") < comment.indexOf("**Review metrics:**"));
-  assert.ok(comment.indexOf("**Review metrics:**") < comment.indexOf("**Merge readiness**"));
+  assert.match(comment, /\| \*\*Proof files affected\*\* \| 3 files affected \|/);
+  assert.ok(comment.indexOf("### PR surface") < comment.indexOf("### Review metrics"));
 });
 
 test("PR surface is OpenClaw pull-request only", () => {
@@ -719,7 +712,7 @@ test("pull request keep-open review comments render repairable merge-risk option
     ],
   });
 
-  assert.match(comment, /\*\*Risk before merge\*\*/);
+  assert.match(comment, /### Merge-risk options/);
   assert.match(comment, new RegExp(escapeRegExpForTest(mergeRisk)));
   assert.doesNotMatch(comment, /Why this matters:/);
   assert.match(

@@ -2134,14 +2134,120 @@ export function isProofNudgeCommentBody(body: string) {
   return /<!--\s*clawsweeper-proof-nudge(?:\s|-->)/i.test(String(body ?? ""));
 }
 
+function isMarkdownSectionBoundary(line: string): boolean {
+  if (!line.startsWith("#") && !line.startsWith("**") && !line.startsWith("<")) {
+    const colon = line.indexOf(":");
+    if (colon >= 0 && line.slice(colon + 1).trim()) return false;
+  }
+  return /^(?:#{1,6}\s+\S|\*\*[^*\n]+\*\*:?$|[A-Z][^:\n]{0,80}:|<\/?details(?:\s|>)|<!--)/.test(
+    line,
+  );
+}
+
+function codeFenceDelimiter(line: string): string | null {
+  return line.match(/^(?:`{3,}|~{3,})/)?.[0] ?? null;
+}
+
+function codeFenceStateAfterLine(fence: string | null, line: string): string | null {
+  const delimiter = line.match(/^(?:`{3,}|~{3,})/)?.[0];
+  if (!delimiter) return fence;
+  if (!fence) return delimiter;
+  // Only a bare matching delimiter (same character, at least the opening length, no
+  // trailing info text) closes the fence; an inner alternate marker like `~~~` inside
+  // a backtick fence or a delimiter run with trailing text is fence content.
+  const closes =
+    delimiter[0] === fence[0] &&
+    delimiter.length >= fence.length &&
+    line.slice(delimiter.length).trim() === "";
+  return closes ? null : fence;
+}
+
+export function extractMarkdownSection(body: JsonValue, heading: string): string | null {
+  const escaped = heading.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const headingPattern = new RegExp(
+    `^(?:\\*\\*${escaped}\\*\\*|#{1,6}\\s+${escaped}|${escaped}:)\\s*$`,
+    "i",
+  );
+  const lines = String(body ?? "").split(/\r?\n/);
+  // Track fenced code blocks so fenced model content can never introduce a trusted
+  // section, and stop permanently at the first top-level <details> boundary: every
+  // renderer-owned section precedes it, and model text inside the collapsed block
+  // could contain forged closing tags that would otherwise re-enter top level.
+  let fence: string | null = null;
+  let headingIndex = -1;
+  for (let index = 0; index < lines.length; index += 1) {
+    const trimmed = (lines[index] ?? "").trim();
+    const delimiter = codeFenceDelimiter(trimmed);
+    if (delimiter) {
+      fence = codeFenceStateAfterLine(fence, trimmed);
+      continue;
+    }
+    if (fence) continue;
+    if (/^<details(?:\s|>)/i.test(trimmed)) break;
+    if (headingPattern.test(trimmed)) {
+      headingIndex = index;
+      break;
+    }
+  }
+  if (headingIndex < 0) return null;
+
+  const section: string[] = [];
+  fence = null;
+  for (const line of lines.slice(headingIndex + 1)) {
+    const trimmed = line.trim();
+    const delimiter = codeFenceDelimiter(trimmed);
+    if (delimiter) {
+      fence = codeFenceStateAfterLine(fence, trimmed);
+      section.push(line);
+      continue;
+    }
+    if (!fence && isMarkdownSectionBoundary(trimmed)) break;
+    section.push(line);
+  }
+  return section.join("\n").trim() || null;
+}
+
+export function reviewSummaryFromCommentBody(body: JsonValue): string | null {
+  return (
+    extractMarkdownSection(body, "What this changes") ?? extractMarkdownSection(body, "Summary")
+  );
+}
+
 function trustedCommentHasPriorityFinding(body: string) {
-  const reviewFindings = markdownSection(body, "Review findings");
+  const reviewFindings =
+    markdownSection(body, "Findings") || markdownSection(body, "Review findings");
   return /(?:^|;|\n)\s*(?:[-*]\s*)?(?:\*\*)?\[P[0-3]\]/i.test(reviewFindings);
 }
 
+function decisionNeededReason(body: string): string {
+  const section = extractMarkdownSection(body, "Decision needed");
+  return section ? compactReason(`Maintainer decision needed: ${section}`, 220) : "";
+}
+
+function beforeMergeReason(body: string): string {
+  const raw = extractMarkdownSection(body, "Before merge") ?? "";
+  // New-format comments render "None." when no checklist entries remain; that is a
+  // no-action sentinel, not a reason a human needs to look. Decision-only reviews
+  // still carry their outstanding maintainer question.
+  if (!raw) return "";
+  if (/^none[.!]?$/i.test(raw.trim())) return decisionNeededReason(body);
+  const lines = raw.split(/\r?\n/).map((line) => line.trim());
+  const tasks = lines.filter((line) => /^- \[[ xX]\]/.test(line));
+  if (tasks.length) {
+    // A checklist where every task is checked leaves only a pending decision, if any.
+    const unresolved = tasks.find((line) => line.startsWith("- [ ]"));
+    return unresolved ? compactReason(unresolved, 220) : decisionNeededReason(body);
+  }
+  return compactReason(raw, 220);
+}
+
 function trustedHumanReviewReason(body: string, verdict: LooseRecord | null) {
+  // A present Before merge section is authoritative; only legacy comments without
+  // it may fall back to the old follow-up heading.
+  const hasBeforeMergeSection = extractMarkdownSection(body, "Before merge") !== null;
   const details = [
-    markdownSection(body, "Next step before merge"),
+    beforeMergeReason(body),
+    hasBeforeMergeSection ? "" : markdownSection(body, "Next step before merge"),
     markdownSection(body, "Security"),
     firstReviewFinding(body),
   ].filter(Boolean);
@@ -2154,18 +2260,11 @@ function trustedHumanReviewReason(body: string, verdict: LooseRecord | null) {
 }
 
 function markdownSection(body: string, heading: string) {
-  const escaped = heading.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const match = String(body ?? "").match(
-    new RegExp(
-      `(?:^|\\n)\\*\\*${escaped}\\*\\*\\s*\\n([\\s\\S]*?)(?=\\n\\n\\*\\*|\\n<details|\\n<!--|$)`,
-      "i",
-    ),
-  );
-  return compactReason(match?.[1] ?? "", 220);
+  return compactReason(extractMarkdownSection(body, heading) ?? "", 220);
 }
 
 function firstReviewFinding(body: string) {
-  const section = markdownSection(body, "Review findings");
+  const section = markdownSection(body, "Findings") || markdownSection(body, "Review findings");
   const finding = section.match(/(?:^|;\s*|\n)\s*[-*]\s*(.+?)(?:$|;\s*|\n)/)?.[1] ?? "";
   return finding ? compactReason(`Review finding: ${finding}`, 180) : "";
 }

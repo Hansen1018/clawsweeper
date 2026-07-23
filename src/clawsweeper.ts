@@ -768,6 +768,8 @@ interface Decision {
   confidence: Confidence;
   summary: string;
   changeSummary: string;
+  systemContext: string;
+  architectureDiagram: string;
   evidence: Evidence[];
   likelyOwners: LikelyOwner[];
   risks: string[];
@@ -2106,6 +2108,8 @@ const DECISION_SCHEMA_KEYS = new Set([
   "confidence",
   "summary",
   "changeSummary",
+  "systemContext",
+  "architectureDiagram",
   "evidence",
   "likelyOwners",
   "risks",
@@ -2231,6 +2235,8 @@ const LIKELY_OWNER_SCHEMA_KEYS = new Set([
 const REVIEW_SECTIONS = {
   summary: "Summary",
   changeSummary: "What This Changes",
+  systemContext: "System Context",
+  architectureDiagram: "Architecture Diagram",
   bestSolution: "Best Possible Solution",
   maintainerDecision: "Maintainer Decision",
   reproductionAssessment: "Reproduction Assessment",
@@ -4033,6 +4039,12 @@ export function parseDecision(value: unknown, item?: DecisionNormalizationItem):
     confidence: requireEnum(record.confidence, CONFIDENCES, "decision.confidence"),
     summary: requireString(record.summary, "decision.summary"),
     changeSummary: requireString(record.changeSummary, "decision.changeSummary"),
+    systemContext: neutralizeOwnedSectionSpoofing(
+      requireString(record.systemContext, "decision.systemContext"),
+    ),
+    architectureDiagram: sanitizeArchitectureDiagram(
+      requireString(record.architectureDiagram, "decision.architectureDiagram"),
+    ),
     evidence,
     likelyOwners,
     risks: requireStringArray(record.risks, "decision.risks").filter(
@@ -5592,26 +5604,76 @@ function filterReviewContextComments(
   return { included, filtered: comments.length - included.length };
 }
 
-function minNonNegative(values: number[]): number {
-  const candidates = values.filter((value) => value >= 0);
-  return candidates.length ? Math.min(...candidates) : -1;
+function markdownFenceDelimiter(line: string): string | null {
+  return line.trimStart().match(/^(?:`{3,}|~{3,})/)?.[0] ?? null;
 }
 
+function markdownFenceStateAfterLine(fence: string | null, line: string): string | null {
+  const trimmed = line.trim();
+  const delimiter = trimmed.match(/^(?:`{3,}|~{3,})/)?.[0];
+  if (!delimiter) return fence;
+  if (!fence) return delimiter;
+  // Only a bare matching delimiter (same character, at least the opening length, no
+  // trailing info text) closes the fence; anything else is fence content.
+  const closes =
+    delimiter[0] === fence[0] &&
+    delimiter.length >= fence.length &&
+    trimmed.slice(delimiter.length).trim() === "";
+  return closes ? null : fence;
+}
+
+// Fence-aware so heading-shaped lines inside fenced blocks (for example the Mermaid
+// architecture diagram) can never open or terminate a section.
 function markdownSection(body: string, heading: string): string {
-  const marker = `**${heading.toLowerCase()}**`;
-  const lowerBody = body.toLowerCase();
-  const markerIndex = lowerBody.indexOf(marker);
-  if (markerIndex < 0) return "";
-  const sectionStart = body.indexOf("\n", markerIndex + marker.length);
-  if (sectionStart < 0) return "";
-  const contentStart = sectionStart + 1;
-  const relative = body.slice(contentStart);
-  const end = minNonNegative([
-    relative.indexOf("\n**"),
-    relative.indexOf("\n<details"),
-    relative.indexOf("\n<!--"),
-  ]);
-  return (end < 0 ? relative : relative.slice(0, end)).trim();
+  return markdownSectionInternal(body, heading, false);
+}
+
+// Renderer-owned scan-first sections always precede the collapsed details block, so
+// lookups for them stop at the first top-level <details> boundary; model text inside
+// the collapsed block can never supply them.
+function markdownTopLevelSection(body: string, heading: string): string {
+  return markdownSectionInternal(body, heading, true);
+}
+
+function markdownSectionInternal(body: string, heading: string, topLevelOnly: boolean): string {
+  const escaped = heading.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const headingPattern = new RegExp(
+    `^(?:\\*\\*${escaped}\\*\\*|#{1,6}[ \\t]+${escaped})[ \\t]*$`,
+    "i",
+  );
+  const boundaryPattern =
+    /^(?:\*\*[^*\n]+\*\*[ \t]*$|#{1,6}[ \t]+\S.*$|<details>|<\/details>|<!--)/;
+  const lines = body.split("\n").map((line) => line.replace(/\r$/, ""));
+  let fence: string | null = null;
+  let contentStart = -1;
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index] ?? "";
+    const delimiter = markdownFenceDelimiter(line);
+    if (delimiter) {
+      fence = markdownFenceStateAfterLine(fence, line);
+      continue;
+    }
+    if (!fence && topLevelOnly && /^<details(?:\s|>)/i.test(line.trim())) break;
+    if (!fence && headingPattern.test(line)) {
+      contentStart = index + 1;
+      break;
+    }
+  }
+  if (contentStart < 0) return "";
+  const section: string[] = [];
+  fence = null;
+  for (let index = contentStart; index < lines.length; index += 1) {
+    const line = lines[index] ?? "";
+    const delimiter = markdownFenceDelimiter(line);
+    if (delimiter) {
+      fence = markdownFenceStateAfterLine(fence, line);
+      section.push(line);
+      continue;
+    }
+    if (!fence && boundaryPattern.test(line)) break;
+    section.push(line);
+  }
+  return section.join("\n").trim();
 }
 
 function firstLineAfterPrefix(body: string, prefix: string): string {
@@ -5665,6 +5727,74 @@ function firstNonEmptyLine(value: string): string {
   );
 }
 
+function markdownTableCells(line: string): string[] {
+  const value = line.trim();
+  if (!value.startsWith("|") || !value.endsWith("|")) return [];
+  const cells: string[] = [];
+  let cell = "";
+  for (let index = 1; index < value.length - 1; index += 1) {
+    const character = value[index];
+    if (character === "|" && value[index - 1] !== "\\") {
+      cells.push(cell.trim().replace(/\\\|/g, "|"));
+      cell = "";
+      continue;
+    }
+    cell += character;
+  }
+  cells.push(cell.trim().replace(/\\\|/g, "|"));
+  return cells;
+}
+
+// Decision-only reviews render an empty Before merge checklist while the
+// outstanding maintainer question lives under "Decision needed"; surface that
+// question as the remaining action.
+function firstDecisionNeededQuestion(body: string): string {
+  const section = markdownTopLevelSection(body, "Decision needed");
+  if (!section) return "";
+  for (const line of section.split(/\r?\n/)) {
+    const cells = markdownTableCells(line);
+    if (cells.length < 2) continue;
+    if (cells.every((cell) => /^:?-{3,}:?$/.test(cell))) continue;
+    const label = cells[0]?.trim().toLowerCase() ?? "";
+    if (label === "question") continue;
+    if (cells[0]) return cells[0];
+  }
+  return firstNonEmptyLine(section);
+}
+
+function firstBeforeMergeAction(body: string): string {
+  const section = markdownTopLevelSection(body, "Before merge");
+  // "None." is the no-action sentinel; a checked task is finished work, not a
+  // remaining action.
+  if (!section || /^none[.!]?$/i.test(section.trim())) {
+    return firstDecisionNeededQuestion(body);
+  }
+  let sawTask = false;
+  for (const line of section.split(/\r?\n/)) {
+    if (/^- \[[xX]\]/.test(line)) {
+      sawTask = true;
+      continue;
+    }
+    const task = line.match(/^- \[ \][ \t]+(?:\*\*(?:\\.|[^*\\\n])+\*\*[ \t]+-[ \t]+)?(\S.*)$/);
+    if (task?.[1]) return task[1].trim();
+    if (line.startsWith("- [")) sawTask = true;
+    const cells = markdownTableCells(line);
+    if (cells.length < 2) continue;
+    if (cells.every((cell) => /^:?-{3,}:?$/.test(cell))) continue;
+    const labels = cells.map((cell) =>
+      cell
+        .replace(/^\*\*|\*\*$/g, "")
+        .trim()
+        .toLowerCase(),
+    );
+    if (labels[0] === "needed" && labels[1] === "why") continue;
+    if (cells[1]) return cells[1];
+  }
+  // A checklist whose tasks are all checked has no remaining checklist action, but
+  // an outstanding maintainer decision still is one.
+  return sawTask ? firstDecisionNeededQuestion(body) : firstNonEmptyLine(section);
+}
+
 function previousReviewStatus(body: string): string {
   const status = firstLineAfterPrefix(body, "Codex review:");
   const reviewedIndex = status.toLowerCase().indexOf("_reviewed ");
@@ -5685,26 +5815,44 @@ function previousReviewReviewedAt(body: string): string | null {
   return inline || null;
 }
 
-function firstMergeReadinessLine(body: string, prefix: string): string {
-  const readiness = markdownSection(body, "Merge readiness");
-  if (!readiness) return "";
+function sectionLabeledValue(body: string, heading: string, prefix: string): string {
+  const section = markdownTopLevelSection(body, heading);
+  if (!section) return "";
   const lowerPrefix = prefix.toLowerCase();
-  return (
-    readiness
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .find((line) => line.toLowerCase().startsWith(lowerPrefix)) ?? ""
+  const plain = section
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find((line) => line.toLowerCase().startsWith(lowerPrefix));
+  if (plain) return plain;
+  const label = prefix.replace(/:$/, "");
+  const escaped = label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const tableRow = section.match(
+    new RegExp(`^\\|\\s*\\*\\*${escaped}\\*\\*\\s*\\|\\s*(.*?)\\s*\\|`, "im"),
   );
+  return tableRow?.[1] ? `${label}: ${tableRow[1]}` : "";
+}
+
+function firstMergeReadinessLine(body: string, prefix: string): string {
+  return sectionLabeledValue(body, "Merge readiness", prefix);
 }
 
 function previousReviewRating(body: string): string {
+  // Prefer the renderer-owned score table; the free-form legacy blocks can contain
+  // model text that merely starts with the legacy label.
   return (
+    sectionLabeledValue(body, "Review scores", "Overall readiness:") ||
     firstNonEmptyLine(markdownSection(body, "PR rating")) ||
     firstMergeReadinessLine(body, "Overall:")
   );
 }
 
 function previousReviewProofStatus(body: string): string {
+  // Prefer the renderer-owned tables; the free-form legacy blocks can contain model
+  // text that merely starts with the legacy label.
+  const fromNewSections =
+    sectionLabeledValue(body, "Review scores", "Proof confidence:") ||
+    sectionLabeledValue(body, "Verification", "Real behavior:");
+  if (fromNewSections) return fromNewSections;
   const oldProofStatus = firstNonEmptyLine(markdownSection(body, "Real behavior proof"));
   if (oldProofStatus) return oldProofStatus;
   const readiness = markdownSection(body, "Merge readiness");
@@ -5760,12 +5908,17 @@ function extractLatestClawSweeperReview(
       null,
     verdictMarker,
     actionMarker,
-    summary: firstNonEmptyLine(markdownSection(body, "Summary")),
+    summary:
+      firstNonEmptyLine(markdownSection(body, "What this changes")) ||
+      firstNonEmptyLine(markdownSection(body, "Summary")),
     proofStatus: previousReviewProofStatus(body),
     rating: previousReviewRating(body),
-    nextStep:
-      firstNonEmptyLine(markdownSection(body, "Next step before merge")) ||
-      firstNonEmptyLine(markdownSection(body, "Next step")),
+    // A present Before merge section is authoritative; legacy next-step headings are
+    // consulted only for comments that predate the scan-first layout.
+    nextStep: markdownTopLevelSection(body, "Before merge")
+      ? firstBeforeMergeAction(body)
+      : firstNonEmptyLine(markdownSection(body, "Next step before merge")) ||
+        firstNonEmptyLine(markdownSection(body, "Next step")),
     findings: reviewHistoryFindings(latestCompletedCycle),
     earlierReviewCycles,
     completedReviewCycles: history.totalCompletedCycles + (currentCycle ? 1 : 0),
@@ -10132,6 +10285,8 @@ function codexFailureDecision(
     confidence: "low",
     summary: `Codex review failed: ${reason}${status === null ? "" : ` (exit ${status})`}.`,
     changeSummary: "Review failed before ClawSweeper could summarize the requested change.",
+    systemContext: "",
+    architectureDiagram: "",
     evidence: [
       evidenceEntry({ label: "failure reason", detail: reason }),
       evidenceEntry({ label: "codex failure detail", detail: trimMiddle(failureDetail, 4000) }),
@@ -11979,7 +12134,7 @@ function securityReviewLine(review: SecurityReview): string {
 }
 
 function publicSecurityReviewLine(review: SecurityReview): string {
-  if (review.status === "not_applicable" && review.concerns.length === 0) return "";
+  if (review.status !== "needs_attention" && review.concerns.length === 0) return "None.";
   const prefix =
     review.status === "needs_attention"
       ? "Needs attention"
@@ -12029,21 +12184,24 @@ function publicRealBehaviorProofLine(proof: RealBehaviorProof): string {
 }
 
 function publicRankDetailsBlock(): string {
-  return collapsedDetailsBlock("What the crustacean ranks mean", [
-    "- 🦀 challenger crab: rare, exceptional readiness with strong proof, clean implementation, and convincing validation.",
-    "- 🦞 diamond lobster: very strong readiness with only minor maintainer review expected.",
-    "- 🐚 platinum hermit: good normal PR, likely mergeable with ordinary maintainer review.",
-    "- 🦐 gold shrimp: useful signal, but proof or patch confidence is still limited.",
-    "- 🦪 silver shellfish: thin signal; proof, validation, or implementation needs work.",
-    "- 🧂 unranked krab: not merge-ready because proof is missing/unusable or there are serious correctness or safety concerns.",
-    "- 🌊 off-meta tidepool: rating does not apply to this item.",
+  return [
+    "| Score | Internal tier | Crab rank | Meaning |",
+    "|---:|:---:|---|---|",
+    "| **6/6** | S | 🦀 challenger crab | Exceptional readiness |",
+    "| **5/6** | A | 🦞 diamond lobster | Very strong readiness |",
+    "| **4/6** | B | 🐚 platinum hermit | Good normal PR; ordinary maintainer review |",
+    "| **3/6** | C | 🦐 gold shrimp | Useful, but confidence is limited |",
+    "| **2/6** | D | 🦪 silver shellfish | Proof or implementation needs work |",
+    "| **1/6** | F | 🧂 unranked krab | Not merge-ready |",
+    "| N/A | NA | 🌊 off-meta tidepool | Rating does not apply |",
     "",
+    "Overall follows the weaker of proof and patch quality.",
     "Shiny media proof means a screenshot, video, or linked artifact directly shows the changed behavior. Runtime, network, CSP, and security claims still need visible diagnostics.",
-  ]);
+  ].join("\n");
 }
 
 function publicMergeReadinessResult(rating: PrRating, proof: RealBehaviorProof): string {
-  if (rating.overallTier === "NA") return "rating does not apply to this item.";
+  if (rating.overallTier === "NA") return "needs maintainer review before merge.";
   switch (proof.status) {
     case "missing":
       return "blocked until real behavior proof is added.";
@@ -12067,36 +12225,159 @@ function publicMergeReadinessResult(rating: PrRating, proof: RealBehaviorProof):
   }
 }
 
-function publicMergeReadinessBlock(rating: PrRating, proof: RealBehaviorProof): string {
+function publicRatingScore(tier: PrRatingTier): number | null {
+  switch (tier) {
+    case "S":
+      return 6;
+    case "A":
+      return 5;
+    case "B":
+      return 4;
+    case "C":
+      return 3;
+    case "D":
+      return 2;
+    case "F":
+      return 1;
+    case "NA":
+      return null;
+  }
+}
+
+function publicRatedName(tier: PrRatingTier): string {
+  const score = publicRatingScore(tier);
+  return `${themedRatingName(tier)}${score === null ? "" : ` **(${score}/6)**`}`;
+}
+
+function publicStatusText(value: string): string {
+  const text = sentence(value);
+  return text ? `${text[0]?.toUpperCase()}${text.slice(1)}` : "";
+}
+
+function publicReviewScoresBlock(
+  rating: PrRating,
+  proof: RealBehaviorProof,
+  findings: readonly ReviewFinding[],
+  securityReview: SecurityReview,
+): string {
   const shiny = hasShinyProof(proof) ? " ✨ media proof bonus" : "";
-  const proofGuidance =
-    proof.status === "missing" || proof.status === "mock_only" || proof.status === "insufficient"
-      ? publicPriorityBullet("P1", publicRealBehaviorProofLine(proof))
+  const overallMeaning =
+    sentence(rating.summary) || "Overall readiness follows the weaker of proof and patch quality.";
+  const proofMeaning =
+    publicRealBehaviorProofLine(proof) || "Real behavior proof does not apply to this change.";
+  const patchMeaning =
+    securityReview.status === "needs_attention" || securityReview.concerns.length > 0
+      ? "Security review found an item that needs attention."
+      : findings.length > 0
+        ? `${findings.length} actionable review ${findings.length === 1 ? "finding" : "findings"} remain.`
+        : rating.patchTier === "F" || rating.patchTier === "D"
+          ? sentence(rating.summary) ||
+            "Patch quality blocks readiness; see the Before merge checklist."
+          : "No actionable review findings were identified.";
+  return [
+    "| Measure | Result | What it means |",
+    "|---|---|---|",
+    `| **Overall readiness** | ${publicRatedName(rating.overallTier)} | ${publicTableCell(overallMeaning)} |`,
+    `| **Proof confidence** | ${publicRatedName(rating.proofTier)}${shiny} | ${publicTableCell(proofMeaning)} |`,
+    `| **Patch quality** | ${publicRatedName(rating.patchTier)} | ${publicTableCell(patchMeaning)} |`,
+  ].join("\n");
+}
+
+function publicVerificationBlock(
+  proof: RealBehaviorProof,
+  evidence: readonly Evidence[],
+  findings: readonly ReviewFinding[],
+  securityReview: SecurityReview,
+): string {
+  const proofResult =
+    proof.status === "sufficient"
+      ? "Verified"
+      : proof.status === "override"
+        ? "Overridden"
+        : proof.status === "not_applicable"
+          ? "Not applicable"
+          : "Needs proof";
+  const proofEvidence =
+    publicRealBehaviorProofLine(proof) || "Real behavior proof does not apply to this change.";
+  const evidenceResult =
+    evidence.length === 0
+      ? "None listed"
+      : `${evidence.length} ${evidence.length === 1 ? "item" : "items"}`;
+  const evidenceSummary =
+    evidence.length === 0
+      ? "None."
+      : evidence
+          .slice(0, 3)
+          .map((entry) =>
+            publicTableCell(
+              `${entry.label.trim() ? `${entry.label.trim()}: ` : ""}${sentence(entry.detail)}`,
+            ),
+          )
+          .join("<br>");
+  const findingResult =
+    findings.length === 0
+      ? "None"
+      : `${findings.length} actionable ${findings.length === 1 ? "finding" : "findings"}`;
+  const findingEvidence =
+    findings.length === 0
+      ? "None."
+      : findings
+          .slice(0, 3)
+          .map((finding) =>
+            publicTableCell(`[${priorityLabel(finding.priority)}] ${finding.title.trim()}`),
+          )
+          .join("<br>");
+  const securityNeedsAttention =
+    securityReview.status === "needs_attention" || securityReview.concerns.length > 0;
+  // Each report-provided entry is sanitized individually; the <br> separators are
+  // renderer-owned and must stay unescaped.
+  const securityEvidence = securityNeedsAttention
+    ? securityReview.concerns.length > 0
+      ? securityReview.concerns
+          .slice(0, 3)
+          .map((concern) => publicTableCell(`${concern.title.trim()}: ${sentence(concern.body)}`))
+          .join("<br>")
+      : publicTableCell(sentence(securityReview.summary))
+    : "None.";
+  return [
+    "| Check | Result | Evidence |",
+    "|---|---|---|",
+    `| **Real behavior** | ${proofResult} | ${publicTableCell(proofEvidence)} |`,
+    `| **Evidence reviewed** | ${evidenceResult} | ${evidenceSummary} |`,
+    `| **Findings** | ${findingResult} | ${findingEvidence} |`,
+    `| **Security** | ${securityNeedsAttention ? "Needs attention" : "None"} | ${securityEvidence} |`,
+  ].join("\n");
+}
+
+function publicMergeReadinessBlock(
+  rating: PrRating,
+  proof: RealBehaviorProof,
+  priority: TriagePriority,
+  bottomLine: string,
+  remainingItemCount: number,
+  decisionNeeded: boolean,
+  reviewedHeadSha: string,
+): string {
+  const result = publicStatusText(publicMergeReadinessResult(rating, proof)).replace(/\.$/, "");
+  const icon = /^blocked\b/i.test(result)
+    ? "⛔"
+    : /^ready\b/i.test(result) && remainingItemCount === 0 && !decisionNeeded
+      ? "✅"
+      : "⚠️";
+  const remaining =
+    remainingItemCount > 0
+      ? ` - ${remainingItemCount} ${remainingItemCount === 1 ? "item remains" : "items remain"}`
       : "";
   const lines = [
-    `Overall: ${themedRatingName(rating.overallTier)}`,
-    `Proof: ${themedRatingName(rating.proofTier)}${shiny}`,
-    `Patch quality: ${themedRatingName(rating.patchTier)}`,
-    `Result: ${publicMergeReadinessResult(rating, proof)}`,
+    `${icon} **${result}${remaining}**`,
     "",
-    "Overall follows the weaker of proof and patch quality, so missing proof can cap an otherwise strong patch.",
+    sentence(bottomLine),
+    "",
+    `**Priority:** ${priority === "none" ? "None" : priority}`,
   ];
-  if (rating.nextSteps.length) {
-    const nextSteps = rating.nextSteps
-      .slice(0, 3)
-      .filter((step) => !isReportNoneList(stripPriorityPrefix(step)));
-    lines.push(
-      "",
-      "Rank-up moves:",
-      ...(nextSteps.length
-        ? nextSteps.map((step) =>
-            publicPriorityBulletIfActionable(step, proofGuidance ? "P1" : "P2"),
-          )
-        : ["- none"]),
-    );
-  }
-  if (proofGuidance) {
-    lines.push("", "Proof guidance:", proofGuidance);
+  if (reviewedHeadSha) lines.push(`**Reviewed head:** \`${reviewedHeadSha}\``);
+  if (decisionNeeded) {
+    lines.push("**Owner decision:** Required. See [Decision needed](#decision-needed).");
   }
   return lines.join("\n");
 }
@@ -14046,11 +14327,14 @@ function reviewMetricsFromReport(markdown: string): ReviewMetric[] {
 }
 
 function renderReviewMetricsDigest(metrics: readonly ReviewMetric[]): string {
-  if (metrics.length === 0) return "**Review metrics:** none identified.";
-  const noun = metrics.length === 1 ? "metric" : "metrics";
+  if (metrics.length === 0) return "None.";
   return [
-    `**Review metrics:** ${metrics.length} noteworthy ${noun}.`,
-    ...metrics.map((metric) => `- **${metric.label}:** ${metric.value}. ${metric.reason}`),
+    "| Metric | Value | Why it matters |",
+    "|---|---|---|",
+    ...metrics.map(
+      (metric) =>
+        `| **${publicTableCell(metric.label)}** | ${publicTableCell(metric.value)} | ${publicTableCell(sentence(metric.reason))} |`,
+    ),
   ].join("\n");
 }
 
@@ -16173,6 +16457,8 @@ function reportDecision(markdown: string, closeReason: CloseReason): Decision {
     confidence: "high",
     summary: reviewSectionValue(markdown, "summary"),
     changeSummary: reviewSectionValue(markdown, "changeSummary"),
+    systemContext: reviewSectionValue(markdown, "systemContext"),
+    architectureDiagram: reviewSectionValue(markdown, "architectureDiagram"),
     evidence: reportEvidence(markdown),
     likelyOwners: reportLikelyOwners(markdown),
     risks: [],
@@ -18502,6 +18788,188 @@ function appendPublicSection(lines: string[], heading: string, body: string): vo
   lines.push(`**${heading}**`, body, "");
 }
 
+function appendHeadingSection(lines: string[], heading: string, body: string): void {
+  lines.push(`## ${heading}`, "", body, "");
+}
+
+function publicTableCell(value: string): string {
+  // Escape report-provided HTML (tags and comment openers) before inserting the
+  // renderer-owned <br> tags; &lt; renders identically to a literal <.
+  return value
+    .replace(/\\/g, "\\\\")
+    .replace(/<(?=[a-z/!?])/gi, "&lt;")
+    .replace(/\r?\n|\r/g, "<br>")
+    .replace(/\|/g, "\\|")
+    .trim();
+}
+
+// A routine phrase inside a larger actionable or negated sentence ("Do not merge
+// after required checks are green; rotate the token first") must not suppress the
+// step, so require the routine phrase, reject negation, and re-check actionability.
+function isRoutineBeforeMergeStep(value: string): boolean {
+  const text = value.trim();
+  if (!text) return false;
+  if (
+    !/\b(?:merge after (?:required )?checks are green|merge after maintainer review|normal (?:ci|maintainer review)|routine (?:ci|maintainer review)|ordinary (?:ci|maintainer review)|wait for (?:required |status )?(?:ci|checks|status checks)|no further action)\b/i.test(
+      text,
+    ) &&
+    !/^(?:land|merge|ship|proceed|continue|wait)\b[^\n]{0,120}\bafter (?:normal |ordinary |routine )?maintainer review\b/i.test(
+      text,
+    )
+  ) {
+    return false;
+  }
+  if (/\b(?:do not|don['’]t|must not|never|not merge|except|unless|until)\b/i.test(text)) {
+    return false;
+  }
+  return !isActionablePriorityText(text);
+}
+
+interface PublicBeforeMergeItem {
+  label: string;
+  detail: string;
+}
+
+function publicBeforeMergeItems(options: {
+  reviewFailed: boolean;
+  proof: RealBehaviorProof;
+  proofBlocked: boolean;
+  findings: readonly ReviewFinding[];
+  securityReview: SecurityReview;
+  risks: string;
+  nextStep: string;
+  decisionPending: boolean;
+  patchQualityBlocked: boolean;
+  requiredRatingSteps: readonly string[];
+}): PublicBeforeMergeItem[] {
+  const items: PublicBeforeMergeItem[] = [];
+  const seen = new Set<string>();
+  const add = (label: string, detail: string, identity?: { distinctKey: string }) => {
+    const rawDetail = stripPriorityPrefix(detail);
+    const cleanDetail = sentence(stripPriorityPrefix(detail));
+    // Typed findings pass a distinct key (title and location) so independent
+    // findings that share remediation wording are all kept; free-form guidance
+    // still de-duplicates on the detail text across sections.
+    const key = normalizePublicReviewText(
+      identity ? `${identity.distinctKey} ${cleanDetail}` : cleanDetail,
+    );
+    if (
+      !cleanDetail ||
+      /^none[.!]?$/i.test(rawDetail) ||
+      isReportNoneList(cleanDetail) ||
+      seen.has(key) ||
+      (!identity && items.some((item) => !publicReviewTextDiffers(item.detail, cleanDetail)))
+    ) {
+      return;
+    }
+    seen.add(key);
+    items.push({ label, detail: cleanDetail });
+  };
+  const addPrioritized = (text: string, fallback: PublicPriority, label: string) => {
+    for (const line of publicRiskBulletsFromText(text, fallback).split("\n")) {
+      const match = line.match(/^-[ \t]+\[(P[0-2])\][ \t]+(\S.*)$/);
+      // Unprioritized bullets are the ones classified as routine CI or ordinary
+      // maintainer review; they are not remaining merge work.
+      if (match?.[1] && match[2]) {
+        add(`${label} (${match[1]})`, match[2]);
+      }
+    }
+  };
+
+  if (options.reviewFailed) {
+    add(
+      "Retry ClawSweeper review",
+      "ClawSweeper must complete a fresh review before readiness is known.",
+    );
+  }
+  if (options.proofBlocked) {
+    add("Add real behavior proof", publicRealBehaviorProofLine(options.proof));
+  }
+  for (const finding of options.findings) {
+    add(`${finding.title.trim()} (${priorityLabel(finding.priority)})`, finding.body, {
+      distinctKey: `${finding.title} ${reviewFindingLocation(finding)}`,
+    });
+  }
+  for (const concern of options.securityReview.concerns) {
+    add(`Resolve security concern: ${concern.title.trim()}`, concern.body, {
+      distinctKey: `security ${concern.title}`,
+    });
+  }
+  if (
+    options.securityReview.status === "needs_attention" &&
+    options.securityReview.concerns.length === 0
+  ) {
+    add("Resolve security review attention item", options.securityReview.summary);
+  }
+  if (!isReportNoneList(options.risks)) addPrioritized(options.risks, "P1", "Resolve merge risk");
+  // Only actionable next-step text enters the checklist: routing rationale or other
+  // explanatory prose is not remaining merge work, and decision questions are
+  // already represented by the decision packet.
+  if (
+    !isRoutineBeforeMergeStep(options.nextStep) &&
+    !isRoutineCiOrReviewText(options.nextStep) &&
+    isActionablePriorityText(options.nextStep) &&
+    !(options.decisionPending && /\bdecision\b/i.test(options.nextStep))
+  ) {
+    add(`Complete next step (${publicPriorityFromText(options.nextStep, "P2")})`, options.nextStep);
+  }
+  // Routine advice never becomes a merge blocker; a step that deduplicates against
+  // an existing item still counts as represented remediation.
+  let ratingRemediationRepresented = false;
+  for (const step of options.requiredRatingSteps) {
+    if (isRoutineBeforeMergeStep(step) || isRoutineCiOrReviewText(step)) continue;
+    const cleanStep = sentence(stripPriorityPrefix(step));
+    if (!cleanStep || /^none[.!]?$/i.test(cleanStep) || isReportNoneList(cleanStep)) continue;
+    ratingRemediationRepresented = true;
+    add("Improve patch quality", step);
+  }
+  // A blocked patch rating must always leave a concrete follow-up, even when the
+  // rating supplied no usable next steps and no typed findings explain the block.
+  if (
+    options.patchQualityBlocked &&
+    !ratingRemediationRepresented &&
+    options.findings.length === 0 &&
+    options.securityReview.concerns.length === 0
+  ) {
+    add(
+      "Improve patch quality",
+      "Address the low patch-quality rating before merge; see the review scores for what is holding it back.",
+    );
+  }
+
+  return items;
+}
+
+// Checklist entries are list items, not table cells; only flatten newlines so
+// downstream consumers of the checklist see command/path text unaltered.
+function publicChecklistText(value: string): string {
+  // Flatten line breaks (with their surrounding layout indentation) only; interior
+  // runs of spaces inside commands, quoted arguments, and paths stay exact.
+  return value
+    .replace(/<(?=[a-z/!?])/gi, "&lt;")
+    .replace(/[ \t]*(?:\r?\n|\r)+[ \t]*/g, " ")
+    .trim();
+}
+
+// Labels are wrapped in renderer-owned bold markers, so Markdown delimiters inside
+// report-provided titles must be escaped or they would break the bold span and the
+// downstream label-stripping parsers.
+function publicChecklistLabel(value: string): string {
+  return publicChecklistText(value)
+    .replace(/\\/g, "\\\\")
+    .replace(/([*_`[\]])/g, "\\$1");
+}
+
+function publicBeforeMergeBlock(items: readonly PublicBeforeMergeItem[]): string {
+  if (items.length === 0) return "None.";
+  return items
+    .map(
+      (item) =>
+        `- [ ] **${publicChecklistLabel(item.label)}** - ${publicChecklistText(item.detail)}`,
+    )
+    .join("\n");
+}
+
 function publicRootCauseClusterBlock(cluster: RootCauseClusterAssessment | undefined): string {
   if (
     !cluster ||
@@ -18547,22 +19015,6 @@ function publicSummaryBody(summaryLine: string, reproductionAssessment: string):
     .join("\n\n");
 }
 
-function publicPrSummaryBody(
-  summaryLine: string,
-  reproductionAssessment: string,
-  prSurfaceSummary: string,
-  reviewedHeadSha: string,
-): string {
-  return [
-    summaryLine,
-    prSurfaceSummary ? `PR surface: ${prSurfaceSummary}` : "",
-    reviewedHeadSha ? `Reviewed head: \`${reviewedHeadSha}\`` : "",
-    publicReproducibilityLine(reproductionAssessment),
-  ]
-    .filter(Boolean)
-    .join("\n\n");
-}
-
 function publicMergeRiskLine(
   risks: string,
   nextStepLine: string,
@@ -18575,12 +19027,7 @@ function publicMergeRiskLine(
   const choices = options.length
     ? mergeRiskOptionsLines(options)
     : mergeRiskFallbackOptionsLines(bestSolutionLine, nextStepLine);
-  return [
-    publicRiskBulletsFromText(risks, "P1"),
-    choices.length ? ["", "**Maintainer options:**", ...choices].join("\n") : "",
-  ]
-    .filter(Boolean)
-    .join("\n");
+  return choices.length ? ["**Maintainer options:**", ...choices].join("\n") : "";
 }
 
 function mergeRiskFallbackOptionsLines(bestSolutionLine: string, nextStepLine: string): string[] {
@@ -18711,25 +19158,131 @@ function appendReviewQuestionDetails(
   }
 }
 
-function reviewWorkflowCallout(): string[] {
+function reviewWorkflowLines(): string[] {
   return [
-    collapsedDetailsBlock("How this review workflow works", [
-      "- ClawSweeper keeps one durable marker-backed review comment per issue or PR.",
-      "- Re-runs edit this comment so the latest verdict, findings, and automation markers stay together instead of adding duplicate bot comments.",
-      "- A fresh review can be triggered by eligible `@clawsweeper re-review` comments, exact-item GitHub events, scheduled/background review runs, or manual workflow dispatch.",
-      "- PR/issue authors and users with repository write access can comment `@clawsweeper re-review` or `@clawsweeper re-run` on an open PR or issue to request a fresh review only.",
-      "- Maintainers can also comment `@clawsweeper review` to request a fresh review only.",
-      "- Fresh-review commands do not start repair, autofix, rebase, CI repair, or automerge.",
-      "- Maintainer-only repair and merge flows require explicit commands such as `@clawsweeper autofix`, `@clawsweeper automerge`, `@clawsweeper fix ci`, or `@clawsweeper address review`.",
-      "- Maintainers can comment `@clawsweeper explain` to ask for more context, or `@clawsweeper stop` to stop active automation.",
-    ]),
-    "",
+    "- ClawSweeper keeps one durable marker-backed review comment per issue or PR.",
+    "- Re-runs edit this comment so the latest verdict, findings, and automation markers stay together instead of adding duplicate bot comments.",
+    "- A fresh review can be triggered by eligible `@clawsweeper re-review` comments, exact-item GitHub events, scheduled/background review runs, or manual workflow dispatch.",
+    "- PR/issue authors and users with repository write access can comment `@clawsweeper re-review` or `@clawsweeper re-run` on an open PR or issue to request a fresh review only.",
+    "- Maintainers can also comment `@clawsweeper review` to request a fresh review only.",
+    "- Fresh-review commands do not start repair, autofix, rebase, CI repair, or automerge.",
+    "- Maintainer-only repair and merge flows require explicit commands such as `@clawsweeper autofix`, `@clawsweeper automerge`, `@clawsweeper fix ci`, or `@clawsweeper address review`.",
+    "- Maintainers can comment `@clawsweeper explain` to ask for more context, or `@clawsweeper stop` to stop active automation.",
   ];
+}
+
+function reviewWorkflowCallout(): string[] {
+  return [collapsedDetailsBlock("How this review workflow works", reviewWorkflowLines()), ""];
 }
 
 function reviewFreshnessText(markdown: string): string {
   const timestamp = formatReviewFreshnessTimestamp(frontMatterValue(markdown, "reviewed_at"));
   return timestamp ? ` _Reviewed ${timestamp}._` : "";
+}
+
+const REVIEW_HISTORY_RENDER_SLOT = "CLAWSWEEPER_REVIEW_HISTORY_RENDER_SLOT";
+
+const OWNED_REVIEW_SECTION_HEADINGS = new Set([
+  "summary",
+  "what this changes",
+  "merge readiness",
+  "review scores",
+  "verification",
+  "how this fits together",
+  "decision needed",
+  "before merge",
+  "next step",
+  "next step before merge",
+  "automerge follow-up",
+  "autofix follow-up",
+  "findings",
+  "review findings",
+  "security",
+  "label changes",
+]);
+
+// Model-generated text is rendered above renderer-owned sections such as
+// "## Before merge", and downstream routing extracts those sections from the first
+// matching Markdown heading. Escape heading-shaped lines in model text so injected
+// content can never spoof a renderer-owned section boundary.
+function neutralizeOwnedSectionSpoofing(value: string): string {
+  // GitHub normalizes CRLF and bare CR to line endings, so normalize first or a
+  // bare-CR line break could smuggle a heading past the per-line checks.
+  return value
+    .replace(/\r\n?/g, "\n")
+    .split("\n")
+    .map((line) => {
+      // Strip blockquote/list container prefixes so nested heading constructs are
+      // neutralized too.
+      // CommonMark accepts blockquotes without a following space and ordered lists
+      // with either "1." or "1)".
+      const containerPrefix =
+        line.match(/^[ \t]*(?:(?:>|(?:[-*+]|\d+[.)])[ \t])[ \t]*)*/)?.[0] ?? "";
+      // Escape every raw HTML delimiter (renderer-emitted <br> excepted) so inline
+      // tags and comment openers cannot restructure or hide trusted sections;
+      // &lt; renders identically to a literal <.
+      const content = line.slice(containerPrefix.length).replace(/<(?!br\s*\/?>)/gi, "&lt;");
+      const trimmed = content.trim();
+      if (/^#{1,6}\s+\S/.test(trimmed)) {
+        return `${containerPrefix}${content.replace("#", "\\#")}`;
+      }
+      if (/^\*\*[^*\n]+\*\*:?\s*$/.test(trimmed)) {
+        return `${containerPrefix}${content.replace("**", "\\*\\*")}`;
+      }
+      if (/^(?:```|~~~)/.test(trimmed)) {
+        return `${containerPrefix}${content.replace(/[`~]/, "\\$&")}`;
+      }
+      // A run of = or - alone on a line is a Setext underline that would promote the
+      // previous line to a heading.
+      if (/^(?:=+|-+)[ \t]*$/.test(trimmed)) {
+        return `${containerPrefix}${content.replace(/[=-]/, "\\$&")}`;
+      }
+      if (
+        trimmed.endsWith(":") &&
+        OWNED_REVIEW_SECTION_HEADINGS.has(trimmed.slice(0, -1).trim().toLowerCase())
+      ) {
+        return `${containerPrefix}${content.trimEnd().slice(0, -1)}&#58;`;
+      }
+      return `${containerPrefix}${content}`;
+    })
+    .join("\n");
+}
+
+// The review prompt and schema require Mermaid flowchart source with no code fences,
+// click directives, URLs, HTML, or initialization/styling directives. The diagram is
+// model output that crosses into a trusted bot comment, so enforce that allowlist
+// here and drop the diagram entirely when it does not comply.
+function sanitizeArchitectureDiagram(value: string): string {
+  const diagram = value.trim();
+  if (!diagram || diagram.length > 4000) return "";
+  if (!/^flowchart\b/i.test(diagram)) return "";
+  // No fence-breaking backticks, node metadata (image/icon nodes), HTML tags, init
+  // directives, or URLs of any form, including scheme-relative and data: URLs.
+  if (diagram.includes("`") || diagram.includes("~~~") || diagram.includes("@{")) return "";
+  if (/<[a-z!/]/i.test(diagram)) return "";
+  // Heading-shaped lines could terminate the report section the diagram is
+  // serialized into; Mermaid flowcharts never need a leading #.
+  if (/^[ \t]*#/m.test(diagram)) return "";
+  if (/%%\{/.test(diagram)) return "";
+  if (diagram.includes("//")) return "";
+  // Require a non-space after the colon so human-readable labels such as
+  // "Data: PR input" are not mistaken for data:/file: URLs.
+  if (/\b(?:data|javascript|vbscript|https?|ftp|file|blob|mailto):\S/i.test(diagram)) return "";
+  // The declaration line must be exactly "flowchart <direction>" so no further
+  // statement can hide after it on the same line.
+  const declarationLine = diagram.split(/\r?\n/, 1)[0] ?? "";
+  if (!/^flowchart[ \t]+(?:LR|RL|TB|BT|TD)[ \t]*;?[ \t]*$/i.test(declarationLine)) return "";
+  // Interaction and styling directives start a statement (newline- or
+  // semicolon-separated); the same words are fine inside human-readable node labels.
+  for (const statement of diagram.split(/[;\r\n]+/)) {
+    if (/^\s*(?:click|style|classDef|class|linkStyle)\b/i.test(statement)) return "";
+  }
+  // Directive shapes are also rejected mid-line, where Mermaid can begin a new
+  // statement without a separator.
+  if (/\bclick[ \t]+[\w-]+[ \t]+(?:href|call)\b/i.test(diagram)) return "";
+  if (/\b(?:style|linkStyle)[ \t]+[\w-]+[ \t]+[\w-]+[ \t]*:/i.test(diagram)) return "";
+  if (/\bclassDef[ \t]+[\w-]+[ \t]+[\w-]+[ \t]*:/i.test(diagram)) return "";
+  return diagram;
 }
 
 function reviewHistoryForRender(
@@ -18761,7 +19314,11 @@ function renderKeepOpenCommentFromReport(
   markdown: string,
   options: ReviewCommentRenderOptions = {},
 ): string {
-  const evidence = reportEvidence(markdown).slice(0, 6).map(closeEvidenceLine);
+  // Keep the full list for verification counts; only the rendered evidence list is
+  // abbreviated.
+  const allEvidenceEntries = reportEvidence(markdown);
+  const evidenceEntries = allEvidenceEntries.slice(0, 6);
+  const evidence = evidenceEntries.map(closeEvidenceLine);
   const likelyOwners = reportLikelyOwners(markdown).slice(0, 5).map(likelyOwnerLine);
   const reviewFindings = reportReviewFindings(markdown);
   const securityReview = reportSecurityReview(markdown);
@@ -18772,6 +19329,12 @@ function renderKeepOpenCommentFromReport(
   const rootCauseCluster = reportRootCauseCluster(markdown);
   const summary = reviewSectionValue(markdown, "summary");
   const changeSummary = reviewSectionValue(markdown, "changeSummary");
+  const systemContext = neutralizeOwnedSectionSpoofing(
+    reviewSectionValue(markdown, "systemContext"),
+  );
+  const architectureDiagram = sanitizeArchitectureDiagram(
+    reviewSectionValue(markdown, "architectureDiagram"),
+  );
   const bestSolution = reviewSectionValue(markdown, "bestSolution");
   const reproductionAssessment = reviewSectionValue(markdown, "reproductionAssessment");
   const solutionAssessment = reviewSectionValue(markdown, "solutionAssessment");
@@ -18791,11 +19354,15 @@ function renderKeepOpenCommentFromReport(
   const isRepairLoopPass = isPullRequest && Boolean(repairLoopPassModeFromReport(markdown));
   const hasRealBehaviorProofBlocker =
     isPullRequest && !reviewFailed && realBehaviorProofBlocksMerge(markdown);
-  const summaryLine = sentence(summary) || "_No summary provided._";
-  const changeSummaryLine = sentence(changeSummary || summary) || "_No change summary provided._";
+  const summaryLine = neutralizeOwnedSectionSpoofing(sentence(summary)) || "_No summary provided._";
+  const changeSummaryLine =
+    neutralizeOwnedSectionSpoofing(sentence(changeSummary || summary)) ||
+    "_No change summary provided._";
   const fallbackNextStep =
     "Continue tracking this item until the missing behavior is implemented or a maintainer decides the product direction.";
-  const nextStepLine = sentence(workReason || bestSolution || fallbackNextStep);
+  const nextStepLine = sentence(
+    workReason || bestSolution || (isPullRequest ? "" : fallbackNextStep),
+  );
   const publicNextStepLine = isPullRequest
     ? hasRealBehaviorProofBlocker
       ? publicPriorityBulletFromText(nextStepLine, "P1")
@@ -18808,6 +19375,7 @@ function renderKeepOpenCommentFromReport(
   const reviewDetails: string[] = [];
   const labelDetails: string[] = [];
   const evidenceDetails: string[] = [];
+  const triagePriority = triagePriorityFromReport(markdown);
   const hasReviewFindings = isPullRequest && reviewFindings.length > 0;
   const verdictLine = reviewFailed
     ? "ClawSweeper review: did not complete due to Codex infrastructure failure."
@@ -18824,73 +19392,20 @@ function renderKeepOpenCommentFromReport(
               : "Codex review: keeping this open for maintainer follow-up; there is still a little grit to resolve.";
   const lines = [`${verdictLine}${reviewFreshnessText(markdown)}`, ""];
   const prSurface = renderOpenClawPrSurfaceFromReport(markdown);
-  const prSurfaceSummary = prSurface.split("\n\n", 1)[0]?.trim() ?? "";
-  if (prSurface) evidenceDetails.push("PR surface:", "", prSurface);
-  if (isPullRequest) {
-    appendPublicSection(
-      lines,
-      "Summary",
-      publicPrSummaryBody(
-        changeSummaryLine,
-        reproductionAssessment,
-        prSurfaceSummary,
-        pullHeadShaFromReport(markdown) ?? "",
-      ),
-    );
-    lines.push(renderReviewMetricsDigest(reviewMetrics), "");
-    const dataModelWarning = renderDataModelWarningFromReport(markdown);
-    if (dataModelWarning) appendPublicSection(lines, "Stored data model", dataModelWarning);
-  } else {
-    appendPublicSection(lines, "Summary", publicSummaryBody(summaryLine, reproductionAssessment));
-  }
+  const dataModelWarning = renderDataModelWarningFromReport(markdown);
   const rootCauseClusterBlock = publicRootCauseClusterBlock(rootCauseCluster);
-  if (rootCauseClusterBlock) {
-    appendPublicSection(lines, "Root-cause cluster", rootCauseClusterBlock);
-  }
-  if (!isPullRequest) {
-    const reproductionHelp = issueReproductionHelpSuggestions(markdown);
-    if (reproductionHelp.length) {
-      appendPublicSection(
-        lines,
-        "Ways to help us reproduce this",
-        reproductionHelp.map((suggestion) => `- ${suggestion}`).join("\n"),
-      );
-    }
-  }
-  if (isPullRequest) {
-    appendPublicSection(
-      lines,
-      "Merge readiness",
-      reviewFailed
-        ? publicFailedReviewReadinessBlock(markdown)
-        : publicMergeReadinessBlock(prRating, realBehaviorProof),
-    );
-  }
   const mantisSuggestion = isPullRequest
     ? publicMantisRecommendationBlock(mantisRecommendation)
     : "";
-  if (mantisSuggestion) appendPublicSection(lines, "Mantis proof suggestion", mantisSuggestion);
   const unsupportedMantisSuggestion = isPullRequest
     ? publicNonDispatchableMantisRecommendationBlock(mantisRecommendation)
     : "";
-  if (unsupportedMantisSuggestion) {
-    appendPublicSection(lines, "Proof path suggestion", unsupportedMantisSuggestion);
-  }
-  if (mergeRiskLine) appendPublicSection(lines, "Risk before merge", mergeRiskLine);
-  appendPublicSection(
-    lines,
-    isPullRequest ? "Next step before merge" : "Next step",
-    publicNextStepLine,
+  // The decision rationale is model text rendered above owned sections; escape
+  // heading-shaped lines so it cannot spoof them.
+  const decisionPacketBlock = neutralizeOwnedSectionSpoofing(
+    renderDecisionPacketPublicBlock(markdown),
   );
-  const decisionPacketBlock = renderDecisionPacketPublicBlock(markdown);
-  if (decisionPacketBlock) {
-    appendPublicSection(lines, "Maintainer decision needed", decisionPacketBlock);
-  }
   const securityLine = publicSecurityReviewLine(securityReview);
-  if (securityLine) appendPublicSection(lines, "Security", securityLine);
-  if (isPullRequest && reviewFindings.length) {
-    lines.push("**Review findings**", ...reviewFindings.slice(0, 3).map(reviewFindingSummaryLine));
-  }
   if (bestSolutionLine && publicReviewTextDiffers(bestSolutionLine, nextStepLine)) {
     reviewDetails.push("Best possible solution:", "", bestSolutionLine);
   }
@@ -18978,17 +19493,174 @@ function renderKeepOpenCommentFromReport(
   }
   const reviewLine = closeReviewLineFromReport(markdown);
   if (reviewLine) reviewDetails.push(...(reviewDetails.length ? [""] : []), reviewLine);
-  const detailsBlock = collapsedDetailsBlock("Review details", reviewDetails);
-  if (detailsBlock) lines.push("", detailsBlock);
-  const labelDetailsBlock = collapsedDetailsBlock("Label changes", labelDetails);
-  if (labelDetailsBlock) lines.push("", labelDetailsBlock);
-  const evidenceDetailsBlock = collapsedDetailsBlock("Evidence reviewed", evidenceDetails);
-  if (evidenceDetailsBlock) lines.push("", evidenceDetailsBlock);
   const reviewHistoryBlock = renderReviewHistorySection(
     reviewHistoryForRender(markdown, options.previousReviewCommentBody),
   );
-  if (isPullRequest && !reviewFailed) lines.push("", publicRankDetailsBlock());
-  lines.push("", ...reviewWorkflowCallout());
+
+  if (isPullRequest) {
+    // When patch quality itself blocks readiness, the rating's remediation steps are
+    // required work, not optional rank-up advice.
+    const patchQualityBlocked =
+      !reviewFailed && (prRating.patchTier === "F" || prRating.patchTier === "D");
+    const beforeMergeItems = publicBeforeMergeItems({
+      reviewFailed,
+      proof: realBehaviorProof,
+      proofBlocked: hasRealBehaviorProofBlocker,
+      findings: reviewFindings,
+      securityReview,
+      risks,
+      nextStep: nextStepLine,
+      decisionPending: Boolean(decisionPacketBlock),
+      patchQualityBlocked,
+      requiredRatingSteps: patchQualityBlocked ? prRating.nextSteps : [],
+    });
+    lines.push("# ClawSweeper review", "");
+    appendHeadingSection(lines, "What this changes", changeSummaryLine);
+    appendHeadingSection(
+      lines,
+      "Merge readiness",
+      reviewFailed
+        ? publicFailedReviewReadinessBlock(markdown)
+        : publicMergeReadinessBlock(
+            prRating,
+            realBehaviorProof,
+            triagePriority,
+            summaryLine,
+            // An outstanding maintainer decision is remaining work even though it
+            // lives outside the checklist.
+            beforeMergeItems.length + (decisionPacketBlock ? 1 : 0),
+            Boolean(decisionPacketBlock),
+            pullHeadShaFromReport(markdown) ?? "",
+          ),
+    );
+    if (!reviewFailed) {
+      appendHeadingSection(
+        lines,
+        "Review scores",
+        publicReviewScoresBlock(prRating, realBehaviorProof, reviewFindings, securityReview),
+      );
+      appendHeadingSection(
+        lines,
+        "Verification",
+        publicVerificationBlock(
+          realBehaviorProof,
+          allEvidenceEntries,
+          reviewFindings,
+          securityReview,
+        ),
+      );
+    }
+    if (systemContext && architectureDiagram) {
+      appendHeadingSection(
+        lines,
+        "How this fits together",
+        `${systemContext}\n\n\`\`\`mermaid\n${architectureDiagram}\n\`\`\``,
+      );
+    }
+    if (decisionPacketBlock) {
+      appendHeadingSection(lines, "Decision needed", decisionPacketBlock);
+    }
+    appendHeadingSection(lines, "Before merge", publicBeforeMergeBlock(beforeMergeItems));
+    if (reviewFindings.length || securityReview.concerns.length) {
+      appendHeadingSection(
+        lines,
+        "Findings",
+        [
+          ...reviewFindings.slice(0, 3).map(reviewFindingSummaryLine),
+          ...securityReview.concerns.slice(0, 3).map(securityConcernSummaryLine),
+        ].join("\n"),
+      );
+    }
+
+    const agentDetails: string[] = ["### Security", "", securityLine || "None."];
+    if (prSurface) agentDetails.push("", "### PR surface", "", prSurface);
+    agentDetails.push("", "### Review metrics", "", renderReviewMetricsDigest(reviewMetrics));
+    if (dataModelWarning) {
+      agentDetails.push("", "### Stored data model", "", dataModelWarning);
+    }
+    if (rootCauseClusterBlock) {
+      agentDetails.push("", "### Root-cause cluster", "", rootCauseClusterBlock);
+    }
+    if (mantisSuggestion) {
+      agentDetails.push("", "### Mantis proof suggestion", "", mantisSuggestion);
+    }
+    if (unsupportedMantisSuggestion) {
+      agentDetails.push("", "### Proof path suggestion", "", unsupportedMantisSuggestion);
+    }
+    if (mergeRiskLine) {
+      // Routine risks are not counted as Before-merge work, so keep their text
+      // visible next to the maintainer options even when actionable risks coexist.
+      const riskBullets = !isReportNoneList(risks) ? publicRiskBulletsFromText(risks, "P1") : "";
+      const routineRiskContext = riskBullets
+        .split("\n")
+        .filter((line) => line.startsWith("- ") && !/^- \[P[0-2]\]/.test(line))
+        .join("\n");
+      agentDetails.push(
+        "",
+        "### Merge-risk options",
+        "",
+        ...(routineRiskContext ? [routineRiskContext, ""] : []),
+        mergeRiskLine,
+      );
+    }
+    if (reviewDetails.length) {
+      agentDetails.push("", "### Technical review", "", ...reviewDetails);
+    }
+    if (labelDetails.length) {
+      agentDetails.push("", "### Labels", "", ...labelDetails);
+    }
+    if (evidenceDetails.length) {
+      agentDetails.push("", "### Evidence", "", ...evidenceDetails);
+    }
+    const rankUpMoves = prRating.nextSteps
+      .map((step) => sentence(step))
+      .filter((step) => step && !isReportNoneList(step) && !/^none[.!]?$/i.test(step));
+    if (!reviewFailed && !patchQualityBlocked && rankUpMoves.length) {
+      agentDetails.push(
+        "",
+        "### Rank-up moves",
+        "",
+        "Optional improvements that raise the rating; they are not merge blockers.",
+        "",
+        rankUpMoves.map((step) => `- ${publicChecklistText(step)}`).join("\n"),
+      );
+    }
+    if (!reviewFailed) {
+      agentDetails.push("", "### Rating scale", "", publicRankDetailsBlock());
+    }
+    agentDetails.push("", "### Workflow", "", ...reviewWorkflowLines());
+    if (reviewHistoryBlock) {
+      agentDetails.push("", "### History", "", REVIEW_HISTORY_RENDER_SLOT);
+    }
+    lines.push("", collapsedDetailsBlock("<strong>Agent review details</strong>", agentDetails));
+  } else {
+    appendPublicSection(lines, "Summary", publicSummaryBody(summaryLine, reproductionAssessment));
+    if (rootCauseClusterBlock) {
+      appendPublicSection(lines, "Root-cause cluster", rootCauseClusterBlock);
+    }
+    const reproductionHelp = issueReproductionHelpSuggestions(markdown);
+    if (reproductionHelp.length) {
+      appendPublicSection(
+        lines,
+        "Ways to help us reproduce this",
+        reproductionHelp.map((suggestion) => `- ${suggestion}`).join("\n"),
+      );
+    }
+    if (decisionPacketBlock) {
+      appendPublicSection(lines, "Maintainer decision needed", decisionPacketBlock);
+    }
+    appendPublicSection(lines, "Next step", publicNextStepLine);
+    if (securityReview.status !== "not_applicable" || securityReview.concerns.length > 0) {
+      appendPublicSection(lines, "Security", securityLine);
+    }
+    const detailsBlock = collapsedDetailsBlock("Review details", reviewDetails);
+    if (detailsBlock) lines.push("", detailsBlock);
+    const labelDetailsBlock = collapsedDetailsBlock("Label changes", labelDetails);
+    if (labelDetailsBlock) lines.push("", labelDetailsBlock);
+    const evidenceDetailsBlock = collapsedDetailsBlock("Evidence reviewed", evidenceDetails);
+    if (evidenceDetailsBlock) lines.push("", evidenceDetailsBlock);
+    lines.push("", ...reviewWorkflowCallout());
+  }
   const publicBody = neutralizeReviewControlMarkers(
     sanitizePublicSelfReferences(
       lines.join("\n"),
@@ -18996,7 +19668,19 @@ function renderKeepOpenCommentFromReport(
       (frontMatterValue(markdown, "type") as ItemKind | undefined) ?? "issue",
     ),
   );
-  return reviewHistoryBlock ? `${publicBody.trimEnd()}\n\n${reviewHistoryBlock}\n` : publicBody;
+  if (!reviewHistoryBlock) return publicBody;
+  // Issues keep the pre-redesign trailing history block; only PRs moved it into the
+  // collapsed details slot.
+  if (!isPullRequest) return `${publicBody.trimEnd()}\n\n${reviewHistoryBlock}\n`;
+  // The slot is always the renderer-appended last occurrence; report text earlier in
+  // the body could mention the sentinel, and a plain replace would expand $-sequences.
+  const slotIndex = publicBody.lastIndexOf(REVIEW_HISTORY_RENDER_SLOT);
+  if (slotIndex < 0) return publicBody;
+  return (
+    publicBody.slice(0, slotIndex) +
+    reviewHistoryBlock +
+    publicBody.slice(slotIndex + REVIEW_HISTORY_RENDER_SLOT.length)
+  );
 }
 
 export function renderReviewCommentFromReport(
@@ -21783,6 +22467,14 @@ ${options.decision.summary}
 ## ${REVIEW_SECTIONS.changeSummary}
 
 ${options.decision.changeSummary}
+
+## ${REVIEW_SECTIONS.systemContext}
+
+${options.decision.systemContext}
+
+## ${REVIEW_SECTIONS.architectureDiagram}
+
+${options.decision.architectureDiagram}
 
 ## ${REVIEW_SECTIONS.bestSolution}
 

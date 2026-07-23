@@ -259,20 +259,89 @@ function hasNonStartedReviewStatusMarker(body: string): boolean {
   return false;
 }
 
+// Marks each line that is part of a fenced code block (including the delimiters) so
+// fenced model output such as the Mermaid diagram cannot fake section markers.
+function fencedLineStates(lines: readonly string[]): readonly boolean[] {
+  let fence: string | null = null;
+  return lines.map((raw) => {
+    const trimmed = raw.trim();
+    const delimiter = trimmed.match(/^(?:`{3,}|~{3,})/)?.[0];
+    if (delimiter) {
+      if (!fence) {
+        fence = delimiter;
+      } else if (
+        delimiter[0] === fence[0] &&
+        delimiter.length >= fence.length &&
+        trimmed.slice(delimiter.length).trim() === ""
+      ) {
+        fence = null;
+      }
+      return true;
+    }
+    return fence !== null;
+  });
+}
+
+// Depth of nested <details> per line (fenced lines keep the surrounding depth) so
+// collapsed agent details cannot be mistaken for top-level sections.
+function detailsDepthStates(
+  lines: readonly string[],
+  fenced: readonly boolean[],
+): readonly number[] {
+  let depth = 0;
+  return lines.map((raw, index) => {
+    const trimmed = raw.trim();
+    if (!fenced[index]) {
+      if (/^<details(?:\s|>)/i.test(trimmed)) depth += 1;
+      else if (/^<\/details>/i.test(trimmed)) depth = Math.max(0, depth - 1);
+    }
+    return depth;
+  });
+}
+
 function reviewFindingLines(lines: readonly string[]): readonly string[] {
-  const detailsStart = lines.findLastIndex((line) => line.trim() === "Full review comments:");
-  if (detailsStart >= 0) {
-    const detailsLines = lines.slice(detailsStart + 1);
-    const end = detailsLines.findIndex((line) =>
-      /^(?:Overall correctness:|<\/details>|<!--)/.test(line.trim()),
-    );
-    return end < 0 ? detailsLines : detailsLines.slice(0, end);
+  const fenced = fencedLineStates(lines);
+  const detailsDepth = detailsDepthStates(lines, fenced);
+  const collect = (start: number, boundary: RegExp): string[] => {
+    const section: string[] = [];
+    for (let index = start; index < lines.length; index += 1) {
+      const line = lines[index] ?? "";
+      if (fenced[index]) continue;
+      if (boundary.test(line.trim())) break;
+      section.push(line);
+    }
+    return section;
+  };
+  let detailsStart = -1;
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    if (!fenced[index] && (lines[index] ?? "").trim() === "Full review comments:") {
+      detailsStart = index;
+      break;
+    }
   }
-  const summaryStart = lines.findIndex((line) => line.trim() === "**Review findings**");
+  if (detailsStart >= 0) {
+    // Stop at later headings so subsequent detail subsections are never recorded as
+    // current findings when the Overall correctness delimiter is absent.
+    return collect(detailsStart + 1, /^(?:Overall correctness:|#{1,6}\s|<\/details>|<!--)/);
+  }
+  let summaryStart = -1;
+  for (let index = 0; index < lines.length; index += 1) {
+    const trimmed = (lines[index] ?? "").trim();
+    // Stop permanently at the first top-level details boundary: renderer-owned
+    // summary sections precede it, and collapsed model text could contain forged
+    // closing tags that would otherwise re-enter top level.
+    if (!fenced[index] && /^<details(?:\s|>)/i.test(trimmed)) break;
+    if (
+      !fenced[index] &&
+      detailsDepth[index] === 0 &&
+      ["**Review findings**", "## Findings"].includes(trimmed)
+    ) {
+      summaryStart = index;
+      break;
+    }
+  }
   if (summaryStart < 0) return [];
-  const summaryLines = lines.slice(summaryStart + 1);
-  const end = summaryLines.findIndex((line) => /^(?:\*\*|<details>|<!--)/.test(line.trim()));
-  return end < 0 ? summaryLines : summaryLines.slice(0, end);
+  return collect(summaryStart + 1, /^(?:\*\*|#{1,6}\s|<details>|<\/details>|<!--)/);
 }
 
 function commentBodyFindings(body: string): string[] {

@@ -52,6 +52,7 @@ import {
   existingCommandStatusBlocksReplay,
   existingModeStatusBlocksReplay,
   existingRepairLoopModeOutcome,
+  extractMarkdownSection,
   freshExactHeadReviewStartLease,
   isAuthorReadOnlyCommandAllowed,
   isMaintainerCommandAllowed,
@@ -75,6 +76,7 @@ import {
   reviewOnlyRepairLoopTerminalChecks,
   repairLoopPauseLabels,
   repairLoopStopPauseReason,
+  reviewSummaryFromCommentBody,
   reviewedHeadShaBlockReason,
   renderAutomergeJob,
   renderIssueImplementationJob,
@@ -442,6 +444,33 @@ async function measureAsync<T>(name: string, fn: () => Promise<T>): Promise<T> {
   }
 }
 
+function reviewFollowupFromCommentBody(body: JsonValue): string | null {
+  const beforeMerge = extractMarkdownSection(body, "Before merge");
+  if (beforeMerge) {
+    // A present Before merge section is authoritative: "None." and fully checked
+    // checklists mean no checklist follow-up, and legacy headings elsewhere in the
+    // comment (possibly model-injected) must not be consulted. A decision-only
+    // review still carries its maintainer question as the follow-up.
+    if (/^none[.!]?$/i.test(beforeMerge.trim())) {
+      return extractMarkdownSection(body, "Decision needed");
+    }
+    const lines = beforeMerge.split(/\r?\n/).map((line) => line.trim());
+    const tasks = lines.filter((line) => /^- \[[ xX]\]/.test(line));
+    if (tasks.length) {
+      return (
+        tasks.find((line) => line.startsWith("- [ ]")) ??
+        extractMarkdownSection(body, "Decision needed")
+      );
+    }
+    return beforeMerge;
+  }
+  return (
+    extractMarkdownSection(body, "Next step before merge") ??
+    extractMarkdownSection(body, "Automerge follow-up") ??
+    extractMarkdownSection(body, "Autofix follow-up")
+  );
+}
+
 function routedCommandForComment(comment: JsonValue): LooseRecord | null {
   const parsed: LooseRecord = parseRoutedCommentCommand(comment, { trustedAuthors: trustedBots });
   if (!parsed) return null;
@@ -479,13 +508,8 @@ function routedCommandForComment(comment: JsonValue): LooseRecord | null {
     trusted_bot_author: parsed.trusted_bot_author ?? null,
     automation_source: parsed.automation_source ?? null,
     repair_reason: parsed.repair_reason ?? null,
-    review_summary:
-      extractMarkdownSection(comment.body, "Summary") ??
-      extractMarkdownSection(comment.body, "What this changes"),
-    review_followup:
-      extractMarkdownSection(comment.body, "Next step before merge") ??
-      extractMarkdownSection(comment.body, "Automerge follow-up") ??
-      extractMarkdownSection(comment.body, "Autofix follow-up"),
+    review_summary: reviewSummaryFromCommentBody(comment.body),
+    review_followup: reviewFollowupFromCommentBody(comment.body),
     freeform_prompt: parsed.freeform_prompt ?? null,
     visual_lens: parsed.visual_lens ?? null,
     expected_head_sha: parsed.expected_head_sha ?? null,
@@ -4396,17 +4420,6 @@ function listCandidateComments() {
     durableComments: listRepairLoopReviewComments(),
     maxComments,
   });
-}
-
-function extractMarkdownSection(body: JsonValue, heading: string): string | null {
-  const text = String(body ?? "");
-  const pattern = new RegExp(
-    `(?:^|\\n)(?:\\*\\*${escapeRegExp(heading)}\\*\\*|${escapeRegExp(
-      heading,
-    )}:)\\s*\\n+([\\s\\S]*?)(?=\\n\\n(?:\\*\\*[^\\n*]{1,80}\\*\\*|[A-Z][^\\n:]{0,80}:\\n)|\\n<details>|\\n<!--|$)`,
-    "i",
-  );
-  return pattern.exec(text)?.[1]?.trim() || null;
 }
 
 function issueCommentsFor(number: JsonValue): JsonValue[] {

@@ -71,8 +71,12 @@ Full review comments:
 
   const comment = renderReviewCommentFromReport(report, "none");
 
-  assert.match(comment, /\*\*Merge readiness\*\*\nOverall: 🦀 challenger crab/);
-  assert.match(comment, /Proof: 🦀 challenger crab ✨ media proof bonus/);
+  assert.match(comment, /## Merge readiness/);
+  assert.match(comment, /\| \*\*Overall readiness\*\* \| 🦀 challenger crab \*\*\(6\/6\)\*\* \|/);
+  assert.match(
+    comment,
+    /\| \*\*Proof confidence\*\* \| 🦀 challenger crab \*\*\(6\/6\)\*\* ✨ media proof bonus \|/,
+  );
   assert.match(comment, /Shiny media proof means a screenshot, video, or linked artifact/);
   assert.doesNotMatch(comment, /Rank-up moves:/);
 });
@@ -127,8 +131,8 @@ Full review comments:
   const comment = renderReviewCommentFromReport(report, "none");
   const markers = reviewAutomationMarkersFromReport(report);
 
-  assert.match(comment, /\*\*Merge readiness\*\*/);
-  assert.match(comment, /Proof: 🌊 off-meta tidepool/);
+  assert.match(comment, /## Merge readiness/);
+  assert.match(comment, /\| \*\*Proof confidence\*\* \| 🌊 off-meta tidepool \|/);
   assert.match(markers, /clawsweeper-verdict:pass/);
   assert.doesNotMatch(markers, /clawsweeper-verdict:needs-human/);
 });
@@ -311,7 +315,7 @@ Full review comments:
   const markers = reviewAutomationMarkersFromReport(report);
 
   assert.match(comment, /Codex review: needs real behavior proof before merge\./);
-  assert.match(comment, /\*\*Merge readiness\*\*/);
+  assert.match(comment, /## Merge readiness/);
   assert.match(comment, /terminal screenshots, console output, copied live output/);
   assert.match(comment, /update the PR body; ClawSweeper should re-review automatically/);
   assert.match(comment, /@clawsweeper re-review/);
@@ -474,9 +478,9 @@ ${prRatingReportSection({
   assert.deepEqual(prRatingLabelsForTest([], decision.prRating.overallTier), [
     "rating: 🦞 diamond lobster",
   ]);
-  assert.match(comment, /Patch quality: 🦞 diamond lobster/);
-  assert.match(comment, /Result: ready for maintainer review\./);
-  assert.doesNotMatch(comment, /Result: blocked by patch quality or review findings\./);
+  assert.match(comment, /\| \*\*Patch quality\*\* \| 🦞 diamond lobster \*\*\(5\/6\)\*\* \|/);
+  assert.match(comment, /✅ \*\*Ready for maintainer review\*\*/);
+  assert.doesNotMatch(comment, /Blocked by patch quality or review findings\./);
   assert.doesNotMatch(comment, /Add changelog entry/i);
 });
 
@@ -637,10 +641,8 @@ Full review comments:
   );
 
   assert.match(comment, /Codex review: passed\./);
-  assert.match(
-    comment,
-    /\*\*Next step before merge\*\*\n- Leave this draft open after fixes are complete\./,
-  );
+  // Explanatory routing prose is not remaining merge work.
+  assert.match(comment, /## Before merge\n\nNone\./);
   assert.doesNotMatch(comment, /\[P2\] Leave this draft open after fixes are complete/);
   assert.doesNotMatch(comment, /Autofix follow-up:/);
   assert.match(comment, /<!-- clawsweeper-verdict:pass item=74610 sha=abc123def456/);
@@ -689,7 +691,7 @@ Full review comments:
   const markers = reviewAutomationMarkersFromReport(report);
 
   assert.match(comment, /Codex review: needs changes before merge\./);
-  assert.match(comment, /\*\*Review findings\*\*/);
+  assert.match(comment, /## Findings/);
   assert.doesNotMatch(comment, /clawsweeper-verdict:pass/);
   assert.match(markers, /clawsweeper-verdict:needs-changes/);
   assert.match(markers, /clawsweeper-action:fix-required/);

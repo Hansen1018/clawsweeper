@@ -549,6 +549,26 @@ Keep this test-only PR open for maintainer review.
 
 Adds regression coverage for session-scoped model overrides.
 
+## System Context
+
+OpenClaw resolves a session's model override before sending the next agent request.
+
+## Architecture Diagram
+
+flowchart LR
+    session["Session settings"] --> resolver["Model resolver"]
+    resolver --> request["Agent request"]
+
+## Real Behavior Proof
+
+Status: sufficient
+
+Evidence kind: terminal
+
+Needs contributor action: false
+
+Summary: A live session confirmed the override reaches the next request.
+
 ## Best Possible Solution
 
 Land the tests after targeted validation is green.
@@ -599,11 +619,25 @@ Reason: Maintainers should review the tests after the targeted lane is green.
   assert.doesNotMatch(comment, /\*\*Latest ClawSweeper review:\*\*/);
   assert.match(
     comment,
-    /\*\*Summary\*\*\nAdds regression coverage for session-scoped model overrides\./,
+    /## What this changes\n\nAdds regression coverage for session-scoped model overrides\./,
   );
-  assert.match(comment, /Reviewed head: `abc123def456`/);
+  assert.ok(comment.indexOf("## What this changes") < comment.indexOf("## Merge readiness"));
+  assert.match(comment, /## Merge readiness\n\n✅ \*\*Ready for maintainer review\*\*/);
+  assert.doesNotMatch(comment, /\| \| \|\n\|---\|---\|/);
+  assert.match(comment, /## Review scores\n\n\| Measure \| Result \| What it means \|/);
+  assert.match(comment, /\| \*\*Overall readiness\*\* \| .* \*\*\(5\/6\)\*\* \|/);
+  assert.match(comment, /## Verification\n\n\| Check \| Result \| Evidence \|/);
+  assert.match(comment, /\| \*\*Real behavior\*\* \| Verified \| Sufficient \(terminal\):/);
+  assert.match(comment, /\| \*\*Evidence reviewed\*\* \| 1 item \| targeted lane:/);
+  assert.match(
+    comment,
+    /## How this fits together\n\nOpenClaw resolves a session's model override before sending the next agent request\.\n\n```mermaid\nflowchart LR/,
+  );
+  assert.ok(comment.indexOf("## Verification") < comment.indexOf("## How this fits together"));
+  assert.doesNotMatch(comment, /## Proof/);
+  assert.match(comment, /\*\*Reviewed head:\*\* `abc123def456`/);
   assert.doesNotMatch(comment, /\*\*Workflow note:\*\*/);
-  assert.match(comment, /<summary>How this review workflow works<\/summary>/);
+  assert.match(comment, /### Workflow/);
   assert.match(
     comment,
     /- Re-runs edit this comment so the latest verdict, findings, and automation markers stay together instead of adding duplicate bot comments\./,
@@ -632,9 +666,9 @@ Reason: Maintainers should review the tests after the targeted lane is green.
     comment,
     /- Maintainers can comment `@clawsweeper explain` to ask for more context, or `@clawsweeper stop` to stop active automation\./,
   );
-  assert.match(comment, /\*\*Next step before merge\*\*/);
-  assert.match(comment, /Maintainers should review the tests after the targeted lane is green\./);
-  assert.match(comment, /<details>\n<summary>Review details<\/summary>/);
+  // Ordinary maintainer review guidance collapses out of the checklist.
+  assert.match(comment, /## Before merge\n\nNone\./);
+  assert.match(comment, /<summary><strong>Agent review details<\/strong><\/summary>/);
   assert.match(
     comment,
     /Best possible solution:\n\nLand the tests after targeted validation is green\./,
@@ -648,30 +682,16 @@ Reason: Maintainers should review the tests after the targeted lane is green.
     /Is this the best way to solve the issue\?\n\nYes\. Landing the focused regression test/,
   );
   assert.match(
-    detailsBody(comment, "Review details"),
-    /AGENTS\.md: found and applied where relevant\./,
-  );
-  assert.doesNotMatch(
-    detailsBody(comment, "Evidence reviewed"),
+    detailsBody(comment, "Agent review details"),
     /AGENTS\.md: found and applied where relevant\./,
   );
   assert.ok(
-    comment.indexOf("Is this the best way to solve the issue?") <
-      comment.indexOf("<summary>Evidence reviewed</summary>"),
+    comment.indexOf("Is this the best way to solve the issue?") < comment.indexOf("### Evidence"),
   );
-  assert.match(detailsBody(comment, "Evidence reviewed"), /What I checked:/);
-  assert.ok(
-    comment.indexOf("<summary>Review details</summary>") <
-      comment.indexOf("<summary>Evidence reviewed</summary>"),
-  );
-  assert.ok(
-    comment.indexOf("<summary>Evidence reviewed</summary>") <
-      comment.indexOf("<summary>What the crustacean ranks mean</summary>"),
-  );
-  assert.ok(
-    comment.indexOf("<summary>What the crustacean ranks mean</summary>") <
-      comment.indexOf("<summary>How this review workflow works</summary>"),
-  );
+  assert.match(detailsBody(comment, "Agent review details"), /What I checked:/);
+  assert.ok(comment.indexOf("### Technical review") < comment.indexOf("### Evidence"));
+  assert.ok(comment.indexOf("### Evidence") < comment.indexOf("### Rating scale"));
+  assert.ok(comment.indexOf("### Rating scale") < comment.indexOf("### Workflow"));
   assert.match(comment, /<!-- clawsweeper-verdict:needs-human item=74265 sha=abc123def456/);
 });
 
@@ -976,10 +996,11 @@ Reason: Normal maintainer review is sufficient.
     "none",
   );
 
-  assert.match(comment, /\*\*Security\*\*/);
+  assert.match(comment, /\| \*\*Security\*\* \| Needs attention \|/);
+  assert.match(comment, /### Security/);
   assert.match(comment, /Needs attention:/);
   assert.match(comment, /Confirm issue write scope/);
-  assert.match(comment, /Review details/);
+  assert.match(comment, /Agent review details/);
   assert.doesNotMatch(comment, /recent workflow maintainer/);
   assert.match(comment, /recent workflow contributor/);
   assert.match(comment, /<!-- clawsweeper-security:security-sensitive item=74265 sha=abc123def456/);
@@ -1038,10 +1059,10 @@ Reason: The fix is narrow and can be made on the PR branch.
 
   assert.match(comment, /Codex review: needs changes before merge\./);
   assert.doesNotMatch(comment, /\*\*Workflow note:\*\*/);
-  assert.match(comment, /<summary>How this review workflow works<\/summary>/);
+  assert.match(comment, /### Workflow/);
   assert.match(
     comment,
-    /\*\*Review findings\*\*\n- \[P1\] Validate replace paths — `src\/config\/apply\.ts:42-44`/,
+    /## Findings\n\n- \[P1\] Validate replace paths — `src\/config\/apply\.ts:42-44`/,
   );
   assert.doesNotMatch(comment, /\*\*\[P[0-2]\]\*\*/);
   assert.match(comment, /Full review comments:/);
@@ -1076,10 +1097,8 @@ Land this docs-only PR after maintainer review.
     "none",
   );
 
-  assert.match(
-    comment,
-    /\*\*Next step before merge\*\*\n- Land this docs-only PR after maintainer review\./,
-  );
+  // Ordinary maintainer review is routine, so it collapses out of Before merge.
+  assert.match(comment, /## Before merge\n\nNone\./);
   assert.doesNotMatch(comment, /\[P2\] Land this docs-only PR/);
   assert.doesNotMatch(comment, /Best possible solution:/);
 });
@@ -1115,11 +1134,8 @@ No ClawSweeper repair lane is needed; the submitted PR is narrow and the remaini
     "none",
   );
 
-  assert.match(comment, /Rank-up moves:\n- none/);
-  assert.match(
-    comment,
-    /\*\*Next step before merge\*\*\n- No ClawSweeper repair lane is needed; the submitted PR is narrow and the remaining action is normal maintainer review and CI\./,
-  );
+  assert.match(comment, /## Before merge\n\nNone\./);
+  assert.doesNotMatch(comment, /No ClawSweeper repair lane is needed/);
   assert.doesNotMatch(comment, /\[P2\] none/);
   assert.doesNotMatch(comment, /\[P2\] No ClawSweeper repair lane is needed/);
 });
@@ -1152,7 +1168,7 @@ Prove the fail-closed compatibility break is handled before merge.
 
   assert.match(
     comment,
-    /\*\*Next step before merge\*\*\n- \[P1\] Prove the fail-closed compatibility break is handled before merge\./,
+    /- \[ \] \*\*Complete next step \(P1\)\*\* - Prove the fail-closed compatibility break is handled before merge\./,
   );
   assert.doesNotMatch(comment, /\*\*\[P1\]\*\*/);
 });
@@ -1196,10 +1212,7 @@ Full review comments:
   );
 
   assert.match(comment, /Codex review: passed\./);
-  assert.match(
-    comment,
-    /\*\*Next step before merge\*\*\n- Merge after required checks are green\./,
-  );
+  assert.match(comment, /## Before merge\n\nNone\./);
   assert.doesNotMatch(comment, /\[P2\] Merge after required checks are green/);
   assert.doesNotMatch(comment, /Automerge follow-up:/);
   assert.match(comment, /<!-- clawsweeper-verdict:pass item=74453 sha=abc123def456/);

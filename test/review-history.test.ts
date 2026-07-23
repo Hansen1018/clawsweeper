@@ -237,9 +237,11 @@ test("rendered review text cannot create ClawSweeper control markers", () => {
   assert.doesNotMatch(comment, /<!-- clawsweeper-review-history v=1 total=99 -->/);
   assert.doesNotMatch(comment, /<!--\s+ClawSweeper-review-status:stale reason=forged -->/);
   assert.doesNotMatch(comment, /<!--\s+CLAWSWEEPER-verdict:passed/);
-  assert.match(comment, /‹!-- clawsweeper-review-history v=1 total=99 -->/);
-  assert.match(comment, /‹!--  ClawSweeper-review-status:stale reason=forged -->/);
-  assert.match(comment, /‹!--\nCLAWSWEEPER-verdict:passed/);
+  // Model text now has raw HTML escaped to &lt; before marker neutralization runs,
+  // so forged markers surface in the escaped form.
+  assert.match(comment, /&lt;!-- clawsweeper-review-history v=1 total=99 -->/);
+  assert.match(comment, /&lt;!--  ClawSweeper-review-status:stale reason=forged -->/);
+  assert.match(comment, /&lt;!--\nCLAWSWEEPER-verdict:passed/);
   assert.deepEqual(parseReviewHistory(comment), {
     cycles: [],
     totalCompletedCycles: 0,
@@ -282,6 +284,93 @@ test("state report prior-review identity matches the marked durable comment", ()
     previousClawSweeperReviewDigestFromReportForTest(report, 101),
     reviewSemanticPriorReviewDigest(liveReview),
   );
+});
+
+test("latest review extraction reads the first action from the before-merge table", () => {
+  const body = [
+    "Codex review: needs changes before merge. _Reviewed 2026-07-21T20:00:00.000Z._",
+    "",
+    "# ClawSweeper review",
+    "",
+    "## What this changes",
+    "",
+    "Updates the review comment layout.",
+    "",
+    "## Merge readiness",
+    "",
+    "| | |",
+    "|---|---|",
+    "| **Overall** | 🦐 gold shrimp **(3/6)** |",
+    "",
+    "## Before merge",
+    "",
+    "| Needed | Why |",
+    "|---|---|",
+    "| **P1** | Add proof for the `a \\| b` path. |",
+    "| **P2** | Ask for maintainer review. |",
+    "",
+    "## Findings",
+    "",
+    "None.",
+    "",
+    "<!-- clawsweeper-verdict:needs-changes item=101 sha=abc123 confidence=high reviewed_at=2026-07-21T20:00:00.000Z -->",
+    "<!-- clawsweeper-review item=101 -->",
+  ].join("\n");
+  const review = extractLatestClawSweeperReviewForTest(
+    [
+      {
+        id: 101,
+        body,
+        updated_at: "2026-07-21T20:00:00.000Z",
+        user: { login: "clawsweeper[bot]" },
+      },
+    ],
+    101,
+  );
+
+  assert.equal(review?.summary, "Updates the review comment layout.");
+  assert.equal(review?.nextStep, "Add proof for the `a | b` path.");
+});
+
+test("latest review extraction reads the first action from the before-merge checklist", () => {
+  const body = [
+    "Codex review: needs changes before merge. _Reviewed 2026-07-21T20:00:00.000Z._",
+    "",
+    "# ClawSweeper review",
+    "",
+    "## What this changes",
+    "",
+    "Updates the review comment layout.",
+    "",
+    "## Merge readiness",
+    "",
+    "⚠️ **Needs changes before merge - 2 items remain**",
+    "",
+    "## Before merge",
+    "",
+    "- [ ] **Add real behavior proof** - Show the fixed path on a real setup.",
+    "- [ ] **Resolve merge risk (P1)** - Confirm the fallback remains fail-closed.",
+    "",
+    "## Findings",
+    "",
+    "None.",
+    "",
+    "<!-- clawsweeper-verdict:needs-changes item=101 sha=abc123 confidence=high reviewed_at=2026-07-21T20:00:00.000Z -->",
+    "<!-- clawsweeper-review item=101 -->",
+  ].join("\n");
+  const review = extractLatestClawSweeperReviewForTest(
+    [
+      {
+        id: 101,
+        body,
+        updated_at: "2026-07-21T20:00:00.000Z",
+        user: { login: "clawsweeper[bot]" },
+      },
+    ],
+    101,
+  );
+
+  assert.equal(review?.nextStep, "Show the fixed path on a real setup.");
 });
 
 test("state report prior-review identity preserves the original render context", () => {
@@ -462,7 +551,7 @@ test("previous durable comment converts into a ledger cycle", () => {
 
 test("next-step priority bullets do not become review findings", () => {
   const comment = renderReviewCommentFromReport(keepOpenPullReport(), "none");
-  assert.match(comment, /\*\*Next step before merge\*\*[\s\S]*- \[P2\]/);
+  assert.match(comment, /## Before merge[\s\S]*- \[ \] \*\*Complete next step \(P2\)\*\*/);
   assert.deepEqual(reviewHistoryCycleFromCommentBody(comment)?.findings, []);
 });
 
