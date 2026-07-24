@@ -9873,7 +9873,7 @@ type MediaProofCommandRunner = (
   error?: Error;
 };
 
-const IMAGE_PROOF_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".webp", ".gif"]);
+const IMAGE_PROOF_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".webp", ".gif", ".avif", ".bmp"]);
 const VIDEO_PROOF_EXTENSIONS = new Set([".mov", ".mp4", ".m4v", ".webm", ".avi", ".mkv"]);
 const MEDIA_PROOF_EXTENSIONS = new Set([...IMAGE_PROOF_EXTENSIONS, ...VIDEO_PROOF_EXTENSIONS]);
 const MEDIA_PROOF_MANIFEST_FILE = "media-proof-manifest.json";
