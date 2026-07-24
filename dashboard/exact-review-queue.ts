@@ -3006,7 +3006,7 @@ export class ExactReviewQueue {
         revision.targetKey,
         Math.max(newestByTarget.get(revision.targetKey) ?? 0, revision.sourceRevision),
       );
-      return [{ item, revision }];
+      return [{ item, revision, lineage: exactReviewPublicationLineage(item.decision) }];
     });
     for (const [targetKey, sourceRevision] of newestByTarget) {
       newestByTarget.set(
@@ -3014,23 +3014,119 @@ export class ExactReviewQueue {
         Math.max(sourceRevision, this.publicationHeadRevisionSync(targetKey)),
       );
     }
-    const candidates = versioned
-      .filter(
-        ({ item, revision }) =>
-          revision.sourceRevision < (newestByTarget.get(revision.targetKey) ?? 0) &&
-          (item.state === "pending" || item.state === "parked") &&
-          !activeBatchItemKeys.has(item.key),
-      )
-      .sort(
-        (left, right) =>
-          left.revision.targetKey.localeCompare(right.revision.targetKey) ||
-          left.revision.sourceRevision - right.revision.sourceRevision ||
-          left.item.key.localeCompare(right.item.key),
-      );
+
+    type ReconcileCandidate = {
+      item: ExactReviewQueueItem;
+      revision: { targetKey: string; sourceRevision: number };
+      reason: "stale_revision" | "duplicate_lineage";
+      lineage: ExactReviewPublicationLineage | null;
+      lineageKey?: string;
+      retainedKey?: string;
+    };
+    const candidatesByKey = new Map<string, ReconcileCandidate>();
+    for (const entry of versioned) {
+      if (
+        entry.revision.sourceRevision < (newestByTarget.get(entry.revision.targetKey) ?? 0) &&
+        (entry.item.state === "pending" || entry.item.state === "parked") &&
+        !activeBatchItemKeys.has(entry.item.key)
+      ) {
+        candidatesByKey.set(entry.item.key, {
+          ...entry,
+          reason: "stale_revision",
+        });
+      }
+    }
+
+    const lineageGroups = new Map<string, typeof versioned>();
+    for (const entry of versioned) {
+      if (
+        !entry.lineage ||
+        entry.revision.sourceRevision < (newestByTarget.get(entry.revision.targetKey) ?? 0)
+      ) {
+        continue;
+      }
+      const lineageKey = exactReviewPublicationLineageKey(entry.lineage);
+      const group = lineageGroups.get(lineageKey) ?? [];
+      group.push(entry);
+      lineageGroups.set(lineageKey, group);
+    }
+
+    const lineageRefreshes = new Map<
+      string,
+      { retainedKey: string; decision: ExactReviewDecision }
+    >();
+    let protectedLineageItems = 0;
+    for (const [lineageKey, entries] of lineageGroups) {
+      if (entries.length < 2) continue;
+      const active = entries
+        .filter(
+          ({ item }) =>
+            activeBatchItemKeys.has(item.key) ||
+            item.state === "dispatching" ||
+            item.state === "leased",
+        )
+        .sort((left, right) => left.item.key.localeCompare(right.item.key));
+      const pending = entries
+        .filter(
+          ({ item }) =>
+            !activeBatchItemKeys.has(item.key) &&
+            (item.state === "pending" || item.state === "parked"),
+        )
+        .sort(
+          (left, right) =>
+            left.item.createdAt - right.item.createdAt ||
+            left.item.key.localeCompare(right.item.key),
+        );
+      if (active.length) {
+        // An active owner may still publish its captured decision. Preserve the
+        // whole lineage until ownership expires so newer provenance is not lost.
+        protectedLineageItems += entries.length;
+        continue;
+      }
+      const retained = pending[0];
+      if (!retained) continue;
+
+      if (pending.length > 1) {
+        const freshest = pending.reduce((latest, candidate) => {
+          const latestPublication = latest.item.decision.publication;
+          const candidatePublication = candidate.item.decision.publication;
+          return latestPublication &&
+            candidatePublication &&
+            exactReviewPublicationProducerIsNewer(candidatePublication, latestPublication)
+            ? candidate
+            : latest;
+        });
+        lineageRefreshes.set(lineageKey, {
+          retainedKey: retained.item.key,
+          decision: freshest.item.decision,
+        });
+      }
+
+      for (const entry of pending) {
+        if (entry.item.key === retained.item.key || candidatesByKey.has(entry.item.key)) continue;
+        candidatesByKey.set(entry.item.key, {
+          ...entry,
+          reason: "duplicate_lineage",
+          lineageKey,
+          retainedKey: retained.item.key,
+        });
+      }
+    }
+
+    const candidates = [...candidatesByKey.values()].sort(
+      (left, right) =>
+        left.item.createdAt - right.item.createdAt || left.item.key.localeCompare(right.item.key),
+    );
     const selected = candidates.slice(0, limit);
+    const changedKeys = new Set<string>();
+    const changedLineages = new Set<string>();
+    let staleRevisionChanged = 0;
+    let lineageDuplicateChanged = 0;
+    let lineageRefreshed = 0;
     if (apply && selected.length) {
       this.storage.transactionSync(() => {
-        for (const { item, revision } of selected) {
+        for (const candidate of selected) {
+          const { item, revision } = candidate;
           const current = state.items[item.key];
           const currentRevision = current ? exactReviewPublicationRevision(current.decision) : null;
           if (
@@ -3043,30 +3139,114 @@ export class ExactReviewQueue {
           ) {
             continue;
           }
+          if (
+            candidate.reason === "stale_revision" &&
+            currentRevision.sourceRevision >=
+              (newestByTarget.get(currentRevision.targetKey) ?? currentRevision.sourceRevision)
+          ) {
+            continue;
+          }
+          if (candidate.reason === "duplicate_lineage") {
+            const currentLineage = exactReviewPublicationLineage(current.decision);
+            const retained = candidate.retainedKey ? state.items[candidate.retainedKey] : null;
+            const retainedLineage = retained
+              ? exactReviewPublicationLineage(retained.decision)
+              : null;
+            if (
+              !currentLineage ||
+              !retainedLineage ||
+              !candidate.lineageKey ||
+              exactReviewPublicationLineageKey(currentLineage) !== candidate.lineageKey ||
+              exactReviewPublicationLineageKey(retainedLineage) !== candidate.lineageKey
+            ) {
+              continue;
+            }
+          }
           delete state.items[current.key];
+          changedKeys.add(current.key);
+          if (candidate.reason === "stale_revision") staleRevisionChanged += 1;
+          else {
+            lineageDuplicateChanged += 1;
+            if (candidate.lineageKey) changedLineages.add(candidate.lineageKey);
+          }
         }
-        this.writeStateSync(state);
-        this.incrementQueueMetricsSync({
-          publicationCompleted: selected.length,
-          publicationSuperseded: selected.length,
-        });
+
+        for (const lineageKey of changedLineages) {
+          const refresh = lineageRefreshes.get(lineageKey);
+          if (!refresh) continue;
+          const retained = state.items[refresh.retainedKey];
+          const retainedLineage = retained
+            ? exactReviewPublicationLineage(retained.decision)
+            : null;
+          const retainedPublication = retained?.decision.publication;
+          const freshestPublication = refresh.decision.publication;
+          if (
+            !retained ||
+            !retainedLineage ||
+            exactReviewPublicationLineageKey(retainedLineage) !== lineageKey ||
+            (retained.state !== "pending" && retained.state !== "parked") ||
+            activeBatchItemKeys.has(retained.key) ||
+            !retainedPublication ||
+            !freshestPublication ||
+            !exactReviewPublicationProducerIsNewer(freshestPublication, retainedPublication)
+          ) {
+            continue;
+          }
+          retained.decision = refresh.decision;
+          retained.revision += 1;
+          retained.updatedAt = now;
+          lineageRefreshed += 1;
+        }
+        if (changedKeys.size) {
+          this.writeStateSync(state);
+          this.incrementQueueMetricsSync({
+            publicationCompleted: changedKeys.size,
+            publicationSuperseded: changedKeys.size,
+            publicationSemanticDeduped: lineageDuplicateChanged,
+          });
+        }
       });
-      await this.scheduleNext(state, now);
+      if (changedKeys.size) await this.scheduleNext(state, now);
     }
+
+    const remaining = apply
+      ? candidates.filter(({ item }) => !changedKeys.has(item.key))
+      : candidates;
+    const oldestAgeSeconds = (entries: ReconcileCandidate[]) =>
+      entries.length
+        ? Math.floor(
+            Math.max(0, now - Math.min(...entries.map(({ item }) => item.createdAt))) / 1000,
+          )
+        : null;
+    const staleRevisionEligible = candidates.filter(
+      ({ reason }) => reason === "stale_revision",
+    ).length;
+    const lineageDuplicateEligible = candidates.length - staleRevisionEligible;
     return json({
       ok: true,
       apply,
       scanned: versioned.length,
       eligible: candidates.length,
-      changed: apply ? selected.length : 0,
-      eligible_remaining: Math.max(0, candidates.length - (apply ? selected.length : 0)),
+      changed: changedKeys.size,
+      eligible_remaining: remaining.length,
+      stale_revision_eligible: staleRevisionEligible,
+      stale_revision_changed: staleRevisionChanged,
+      lineage_duplicate_eligible: lineageDuplicateEligible,
+      lineage_duplicate_changed: lineageDuplicateChanged,
+      lineage_refreshed: lineageRefreshed,
       protected_batch_items: activeBatchItemKeys.size,
-      sample: selected.slice(0, 20).map(({ item, revision }) => ({
+      protected_lineage_items: protectedLineageItems,
+      oldest_eligible_age_seconds: oldestAgeSeconds(candidates),
+      oldest_remaining_age_seconds: oldestAgeSeconds(remaining),
+      sample: selected.slice(0, 20).map(({ item, revision, reason, lineage, retainedKey }) => ({
         item_key: item.key,
         queue_revision: item.revision,
+        reason,
         target_key: revision.targetKey,
         publication_revision: revision.sourceRevision,
         superseded_by_revision: newestByTarget.get(revision.targetKey),
+        lineage_claim_generation: lineage?.claimGeneration ?? null,
+        retained_item_key: retainedKey ?? null,
       })),
     });
   }
@@ -5593,11 +5773,15 @@ function exactReviewPublicationRevision(decision: ExactReviewDecision): {
   };
 }
 
-function exactReviewPublicationLineage(decision: ExactReviewDecision): {
+type ExactReviewPublicationLineage = {
   targetKey: string;
   sourceRevision: number;
   claimGeneration: number;
-} | null {
+};
+
+function exactReviewPublicationLineage(
+  decision: ExactReviewDecision,
+): ExactReviewPublicationLineage | null {
   const publication = decision.publication;
   if (!publication || publication.protocolVersion !== 2 || publication.leaseRevision === null) {
     return null;
@@ -5608,6 +5792,10 @@ function exactReviewPublicationLineage(decision: ExactReviewDecision): {
     sourceRevision: publication.leaseRevision,
     claimGeneration: publication.claimGeneration,
   };
+}
+
+function exactReviewPublicationLineageKey(lineage: ExactReviewPublicationLineage) {
+  return `${lineage.targetKey}\u0000${lineage.sourceRevision}\u0000${lineage.claimGeneration}`;
 }
 
 function exactReviewPublicationProducerIsNewer(

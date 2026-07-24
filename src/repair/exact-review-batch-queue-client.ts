@@ -32,7 +32,15 @@ export type ExactReviewPublicationReconcileResult = {
   eligible: number;
   changed: number;
   eligibleRemaining: number;
+  staleRevisionEligible: number;
+  staleRevisionChanged: number;
+  lineageDuplicateEligible: number;
+  lineageDuplicateChanged: number;
+  lineageRefreshed: number;
   protectedBatchItems: number;
+  protectedLineageItems: number;
+  oldestEligibleAgeSeconds: number | null;
+  oldestRemainingAgeSeconds: number | null;
 };
 
 export interface ExactReviewBatchQueue {
@@ -145,9 +153,38 @@ export class ExactReviewBatchQueueClient implements ExactReviewBatchQueue {
       eligible: nonNegativeInteger(response.eligible, "eligible"),
       changed: nonNegativeInteger(response.changed, "changed"),
       eligibleRemaining: nonNegativeInteger(response.eligible_remaining, "eligible_remaining"),
+      staleRevisionEligible: nonNegativeInteger(
+        response.stale_revision_eligible ?? response.eligible,
+        "stale_revision_eligible",
+      ),
+      staleRevisionChanged: nonNegativeInteger(
+        response.stale_revision_changed ?? response.changed,
+        "stale_revision_changed",
+      ),
+      lineageDuplicateEligible: nonNegativeInteger(
+        response.lineage_duplicate_eligible ?? 0,
+        "lineage_duplicate_eligible",
+      ),
+      lineageDuplicateChanged: nonNegativeInteger(
+        response.lineage_duplicate_changed ?? 0,
+        "lineage_duplicate_changed",
+      ),
+      lineageRefreshed: nonNegativeInteger(response.lineage_refreshed ?? 0, "lineage_refreshed"),
       protectedBatchItems: nonNegativeInteger(
         response.protected_batch_items,
         "protected_batch_items",
+      ),
+      protectedLineageItems: nonNegativeInteger(
+        response.protected_lineage_items ?? 0,
+        "protected_lineage_items",
+      ),
+      oldestEligibleAgeSeconds: nullableNonNegativeInteger(
+        response.oldest_eligible_age_seconds,
+        "oldest_eligible_age_seconds",
+      ),
+      oldestRemainingAgeSeconds: nullableNonNegativeInteger(
+        response.oldest_remaining_age_seconds,
+        "oldest_remaining_age_seconds",
       ),
     } satisfies ExactReviewPublicationReconcileResult;
   }
@@ -286,4 +323,8 @@ function nonNegativeInteger(value: unknown, name: string): number {
   const result = Number(value);
   if (!Number.isSafeInteger(result) || result < 0) throw new Error(`Invalid batch queue ${name}`);
   return result;
+}
+
+function nullableNonNegativeInteger(value: unknown, name: string): number | null {
+  return value === null || value === undefined ? null : nonNegativeInteger(value, name);
 }

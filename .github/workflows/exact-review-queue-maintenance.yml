@@ -4,12 +4,12 @@ on:
   workflow_dispatch:
     inputs:
       execute:
-        description: "Apply bounded publication supersession"
+        description: "Apply one bounded pass (false runs a dry-run)"
         required: true
         type: boolean
         default: false
       passes:
-        description: "Maximum 100-item passes"
+        description: "Deprecated compatibility input; accepted but clamped to one pass"
         required: true
         type: string
         default: "1"
@@ -23,7 +23,6 @@ permissions:
 
 jobs:
   reconcile:
-    if: ${{ inputs.execute }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
@@ -41,11 +40,14 @@ jobs:
         with:
           build-script: build:repair
 
-      - name: Reconcile superseded publication items
+      - name: Preview or reconcile historical publication lineages
         env:
+          EXECUTE: ${{ inputs.execute }}
           PASSES: ${{ inputs.passes }}
-        run: >-
-          pnpm run --silent repair:exact-review-queue-maintenance --
-          --apply
-          --max-items 100
-          --passes "$PASSES"
+        run: |
+          args=(--max-items 100)
+          if [[ "$EXECUTE" == "true" ]]; then
+            args+=(--apply)
+          fi
+          args+=(--passes "$PASSES")
+          pnpm run --silent repair:exact-review-queue-maintenance -- "${args[@]}"

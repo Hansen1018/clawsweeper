@@ -876,6 +876,204 @@ test("publication reconcile preserves active batches and removes older revisions
   }
 });
 
+test("publication reconcile backfills historical duplicate lineages in bounded passes", async () => {
+  const originalNow = Date.now;
+  const now = 6_450_000;
+  Date.now = () => now;
+  try {
+    const storage = new TestStorage();
+    const decisions = await Promise.all(
+      ["2401", "2402", "2403"].map(async (producerRunId) => {
+        const payload = (await publicationRequest(
+          `legacy-lineage-${producerRunId}`,
+          108703,
+          producerRunId,
+        ).json()) as { decision: Record<string, unknown> };
+        return payload.decision;
+      }),
+    );
+    const keys = ["2401", "2402", "2403"].map(
+      (producerRunId) => `openclaw/openclaw#108703@publish:${producerRunId}:1`,
+    );
+    await storage.put("exact-review-queue", {
+      items: Object.fromEntries(
+        keys.map((key, index) => [
+          key,
+          {
+            decision: decisions[index],
+            state: "pending",
+            revision: 1,
+            createdAt: now - (3 - index) * 100_000,
+            updatedAt: now - (3 - index) * 100_000,
+            nextAttemptAt: now - (3 - index) * 100_000,
+            attempts: index === 0 ? 7 : 0,
+            ...(index === 0
+              ? {
+                  publicationFailureAttempts: 2,
+                  firstFailureAt: now - 300_000,
+                  lastFailureReason: "state_contention",
+                }
+              : {}),
+          },
+        ]),
+      ),
+      deliveries: {},
+    });
+    const queue = new ExactReviewQueue({ storage }, {});
+
+    const dryRun = await (
+      await queue.fetch(batchRequest("/publications/reconcile", { max_items: 1 }))
+    ).json();
+    assert.equal(dryRun.apply, false);
+    assert.equal(dryRun.eligible, 2);
+    assert.equal(dryRun.changed, 0);
+    assert.equal(dryRun.lineage_duplicate_eligible, 2);
+    assert.equal(dryRun.oldest_eligible_age_seconds, 200);
+    assert.equal(dryRun.oldest_remaining_age_seconds, 200);
+    assert.equal(dryRun.sample[0].reason, "duplicate_lineage");
+    assert.equal(dryRun.sample[0].retained_item_key, keys[0]);
+
+    const firstPass = await (
+      await queue.fetch(batchRequest("/publications/reconcile", { apply: true, max_items: 1 }))
+    ).json();
+    assert.equal(firstPass.changed, 1);
+    assert.equal(firstPass.eligible_remaining, 1);
+    assert.equal(firstPass.lineage_duplicate_changed, 1);
+    assert.equal(firstPass.lineage_refreshed, 1);
+    assert.equal(firstPass.oldest_remaining_age_seconds, 100);
+
+    const afterFirstPass = await (
+      await queue.fetch(batchRequest("/publications/list", { limit: 100 }))
+    ).json();
+    const retained = afterFirstPass.publications.find(
+      (item: { item_key: string }) => item.item_key === keys[0],
+    );
+    assert.equal(retained.attempts, 7);
+    assert.equal(retained.revision, 2);
+    assert.equal(retained.decision.publication.producerRunId, "2403");
+
+    const staleSupersede = await (
+      await queue.fetch(
+        batchRequest("/publications/supersede", {
+          items: [{ item_key: keys[0], revision: 1 }],
+        }),
+      )
+    ).json();
+    assert.equal(staleSupersede.superseded, 0);
+
+    const secondPass = await (
+      await queue.fetch(batchRequest("/publications/reconcile", { apply: true, max_items: 100 }))
+    ).json();
+    assert.equal(secondPass.changed, 1);
+    assert.equal(secondPass.eligible_remaining, 0);
+    assert.equal(secondPass.lineage_duplicate_changed, 1);
+    assert.equal(secondPass.lineage_refreshed, 0);
+    assert.equal(secondPass.oldest_remaining_age_seconds, null);
+
+    const stats = await (await queue.fetch(new Request("https://queue/stats"))).json();
+    assert.equal(stats.lanes.publication.pending, 1);
+    assert.equal(stats.lanes.publication.superseded_total, 2);
+    assert.equal(stats.lanes.publication.semantic_deduped_total, 2);
+  } finally {
+    Date.now = originalNow;
+  }
+});
+
+test("publication lineage reconcile defers the whole lineage while a batch owns it", async () => {
+  const originalNow = Date.now;
+  let now = 6_475_000;
+  Date.now = () => now;
+  try {
+    const storage = new TestStorage();
+    const producerRunIds = ["2501", "2502"];
+    const decisions = await Promise.all(
+      producerRunIds.map(async (producerRunId) => {
+        const payload = (await publicationRequest(
+          `legacy-owned-lineage-${producerRunId}`,
+          108704,
+          producerRunId,
+        ).json()) as { decision: Record<string, unknown> };
+        return payload.decision;
+      }),
+    );
+    const keys = producerRunIds.map(
+      (producerRunId) => `openclaw/openclaw#108704@publish:${producerRunId}:1`,
+    );
+    await storage.put("exact-review-queue", {
+      items: Object.fromEntries(
+        keys.map((key, index) => [
+          key,
+          {
+            decision: decisions[index],
+            state: "pending",
+            revision: 1,
+            createdAt: now - (2 - index) * 100_000,
+            updatedAt: now - (2 - index) * 100_000,
+            nextAttemptAt: now - (2 - index) * 100_000,
+            attempts: 0,
+          },
+        ]),
+      ),
+      deliveries: {},
+    });
+    const queue = new ExactReviewQueue(
+      { storage },
+      {
+        EXACT_REVIEW_PUBLICATION_BATCHING_ENABLED: "1",
+        EXACT_REVIEW_PUBLICATION_BATCH_LEASE_MS: "60000",
+      },
+    );
+    const claim = await (
+      await queue.fetch(
+        batchRequest("/publication-batches/claim", {
+          claim_id: "claim-lineage-reconcile-protection",
+          lease_owner: "worker-1",
+          max_items: 1,
+        }),
+      )
+    ).json();
+    assert.equal(claim.claimed, true);
+    assert.equal(claim.batch.items[0].item_key, keys[0]);
+
+    const applied = await (
+      await queue.fetch(batchRequest("/publications/reconcile", { apply: true, max_items: 100 }))
+    ).json();
+    assert.equal(applied.changed, 0);
+    assert.equal(applied.eligible, 0);
+    assert.equal(applied.lineage_duplicate_changed, 0);
+    assert.equal(applied.protected_batch_items, 1);
+    assert.equal(applied.protected_lineage_items, 2);
+
+    const fetched = await (
+      await queue.fetch(
+        batchRequest("/publication-batches/fetch", {
+          batch_id: claim.batch.batch_id,
+          lease_owner: "worker-1",
+        }),
+      )
+    ).json();
+    assert.equal(fetched.batch.items[0].item_key, keys[0]);
+    assert.equal(fetched.items[0].item_key, keys[0]);
+
+    now += 60_001;
+    const reconciled = await (
+      await queue.fetch(batchRequest("/publications/reconcile", { apply: true, max_items: 100 }))
+    ).json();
+    assert.equal(reconciled.changed, 1);
+    assert.equal(reconciled.lineage_duplicate_changed, 1);
+    assert.equal(reconciled.lineage_refreshed, 1);
+
+    const publications = await (
+      await queue.fetch(batchRequest("/publications/list", { limit: 100 }))
+    ).json();
+    assert.equal(publications.publications.length, 1);
+    assert.equal(publications.publications[0].item_key, keys[0]);
+    assert.equal(publications.publications[0].decision.publication.producerRunId, "2502");
+  } finally {
+    Date.now = originalNow;
+  }
+});
+
 test("batch claim scans beyond but cannot exceed the configured rollout size", async () => {
   const originalNow = Date.now;
   Date.now = () => 6_500_000;
@@ -1140,37 +1338,103 @@ test("batch protocol routes require the shared internal signature", async () => 
   assert.equal(forwardedPath, "/publication-batches/claim");
 });
 
-test("publication reconciliation route requires the shared internal signature", async () => {
-  const secret = "test-secret";
-  const body = JSON.stringify({ apply: false, max_items: 1 });
-  let forwardedPath = "";
-  const env = {
-    CLAWSWEEPER_WEBHOOK_SECRET: secret,
-    EXACT_REVIEW_QUEUE: {
-      idFromName: () => "global",
-      get: () => ({
-        fetch: async (request: Request) => {
-          forwardedPath = new URL(request.url).pathname;
-          return new Response(JSON.stringify({ ok: true }));
-        },
+test("authenticated publication reconciliation dry-run reports without mutation", async () => {
+  const originalNow = Date.now;
+  const now = 13_000_000;
+  Date.now = () => now;
+  try {
+    const secret = "test-secret";
+    const producerRunIds = ["2601", "2602"];
+    const decisions = await Promise.all(
+      producerRunIds.map(async (producerRunId) => {
+        const payload = (await publicationRequest(
+          `authenticated-dry-run-${producerRunId}`,
+          108705,
+          producerRunId,
+        ).json()) as { decision: Record<string, unknown> };
+        return payload.decision;
       }),
-    },
-  };
-  const url = "https://clawsweeper.openclaw.ai/internal/exact-review/publications/reconcile";
-  const unauthorized = await worker.fetch(new Request(url, { method: "POST", body }), env);
-  assert.equal(unauthorized.status, 401);
+    );
+    const storage = new TestStorage();
+    await storage.put("exact-review-queue", {
+      items: Object.fromEntries(
+        producerRunIds.map((producerRunId, index) => [
+          `openclaw/openclaw#108705@publish:${producerRunId}:1`,
+          {
+            decision: decisions[index],
+            state: "pending",
+            revision: 1,
+            createdAt: now - (2 - index) * 60_000,
+            updatedAt: now - (2 - index) * 60_000,
+            nextAttemptAt: now - (2 - index) * 60_000,
+            attempts: 0,
+          },
+        ]),
+      ),
+      deliveries: {},
+    });
+    const queue = new ExactReviewQueue({ storage }, {});
+    let forwardedPath = "";
+    const env = {
+      CLAWSWEEPER_WEBHOOK_SECRET: secret,
+      EXACT_REVIEW_QUEUE: {
+        idFromName: () => "global",
+        get: () => ({
+          fetch: async (request: Request) => {
+            forwardedPath = new URL(request.url).pathname;
+            return queue.fetch(request);
+          },
+        }),
+      },
+    };
+    const body = JSON.stringify({ apply: false, max_items: 1 });
+    const url = "https://clawsweeper.openclaw.ai/internal/exact-review/publications/reconcile";
+    const unauthorized = await worker.fetch(new Request(url, { method: "POST", body }), env);
+    assert.equal(unauthorized.status, 401);
 
-  const signature = `sha256=${createHmac("sha256", secret).update(body).digest("hex")}`;
-  const authorized = await worker.fetch(
-    new Request(url, {
-      method: "POST",
-      headers: { "x-clawsweeper-exact-review-signature": signature },
-      body,
-    }),
-    env,
-  );
-  assert.equal(authorized.status, 200);
-  assert.equal(forwardedPath, "/publications/reconcile");
+    const signature = `sha256=${createHmac("sha256", secret).update(body).digest("hex")}`;
+    const authorized = await worker.fetch(
+      new Request(url, {
+        method: "POST",
+        headers: { "x-clawsweeper-exact-review-signature": signature },
+        body,
+      }),
+      env,
+    );
+    assert.equal(authorized.status, 200);
+    assert.equal(forwardedPath, "/publications/reconcile");
+    const result = await authorized.json();
+    assert.equal(result.apply, false);
+    assert.equal(result.eligible, 1);
+    assert.equal(result.changed, 0);
+    assert.equal(result.eligible_remaining, 1);
+    assert.equal(result.lineage_duplicate_eligible, 1);
+    assert.equal(result.protected_lineage_items, 0);
+    assert.equal(result.oldest_eligible_age_seconds, 60);
+    const stats = await (await queue.fetch(new Request("https://queue/stats"))).json();
+    assert.equal(stats.lanes.publication.pending, 2);
+
+    if (process.env.CLAWSWEEPER_EVIDENCE_TRANSCRIPT === "1") {
+      console.log(
+        `AUTHENTICATED_PUBLICATION_RECONCILE_DRY_RUN=${JSON.stringify({
+          http_status: authorized.status,
+          apply: result.apply,
+          scanned: result.scanned,
+          eligible: result.eligible,
+          changed: result.changed,
+          eligible_remaining: result.eligible_remaining,
+          lineage_duplicate_eligible: result.lineage_duplicate_eligible,
+          protected_batch_items: result.protected_batch_items,
+          protected_lineage_items: result.protected_lineage_items,
+          oldest_eligible_age_seconds: result.oldest_eligible_age_seconds,
+          pending_before: 2,
+          pending_after: stats.lanes.publication.pending,
+        })}`,
+      );
+    }
+  } finally {
+    Date.now = originalNow;
+  }
 });
 
 test("queue fetch terminalizes a stale batch revision before dispatch", async () => {

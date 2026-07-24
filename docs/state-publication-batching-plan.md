@@ -195,6 +195,29 @@ revisions, comment routing, and apply work remain separate lanes. The queue
 reports `semantic_deduped_total` independently from stale-revision supersession
 so backlog reduction is not mistaken for completed review output. See #800.
 
+The same invariant is available as an explicit historical backfill through
+`/internal/exact-review/publications/reconcile` and
+`.github/workflows/exact-review-queue-maintenance.yml`. The workflow runs a
+dry-run by default and can apply exactly one pass of at most 100 removals per
+manual dispatch. The deprecated `passes` input remains accepted for existing
+dispatch callers, but values above one are explicitly logged and clamped to one
+observed pass. The workflow is not scheduled and cannot loop through multiple
+passes in one run. A pass considers only `pending` and `parked` protocol-v2 publications.
+It never removes `dispatching`, `leased`, or active-batch-owned rows. For a
+current lineage without an active owner, it preserves the oldest queue slot and
+its retry/failure budget, refreshes that slot to the newest known producer
+artifact, and removes only the redundant siblings. Older review revisions keep
+the existing supersession behavior.
+
+Each dry-run or apply result records the total scanned and eligible rows, rows
+changed and remaining, stale-revision versus duplicate-lineage counts, refreshed
+retained lineages, protected ownership, and the oldest eligible and remaining
+ages. Operators should inspect a dry-run first, apply one bounded pass, then
+observe the public 15-minute and 60-minute publication flow. Another pass should
+wait for stable positive net drain and unchanged contention/dead-letter safety;
+historical cleanup is not a reason to raise publication concurrency or bypass
+the state-writer rollout gates.
+
 ## Production incident and root cause
 
 The first real size-2 batch was
