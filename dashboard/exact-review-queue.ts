@@ -416,6 +416,8 @@ const DEFAULT_EXACT_REVIEW_PUBLICATION_BATCH_LEASE_MS = 30 * 60 * 1000;
 const DEFAULT_EXACT_REVIEW_PUBLICATION_BATCH_WAIT_MS = 60_000;
 const DEFAULT_EXACT_REVIEW_PUBLICATION_BATCH_DISPATCH_COOLDOWN_MS = 30_000;
 const DEFAULT_EXACT_REVIEW_PUBLICATION_BATCH_DISPATCH_RESERVATION_MS = 10 * 60_000;
+const DEFAULT_EXACT_REVIEW_PUBLICATION_FRESH_LANE_MAX_ITEMS = 2;
+const DEFAULT_EXACT_REVIEW_PUBLICATION_FRESH_LANE_MAX_AGE_MS = 15 * 60_000;
 const DEFAULT_STATE_WRITER_COORDINATOR_LEASE_MS = 2 * 60_000;
 const DEFAULT_STATE_WRITER_COORDINATOR_QUEUED_STALE_MS = 2 * 60_000;
 // A watchdog may keep a synchronous Git operation alive, but it cannot turn a
@@ -1862,6 +1864,7 @@ export class ExactReviewQueue {
       );
       const publicationBatches = this.batchStore.stats(now);
       const batchOwnedItemKeys = new Set<string>(publicationBatches.activeItemKeys);
+      const freshPublicationItemKeys = this.freshPublicationItemKeysSync(state, now);
       const legacyExcludedItemKeys = new Set(batchOwnedItemKeys);
       if (exactReviewPublicationBatchingEnabled(this.env)) {
         for (const item of Object.values(state.items) as ExactReviewQueueItem[]) {
@@ -1928,6 +1931,16 @@ export class ExactReviewQueue {
               max_items: exactReviewPublicationBatchSize(this.env),
               max_concurrent: exactReviewPublicationBatchMaxConcurrent(this.env),
               max_wait_seconds: exactReviewPublicationBatchWaitMs(this.env) / 1_000,
+              fresh_lane: {
+                enabled: exactReviewPublicationFreshLaneMaxItems(this.env) > 0,
+                reserved_items: exactReviewPublicationFreshLaneMaxItems(this.env),
+                max_age_seconds: exactReviewPublicationFreshLaneMaxAgeMs(this.env) / 1_000,
+                ready_items: freshPublicationItemKeys.size,
+                historical_ready_items: Math.max(
+                  0,
+                  stats.lanes.publication.ready - freshPublicationItemKeys.size,
+                ),
+              },
               last_dispatch_at: state.dispatcher?.publicationBatchDispatchedAt
                 ? new Date(state.dispatcher.publicationBatchDispatchedAt).toISOString()
                 : null,
@@ -2023,6 +2036,7 @@ export class ExactReviewQueue {
       startedAt,
       new Set(snapshotBatchOwnership.itemKeys),
       snapshotBatchOwnership.activeBatches,
+      this.freshPublicationItemKeysSync(snapshot, startedAt),
     );
     let batchDispatchAttempted = false;
     let batchDispatchSucceeded = false;
@@ -2129,6 +2143,9 @@ export class ExactReviewQueue {
       publicationCapacity,
       new Set<string>(batchOwnership.itemKeys),
       exactReviewPublicationBatchingEnabled(this.env) || batchOwnership.itemKeys.length > 0,
+      false,
+      this.freshPublicationItemKeysSync(state, now),
+      exactReviewPublicationFreshLaneMaxItems(this.env),
     );
     if (!preflight.ok) {
       const retryAt = now + exactReviewWorkflowPausedRetryMs(this.env);
@@ -3408,6 +3425,8 @@ export class ExactReviewQueue {
             excludedItemKeys,
             false, // batching replaces legacy publication blocking at this admission point
             true, // one durable item path per commit; later events remain FIFO candidates
+            this.freshPublicationItemKeysSync(state, now),
+            exactReviewPublicationFreshLaneMaxItems(this.env),
           )
             .filter(exactReviewQueueIsPublication)
             .filter((item) => {
@@ -3474,13 +3493,19 @@ export class ExactReviewQueue {
     const now = Date.now();
     let batch = this.batchStore.fetch(batchId, leaseOwner, now);
     if (!batch) return json({ error: "batch_lease_not_active" }, 409);
-    const state = this.readStateSync();
+    let state = this.readStateSync();
     const stale: PublicationBatchCompletion[] = batch.items
       .filter((membership) => {
         if (membership.terminalOutcome !== null) return false;
         const item = state.items[membership.itemKey];
+        const publicationRevision = item ? exactReviewPublicationRevision(item.decision) : null;
         return (
-          !item || item.revision !== membership.revision || !exactReviewQueueIsPublication(item)
+          !item ||
+          item.revision !== membership.revision ||
+          !exactReviewQueueIsPublication(item) ||
+          (publicationRevision !== null &&
+            publicationRevision.sourceRevision <
+              this.publicationHeadRevisionSync(publicationRevision.targetKey))
         );
       })
       .map((membership) => ({
@@ -3490,8 +3515,42 @@ export class ExactReviewQueue {
         terminalOutcome: "superseded",
       }));
     if (stale.length) {
-      batch = this.batchStore.complete(batchId, leaseOwner, stale, now);
+      batch = this.batchStore.complete(batchId, leaseOwner, stale, now, {}, (accepted) => {
+        const current = this.readStateSync();
+        let superseded = 0;
+        for (const completion of accepted) {
+          const item = current.items[completion.itemKey];
+          const publicationRevision = item ? exactReviewPublicationRevision(item.decision) : null;
+          if (
+            !item ||
+            item.revision !== completion.revision ||
+            !exactReviewQueueIsPublication(item) ||
+            !publicationRevision ||
+            publicationRevision.sourceRevision >=
+              this.publicationHeadRevisionSync(publicationRevision.targetKey)
+          ) {
+            continue;
+          }
+          const result = finishExactReviewPublicationQueueItem({
+            state: current,
+            item,
+            now,
+            completion: { kind: "superseded", reasonCode: "remote_newer_tuple" },
+            ownedRevision: completion.revision,
+            deadLetterCapacityAvailable: true,
+            env: this.env,
+          });
+          if (!result.requeued && !result.parked) superseded += 1;
+        }
+        if (!superseded) return;
+        this.writeStateSync(current);
+        this.incrementQueueMetricsSync({
+          publicationCompleted: superseded,
+          publicationSuperseded: superseded,
+        });
+      });
       if (!batch) return json({ error: "batch_lease_not_active" }, 409);
+      state = this.readStateSync();
       await this.scheduleNext(state, now);
     }
     const items = batch.items.flatMap((membership) => {
@@ -3703,6 +3762,29 @@ export class ExactReviewQueue {
 
   private nextExactReviewItemRevisionSync(itemKey: string): number {
     return this.publicationHeadRevisionSync(itemKey.toLowerCase()) + 1;
+  }
+
+  private freshPublicationItemKeysSync(state: ExactReviewQueueState, now: number) {
+    const reserve = exactReviewPublicationFreshLaneMaxItems(this.env);
+    if (!reserve) return new Set<string>();
+    const cutoff = now - exactReviewPublicationFreshLaneMaxAgeMs(this.env);
+    return new Set(
+      Object.values(state.items).flatMap((item) => {
+        if (
+          item.state !== "pending" ||
+          item.nextAttemptAt > now ||
+          item.createdAt < cutoff ||
+          !exactReviewQueueIsPublication(item)
+        ) {
+          return [];
+        }
+        const revision = exactReviewPublicationRevision(item.decision);
+        return revision &&
+          revision.sourceRevision >= this.publicationHeadRevisionSync(revision.targetKey)
+          ? [item.key]
+          : [];
+      }),
+    );
   }
 
   private recordPublicationHeadSync(targetKey: string, sourceRevision: number, now: number) {
@@ -5669,6 +5751,7 @@ export class ExactReviewQueue {
       now,
       new Set(batchOwnership.itemKeys),
       batchOwnership.activeBatches,
+      this.freshPublicationItemKeysSync(state, now),
     );
     const sourceAuthorityNext = await this.nextSourceAuthorityVerificationAt();
     const next = [
@@ -6988,6 +7071,20 @@ function exactReviewQueueActivePublicationCount(state: ExactReviewQueueState) {
   ).length;
 }
 
+function exactReviewPrioritizePublicationItems(
+  items: ExactReviewQueueItem[],
+  freshItemKeys: ReadonlySet<string>,
+  freshReserve: number,
+) {
+  if (!freshReserve || !freshItemKeys.size) return items;
+  const fresh = items.filter((item) => freshItemKeys.has(item.key));
+  if (!fresh.length) return items;
+  const historical = items.filter((item) => !freshItemKeys.has(item.key));
+  if (!historical.length) return items;
+  const reservedFresh = fresh.slice(0, freshReserve);
+  return [...reservedFresh, ...historical, ...fresh.slice(reservedFresh.length)];
+}
+
 export function exactReviewQueueAdmittedItems(
   state: ExactReviewQueueState,
   now: number,
@@ -6997,6 +7094,8 @@ export function exactReviewQueueAdmittedItems(
   excludedItemKeys: ReadonlySet<string> = new Set(),
   publicationAdmissionBlocked = false,
   uniquePublicationItems = false,
+  freshPublicationItemKeys: ReadonlySet<string> = new Set(),
+  freshPublicationReserve = 0,
 ) {
   const dispatcherRetryAt = Number(state.dispatcher?.retryAt || 0);
   if (
@@ -7026,7 +7125,16 @@ export function exactReviewQueueAdmittedItems(
         item.state === "pending" && item.nextAttemptAt <= now && !excludedItemKeys.has(item.key),
     )
     .sort((left, right) => left.createdAt - right.createdAt || left.key.localeCompare(right.key));
-  for (const item of pending) {
+  const prioritizedPublications = exactReviewPrioritizePublicationItems(
+    pending.filter(exactReviewQueueIsPublication),
+    freshPublicationItemKeys,
+    freshPublicationReserve,
+  );
+  let publicationIndex = 0;
+  const ordered = pending.map((item) =>
+    exactReviewQueueIsPublication(item) ? prioritizedPublications[publicationIndex++]! : item,
+  );
+  for (const item of ordered) {
     const publication = exactReviewQueueIsPublication(item);
     if (publication) {
       if (publicationAdmissionBlocked) continue;
@@ -7809,6 +7917,35 @@ function exactReviewPublicationBatchMaxConcurrent(env) {
   return Math.max(1, Math.min(8, numberFrom(env.EXACT_REVIEW_PUBLICATION_BATCH_MAX_CONCURRENT, 1)));
 }
 
+function exactReviewPublicationFreshLaneMaxItems(env) {
+  if (String(env.EXACT_REVIEW_PUBLICATION_FRESH_LANE_ENABLED || "").trim() !== "1") return 0;
+  const batchSize = exactReviewPublicationBatchSize(env);
+  if (batchSize <= 1) return 0;
+  return Math.max(
+    1,
+    Math.min(
+      batchSize - 1,
+      numberFrom(
+        env.EXACT_REVIEW_PUBLICATION_FRESH_LANE_MAX_ITEMS,
+        DEFAULT_EXACT_REVIEW_PUBLICATION_FRESH_LANE_MAX_ITEMS,
+      ),
+    ),
+  );
+}
+
+function exactReviewPublicationFreshLaneMaxAgeMs(env) {
+  return Math.max(
+    60_000,
+    Math.min(
+      60 * 60_000,
+      numberFrom(
+        env.EXACT_REVIEW_PUBLICATION_FRESH_LANE_MAX_AGE_MS,
+        DEFAULT_EXACT_REVIEW_PUBLICATION_FRESH_LANE_MAX_AGE_MS,
+      ),
+    ),
+  );
+}
+
 function exactReviewPublicationBatchWaitMs(env) {
   return Math.max(
     1_000,
@@ -7854,6 +7991,7 @@ function exactReviewPublicationBatchDeparture(
   now: number,
   ownedItemKeys: ReadonlySet<string>,
   activeBatchCount: number,
+  freshItemKeys: ReadonlySet<string> = new Set(),
 ) {
   if (
     !exactReviewPublicationBatchingEnabled(env) ||
@@ -7861,14 +7999,18 @@ function exactReviewPublicationBatchDeparture(
   ) {
     return null;
   }
-  const pending = Object.values(state.items)
-    .filter(
-      (item) =>
-        exactReviewQueueIsPublication(item) &&
-        item.state === "pending" &&
-        !ownedItemKeys.has(item.key),
-    )
-    .sort((left, right) => left.createdAt - right.createdAt || left.key.localeCompare(right.key));
+  const pending = exactReviewPrioritizePublicationItems(
+    Object.values(state.items)
+      .filter(
+        (item) =>
+          exactReviewQueueIsPublication(item) &&
+          item.state === "pending" &&
+          !ownedItemKeys.has(item.key),
+      )
+      .sort((left, right) => left.createdAt - right.createdAt || left.key.localeCompare(right.key)),
+    freshItemKeys,
+    exactReviewPublicationFreshLaneMaxItems(env),
+  );
   const maxItems = exactReviewPublicationBatchSize(env);
   const nextEligibilityAt = pending.reduce(
     (earliest, item) =>
@@ -7876,7 +8018,11 @@ function exactReviewPublicationBatchDeparture(
     Number.POSITIVE_INFINITY,
   );
   const candidates = pending.filter((item) => item.nextAttemptAt <= now);
-  const owner = candidates[0]?.decision.targetRepo.split("/", 1)[0]?.toLowerCase();
+  const freshOwner = candidates
+    .find((item) => freshItemKeys.has(item.key))
+    ?.decision.targetRepo.split("/", 1)[0]
+    ?.toLowerCase();
+  const owner = freshOwner ?? candidates[0]?.decision.targetRepo.split("/", 1)[0]?.toLowerCase();
   if (!owner) {
     return Number.isFinite(nextEligibilityAt)
       ? { candidateCount: 0, maxItems, dueAt: nextEligibilityAt, due: false }
@@ -7890,10 +8036,12 @@ function exactReviewPublicationBatchDeparture(
     group.push(item);
     candidatesByOwner.set(candidateOwner, group);
   }
-  // A full owner can leave immediately; only fall back to the globally oldest
-  // partial owner when no owner can fill the configured batch.
+  // Keep a fresh owner's bounded service even when another owner could fill a
+  // historical batch. Without fresh work, retain the existing full-owner choice.
   const selectedOwner =
-    [...candidatesByOwner].find(([, group]) => group.length >= maxItems)?.[0] ?? owner;
+    freshOwner ??
+    [...candidatesByOwner].find(([, group]) => group.length >= maxItems)?.[0] ??
+    owner;
   const ownerCandidates = candidatesByOwner.get(selectedOwner)!;
   const oldestAt = ownerCandidates[0]!.createdAt;
   const fullAt = ownerCandidates.length >= maxItems ? now : Number.POSITIVE_INFINITY;

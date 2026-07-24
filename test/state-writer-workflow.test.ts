@@ -228,6 +228,9 @@ test("the rollout scans 50 and grants four concurrent size-8 preparations", () =
   assert.match(workflow, /EXACT_REVIEW_BATCH_MAX_ITEMS: "50"/);
   assert.match(worker, /EXACT_REVIEW_PUBLICATION_BATCH_SIZE = "8"/);
   assert.match(worker, /EXACT_REVIEW_PUBLICATION_BATCH_MAX_CONCURRENT = "4"/);
+  assert.match(worker, /EXACT_REVIEW_PUBLICATION_FRESH_LANE_ENABLED = "1"/);
+  assert.match(worker, /EXACT_REVIEW_PUBLICATION_FRESH_LANE_MAX_ITEMS = "2"/);
+  assert.match(worker, /EXACT_REVIEW_PUBLICATION_FRESH_LANE_MAX_AGE_MS = "900000"/);
   assert.match(worker, /EXACT_REVIEW_PUBLICATION_BATCH_WAIT_MS = "60000"/);
 });
 

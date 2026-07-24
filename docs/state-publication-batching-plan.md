@@ -218,6 +218,33 @@ wait for stable positive net drain and unchanged contention/dead-letter safety;
 historical cleanup is not a reason to raise publication concurrency or bypass
 the state-writer rollout gates.
 
+### Bounded fresh-authority admission
+
+Historical cleanup and current-result publication share the same guarded batch
+publisher, but they no longer have to share one strict FIFO admission order.
+When `EXACT_REVIEW_PUBLICATION_FRESH_LANE_ENABLED=1`, each batch reserves at
+most `EXACT_REVIEW_PUBLICATION_FRESH_LANE_MAX_ITEMS` members for recent
+protocol-v2 publications whose immutable source revision still matches the
+queue's current head for that durable item. Queue age is only a recency bound;
+it never establishes authority by itself. Tupleless, older-revision, leased,
+active-batch-owned, and backoff rows cannot enter the reserved lane.
+
+The remaining batch members keep oldest-first historical FIFO. Unused reserved
+capacity returns to the historical lane, and when no historical work exists the
+batch may fill with fresh work, so neither lane loses usable capacity. The
+existing one-durable-item-per-batch rule and owner-homogeneous token boundary
+remain unchanged. Batch fetch rechecks the source head after ownership is
+claimed; a head that advanced meanwhile terminalizes the captured member as
+`superseded` before artifact preparation or any GitHub/state mutation.
+
+The status endpoint reports whether the lane is enabled, its reservation and
+age bounds, and separate ready counts for fresh and historical work. Rollback is
+admission-only: set `EXACT_REVIEW_PUBLICATION_FRESH_LANE_ENABLED=0` to restore
+strict historical FIFO without cancelling or invalidating active batch leases.
+Production evaluation must track actual `published` outcomes and current-result
+latency separately from `superseded` historical cleanup; queue depth alone is
+not a success criterion.
+
 ## Production incident and root cause
 
 The first real size-2 batch was
