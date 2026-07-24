@@ -287,7 +287,9 @@ export async function runReviewPlaceholderRecovery(
     // reread and the DELETE is an accepted residual race on a >=2h-orphaned
     // closed item; the durable review tuple in the state repo survives either
     // way and the 15-minute sweep converges.
-    const item = await github<{ state?: unknown }>(`/repos/${repo}/issues/${number}`);
+    const item = await github<{ state?: unknown; locked?: unknown }>(
+      `/repos/${repo}/issues/${number}`,
+    );
     if (item.state !== "closed") return "skipped";
     const current = await github<ReviewPlaceholderComment>(
       `/repos/${repo}/issues/comments/${commentId}`,
@@ -311,6 +313,11 @@ export async function runReviewPlaceholderRecovery(
       },
     });
     if (!response.ok) {
+      // Observed live (openclaw/openclaw#99252): the installation token gets
+      // 403 deleting comments in locked conversations even though it deletes
+      // fine elsewhere; repo policy treats locked-comment 403s as terminal
+      // skips, not errors to retry every sweep.
+      if (response.status === 403 && item.locked === true) return "skipped";
       throw new Error(
         `DELETE /repos/${repo}/issues/comments/${commentId} returned ${response.status}`,
       );

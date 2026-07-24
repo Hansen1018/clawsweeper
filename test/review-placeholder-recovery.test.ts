@@ -550,6 +550,70 @@ test("closed-item cleanup revalidates and skips a placeholder that became a real
   assert.equal(deleteRequests, 0);
 });
 
+test("locked closed items are terminal skips, not retrying cleanup errors", async () => {
+  let deleteRequests = 0;
+  const mockFetch = async (
+    input: string | URL | Request,
+    init?: RequestInit,
+  ): Promise<Response> => {
+    const url = new URL(input instanceof Request ? input.url : input.toString());
+    if (url.pathname === "/search/issues") {
+      const query = url.searchParams.get("q") ?? "";
+      if (query.includes("is:closed")) return Response.json({ items: [{ number: 405 }] });
+      return Response.json({ items: [] });
+    }
+    if (url.pathname === "/repos/openclaw/openclaw/issues/405/comments") {
+      return Response.json([
+        {
+          id: 9005,
+          body: REVIEW_PLACEHOLDER_MARKER,
+          created_at: "2026-07-17T08:00:00.000Z",
+          user: bot,
+        },
+      ]);
+    }
+    if (url.pathname === "/repos/openclaw/openclaw/issues/405") {
+      return Response.json({ state: "closed", locked: true });
+    }
+    if (url.pathname === "/repos/openclaw/openclaw/issues/comments/9005") {
+      if ((init?.method ?? "GET") === "GET") {
+        return Response.json({
+          id: 9005,
+          body: `${REVIEW_PLACEHOLDER_MARKER}\n\n<!-- clawsweeper-review-status:started item=405 sha=abc v=1 -->`,
+          created_at: "2026-07-17T08:00:00.000Z",
+          user: bot,
+        });
+      }
+      deleteRequests += 1;
+      return new Response("locked", { status: 403 });
+    }
+    throw new Error(`unexpected request: ${init?.method ?? "GET"} ${url.pathname}`);
+  };
+
+  const summary = await runReviewPlaceholderRecovery({
+    env: {
+      GH_TOKEN: "test-token-placeholder",
+      TARGET_WRITE_TOKEN: "test-target-write-token",
+      CLAWSWEEPER_WEBHOOK_SECRET: "test-token-placeholder",
+      GITHUB_API_URL: "https://api.github.test",
+      QUEUE_URL: "https://queue.test",
+      TARGET_REPO: "openclaw/openclaw",
+    },
+    fetchImpl: mockFetch as typeof fetch,
+    now,
+  });
+
+  assert.deepEqual(summary, {
+    checked: 1,
+    orphaned: 1,
+    enqueued: 0,
+    cleaned: 0,
+    escalated: 0,
+    errors: 0,
+  });
+  assert.equal(deleteRequests, 1);
+});
+
 test("closed cleanup keeps its own check budget when open placeholders fill the cap", async () => {
   const deletedComments: string[] = [];
   const mockFetch = async (
