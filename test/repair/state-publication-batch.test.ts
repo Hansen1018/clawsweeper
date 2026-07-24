@@ -213,6 +213,34 @@ test("commit_refs recovery retries transient receipt and lease renewal rejection
   );
 });
 
+test("commit_refs recovery retries a transient state branch push rejection", () => {
+  const fixture = createRepositoryFixture();
+  const plan = newItemPlan(fixture, 31);
+  const batchId = "github-state-branch-single-ref-retry";
+  const rejected = installMultiRefAndStateBranchCommitRefsFailure(fixture.origin);
+
+  const result = withStateEnvironment(fixture.work, () =>
+    commitPreparedStateBatch({
+      batchId,
+      plans: [plan],
+    }),
+  );
+
+  assert.equal(result.outcome, "committed");
+  assert.equal(fs.existsSync(rejected.statePush), true);
+  assert.equal(
+    git(fixture.origin, "show", "state:records/openclaw-openclaw/items/31.md"),
+    "item 31\n",
+  );
+  const receiptRef = `refs/heads/clawsweeper-state-batches/${createHash("sha256")
+    .update(batchId)
+    .digest("hex")}`;
+  assert.equal(
+    git(fixture.origin, "rev-parse", "state").trim(),
+    git(fixture.origin, "rev-parse", receiptRef).trim(),
+  );
+});
+
 test("a receipt created after lookup cannot be overwritten", () => {
   const fixture = createRepositoryFixture();
   const plan = newItemPlan(fixture, 29);
@@ -474,6 +502,81 @@ test("incompatible same-path plans fail before acquiring a lease or pushing", ()
   );
 });
 
+test("a single poisoned item is quarantined without stranding the rest of the batch", () => {
+  const fixture = createRepositoryFixture();
+  const healthyBefore = newItemPlan(fixture, 50);
+  const expectedOid = git(fixture.work, "rev-parse", "state:records/existing.md").trim();
+  const poisoned = withStateEnvironment(fixture.work, () =>
+    prepareStateMutationPlan({
+      identity: { itemKey: "openclaw/openclaw#51", revision: 1, claimGeneration: 1 },
+      operations: [{ path: "records/existing.md", expectedOid, content: "candidate\n" }],
+    }),
+  );
+  const healthyAfter = newItemPlan(fixture, 52);
+  publishSibling(fixture, "records/existing.md", "raced by another writer\n");
+
+  const result = withStateEnvironment(fixture.work, () =>
+    commitPreparedStateBatch({
+      batchId: "quarantine-single-item",
+      plans: [healthyBefore, poisoned, healthyAfter],
+    }),
+  );
+
+  assert.equal(result.outcome, "committed");
+  assert.equal(result.itemCount, 2);
+  assert.deepEqual(
+    result.quarantinedItems.map((item) => item.itemKey),
+    ["openclaw/openclaw#51"],
+  );
+  assert.match(result.quarantinedItems[0]?.reason ?? "", /changed after mutation preparation/);
+  assert.equal(
+    git(fixture.origin, "show", "state:records/openclaw-openclaw/items/50.md"),
+    "item 50\n",
+  );
+  assert.equal(
+    git(fixture.origin, "show", "state:records/openclaw-openclaw/items/52.md"),
+    "item 52\n",
+  );
+  assert.equal(
+    git(fixture.origin, "show", "state:records/existing.md"),
+    "raced by another writer\n",
+  );
+});
+
+test("a batch that quarantines an item down to one survivor is retry-idempotent", () => {
+  const fixture = createRepositoryFixture();
+  const healthy = newItemPlan(fixture, 60);
+  const expectedOid = git(fixture.work, "rev-parse", "state:records/existing.md").trim();
+  const poisoned = withStateEnvironment(fixture.work, () =>
+    prepareStateMutationPlan({
+      identity: { itemKey: "openclaw/openclaw#61", revision: 1, claimGeneration: 1 },
+      operations: [{ path: "records/existing.md", expectedOid, content: "candidate\n" }],
+    }),
+  );
+  publishSibling(fixture, "records/existing.md", "raced by another writer\n");
+
+  const first = withStateEnvironment(fixture.work, () =>
+    commitPreparedStateBatch({
+      batchId: "quarantine-retry",
+      plans: [healthy, poisoned],
+    }),
+  );
+  const retried = withStateEnvironment(fixture.work, () =>
+    commitPreparedStateBatch({
+      batchId: "quarantine-retry",
+      plans: [healthy, poisoned],
+    }),
+  );
+
+  assert.equal(first.outcome, "committed");
+  assert.equal(retried.outcome, "already_committed");
+  assert.equal(retried.commitSha, first.commitSha);
+  assert.deepEqual(
+    retried.quarantinedItems.map((item) => item.itemKey),
+    ["openclaw/openclaw#61"],
+  );
+});
+
 test("remote same-path drift is fenced before push", () => {
   const fixture = createRepositoryFixture();
   const expectedOid = git(fixture.work, "rev-parse", "state:records/existing.md").trim();
@@ -486,13 +589,13 @@ test("remote same-path drift is fenced before push", () => {
   publishSibling(fixture, "records/existing.md", "newer remote\n");
   const before = git(fixture.origin, "rev-parse", "state").trim();
 
-  assert.throws(
-    () =>
-      withStateEnvironment(fixture.work, () =>
-        commitPreparedStateBatch({ batchId: "same-path-drift", plans: [plan] }),
-      ),
-    /changed after mutation preparation/,
+  const result = withStateEnvironment(fixture.work, () =>
+    commitPreparedStateBatch({ batchId: "same-path-drift", plans: [plan] }),
   );
+  assert.equal(result.outcome, "quarantined");
+  assert.equal(result.commitSha, null);
+  assert.equal(result.quarantinedItems.length, 1);
+  assert.match(result.quarantinedItems[0].reason, /changed after mutation preparation/);
   assert.equal(git(fixture.origin, "rev-parse", "state").trim(), before);
   assert.equal(git(fixture.origin, "show", "state:records/existing.md"), "newer remote\n");
 });
@@ -646,13 +749,12 @@ test("literal Git path names cannot bypass the remote compare-and-swap fence", (
     }),
   );
 
-  assert.throws(
-    () =>
-      withStateEnvironment(fixture.work, () =>
-        commitPreparedStateBatch({ batchId: "literal-path-fence", plans: [plan] }),
-      ),
-    /changed after mutation preparation/,
+  const result = withStateEnvironment(fixture.work, () =>
+    commitPreparedStateBatch({ batchId: "literal-path-fence", plans: [plan] }),
   );
+  assert.equal(result.outcome, "quarantined");
+  assert.equal(result.quarantinedItems.length, 1);
+  assert.match(result.quarantinedItems[0].reason, /changed after mutation preparation/);
   assert.equal(git(fixture.origin, "show", `state:${literalPath}`), "remote literal\n");
 });
 
@@ -958,6 +1060,36 @@ function installMultiRefAndFirstStateFailure(origin: string): void {
     ].join("\n"),
   );
   fs.chmodSync(hook, 0o755);
+}
+
+function installMultiRefAndStateBranchCommitRefsFailure(origin: string): { statePush: string } {
+  const hook = path.join(origin, "hooks", "pre-receive");
+  const rejectedStateMarker = path.join(origin, "hooks", "rejected-state-branch-commit-refs-once");
+  fs.writeFileSync(
+    hook,
+    [
+      "#!/bin/sh",
+      "count=0",
+      'only_ref=""',
+      "while read -r old_oid new_oid ref_name; do",
+      "  count=$((count + 1))",
+      '  only_ref="$ref_name"',
+      "done",
+      'if [ "$count" -ge 2 ]; then',
+      '  echo "fatal error in commit_refs" >&2',
+      "  exit 1",
+      "fi",
+      `if [ "$only_ref" = "refs/heads/state" ] && [ ! -f '${rejectedStateMarker}' ]; then`,
+      `  touch '${rejectedStateMarker}'`,
+      '  echo "fatal error in commit_refs" >&2',
+      "  exit 1",
+      "fi",
+      "exit 0",
+      "",
+    ].join("\n"),
+  );
+  fs.chmodSync(hook, 0o755);
+  return { statePush: rejectedStateMarker };
 }
 
 function configureUser(root: string): void {
