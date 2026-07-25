@@ -10,7 +10,7 @@ The sequence proves:
 
 - visible partial-telemetry diagnostics;
 - the Bay timing badge naming its bounded **review trigger → final review** measurement, completed by the command-status update emitted after the durable review summary;
-- a 390px portrait layout that stacks Arriving through Applying vertically, keeps the terminal pools at the waterline, and has no horizontal page overflow;
+- a 390px portrait layout that stacks Arriving through Publishing and Applying vertically, keeps the terminal pools at the waterline, and has no horizontal page overflow;
 - advancing crustacean-claw and master-sweeper animations;
 - a READY flag followed by a physical forward sweep and landing;
 - a changed run ID using the retrigger tunnel and resurfacing path;
@@ -18,7 +18,7 @@ The sequence proves:
 - repository filtering;
 - the read-only drawer's safe GitHub item, job, and workflow-run links;
 - readable overflow controls that open the known queue sample and explicitly explain when aggregate queue IDs are outside the bounded public projection;
-- compact review-admission and result-publication charts with labelled y-axes, exact point hover labels, and cached 6-hour, 24-hour, and 7-day range controls;
+- compact review-admission, result-publication, and State writer charts with labelled y-axes, exact point hover labels, and cached 6-hour, 24-hour, and 7-day range controls;
 - lightweight hover/focus explanations on the beach lane signs;
 - the local-only tide preview advancing through incoming, crest, backwash, and restored states while preserving terminal keys and count;
 - the short static reduced-motion tide cue preserving the same preview state;

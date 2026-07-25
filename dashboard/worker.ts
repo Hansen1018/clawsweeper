@@ -3351,19 +3351,22 @@ async function activeWorkerSnapshot(
   const detailRuns: WorkflowRunSummary[] = runs.slice(0, detailRunLimit);
   const results = await mapWithConcurrency(detailRuns, fetchConcurrency, async (run) => {
     try {
-      const jobs = await workflowJobsForRun(env, repo, run.id, github);
+      const jobs = await workflowJobsForRun(env, repo, run.id, github, run);
+      const activeJobs = jobs.filter((job) => isActiveWorkflowJob(job));
       return {
         run,
-        workers: jobs
-          .filter((job) => isActiveWorkflowJob(job) && isCodexWorkerJob(job))
+        workers: activeJobs
+          .filter((job) => isDashboardWorkerJob(job, run))
           .map((job) => normalizeWorkerJob(run, job)),
-        hasWorkerJobs: jobs.some((job) => isCodexWorkerJob(job)),
+        codexWorkers: activeJobs.filter((job) => isCodexWorkerJob(job)).length,
+        hasWorkerJobs: jobs.some((job) => isDashboardWorkerJob(job, run)),
         error: null,
       };
     } catch (error) {
       return {
         run,
         workers: [],
+        codexWorkers: 0,
         hasWorkerJobs: false,
         error: error instanceof Error ? error.message : String(error),
       };
@@ -3372,12 +3375,15 @@ async function activeWorkerSnapshot(
   const workers = [];
   const errors = [];
   let fallbacks = 0;
+  let codexWorkers = 0;
   for (const result of results) {
+    codexWorkers += result.codexWorkers;
     if (result.error) {
       errors.push(`workflow jobs ${result.run.id}: ${result.error}`);
       if (isCodexWorkflowFallback(result.run)) {
         workers.push(normalizeFallbackWorker(result.run));
         fallbacks += 1;
+        codexWorkers += 1;
       }
       continue;
     }
@@ -3386,12 +3392,14 @@ async function activeWorkerSnapshot(
     } else if (!result.hasWorkerJobs && isCodexWorkflowFallback(result.run)) {
       workers.push(normalizeFallbackWorker(result.run));
       fallbacks += 1;
+      codexWorkers += 1;
     }
   }
   for (const run of runs.slice(detailRunLimit)) {
     if (!isCodexWorkflowFallback(run)) continue;
     workers.push(normalizeFallbackWorker(run));
     fallbacks += 1;
+    codexWorkers += 1;
   }
   workers.sort(
     (left, right) =>
@@ -3401,7 +3409,7 @@ async function activeWorkerSnapshot(
   );
   await attachWorkerTargets(env, workers, errors);
   return {
-    count: workers.length,
+    count: codexWorkers,
     workers,
     detailRuns: detailRuns.length,
     fallbacks,
@@ -3444,7 +3452,7 @@ async function recentWorkerHealth(
   const results = await mapWithConcurrency(completedRuns, fetchConcurrency, async (run) => {
     try {
       return {
-        attempts: (await workflowJobsForRun(env, repo, run.id, github))
+        attempts: (await workflowJobsForRun(env, repo, run.id, github, run))
           .filter((job) => isCodexWorkerJob(job))
           .map((job) => workerHealthAttempt(run, job))
           .filter(Boolean),
@@ -4340,6 +4348,7 @@ async function workflowJobsForRun(
   repo,
   runId,
   github: GithubJsonReader = (path) => githubJson(env, path),
+  run?: WorkflowRunSummary,
 ) {
   const key = `workflow-jobs:${repo}:${runId}`;
   const cached = await readStoredJson(env, key);
@@ -4359,7 +4368,9 @@ async function workflowJobsForRun(
       break;
     }
   }
-  const hasActiveWorker = jobs.some((job) => isActiveWorkflowJob(job) && isCodexWorkerJob(job));
+  const hasActiveWorker = jobs.some(
+    (job) => isActiveWorkflowJob(job) && isDashboardWorkerJob(job, run),
+  );
   await writeStoredJson(
     env,
     key,
@@ -4384,6 +4395,25 @@ function isCodexWorkerJob(job) {
   );
 }
 
+function isExactReviewPublicationJob(job, run?: WorkflowRunSummary) {
+  const name = String(job?.name || "");
+  const steps = Array.isArray(job?.steps) ? job.steps : [];
+  const workflow = `${run?.name || ""} ${run?.display_title || ""}`;
+  return (
+    /publish (?:exact )?review artifacts?/i.test(name) ||
+    (/publish exact review batch/i.test(workflow) && /^publish$/i.test(name)) ||
+    steps.some((step) =>
+      /claim durable exact review publication|claim one durable publication batch|finalize healthy members under a fenced heartbeat|publish event result and apply safe close|complete durable exact review publication|apply review artifacts|publish review artifact action ledger|commit review records/i.test(
+        String(step?.name || ""),
+      ),
+    )
+  );
+}
+
+function isDashboardWorkerJob(job, run?: WorkflowRunSummary) {
+  return isCodexWorkerJob(job) || isExactReviewPublicationJob(job, run);
+}
+
 function normalizeWorkerJob(run, job) {
   const runItem = classifyRun(run);
   const target = workerTargetFromJob(runItem, job.name);
@@ -4406,6 +4436,7 @@ function normalizeWorkerJob(run, job) {
   return {
     id: job.id,
     source: "job",
+    is_codex_worker: isCodexWorkerJob(job),
     name: String(job.name || runItem.title || "Codex worker"),
     mode,
     work_kind: workKind,
@@ -4465,6 +4496,7 @@ function normalizeFallbackWorker(run) {
   return {
     id: `run-${run.id}`,
     source: "workflow-fallback",
+    is_codex_worker: true,
     name: item.title || item.workflow || "Codex worker",
     mode: item.mode,
     work_kind: workerWorkKind(item, ""),
@@ -6308,7 +6340,7 @@ function workflowRunSummary(run) {
 function isCodexWorkflowFallback(run) {
   const name = `${run?.name || ""} ${run?.display_title || ""}`;
   if (
-    /repair comment router|clawsweeper_comment|@publish:|publish exact review artifact|exact.review publication|reconcile exact.review lease|sync codex review comments/i.test(
+    /repair comment router|clawsweeper_comment|@publish:|publish (?:exact )?review (?:artifacts?|batch)|exact.review publication|reconcile exact.review lease|sync codex review comments/i.test(
       name,
     )
   ) {
@@ -6327,13 +6359,16 @@ function controlPlaneSnapshot(runs) {
   };
   for (const run of runs) {
     const name = `${run?.name || ""} ${run?.display_title || ""}`;
-    const lane = /@publish:|publish exact review artifact|exact.review publication/i.test(name)
-      ? snapshot.publishers
-      : /repair comment router|clawsweeper_comment|sync codex review comments/i.test(name)
-        ? snapshot.comment_routers
-        : /reconcile exact.review lease/i.test(name)
-          ? snapshot.reconcilers
-          : null;
+    const lane =
+      /@publish:|publish (?:exact )?review (?:artifacts?|batch)|exact.review publication/i.test(
+        name,
+      )
+        ? snapshot.publishers
+        : /repair comment router|clawsweeper_comment|sync codex review comments/i.test(name)
+          ? snapshot.comment_routers
+          : /reconcile exact.review lease/i.test(name)
+            ? snapshot.reconcilers
+            : null;
     if (!lane) continue;
     if (run.status === "in_progress") lane.running += 1;
     else lane.waiting += 1;
@@ -9174,6 +9209,7 @@ function laneFlowDetails(laneKey, flow) {
 }
 function renderSystemMap(data) {
   const workers = data.workers || [];
+  const codexWorkers = workers.filter(worker => worker.is_codex_worker !== false);
   const pipeline = data.pipeline || [];
   const fleet = data.fleet || {};
   const workerRunIds = new Set(workers.map(worker => String(worker.run_id)));
@@ -9183,7 +9219,7 @@ function renderSystemMap(data) {
   const nodes = [
     ["01 · Intake", fleet.queued_workflow_runs || 0, "Events and scheduled sweeps waiting to start"],
     ["02 · Plan", planning, "Runs selecting work or expanding a matrix"],
-    ["03 · Workers", workers.length, "Codex jobs reviewing, repairing, or assisting"],
+    ["03 · Workers", codexWorkers.length, "Codex jobs reviewing, repairing, or assisting"],
     ["04 · Apply", applying, "Deterministic comment, close, merge, and publish lanes"],
     ["05 · Results", closed, (data.recent?.closed_stats?.window_hours || 24) + "h ClawSweeper closes"]
   ];
@@ -9191,8 +9227,8 @@ function renderSystemMap(data) {
     '<div class="flow-node"><span>' + esc(node[0]) + '</span><strong>' + fmt.format(node[1]) + '</strong><p>' + esc(node[2]) + '</p></div>'
   ).join("");
   const budget = Math.max(0, fleet.worker_budget || 0);
-  const running = workers.filter(worker => worker.status === "in_progress").length;
-  const waiting = workers.length - running;
+  const running = codexWorkers.filter(worker => worker.status === "in_progress").length;
+  const waiting = codexWorkers.length - running;
   const free = Math.max(0, budget - running - waiting);
   const overflow = Math.max(0, running + waiting - budget);
   const share = value => budget ? Math.min(100, (value / budget) * 100) : 0;
@@ -9713,7 +9749,7 @@ function renderDashboard(data, note) {
       );
   const severity = serverHealth?.severity ||
     (handoffStatus === "stalled" || operationalStatus === "stalled" ? "red" : needsAttention ? "amber" : "green");
-  const workerCount = (data.workers || []).length;
+  const workerCount = (data.workers || []).filter(worker => worker.is_codex_worker !== false).length;
   const repoCount = (data.source.target_repositories || []).length;
   document.getElementById("hero-dot").className = "hero-dot " + (severity === "green" ? "ok" : severity);
   document.getElementById("hero-headline").textContent =

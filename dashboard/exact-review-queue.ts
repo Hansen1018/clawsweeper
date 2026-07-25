@@ -1880,7 +1880,10 @@ export class ExactReviewQueue {
         stateWriterCoordinatorQueuedStaleMs(this.env),
       );
       const publicationBatches = this.batchStore.stats(now);
-      const batchOwnedItemKeys = new Set<string>(publicationBatches.activeItemKeys);
+      const batchByItemKey = new Map<string, ExactReviewBayBatchOwner>(
+        publicationBatches.activeItemBatches.map((batch) => [batch.itemKey, batch] as const),
+      );
+      const batchOwnedItemKeys = new Set<string>(batchByItemKey.keys());
       const freshPublicationItemKeys = this.freshPublicationItemKeysSync(state, now);
       const legacyExcludedItemKeys = new Set(batchOwnedItemKeys);
       if (exactReviewPublicationBatchingEnabled(this.env)) {
@@ -1920,7 +1923,11 @@ export class ExactReviewQueue {
       return json({
         ...stats,
         pressure: elevateExactReviewPressureForPublication(stats.pressure, publicationHealth),
-        bay_projection: exactReviewQueueBayProjection(Object.values(state.items), bayPriorityKeys),
+        bay_projection: exactReviewQueueBayProjection(
+          Object.values(state.items),
+          bayPriorityKeys,
+          batchByItemKey,
+        ),
         lanes: {
           review: {
             ...stats.lanes.review,
@@ -7257,7 +7264,9 @@ function exactReviewQueueLane(item: ExactReviewQueueItem) {
 // state. Keep this representation bounded and scrubbed: it is public dashboard
 // data, not a queue-inspection API. Live workers remain the authority for the
 // reviewing stage; these records only make the otherwise invisible admission,
-// setup, publication, and recovery phases visible.
+// setup, publication, and recovery phases visible. Publication is distinct
+// from the publisher workflow's deterministic follow-up, which the Bay shows
+// from the live worker as Applying.
 const EXACT_REVIEW_BAY_SAMPLE_LIMIT = 24;
 // The dashboard can retain both a terminal-buffer card and its washed card
 // while their live queue retry is pending. Accept all bounded Bay candidates
@@ -7267,6 +7276,7 @@ const EXACT_REVIEW_BAY_STAGES = [
   "arriving",
   "setting-up",
   "reviewing",
+  "publishing",
   "applying",
   "repairing",
 ] as const;
@@ -7280,10 +7290,28 @@ type ExactReviewBayProjectionItem = {
   created_at: string;
   updated_at: string;
   next_attempt_at: string;
+  batch_id?: string;
+  batch_created_at?: string;
 };
 
-function exactReviewQueueBayStage(item: ExactReviewQueueItem): ExactReviewBayStage {
-  if (exactReviewQueueIsPublication(item)) return "applying";
+type ExactReviewBayBatchOwner = {
+  batchId: string;
+};
+
+function exactReviewQueueBayStage(
+  item: ExactReviewQueueItem,
+  batchByItemKey: ReadonlyMap<string, ExactReviewBayBatchOwner> = new Map(),
+): ExactReviewBayStage {
+  // A parked item is deliberately no longer making normal queue progress. This
+  // includes bounded review-retry exhaustion, permanent dispatch rejection,
+  // and a publication that needs its dead-letter/recovery path. Keep it in the
+  // exception cove instead of making it look like an active setup or publisher.
+  if (item.state === "parked") return "repairing";
+  // The batch publisher's GitHub job is intentionally targetless. Its durable
+  // batch membership is the authoritative bounded source for the individual
+  // items it is currently applying, without another GitHub lookup.
+  if (batchByItemKey.has(item.key)) return "applying";
+  if (exactReviewQueueIsPublication(item)) return "publishing";
   if (isLowPriorityExactReviewDecision(item.decision)) return "repairing";
   return item.state === "pending" ? "arriving" : "setting-up";
 }
@@ -7306,22 +7334,31 @@ function exactReviewQueueBayPriorityKeys(values: string[]) {
 function exactReviewQueueBayProjection(
   items: ExactReviewQueueItem[],
   priorityItemKeys: string[] = [],
+  batchByItemKey: ReadonlyMap<string, ExactReviewBayBatchOwner> = new Map(),
 ) {
   const projected = new Map<string, ExactReviewBayProjectionItem>();
   for (const item of items) {
-    if (item.state === "parked") continue;
+    // Parked records are not terminal outcomes: they remain bounded durable
+    // queue work that needs recovery. Keep their already-scrubbed identity in
+    // the projection so Bay shows the exception rather than a false empty lane.
     const repository = String(item.decision.targetRepo || "").trim();
     const itemNumber = Number(item.decision.itemNumber);
     if (!repository || !Number.isSafeInteger(itemNumber) || itemNumber <= 0) continue;
+    const batch = batchByItemKey.get(item.key);
     const candidate: ExactReviewBayProjectionItem = {
       item_key: `${repository}#${itemNumber}`,
       repository,
       item_number: itemNumber,
-      stage: exactReviewQueueBayStage(item),
+      stage: exactReviewQueueBayStage(item, batchByItemKey),
       queue_state: item.state,
       created_at: new Date(item.createdAt).toISOString(),
       updated_at: new Date(item.updatedAt).toISOString(),
       next_attempt_at: new Date(item.nextAttemptAt).toISOString(),
+      ...(batch
+        ? {
+            batch_id: batch.batchId,
+          }
+        : {}),
     };
     const previous = projected.get(candidate.item_key);
     const candidateUpdatedAt = Date.parse(candidate.updated_at);
