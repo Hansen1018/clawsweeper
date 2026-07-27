@@ -330,7 +330,12 @@ type ExactReviewQueueMetricDelta = {
   publicationDeadLettered?: number;
   publicationRefreshed?: number;
 };
-type StateAppendKind = "sweep_status" | "comment_router" | "apply_proof" | "record_tuple";
+type StateAppendKind =
+  | "sweep_status"
+  | "comment_router"
+  | "apply_proof"
+  | "record_tuple"
+  | "cluster_intake";
 type StateAppendRecord = {
   kind: StateAppendKind;
   key: string;
@@ -452,6 +457,7 @@ const STATE_APPEND_KINDS = new Set<StateAppendKind>([
   "sweep_status",
   "comment_router",
   "apply_proof",
+  "cluster_intake",
 ]);
 const DEFAULT_STATE_APPEND_MAX_PENDING_ROWS = 50_000;
 const DEFAULT_STATE_APPEND_MAX_PENDING_BYTES = 100 * 1024 * 1024;
@@ -460,6 +466,7 @@ const DEFAULT_STATE_APPEND_MAX_RECORD_BYTES = 256 * 1024;
 // residual lease contention during the #738 transition).
 const DEFAULT_STATE_APPEND_DRAIN_LEASE_MS = 30 * 60 * 1000;
 const STATE_APPEND_MATERIALIZATION_RETRY_LIMIT = 3;
+const STATE_APPEND_MAX_CONSECUTIVE_INTAKE_ONLY_DRAINS = 1;
 const EXACT_REVIEW_REVIEW_TELEMETRY_TABLE = "exact_review_review_telemetry";
 const EXACT_REVIEW_RUN_TELEMETRY_TABLE = "exact_review_run_telemetry";
 const EXACT_REVIEW_STATE_WRITER_OPERATION_TABLE = "exact_review_state_writer_operations";
@@ -5401,7 +5408,7 @@ export class ExactReviewQueue {
     this.storage.sql.exec(
       `CREATE TABLE IF NOT EXISTS ${STATE_APPEND_WINDOW_TABLE} (
          seq INTEGER PRIMARY KEY AUTOINCREMENT,
-         kind TEXT NOT NULL CHECK (kind IN ('sweep_status', 'comment_router', 'apply_proof', 'record_tuple')),
+         kind TEXT NOT NULL CHECK (kind IN ('sweep_status', 'comment_router', 'apply_proof', 'record_tuple', 'cluster_intake')),
          record_key TEXT NOT NULL,
          payload_json TEXT NOT NULL,
          payload_bytes INTEGER NOT NULL CHECK (payload_bytes >= 0),
@@ -5413,42 +5420,9 @@ export class ExactReviewQueue {
          materialization_last_error TEXT
        ) STRICT`,
     );
-    const stateAppendTableRow = Array.from(
-      this.storage.sql.exec(
-        `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?`,
-        STATE_APPEND_WINDOW_TABLE,
-      ),
-    )[0] as { sql?: string } | undefined;
-    const stateAppendTableSql = String(stateAppendTableRow?.sql || "");
-    if (!stateAppendTableSql.includes("'record_tuple'")) {
-      this.storage.transactionSync(() => {
-        this.storage.sql.exec(
-          `CREATE TABLE state_append_window_v2 (
-             seq INTEGER PRIMARY KEY AUTOINCREMENT,
-             kind TEXT NOT NULL CHECK (kind IN ('sweep_status', 'comment_router', 'apply_proof', 'record_tuple')),
-             record_key TEXT NOT NULL,
-             payload_json TEXT NOT NULL,
-             payload_bytes INTEGER NOT NULL CHECK (payload_bytes >= 0),
-             produced_at TEXT NOT NULL,
-             delivery_id TEXT NOT NULL,
-             drain_token TEXT,
-             materialization_attempts INTEGER NOT NULL DEFAULT 0 CHECK (materialization_attempts >= 0),
-             materialization_first_failed_at INTEGER,
-             materialization_last_error TEXT
-           ) STRICT`,
-        );
-        this.storage.sql.exec(
-          `INSERT INTO state_append_window_v2
-             (seq, kind, record_key, payload_json, payload_bytes, produced_at, delivery_id, drain_token)
-           SELECT seq, kind, record_key, payload_json, payload_bytes, produced_at, delivery_id, drain_token
-             FROM ${STATE_APPEND_WINDOW_TABLE}`,
-        );
-        this.storage.sql.exec(`DROP TABLE ${STATE_APPEND_WINDOW_TABLE}`);
-        this.storage.sql.exec(
-          `ALTER TABLE state_append_window_v2 RENAME TO ${STATE_APPEND_WINDOW_TABLE}`,
-        );
-      });
-    }
+    // Durable Objects can skip intermediate deployments. Normalize columns
+    // introduced by the retry-history migration before rebuilding an older
+    // kind constraint, because the copy below preserves those values.
     for (const [column, definition] of [
       [
         "materialization_attempts",
@@ -5468,6 +5442,44 @@ export class ExactReviewQueue {
           `ALTER TABLE ${STATE_APPEND_WINDOW_TABLE} ADD COLUMN ${column} ${definition}`,
         );
       }
+    }
+    const stateAppendTableRow = Array.from(
+      this.storage.sql.exec(
+        `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?`,
+        STATE_APPEND_WINDOW_TABLE,
+      ),
+    )[0] as { sql?: string } | undefined;
+    const stateAppendTableSql = String(stateAppendTableRow?.sql || "");
+    if (!stateAppendTableSql.includes("'cluster_intake'")) {
+      this.storage.transactionSync(() => {
+        this.storage.sql.exec(
+          `CREATE TABLE state_append_window_v2 (
+             seq INTEGER PRIMARY KEY AUTOINCREMENT,
+             kind TEXT NOT NULL CHECK (kind IN ('sweep_status', 'comment_router', 'apply_proof', 'record_tuple', 'cluster_intake')),
+             record_key TEXT NOT NULL,
+             payload_json TEXT NOT NULL,
+             payload_bytes INTEGER NOT NULL CHECK (payload_bytes >= 0),
+             produced_at TEXT NOT NULL,
+             delivery_id TEXT NOT NULL,
+             drain_token TEXT,
+             materialization_attempts INTEGER NOT NULL DEFAULT 0 CHECK (materialization_attempts >= 0),
+             materialization_first_failed_at INTEGER,
+             materialization_last_error TEXT
+           ) STRICT`,
+        );
+        this.storage.sql.exec(
+          `INSERT INTO state_append_window_v2
+             (seq, kind, record_key, payload_json, payload_bytes, produced_at, delivery_id, drain_token,
+              materialization_attempts, materialization_first_failed_at, materialization_last_error)
+           SELECT seq, kind, record_key, payload_json, payload_bytes, produced_at, delivery_id, drain_token,
+                  materialization_attempts, materialization_first_failed_at, materialization_last_error
+             FROM ${STATE_APPEND_WINDOW_TABLE}`,
+        );
+        this.storage.sql.exec(`DROP TABLE ${STATE_APPEND_WINDOW_TABLE}`);
+        this.storage.sql.exec(
+          `ALTER TABLE state_append_window_v2 RENAME TO ${STATE_APPEND_WINDOW_TABLE}`,
+        );
+      });
     }
     this.storage.sql.exec(
       `CREATE INDEX IF NOT EXISTS state_append_window_drain_seq
@@ -5497,9 +5509,24 @@ export class ExactReviewQueue {
     this.storage.sql.exec(
       `CREATE TABLE IF NOT EXISTS ${STATE_APPEND_META_TABLE} (
          singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
-         shed_since_reset INTEGER NOT NULL DEFAULT 0 CHECK (shed_since_reset >= 0)
+         shed_since_reset INTEGER NOT NULL DEFAULT 0 CHECK (shed_since_reset >= 0),
+         consecutive_intake_only_drains INTEGER NOT NULL DEFAULT 0
+           CHECK (consecutive_intake_only_drains >= 0)
        ) STRICT`,
     );
+    const intakeDrainBudgetPresent = Array.from(
+      this.storage.sql.exec(
+        `SELECT name FROM pragma_table_info('${STATE_APPEND_META_TABLE}')
+          WHERE name = 'consecutive_intake_only_drains'`,
+      ),
+    ).length;
+    if (!intakeDrainBudgetPresent) {
+      this.storage.sql.exec(
+        `ALTER TABLE ${STATE_APPEND_META_TABLE}
+           ADD COLUMN consecutive_intake_only_drains INTEGER NOT NULL DEFAULT 0
+             CHECK (consecutive_intake_only_drains >= 0)`,
+      );
+    }
     this.storage.sql.exec(
       `INSERT OR IGNORE INTO ${STATE_APPEND_META_TABLE} (singleton_id) VALUES (1)`,
     );
@@ -7044,14 +7071,26 @@ export class ExactReviewQueue {
       };
     }
 
+    const appendMeta = Array.from(
+      this.storage.sql.exec(
+        `SELECT consecutive_intake_only_drains
+           FROM ${STATE_APPEND_META_TABLE}
+          WHERE singleton_id = 1`,
+      ),
+    )[0] as { consecutive_intake_only_drains?: number } | undefined;
+    const prioritizeOrdinary =
+      Number(appendMeta?.consecutive_intake_only_drains || 0) >=
+      STATE_APPEND_MAX_CONSECUTIVE_INTAKE_ONLY_DRAINS;
     const candidates = Array.from(
       this.storage.sql.exec(
         `SELECT seq, kind, record_key, payload_json, payload_bytes, produced_at, delivery_id,
                 materialization_attempts, materialization_first_failed_at, materialization_last_error
            FROM ${STATE_APPEND_WINDOW_TABLE}
           WHERE drain_token IS NULL
-          ORDER BY seq
+          ORDER BY CASE WHEN kind = 'cluster_intake' THEN ? ELSE ? END, seq
           LIMIT ?`,
+        prioritizeOrdinary ? 1 : 0,
+        prioritizeOrdinary ? 0 : 1,
         maxRows,
       ) as Iterable<StateAppendWindowRow>,
     );
@@ -7064,6 +7103,18 @@ export class ExactReviewQueue {
     }
     if (!rows.length) return { token: null, expiresAt: null, rows };
 
+    const intakeOnly = rows.every((row) => row.kind === "cluster_intake");
+    this.storage.sql.exec(
+      `UPDATE ${STATE_APPEND_META_TABLE}
+          SET consecutive_intake_only_drains = CASE
+                WHEN ? THEN MIN(consecutive_intake_only_drains + 1, ?)
+                ELSE 0
+              END
+        WHERE singleton_id = 1`,
+      intakeOnly ? 1 : 0,
+      STATE_APPEND_MAX_CONSECUTIVE_INTAKE_ONLY_DRAINS,
+    );
+
     const token = crypto.randomUUID();
     const expiresAt = now + stateAppendDrainLeaseMs(this.env);
     this.storage.sql.exec(
@@ -7073,13 +7124,25 @@ export class ExactReviewQueue {
       now,
       expiresAt,
     );
-    this.storage.sql.exec(
-      `UPDATE ${STATE_APPEND_WINDOW_TABLE}
-          SET drain_token = ?
-        WHERE drain_token IS NULL AND seq <= ?`,
-      token,
-      rows.at(-1)?.seq,
-    );
+    const selectedSequences = rows.map((row) => Number(row.seq));
+    for (
+      let offset = 0;
+      offset < selectedSequences.length;
+      offset += EXACT_REVIEW_QUEUE_SQL_BINDING_ROW_BATCH
+    ) {
+      const batch = selectedSequences.slice(
+        offset,
+        offset + EXACT_REVIEW_QUEUE_SQL_BINDING_ROW_BATCH,
+      );
+      const placeholders = batch.map(() => "?").join(",");
+      this.storage.sql.exec(
+        `UPDATE ${STATE_APPEND_WINDOW_TABLE}
+            SET drain_token = ?
+          WHERE drain_token IS NULL AND seq IN (${placeholders})`,
+        token,
+        ...batch,
+      );
+    }
     return { token, expiresAt, rows };
   }
 
@@ -10236,8 +10299,8 @@ function stateWriterTicketInput(value: unknown): StateWriterTicketInput | null {
   const runId = boundedStateWriterIdentity(body.run_id);
   const runAttempt = Number(body.run_attempt);
   const writerClass =
-    body.writer_class === "publication_batch"
-      ? "publication_batch"
+    body.writer_class === "publication_batch" || body.writer_class === "cluster_intake"
+      ? body.writer_class
       : body.writer_class === "ordinary" || body.writer_class === undefined
         ? "ordinary"
         : null;
