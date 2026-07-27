@@ -380,6 +380,69 @@ test("exact-review supersession audit migration preserves legacy records", () =>
   assert.equal(rollbackAudit[0]?.reason_code, "newer_source_event");
 });
 
+test("exact-review supersession audit migration keeps existing rows non-authoritative", async () => {
+  const storage = new MemoryDurableStorage();
+  storage.sql.exec(`CREATE TABLE exact_review_queue_supersessions (
+    audit_id TEXT PRIMARY KEY,
+    item_key TEXT NOT NULL,
+    prior_revision INTEGER NOT NULL CHECK (prior_revision >= 1),
+    next_revision INTEGER NOT NULL CHECK (next_revision > prior_revision),
+    superseded_run_id TEXT,
+    source_action TEXT NOT NULL,
+    reason_code TEXT NOT NULL DEFAULT 'newer_source_event',
+    superseded_at INTEGER NOT NULL
+  ) STRICT`);
+  storage.sql.exec(
+    `INSERT INTO exact_review_queue_supersessions
+       (audit_id, item_key, prior_revision, next_revision, superseded_run_id,
+        source_action, reason_code, superseded_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    "existing-audit",
+    "openclaw/openclaw#113454",
+    7,
+    8,
+    "30138593401",
+    "synchronize",
+    "newer_source_event",
+    1_785_000_000_002,
+  );
+
+  const queue = new ExactReviewQueue({ storage }, {});
+
+  const rows = Array.from(
+    storage.sql.exec(
+      `SELECT superseded_lease_id, superseded_run_attempt,
+              superseded_claim_generation, superseded_protocol_version
+         FROM exact_review_queue_supersessions`,
+    ),
+  ).map((row) => ({ ...row }));
+  assert.deepEqual(rows, [
+    {
+      superseded_lease_id: null,
+      superseded_run_attempt: null,
+      superseded_claim_generation: null,
+      superseded_protocol_version: null,
+    },
+  ]);
+
+  const completion = await queue.fetch(
+    new Request("https://clawsweeper-exact-review-queue/complete", {
+      method: "POST",
+      body: JSON.stringify({
+        lease_id: "legacy-lease",
+        item_key: "openclaw/openclaw#113454",
+        lease_revision: 7,
+        claim_generation: 1,
+        run_id: "30138593401",
+        run_attempt: 1,
+        outcome: "success",
+      }),
+    }),
+  );
+  assert.equal(completion.status, 409);
+  assert.deepEqual(await completion.json(), { error: "lease_not_claimed" });
+});
+
 test("automerge reliability summarizes failures, recovery, duration, and stalled runs", () => {
   const run = (
     id: number,
@@ -968,7 +1031,8 @@ test("superseding source revisions revoke the old lease without Actions cancella
       Array.from(
         storage.sql.exec(
           `SELECT item_key, prior_revision, next_revision, superseded_run_id,
-                  source_action, superseded_at
+                  superseded_lease_id, superseded_run_attempt, superseded_claim_generation,
+                  superseded_protocol_version, source_action, superseded_at
              FROM exact_review_queue_supersessions`,
         ),
         (row) => ({ ...row }),
@@ -978,7 +1042,11 @@ test("superseding source revisions revoke the old lease without Actions cancella
           item_key: "openclaw/openclaw#753",
           prior_revision: 1,
           next_revision: 2,
+          superseded_lease_id: "lease-753",
           superseded_run_id: "7530",
+          superseded_run_attempt: 1,
+          superseded_claim_generation: 1,
+          superseded_protocol_version: 2,
           source_action: "synchronize",
           superseded_at: now,
         },
@@ -1000,7 +1068,10 @@ test("superseding source revisions revoke the old lease without Actions cancella
       }),
     );
     assert.equal(staleCompletion.status, 409);
-    assert.deepEqual(await staleCompletion.json(), { error: "lease_not_claimed" });
+    assert.deepEqual(await staleCompletion.json(), {
+      error: "lease_superseded",
+      superseded_by_revision: 2,
+    });
   } finally {
     Date.now = originalNow;
   }
@@ -7773,7 +7844,27 @@ test("a newer exact-review enqueue revokes a claimed immutable decision", async 
     }),
   );
   assert.equal(complete.status, 409);
-  assert.deepEqual(await complete.json(), { error: "lease_not_claimed" });
+  assert.deepEqual(await complete.json(), {
+    error: "lease_superseded",
+    superseded_by_revision: 2,
+  });
+
+  const mismatchedGeneration = await queue.fetch(
+    new Request("https://clawsweeper-exact-review-queue/complete", {
+      method: "POST",
+      body: JSON.stringify({
+        lease_id: "lease-620",
+        item_key: "openclaw/openclaw#620",
+        lease_revision: 1,
+        claim_generation: 2,
+        run_id: "6200",
+        run_attempt: 1,
+        outcome: "success",
+      }),
+    }),
+  );
+  assert.equal(mismatchedGeneration.status, 409);
+  assert.deepEqual(await mismatchedGeneration.json(), { error: "lease_not_claimed" });
 });
 
 test("a newer exact-review enqueue revokes a claimed legacy workflow lease", async () => {
