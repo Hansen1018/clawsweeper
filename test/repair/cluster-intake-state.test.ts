@@ -17,6 +17,7 @@ import {
   markClusterIntakeDispatchClaimed,
   markClusterIntakeDispatched,
   mergeClusterIntakeLedger,
+  mergeClusterSelectorDecisionLedger,
   verifyClusterLedgerEntryAcceptedIntent,
 } from "../../dist/repair/cluster-intake-state.js";
 import {
@@ -84,7 +85,26 @@ require_fix_before_close: true
     runner: "blacksmith-4vcpu-ubuntu-2404",
     execution_runner: "blacksmith-16vcpu-ubuntu-2404",
     model: "internal",
-    selector_summary: { evaluated: 10, rejected: 9, reason_counts: { stale: 4 } },
+    selector_summary: { evaluated: 2, rejected: 1, reason_counts: { model_rejected: 1 } },
+    selector_decision: {
+      rationale: "The cluster is narrow, current, and has a concrete validation path.",
+      assessments: [
+        {
+          cluster_id: 42,
+          decision: "selected",
+          rationale: "The two live reports describe one reproducible defect.",
+          candidate_refs: [420, 421],
+          cluster_refs: [420, 421],
+        },
+        {
+          cluster_id: 43,
+          decision: "rejected",
+          rationale: "The related report is already fixed on main.",
+          candidate_refs: [430],
+          cluster_refs: [430, 431],
+        },
+      ],
+    },
     jobs: [
       {
         cluster_id: 42,
@@ -184,7 +204,19 @@ require_fix_before_close: true
       runner: "blacksmith-4vcpu-ubuntu-2404",
       execution_runner: "blacksmith-16vcpu-ubuntu-2404",
       model: "internal",
-      selector_summary: { evaluated: 10, rejected: 9, reason_counts: { stale: 4 } },
+      selector_summary: { evaluated: 1, rejected: 0, reason_counts: {} },
+      selector_decision: {
+        rationale: "The cluster is narrow, current, and has a concrete validation path.",
+        assessments: [
+          {
+            cluster_id: clusterId,
+            decision: "selected",
+            rationale: "The live reports describe one reproducible defect.",
+            candidate_refs: [clusterId * 10, clusterId * 10 + 1],
+            cluster_refs: [clusterId * 10, clusterId * 10 + 1],
+          },
+        ],
+      },
       jobs: [
         {
           cluster_id: clusterId,
@@ -252,8 +284,22 @@ test("cluster intake materializes exact paths without deleting unrelated jobs", 
   assert.deepEqual(plan.deletes, []);
   assert.deepEqual(
     plan.publishPaths.sort(),
-    [value.jobs[0].path, "results/cluster-repair-intake/openclaw-openclaw.json"].sort(),
+    [
+      value.jobs[0].path,
+      "results/cluster-repair-intake/openclaw-openclaw.json",
+      "results/cluster-repair-intake/openclaw-openclaw.selector-decisions-v1.json",
+    ].sort(),
   );
+  const dispatchLedger = JSON.parse(
+    plan.writes.find(
+      (write) => write.path === "results/cluster-repair-intake/openclaw-openclaw.json",
+    )!.content,
+  ) as { stores: Array<Record<string, unknown>> };
+  assert.equal(Object.hasOwn(dispatchLedger.stores[0], "selector_decision"), false);
+  const selectorLedger = JSON.parse(
+    plan.writes.find((write) => write.path.endsWith(".selector-decisions-v1.json"))!.content,
+  ) as { stores: Array<{ selector_decision: { assessments: Array<Record<string, unknown>> } }> };
+  assert.equal(selectorLedger.stores[0].selector_decision.assessments[0].decision, "selected");
   assert.equal(
     plan.writes.some((write) => write.path === unrelated),
     false,
@@ -268,6 +314,76 @@ test("duplicate intake is idempotent and a completed dispatch never regresses", 
   assert.equal(Object.keys(replayed.clusters).length, 1);
   assert.equal(replayed.clusters["42"].status, "dispatched");
   assert.equal(replayed.stores.length, 1);
+});
+
+test("durable selector decisions preserve rejected clusters even when no job is selected", () => {
+  const proposal = {
+    ...receiptProposal(),
+    selector_summary: { evaluated: 1, rejected: 1, reason_counts: { model_rejected: 1 } },
+    selector_decision: {
+      rationale: "The only cluster is already fixed on main.",
+      assessments: [
+        {
+          cluster_id: 43,
+          decision: "rejected" as const,
+          rationale: "The reported behavior is covered by the current implementation.",
+          candidate_refs: [430],
+          cluster_refs: [430, 431],
+        },
+      ],
+    },
+    jobs: [],
+  };
+  const accepted = acceptClusterIntakeIntent(proposal, receiptSecret);
+  const ledger = mergeClusterIntakeLedger(undefined, [accepted]);
+  const selectorLedger = mergeClusterSelectorDecisionLedger(undefined, [accepted]);
+
+  assert.equal(ledger.stores[0].outcome, "selector_rejected");
+  assert.equal(Object.hasOwn(ledger.stores[0], "selector_decision"), false);
+  assert.deepEqual(selectorLedger?.stores[0].selector_decision, proposal.selector_decision);
+});
+
+test("selector decision sidecars merge stale snapshots without losing unrelated decisions", () => {
+  const first = intent(42, "a".repeat(64));
+  const second = intent(43, "b".repeat(64));
+  const initial = mergeClusterSelectorDecisionLedger(undefined, [first]);
+  assert(initial);
+  const merged = mergeClusterSelectorDecisionLedger(JSON.stringify(initial), [second, first]);
+
+  assert.deepEqual(
+    merged?.stores.flatMap((store) =>
+      store.selector_decision.assessments.map((assessment) => assessment.cluster_id),
+    ),
+    [42, 43],
+  );
+});
+
+test("selector decisions must match selected job identities and references", () => {
+  const wrongCluster = receiptProposal();
+  wrongCluster.selector_decision.assessments[0].cluster_id = 44;
+  assert.throws(
+    () => acceptClusterIntakeIntent(wrongCluster, receiptSecret),
+    /does not match selected jobs/,
+  );
+
+  const wrongReferences = receiptProposal();
+  wrongReferences.selector_decision.assessments[0].candidate_refs = [420];
+  assert.throws(
+    () => acceptClusterIntakeIntent(wrongReferences, receiptSecret),
+    /does not match selected job references/,
+  );
+});
+
+test("a cluster with one live candidate and closed context passes durable acceptance", () => {
+  const proposal = receiptProposal();
+  proposal.jobs[0].content = proposal.jobs[0].content.replace(
+    "candidates:\n  - #420\n  - #421",
+    "candidates:\n  - #420",
+  );
+  proposal.jobs[0].digest = createHash("sha256").update(proposal.jobs[0].content).digest("hex");
+  proposal.selector_decision.assessments[0].candidate_refs = [420];
+
+  assert.doesNotThrow(() => acceptClusterIntakeIntent(proposal, receiptSecret));
 });
 
 test("claiming a newer store preserves completed outcomes for older stores", () => {
@@ -405,6 +521,7 @@ test("every accepted job fits a complete workflow dispatch independently", () =>
   const accepted = acceptClusterIntakeIntent(
     {
       ...firstUnsigned,
+      selector_decision: null,
       jobs: [padToLimit(firstUnsigned.jobs[0]), padToLimit(secondUnsigned.jobs[0])],
     },
     receiptSecret,
@@ -1180,4 +1297,17 @@ test("v2 cluster intake ledgers reject unvalidated JSON shapes", () => {
     mutate(malformed);
     assert.throws(() => clusterIntakeLedger(malformed));
   }
+});
+
+test("selector decision sidecars reject unvalidated persisted shapes", () => {
+  const accepted = acceptClusterIntakeIntent(receiptProposal(), receiptSecret);
+  const ledger = mergeClusterSelectorDecisionLedger(undefined, [accepted]);
+  assert(ledger);
+  const malformed = JSON.parse(JSON.stringify(ledger)) as Record<string, unknown>;
+  const stores = malformed.stores as Array<Record<string, unknown>>;
+  const decision = stores[0].selector_decision as Record<string, unknown>;
+  const assessments = decision.assessments as Array<Record<string, unknown>>;
+  assessments[0].candidate_refs = [420, 999];
+
+  assert.throws(() => mergeClusterSelectorDecisionLedger(JSON.stringify(malformed), [accepted]));
 });

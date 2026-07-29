@@ -274,10 +274,15 @@ pnpm run repair:import-gitcrawl -- --from-gitcrawl --limit 40 --mode autonomous 
 # results/cluster-repair-intake/<repo>.json, and skips repeated ticks for the
 # same store snapshot. The selector model compares the candidate batch without
 # word lists, scores, or semantic thresholds, and dispatches at most one cluster
-# through the two-worker cluster_repair lane. Intake appends the selected job,
-# store identity, selector summary, and stable dispatch key to the Cloudflare
-# durable window before dispatch; the state materializer projects only those
-# exact paths and recovers pending dispatch without duplicating completed work.
+# through the two-worker cluster_repair lane. Clusters with one live candidate
+# and useful closed context remain eligible for model evaluation. Intake appends
+# the selected job, store identity, model rationale and per-cluster decisions,
+# and stable dispatch key to the Cloudflare durable window before dispatch.
+# Decisions materialize into a versioned sidecar, leaving the strict v2 dispatch
+# ledger readable by in-flight older workers. Rejected cluster IDs are remembered
+# instead of being offered again on the next snapshot; the state materializer
+# projects only selected job paths and recovers pending dispatch without
+# duplicating completed work.
 #
 # Durable intake dispatch guarantee: at-least-once workflow creation with
 # exactly-once worker execution intent. GitHub workflow_dispatch has no atomic
