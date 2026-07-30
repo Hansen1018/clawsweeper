@@ -16,7 +16,6 @@ const sections = [
     "Lanes",
     [
       "commit-sweeper.md",
-      "commit-dispatcher.md",
       "target-dispatcher.md",
       "pr-review-comments.md",
       "openclaw-event-hooks.md",
@@ -558,9 +557,9 @@ function landingBody() {
       desc: 'Bounded "review, fix, re-review, merge" loop for opted-in PRs and strict generated bug PRs.',
     },
     {
-      name: "Commit Review Lane",
+      name: "Local Branch Review",
       href: "commit-sweeper.html",
-      desc: "Reviews code-bearing commits on <code>main</code>. Skips non-code commits cheaply. Optional Check Runs.",
+      desc: "Offline pre-PR self-review of a branch's committed range. Never contacts GitHub.",
     },
   ];
   const laneCards = lanes
@@ -589,10 +588,7 @@ function landingBody() {
 <span class="comment"># records/openclaw-openclaw/items/812.md</span>
 <span class="comment"># durable comment marker: clawsweeper:review</span>
 <span class="prompt">$</span> pnpm run apply-decisions -- --target-repo openclaw/openclaw --limit 40
-<span class="comment"># guarded close/comment mutations only after live re-fetch</span>
-<span class="prompt">$</span> pnpm commit-reports -- --since 24h --findings
-<span class="comment"># 6 commits reviewed - 1 finding (non-security)</span>
-<span class="comment"># dispatched to repair intake</span></code></pre>
+<span class="comment"># guarded close/comment mutations only after live re-fetch</span></code></pre>
         </section>
         <section class="lanes-row" aria-label="The lanes">
           <h2>Four lanes, one engine</h2>
