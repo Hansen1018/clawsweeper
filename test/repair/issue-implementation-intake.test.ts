@@ -1,5 +1,15 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import {
+  chmodSync,
+  cpSync,
+  mkdtempSync,
+  mkdirSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -1015,6 +1025,10 @@ worker_dispatched: false
 
   assert.equal(issueImplementationJobNeedsRefresh(legacy, current), true);
   assert.equal(issueImplementationJobNeedsRefresh(alreadyDispatched, current), false);
+  assert.equal(
+    issueImplementationJobNeedsRefresh(alreadyDispatched, current, { completedWorker: true }),
+    true,
+  );
   assert.equal(issueImplementationJobNeedsRefresh(temporarilyIneligible, current), true);
   assert.equal(
     issueImplementationJobNeedsRefresh(temporarilyIneligibleAfterChangedReview, current),
@@ -1243,13 +1257,381 @@ worker_dispatched: false
     );
     assert.equal(discoverImplementationCandidates(options).length, 1);
 
+    writeFileSync(
+      auditPath,
+      readFileSync(auditPath, "utf8").replace(
+        /^report_revision_sha256:.*$/m,
+        `report_revision_sha256: ${reportRevisionSha256(readFileSync(report244Path, "utf8"))}`,
+      ),
+    );
     markIssueImplementationDispatched({
       root,
       auditPath: path.relative(root, auditPath),
       jobPath: path.relative(root, jobPath),
     });
     assert.match(readFileSync(auditPath, "utf8"), /worker_dispatched: true/);
+    assert.match(readFileSync(auditPath, "utf8"), /worker_dispatched_at: \d{4}-/);
+    assert.match(readFileSync(auditPath, "utf8"), /worker_attempt_count: 1/);
     assert.deepEqual(discoverImplementationCandidates(options), []);
+
+    writeFileSync(
+      auditPath,
+      readFileSync(auditPath, "utf8").replace(
+        /^worker_retry_after:.*$/m,
+        `worker_retry_after: ${new Date(Date.now() - 60_000).toISOString()}`,
+      ),
+    );
+    assert.deepEqual(
+      discoverImplementationCandidates(options).map((candidate) => candidate.item_number),
+      [244],
+    );
+
+    writeFileSync(
+      auditPath,
+      readFileSync(auditPath, "utf8").replace(
+        /^report_revision_sha256:.*$/m,
+        "report_revision_sha256: old-dispatched-review",
+      ),
+    );
+    assert.deepEqual(
+      discoverImplementationCandidates(options).map((candidate) => candidate.item_number),
+      [244],
+    );
+    writeFileSync(
+      auditPath,
+      readFileSync(auditPath, "utf8").replace(
+        /^report_revision_sha256:.*$/m,
+        `report_revision_sha256: ${reportRevisionSha256(readFileSync(report244Path, "utf8"))}`,
+      ),
+    );
+
+    writeFileSync(
+      auditPath,
+      readFileSync(auditPath, "utf8").replace(
+        /^worker_attempt_count:.*$/m,
+        "worker_attempt_count: 3",
+      ),
+    );
+    assert.deepEqual(discoverImplementationCandidates(options), []);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("successful issue workers with open implementation PRs are not requeued", () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "clawsweeper-open-implementation-pr-"));
+  try {
+    const markdown = report({ reviewed_at: "2026-07-31T10:00:00.000Z" });
+    const reportDir = path.join(root, "records", "openclaw-openclaw", "items");
+    const reportPath = path.join(reportDir, "123.md");
+    const jobPath = path.join(root, issueImplementationJobPath("openclaw/openclaw", 123));
+    const auditPath = path.join(
+      root,
+      "results",
+      "issue-implementation-intake",
+      "openclaw-openclaw",
+      "123.md",
+    );
+    mkdirSync(reportDir, { recursive: true });
+    mkdirSync(path.dirname(jobPath), { recursive: true });
+    mkdirSync(path.dirname(auditPath), { recursive: true });
+    writeFileSync(reportPath, markdown);
+    writeFileSync(jobPath, "existing issue implementation job\n");
+    writeFileSync(
+      auditPath,
+      `---
+repo: openclaw/openclaw
+number: 123
+report_revision_sha256: ${reportRevisionSha256(markdown)}
+report_reviewed_at: 2026-07-31T10:00:00.000Z
+job_report_revision_sha256: ${reportRevisionSha256(markdown)}
+decision: not_eligible
+prepared_at: ${new Date().toISOString()}
+worker_dispatched: true
+worker_dispatched_at: ${new Date(Date.now() - 300_000).toISOString()}
+worker_attempt_count: 1
+worker_retry_after: ${new Date(Date.now() + 30 * 60_000).toISOString()}
+---
+
+## Blockers
+
+- existing ClawSweeper issue implementation PR is open
+`,
+    );
+
+    const options = {
+      enabled: true,
+      candidateKind: "strict_bug" as const,
+      targetRepo: "openclaw/openclaw",
+      reportRepo: "openclaw/clawsweeper-state",
+      sourceDirs: [reportDir],
+      jobRoot: root,
+    };
+    assert.deepEqual(discoverImplementationCandidates(options), []);
+    writeFileSync(
+      auditPath,
+      readFileSync(auditPath, "utf8").replace(
+        /^worker_retry_after:.*$/m,
+        `worker_retry_after: ${new Date(Date.now() - 60_000).toISOString()}`,
+      ),
+    );
+    assert.equal(discoverImplementationCandidates(options).length, 1);
+    writeFileSync(
+      auditPath,
+      readFileSync(auditPath, "utf8").replace(
+        /^worker_retry_after:.*$/m,
+        `worker_retry_after: ${new Date(Date.now() + 30 * 60_000).toISOString()}`,
+      ),
+    );
+    writeFileSync(reportPath, report({ reviewed_at: "2026-07-31T10:05:00.000Z" }));
+    assert.equal(discoverImplementationCandidates(options).length, 1);
+    writeFileSync(
+      path.join(reportDir, "124.md"),
+      report({ number: "124", work_cluster_refs: JSON.stringify(["#124"]) }),
+    );
+    assert.deepEqual(
+      discoverImplementationCandidates(options).map(({ item_number }) => item_number),
+      [123, 124],
+    );
+    rmSync(path.join(reportDir, "124.md"));
+    writeFileSync(reportPath, markdown);
+    writeFileSync(
+      auditPath,
+      readFileSync(auditPath, "utf8")
+        .replace("worker_dispatched: true", "worker_dispatched: false")
+        .replace(
+          /^worker_retry_after:.*$/m,
+          `worker_retry_after: ${new Date(Date.now() - 60_000).toISOString()}`,
+        ),
+    );
+    assert.equal(discoverImplementationCandidates(options).length, 1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("newer reviews immediately regenerate completed jobs ahead of fresh issue work", () => {
+  const root = realpathSync(
+    mkdtempSync(path.join(os.tmpdir(), "clawsweeper-newer-review-recovery-")),
+  );
+  try {
+    for (const entry of ["dist", "config", "package.json"]) {
+      cpSync(entry, path.join(root, entry), { recursive: true });
+    }
+    const oldReport = report({ reviewed_at: "2026-07-31T10:00:00.000Z" });
+    const currentReport = report({
+      reviewed_at: "2026-07-31T10:05:00.000Z",
+      work_cluster_refs: JSON.stringify(["https://github.com/openclaw/openclaw/pull/456"]),
+    });
+    const reportDir = path.join(root, "records", "openclaw-openclaw", "items");
+    const jobRelativePath = issueImplementationJobPath("openclaw/openclaw", 123);
+    const jobPath = path.join(root, jobRelativePath);
+    const auditPath = path.join(
+      root,
+      "results",
+      "issue-implementation-intake",
+      "openclaw-openclaw",
+      "123.md",
+    );
+    mkdirSync(reportDir, { recursive: true });
+    mkdirSync(path.dirname(jobPath), { recursive: true });
+    mkdirSync(path.dirname(auditPath), { recursive: true });
+    writeFileSync(path.join(reportDir, "123.md"), currentReport);
+    writeFileSync(
+      path.join(reportDir, "124.md"),
+      report({ number: "124", work_cluster_refs: JSON.stringify(["#124"]) }),
+    );
+    writeFileSync(jobPath, "old queued issue implementation job\n");
+    const dispatchedAt = new Date(Date.now() - 180_000).toISOString();
+    const completedAt = new Date(Date.now() - 120_000).toISOString();
+    writeFileSync(
+      auditPath,
+      `---
+repo: openclaw/openclaw
+number: 123
+report_revision_sha256: ${reportRevisionSha256(oldReport)}
+report_reviewed_at: 2026-07-31T10:00:00.000Z
+job_report_revision_sha256: ${reportRevisionSha256(oldReport)}
+decision: queued_for_repair
+prepared_at: ${dispatchedAt}
+worker_dispatched: true
+worker_dispatched_at: ${dispatchedAt}
+worker_attempt_count: 3
+worker_retry_after: ${new Date(Date.now() + 30 * 60_000).toISOString()}
+---
+`,
+    );
+    assert.deepEqual(
+      discoverImplementationCandidates({
+        enabled: true,
+        candidateKind: "strict_bug",
+        targetRepo: "openclaw/openclaw",
+        reportRepo: "openclaw/clawsweeper-state",
+        sourceDirs: [reportDir],
+        jobRoot: root,
+      }).map(({ item_number }) => item_number),
+      [123, 124],
+    );
+    writeFileSync(
+      path.join(reportDir, "123.md"),
+      report({
+        reviewed_at: "2026-07-31T09:55:00.000Z",
+        item_updated_at: "2026-07-31T09:00:00.000Z",
+      }),
+    );
+    assert.deepEqual(
+      discoverImplementationCandidates({
+        enabled: true,
+        candidateKind: "strict_bug",
+        targetRepo: "openclaw/openclaw",
+        reportRepo: "openclaw/clawsweeper-state",
+        sourceDirs: [reportDir],
+        jobRoot: root,
+      }).map(({ item_number }) => item_number),
+      [124],
+    );
+    const fakeGh = path.join(root, "fake-gh");
+    const openPrFlag = path.join(root, "open-implementation-pr");
+    const workflowHistory = JSON.stringify({
+      total_count: 1,
+      workflow_runs: [
+        {
+          display_title: `issue implementation ${jobRelativePath}`,
+          status: "completed",
+          conclusion: "failure",
+          created_at: dispatchedAt,
+          updated_at: completedAt,
+        },
+      ],
+    });
+    writeFileSync(
+      fakeGh,
+      `#!/bin/sh
+case "$2" in
+  repos/openclaw/openclaw/issues/123) printf '%s\\n' '{"state":"open","labels":[],"title":"Existing bug","body":"Existing behavior"}' ;;
+  repos/openclaw/openclaw/issues/456)
+    if [ -f '${openPrFlag}' ]; then
+      printf '%s\\n' '{"number":456,"state":"open","url":"https://github.com/openclaw/openclaw/pull/456","is_pull":true}'
+    else
+      printf '%s\\n' '{"number":456,"state":"closed","url":"https://github.com/openclaw/openclaw/pull/456","is_pull":true}'
+    fi ;;
+  repos/openclaw/openclaw/issues/123/comments*) printf '%s\\n' '[]' ;;
+  repos/openclaw/openclaw/pulls) printf '%s\\n' '[]' ;;
+  search/issues) printf '%s\\n' '[]' ;;
+  repos/openclaw/clawsweeper/actions/workflows/repair-cluster-worker.yml/runs*) printf '%s\\n' '${workflowHistory}' ;;
+  *) printf 'unexpected fake GitHub call: %s\\n' "$*" >&2; exit 2 ;;
+esac
+`,
+    );
+    chmodSync(fakeGh, 0o755);
+    const intakeArgs = [
+      path.join(root, "dist", "repair", "issue-implementation-intake.js"),
+      "prepare",
+      "--enabled",
+      "true",
+      "--candidate-kind",
+      "strict_bug",
+      "--target-repo",
+      "openclaw/openclaw",
+      "--item-number",
+      "123",
+    ];
+    const processOptions = {
+      cwd: root,
+      encoding: "utf8" as const,
+      env: {
+        ...process.env,
+        GH_BIN: fakeGh,
+        CLAWSWEEPER_GH_RETRY_ATTEMPTS: "1",
+      },
+    };
+    const dispatchedAudit = readFileSync(auditPath, "utf8");
+    writeFileSync(
+      auditPath,
+      dispatchedAudit.replace("worker_dispatched: true", "worker_dispatched: false"),
+    );
+    assert.deepEqual(
+      discoverImplementationCandidates({
+        enabled: true,
+        candidateKind: "strict_bug",
+        targetRepo: "openclaw/openclaw",
+        reportRepo: "openclaw/clawsweeper-state",
+        sourceDirs: [reportDir],
+        jobRoot: root,
+      }).map(({ item_number }) => item_number),
+      [124],
+    );
+    for (const previousAudit of [readFileSync(auditPath, "utf8"), dispatchedAudit]) {
+      writeFileSync(auditPath, previousAudit);
+      const stalePreparation = spawnSync(process.execPath, intakeArgs, processOptions);
+      assert.equal(stalePreparation.status, 1);
+      assert.match(stalePreparation.stderr, /older than the authoritative intake/);
+    }
+    assert.equal(
+      parseReviewReport(readFileSync(auditPath, "utf8")).frontmatter.report_revision_sha256,
+      reportRevisionSha256(oldReport),
+    );
+    assert.equal(readFileSync(jobPath, "utf8"), "old queued issue implementation job\n");
+    writeFileSync(path.join(reportDir, "123.md"), currentReport);
+    writeFileSync(openPrFlag, "open\n");
+    const blockedPreparation = spawnSync(process.execPath, intakeArgs, processOptions);
+    assert.equal(blockedPreparation.status, 0, blockedPreparation.stderr);
+    assert.equal(JSON.parse(blockedPreparation.stdout).status, "not_eligible");
+    const blockedAudit = parseReviewReport(readFileSync(auditPath, "utf8"));
+    assert.match(
+      blockedAudit.body,
+      /review report references an open or unverifiable pull request/,
+    );
+    assert.ok(
+      Date.parse(blockedAudit.frontmatter.worker_retry_after ?? "") > Date.now() + 25 * 60_000,
+    );
+    rmSync(openPrFlag);
+    assert.deepEqual(
+      discoverImplementationCandidates({
+        enabled: true,
+        candidateKind: "strict_bug",
+        targetRepo: "openclaw/openclaw",
+        reportRepo: "openclaw/clawsweeper-state",
+        sourceDirs: [reportDir],
+        jobRoot: root,
+      }).map(({ item_number }) => item_number),
+      [124],
+    );
+    writeFileSync(
+      auditPath,
+      readFileSync(auditPath, "utf8").replace(
+        /^worker_retry_after:.*$/m,
+        `worker_retry_after: ${new Date(Date.now() - 60_000).toISOString()}`,
+      ),
+    );
+    assert.deepEqual(
+      discoverImplementationCandidates({
+        enabled: true,
+        candidateKind: "strict_bug",
+        targetRepo: "openclaw/openclaw",
+        reportRepo: "openclaw/clawsweeper-state",
+        sourceDirs: [reportDir],
+        jobRoot: root,
+      }).map(({ item_number }) => item_number),
+      [123, 124],
+    );
+    const prepared = spawnSync(process.execPath, intakeArgs, processOptions);
+    assert.equal(prepared.status, 0, prepared.stderr);
+    assert.ok(prepared.stdout, prepared.stderr);
+    assert.equal(JSON.parse(prepared.stdout).status, "queued_for_repair");
+    const refreshedAudit = parseReviewReport(readFileSync(auditPath, "utf8"));
+    assert.equal(
+      refreshedAudit.frontmatter.report_revision_sha256,
+      reportRevisionSha256(currentReport),
+    );
+    assert.equal(
+      refreshedAudit.frontmatter.job_report_revision_sha256,
+      reportRevisionSha256(currentReport),
+    );
+    assert.equal(refreshedAudit.frontmatter.report_reviewed_at, "2026-07-31T10:05:00.000Z");
+    assert.equal(refreshedAudit.frontmatter.worker_dispatched, "false");
+    assert.equal(refreshedAudit.frontmatter.worker_attempt_count, "0");
+    assert.notEqual(readFileSync(jobPath, "utf8"), "old queued issue implementation job\n");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -1269,6 +1651,49 @@ test("review-triggered issue implementation jobs require autogenerated autofix l
   assert.match(job, /required_pr_labels:\n  - clawsweeper:autogenerated\n  - clawsweeper:autofix/);
   assert.match(job, /Treat it as bug-only/);
   assert.match(job, /new config\s+option/);
+});
+
+test("dispatch audit preserves an existing deduplicated worker generation", () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "clawsweeper-deduplicated-issue-worker-"));
+  try {
+    const repository = "openclaw/openclaw";
+    const number = 123;
+    const jobPath = issueImplementationJobPath(repository, number);
+    const auditPath = `results/issue-implementation-intake/openclaw-openclaw/${number}.md`;
+    const originalDispatch = "2026-07-31T18:57:00.000Z";
+    mkdirSync(path.dirname(path.join(root, jobPath)), { recursive: true });
+    mkdirSync(path.dirname(path.join(root, auditPath)), { recursive: true });
+    writeFileSync(path.join(root, jobPath), "durable issue job\n");
+    writeFileSync(
+      path.join(root, auditPath),
+      `---
+repo: ${repository}
+number: ${number}
+report_revision_sha256: ${"a".repeat(64)}
+job_report_revision_sha256: ${"a".repeat(64)}
+decision: already_queued
+prepared_at: 2026-07-31T18:59:00.000Z
+worker_dispatched: false
+worker_dispatched_at: 2026-07-31T18:59:00.000Z
+worker_attempt_count: 0
+worker_retry_after:
+---
+`,
+    );
+
+    markIssueImplementationDispatched({
+      root,
+      auditPath,
+      jobPath,
+      workerCreatedAt: originalDispatch,
+    });
+
+    const markedAudit = readFileSync(path.join(root, auditPath), "utf8");
+    assert.match(markedAudit, new RegExp(`worker_dispatched_at: ${originalDispatch}`));
+    assert.match(markedAudit, /worker_attempt_count: 1/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("vision-fit issue implementation jobs carry vision guardrails", () => {

@@ -24,6 +24,12 @@ import {
   REVIEW_VISION_FIT_TRIGGER_SOURCE,
 } from "./comment-router-core.js";
 import { issueSourceRevisionSha256 } from "./issue-source-guard.js";
+import {
+  dispatchedIssueImplementationWorkerRetryDue,
+  issueImplementationWorkerAttemptCount,
+  nextIssueImplementationWorkerRetry,
+  recoverableIssueImplementationWorker,
+} from "./issue-worker-recovery.js";
 import { hasSecuritySignal } from "./security-signals.js";
 import {
   CLOSE_PROTECTED_LABEL_NAMES,
@@ -48,6 +54,13 @@ type ReviewReport = {
 };
 
 const args = parseArgs(process.argv.slice(2));
+const OPEN_IMPLEMENTATION_PR_BLOCKERS = [
+  "existing ClawSweeper issue implementation PR is open",
+  "open PR already mentions this issue",
+  "open PR already covers a related issue in this work cluster",
+  "review report references an open or unverifiable pull request",
+];
+const ISSUE_IMPLEMENTATION_BLOCKER_RECHECK_DELAY_MS = 30 * 60_000;
 
 function main() {
   const command = String(args._[0] ?? "prepare");
@@ -123,29 +136,77 @@ function prepare() {
     ? intakeAudit({ root: repoRoot(), repo: targetRepo, number: itemNumber })
     : null;
   let workerDispatched = previousAudit?.frontmatter.worker_dispatched === "true";
+  let workerAttemptCount = issueImplementationWorkerAttemptCount(previousAudit);
+  if (
+    authoritativeReviewOrdering({
+      audit: previousAudit,
+      report,
+      reportRevision: reportRevisionSha256(reportMarkdown),
+    }) < 0
+  ) {
+    die(
+      "local issue review is older than the authoritative intake; refresh records before retrying",
+    );
+  }
   if (decision.shouldRepair && existingJob && !operatorOverride) {
     if (!issueImplementationJobNeedsRefresh(previousAudit, reportMarkdown)) {
       recoverExistingJob = intakeAuditAwaitsWorkerDispatch(previousAudit);
-      decision = {
-        status: "already_queued",
-        shouldRepair: false,
-        reason: "issue implementation job already queued",
-        blockers: ["issue implementation job already queued"],
-      };
+      if (!recoverExistingJob && workerDispatched) {
+        try {
+          recoverExistingJob = recoverableIssueImplementationWorker({
+            audit: previousAudit,
+            jobPath: relative(jobPath),
+            reportRevision: reportRevisionSha256(reportMarkdown),
+          });
+        } catch (error) {
+          console.warn(`issue implementation worker recovery unavailable: ${ghErrorText(error)}`);
+        }
+      }
+      if (recoverExistingJob) workerDispatched = false;
+      if (
+        recoverExistingJob &&
+        issueImplementationJobNeedsRefresh(previousAudit, reportMarkdown, {
+          completedWorker: true,
+        })
+      ) {
+        recoverExistingJob = false;
+      } else {
+        decision = {
+          status: "already_queued",
+          shouldRepair: false,
+          reason: "issue implementation job already queued",
+          blockers: ["issue implementation job already queued"],
+        };
+      }
     }
   }
-  if (decision.shouldRepair) workerDispatched = false;
+  if (decision.shouldRepair) {
+    workerDispatched = false;
+    workerAttemptCount = 0;
+  }
   const jobReportRevisionSha256 = decision.shouldRepair
     ? reportRevisionSha256(reportMarkdown)
     : existingIssueImplementationJobRevision(previousAudit);
+  const blockedByOpenImplementationPr = decision.blockers.some((blocker) =>
+    OPEN_IMPLEMENTATION_PR_BLOCKERS.includes(blocker),
+  );
   const workerRetryAfter =
     existingJob &&
     !decision.shouldRepair &&
     decision.status !== "already_queued" &&
-    !workerDispatched
-      ? new Date(Date.now() + 30 * 60_000).toISOString()
-      : "";
+    (!workerDispatched || blockedByOpenImplementationPr)
+      ? new Date(Date.now() + ISSUE_IMPLEMENTATION_BLOCKER_RECHECK_DELAY_MS).toISOString()
+      : workerDispatched
+        ? nextIssueImplementationWorkerRetry()
+        : "";
   const preparedAt = new Date().toISOString();
+  const workerDispatchedAt =
+    workerDispatched ||
+    (recoverExistingJob && previousAudit?.frontmatter.worker_dispatched !== "true")
+      ? previousAudit?.frontmatter.worker_dispatched_at ||
+        previousAudit?.frontmatter.prepared_at ||
+        ""
+      : "";
   const context = {
     targetRepo,
     reportRepo,
@@ -163,6 +224,8 @@ function prepare() {
     operatorOverride,
     overrideRequestedBy,
     workerDispatched,
+    workerDispatchedAt,
+    workerAttemptCount,
     jobReportRevisionSha256,
     workerRetryAfter,
   };
@@ -293,9 +356,10 @@ export function discoverImplementationCandidates({
   }
   const candidates: { candidate: LooseRecord; existingJob: boolean; retryDue: boolean }[] = [];
   for (const { markdown, number, reportPath, repository } of reviewsByIssue.values()) {
+    const parsedReport = parseReviewReport(markdown);
     const decision = reportOnlyDecision({
       targetRepo,
-      report: parseReviewReport(markdown),
+      report: parsedReport,
       reportMarkdown: markdown,
       candidateKind,
     });
@@ -305,11 +369,33 @@ export function discoverImplementationCandidates({
     const previousAudit = existingJob
       ? intakeAudit({ root: jobRoot, repo: repository, number })
       : null;
+    const reportRevision = reportRevisionSha256(markdown);
+    const reviewOrdering = authoritativeReviewOrdering({
+      audit: previousAudit,
+      report: parsedReport,
+      reportRevision,
+    });
+    const newerReview = reviewOrdering > 0;
+    const blockedByOpenImplementationPr =
+      previousAudit?.frontmatter.decision === "not_eligible" &&
+      previousAudit.frontmatter.worker_dispatched === "true" &&
+      OPEN_IMPLEMENTATION_PR_BLOCKERS.some((blocker) => previousAudit.body.includes(blocker));
+    const blockerRecheckDue =
+      blockedByOpenImplementationPr &&
+      (!Number.isFinite(Date.parse(previousAudit?.frontmatter.worker_retry_after ?? "")) ||
+        intakeAuditRetryDue(previousAudit));
     if (existingJob) {
+      if (reviewOrdering < 0) continue;
       if (intakeAuditRetryDeferred(previousAudit, markdown)) continue;
       if (
+        !newerReview &&
+        !blockerRecheckDue &&
         !intakeAuditAwaitsWorkerDispatch(previousAudit) &&
-        !issueImplementationJobNeedsRefresh(previousAudit, markdown)
+        !issueImplementationJobNeedsRefresh(previousAudit, markdown) &&
+        !dispatchedIssueImplementationWorkerRetryDue({
+          audit: previousAudit,
+          reportRevision,
+        })
       ) {
         continue;
       }
@@ -321,6 +407,8 @@ export function discoverImplementationCandidates({
     candidates.push({
       existingJob,
       retryDue:
+        newerReview ||
+        blockerRecheckDue ||
         intakeAuditRetryDue(previousAudit) ||
         (intakeAuditAwaitsWorkerDispatch(previousAudit) &&
           !Number.isFinite(Date.parse(previousAudit?.frontmatter.worker_retry_after ?? ""))),
@@ -354,6 +442,34 @@ function reviewFreshness(report: ReviewReport): readonly [number, number] {
     value("item_updated_at", "current_item_updated_at", "current_item_closed_at"),
     value("reviewed_at", "last_full_review_at"),
   ];
+}
+
+function authoritativeReviewOrdering({
+  audit,
+  report,
+  reportRevision,
+}: {
+  audit: ReviewReport | null;
+  report: ReviewReport;
+  reportRevision: string;
+}) {
+  if (!audit || audit.frontmatter.report_revision_sha256 === reportRevision) return 0;
+  const incoming = reviewFreshness(report);
+  const audited = [
+    Date.parse(audit.frontmatter.report_item_updated_at ?? ""),
+    Date.parse(audit.frontmatter.report_reviewed_at ?? ""),
+  ].map((value) => (Number.isFinite(value) ? value : Number.NEGATIVE_INFINITY));
+  if (audited.some(Number.isFinite)) {
+    for (const [index, incomingValue] of incoming.entries()) {
+      const auditedValue = audited[index] ?? Number.NEGATIVE_INFINITY;
+      if (!Number.isFinite(incomingValue) || !Number.isFinite(auditedValue)) continue;
+      if (incomingValue !== auditedValue) return incomingValue > auditedValue ? 1 : -1;
+    }
+    return 0;
+  }
+  const preparedAt = Date.parse(audit.frontmatter.prepared_at ?? "");
+  if (!Number.isFinite(incoming[1]) || !Number.isFinite(preparedAt)) return 0;
+  return incoming[1] > preparedAt ? 1 : -1;
 }
 
 function compareReviewFreshness(left: readonly number[], right: readonly number[]) {
@@ -783,16 +899,21 @@ function writeAudit(context: LooseRecord) {
   const jobLine = context.decision.shouldRepair
     ? `- Job: \`${relative(context.jobPath)}\``
     : "- Job: none";
+  const [itemUpdatedAt, reviewedAt] = reviewFreshness(context.report as ReviewReport);
   const body = `---
 repo: ${context.targetRepo}
 number: ${context.itemNumber}
 report_repo: ${context.reportRepo}
 report_path: ${context.reportPath}
 report_revision_sha256: ${reportRevisionSha256(context.reportMarkdown)}
+report_item_updated_at: ${Number.isFinite(itemUpdatedAt) ? new Date(itemUpdatedAt).toISOString() : ""}
+report_reviewed_at: ${Number.isFinite(reviewedAt) ? new Date(reviewedAt).toISOString() : ""}
 job_report_revision_sha256: ${context.jobReportRevisionSha256 || ""}
 decision: ${context.decision.status}
 prepared_at: ${context.preparedAt}
 worker_dispatched: ${context.workerDispatched === true ? "true" : "false"}
+worker_dispatched_at: ${context.workerDispatchedAt || ""}
+worker_attempt_count: ${context.workerAttemptCount ?? 0}
 worker_retry_after: ${context.workerRetryAfter || ""}
 ---
 
@@ -893,10 +1014,11 @@ function existingIssueImplementationJobRevision(audit: ReviewReport | null) {
 export function issueImplementationJobNeedsRefresh(
   audit: ReviewReport | null,
   reportMarkdown: string,
+  { completedWorker = false }: { completedWorker?: boolean } = {},
 ) {
   return (
     audit !== null &&
-    audit.frontmatter.worker_dispatched !== "true" &&
+    (completedWorker || audit.frontmatter.worker_dispatched !== "true") &&
     existingIssueImplementationJobRevision(audit) !== reportRevisionSha256(reportMarkdown)
   );
 }
@@ -904,8 +1026,9 @@ export function issueImplementationJobNeedsRefresh(
 function markDispatched() {
   const auditPath = stringArg("audit-path", "");
   const jobPath = stringArg("job-path", "");
+  const workerCreatedAt = stringArg("worker-created-at", "");
   if (!auditPath || !jobPath) die("mark-dispatched requires --audit-path and --job-path");
-  markIssueImplementationDispatched({ root: repoRoot(), auditPath, jobPath });
+  markIssueImplementationDispatched({ root: repoRoot(), auditPath, jobPath, workerCreatedAt });
   console.log(`recorded dispatched issue implementation worker for ${jobPath}`);
 }
 
@@ -913,10 +1036,12 @@ export function markIssueImplementationDispatched({
   root,
   auditPath,
   jobPath,
+  workerCreatedAt,
 }: {
   root: string;
   auditPath: string;
   jobPath: string;
+  workerCreatedAt?: string;
 }) {
   const resolvedRoot = path.resolve(root);
   const resolvedAudit = path.resolve(resolvedRoot, auditPath);
@@ -946,9 +1071,31 @@ export function markIssueImplementationDispatched({
   if (!intakeAuditAwaitsWorkerDispatch(audit)) {
     throw new Error("issue implementation worker is not awaiting dispatch");
   }
-  const marked = /^worker_dispatched: false$/m.test(markdown)
+  let marked = /^worker_dispatched: false$/m.test(markdown)
     ? markdown.replace(/^worker_dispatched: false$/m, "worker_dispatched: true")
     : markdown.replace(/\n---\n/, "\nworker_dispatched: true\n---\n");
+  const attempts = issueImplementationWorkerAttemptCount(audit) + 1;
+  const dispatchedAt = String(
+    (Number.isFinite(Date.parse(String(workerCreatedAt ?? ""))) && workerCreatedAt) ||
+      audit.frontmatter.worker_dispatched_at ||
+      audit.frontmatter.prepared_at ||
+      new Date().toISOString(),
+  );
+  marked = /^worker_dispatched_at:.*$/m.test(marked)
+    ? marked.replace(/^worker_dispatched_at:.*$/m, `worker_dispatched_at: ${dispatchedAt}`)
+    : marked.replace(/\n---\n/, `\nworker_dispatched_at: ${dispatchedAt}\n---\n`);
+  marked = /^worker_attempt_count:.*$/m.test(marked)
+    ? marked.replace(/^worker_attempt_count:.*$/m, `worker_attempt_count: ${attempts}`)
+    : marked.replace(/\n---\n/, `\nworker_attempt_count: ${attempts}\n---\n`);
+  marked = /^worker_retry_after:.*$/m.test(marked)
+    ? marked.replace(
+        /^worker_retry_after:.*$/m,
+        `worker_retry_after: ${nextIssueImplementationWorkerRetry()}`,
+      )
+    : marked.replace(
+        /\n---\n/,
+        `\nworker_retry_after: ${nextIssueImplementationWorkerRetry()}\n---\n`,
+      );
   fs.writeFileSync(resolvedAudit, marked);
 }
 
