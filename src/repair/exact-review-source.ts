@@ -1,4 +1,4 @@
-import { currentHead } from "./git-repo-utils.js";
+import { currentHead, ensureMergeBaseAvailable } from "./git-repo-utils.js";
 import { runCommand as run } from "./command-runner.js";
 
 const gitNetworkTimeoutMs = Math.max(
@@ -18,6 +18,7 @@ export function materializeExactReviewSource(options: {
   targetDir: string;
   itemKind: "issue" | "pull_request";
   itemNumber: number;
+  baseBranch?: string;
   sourceHeadSha?: string;
 }): ExactReviewSourceResult {
   if (!Number.isSafeInteger(options.itemNumber) || options.itemNumber < 1) {
@@ -33,8 +34,12 @@ export function materializeExactReviewSource(options: {
   if (!/^[0-9a-f]{40}$/.test(leasedHeadSha)) {
     throw new Error("Exact PR review requires a valid leased source head SHA");
   }
+  const baseBranch = String(options.baseBranch ?? "").trim();
+  if (!baseBranch) {
+    throw new Error("Exact PR review requires its base branch");
+  }
 
-  run("git", ["fetch", "--force", "--depth=50", "origin", `refs/pull/${options.itemNumber}/head`], {
+  run("git", ["fetch", "--force", "origin", `refs/pull/${options.itemNumber}/head`], {
     cwd: options.targetDir,
     timeoutMs: gitNetworkTimeoutMs,
   });
@@ -57,5 +62,6 @@ export function materializeExactReviewSource(options: {
       `Target checkout head ${headSha || "empty"} does not match leased source head ${leasedHeadSha}`,
     );
   }
+  ensureMergeBaseAvailable({ targetDir: options.targetDir, baseBranch });
   return { status: "ready", headSha };
 }

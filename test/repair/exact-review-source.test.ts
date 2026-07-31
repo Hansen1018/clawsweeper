@@ -15,7 +15,10 @@ function git(args: string[], cwd?: string): string {
   }).trim();
 }
 
-function createPullFixture() {
+function createPullFixture(
+  featureCommitCount = 1,
+  options: { baseAdvanceCount?: number; shallowTarget?: boolean } = {},
+) {
   const root = mkdtempSync(join(tmpdir(), "exact-review-source-"));
   const origin = join(root, "origin.git");
   const source = join(root, "source");
@@ -28,18 +31,36 @@ function createPullFixture() {
   writeFileSync(join(source, "README.md"), "base\n");
   git(["add", "README.md"], source);
   git(["commit", "-m", "base"], source);
+  const baseSha = git(["rev-parse", "HEAD"], source);
   git(["branch", "-M", "main"], source);
   git(["remote", "add", "origin", origin], source);
   git(["push", "origin", "main"], source);
 
-  writeFileSync(join(source, "feature.txt"), "first\n");
-  git(["add", "feature.txt"], source);
-  git(["commit", "-m", "feature"], source);
+  for (let index = 1; index <= featureCommitCount; index += 1) {
+    writeFileSync(join(source, "feature.txt"), `feature ${index}\n`);
+    git(["add", "feature.txt"], source);
+    git(["commit", "-m", `feature ${index}`], source);
+  }
   const leasedHeadSha = git(["rev-parse", "HEAD"], source);
   git(["push", "origin", "HEAD:refs/pull/357/head"], source);
-  git(["clone", "--branch", "main", origin, target]);
+  if ((options.baseAdvanceCount ?? 0) > 0) {
+    git(["checkout", "-B", "advanced-main", baseSha], source);
+    for (let index = 1; index <= (options.baseAdvanceCount ?? 0); index += 1) {
+      writeFileSync(join(source, "README.md"), `base ${index}\n`);
+      git(["add", "README.md"], source);
+      git(["commit", "-m", `base ${index}`], source);
+    }
+    git(["push", "origin", "HEAD:main"], source);
+  }
+  git([
+    "clone",
+    "--branch",
+    "main",
+    ...(options.shallowTarget ? ["--depth=1", `file://${origin}`] : [origin]),
+    target,
+  ]);
 
-  return { root, origin, source, target, leasedHeadSha };
+  return { root, origin, source, target, baseSha, leasedHeadSha };
 }
 
 test("materializes the immutable leased pull request head", () => {
@@ -50,13 +71,35 @@ test("materializes the immutable leased pull request head", () => {
         targetDir: fixture.target,
         itemKind: "pull_request",
         itemNumber: 357,
+        baseBranch: "main",
         sourceHeadSha: fixture.leasedHeadSha,
       }),
       { status: "ready", headSha: fixture.leasedHeadSha },
     );
     assert.equal(git(["rev-parse", "HEAD"], fixture.target), fixture.leasedHeadSha);
     assert.equal(git(["rev-parse", "--abbrev-ref", "HEAD"], fixture.target), "HEAD");
-    assert.equal(readFileSync(join(fixture.target, "feature.txt"), "utf8"), "first\n");
+    assert.equal(readFileSync(join(fixture.target, "feature.txt"), "utf8"), "feature 1\n");
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("materializes both sides of deep pull request ancestry from a shallow base", () => {
+  const fixture = createPullFixture(75, { baseAdvanceCount: 60, shallowTarget: true });
+  try {
+    assert.deepEqual(
+      materializeExactReviewSource({
+        targetDir: fixture.target,
+        itemKind: "pull_request",
+        itemNumber: 357,
+        baseBranch: "main",
+        sourceHeadSha: fixture.leasedHeadSha,
+      }),
+      { status: "ready", headSha: fixture.leasedHeadSha },
+    );
+    assert.equal(git(["merge-base", "origin/main", "HEAD"], fixture.target), fixture.baseSha);
+    assert.equal(git(["rev-list", "--count", "origin/main..HEAD"], fixture.target), "75");
+    assert.equal(git(["rev-parse", "--is-shallow-repository"], fixture.target), "false");
   } finally {
     rmSync(fixture.root, { recursive: true, force: true });
   }
@@ -77,6 +120,7 @@ test("reports source drift without checking out the moved pull request head", ()
         targetDir: fixture.target,
         itemKind: "pull_request",
         itemNumber: 357,
+        baseBranch: "main",
         sourceHeadSha: fixture.leasedHeadSha,
       }),
       {
@@ -105,6 +149,7 @@ test("fails closed when the pull request ref cannot be fetched", () => {
           targetDir: target,
           itemKind: "pull_request",
           itemNumber: 357,
+          baseBranch: "main",
           sourceHeadSha: "a".repeat(40),
         }),
       /couldn't find remote ref|could not read from remote repository|fatal:/i,

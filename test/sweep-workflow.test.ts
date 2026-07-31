@@ -3647,6 +3647,7 @@ test("exact PR reviews fail closed unless the leased source head is checked out"
     "${{ fromJSON(steps.claim-exact-review-queue.outputs.decision).sourceHeadSha || '' }}",
   );
   assert.match(checkout.run ?? "", /repair:exact-review-source/);
+  assert.match(checkout.run ?? "", /--base-branch "\$target_branch"/);
   assert.equal(
     requeue.if,
     "${{ steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.checkout-target.outputs.source_drift == 'true' }}",

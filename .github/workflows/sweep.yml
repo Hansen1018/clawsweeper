@@ -896,6 +896,7 @@ jobs:
             --target-dir "$checkout_dir" \
             --item-kind "$ITEM_KIND" \
             --item-number "$ITEM_NUMBER" \
+            --base-branch "$target_branch" \
             --source-head-sha "$SOURCE_HEAD_SHA"
 
       - name: Requeue exact review after source drift

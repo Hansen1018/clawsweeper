@@ -4,10 +4,12 @@ import fs from "node:fs";
 import { materializeExactReviewSource } from "./exact-review-source.js";
 
 const args = parseArgs(process.argv.slice(2));
+const kind = itemKind(required(args.itemKind, "--item-kind"));
 const result = materializeExactReviewSource({
   targetDir: required(args.targetDir, "--target-dir"),
-  itemKind: itemKind(required(args.itemKind, "--item-kind")),
+  itemKind: kind,
   itemNumber: positiveInteger(required(args.itemNumber, "--item-number"), "--item-number"),
+  ...(kind === "pull_request" ? { baseBranch: required(args.baseBranch, "--base-branch") } : {}),
   ...(args.sourceHeadSha ? { sourceHeadSha: args.sourceHeadSha } : {}),
 });
 
@@ -28,6 +30,7 @@ function parseArgs(argv: readonly string[]) {
     targetDir?: string;
     itemKind?: string;
     itemNumber?: string;
+    baseBranch?: string;
     sourceHeadSha?: string;
   } = {};
   for (let index = 0; index < argv.length; index += 1) {
@@ -39,6 +42,7 @@ function parseArgs(argv: readonly string[]) {
     if (flag === "--target-dir") parsed.targetDir = value;
     else if (flag === "--item-kind") parsed.itemKind = value;
     else if (flag === "--item-number") parsed.itemNumber = value;
+    else if (flag === "--base-branch") parsed.baseBranch = value;
     else if (flag === "--source-head-sha") parsed.sourceHeadSha = value;
     else throw new Error(`unknown argument: ${flag}`);
     index += 1;
