@@ -3594,9 +3594,13 @@ test("sweep workflow schedules cursor-based PR comment sync batches", () => {
 });
 
 test("sweep target checkouts retry without cached references", () => {
-  const workflow = readText(".github/workflows/sweep.yml");
-  const checkoutBlocks =
-    workflow.match(/- name: Check out target repository[\s\S]*?rev-parse --short HEAD/g) ?? [];
+  const workflow = YAML.parse(readText(".github/workflows/sweep.yml")) as {
+    jobs: Record<string, { steps?: Array<{ name?: string; run?: string }> }>;
+  };
+  const checkoutBlocks = Object.values(workflow.jobs)
+    .flatMap((job) => job.steps ?? [])
+    .filter((step) => step.name === "Check out target repository")
+    .map((step) => step.run ?? "");
 
   assert.equal(checkoutBlocks.length, 2);
   for (const block of checkoutBlocks) {
@@ -3642,12 +3646,7 @@ test("exact PR reviews fail closed unless the leased source head is checked out"
     checkout.env?.SOURCE_HEAD_SHA,
     "${{ fromJSON(steps.claim-exact-review-queue.outputs.decision).sourceHeadSha || '' }}",
   );
-  assert.match(checkout.run ?? "", /refs\/pull\/\$\{ITEM_NUMBER\}\/head/);
-  assert.match(checkout.run ?? "", /fetched_head" != "\$SOURCE_HEAD_SHA/);
-  assert.match(checkout.run ?? "", /source_drift=true/);
-  assert.match(checkout.run ?? "", /exit 0/);
-  assert.match(checkout.run ?? "", /checkout --detach "\$SOURCE_HEAD_SHA"/);
-  assert.match(checkout.run ?? "", /checked_out_head" != "\$SOURCE_HEAD_SHA/);
+  assert.match(checkout.run ?? "", /repair:exact-review-source/);
   assert.equal(
     requeue.if,
     "${{ steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.checkout-target.outputs.source_drift == 'true' }}",
@@ -3661,6 +3660,18 @@ test("exact PR reviews fail closed unless the leased source head is checked out"
   );
   assert.match(generation.run ?? "", /SOURCE_DRIFT" = "true"/);
   assert.match(generation.run ?? "", /requeue_latest=true/);
+
+  for (const name of [
+    "Reserve exact review lease",
+    "Review exact event item",
+    "Finalize exact event action ledger",
+    "Create exact review artifact bundle",
+    "Release unsuccessful workflow-owned review lease",
+  ]) {
+    const step = steps.find((candidate) => candidate.name === name);
+    assert.ok(step, `missing ${name}`);
+    assert.match(step.if ?? "", /checkout-target\.outputs\.source_drift != 'true'/);
+  }
 });
 
 test("scheduled OpenClaw review workers materialize sibling Codex source", () => {

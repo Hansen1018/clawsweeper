@@ -18,6 +18,7 @@ checkpoint, and status-only commits are intentionally omitted.
 
 ### Changed
 
+- Exact pull-request reviews now materialize and verify the leased head through a tested TypeScript guard, requeue moved heads without running review or lease cleanup, and materialize sibling Codex source for OpenClaw contract review.
 - Event-review artifact publication completes as a superseded no-op when the reviewed branch vanished upstream (force-push or deletion) instead of failing the run.
 - Worker record requests now retry transient blank/invalid 2xx bodies from the edge within the bounded budget instead of failing hydration on the first occurrence.
 - Exact reviews of items that closed after enqueue now complete as superseded no-ops, and GitHub-throttled reservations defer as held retries — neither spends the item's review-failure budget.

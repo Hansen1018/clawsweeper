@@ -892,28 +892,11 @@ jobs:
             git clone --bare --filter=blob:none --single-branch --branch "$target_branch" "$url" "$cache_dir"
             git clone --filter=blob:none --branch "$target_branch" --single-branch "$url" "$checkout_dir"
           fi
-          if [ "$ITEM_KIND" = "pull_request" ]; then
-            if ! [[ "$SOURCE_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
-              echo "::error::Exact PR review requires a valid leased source head SHA."
-              exit 1
-            fi
-            git -C "$checkout_dir" fetch --force --depth=50 origin "refs/pull/${ITEM_NUMBER}/head"
-            fetched_head="$(git -C "$checkout_dir" rev-parse FETCH_HEAD)"
-            if [ "$fetched_head" != "$SOURCE_HEAD_SHA" ]; then
-              echo "::notice::Fetched PR head $fetched_head moved past leased source head $SOURCE_HEAD_SHA; skipping review and requeueing the latest source."
-              echo "source_drift=true" >> "$GITHUB_OUTPUT"
-              exit 0
-            else
-              git -C "$checkout_dir" checkout --detach "$SOURCE_HEAD_SHA"
-              checked_out_head="$(git -C "$checkout_dir" rev-parse HEAD)"
-              if [ "$checked_out_head" != "$SOURCE_HEAD_SHA" ]; then
-                echo "::error::Target checkout head $checked_out_head does not match leased source head $SOURCE_HEAD_SHA."
-                exit 1
-              fi
-            fi
-          fi
-          echo "source_drift=false" >> "$GITHUB_OUTPUT"
-          git -C "$checkout_dir" rev-parse --short HEAD
+          pnpm run --silent repair:exact-review-source -- \
+            --target-dir "$checkout_dir" \
+            --item-kind "$ITEM_KIND" \
+            --item-number "$ITEM_NUMBER" \
+            --source-head-sha "$SOURCE_HEAD_SHA"
 
       - name: Requeue exact review after source drift
         if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.checkout-target.outputs.source_drift == 'true' }}
@@ -1062,7 +1045,7 @@ jobs:
 
       - name: Review exact event item
         id: review-exact-event-item
-        if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.live-item.outputs.proceed == 'true' && steps.reserve-exact-review-lease.outputs.status == 'posted' }}
+        if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.live-item.outputs.proceed == 'true' && steps.checkout-target.outputs.source_drift != 'true' && steps.reserve-exact-review-lease.outputs.status == 'posted' }}
         continue-on-error: true
         env:
           GH_TOKEN: ${{ steps.target-read-token.outputs.token }}
@@ -1465,7 +1448,7 @@ jobs:
           exit 1
 
       - name: Release unsuccessful workflow-owned review lease
-        if: ${{ always() && steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.live-item.outputs.proceed == 'true' && steps.reserve-exact-review-lease.outputs.status != 'held' && steps.direct-exact-review-publication.outputs.accepted != 'true' && steps.queue-exact-review-publication.outcome != 'success' }}
+        if: ${{ always() && steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.live-item.outputs.proceed == 'true' && steps.checkout-target.outputs.source_drift != 'true' && steps.reserve-exact-review-lease.outputs.status != 'held' && steps.direct-exact-review-publication.outputs.accepted != 'true' && steps.queue-exact-review-publication.outcome != 'success' }}
         env:
           GH_TOKEN: ${{ steps.target-write-token.outputs.token }}
           TARGET_REPO: ${{ steps.target.outputs.target_repo }}
