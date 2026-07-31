@@ -182,7 +182,10 @@ const executionModelArgs = codexModelArgs(model);
 const { codexTimeoutMs, fixStepTimeoutMs, lateWorkerReserveMs } = repairTimeoutBudgetFromEnv(
   process.env,
 );
-const codexReasoningEffort = repairCodexReasoningEffort();
+const codexReasoningEffort = repairCodexReasoningEffort(
+  undefined,
+  /^jobs\/[^/]+\/inbox\/issue-/.test(String(jobPath ?? "")),
+);
 const scriptStartedAt = new Date();
 const codexServiceTier = repairCodexServiceTier();
 const codexHeartbeatMs = Math.max(
@@ -3774,6 +3777,19 @@ function assertIssueImplementationNotPaused() {
   if (pauseLabel) {
     throw new Error(
       `source issue ${repo}#${number} is paused by ${pauseLabel}; refusing to push or open a PR`,
+    );
+  }
+  if (
+    job.frontmatter.operator_override !== true &&
+    issue.labels.some(
+      (label: JsonValue) =>
+        String(label?.name ?? label)
+          .trim()
+          .toLowerCase() === "clawsweeper:bulk-filed",
+    )
+  ) {
+    throw new Error(
+      `source issue ${repo}#${number} is bulk-filed; refusing to push or open an automatic PR`,
     );
   }
 }

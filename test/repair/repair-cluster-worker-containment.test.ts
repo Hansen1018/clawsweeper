@@ -100,6 +100,49 @@ test("initial planning forwards the selected model like requeues", () => {
   assert.match(workflow.slice(reviewWorkerIndex), /--model "\$CLUSTER_WORKER_MODEL"/);
 });
 
+test("issue PR execution is pinned to sol xhigh without changing planning", () => {
+  const executeJobIndex = workflow.indexOf("\n  execute:");
+  const planningJob = workflow.slice(0, executeJobIndex);
+  const executeJob = workflow.slice(executeJobIndex);
+
+  assert.ok(executeJobIndex >= 0);
+  assert.match(planningJob, /CLAWSWEEPER_INTERNAL_MODEL: \$\{\{ secrets\.CLAWSWEEPER_MODEL \}\}/);
+  assert.match(
+    executeJob,
+    /CLAWSWEEPER_CODEX_REASONING_EFFORT: \$\{\{ contains\(inputs\.job, '\/inbox\/issue-'\) && \(vars\.CLAWSWEEPER_FIX_PR_REASONING_EFFORT \|\| 'xhigh'\)/,
+  );
+  assert.match(
+    executeJob,
+    /CLAWSWEEPER_INTERNAL_MODEL: \$\{\{ contains\(inputs\.job, '\/inbox\/issue-'\) && \(vars\.CLAWSWEEPER_FIX_PR_MODEL \|\| 'gpt-5\.6-sol'\) \|\| secrets\.CLAWSWEEPER_MODEL \}\}/,
+  );
+  assert.match(
+    executeJob,
+    /CLAWSWEEPER_OPENCLAW_MODEL: \$\{\{ contains\(inputs\.job, '\/inbox\/issue-'\) && format\('openai\/\{0\}', vars\.CLAWSWEEPER_FIX_PR_MODEL \|\| 'gpt-5\.6-sol'\) \|\| secrets\.CLAWSWEEPER_OPENCLAW_MODEL \}\}/,
+  );
+  assert.match(
+    fs.readFileSync("src/repair/execute-fix-artifact.ts", "utf8"),
+    /repairCodexReasoningEffort\(\s*undefined,\s*\/\^jobs\\\/\[\^\/\]\+\\\/inbox\\\/issue-\//,
+  );
+});
+
+test("issue implementation workers hydrate only their canonical issue in both jobs", () => {
+  const focusedHydration = workflow.match(
+    /records-item-number: \$\{\{ steps\.target\.outputs\.records_item_number \|\| '' \}\}/g,
+  );
+  const targetSlugs = workflow.match(
+    /records-repo-slugs: \$\{\{ steps\.target\.outputs\.target_slug \|\| '' \}\}/g,
+  );
+
+  assert.equal(focusedHydration?.length, 2);
+  assert.equal(targetSlugs?.length, 2);
+  assert.equal((workflow.match(/echo "records_item_number=\$item_number"/g) || []).length, 2);
+  assert.equal(
+    (workflow.match(/echo "target_slug=\$\{owner_slug\}-\$\{repository\}"/g) || []).length,
+    2,
+  );
+  assert.equal((workflow.match(/owner_slug="\$\(printf/g) || []).length, 2);
+});
+
 test("execution-gate downgrades complete the planning session without starting execution", () => {
   const runWorkerIndex = workflow.indexOf("- name: Run worker");
   const completionIndex = workflow.indexOf("- name: Record planning completion", runWorkerIndex);

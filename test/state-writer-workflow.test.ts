@@ -31,7 +31,7 @@ test("every state hydration uses the canonical Worker with an explicit git-state
     }
   }
 
-  assert.equal(setups.length, 19, "setup-state site count is an audited invariant");
+  assert.equal(setups.length, 20, "setup-state site count is an audited invariant");
   for (const { site, step } of setups) {
     assert.equal(step.with?.["records-url"], workerUrl, site);
     assert.equal(step.with?.["records-secret"], workerSecret, site);
@@ -69,8 +69,11 @@ test("per-target state hydration is slug-scoped while fleet lanes retain discove
     [
       ".github/workflows/exact-review-batch-publish.yml:publish",
       ".github/workflows/repair-cluster-intake.yml:intake",
+      ".github/workflows/repair-cluster-worker.yml:cluster",
+      ".github/workflows/repair-cluster-worker.yml:execute",
       ".github/workflows/repair-comment-router.yml:route-comments",
       ".github/workflows/repair-conflict-self-heal.yml:self-heal",
+      ".github/workflows/repair-issue-implementation-backfill.yml:backfill",
       ".github/workflows/repair-issue-implementation-intake.yml:intake",
       ".github/workflows/spam-scanner.yml:scan",
       ".github/workflows/sweep.yml:event-review-apply",
@@ -87,8 +90,6 @@ test("per-target state hydration is slug-scoped while fleet lanes retain discove
       .filter(({ step }) => step.with?.["records-repo-slugs"] === undefined)
       .map(({ site }) => site),
     [
-      ".github/workflows/repair-cluster-worker.yml:cluster",
-      ".github/workflows/repair-cluster-worker.yml:execute",
       ".github/workflows/repair-publish-results.yml:publish",
       ".github/workflows/repair-self-heal.yml:self-heal",
       ".github/workflows/sweep.yml:target-fanout",
@@ -101,6 +102,20 @@ test("per-target state hydration is slug-scoped while fleet lanes retain discove
   }
 });
 
+test("automatic issue implementation joins the priority intake state-writer lane", () => {
+  const source = readFileSync(".github/workflows/repair-issue-implementation-intake.yml", "utf8");
+  const workflow = parse(source) as WorkflowDocument;
+  const stateSetup = workflow.jobs?.intake?.steps?.find(isSetupState);
+
+  assert.equal(stateSetup?.with?.["coordinator-class"], "cluster_intake");
+  assert.equal(
+    stateSetup?.with?.["records-item-number"],
+    "${{ github.event.inputs.item_number || github.event.client_payload.item_number }}",
+  );
+  assert.equal(source.match(/for attempt in 1 2 3; do/g)?.length, 2);
+  assert.match(source, /sleep "\$\(\(attempt \* 3\)\)"/);
+});
+
 test("setup-state checks out only the remaining operational git tree", () => {
   const source = readFileSync(".github/actions/setup-state/action.yml", "utf8");
   const action = parse(source) as {
@@ -111,6 +126,15 @@ test("setup-state checks out only the remaining operational git tree", () => {
   assert.equal(action.inputs?.["ledger-source"], undefined);
   assert.equal(action.inputs?.["coordinator-enabled"], undefined);
   assert.ok(action.inputs?.["hydrate-git-state"]);
+  assert.ok(action.inputs?.["records-item-number"]);
+  const snapshot = action.runs?.steps?.find(
+    (step) => step.name === "Resolve canonical record snapshot cache key",
+  );
+  assert.equal(
+    (snapshot as WorkflowStep & { if?: string })?.if,
+    "${{ inputs.records-item-number == '' }}",
+  );
+  assert.match(source, /--records-item-number "\$RECORDS_ITEM_NUMBER"/);
   assert.match(source, /CLAWSWEEPER_STATE_COORDINATOR_ENABLED=1/);
   const checkout = action.runs?.steps?.find((step) => step.name === "Check out operational state");
   const sparse = String(checkout?.with?.["sparse-checkout"] ?? "");
@@ -146,7 +170,7 @@ test("all remaining git publishers join setup-state and receive a step-scoped co
       }
     }
   }
-  assert.equal(publishers, 19, "git publisher count is an audited invariant");
+  assert.equal(publishers, 20, "git publisher count is an audited invariant");
 });
 
 test("post-side-effect git bookkeeping is non-fatal while durability fences stay strict", () => {

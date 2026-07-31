@@ -223,6 +223,23 @@ jobs:
             exit 1
           fi
           echo "target_owner=$owner" >> "$GITHUB_OUTPUT"
+          job_file="${JOB_PATH##*/}"
+          owner_slug="$(printf '%s' "$owner" | tr '[:upper:]' '[:lower:]')"
+          if [[ "$job_file" == "issue-${owner_slug}-"*.md ]]; then
+            issue_target="${job_file#issue-${owner_slug}-}"
+            issue_target="${issue_target%.md}"
+            item_number="${issue_target##*-}"
+            repository="${issue_target%-${item_number}}"
+            if ! [[ "$item_number" =~ ^[1-9][0-9]*$ ]] ||
+              ! [[ "$repository" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+              echo "Invalid issue implementation target: $job_file" >&2
+              exit 1
+            fi
+            {
+              echo "target_slug=${owner_slug}-${repository}"
+              echo "records_item_number=$item_number"
+            } >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Create GitHub App token
         id: app_token
@@ -255,6 +272,8 @@ jobs:
         with:
           coordinator-url: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
           records-url: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
+          records-repo-slugs: ${{ steps.target.outputs.target_slug || '' }}
+          records-item-number: ${{ steps.target.outputs.records_item_number || '' }}
           records-secret: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           hydrate-state-blobs: "false"
           token: ${{ steps.state-token.outputs.token }}
@@ -480,7 +499,8 @@ jobs:
       CLAWSWEEPER_ALLOW_EXECUTE: ${{ needs.cluster.outputs.allow_execute == '1' && '1' || '0' }}
       CLAWSWEEPER_ALLOW_FIX_PR: ${{ needs.cluster.outputs.allow_fix_pr == '1' && '1' || '0' }}
       CLAWSWEEPER_ALLOW_MERGE: ${{ needs.cluster.outputs.allow_merge || '0' }}
-      CLAWSWEEPER_CODEX_REASONING_EFFORT: ${{ vars.CLAWSWEEPER_CODEX_REASONING_EFFORT || 'high' }}
+      CLAWSWEEPER_OPENCLAW_MODEL: ${{ contains(inputs.job, '/inbox/issue-') && format('openai/{0}', vars.CLAWSWEEPER_FIX_PR_MODEL || 'gpt-5.6-sol') || secrets.CLAWSWEEPER_OPENCLAW_MODEL }}
+      CLAWSWEEPER_CODEX_REASONING_EFFORT: ${{ contains(inputs.job, '/inbox/issue-') && (vars.CLAWSWEEPER_FIX_PR_REASONING_EFFORT || 'xhigh') || vars.CLAWSWEEPER_CODEX_REASONING_EFFORT || 'high' }}
       CLAWSWEEPER_CODEX_REVIEW_ATTEMPTS: ${{ vars.CLAWSWEEPER_CODEX_REVIEW_ATTEMPTS || '4' }}
       CLAWSWEEPER_FIX_CODEX_TIMEOUT_MS: ${{ vars.CLAWSWEEPER_FIX_CODEX_TIMEOUT_MS || '1800000' }}
       CLAWSWEEPER_FIX_STEP_TIMEOUT_MS: ${{ vars.CLAWSWEEPER_FIX_STEP_TIMEOUT_MS || '4200000' }}
@@ -520,6 +540,23 @@ jobs:
             exit 1
           fi
           echo "target_owner=$owner" >> "$GITHUB_OUTPUT"
+          job_file="${JOB_PATH##*/}"
+          owner_slug="$(printf '%s' "$owner" | tr '[:upper:]' '[:lower:]')"
+          if [[ "$job_file" == "issue-${owner_slug}-"*.md ]]; then
+            issue_target="${job_file#issue-${owner_slug}-}"
+            issue_target="${issue_target%.md}"
+            item_number="${issue_target##*-}"
+            repository="${issue_target%-${item_number}}"
+            if ! [[ "$item_number" =~ ^[1-9][0-9]*$ ]] ||
+              ! [[ "$repository" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+              echo "Invalid issue implementation target: $job_file" >&2
+              exit 1
+            fi
+            {
+              echo "target_slug=${owner_slug}-${repository}"
+              echo "records_item_number=$item_number"
+            } >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Create GitHub App token
         id: target_write_token
@@ -556,6 +593,8 @@ jobs:
         with:
           coordinator-url: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
           records-url: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
+          records-repo-slugs: ${{ steps.target.outputs.target_slug || '' }}
+          records-item-number: ${{ steps.target.outputs.records_item_number || '' }}
           records-secret: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           hydrate-state-blobs: "false"
           token: ${{ steps.state-token.outputs.token }}
@@ -600,7 +639,7 @@ jobs:
         if: ${{ env.CLAWSWEEPER_RUNNER != 'openclaw' && steps.check_job.outputs.job_exists == '1' }}
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          CLAWSWEEPER_INTERNAL_MODEL: ${{ secrets.CLAWSWEEPER_MODEL }}
+          CLAWSWEEPER_INTERNAL_MODEL: ${{ contains(inputs.job, '/inbox/issue-') && (vars.CLAWSWEEPER_FIX_PR_MODEL || 'gpt-5.6-sol') || secrets.CLAWSWEEPER_MODEL }}
         with:
           cache-suffix: target-pnpm
           codex-home: ${{ steps.codex_session.outputs.codex_home }}
