@@ -4473,30 +4473,118 @@ function compactSemanticPullFile(value: unknown): unknown {
   };
 }
 
+type PullFileSnapshot = {
+  baseSha: string;
+  headSha: string;
+};
+
+const GITHUB_PULL_FILES_MAX = 3000;
+
+function pullFileSnapshot(value: unknown): PullFileSnapshot | null {
+  const pull = asRecord(value);
+  const baseSha = stringOrUndefined(asRecord(pull.base).sha)?.toLowerCase() ?? "";
+  const headSha = stringOrUndefined(asRecord(pull.head).sha)?.toLowerCase() ?? "";
+  return /^[0-9a-f]{40}$/.test(baseSha) && /^[0-9a-f]{40}$/.test(headSha)
+    ? { baseSha, headSha }
+    : null;
+}
+
 function completePullFilesForDeterministicReview(options: {
+  initialPullRequest: unknown;
   repo: string;
   total: number;
   truncated: boolean;
   fetchAll: () => unknown[];
+  fetchPullRequest: () => unknown;
 }): unknown[] | null {
-  if (options.repo !== "openclaw/openclaw" || !options.truncated) return null;
+  if (
+    options.repo !== "openclaw/openclaw" ||
+    !options.truncated ||
+    options.total > GITHUB_PULL_FILES_MAX
+  ) {
+    return null;
+  }
   try {
+    const initialSnapshot = pullFileSnapshot(options.initialPullRequest);
+    if (!initialSnapshot) return null;
     const files = options.fetchAll();
-    return files.length === options.total ? files.map(compactSemanticPullFile) : null;
+    if (files.length !== options.total) return null;
+    const filenames = files.map((file) => stringOrUndefined(asRecord(file).filename)?.trim() ?? "");
+    if (filenames.some((filename) => !filename) || new Set(filenames).size !== filenames.length) {
+      return null;
+    }
+    const refreshedSnapshot = pullFileSnapshot(options.fetchPullRequest());
+    if (
+      !refreshedSnapshot ||
+      refreshedSnapshot.baseSha !== initialSnapshot.baseSha ||
+      refreshedSnapshot.headSha !== initialSnapshot.headSha
+    ) {
+      return null;
+    }
+    return files.map(compactSemanticPullFile);
   } catch {
     // Keep the bounded window usable; deterministic classifiers retain the unknown marker.
     return null;
   }
 }
 
+function pullFileReviewHydration(options: {
+  repo: string;
+  path: string;
+  total: unknown;
+  pullRequest: unknown;
+  fetchPage: (path: string, page: number) => unknown[];
+  fetchPullRequest: () => unknown;
+}): { window: ContextHydration<unknown>; completeFiles: unknown[] | null } {
+  const pages = new Map<number, unknown[]>();
+  const readPage = (path: string, page: number): unknown[] => {
+    const cached = pages.get(page);
+    if (cached) return cached;
+    const files = options.fetchPage(path, page);
+    pages.set(page, files);
+    return files;
+  };
+  const window = ghPagedContextWindow<unknown>(options.path, options.total, 80, {
+    page: readPage,
+  });
+  const completeFiles = completePullFilesForDeterministicReview({
+    initialPullRequest: options.pullRequest,
+    repo: options.repo,
+    total: window.total,
+    truncated: window.truncated,
+    fetchAll: () => {
+      const files: unknown[] = [];
+      const pageCount = Math.ceil(window.total / 100);
+      for (let page = 1; page <= pageCount; page += 1) {
+        const pageFiles = readPage(options.path, page);
+        files.push(...pageFiles);
+        if (pageFiles.length < 100) break;
+      }
+      return files;
+    },
+    fetchPullRequest: options.fetchPullRequest,
+  });
+  return { window, completeFiles };
+}
+
 export function completePullFilesForDeterministicReviewForTest(options: {
+  initialBaseSha?: string;
+  initialHeadSha?: string;
+  refreshedBaseSha?: string;
+  refreshedHeadSha?: string;
   repo?: string;
   total: number;
   truncated: boolean;
   files: unknown[];
   fetchError?: Error;
 }): unknown[] | null {
+  const initialBaseSha = options.initialBaseSha ?? "a".repeat(40);
+  const initialHeadSha = options.initialHeadSha ?? "b".repeat(40);
   return completePullFilesForDeterministicReview({
+    initialPullRequest: {
+      base: { sha: initialBaseSha },
+      head: { sha: initialHeadSha },
+    },
     repo: options.repo ?? "openclaw/openclaw",
     total: options.total,
     truncated: options.truncated,
@@ -4504,7 +4592,42 @@ export function completePullFilesForDeterministicReviewForTest(options: {
       if (options.fetchError) throw options.fetchError;
       return options.files;
     },
+    fetchPullRequest: () => ({
+      base: { sha: options.refreshedBaseSha ?? initialBaseSha },
+      head: { sha: options.refreshedHeadSha ?? initialHeadSha },
+    }),
   });
+}
+
+export function pullFileReviewHydrationForTest(options: {
+  total: number;
+  pages: readonly unknown[][];
+}): {
+  completeFiles: unknown[] | null;
+  hydrated: number;
+  pageCalls: number[];
+} {
+  const pageCalls: number[] = [];
+  const pullRequest = {
+    base: { sha: "a".repeat(40) },
+    head: { sha: "b".repeat(40) },
+  };
+  const result = pullFileReviewHydration({
+    repo: "openclaw/openclaw",
+    path: "repos/openclaw/openclaw/pulls/123/files",
+    total: options.total,
+    pullRequest,
+    fetchPage: (_path, page) => {
+      pageCalls.push(page);
+      return [...(options.pages[page - 1] ?? [])];
+    },
+    fetchPullRequest: () => pullRequest,
+  });
+  return {
+    completeFiles: result.completeFiles,
+    hydrated: result.window.hydrated,
+    pageCalls,
+  };
 }
 
 function normalizedPullFileStatus(value: unknown): string {
@@ -6597,18 +6720,19 @@ function collectItemContext(
   if (item.kind === "pull_request") {
     pullRequest = ghJson<unknown>(["api", `repos/${targetRepo()}/pulls/${item.number}`]);
     const pullRecord = asRecord(pullRequest);
-    const pullFilesWindow = ghPagedContextWindow<unknown>(
-      `repos/${targetRepo()}/pulls/${item.number}/files`,
-      pullRecord.changed_files,
-      80,
-    );
-    const pullFiles = pullFilesWindow.items;
-    const completePullFiles = completePullFilesForDeterministicReview({
+    const pullFilesPath = `repos/${targetRepo()}/pulls/${item.number}/files`;
+    const pullFileHydration = pullFileReviewHydration({
       repo: targetRepo(),
-      total: pullFilesWindow.total,
-      truncated: pullFilesWindow.truncated,
-      fetchAll: () => ghPaged<unknown>(`repos/${targetRepo()}/pulls/${item.number}/files`),
+      path: pullFilesPath,
+      total: pullRecord.changed_files,
+      pullRequest,
+      fetchPage: ghPage,
+      fetchPullRequest: () =>
+        ghJson<unknown>(["api", `repos/${targetRepo()}/pulls/${item.number}`]),
     });
+    const pullFilesWindow = pullFileHydration.window;
+    const pullFiles = pullFilesWindow.items;
+    const completePullFiles = pullFileHydration.completeFiles;
     const pullCommitsWindow = ghPagedContextWindow<unknown>(
       `repos/${targetRepo()}/pulls/${item.number}/commits`,
       pullRecord.commits,

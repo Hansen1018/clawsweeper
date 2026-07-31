@@ -15,6 +15,7 @@ import {
   githubContextWindowPlan,
   githubLinkLastPageNumber,
   githubPaginatedPath,
+  pullFileReviewHydrationForTest,
   stripEmptyMaintainerRulingFieldsForTest,
 } from "../dist/clawsweeper.js";
 
@@ -141,6 +142,69 @@ test("complete pull-file hydration requires the exact reported count", () => {
     })?.length,
     118,
   );
+});
+
+test("complete pull-file hydration requires unique filenames and a stable pull snapshot", () => {
+  const files = Array.from({ length: 118 }, (_, index) => ({
+    filename: `src/file-${index}.ts`,
+    patch: `+export const value${index} = ${index};`,
+  }));
+
+  assert.equal(
+    completePullFilesForDeterministicReviewForTest({
+      total: 118,
+      truncated: true,
+      files: [...files.slice(0, 117), files[0]],
+    }),
+    null,
+  );
+  assert.equal(
+    completePullFilesForDeterministicReviewForTest({
+      total: 118,
+      truncated: true,
+      files,
+      refreshedHeadSha: "c".repeat(40),
+    }),
+    null,
+  );
+  assert.equal(
+    completePullFilesForDeterministicReviewForTest({
+      total: 118,
+      truncated: true,
+      files,
+      refreshedBaseSha: "d".repeat(40),
+    }),
+    null,
+  );
+});
+
+test("complete pull-file hydration fetches each page at most once", () => {
+  const files = Array.from({ length: 118 }, (_, index) => ({
+    filename: `src/file-${index}.ts`,
+    patch: `+export const value${index} = ${index};`,
+  }));
+  const result = pullFileReviewHydrationForTest({
+    total: files.length,
+    pages: [files.slice(0, 100), files.slice(100)],
+  });
+
+  assert.equal(result.hydrated, 80);
+  assert.equal(result.completeFiles?.length, 118);
+  assert.deepEqual(result.pageCalls, [1, 2]);
+});
+
+test("complete pull-file hydration fails closed above GitHub's file-list limit", () => {
+  const files = Array.from({ length: 100 }, (_, index) => ({
+    filename: `src/file-${index}.ts`,
+    patch: `+export const value${index} = ${index};`,
+  }));
+  const result = pullFileReviewHydrationForTest({
+    total: 5000,
+    pages: [files],
+  });
+
+  assert.equal(result.completeFiles, null);
+  assert.deepEqual(result.pageCalls, [1, 50]);
 });
 
 test("complete pull-file hydration fails closed when the full fetch throws", () => {
