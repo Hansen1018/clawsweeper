@@ -294,6 +294,136 @@ test("data model detector ignores query-only and non-semantic docs changes", () 
   assert.deepEqual(detection, { change: false, surfaces: [] });
 });
 
+test("data model detector ignores runtime repair, telemetry, and test vocabulary", () => {
+  const detection = dataModelChangeFromPullFilesForTest({
+    pullFiles: [
+      {
+        filename: "src/agents/embedded-agent-runner/run/code-mode-tool-call-repair.ts",
+        patch: "@@\n+  return repairSmallModelToolCall(payload);",
+      },
+      {
+        filename: "src/agents/tool-search-runtime.ts",
+        patch: "@@\n+  const repaired = repairToolResult(result);",
+      },
+      {
+        filename: "src/agents/tool-search-telemetry.ts",
+        patch: "@@\n+  metadata: toolMetadata,\n+  cacheRead: usage.cacheRead,",
+      },
+      {
+        filename: "src/agents/code-mode-tool-input-repair.ts",
+        patch: "@@\n+  return JSON.parse(candidate);",
+      },
+      {
+        filename: "extensions/qa-lab/src/code-mode-model-matrix.options.test.ts",
+        patch: "@@\n+  it('preserves cache fields', () => JSON.stringify(result));",
+      },
+    ],
+  });
+
+  assert.deepEqual(detection, { change: false, surfaces: [] });
+});
+
+test("data model detector keeps explicit repair and persistence surfaces", () => {
+  const detection = dataModelChangeFromPullFilesForTest({
+    pullFiles: [
+      {
+        filename: "src/doctor/repair.ts",
+        patch: "@@\n+  await repair(database);",
+      },
+      {
+        filename: "src/cache/schema.ts",
+        patch: "@@\n+  entryFingerprint: string;",
+      },
+      {
+        filename: "src/runtime/checkpoint.ts",
+        patch:
+          "@@\n+  const raw = await readFile(checkpointPath, 'utf8');\n+  return JSON.parse(raw);",
+      },
+      {
+        filename: "scripts/config-fixture.ts",
+        patch:
+          "@@\n+  await writeFile(configPath, JSON.stringify(config));\n+  return readFile(resultPath, 'utf8');",
+      },
+    ],
+  });
+
+  assert.deepEqual(detection, {
+    change: true,
+    surfaces: [
+      "migration/backfill/repair: src/doctor/repair.ts",
+      "persistent cache schema: src/cache/schema.ts",
+      "serialized state: src/runtime/checkpoint.ts",
+    ],
+  });
+});
+
+test("data model detector keeps production snapshot schemas", () => {
+  const detection = dataModelChangeFromPullFilesForTest({
+    pullFiles: [
+      {
+        filename: "src/storage/snapshots/schema.sql",
+        patch: "@@\n+ALTER TABLE snapshots ADD COLUMN format_version INTEGER;",
+      },
+    ],
+  });
+
+  assert.deepEqual(detection, {
+    change: true,
+    surfaces: ["database schema: src/storage/snapshots/schema.sql"],
+  });
+});
+
+test("data model detector recognizes semantic prose forms", () => {
+  const detection = dataModelChangeFromPullFilesForTest({
+    pullFiles: [
+      {
+        filename: "docs/storage.md",
+        patch:
+          "@@\n+The cache version changes when persisted entries become incompatible.\n+The embedding dimension remains part of stored vector metadata.",
+      },
+    ],
+  });
+
+  assert.deepEqual(detection, {
+    change: true,
+    surfaces: [
+      "persistent cache schema: docs/storage.md",
+      "vector/embedding metadata: docs/storage.md",
+    ],
+  });
+});
+
+test("data model detector recognizes compound persisted path identifiers", () => {
+  const detection = dataModelChangeFromPullFilesForTest({
+    pullFiles: [
+      {
+        filename: "src/runtime/load-checkpoint.ts",
+        patch:
+          "@@\n+  const raw = await readFile(checkpointFilePath, 'utf8');\n+  return JSON.parse(raw);",
+      },
+      {
+        filename: "src/runtime/load-state.ts",
+        patch:
+          "@@\n+  const raw = await readFile(state_file_path, 'utf8');\n+  return JSON.parse(raw);",
+      },
+      {
+        filename: "src/runtime/load-cache.ts",
+        patch:
+          "@@\n+  const raw = await readFile(cacheDirectoryPath, 'utf8');\n+  return JSON.parse(raw);",
+      },
+    ],
+  });
+
+  assert.deepEqual(detection, {
+    change: true,
+    surfaces: [
+      "serialized state: src/runtime/load-cache.ts",
+      "serialized state: src/runtime/load-checkpoint.ts",
+      "serialized state: src/runtime/load-state.ts",
+    ],
+  });
+});
+
 test("data model detector flags path-hinted persisted field declarations", () => {
   const detection = dataModelChangeFromPullFilesForTest({
     pullFiles: [
