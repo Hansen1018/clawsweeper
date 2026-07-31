@@ -3610,6 +3610,78 @@ test("sweep target checkouts retry without cached references", () => {
   }
 });
 
+test("exact PR reviews fail closed unless the leased source head is checked out", () => {
+  const workflow = YAML.parse(readText(".github/workflows/sweep.yml")) as {
+    jobs: Record<
+      string,
+      {
+        steps: Array<{
+          name?: string;
+          if?: string;
+          env?: Record<string, string>;
+          run?: string;
+        }>;
+      }
+    >;
+  };
+  const steps = workflow.jobs["event-review-apply"]!.steps;
+  const checkoutIndex = steps.findIndex((step) => step.name === "Check out target repository");
+  const codexIndex = steps.findIndex(
+    (step) => step.name === "Materialize Codex source for OpenClaw review",
+  );
+  const reviewIndex = steps.findIndex((step) => step.name === "Review exact event item");
+  const checkout = steps[checkoutIndex]!;
+  const codex = steps[codexIndex]!;
+  const requeue = steps.find((step) => step.name === "Requeue exact review after source drift")!;
+  const generation = steps.find((step) => step.name === "Export exact review generation result")!;
+
+  assert.ok(checkoutIndex >= 0);
+  assert.ok(codexIndex > checkoutIndex);
+  assert.ok(reviewIndex > codexIndex);
+  assert.equal(
+    checkout.env?.SOURCE_HEAD_SHA,
+    "${{ fromJSON(steps.claim-exact-review-queue.outputs.decision).sourceHeadSha || '' }}",
+  );
+  assert.match(checkout.run ?? "", /refs\/pull\/\$\{ITEM_NUMBER\}\/head/);
+  assert.match(checkout.run ?? "", /fetched_head" != "\$SOURCE_HEAD_SHA/);
+  assert.match(checkout.run ?? "", /source_drift=true/);
+  assert.match(checkout.run ?? "", /exit 0/);
+  assert.match(checkout.run ?? "", /checkout --detach "\$SOURCE_HEAD_SHA"/);
+  assert.match(checkout.run ?? "", /checked_out_head" != "\$SOURCE_HEAD_SHA/);
+  assert.equal(
+    requeue.if,
+    "${{ steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.checkout-target.outputs.source_drift == 'true' }}",
+  );
+  assert.match(codex.if ?? "", /source_drift != 'true'/);
+  assert.match(codex.if ?? "", /target_repo == 'openclaw\/openclaw'/);
+  assert.match(codex.run ?? "", /https:\/\/github\.com\/openai\/codex\.git codex/);
+  assert.equal(
+    generation.env?.SOURCE_DRIFT,
+    "${{ steps.checkout-target.outputs.source_drift || 'false' }}",
+  );
+  assert.match(generation.run ?? "", /SOURCE_DRIFT" = "true"/);
+  assert.match(generation.run ?? "", /requeue_latest=true/);
+});
+
+test("scheduled OpenClaw review workers materialize sibling Codex source", () => {
+  const workflow = YAML.parse(readText(".github/workflows/sweep.yml")) as {
+    jobs: Record<string, { steps: Array<{ name?: string; if?: string; run?: string }> }>;
+  };
+  const steps = workflow.jobs.review!.steps;
+  const checkoutIndex = steps.findIndex((step) => step.name === "Check out target repository");
+  const codexIndex = steps.findIndex(
+    (step) => step.name === "Materialize Codex source for OpenClaw review",
+  );
+  const reviewIndex = steps.findIndex((step) => step.name === "Review shard");
+  const codex = steps[codexIndex]!;
+
+  assert.ok(checkoutIndex >= 0);
+  assert.ok(codexIndex > checkoutIndex);
+  assert.ok(reviewIndex > codexIndex);
+  assert.equal(codex.if, "${{ needs.plan.outputs.target_repo == 'openclaw/openclaw' }}");
+  assert.match(codex.run ?? "", /https:\/\/github\.com\/openai\/codex\.git codex/);
+});
+
 test("target sweep runs count as background review capacity", () => {
   const workflow = readText(".github/workflows/sweep.yml");
   const capacityBlock = workflow.slice(

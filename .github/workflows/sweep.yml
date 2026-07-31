@@ -857,7 +857,12 @@ jobs:
             ${{ steps.target.outputs.target_repo_name }}-git-${{ runner.os }}-
 
       - name: Check out target repository
+        id: checkout-target
         if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.live-item.outputs.proceed == 'true' }}
+        env:
+          ITEM_KIND: ${{ steps.live-item.outputs.item_kind }}
+          ITEM_NUMBER: ${{ steps.target.outputs.item_number }}
+          SOURCE_HEAD_SHA: ${{ fromJSON(steps.claim-exact-review-queue.outputs.decision).sourceHeadSha || '' }}
         run: |
           set -euo pipefail
           url="https://github.com/${{ steps.target.outputs.target_repo }}.git"
@@ -887,10 +892,39 @@ jobs:
             git clone --bare --filter=blob:none --single-branch --branch "$target_branch" "$url" "$cache_dir"
             git clone --filter=blob:none --branch "$target_branch" --single-branch "$url" "$checkout_dir"
           fi
+          if [ "$ITEM_KIND" = "pull_request" ]; then
+            if ! [[ "$SOURCE_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::Exact PR review requires a valid leased source head SHA."
+              exit 1
+            fi
+            git -C "$checkout_dir" fetch --force --depth=50 origin "refs/pull/${ITEM_NUMBER}/head"
+            fetched_head="$(git -C "$checkout_dir" rev-parse FETCH_HEAD)"
+            if [ "$fetched_head" != "$SOURCE_HEAD_SHA" ]; then
+              echo "::notice::Fetched PR head $fetched_head moved past leased source head $SOURCE_HEAD_SHA; skipping review and requeueing the latest source."
+              echo "source_drift=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            else
+              git -C "$checkout_dir" checkout --detach "$SOURCE_HEAD_SHA"
+              checked_out_head="$(git -C "$checkout_dir" rev-parse HEAD)"
+              if [ "$checked_out_head" != "$SOURCE_HEAD_SHA" ]; then
+                echo "::error::Target checkout head $checked_out_head does not match leased source head $SOURCE_HEAD_SHA."
+                exit 1
+              fi
+            fi
+          fi
+          echo "source_drift=false" >> "$GITHUB_OUTPUT"
           git -C "$checkout_dir" rev-parse --short HEAD
 
+      - name: Requeue exact review after source drift
+        if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.checkout-target.outputs.source_drift == 'true' }}
+        run: echo "::notice::The leased PR source moved before review; this run is a successful no-op and the durable queue will review the latest head."
+
+      - name: Materialize Codex source for OpenClaw review
+        if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.live-item.outputs.proceed == 'true' && steps.checkout-target.outputs.source_drift != 'true' && steps.target.outputs.target_repo == 'openclaw/openclaw' }}
+        run: git clone --filter=blob:none --depth=1 https://github.com/openai/codex.git codex
+
       - name: Mark re-review command in progress
-        if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.live-item.outputs.proceed == 'true' }}
+        if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.live-item.outputs.proceed == 'true' && steps.checkout-target.outputs.source_drift != 'true' }}
         continue-on-error: true
         env:
           GH_TOKEN: ${{ steps.target-write-token.outputs.token }}
@@ -911,7 +945,7 @@ jobs:
             --wait-ms 120000
 
       - uses: ./.github/actions/setup-codex
-        if: ${{ env.CLAWSWEEPER_RUNNER != 'openclaw' && steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.live-item.outputs.proceed == 'true' }}
+        if: ${{ env.CLAWSWEEPER_RUNNER != 'openclaw' && steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.live-item.outputs.proceed == 'true' && steps.checkout-target.outputs.source_drift != 'true' }}
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           CLAWSWEEPER_INTERNAL_MODEL: ${{ secrets.CLAWSWEEPER_MODEL }}
@@ -919,11 +953,11 @@ jobs:
           login-status: "true"
 
       - uses: ./.github/actions/setup-openclaw
-        if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.live-item.outputs.proceed == 'true' }}
+        if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.live-item.outputs.proceed == 'true' && steps.checkout-target.outputs.source_drift != 'true' }}
 
       - name: Reserve exact review lease
         id: reserve-exact-review-lease
-        if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.live-item.outputs.proceed == 'true' }}
+        if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.live-item.outputs.proceed == 'true' && steps.checkout-target.outputs.source_drift != 'true' }}
         env:
           GH_TOKEN: ${{ steps.target-write-token.outputs.token }}
           TARGET_REPO: ${{ steps.target.outputs.target_repo }}
@@ -1232,7 +1266,7 @@ jobs:
           fi
 
       - name: Finalize exact event action ledger
-        if: ${{ always() && steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.live-item.outputs.proceed == 'true' }}
+        if: ${{ always() && steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.live-item.outputs.proceed == 'true' && steps.checkout-target.outputs.source_drift != 'true' }}
         continue-on-error: true
         env:
           REVIEW_EXIT_CODE: ${{ steps.review-exact-event-item.outputs.exit_code || '' }}
@@ -1251,7 +1285,7 @@ jobs:
 
       - name: Create exact review artifact bundle
         id: create-exact-review-bundle
-        if: ${{ always() && steps.claim-exact-review-queue.outputs.claimed == 'true' && !cancelled() && steps.target.outputs.target_enabled == 'true' && steps.live-item.outcome == 'success' && steps.live-item.outputs.admission_retry != 'true' && steps.setup-pnpm.outcome == 'success' && steps.review-exact-event-item.outputs.superseded != 'true' && (steps.live-item.outputs.proceed != 'true' || (steps.review-exact-event-item.outcome == 'success' && steps.review-exact-event-item.outputs.retry_at == '')) }}
+        if: ${{ always() && steps.claim-exact-review-queue.outputs.claimed == 'true' && !cancelled() && steps.target.outputs.target_enabled == 'true' && steps.live-item.outcome == 'success' && steps.live-item.outputs.admission_retry != 'true' && steps.setup-pnpm.outcome == 'success' && steps.checkout-target.outputs.source_drift != 'true' && steps.review-exact-event-item.outputs.superseded != 'true' && (steps.live-item.outputs.proceed != 'true' || (steps.review-exact-event-item.outcome == 'success' && steps.review-exact-event-item.outputs.retry_at == '')) }}
         env:
           EXACT_REVIEW_ACTION_LEDGER_ROOT: ${{ env.CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT }}
           EXACT_REVIEW_BUNDLE_DIR: .artifacts/exact-review-bundle
@@ -1471,13 +1505,17 @@ jobs:
           RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
           REVIEW_OUTCOME: ${{ steps.review-exact-event-item.outcome }}
           REVIEW_SUPERSEDED: ${{ steps.review-exact-event-item.outputs.superseded || 'false' }}
+          SOURCE_DRIFT: ${{ steps.checkout-target.outputs.source_drift || 'false' }}
           RESERVATION_STATUS: ${{ steps.reserve-exact-review-lease.outputs.status }}
           RETRY_AT: ${{ steps.reserve-exact-review-lease.outputs.retry_at || steps.review-exact-event-item.outputs.retry_at }}
           CLAWSWEEPER_ACTION_LEDGER_DISABLED: "1"
         run: |
           state="Failed"
           detail="The exact review did not produce a publishable artifact. The durable queue will retry it."
-          if [ "$RESERVATION_STATUS" = "superseded" ] || [ "$REVIEW_SUPERSEDED" = "true" ]; then
+          if [ "$SOURCE_DRIFT" = "true" ]; then
+            state="Waiting"
+            detail="The pull request head moved before review. The durable queue will review the latest source."
+          elif [ "$RESERVATION_STATUS" = "superseded" ] || [ "$REVIEW_SUPERSEDED" = "true" ]; then
             state="Waiting"
             detail="A newer exact-review queue owner superseded this run. This run completed as a no-op."
           elif [ "$RESERVATION_STATUS" = "held" ]; then
@@ -1505,13 +1543,17 @@ jobs:
           LIVE_OUTCOME: ${{ steps.live-item.outcome }}
           REVIEW_OUTCOME: ${{ steps.review-exact-event-item.outcome }}
           REVIEW_SUPERSEDED: ${{ steps.review-exact-event-item.outputs.superseded || 'false' }}
+          SOURCE_DRIFT: ${{ steps.checkout-target.outputs.source_drift || 'false' }}
           RESERVATION_STATUS: ${{ steps.reserve-exact-review-lease.outputs.status }}
           PUBLICATION_QUEUE_OUTCOME: ${{ steps.queue-exact-review-publication.outcome }}
           DIRECT_PUBLICATION_ACCEPTED: ${{ steps.direct-exact-review-publication.outputs.accepted }}
         run: |
           outcome=failure
           requeue_latest=false
-          if [ "$ADMISSION_RETRY" = "true" ]; then
+          if [ "$SOURCE_DRIFT" = "true" ]; then
+            outcome=success
+            requeue_latest=true
+          elif [ "$ADMISSION_RETRY" = "true" ]; then
             outcome=success
             requeue_latest=true
           elif [ "$TARGET_ENABLED" = "false" ]; then
@@ -3289,6 +3331,10 @@ jobs:
             git clone --filter=blob:none --branch "$target_branch" --single-branch "$url" "$checkout_dir"
           fi
           git -C "$checkout_dir" rev-parse --short HEAD
+
+      - name: Materialize Codex source for OpenClaw review
+        if: ${{ needs.plan.outputs.target_repo == 'openclaw/openclaw' }}
+        run: git clone --filter=blob:none --depth=1 https://github.com/openai/codex.git codex
 
       - name: Mark shard start
         id: shard-start
