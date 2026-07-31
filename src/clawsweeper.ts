@@ -234,7 +234,7 @@ import {
   themedRatingName,
 } from "./clawsweeper-rating.js";
 
-import { completeActivityContextSymbol } from "./clawsweeper-types.js";
+import { completeActivityContextSymbol, completePullFilesSymbol } from "./clawsweeper-types.js";
 import type {
   AcquiredReviewStartLease,
   Action,
@@ -4473,6 +4473,40 @@ function compactSemanticPullFile(value: unknown): unknown {
   };
 }
 
+function completePullFilesForDeterministicReview(options: {
+  repo: string;
+  total: number;
+  truncated: boolean;
+  fetchAll: () => unknown[];
+}): unknown[] | null {
+  if (options.repo !== "openclaw/openclaw" || !options.truncated) return null;
+  try {
+    const files = options.fetchAll();
+    return files.length === options.total ? files.map(compactSemanticPullFile) : null;
+  } catch {
+    // Keep the bounded window usable; deterministic classifiers retain the unknown marker.
+    return null;
+  }
+}
+
+export function completePullFilesForDeterministicReviewForTest(options: {
+  repo?: string;
+  total: number;
+  truncated: boolean;
+  files: unknown[];
+  fetchError?: Error;
+}): unknown[] | null {
+  return completePullFilesForDeterministicReview({
+    repo: options.repo ?? "openclaw/openclaw",
+    total: options.total,
+    truncated: options.truncated,
+    fetchAll: () => {
+      if (options.fetchError) throw options.fetchError;
+      return options.files;
+    },
+  });
+}
+
 function normalizedPullFileStatus(value: unknown): string {
   const status = typeof value === "string" ? value.trim().toLowerCase() : "";
   if (status === "m" || status === "modified" || status === "changed") return "modified";
@@ -6569,6 +6603,12 @@ function collectItemContext(
       80,
     );
     const pullFiles = pullFilesWindow.items;
+    const completePullFiles = completePullFilesForDeterministicReview({
+      repo: targetRepo(),
+      total: pullFilesWindow.total,
+      truncated: pullFilesWindow.truncated,
+      fetchAll: () => ghPaged<unknown>(`repos/${targetRepo()}/pulls/${item.number}/files`),
+    });
     const pullCommitsWindow = ghPagedContextWindow<unknown>(
       `repos/${targetRepo()}/pulls/${item.number}/commits`,
       pullRecord.commits,
@@ -6599,6 +6639,12 @@ function collectItemContext(
       fullPullReviewComments.length >= pullReviewCommentsWindow.total;
     context.pullRequest = compactPullRequest(pullRequest);
     context.pullFiles = compactMappedWindow(pullFiles, pullFilesWindow.total, 80, compactPullFile);
+    if (completePullFiles) {
+      Object.defineProperty(context, completePullFilesSymbol, {
+        value: completePullFiles,
+        enumerable: false,
+      });
+    }
     context.semanticPullFiles =
       options.reviewCacheDigest &&
       options.reviewCacheGitDir &&
@@ -10724,13 +10770,28 @@ function pullRequestFilePathsFromReport(markdown: string): string[] {
   return frontMatterStringArray(markdown, "pull_files");
 }
 
+function deterministicPullFilesFromContext(context: ItemContext): {
+  complete: boolean;
+  files: readonly unknown[];
+} {
+  const completePullFiles = context[completePullFilesSymbol];
+  if (context.counts?.pullFilesTruncated && completePullFiles) {
+    return { complete: true, files: completePullFiles };
+  }
+  return {
+    complete: context.counts?.pullFilesTruncated !== true,
+    files: context.pullFiles ?? [],
+  };
+}
+
 function configSurfaceChangeFromContext(repo: string, context: ItemContext): ConfigSurfaceChange {
   if (repo !== "openclaw/openclaw") {
     return { change: false, keys: [] };
   }
 
   const keys = new Set<string>();
-  for (const entry of context.pullFiles ?? []) {
+  const deterministicPullFiles = deterministicPullFilesFromContext(context);
+  for (const entry of deterministicPullFiles.files) {
     const file = asRecord(entry);
     const path = typeof file.filename === "string" ? file.filename.trim() : "";
     const previousPath =
@@ -10760,7 +10821,7 @@ function configSurfaceChangeFromContext(repo: string, context: ItemContext): Con
     }
   }
 
-  if (context.counts?.pullFilesTruncated) {
+  if (!deterministicPullFiles.complete) {
     keys.add("unknown-truncated-pull-files");
   }
 
@@ -10768,6 +10829,7 @@ function configSurfaceChangeFromContext(repo: string, context: ItemContext): Con
 }
 
 export function configSurfaceChangeFromPullFilesForTest(options: {
+  completePullFiles?: readonly unknown[];
   repo?: string;
   pullFiles?: unknown[];
   pullFilesTruncated?: boolean;
@@ -10782,6 +10844,8 @@ export function configSurfaceChangeFromPullFilesForTest(options: {
     counts,
   };
   if (options.pullFiles !== undefined) context.pullFiles = options.pullFiles;
+  if (options.completePullFiles !== undefined)
+    context[completePullFilesSymbol] = options.completePullFiles;
   return configSurfaceChangeFromContext(options.repo ?? "openclaw/openclaw", context);
 }
 
@@ -10791,7 +10855,8 @@ function dataModelChangeFromContext(repo: string, context: ItemContext): DataMod
   }
 
   const surfaces = new Set<string>();
-  for (const entry of context.pullFiles ?? []) {
+  const deterministicPullFiles = deterministicPullFilesFromContext(context);
+  for (const entry of deterministicPullFiles.files) {
     const file = asRecord(entry);
     const path = typeof file.filename === "string" ? file.filename.trim() : "";
     const previousPath =
@@ -10823,7 +10888,7 @@ function dataModelChangeFromContext(repo: string, context: ItemContext): DataMod
     }
   }
 
-  if (context.counts?.pullFilesTruncated) {
+  if (!deterministicPullFiles.complete) {
     surfaces.add("unknown-truncated-pull-files");
   }
 
@@ -10831,6 +10896,7 @@ function dataModelChangeFromContext(repo: string, context: ItemContext): DataMod
 }
 
 export function dataModelChangeFromPullFilesForTest(options: {
+  completePullFiles?: readonly unknown[];
   repo?: string;
   pullFiles?: unknown[];
   pullFilesTruncated?: boolean;
@@ -10845,6 +10911,8 @@ export function dataModelChangeFromPullFilesForTest(options: {
     counts,
   };
   if (options.pullFiles !== undefined) context.pullFiles = options.pullFiles;
+  if (options.completePullFiles !== undefined)
+    context[completePullFilesSymbol] = options.completePullFiles;
   return dataModelChangeFromContext(options.repo ?? "openclaw/openclaw", context);
 }
 

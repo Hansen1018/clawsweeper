@@ -238,6 +238,29 @@ test("config surface detector fails closed for truncated pull files", () => {
   });
 });
 
+test("config surface detector uses complete files without a truncation marker", () => {
+  const completePullFiles = Array.from({ length: 118 }, (_, index) => ({
+    filename: index === 59 ? "src/config/schema.ts" : `src/agents/generated/file-${index}.test.ts`,
+    patch: index === 59 ? "@@\n+  codeMode: z.boolean().optional()," : "@@\n+  const value = true;",
+  }));
+  const compactPullFiles = [
+    ...completePullFiles.slice(0, 40),
+    { omitted: 38, note: "middle entries omitted from prompt context" },
+    ...completePullFiles.slice(-40),
+  ];
+
+  const detection = configSurfaceChangeFromPullFilesForTest({
+    completePullFiles,
+    pullFiles: compactPullFiles,
+    pullFilesTruncated: true,
+  });
+
+  assert.deepEqual(detection, {
+    change: true,
+    keys: ["codeMode"],
+  });
+});
+
 test("data model detector finds persistent schema and embedding metadata changes", () => {
   const detection = dataModelChangeFromPullFilesForTest({
     pullFiles: [
@@ -344,6 +367,27 @@ test("data model detector fails closed for missing and truncated likely-surface 
       "unknown-data-model-change: src/storage/session-state.ts",
       "unknown-truncated-pull-files",
     ],
+  });
+});
+
+test("data model detector uses complete files without a truncation marker", () => {
+  const completePullFiles = Array.from({ length: 118 }, (_, index) => ({
+    filename: index === 58 ? "packages/database/schema.sql" : `src/runtime/file-${index}.ts`,
+    patch:
+      index === 58
+        ? "@@\n+ALTER TABLE sessions ADD COLUMN last_model TEXT;"
+        : "@@\n+export const value = true;",
+  }));
+
+  const detection = dataModelChangeFromPullFilesForTest({
+    completePullFiles,
+    pullFiles: [...completePullFiles.slice(0, 40), ...completePullFiles.slice(-40)],
+    pullFilesTruncated: true,
+  });
+
+  assert.deepEqual(detection, {
+    change: true,
+    surfaces: ["database schema: packages/database/schema.sql"],
   });
 });
 

@@ -4,6 +4,7 @@ import test from "node:test";
 
 import {
   compactPullRequestForTest,
+  itemContentDigestForTest,
   renderReviewContextBudgetForTest,
   reviewContextLedgerForTest,
   reviewDecisionSchemaText,
@@ -11,6 +12,7 @@ import {
   reviewPromptTelemetryForTest,
   reviewPromptTemplate,
 } from "../dist/clawsweeper.js";
+import { completePullFilesSymbol } from "../dist/clawsweeper-types.js";
 import { parseArgs as parseClawsweeperArgs } from "../dist/clawsweeper-args.js";
 import { git, item } from "./helpers.ts";
 
@@ -210,4 +212,43 @@ test("review context ledger records ordered section budgets", () => {
   );
   assert.match(renderReviewContextBudgetForTest(context), /- timeline events: 1\/1 hydrated/);
   assert.match(renderReviewContextBudgetForTest(context), /- previous ClawSweeper review: 1 entry/);
+});
+
+test("review prompt, ledger, and content digest exclude complete deterministic pull files", () => {
+  const context = {
+    issue: { number: 123, title: "Large PR" },
+    comments: [],
+    timeline: [],
+    pullRequest: { number: 123, additions: 120 },
+    pullFiles: [{ filename: "src/first.ts", patch: "+first" }],
+    pullCommits: [],
+    pullReviewComments: [],
+    counts: {
+      comments: 0,
+      timeline: 0,
+      pullFiles: 118,
+      pullFilesHydrated: 80,
+      pullFilesTruncated: true,
+    },
+  };
+  const digestWithoutSidecar = itemContentDigestForTest(
+    item({ kind: "pull_request", number: 123 }),
+    context,
+    git,
+  );
+  Object.defineProperty(context, completePullFilesSymbol, {
+    value: [{ filename: "src/private-middle.ts", patch: "+middle" }],
+  });
+
+  const prompt = reviewPromptForTest(item({ kind: "pull_request", number: 123 }), context, git);
+  const ledger = reviewContextLedgerForTest(context);
+  const digestWithSidecar = itemContentDigestForTest(
+    item({ kind: "pull_request", number: 123 }),
+    context,
+    git,
+  );
+
+  assert.doesNotMatch(prompt, /private-middle/);
+  assert.equal(ledger.find((entry) => entry.section === "pullFiles")?.entries, 1);
+  assert.equal(digestWithSidecar, digestWithoutSidecar);
 });

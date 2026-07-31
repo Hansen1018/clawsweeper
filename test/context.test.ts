@@ -6,6 +6,7 @@ import {
   assistPromptContextForTest,
   compactMappedSlice,
   compactMappedWindow,
+  completePullFilesForDeterministicReviewForTest,
   extractLatestClawSweeperReviewForTest,
   extractLatestClawSweeperReviewFromHydrationForTest,
   filterReviewContextCommentsForTest,
@@ -107,6 +108,51 @@ test("compactMappedWindow keeps bounded hydrated context when total is larger th
     100,
   ]);
   assert.deepEqual(mapped, [1, 2, 99, 100]);
+});
+
+test("complete pull-file hydration requires the exact reported count", () => {
+  const files = Array.from({ length: 118 }, (_, index) => ({
+    filename: `src/file-${index}.ts`,
+    patch: `+export const value${index} = ${index};`,
+  }));
+
+  assert.equal(
+    completePullFilesForDeterministicReviewForTest({
+      total: 118,
+      truncated: true,
+      files: files.slice(0, 117),
+    }),
+    null,
+  );
+  assert.equal(
+    completePullFilesForDeterministicReviewForTest({
+      repo: "openclaw/clawhub",
+      total: 118,
+      truncated: true,
+      files,
+    }),
+    null,
+  );
+  assert.equal(
+    completePullFilesForDeterministicReviewForTest({
+      total: 118,
+      truncated: true,
+      files,
+    })?.length,
+    118,
+  );
+});
+
+test("complete pull-file hydration fails closed when the full fetch throws", () => {
+  assert.equal(
+    completePullFilesForDeterministicReviewForTest({
+      total: 118,
+      truncated: true,
+      files: [],
+      fetchError: new Error("GitHub pagination failed"),
+    }),
+    null,
+  );
 });
 
 function issueComment(

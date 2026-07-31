@@ -8,6 +8,7 @@ import type { SchedulerDueCandidate } from "./scheduler-policy.js";
 
 /** Shared ClawSweeper domain, review, scheduling, and dashboard shapes. */
 export const completeActivityContextSymbol = Symbol("completeActivityContext");
+export const completePullFilesSymbol = Symbol("completePullFiles");
 
 export type ItemKind = "issue" | "pull_request";
 export type ApplyKind = ItemKind | "all";
@@ -535,6 +536,7 @@ export interface CompleteActivityContext {
 
 export interface ItemContext {
   [completeActivityContextSymbol]?: CompleteActivityContext;
+  [completePullFilesSymbol]?: readonly unknown[];
   issue: unknown;
   comments: unknown[];
   timeline: unknown[];
