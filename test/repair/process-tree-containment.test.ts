@@ -19,7 +19,7 @@ test("Linux validation containment uses an externally owned PID namespace and su
   assert.match(containment, /if pid != primary_pid:\s+background_pids\.add\(pid\)/);
   assert.match(containment, /if pid != os\.getpid\(\)/);
   assert.match(containment, /background_pids\.update\(pid for pid in remaining_pids/);
-  assert.match(containment, /reap_adopted_children\(child\.pid, background_pids\)/);
+  assert.match(containment, /reap_adopted_children\(child\.pid, background_pids, child\)/);
   assert.match(containment, /return_code = child\.poll\(\)/);
   assert.match(containment, /except ChildProcessError/);
   assert.match(containment, /struct\.pack\("=Qi", allowed_access, path_fd\)/);
@@ -107,6 +107,25 @@ test("procfs enumeration tolerates only tasks that disappear during stat reads",
   assert.deepEqual(runLandlockScenario("process_rows_eacces"), {
     errno: 13,
     status: "error",
+  });
+});
+
+test("containment does not classify reaped transient helpers as surviving background processes", () => {
+  assert.deepEqual(runLandlockScenario("adopted_child_reaped"), {
+    tracked: [],
+    status: "ok",
+  });
+  assert.deepEqual(runLandlockScenario("adopted_child_alive"), {
+    tracked: [25],
+    status: "ok",
+  });
+  assert.deepEqual(runLandlockScenario("adopted_child_already_reaped"), {
+    tracked: [],
+    status: "ok",
+  });
+  assert.deepEqual(runLandlockScenario("adopted_child_primary_exited"), {
+    tracked: [25],
+    status: "ok",
   });
 });
 
@@ -229,12 +248,30 @@ function runLandlockScenario(scenario: string): Record<string, unknown> {
   try {
     const harness = String.raw`
 import errno
+import ctypes
 import importlib.util
 import io
 import json
 import sys
 
 module_path, scenario = sys.argv[1:]
+if sys.platform != "linux":
+    import os
+    errno.ENOSYS = 38
+    if not hasattr(os, "O_PATH"):
+        os.O_PATH = 0
+    original_cdll = ctypes.CDLL
+    class PortableLibc:
+        def __init__(self, *args, **kwargs):
+            self.real = original_cdll(*args, **kwargs)
+        def __getattr__(self, name):
+            try:
+                return getattr(self.real, name)
+            except AttributeError:
+                if name not in {"capset", "prctl"}:
+                    raise
+                return lambda *_arguments: 0
+    ctypes.CDLL = PortableLibc
 spec = importlib.util.spec_from_file_location("containment_runtime", module_path)
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
@@ -257,6 +294,22 @@ if scenario in {"process_rows_esrch", "process_rows_eacces"}:
     except OSError as error:
         payload = {"errno": error.errno, "status": "error"}
     print(json.dumps(payload, separators=(",", ":")))
+    raise SystemExit(0)
+
+if scenario.startswith("adopted_child_"):
+    module.os.getpid = lambda: 10
+    module.process_rows = lambda: [(25, 10)]
+    def fake_waitpid(_pid, _flags):
+        if scenario == "adopted_child_already_reaped":
+            raise ChildProcessError()
+        return (0, 0) if scenario == "adopted_child_alive" else (25, 0)
+    module.os.waitpid = fake_waitpid
+    tracked = {25}
+    class PrimaryProcess:
+        def poll(self):
+            return 0 if scenario == "adopted_child_primary_exited" else None
+    module.reap_adopted_children(20, tracked, PrimaryProcess())
+    print(json.dumps({"tracked": sorted(tracked), "status": "ok"}, separators=(",", ":")))
     raise SystemExit(0)
 
 def error_payload(error):
