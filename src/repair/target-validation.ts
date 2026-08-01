@@ -56,6 +56,10 @@ const MIN_VALIDATION_IDENTITY_WINDOW_MS = 10_000;
 const MIN_VALIDATION_COMMAND_BUDGET_MS = 25;
 const verifiedRustupToolchainBins = new Map<string, VerifiedRustupToolchain>();
 const preparedTargetPnpmRuntimes = new Map<string, PreparedTargetPnpmRuntime>();
+const validationCheckoutRuntimeRootDigests = new WeakMap<
+  ValidationCheckoutIdentity,
+  ReadonlyMap<string, string>
+>();
 let preparedTargetPnpmRuntimeCleanupRegistered = false;
 
 export type TargetValidationOptions = {
@@ -2549,6 +2553,7 @@ function validationSourceIdentity(
   cwd: string,
   deadlineAt: number,
   excludedRuntimeRoots: readonly string[] = [],
+  runtimeRootDigests?: Map<string, string>,
 ): ValidationSourceIdentity {
   assertCallbackFreeGitConfig(cwd, deadlineAt);
   assertNoHiddenIndexEntries(cwd, deadlineAt);
@@ -2570,7 +2575,12 @@ function validationSourceIdentity(
     contentTreeSha,
     gitAdminSha256: gitAdministrativeSha256(cwd, deadlineAt),
     headSha,
-    runtimeInputsSha256: validationRuntimeInputsSha256(cwd, deadlineAt, excludedRuntimeRoots),
+    runtimeInputsSha256: validationRuntimeInputsSha256(
+      cwd,
+      deadlineAt,
+      excludedRuntimeRoots,
+      runtimeRootDigests,
+    ),
     treeSha,
     status,
     worktreeSha256,
@@ -2596,10 +2606,13 @@ function validationCheckoutIdentity(
   deadlineAt: number,
   excludedRuntimeRoots: readonly string[] = [],
 ): ValidationCheckoutIdentity {
-  return {
-    ...validationSourceIdentity(cwd, deadlineAt, excludedRuntimeRoots),
+  const runtimeRootDigests = new Map<string, string>();
+  const identity = {
+    ...validationSourceIdentity(cwd, deadlineAt, excludedRuntimeRoots, runtimeRootDigests),
     baseSha: runIdentityGit(cwd, ["rev-parse", baseRef], deadlineAt, "checkout base").trim(),
   };
+  validationCheckoutRuntimeRootDigests.set(identity, runtimeRootDigests);
+  return identity;
 }
 
 function assertValidationCheckoutIdentity(
@@ -2614,10 +2627,47 @@ function assertValidationCheckoutIdentity(
   if (!sameValidationSourceIdentity(actual, expected) || actual.baseSha !== expected.baseSha) {
     const fields: string[] = validationSourceIdentityMismatchFields(actual, expected);
     if (actual.baseSha !== expected.baseSha) fields.push("baseSha");
+    const changedRuntimeRoots = fields.includes("runtimeInputsSha256")
+      ? changedValidationRuntimeRoots(actual, expected, deadlineAt)
+      : [];
+    const runtimeRootDetail =
+      changedRuntimeRoots.length > 0
+        ? `; changed runtime roots: ${changedRuntimeRoots.slice(0, 5).join(", ")}${
+            changedRuntimeRoots.length > 5 ? ` (+${changedRuntimeRoots.length - 5} more)` : ""
+          }`
+        : "";
     throw new Error(
-      `unsafe validation command mutated checkout identity (${command}): ${fields.join(", ")}`,
+      `unsafe validation command mutated checkout identity (${command}): ${fields.join(", ")}${runtimeRootDetail}`,
     );
   }
+}
+
+function changedValidationRuntimeRoots(
+  actual: ValidationCheckoutIdentity,
+  expected: ValidationCheckoutIdentity,
+  deadlineAt: number,
+) {
+  const actualRoots = validationCheckoutRuntimeRootDigests.get(actual);
+  const expectedRoots = validationCheckoutRuntimeRootDigests.get(expected);
+  if (!actualRoots || !expectedRoots) return [];
+  const roots = new Set<string>();
+  for (const root of actualRoots.keys()) {
+    assertValidationIdentityDeadline(deadlineAt, "runtime root comparison");
+    roots.add(root);
+  }
+  for (const root of expectedRoots.keys()) {
+    assertValidationIdentityDeadline(deadlineAt, "runtime root comparison");
+    roots.add(root);
+  }
+  const changedRoots: string[] = [];
+  for (const root of roots) {
+    assertValidationIdentityDeadline(deadlineAt, "runtime root comparison");
+    if (actualRoots.get(root) !== expectedRoots.get(root)) changedRoots.push(root);
+  }
+  return changedRoots.sort((left, right) => {
+    assertValidationIdentityDeadline(deadlineAt, "runtime root comparison");
+    return left < right ? -1 : left > right ? 1 : 0;
+  });
 }
 
 function sameValidationSourceIdentity(
@@ -2917,6 +2967,7 @@ function validationRuntimeInputsSha256(
   cwd: string,
   deadlineAt: number,
   excludedRuntimeRoots: readonly string[] = [],
+  runtimeRootDigests?: Map<string, string>,
 ) {
   const hash = createHash("sha256");
   const root = fs.realpathSync(cwd);
@@ -2933,27 +2984,74 @@ function validationRuntimeInputsSha256(
       ),
   );
   updateIdentityHash(hash, "runtime-input-paths", runtimePaths.join("\0"));
-  const coveredEntries = new Map<string, string>();
+  const coveredEntries = new Map<string, CoveredRuntimeEntry>();
+  const pendingRoots: Array<{
+    relativePath: string;
+    hash: ReturnType<typeof createHash>;
+    entries: Set<string>;
+  }> = [];
   for (const relativePath of runtimePaths) {
     assertValidationIdentityDeadline(deadlineAt, relativePath);
     const entryPath = path.join(root, relativePath);
-    updateIdentityHash(hash, "runtime-input", relativePath);
+    const rootHash = createHash("sha256");
+    updateIdentityHash(rootHash, "runtime-input", relativePath);
     try {
       fs.lstatSync(entryPath);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-      updateIdentityHash(hash, "runtime-state", "absent");
+      updateIdentityHash(rootHash, "runtime-state", "absent");
+      pendingRoots.push({ relativePath, hash: rootHash, entries: new Set() });
       continue;
     }
+    const rootEntries = new Set<string>();
     updateRuntimeInputDigest(
-      hash,
+      rootHash,
       root,
       entryPath,
       relativePath,
       deadlineAt,
       coveredEntries,
       trackedPaths,
+      rootEntries,
     );
+    pendingRoots.push({ relativePath, hash: rootHash, entries: rootEntries });
+  }
+  for (const pendingRoot of pendingRoots) {
+    assertValidationIdentityDeadline(deadlineAt, pendingRoot.relativePath);
+    const reachableEntries = new Set(pendingRoot.entries);
+    for (const realPath of reachableEntries) {
+      assertValidationIdentityDeadline(deadlineAt, pendingRoot.relativePath);
+      const coveredEntry = coveredEntries.get(realPath);
+      if (!coveredEntry?.contentSha256) {
+        throw new Error(`incomplete validation runtime input: ${pendingRoot.relativePath}`);
+      }
+      for (const dependency of coveredEntry.dependencies) {
+        assertValidationIdentityDeadline(deadlineAt, pendingRoot.relativePath);
+        reachableEntries.add(dependency);
+      }
+    }
+    const orderedEntries: string[] = [];
+    for (const realPath of reachableEntries) {
+      assertValidationIdentityDeadline(deadlineAt, pendingRoot.relativePath);
+      orderedEntries.push(realPath);
+    }
+    orderedEntries.sort((left, right) => {
+      assertValidationIdentityDeadline(deadlineAt, pendingRoot.relativePath);
+      return left < right ? -1 : left > right ? 1 : 0;
+    });
+    for (const realPath of orderedEntries) {
+      assertValidationIdentityDeadline(deadlineAt, pendingRoot.relativePath);
+      const coveredEntry = coveredEntries.get(realPath)!;
+      updateIdentityHash(
+        pendingRoot.hash,
+        "runtime-reachable-entry",
+        `${path.relative(root, realPath)}\0${coveredEntry.contentSha256}`,
+      );
+    }
+    assertValidationIdentityDeadline(deadlineAt, pendingRoot.relativePath);
+    const rootDigest = pendingRoot.hash.digest("hex");
+    updateIdentityHash(hash, "runtime-input-root", rootDigest);
+    runtimeRootDigests?.set(pendingRoot.relativePath, rootDigest);
   }
   assertValidationIdentityDeadline(deadlineAt, "runtime input digest");
   return hash.digest("hex");
@@ -3024,24 +3122,33 @@ function minimalValidationRuntimeRoots(paths: Iterable<string>) {
   return roots.sort();
 }
 
+type CoveredRuntimeEntry = {
+  contentSha256: string;
+  dependencies: Set<string>;
+};
+
 function updateRuntimeInputDigest(
   hash: ReturnType<typeof createHash>,
   root: string,
   entryPath: string,
   logicalPath: string,
   deadlineAt: number,
-  coveredEntries: Map<string, string>,
+  coveredEntries: Map<string, CoveredRuntimeEntry>,
   trackedPaths: ReadonlySet<string>,
+  rootEntries: Set<string>,
+  parentEntry?: CoveredRuntimeEntry,
 ) {
   assertValidationIdentityDeadline(deadlineAt, logicalPath);
   const stat = fs.lstatSync(entryPath);
-  updateIdentityHash(hash, "runtime-path", logicalPath);
-  updateIdentityHash(hash, "runtime-mode", String(stat.mode));
+  const entryHash = createHash("sha256");
+  updateIdentityHash(entryHash, "runtime-path", path.relative(root, path.resolve(entryPath)));
+  updateIdentityHash(entryHash, "runtime-mode", String(stat.mode));
+  const appendEntry = () => updateIdentityHash(hash, "runtime-entry", entryHash.digest("hex"));
   if (stat.isSymbolicLink()) {
-    updateIdentityHash(hash, "runtime-symlink", fs.readlinkSync(entryPath));
+    updateIdentityHash(entryHash, "runtime-symlink", fs.readlinkSync(entryPath));
     const targetPath = fs.realpathSync(entryPath);
     assertPathWithin(root, targetPath, logicalPath);
-    updateIdentityHash(hash, "runtime-symlink-target", path.relative(root, targetPath));
+    updateIdentityHash(entryHash, "runtime-symlink-target", path.relative(root, targetPath));
     const workspaceReference = trackedSymlinkTargetReference(
       root,
       entryPath,
@@ -3053,47 +3160,67 @@ function updateRuntimeInputDigest(
       // pnpm creates ignored node_modules links back to tracked workspaces. The
       // checkout identity already binds their source, while traversing them here
       // would also absorb mutable .git state and make a read-only fetch stale the runtime.
-      updateIdentityHash(hash, "runtime-workspace-reference", workspaceReference);
+      updateIdentityHash(entryHash, "runtime-workspace-reference", workspaceReference);
+      appendEntry();
       return;
     }
+    // Target contents are bound independently through the root's reachable
+    // physical-entry graph. Keep this symlink's own digest structural so a
+    // cyclic graph has the same identity regardless of which root visits first.
     updateRuntimeInputDigest(
-      hash,
+      createHash("sha256"),
       root,
       targetPath,
       `${logicalPath}\0target`,
       deadlineAt,
       coveredEntries,
       trackedPaths,
+      rootEntries,
+      parentEntry,
     );
+    appendEntry();
     return;
   }
   const realPath = fs.realpathSync(entryPath);
+  if (parentEntry) parentEntry.dependencies.add(realPath);
+  else rootEntries.add(realPath);
   const coveredBy = coveredEntries.get(realPath);
   if (coveredBy !== undefined) {
-    updateIdentityHash(hash, "runtime-reference", `${path.relative(root, realPath)}\0${coveredBy}`);
+    updateIdentityHash(
+      hash,
+      "runtime-entry",
+      coveredBy.contentSha256 || `cycle:${path.relative(root, realPath)}`,
+    );
     return;
   }
-  coveredEntries.set(realPath, logicalPath);
+  const coveredEntry = { contentSha256: "", dependencies: new Set<string>() };
+  coveredEntries.set(realPath, coveredEntry);
   if (stat.isFile()) {
-    updateFileDigest(hash, entryPath, logicalPath, deadlineAt);
+    updateFileDigest(entryHash, entryPath, logicalPath, deadlineAt);
+    coveredEntry.contentSha256 = entryHash.digest("hex");
+    updateIdentityHash(hash, "runtime-entry", coveredEntry.contentSha256);
     return;
   }
   if (!stat.isDirectory()) {
     throw new Error(`unsupported validation runtime input: ${logicalPath}`);
   }
   const children = fs.readdirSync(entryPath).sort();
-  updateIdentityHash(hash, "runtime-children", children.join("\0"));
+  updateIdentityHash(entryHash, "runtime-children", children.join("\0"));
   for (const child of children) {
     updateRuntimeInputDigest(
-      hash,
+      entryHash,
       root,
       path.join(entryPath, child),
       `${logicalPath}/${child}`,
       deadlineAt,
       coveredEntries,
       trackedPaths,
+      rootEntries,
+      coveredEntry,
     );
   }
+  coveredEntry.contentSha256 = entryHash.digest("hex");
+  updateIdentityHash(hash, "runtime-entry", coveredEntry.contentSha256);
 }
 
 type TargetTreeEntry = {
