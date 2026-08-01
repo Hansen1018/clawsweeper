@@ -69,7 +69,10 @@ import {
   type LifecycleTerminalDisposition,
 } from "./exact-review-lifecycle.ts";
 import { ExactReviewLifecycleTelemetryStore } from "./exact-review-lifecycle-telemetry.ts";
+import { recentDurablePublicationEvents } from "./recent-durable-publication-events.ts";
 import { sanitizedServerError } from "./error-safety.ts";
+
+const RECENT_DURABLE_PUBLICATION_EVENTS_CACHE_MS = 60_000;
 
 type GithubAppJsonOptions = { method?: string; body?: BodyInit; errorLabel?: string };
 const GITHUB_TIMEOUT_MS = 4500;
@@ -567,6 +570,10 @@ export class ExactReviewQueue {
   private lifecycleTelemetryStore;
   private readonly baselines = new WeakMap<ExactReviewQueueState, ExactReviewQueueBaseline>();
   private reviewCoverageCache: { at: number; summary: ReviewCoverageSummary } | null = null;
+  private recentDurablePublicationEventsCache = new Map<
+    string,
+    { expiresAt: number; value: NonNullable<ReturnType<typeof recentDurablePublicationEvents>> }
+  >();
 
   constructor(state, env) {
     this.storage = state.storage;
@@ -611,6 +618,14 @@ export class ExactReviewQueue {
     }
     if (targetFanoutMode && request.method === "PUT") {
       return this.writeTargetFanoutCursor(targetFanoutMode, await request.json().catch(() => null));
+    }
+    if (request.method === "GET" && url.pathname === "/recent-durable-publication-events") {
+      const events = this.recentDurablePublicationEvents(
+        String(url.searchParams.get("window") || "24h"),
+      );
+      return events
+        ? json({ recent_durable_publication_events: events })
+        : json({ error: "invalid_window" }, 400);
     }
     if (request.method === "POST" && url.pathname === "/source-authority") {
       const body = objectValue(await request.json().catch(() => null));
@@ -3003,6 +3018,21 @@ export class ExactReviewQueue {
     }
 
     return new Response("not found", { status: 404 });
+  }
+
+  private recentDurablePublicationEvents(window: string) {
+    const now = Date.now();
+    const cached = this.recentDurablePublicationEventsCache.get(window);
+    if (cached && cached.expiresAt > now) return cached.value;
+    const value = recentDurablePublicationEvents({ storage: this.storage, window, now });
+    if (!value) return null;
+    // This deliberately has no write-path invalidation: it is a short-lived,
+    // best-effort shield for the optional public aggregate, not lifecycle state.
+    this.recentDurablePublicationEventsCache.set(window, {
+      value,
+      expiresAt: now + RECENT_DURABLE_PUBLICATION_EVENTS_CACHE_MS,
+    });
+    return value;
   }
 
   private readTargetFanoutCursor(mode: TargetFanoutMode) {
