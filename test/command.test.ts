@@ -17,12 +17,15 @@ import { fileURLToPath } from "node:url";
 import {
   defaultReviewArtifactDirForTest,
   exactEventReviewLeaseDispositionForTest,
+  itemSourceRevisionSha256ForTest,
   isSuppliedReviewStartLeaseForTest,
   prepareManagedLocalReviewCheckoutForTest,
+  reviewPolicyHashForTest,
   reviewLeaseStillMatchesContextForTest,
 } from "../dist/clawsweeper.js";
 import { runText, UserFacingCommandError } from "../dist/command.js";
-import { mockGhBinEnv } from "./helpers.ts";
+import { reviewStructuralPullStateDigest } from "../dist/review-structural-cache.js";
+import { mockGhBinEnv, workPlanCandidateReport } from "./helpers.ts";
 
 const CLI = fileURLToPath(new URL("../dist/clawsweeper.js", import.meta.url));
 
@@ -95,6 +98,302 @@ test("local exact reviews default to item-specific artifacts", () => {
   assert.equal(defaultReviewArtifactDirForTest(true, 357, undefined), "artifacts/local-review-357");
   assert.equal(defaultReviewArtifactDirForTest(true, 357, [357]), "artifacts/reviews");
   assert.equal(defaultReviewArtifactDirForTest(false, 357, undefined), "artifacts/reviews");
+});
+
+test("CSW-088 scheduled hot planning suppresses #117063, observes an in-flight update, and leaves explicit re-review eligible", () => {
+  const root = mkdtempSync(join(tmpdir(), "cmd-csw-088-"));
+  const binDir = join(root, "bin");
+  const itemsDir = join(root, "items");
+  const coverageManifest = join(root, "coverage.json");
+  const ghPath = join(binDir, "gh.js");
+  const number = 117063;
+  const headSha = "0a3959fe0123456789abcdef0123456789abcdef";
+  const reviewedAt = new Date().toISOString();
+  const pull = {
+    number,
+    title: "CSW-088 scheduled hot review fixture",
+    body: "The reviewed PR body is unchanged.",
+    labels: ["needs-review"],
+    head: { sha: headSha },
+    base: { sha: "b".repeat(40) },
+    draft: false,
+    mergeable: true,
+    mergeable_state: "clean",
+    additions: 5,
+    deletions: 2,
+    changed_files: 2,
+    commits: 1,
+    updated_at: reviewedAt,
+  };
+  const updatedPull = { ...pull, body: "The PR body changed during the snapshot read." };
+  const commentUpdatedPull = {
+    ...pull,
+    updated_at: new Date(Date.parse(reviewedAt) + 1).toISOString(),
+  };
+  const issue = {
+    number,
+    title: pull.title,
+    body: pull.body,
+    html_url: `https://github.com/openclaw/openclaw/pull/${number}`,
+    created_at: "2026-07-30T00:00:00Z",
+    updated_at: reviewedAt,
+    closed_at: null,
+    state: "open",
+    locked: false,
+    active_lock_reason: null,
+    author_association: "CONTRIBUTOR",
+    user: { login: "contributor" },
+    labels: pull.labels,
+    pull_request: {},
+  };
+  const listItem = {
+    number,
+    title: pull.title,
+    html_url: issue.html_url,
+    created_at: issue.created_at,
+    updated_at: issue.updated_at,
+    author_association: issue.author_association,
+    user: issue.user,
+    labels: issue.labels,
+    pull_request: {},
+  };
+  const sourceRevision = itemSourceRevisionSha256ForTest(pull, []);
+  const pullStateDigest = reviewStructuralPullStateDigest({
+    headSha,
+    baseSha: pull.base.sha,
+    draft: pull.draft,
+    mergeable: pull.mergeable,
+    mergeStateStatus: pull.mergeable_state,
+    additions: pull.additions,
+    deletions: pull.deletions,
+    changedFiles: pull.changed_files,
+    commitCount: pull.commits,
+  });
+  assert.ok(pullStateDigest);
+
+  try {
+    mkdirSync(binDir, { recursive: true });
+    mkdirSync(itemsDir, { recursive: true });
+    writeFileSync(
+      join(itemsDir, `${number}.md`),
+      workPlanCandidateReport({
+        repository: "openclaw/openclaw",
+        type: "pull_request",
+        number,
+        title: pull.title,
+        reviewed_at: reviewedAt,
+        review_policy: reviewPolicyHashForTest(),
+        item_updated_at: reviewedAt,
+        item_source_revision: sourceRevision,
+        pull_head_sha: headSha,
+        reviewed_pull_state_digest: pullStateDigest,
+      }),
+    );
+    writeFileSync(
+      coverageManifest,
+      JSON.stringify({
+        schemaVersion: 3,
+        source: "worker",
+        repositories: { "openclaw-openclaw": { coverageTrackedItemIds: [] } },
+      }),
+    );
+    writeFileSync(
+      ghPath,
+      `#!/usr/bin/env node
+const args = process.argv.slice(2);
+const path = args[1] || "";
+const listItem = ${JSON.stringify(listItem)};
+const issue = ${JSON.stringify(issue)};
+const pull = ${JSON.stringify(pull)};
+const updatedPull = ${JSON.stringify(updatedPull)};
+const commentUpdatedPull = ${JSON.stringify(commentUpdatedPull)};
+const raceMarker = process.env.CSW_RACE_MARKER;
+const race = process.env.CSW_RACE === "1";
+const activityRaceMarker = process.env.CSW_ACTIVITY_RACE_MARKER;
+const activityRace = process.env.CSW_ACTIVITY_RACE === "1";
+const commentRaceMarker = process.env.CSW_COMMENT_RACE_MARKER;
+const commentRace = process.env.CSW_COMMENT_RACE === "1";
+const updatedReview = { id: 1, user: { login: "reviewer" }, state: "COMMENTED", body: "new review activity", submitted_at: "2026-07-31T00:00:00Z", commit_id: pull.head.sha };
+if (args[0] === "api" && /issues\\?state=open/.test(path)) {
+  console.log(JSON.stringify(listItem));
+  process.exit(0);
+}
+if (args[0] === "api" && path === "repos/openclaw/openclaw/issues/${number}") {
+  console.log(JSON.stringify(issue));
+  process.exit(0);
+}
+if (args[0] === "api" && path === "repos/openclaw/openclaw/pulls/${number}") {
+  if (activityRace && activityRaceMarker) require("node:fs").writeFileSync(activityRaceMarker, "seen");
+  console.log(JSON.stringify(race && raceMarker && require("node:fs").existsSync(raceMarker) ? updatedPull : commentRace && commentRaceMarker && require("node:fs").existsSync(commentRaceMarker) ? commentUpdatedPull : pull));
+  process.exit(0);
+}
+if (args[0] === "api" && path.startsWith("repos/openclaw/openclaw/issues/${number}/comments")) {
+  if (commentRace && commentRaceMarker) require("node:fs").writeFileSync(commentRaceMarker, "seen");
+  console.log(JSON.stringify([[]]));
+  process.exit(0);
+}
+if (args[0] === "api" && path.startsWith("repos/openclaw/openclaw/pulls/${number}/comments")) {
+  if (race && raceMarker) require("node:fs").writeFileSync(raceMarker, "seen");
+  console.log(JSON.stringify([[]]));
+  process.exit(0);
+}
+if (args[0] === "api" && /pulls\\/${number}\\/reviews/.test(path)) {
+  console.log(JSON.stringify(activityRace && activityRaceMarker && require("node:fs").existsSync(activityRaceMarker) ? [[updatedReview]] : [[]]));
+  process.exit(0);
+}
+console.error("unexpected gh args " + JSON.stringify(args));
+process.exit(1);
+`,
+    );
+    chmodSync(ghPath, 0o755);
+    const env = { ...process.env, ...mockGhBinEnv(ghPath) };
+    const scheduled = spawnSync(
+      process.execPath,
+      [
+        CLI,
+        "plan",
+        "--target-repo",
+        "openclaw/openclaw",
+        "--items-dir",
+        itemsDir,
+        "--coverage-tracked-items-manifest",
+        coverageManifest,
+        "--hot-intake",
+        "--max-pages",
+        "1",
+        "--batch-size",
+        "1",
+        "--shard-count",
+        "1",
+      ],
+      { encoding: "utf8", env },
+    );
+    assert.equal(scheduled.status, 0, scheduled.stderr);
+    assert.deepEqual(JSON.parse(scheduled.stdout).candidates, []);
+
+    const raced = spawnSync(
+      process.execPath,
+      [
+        CLI,
+        "plan",
+        "--target-repo",
+        "openclaw/openclaw",
+        "--items-dir",
+        itemsDir,
+        "--coverage-tracked-items-manifest",
+        coverageManifest,
+        "--hot-intake",
+        "--max-pages",
+        "1",
+        "--batch-size",
+        "1",
+        "--shard-count",
+        "1",
+      ],
+      { encoding: "utf8", env: { ...env, CSW_RACE: "1", CSW_RACE_MARKER: join(root, "race") } },
+    );
+    assert.equal(raced.status, 0, raced.stderr);
+    assert.deepEqual(
+      JSON.parse(raced.stdout).candidates.map((candidate: { number: number }) => candidate.number),
+      [number],
+    );
+
+    const commentRaced = spawnSync(
+      process.execPath,
+      [
+        CLI,
+        "plan",
+        "--target-repo",
+        "openclaw/openclaw",
+        "--items-dir",
+        itemsDir,
+        "--coverage-tracked-items-manifest",
+        coverageManifest,
+        "--hot-intake",
+        "--max-pages",
+        "1",
+        "--batch-size",
+        "1",
+        "--shard-count",
+        "1",
+      ],
+      {
+        encoding: "utf8",
+        env: {
+          ...env,
+          CSW_COMMENT_RACE: "1",
+          CSW_COMMENT_RACE_MARKER: join(root, "comment-race"),
+        },
+      },
+    );
+    assert.equal(commentRaced.status, 0, commentRaced.stderr);
+    assert.deepEqual(
+      JSON.parse(commentRaced.stdout).candidates.map(
+        (candidate: { number: number }) => candidate.number,
+      ),
+      [number],
+    );
+
+    const activityRaced = spawnSync(
+      process.execPath,
+      [
+        CLI,
+        "plan",
+        "--target-repo",
+        "openclaw/openclaw",
+        "--items-dir",
+        itemsDir,
+        "--coverage-tracked-items-manifest",
+        coverageManifest,
+        "--hot-intake",
+        "--max-pages",
+        "1",
+        "--batch-size",
+        "1",
+        "--shard-count",
+        "1",
+      ],
+      {
+        encoding: "utf8",
+        env: {
+          ...env,
+          CSW_ACTIVITY_RACE: "1",
+          CSW_ACTIVITY_RACE_MARKER: join(root, "activity-race"),
+        },
+      },
+    );
+    assert.equal(activityRaced.status, 0, activityRaced.stderr);
+    assert.deepEqual(
+      JSON.parse(activityRaced.stdout).candidates.map(
+        (candidate: { number: number }) => candidate.number,
+      ),
+      [number],
+    );
+
+    const explicit = spawnSync(
+      process.execPath,
+      [
+        CLI,
+        "plan",
+        "--target-repo",
+        "openclaw/openclaw",
+        "--items-dir",
+        itemsDir,
+        "--item-number",
+        String(number),
+      ],
+      { encoding: "utf8", env },
+    );
+    assert.equal(explicit.status, 0, explicit.stderr);
+    assert.deepEqual(
+      JSON.parse(explicit.stdout).candidates.map(
+        (candidate: { number: number }) => candidate.number,
+      ),
+      [number],
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("exact event publication requeues legacy tuples and source drift before mutation", () => {
