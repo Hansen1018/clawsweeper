@@ -179,21 +179,29 @@ jobs:
             test ! -f "$heartbeat_failed"
             outcome_path="$(jq -r '.outcomePath' <<<"$item")"
             [ -f "$outcome_path" ] || continue
-            if ! jq -e '.kind == "eligible" or (.kind == "superseded" and .disposition.requeueLatestExpected == true)' "$outcome_path" >/dev/null; then
-              continue
-            fi
-            if jq -e '.kind == "eligible"' "$outcome_path" >/dev/null; then
-              fence_key="$(jq -r '.itemKey' <<<"$item")"
-              if ! jq -e --arg fence_key "$fence_key" \
-                'any(.outcomes[]?; .fenceKey == $fence_key and (.outcome == "accepted" or .outcome == "deduped"))' \
-                "$receipt_path" >/dev/null; then
+            outcome_kind="$(jq -r '.kind // empty' "$outcome_path")"
+            fence_key="$(jq -r '.itemKey' <<<"$item")"
+            receipt_outcome="$(jq -r --arg fence_key "$fence_key" \
+              '[.outcomes[]? | select(.fenceKey == $fence_key) | .outcome] | last // empty' \
+              "$receipt_path")"
+            if [ "$outcome_kind" = "eligible" ]; then
+              if [ "$receipt_outcome" != "accepted" ] && [ "$receipt_outcome" != "deduped" ] && \
+                [ "$receipt_outcome" != "superseded" ] && [ "$receipt_outcome" != "permanent" ]; then
                 continue
               fi
+            elif [ "$outcome_kind" != "superseded" ] && [ "$outcome_kind" != "permanent_failure" ]; then
+              continue
             fi
             target_repo="$(jq -r '.decision.targetRepo' <<<"$item")"
             target_branch="$(jq -r '.decision.targetBranch' <<<"$item")"
             item_number="$(jq -r '.decision.itemNumber' <<<"$item")"
             source_action="$(jq -r '.decision.publication.producerDecision.sourceAction' <<<"$item")"
+            fence_key="$(jq -r '.itemKey' <<<"$item")"
+            revision="$(jq -r '.revision' <<<"$item")"
+            export TARGET_REPO="$target_repo" ITEM_NUMBER="$item_number" FENCE_KEY="$fence_key" REVISION="$revision"
+            lifecycle_terminal=""
+            lifecycle_router_outcome=""
+            lifecycle_deferred_coverage="false"
             if jq -e '.disposition.requeueLatestExpected == true' "$outcome_path" >/dev/null; then
               delivery_id="publisher-source-drift:$(jq -r '.itemKey' <<<"$item"):$(jq -r '.revision' <<<"$item")"
               producer_decision="$(jq -c '.decision.publication.producerDecision' <<<"$item")"
@@ -216,11 +224,23 @@ jobs:
                 --data "$payload" \
                 "${EXACT_REVIEW_QUEUE_URL%/}/internal/exact-review/enqueue")"
               jq -e '.ok == true and (.queued == true or .deduped == true or .shed == true)' <<<"$response" >/dev/null
-            elif jq -e '.disposition.deferredCloseCoverageExpected == true' "$outcome_path" >/dev/null; then
-              # The committed tuple is the durable input consumed by the bounded
-              # scheduled proof lane; no immediate mutation workflow is dispatched.
-              :
-            elif jq -e '.disposition.routableSyncExpected == true' "$outcome_path" >/dev/null && [ "$source_action" != "failed_review_shard_recovery" ]; then
+              lifecycle_terminal="requeue"
+            elif jq -e '.disposition.terminalMissingExpected == true' "$outcome_path" >/dev/null; then
+              lifecycle_terminal="target_missing"
+            elif jq -e '.disposition.terminalClosedExpected == true' "$outcome_path" >/dev/null; then
+              lifecycle_terminal="target_closed"
+            elif jq -e '.disposition.guardedOpenAction != null and .disposition.guardedOpenAction != ""' "$outcome_path" >/dev/null; then
+              lifecycle_terminal="guarded_open"
+            elif [ "$outcome_kind" = "permanent_failure" ] || [ "$receipt_outcome" = "permanent" ]; then
+              # A permanent publisher result remains retryable until the durable
+              # queue decides whether it requeues or reaches dead-letter. The
+              # later guarded acknowledgement reads that terminal projection.
+              continue
+            elif [ "$outcome_kind" = "superseded" ] || [ "$receipt_outcome" = "superseded" ]; then
+              lifecycle_terminal="superseded"
+            elif [ "$source_action" = "failed_review_shard_recovery" ]; then
+              lifecycle_router_outcome="not_required"
+            elif jq -e '.disposition.routableSyncExpected == true' "$outcome_path" >/dev/null; then
               github_apply_error="$(mktemp)"
               if gh workflow run repair-comment-router.yml \
                 --repo "$GITHUB_REPOSITORY" \
@@ -243,11 +263,78 @@ jobs:
                 rm -f "$github_apply_error"
                 exit "$github_apply_status"
               fi
+              lifecycle_router_outcome="durable"
+            elif jq -e '.disposition.deferredCloseCoverageExpected == true' "$outcome_path" >/dev/null; then
+              # Target closure remains a later proof-lane concern, while the
+              # durable handoff completes this review lifecycle.
+              lifecycle_router_outcome="durable"
+              lifecycle_deferred_coverage="true"
+            else
+              lifecycle_terminal="policy_noop"
             fi
+            if [ -n "$lifecycle_router_outcome" ] || [ -n "$lifecycle_terminal" ]; then
+              temporary="${outcome_path}.tmp"
+              jq '.postEffectsRequired = true' "$outcome_path" > "$temporary"
+              mv "$temporary" "$outcome_path"
+            fi
+            if [ -n "$lifecycle_router_outcome" ]; then
+              export LIFECYCLE_ROUTER_OUTCOME="$lifecycle_router_outcome"
+              export LIFECYCLE_DEFERRED_COVERAGE="$lifecycle_deferred_coverage"
+              lifecycle_payload="$(node -e '
+                const crypto = require("node:crypto");
+                const revision = Number(process.env.REVISION);
+                if (!Number.isInteger(revision) || revision < 1 || !process.env.FENCE_KEY) process.exit(1);
+                const receiptFence = crypto.createHash("sha256").update(process.env.FENCE_KEY).digest("hex").slice(0, 24);
+                const prefix = process.env.LIFECYCLE_DEFERRED_COVERAGE === "true"
+                  ? "router-batch-proof"
+                  : process.env.LIFECYCLE_ROUTER_OUTCOME === "not_required"
+                    ? "router-batch-not-required"
+                    : "router-batch";
+                process.stdout.write(JSON.stringify({
+                  canonical_target_key: `${process.env.TARGET_REPO}#${process.env.ITEM_NUMBER}`,
+                  fence_key: process.env.FENCE_KEY,
+                  revision,
+                  outcome: process.env.LIFECYCLE_ROUTER_OUTCOME,
+                  receipt_id: `${prefix}:${process.env.GITHUB_RUN_ID}:${process.env.GITHUB_RUN_ATTEMPT}:${receiptFence}`,
+                }));
+              ')"
+              lifecycle_signature="$(PAYLOAD="$lifecycle_payload" node -e 'const crypto=require("node:crypto"); process.stdout.write(`sha256=${crypto.createHmac("sha256", process.env.CLAWSWEEPER_WEBHOOK_SECRET).update(process.env.PAYLOAD).digest("hex")}`)')"
+              lifecycle_response="$(curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
+                --request POST \
+                --header "content-type: application/json" \
+                --header "x-clawsweeper-exact-review-signature: $lifecycle_signature" \
+                --data "$lifecycle_payload" \
+                "${EXACT_REVIEW_QUEUE_URL%/}/internal/exact-review/lifecycle/router-receipt")"
+              jq -e '.ok == true' <<<"$lifecycle_response" >/dev/null
+            elif [ -n "$lifecycle_terminal" ]; then
+              export LIFECYCLE_TERMINAL="$lifecycle_terminal"
+              lifecycle_payload="$(node -e '
+                const revision = Number(process.env.REVISION);
+                if (!Number.isInteger(revision) || revision < 1 || !process.env.FENCE_KEY || !process.env.LIFECYCLE_TERMINAL) process.exit(1);
+                process.stdout.write(JSON.stringify({
+                  canonical_target_key: `${process.env.TARGET_REPO}#${process.env.ITEM_NUMBER}`,
+                  fence_key: process.env.FENCE_KEY,
+                  revision,
+                  kind: process.env.LIFECYCLE_TERMINAL,
+                }));
+              ')"
+              lifecycle_signature="$(PAYLOAD="$lifecycle_payload" node -e 'const crypto=require("node:crypto"); process.stdout.write(`sha256=${crypto.createHmac("sha256", process.env.CLAWSWEEPER_WEBHOOK_SECRET).update(process.env.PAYLOAD).digest("hex")}`)')"
+              lifecycle_response="$(curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
+                --request POST \
+                --header "content-type: application/json" \
+                --header "x-clawsweeper-exact-review-signature: $lifecycle_signature" \
+                --data "$lifecycle_payload" \
+                "${EXACT_REVIEW_QUEUE_URL%/}/internal/exact-review/lifecycle/terminal-disposition")"
+              jq -e '.ok == true' <<<"$lifecycle_response" >/dev/null
+            fi
+            # The optional implementation lane consumes only a durable lifecycle
+            # receipt or terminal handoff. It is deliberately independent of
+            # the later terminal command acknowledgement finalizer.
             if [ "$AUTO_IMPLEMENT_ISSUES" = "1" ] &&
               [ "$remaining_implementations" -gt 0 ] &&
               [ "$target_repo" = "openclaw/openclaw" ] &&
               [ "$(jq -r '.decision.itemKind' <<<"$item")" = "issue" ] &&
+              { [ "$receipt_outcome" = "accepted" ] || [ "$receipt_outcome" = "deduped" ]; } &&
               jq -e '.kind == "eligible"' "$outcome_path" >/dev/null; then
               report_path="${outcome_path%.json}.report.md"
               if [ -f "$report_path" ]; then

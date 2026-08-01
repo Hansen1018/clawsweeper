@@ -14,13 +14,29 @@ export type DirectPublicationOperation = PreparedStateMutationOperation & {
   contentBase64?: string;
 };
 
+export type DirectPublicationLifecycleKind =
+  | "router"
+  | "router_deferred_coverage"
+  | "router_not_required"
+  | "requeue"
+  | "target_missing"
+  | "target_closed"
+  | "guarded_open"
+  | "policy_noop";
+
+export type DirectPublicationLifecyclePlan = {
+  kind: DirectPublicationLifecycleKind;
+};
+
 export type DirectPublicationPayload = {
   canonicalTargetKey: string;
   fenceKey: string;
   revision: number;
+  sourceSha?: string;
   identity: BatchPublicationIdentity & PreparedStateMutationPlan["identity"];
   operations: DirectPublicationOperation[];
   totalBytes: number;
+  lifecycle?: DirectPublicationLifecyclePlan;
 };
 
 export type DirectPublicationPostResult =
@@ -34,6 +50,8 @@ export function exactReviewDirectPublicationEnabled(value: string | undefined) {
 export function prepareDirectPublicationPayload(options: {
   revision: number;
   plan: PreparedStateMutationPlan;
+  sourceSha?: string;
+  lifecycle?: DirectPublicationLifecyclePlan;
 }): DirectPublicationPayload {
   const publication = options.plan.publication ?? {
     canonicalTargetKey: options.plan.identity.itemKey,
@@ -43,9 +61,11 @@ export function prepareDirectPublicationPayload(options: {
     canonicalTargetKey: publication.canonicalTargetKey,
     fenceKey: publication.fenceKey,
     revision: options.revision,
+    ...(options.sourceSha === undefined ? {} : { sourceSha: options.sourceSha }),
     identity: { ...publication, ...options.plan.identity },
     operations: options.plan.operations.map((operation) => ({ ...operation })),
     totalBytes: options.plan.totalBytes,
+    ...(options.lifecycle === undefined ? {} : { lifecycle: options.lifecycle }),
   };
 }
 
@@ -133,6 +153,7 @@ export async function runExactReviewDirectPublicationFromEnv() {
   const outcome = JSON.parse(fs.readFileSync(outputPath, "utf8")) as {
     kind?: string;
     plan?: PreparedStateMutationPlan;
+    disposition?: unknown;
   };
   if (outcome.kind !== "eligible" || !outcome.plan) {
     writeGithubOutput("accepted", "false");
@@ -140,9 +161,25 @@ export async function runExactReviewDirectPublicationFromEnv() {
     writeGithubOutput("reason", `mutation_${String(outcome.kind || "missing")}`);
     return;
   }
+  const sourceAction = process.env.EXACT_REVIEW_DIRECT_SOURCE_ACTION;
+  if (typeof sourceAction !== "string" || sourceAction.length === 0) {
+    writeGithubOutput("accepted", "false");
+    writeGithubOutput("fallback", "true");
+    writeGithubOutput("reason", "invalid_direct_source_action");
+    return;
+  }
+  const lifecycle = directPublicationLifecyclePlanFromOutcome(outcome.disposition, sourceAction);
+  if (!lifecycle) {
+    writeGithubOutput("accepted", "false");
+    writeGithubOutput("fallback", "true");
+    writeGithubOutput("reason", "invalid_direct_lifecycle");
+    return;
+  }
   const payload = prepareDirectPublicationPayload({
     revision: positiveInteger(requiredEnv("EXACT_REVIEW_DIRECT_REVISION"), "revision"),
     plan: outcome.plan,
+    sourceSha: requiredExactShaEnv("GITHUB_SHA"),
+    lifecycle,
   });
   const result = await postDirectPublicationResult({
     baseUrl: requiredEnv("EXACT_REVIEW_QUEUE_URL"),
@@ -152,10 +189,54 @@ export async function runExactReviewDirectPublicationFromEnv() {
   writeGithubOutput("accepted", result.kind === "accepted" ? "true" : "false");
   writeGithubOutput("fallback", result.kind === "fallback" ? "true" : "false");
   writeGithubOutput("attempts", String(result.attempts));
+  writeGithubOutput(
+    "superseded",
+    result.kind === "accepted" && result.response.superseded === true ? "true" : "false",
+  );
   if (result.kind === "fallback") {
     writeGithubOutput("reason", result.reason.replace(/[\r\n]/g, " ").slice(0, 500));
     console.warn(`Direct exact-review publication deferred to the durable queue: ${result.reason}`);
   }
+}
+
+function directPublicationLifecyclePlanFromOutcome(
+  value: unknown,
+  sourceAction: string | undefined,
+): DirectPublicationLifecyclePlan | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const disposition = value as Record<string, unknown>;
+  const expectedBoolean = (name: string) => disposition[name] === true;
+  const guardedOpenAction = disposition.guardedOpenAction;
+  if (
+    typeof guardedOpenAction !== "string" &&
+    guardedOpenAction !== null &&
+    guardedOpenAction !== undefined
+  ) {
+    return null;
+  }
+  if (expectedBoolean("requeueLatestExpected")) return { kind: "requeue" };
+  if (expectedBoolean("terminalMissingExpected")) return { kind: "target_missing" };
+  if (expectedBoolean("terminalClosedExpected")) return { kind: "target_closed" };
+  if (typeof guardedOpenAction === "string" && guardedOpenAction.length > 0) {
+    return { kind: "guarded_open" };
+  }
+  if (sourceAction === "failed_review_shard_recovery") return { kind: "router_not_required" };
+  if (expectedBoolean("routableSyncExpected")) return { kind: "router" };
+  if (expectedBoolean("deferredCloseCoverageExpected")) {
+    return { kind: "router_deferred_coverage" };
+  }
+  if (
+    [
+      "requeueLatestExpected",
+      "terminalMissingExpected",
+      "terminalClosedExpected",
+      "routableSyncExpected",
+      "deferredCloseCoverageExpected",
+    ].some((name) => disposition[name] !== false && disposition[name] !== true)
+  ) {
+    return null;
+  }
+  return { kind: "policy_noop" };
 }
 
 function boundedAttempts(value: number) {
@@ -168,6 +249,14 @@ function boundedAttempts(value: number) {
 function requiredEnv(name: string) {
   const value = String(process.env[name] || "").trim();
   if (!value) throw new Error(`${name} is required`);
+  return value;
+}
+
+function requiredExactShaEnv(name: string) {
+  const value = process.env[name];
+  if (typeof value !== "string" || !/^[a-f0-9]{40}$/.test(value)) {
+    throw new Error(`${name} must be an exact lowercase commit SHA`);
+  }
   return value;
 }
 

@@ -408,7 +408,7 @@ jobs:
 
   event-review-apply:
     name: Review exact event item
-    if: ${{ github.event_name == 'repository_dispatch' && github.event.action != 'clawsweeper_target_sweep' && github.event.client_payload.queue_lease_id != '' && github.event.client_payload.source_action != 'exact_review_artifact_publish' }}
+    if: ${{ github.event_name == 'repository_dispatch' && github.event.action != 'clawsweeper_target_sweep' && github.event.client_payload.queue_lease_id != '' && github.event.client_payload.source_action != 'exact_review_artifact_publish' && github.event.client_payload.source_action != 'exact_review_command_acknowledgement' }}
     runs-on: ${{ vars.CLAWSWEEPER_REVIEW_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 120
     concurrency:
@@ -1320,12 +1320,128 @@ jobs:
           EXACT_REVIEW_DIRECT_MUTATION_OUTPUT: .artifacts/direct-publication-outcome.json
           EXACT_REVIEW_DIRECT_ITEM_KEY: ${{ steps.claim-exact-review-queue.outputs.item_key }}
           EXACT_REVIEW_DIRECT_REVISION: ${{ steps.claim-exact-review-queue.outputs.lease_revision }}
+          EXACT_REVIEW_DIRECT_SOURCE_ACTION: ${{ fromJSON(steps.claim-exact-review-queue.outputs.decision).sourceAction }}
           EXACT_REVIEW_QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
           CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
         run: pnpm run --silent repair:exact-review-direct-publication
 
+      - name: Finalize direct exact review lifecycle
+        id: finalize-direct-exact-review-lifecycle
+        if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.direct-exact-review-publication.outputs.accepted == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_REPO: ${{ steps.target.outputs.target_repo }}
+          TARGET_BRANCH: ${{ steps.target.outputs.target_branch }}
+          ITEM_NUMBER: ${{ steps.target.outputs.item_number }}
+          FENCE_KEY: ${{ steps.claim-exact-review-queue.outputs.item_key }}
+          REVISION: ${{ steps.claim-exact-review-queue.outputs.lease_revision }}
+          CLAIM_DECISION: ${{ steps.claim-exact-review-queue.outputs.decision }}
+          DIRECT_PUBLICATION_SUPERSEDED: ${{ steps.direct-exact-review-publication.outputs.superseded }}
+          DIRECT_OUTCOME: .artifacts/direct-publication-outcome.json
+          QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
+          CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
+          CLAWSWEEPER_COMMENT_LOOKBACK_MINUTES: ${{ vars.CLAWSWEEPER_COMMENT_LOOKBACK_MINUTES || '180' }}
+          CLAWSWEEPER_COMMENT_MAX_COMMENTS: ${{ vars.CLAWSWEEPER_COMMENT_MAX_COMMENTS || '1000' }}
+        run: |
+          set -euo pipefail
+          test -s "$DIRECT_OUTCOME"
+          jq -e '.kind == "eligible" and .disposition != null' "$DIRECT_OUTCOME" >/dev/null
+          test -n "$CLAWSWEEPER_WEBHOOK_SECRET"
+          source_action="$(node -e 'const decision=JSON.parse(process.env.CLAIM_DECISION || "{}"); process.stdout.write(decision.sourceAction || "")')"
+          lifecycle_terminal=""
+          lifecycle_router_outcome=""
+          lifecycle_deferred_coverage="false"
+          direct_lifecycle_requeue=false
+          queue_url="${QUEUE_URL%/}"
+          if [ "${DIRECT_PUBLICATION_SUPERSEDED:-false}" != "true" ]; then
+            if jq -e '.disposition.requeueLatestExpected == true' "$DIRECT_OUTCOME" >/dev/null; then
+              lifecycle_terminal="requeue"
+              # The completion owns this direct receipt. Let its fenced queue
+              # transition create the fresh source-drift revision atomically.
+              direct_lifecycle_requeue=true
+            elif jq -e '.disposition.terminalMissingExpected == true' "$DIRECT_OUTCOME" >/dev/null; then
+              lifecycle_terminal="target_missing"
+            elif jq -e '.disposition.terminalClosedExpected == true' "$DIRECT_OUTCOME" >/dev/null; then
+              lifecycle_terminal="target_closed"
+            elif jq -e '.disposition.guardedOpenAction != null and .disposition.guardedOpenAction != ""' "$DIRECT_OUTCOME" >/dev/null; then
+              lifecycle_terminal="guarded_open"
+            elif [ "$source_action" = "failed_review_shard_recovery" ]; then
+              lifecycle_router_outcome="not_required"
+            elif jq -e '.disposition.routableSyncExpected == true' "$DIRECT_OUTCOME" >/dev/null; then
+              gh workflow run repair-comment-router.yml \
+                --repo "$GITHUB_REPOSITORY" \
+                --ref main \
+                -f execute=true \
+                -f target_repo="$TARGET_REPO" \
+                -f target_branch="$TARGET_BRANCH" \
+                -f item_numbers="$ITEM_NUMBER" \
+                -f lookback_minutes="$CLAWSWEEPER_COMMENT_LOOKBACK_MINUTES" \
+                -f max_comments="$CLAWSWEEPER_COMMENT_MAX_COMMENTS"
+              lifecycle_router_outcome="durable"
+            elif jq -e '.disposition.deferredCloseCoverageExpected == true' "$DIRECT_OUTCOME" >/dev/null; then
+              # The close proof remains a separate later concern. The durable
+              # handoff means this review itself is complete.
+              lifecycle_router_outcome="durable"
+              lifecycle_deferred_coverage="true"
+            else
+              lifecycle_terminal="policy_noop"
+            fi
+          fi
+          if [ -n "$lifecycle_router_outcome" ]; then
+            export LIFECYCLE_ROUTER_OUTCOME="$lifecycle_router_outcome"
+            export LIFECYCLE_DEFERRED_COVERAGE="$lifecycle_deferred_coverage"
+            lifecycle_payload="$(node -e '
+              const revision = Number(process.env.REVISION);
+              if (!Number.isInteger(revision) || revision < 1 || !process.env.FENCE_KEY) process.exit(1);
+              const prefix = process.env.LIFECYCLE_DEFERRED_COVERAGE === "true"
+                ? "router-direct-proof"
+                : process.env.LIFECYCLE_ROUTER_OUTCOME === "not_required"
+                  ? "router-direct-not-required"
+                  : "router-direct";
+              process.stdout.write(JSON.stringify({
+                canonical_target_key: `${process.env.TARGET_REPO}#${process.env.ITEM_NUMBER}`,
+                fence_key: process.env.FENCE_KEY,
+                revision,
+                outcome: process.env.LIFECYCLE_ROUTER_OUTCOME,
+                receipt_id: `${prefix}:${process.env.GITHUB_RUN_ID}:${process.env.GITHUB_RUN_ATTEMPT}`,
+              }));
+            ')"
+            lifecycle_signature="$(PAYLOAD="$lifecycle_payload" node -e 'const crypto=require("node:crypto"); process.stdout.write(`sha256=${crypto.createHmac("sha256", process.env.CLAWSWEEPER_WEBHOOK_SECRET).update(process.env.PAYLOAD).digest("hex")}`)')"
+            lifecycle_response="$(curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
+              --request POST \
+              --header "content-type: application/json" \
+              --header "x-clawsweeper-exact-review-signature: $lifecycle_signature" \
+              --data "$lifecycle_payload" \
+              "$queue_url/internal/exact-review/lifecycle/router-receipt")"
+            jq -e '.ok == true' <<<"$lifecycle_response" >/dev/null
+          elif [ -n "$lifecycle_terminal" ]; then
+            export LIFECYCLE_TERMINAL="$lifecycle_terminal"
+            lifecycle_payload="$(node -e '
+              const revision = Number(process.env.REVISION);
+              if (!Number.isInteger(revision) || revision < 1 || !process.env.FENCE_KEY || !process.env.LIFECYCLE_TERMINAL) process.exit(1);
+              process.stdout.write(JSON.stringify({
+                canonical_target_key: `${process.env.TARGET_REPO}#${process.env.ITEM_NUMBER}`,
+                fence_key: process.env.FENCE_KEY,
+                revision,
+                kind: process.env.LIFECYCLE_TERMINAL,
+              }));
+            ')"
+            lifecycle_signature="$(PAYLOAD="$lifecycle_payload" node -e 'const crypto=require("node:crypto"); process.stdout.write(`sha256=${crypto.createHmac("sha256", process.env.CLAWSWEEPER_WEBHOOK_SECRET).update(process.env.PAYLOAD).digest("hex")}`)')"
+            lifecycle_response="$(curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
+              --request POST \
+              --header "content-type: application/json" \
+              --header "x-clawsweeper-exact-review-signature: $lifecycle_signature" \
+              --data "$lifecycle_payload" \
+              "$queue_url/internal/exact-review/lifecycle/terminal-disposition")"
+            jq -e '.ok == true' <<<"$lifecycle_response" >/dev/null
+          fi
+          echo "direct_lifecycle_requeue=$direct_lifecycle_requeue" >> "$GITHUB_OUTPUT"
+
+      # This is deliberately after the durable lifecycle handoff. Command
+      # acknowledgement is performed later by the dedicated finalizer and is
+      # not a precondition for optional implementation dispatch.
       - name: Dispatch exact high-confidence bug implementation
-        if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.direct-exact-review-publication.outputs.accepted == 'true' && vars.CLAWSWEEPER_AUTO_IMPLEMENT_ISSUES == '1' && steps.target.outputs.target_repo == 'openclaw/openclaw' && fromJSON(steps.claim-exact-review-queue.outputs.decision).itemKind == 'issue' }}
+        if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.finalize-direct-exact-review-lifecycle.outcome == 'success' && vars.CLAWSWEEPER_AUTO_IMPLEMENT_ISSUES == '1' && steps.target.outputs.target_repo == 'openclaw/openclaw' && fromJSON(steps.claim-exact-review-queue.outputs.decision).itemKind == 'issue' }}
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
@@ -1340,7 +1456,9 @@ jobs:
 
       - name: Upload exact review artifact bundle
         id: upload-exact-review-bundle
-        if: ${{ always() && steps.claim-exact-review-queue.outputs.claimed == 'true' && !cancelled() && steps.create-exact-review-bundle.outcome == 'success' && steps.direct-exact-review-publication.outputs.accepted != 'true' }}
+        # Keep the artifact if direct publication needs publisher recovery after
+        # its lifecycle handoff fails. A committed handoff owns the final path.
+        if: ${{ always() && steps.claim-exact-review-queue.outputs.claimed == 'true' && !cancelled() && steps.create-exact-review-bundle.outcome == 'success' && (steps.direct-exact-review-publication.outputs.accepted != 'true' || steps.finalize-direct-exact-review-lifecycle.outcome != 'success') }}
         uses: actions/upload-artifact@v7
         with:
           name: ${{ steps.create-exact-review-bundle.outputs.artifact_name }}
@@ -1508,6 +1626,9 @@ jobs:
           RESERVATION_STATUS: ${{ steps.reserve-exact-review-lease.outputs.status }}
           PUBLICATION_QUEUE_OUTCOME: ${{ steps.queue-exact-review-publication.outcome }}
           DIRECT_PUBLICATION_ACCEPTED: ${{ steps.direct-exact-review-publication.outputs.accepted }}
+          DIRECT_PUBLICATION_SUPERSEDED: ${{ steps.direct-exact-review-publication.outputs.superseded }}
+          DIRECT_LIFECYCLE_OUTCOME: ${{ steps.finalize-direct-exact-review-lifecycle.outcome }}
+          DIRECT_LIFECYCLE_REQUEUE: ${{ steps.finalize-direct-exact-review-lifecycle.outputs.direct_lifecycle_requeue || 'false' }}
         run: |
           outcome=failure
           requeue_latest=false
@@ -1520,15 +1641,19 @@ jobs:
             outcome=success
           elif [ "$REVIEW_OUTCOME" = "cancelled" ]; then
             outcome=cancelled
-          elif [ "$LIVE_OUTCOME" = "success" ] && { [ "$DIRECT_PUBLICATION_ACCEPTED" = "true" ] || [ "$PUBLICATION_QUEUE_OUTCOME" = "success" ]; }; then
+          elif [ "$LIVE_OUTCOME" = "success" ] && { \
+            { [ "$DIRECT_PUBLICATION_ACCEPTED" = "true" ] && [ "$DIRECT_LIFECYCLE_OUTCOME" = "success" ]; } || \
+            { [ "$DIRECT_PUBLICATION_ACCEPTED" != "true" ] && [ "$PUBLICATION_QUEUE_OUTCOME" = "success" ]; }; \
+          }; then
             outcome=success
           fi
           echo "outcome=$outcome" >> "$GITHUB_OUTPUT"
           echo "requeue_latest=$requeue_latest" >> "$GITHUB_OUTPUT"
+          echo "direct_lifecycle_requeue=$DIRECT_LIFECYCLE_REQUEUE" >> "$GITHUB_OUTPUT"
 
       - name: Complete exact-review queue lease
         id: complete-exact-review-queue
-        if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' && always() && steps.direct-exact-review-publication.outputs.accepted != 'true' }}
+        if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' && always() && (steps.direct-exact-review-publication.outputs.accepted != 'true' || steps.finalize-direct-exact-review-lifecycle.outcome == 'success') }}
         continue-on-error: true
         env:
           PRIMARY_OUTCOME: ${{ steps.exact-review-generation-result.outputs.outcome || 'failure' }}
@@ -1540,6 +1665,10 @@ jobs:
           QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
           REQUEUE_LATEST: ${{ steps.exact-review-generation-result.outputs.requeue_latest }}
           RETRY_AT: ${{ steps.live-item.outputs.retry_at || steps.reserve-exact-review-lease.outputs.retry_at || steps.review-exact-event-item.outputs.retry_at }}
+          DIRECT_PUBLICATION_ACCEPTED: ${{ steps.direct-exact-review-publication.outputs.accepted }}
+          DIRECT_PUBLICATION_SUPERSEDED: ${{ steps.direct-exact-review-publication.outputs.superseded }}
+          DIRECT_LIFECYCLE_OUTCOME: ${{ steps.finalize-direct-exact-review-lifecycle.outcome }}
+          DIRECT_LIFECYCLE_REQUEUE: ${{ steps.exact-review-generation-result.outputs.direct_lifecycle_requeue }}
           RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
           set -euo pipefail
@@ -1566,6 +1695,14 @@ jobs:
               : "failure";
             const requeueLatest = process.env.REQUEUE_LATEST === "true";
             const retryAt = String(process.env.RETRY_AT || "").trim();
+            const directPublicationCompleted =
+              process.env.DIRECT_PUBLICATION_ACCEPTED === "true" &&
+              process.env.DIRECT_LIFECYCLE_OUTCOME === "success";
+            const directPublicationSuperseded =
+              directPublicationCompleted && process.env.DIRECT_PUBLICATION_SUPERSEDED === "true";
+            const directLifecycleRequeue =
+              directPublicationCompleted && process.env.DIRECT_LIFECYCLE_REQUEUE === "true";
+            if (requeueLatest && directLifecycleRequeue) process.exit(1);
             process.stdout.write(JSON.stringify({
               lease_id: process.env.QUEUE_LEASE_ID,
               ...(protocolVersion === 2
@@ -1579,6 +1716,12 @@ jobs:
               run_attempt: runAttempt,
               outcome,
               ...(requeueLatest ? { requeue_latest: true } : {}),
+              ...(directPublicationCompleted
+                ? directPublicationSuperseded
+                  ? { completion_kind: "superseded", reason_code: "remote_newer_tuple" }
+                  : { completion_kind: "published", reason_code: "publication_applied" }
+                : {}),
+              ...(directLifecycleRequeue ? { direct_lifecycle_requeue: true } : {}),
               ...(retryAt ? { retry_at: retryAt } : {}),
             }));
           ')"
@@ -1742,12 +1885,50 @@ jobs:
                 const decision = response.decision;
                 const publication = decision?.publication;
                 const producerDecision = publication?.producerDecision;
-                const expectedItemKey = `${decision?.targetRepo}#${decision?.itemNumber}@publish:${publication?.producerRunId}:${publication?.producerRunAttempt}`;
+                const leaseRevision = Number(response.lease_revision);
+                const claimGeneration = Number(response.claim_generation);
+                const publicationLeaseRevision = Number(publication?.leaseRevision);
+                const directItemKey = `${decision?.targetRepo}#${decision?.itemNumber}`;
+                const expectedDeferredItemKey = `${directItemKey}@publish:${publication?.producerRunId}:${publication?.producerRunAttempt}`;
+                // Direct publication converts its already-leased base item into a
+                // recoverable publication. Its saved revision must still match
+                // this publisher lease before any external router handoff;
+                // deferred publication has its own key.
+                const directLifecycleRecovery =
+                  response.item_key === directItemKey &&
+                  publication?.itemKey === directItemKey &&
+                  Number.isInteger(publicationLeaseRevision) &&
+                  publicationLeaseRevision === leaseRevision;
+                const directLifecycle = directLifecycleRecovery ? publication?.directLifecycle : null;
+                const directLifecyclePlan = directLifecycle?.plan;
+                const directLifecycleReceiptOutcome = directLifecycle?.receiptOutcome;
+                const directLifecycleKinds = new Set([
+                  "router",
+                  "router_deferred_coverage",
+                  "router_not_required",
+                  "requeue",
+                  "target_missing",
+                  "target_closed",
+                  "guarded_open",
+                  "policy_noop",
+                ]);
+                // Pre-projection rows have no saved post-effect intent. They
+                // deliberately retain artifact recovery rather than inferring a
+                // router or terminal result from a newer publisher run.
+                const directLifecycleRecoveryReady =
+                  directLifecycleRecovery &&
+                  directLifecyclePlan &&
+                  typeof directLifecyclePlan === "object" &&
+                  !Array.isArray(directLifecyclePlan) &&
+                  Object.keys(directLifecyclePlan).length === 1 &&
+                  directLifecycleKinds.has(directLifecyclePlan.kind) &&
+                  ["accepted", "deduped", "superseded"].includes(directLifecycleReceiptOutcome);
+                const deferredPublication = response.item_key === expectedDeferredItemKey;
                 if (
                   response.claimed !== true ||
                   response.protocol_version !== 2 ||
                   response.item_key !== process.env.ITEM_KEY ||
-                  response.item_key !== expectedItemKey ||
+                  (!deferredPublication && !directLifecycleRecovery) ||
                   decision?.sourceAction !== "exact_review_artifact_publish" ||
                   !publication ||
                   !producerDecision ||
@@ -1756,8 +1937,6 @@ jobs:
                   producerDecision.itemNumber !== decision.itemNumber ||
                   producerDecision.itemKind !== decision.itemKind
                 ) process.exit(1);
-                const leaseRevision = Number(response.lease_revision);
-                const claimGeneration = Number(response.claim_generation);
                 if (!Number.isInteger(leaseRevision) || leaseRevision < 1) process.exit(1);
                 if (!Number.isInteger(claimGeneration) || claimGeneration < 1) process.exit(1);
                 const targetRepo = String(decision.targetRepo);
@@ -1791,6 +1970,13 @@ jobs:
                   publisher_item_key: response.item_key,
                   publisher_lease_revision: leaseRevision,
                   publisher_claim_generation: claimGeneration,
+                  direct_lifecycle_recovery: directLifecycleRecoveryReady,
+                  direct_lifecycle_plan: directLifecycleRecoveryReady
+                    ? JSON.stringify(directLifecyclePlan)
+                    : "",
+                  direct_lifecycle_receipt_outcome: directLifecycleRecoveryReady
+                    ? directLifecycleReceiptOutcome
+                    : "",
                 };
                 fs.appendFileSync(process.env.GITHUB_OUTPUT, "claimed=true\n");
                 for (const [key, value] of Object.entries(values)) {
@@ -1812,8 +1998,146 @@ jobs:
           done
           exit 1
 
+      - name: Replay committed direct lifecycle handoff
+        id: replay-direct-lifecycle
+        # A direct receipt already owns the GitHub effect. Its persisted plan is
+        # the only safe source for post-effect recovery; old receipts fall back
+        # to the artifact path above rather than being inferred here.
+        if: ${{ steps.publication-context.outputs.claimed == 'true' && steps.publication-context.outputs.direct_lifecycle_recovery == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_REPO: ${{ steps.publication-context.outputs.target_repo }}
+          TARGET_BRANCH: ${{ steps.publication-context.outputs.target_branch }}
+          ITEM_NUMBER: ${{ steps.publication-context.outputs.item_number }}
+          FENCE_KEY: ${{ steps.publication-context.outputs.publisher_item_key }}
+          REVISION: ${{ steps.publication-context.outputs.publisher_lease_revision }}
+          CLAIM_DECISION: ${{ steps.publication-context.outputs.decision }}
+          DIRECT_LIFECYCLE_PLAN: ${{ steps.publication-context.outputs.direct_lifecycle_plan }}
+          DIRECT_LIFECYCLE_RECEIPT_OUTCOME: ${{ steps.publication-context.outputs.direct_lifecycle_receipt_outcome }}
+          QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
+          CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
+          CLAWSWEEPER_COMMENT_LOOKBACK_MINUTES: ${{ vars.CLAWSWEEPER_COMMENT_LOOKBACK_MINUTES || '180' }}
+          CLAWSWEEPER_COMMENT_MAX_COMMENTS: ${{ vars.CLAWSWEEPER_COMMENT_MAX_COMMENTS || '1000' }}
+        run: |
+          set -euo pipefail
+          test -n "$CLAWSWEEPER_WEBHOOK_SECRET"
+          queue_url="${QUEUE_URL%/}"
+          lifecycle_kind="$(DIRECT_LIFECYCLE_PLAN="$DIRECT_LIFECYCLE_PLAN" node -e '
+            const plan = JSON.parse(process.env.DIRECT_LIFECYCLE_PLAN || "");
+            const kinds = new Set([
+              "router", "router_deferred_coverage", "router_not_required", "requeue",
+              "target_missing", "target_closed", "guarded_open", "policy_noop",
+            ]);
+            if (!plan || typeof plan !== "object" || Array.isArray(plan) || Object.keys(plan).length !== 1 || !kinds.has(plan.kind)) process.exit(1);
+            process.stdout.write(plan.kind);
+          ')"
+          receipt_outcome="$DIRECT_LIFECYCLE_RECEIPT_OUTCOME"
+          case "$receipt_outcome" in
+            accepted|deduped|superseded) ;;
+            *) exit 1 ;;
+          esac
+          post_router_receipt() {
+            local outcome="$1"
+            local deferred_coverage="$2"
+            lifecycle_payload="$(LIFECYCLE_ROUTER_OUTCOME="$outcome" LIFECYCLE_DEFERRED_COVERAGE="$deferred_coverage" node -e '
+              const revision = Number(process.env.REVISION);
+              if (!Number.isInteger(revision) || revision < 1 || !process.env.FENCE_KEY) process.exit(1);
+              const prefix = process.env.LIFECYCLE_DEFERRED_COVERAGE === "true"
+                ? "router-direct-recovery-proof"
+                : process.env.LIFECYCLE_ROUTER_OUTCOME === "not_required"
+                  ? "router-direct-recovery-not-required"
+                  : "router-direct-recovery";
+              process.stdout.write(JSON.stringify({
+                canonical_target_key: `${process.env.TARGET_REPO}#${process.env.ITEM_NUMBER}`,
+                fence_key: process.env.FENCE_KEY,
+                revision,
+                outcome: process.env.LIFECYCLE_ROUTER_OUTCOME,
+                receipt_id: `${prefix}:${process.env.GITHUB_RUN_ID}:${process.env.GITHUB_RUN_ATTEMPT}`,
+              }));
+            ')"
+            lifecycle_signature="$(PAYLOAD="$lifecycle_payload" node -e 'const crypto=require("node:crypto"); process.stdout.write(`sha256=${crypto.createHmac("sha256", process.env.CLAWSWEEPER_WEBHOOK_SECRET).update(process.env.PAYLOAD).digest("hex")}`)')"
+            lifecycle_response="$(curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
+              --request POST \
+              --header "content-type: application/json" \
+              --header "x-clawsweeper-exact-review-signature: $lifecycle_signature" \
+              --data "$lifecycle_payload" \
+              "$queue_url/internal/exact-review/lifecycle/router-receipt")"
+            jq -e '.ok == true' <<<"$lifecycle_response" >/dev/null
+          }
+          post_terminal_disposition() {
+            local terminal_kind="$1"
+            lifecycle_payload="$(LIFECYCLE_TERMINAL="$terminal_kind" node -e '
+              const revision = Number(process.env.REVISION);
+              if (!Number.isInteger(revision) || revision < 1 || !process.env.FENCE_KEY || !process.env.LIFECYCLE_TERMINAL) process.exit(1);
+              process.stdout.write(JSON.stringify({
+                canonical_target_key: `${process.env.TARGET_REPO}#${process.env.ITEM_NUMBER}`,
+                fence_key: process.env.FENCE_KEY,
+                revision,
+                kind: process.env.LIFECYCLE_TERMINAL,
+              }));
+            ')"
+            lifecycle_signature="$(PAYLOAD="$lifecycle_payload" node -e 'const crypto=require("node:crypto"); process.stdout.write(`sha256=${crypto.createHmac("sha256", process.env.CLAWSWEEPER_WEBHOOK_SECRET).update(process.env.PAYLOAD).digest("hex")}`)')"
+            lifecycle_response="$(curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
+              --request POST \
+              --header "content-type: application/json" \
+              --header "x-clawsweeper-exact-review-signature: $lifecycle_signature" \
+              --data "$lifecycle_payload" \
+              "$queue_url/internal/exact-review/lifecycle/terminal-disposition")"
+            jq -e '.ok == true' <<<"$lifecycle_response" >/dev/null
+          }
+          completion_kind=published
+          reason_code=publication_applied
+          requeue_latest=false
+          direct_requeue=false
+          if [ "$receipt_outcome" = "superseded" ]; then
+            # The direct receipt already committed the terminal supersession.
+            # Do not manufacture a router, requeue, or acknowledgement attempt.
+            completion_kind=superseded
+            reason_code=remote_newer_tuple
+          else
+            case "$lifecycle_kind" in
+              router)
+                gh workflow run repair-comment-router.yml \
+                  --repo "$GITHUB_REPOSITORY" \
+                  --ref main \
+                  -f execute=true \
+                  -f target_repo="$TARGET_REPO" \
+                  -f target_branch="$TARGET_BRANCH" \
+                  -f item_numbers="$ITEM_NUMBER" \
+                  -f lookback_minutes="$CLAWSWEEPER_COMMENT_LOOKBACK_MINUTES" \
+                  -f max_comments="$CLAWSWEEPER_COMMENT_MAX_COMMENTS"
+                post_router_receipt durable false
+                ;;
+              router_deferred_coverage)
+                post_router_receipt durable true
+                ;;
+              router_not_required)
+                post_router_receipt not_required false
+                ;;
+              requeue)
+                post_terminal_disposition requeue
+                # The completion endpoint atomically changes this exact direct
+                # publication into a new fenced source-drift review revision.
+                # A separate enqueue here could be ignored while this lease is
+                # still active and would leave the old receipt replayable.
+                direct_requeue=true
+                ;;
+              target_missing|target_closed|guarded_open|policy_noop)
+                post_terminal_disposition "$lifecycle_kind"
+                ;;
+              *) exit 1 ;;
+            esac
+          fi
+          {
+            echo "outcome=success"
+            echo "completion_kind=$completion_kind"
+            echo "reason_code=$reason_code"
+            echo "requeue_latest=$requeue_latest"
+            echo "direct_requeue=$direct_requeue"
+          } >> "$GITHUB_OUTPUT"
+
       - uses: actions/checkout@v7
-        if: ${{ steps.publication-context.outputs.claimed == 'true' }}
+        if: ${{ steps.publication-context.outputs.claimed == 'true' && steps.publication-context.outputs.direct_lifecycle_recovery != 'true' }}
         with:
           # The artifact validator binds the producer SHA. The publisher itself
           # must run the current repaired implementation, not historical code.
@@ -1823,17 +2147,17 @@ jobs:
           persist-credentials: false
 
       - uses: ./.github/actions/setup-action-ledger
-        if: ${{ steps.publication-context.outputs.claimed == 'true' }}
+        if: ${{ steps.publication-context.outputs.claimed == 'true' && steps.publication-context.outputs.direct_lifecycle_recovery != 'true' }}
         continue-on-error: true
 
       - uses: ./.github/actions/setup-pnpm
-        if: ${{ steps.publication-context.outputs.claimed == 'true' }}
+        if: ${{ steps.publication-context.outputs.claimed == 'true' && steps.publication-context.outputs.direct_lifecycle_recovery != 'true' }}
         id: setup-publish-pnpm
         with:
           build-script: build:all
 
       - name: Download exact review artifact bundle
-        if: ${{ steps.publication-context.outputs.claimed == 'true' }}
+        if: ${{ steps.publication-context.outputs.claimed == 'true' && steps.publication-context.outputs.direct_lifecycle_recovery != 'true' }}
         id: download-exact-review-bundle
         continue-on-error: true
         uses: actions/download-artifact@v8
@@ -1845,7 +2169,7 @@ jobs:
           path: .artifacts/exact-review-bundle
 
       - name: Validate exact review artifact bundle
-        if: ${{ steps.publication-context.outputs.claimed == 'true' && steps.download-exact-review-bundle.outcome == 'success' }}
+        if: ${{ steps.publication-context.outputs.claimed == 'true' && steps.publication-context.outputs.direct_lifecycle_recovery != 'true' && steps.download-exact-review-bundle.outcome == 'success' }}
         id: validate-exact-review-bundle
         continue-on-error: true
         env:
@@ -1871,7 +2195,7 @@ jobs:
 
       - name: Identify legacy tuple-less exact artifact
         id: legacy-exact-artifact
-        if: ${{ steps.publication-context.outputs.claimed == 'true' && steps.validate-exact-review-bundle.outcome == 'success' }}
+        if: ${{ steps.publication-context.outputs.claimed == 'true' && steps.publication-context.outputs.direct_lifecycle_recovery != 'true' && steps.validate-exact-review-bundle.outcome == 'success' }}
         env:
           REPORT_PATH: .artifacts/exact-review-bundle/review/${{ steps.publication-context.outputs.item_number }}.md
         run: |
@@ -1897,7 +2221,7 @@ jobs:
           NODE
 
       - name: Stage validated exact review artifact
-        if: ${{ steps.publication-context.outputs.claimed == 'true' && steps.validate-exact-review-bundle.outcome == 'success' }}
+        if: ${{ steps.publication-context.outputs.claimed == 'true' && steps.publication-context.outputs.direct_lifecycle_recovery != 'true' && steps.validate-exact-review-bundle.outcome == 'success' }}
         run: |
           set -euo pipefail
           mkdir -p artifacts/event
@@ -1907,7 +2231,7 @@ jobs:
           fi
 
       - name: Create target write token
-        if: ${{ steps.publication-context.outputs.claimed == 'true' && steps.validate-exact-review-bundle.outcome == 'success' }}
+        if: ${{ steps.publication-context.outputs.claimed == 'true' && steps.publication-context.outputs.direct_lifecycle_recovery != 'true' && steps.validate-exact-review-bundle.outcome == 'success' }}
         id: target-write-token
         continue-on-error: true
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
@@ -1923,7 +2247,7 @@ jobs:
           permission-statuses: read
 
       - uses: ./.github/actions/setup-state
-        if: ${{ steps.publication-context.outputs.claimed == 'true' && steps.validate-exact-review-bundle.outcome == 'success' && steps.legacy-exact-artifact.outputs.legacy_tupleless != 'true' }}
+        if: ${{ steps.publication-context.outputs.claimed == 'true' && steps.publication-context.outputs.direct_lifecycle_recovery != 'true' && steps.validate-exact-review-bundle.outcome == 'success' && steps.legacy-exact-artifact.outputs.legacy_tupleless != 'true' }}
         id: setup-state
         with:
           coordinator-url: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
@@ -1934,7 +2258,7 @@ jobs:
           hydrate-state-blobs: "false"
 
       - name: Publish event result and apply safe close
-        if: ${{ steps.publication-context.outputs.claimed == 'true' && steps.validate-exact-review-bundle.outcome == 'success' && steps.legacy-exact-artifact.outputs.legacy_tupleless != 'true' }}
+        if: ${{ steps.publication-context.outputs.claimed == 'true' && steps.publication-context.outputs.direct_lifecycle_recovery != 'true' && steps.validate-exact-review-bundle.outcome == 'success' && steps.legacy-exact-artifact.outputs.legacy_tupleless != 'true' }}
         id: publish-event-result
         env:
           CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
@@ -2078,14 +2402,50 @@ jobs:
           fi
           rm -f "$publication_error"
 
+      - name: Record fallback canonical exact review lifecycle receipt
+        id: record-fallback-canonical-lifecycle-receipt
+        if: ${{ steps.publication-context.outputs.claimed == 'true' && steps.publication-context.outputs.direct_lifecycle_recovery != 'true' && steps.publish-event-result.outcome == 'success' && (steps.publish-event-result.outputs.remote_tuple_verified == 'true' || (steps.publish-event-result.outputs.completion_kind == 'deferred' && steps.publish-event-result.outputs.reason_code == 'close_coverage_deferred')) }}
+        env:
+          TARGET_REPO: ${{ steps.publication-context.outputs.target_repo }}
+          ITEM_NUMBER: ${{ steps.publication-context.outputs.item_number }}
+          FENCE_KEY: ${{ steps.publication-context.outputs.publisher_item_key }}
+          REVISION: ${{ steps.publication-context.outputs.publisher_lease_revision }}
+          QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
+          CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
+        run: |
+          set -euo pipefail
+          payload="$(node -e '
+            const revision = Number(process.env.REVISION);
+            if (!Number.isInteger(revision) || revision < 1 || !process.env.FENCE_KEY) process.exit(1);
+            process.stdout.write(JSON.stringify({
+              canonical_target_key: `${process.env.TARGET_REPO}#${process.env.ITEM_NUMBER}`,
+              fence_key: process.env.FENCE_KEY,
+              revision,
+              outcome: "accepted",
+              receipt_id: `fallback:${process.env.GITHUB_RUN_ID}:${process.env.GITHUB_RUN_ATTEMPT}`,
+            }));
+          ')"
+          signature="$(PAYLOAD="$payload" node -e 'const crypto=require("node:crypto"); process.stdout.write(`sha256=${crypto.createHmac("sha256", process.env.CLAWSWEEPER_WEBHOOK_SECRET).update(process.env.PAYLOAD).digest("hex")}`)')"
+          queue_url="${QUEUE_URL%/}"
+          curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
+            --request POST \
+            --header "content-type: application/json" \
+            --header "x-clawsweeper-exact-review-signature: $signature" \
+            --data "$payload" \
+            "$queue_url/internal/exact-review/lifecycle/canonical-receipt" >/dev/null
+
       - name: Queue deferred exact verdict router
         id: queue-deferred-verdict-router
-        if: ${{ steps.publication-context.outputs.claimed == 'true' && fromJSON(steps.publication-context.outputs.decision).sourceAction != 'failed_review_shard_recovery' && steps.publish-event-result.outcome == 'success' && steps.publish-event-result.outputs.remote_tuple_verified == 'true' && steps.publish-event-result.outputs.routing_deferred == 'true' }}
+        if: ${{ steps.publication-context.outputs.claimed == 'true' && steps.publication-context.outputs.direct_lifecycle_recovery != 'true' && fromJSON(steps.publication-context.outputs.decision).sourceAction != 'failed_review_shard_recovery' && steps.publish-event-result.outcome == 'success' && steps.publish-event-result.outputs.remote_tuple_verified == 'true' && steps.publish-event-result.outputs.routing_deferred == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           TARGET_REPO: ${{ steps.publication-context.outputs.target_repo }}
           TARGET_BRANCH: ${{ steps.publication-context.outputs.target_branch }}
           ITEM_NUMBER: ${{ steps.publication-context.outputs.item_number }}
+          FENCE_KEY: ${{ steps.publication-context.outputs.publisher_item_key }}
+          REVISION: ${{ steps.publication-context.outputs.publisher_lease_revision }}
+          QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
+          CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           CLAWSWEEPER_COMMENT_LOOKBACK_MINUTES: ${{ vars.CLAWSWEEPER_COMMENT_LOOKBACK_MINUTES || '180' }}
           CLAWSWEEPER_COMMENT_MAX_COMMENTS: ${{ vars.CLAWSWEEPER_COMMENT_MAX_COMMENTS || '1000' }}
         run: |
@@ -2099,8 +2459,91 @@ jobs:
             -f lookback_minutes="$CLAWSWEEPER_COMMENT_LOOKBACK_MINUTES" \
             -f max_comments="$CLAWSWEEPER_COMMENT_MAX_COMMENTS"
 
+          payload="$(node -e '
+            const revision = Number(process.env.REVISION);
+            if (!Number.isInteger(revision) || revision < 1 || !process.env.FENCE_KEY) process.exit(1);
+            process.stdout.write(JSON.stringify({
+              canonical_target_key: `${process.env.TARGET_REPO}#${process.env.ITEM_NUMBER}`,
+              fence_key: process.env.FENCE_KEY,
+              revision,
+              receipt_id: `router:${process.env.GITHUB_RUN_ID}:${process.env.GITHUB_RUN_ATTEMPT}`,
+            }));
+          ')"
+          signature="$(PAYLOAD="$payload" node -e 'const crypto=require("node:crypto"); process.stdout.write(`sha256=${crypto.createHmac("sha256", process.env.CLAWSWEEPER_WEBHOOK_SECRET).update(process.env.PAYLOAD).digest("hex")}`)')"
+          queue_url="${QUEUE_URL%/}"
+          curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
+            --request POST \
+            --header "content-type: application/json" \
+            --header "x-clawsweeper-exact-review-signature: $signature" \
+            --data "$payload" \
+            "$queue_url/internal/exact-review/lifecycle/router-receipt" >/dev/null
+
+      - name: Record deferred close-proof exact review lifecycle receipt
+        id: record-deferred-close-proof-lifecycle-receipt
+        if: ${{ steps.publication-context.outputs.claimed == 'true' && steps.publication-context.outputs.direct_lifecycle_recovery != 'true' && steps.publish-event-result.outcome == 'success' && steps.publish-event-result.outputs.completion_kind == 'deferred' && steps.publish-event-result.outputs.reason_code == 'close_coverage_deferred' }}
+        env:
+          TARGET_REPO: ${{ steps.publication-context.outputs.target_repo }}
+          ITEM_NUMBER: ${{ steps.publication-context.outputs.item_number }}
+          FENCE_KEY: ${{ steps.publication-context.outputs.publisher_item_key }}
+          REVISION: ${{ steps.publication-context.outputs.publisher_lease_revision }}
+          QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
+          CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
+        run: |
+          set -euo pipefail
+          payload="$(node -e '
+            const revision = Number(process.env.REVISION);
+            if (!Number.isInteger(revision) || revision < 1 || !process.env.FENCE_KEY) process.exit(1);
+            process.stdout.write(JSON.stringify({
+              canonical_target_key: process.env.TARGET_REPO + "#" + process.env.ITEM_NUMBER,
+              fence_key: process.env.FENCE_KEY,
+              revision,
+              outcome: "durable",
+              receipt_id: "router-proof:" + process.env.GITHUB_RUN_ID + ":" + process.env.GITHUB_RUN_ATTEMPT,
+            }));
+          ')"
+          signature="$(PAYLOAD="$payload" node -e 'const crypto=require("node:crypto"); process.stdout.write("sha256="+crypto.createHmac("sha256", process.env.CLAWSWEEPER_WEBHOOK_SECRET).update(process.env.PAYLOAD).digest("hex"))')"
+          queue_url="${QUEUE_URL%/}"
+          curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
+            --request POST \
+            --header "content-type: application/json" \
+            --header "x-clawsweeper-exact-review-signature: $signature" \
+            --data "$payload" \
+            "$queue_url/internal/exact-review/lifecycle/router-receipt" >/dev/null
+
+      - name: Record no-router exact review lifecycle receipt
+        id: record-no-router-lifecycle-receipt
+        if: ${{ steps.publication-context.outputs.claimed == 'true' && steps.publication-context.outputs.direct_lifecycle_recovery != 'true' && fromJSON(steps.publication-context.outputs.decision).sourceAction == 'failed_review_shard_recovery' && steps.publish-event-result.outcome == 'success' && steps.publish-event-result.outputs.remote_tuple_verified == 'true' }}
+        env:
+          TARGET_REPO: ${{ steps.publication-context.outputs.target_repo }}
+          ITEM_NUMBER: ${{ steps.publication-context.outputs.item_number }}
+          FENCE_KEY: ${{ steps.publication-context.outputs.publisher_item_key }}
+          REVISION: ${{ steps.publication-context.outputs.publisher_lease_revision }}
+          QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
+          CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
+        run: |
+          set -euo pipefail
+          payload="$(node -e '
+            const revision = Number(process.env.REVISION);
+            if (!Number.isInteger(revision) || revision < 1 || !process.env.FENCE_KEY) process.exit(1);
+            process.stdout.write(JSON.stringify({
+              canonical_target_key: `${process.env.TARGET_REPO}#${process.env.ITEM_NUMBER}`,
+              fence_key: process.env.FENCE_KEY,
+              revision,
+              outcome: "not_required",
+              receipt_id: `router-not-required:${process.env.GITHUB_RUN_ID}:${process.env.GITHUB_RUN_ATTEMPT}`,
+            }));
+          ')"
+          signature="$(PAYLOAD="$payload" node -e 'const crypto=require("node:crypto"); process.stdout.write(`sha256=${crypto.createHmac("sha256", process.env.CLAWSWEEPER_WEBHOOK_SECRET).update(process.env.PAYLOAD).digest("hex")}`)')"
+          queue_url="${QUEUE_URL%/}"
+          curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
+            --request POST \
+            --header "content-type: application/json" \
+            --header "x-clawsweeper-exact-review-signature: $signature" \
+            --data "$payload" \
+            "$queue_url/internal/exact-review/lifecycle/router-receipt" >/dev/null
+
       - name: Dispatch deferred high-confidence bug implementation
-        if: ${{ steps.publication-context.outputs.claimed == 'true' && steps.publish-event-result.outcome == 'success' && steps.publish-event-result.outputs.remote_tuple_verified == 'true' && vars.CLAWSWEEPER_AUTO_IMPLEMENT_ISSUES == '1' && steps.publication-context.outputs.target_repo == 'openclaw/openclaw' && fromJSON(steps.publication-context.outputs.decision).itemKind == 'issue' }}
+        if: ${{ steps.publication-context.outputs.claimed == 'true' && steps.publication-context.outputs.direct_lifecycle_recovery != 'true' && steps.publish-event-result.outcome == 'success' && steps.publish-event-result.outputs.remote_tuple_verified == 'true' && steps.record-fallback-canonical-lifecycle-receipt.outcome == 'success' && vars.CLAWSWEEPER_AUTO_IMPLEMENT_ISSUES == '1' && steps.publication-context.outputs.target_repo == 'openclaw/openclaw' && fromJSON(steps.publication-context.outputs.decision).itemKind == 'issue' && ((fromJSON(steps.publication-context.outputs.decision).sourceAction == 'failed_review_shard_recovery' && steps.record-no-router-lifecycle-receipt.outcome == 'success') || (fromJSON(steps.publication-context.outputs.decision).sourceAction != 'failed_review_shard_recovery' && (steps.publish-event-result.outputs.routing_deferred != 'true' || steps.queue-deferred-verdict-router.outcome == 'success'))) }}
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
@@ -2115,7 +2558,7 @@ jobs:
 
       - name: Queue fresh review after source drift
         id: queue-source-drift-review
-        if: ${{ steps.publication-context.outputs.claimed == 'true' && (steps.publish-event-result.outputs.requeue_latest == 'true' || steps.legacy-exact-artifact.outputs.legacy_tupleless == 'true') }}
+        if: ${{ steps.publication-context.outputs.claimed == 'true' && steps.publication-context.outputs.direct_lifecycle_recovery != 'true' && (steps.publish-event-result.outputs.requeue_latest == 'true' || steps.legacy-exact-artifact.outputs.legacy_tupleless == 'true') }}
         env:
           CLAIM_DECISION: ${{ steps.publication-context.outputs.decision }}
           PRODUCER_RUN_ATTEMPT: ${{ steps.publication-context.outputs.generation_attempt }}
@@ -2155,7 +2598,7 @@ jobs:
 
       - name: Release terminal review leases
         id: release-terminal-review-leases
-        if: ${{ always() && steps.publication-context.outputs.claimed == 'true' && (steps.publish-event-result.outputs.terminal_noop == 'true' || steps.publish-event-result.outputs.terminal_closed == 'true') }}
+        if: ${{ always() && steps.publication-context.outputs.claimed == 'true' && steps.publication-context.outputs.direct_lifecycle_recovery != 'true' && (steps.publish-event-result.outputs.terminal_noop == 'true' || steps.publish-event-result.outputs.terminal_closed == 'true') }}
         env:
           GH_TOKEN: ${{ steps.target-write-token.outputs.token }}
           TARGET_REPO: ${{ steps.publication-context.outputs.target_repo }}
@@ -2183,7 +2626,7 @@ jobs:
 
       - name: Confirm terminal item remains closed
         id: confirm-terminal-item
-        if: ${{ always() && steps.publication-context.outputs.claimed == 'true' && steps.release-terminal-review-leases.outcome == 'success' }}
+        if: ${{ always() && steps.publication-context.outputs.claimed == 'true' && steps.publication-context.outputs.direct_lifecycle_recovery != 'true' && steps.release-terminal-review-leases.outcome == 'success' }}
         env:
           GH_TOKEN: ${{ steps.target-write-token.outputs.token }}
           TARGET_REPO: ${{ steps.publication-context.outputs.target_repo }}
@@ -2192,78 +2635,8 @@ jobs:
           test "$(gh api "repos/$TARGET_REPO/issues/$ITEM_NUMBER" --jq .state)" = "closed"
           echo "confirmed=true" >> "$GITHUB_OUTPUT"
 
-      - name: Mark re-review complete
-        if: ${{ always() && steps.publication-context.outputs.claimed == 'true' && steps.publication-context.outputs.has_command_context == 'true' && !(steps.publish-event-result.outputs.completion_kind == 'retryable_failure' && steps.publish-event-result.outputs.reason_code == 'review_lease_active') }}
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ steps.target-write-token.outputs.token }}
-          TARGET_REPO: ${{ steps.publication-context.outputs.target_repo }}
-          ITEM_NUMBER: ${{ steps.publication-context.outputs.item_number }}
-          COMMAND_STATUS_MARKER: ${{ fromJSON(steps.publication-context.outputs.decision).commandStatusMarker || '' }}
-          STATUS_COMMENT_ID: ${{ fromJSON(steps.publication-context.outputs.decision).statusCommentId || '' }}
-          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          PUBLISH_OUTCOME: ${{ steps.publish-event-result.outcome }}
-          PUBLISH_COMPLETION_KIND: ${{ steps.publish-event-result.outputs.completion_kind }}
-          PUBLISH_REASON_CODE: ${{ steps.publish-event-result.outputs.reason_code }}
-          ROUTE_HANDOFF_OUTCOME: ${{ steps.queue-deferred-verdict-router.outcome }}
-          TERMINAL_MISSING: ${{ steps.publish-event-result.outputs.terminal_missing }}
-          TERMINAL_CLOSED: ${{ steps.publish-event-result.outputs.terminal_closed }}
-          GUARDED_OPEN: ${{ steps.publish-event-result.outputs.guarded_open }}
-          REMOTE_TUPLE_VERIFIED: ${{ steps.publish-event-result.outputs.remote_tuple_verified }}
-          ROUTING_DEFERRED: ${{ steps.publish-event-result.outputs.routing_deferred }}
-          POLICY_NOOP: ${{ steps.publish-event-result.outputs.policy_noop }}
-          REQUEUE_LATEST: ${{ steps.publish-event-result.outputs.requeue_latest }}
-          LEGACY_TUPLELESS: ${{ steps.legacy-exact-artifact.outputs.legacy_tupleless }}
-          REVIEW_ONLY: ${{ fromJSON(steps.publication-context.outputs.decision).sourceAction == 'failed_review_shard_recovery' && 'true' || 'false' }}
-        run: |
-          state="Failed"
-          detail="The review artifact was captured, but publication did not finish cleanly."
-          if [ "$POLICY_NOOP" = "true" ]; then
-            state="Complete"
-            detail="The exact review reached a deterministic policy veto; no action was taken."
-          elif [ "$PUBLISH_COMPLETION_KIND" = "deferred" ] && [ "$PUBLISH_REASON_CODE" = "close_coverage_deferred" ]; then
-            state="Complete"
-            detail="The exact review is complete. Its close recommendation is queued for an independent bounded read-only proof check; no comment, label, or close action will occur unless that proof lane authorizes it."
-          elif [ "$LEGACY_TUPLELESS" = "true" ] && [ "${{ steps.queue-source-drift-review.outcome }}" = "success" ]; then
-            state="Complete"
-            detail="The legacy artifact lacked its durable review lease tuple; one fresh exact review was queued."
-          elif [ "$REQUEUE_LATEST" = "true" ] && [ "${{ steps.queue-source-drift-review.outcome }}" = "success" ]; then
-            state="Complete"
-            detail="The item changed after review; one fresh exact review was queued."
-          elif [ "$PUBLISH_COMPLETION_KIND" = "superseded" ]; then
-            state="Complete"
-            if [ "$PUBLISH_REASON_CODE" = "remote_closed" ]; then
-              detail="A newer publication already closed the item; this stale result was superseded."
-            else
-              detail="A newer review tuple already exists; this stale result was superseded."
-            fi
-          elif [ "${{ steps.confirm-terminal-item.outputs.confirmed }}" = "true" ]; then
-            state="Complete"
-            detail="The item is closed; no stale verdict was published."
-          elif [ "$TERMINAL_MISSING" = "true" ]; then
-            state="Complete"
-            detail="The repository is accessible but the item is missing; no stale verdict was published."
-          elif [ "$GUARDED_OPEN" = "true" ]; then
-            state="Complete"
-            detail="A deterministic remain-open guard blocked publication of a stale close verdict."
-          elif [ "$PUBLISH_OUTCOME" = "success" ] && [ "$REMOTE_TUPLE_VERIFIED" = "true" ] && [ "$REVIEW_ONLY" = "true" ]; then
-            state="Complete"
-            detail="The failed-shard recovery published a durable review comment without close routing."
-          elif [ "$PUBLISH_OUTCOME" = "success" ] && [ "$ROUTING_DEFERRED" = "true" ] && [ "$ROUTE_HANDOFF_OUTCOME" = "success" ]; then
-            state="Complete"
-            detail="The durable review comment was published and its verdict was queued for target-serialized routing."
-          fi
-          pnpm run repair:update-command-status -- \
-            --repo "$TARGET_REPO" \
-            --item-number "$ITEM_NUMBER" \
-            --marker "$COMMAND_STATUS_MARKER" \
-            --status-comment-id "$STATUS_COMMENT_ID" \
-            --state "$state" \
-            --detail "$detail" \
-            --run-url "$RUN_URL"
-
       - name: React to target item completion
-        if: ${{ steps.publication-context.outputs.claimed == 'true' && steps.publish-event-result.outputs.requeue_latest != 'true' && (steps.publish-event-result.outputs.terminal_closed == 'true' || steps.publish-event-result.outputs.guarded_open == 'true' || steps.publish-event-result.outputs.policy_noop == 'true' || steps.queue-deferred-verdict-router.outcome == 'success' || (fromJSON(steps.publication-context.outputs.decision).sourceAction == 'failed_review_shard_recovery' && steps.publish-event-result.outputs.remote_tuple_verified == 'true')) }}
+        if: ${{ steps.publication-context.outputs.claimed == 'true' && steps.publication-context.outputs.direct_lifecycle_recovery != 'true' && steps.publish-event-result.outputs.requeue_latest != 'true' && (steps.publish-event-result.outputs.terminal_closed == 'true' || steps.publish-event-result.outputs.guarded_open == 'true' || steps.publish-event-result.outputs.policy_noop == 'true' || steps.queue-deferred-verdict-router.outcome == 'success' || (fromJSON(steps.publication-context.outputs.decision).sourceAction == 'failed_review_shard_recovery' && steps.publish-event-result.outputs.remote_tuple_verified == 'true')) }}
         continue-on-error: true
         env:
           GH_TOKEN: ${{ steps.target-write-token.outputs.token }}
@@ -2287,7 +2660,7 @@ jobs:
           done <<< "$reaction_ids"
 
       - name: Release superseded or unsuccessful publisher-owned review lease
-        if: ${{ always() && steps.publication-context.outputs.claimed == 'true' && steps.publication-context.outputs.live_proceeded == 'true' && (steps.publish-event-result.outputs.completion_kind == 'superseded' || steps.publish-event-result.outcome != 'success' || (steps.publish-event-result.outputs.requeue_latest == 'true' && steps.queue-source-drift-review.outcome != 'success')) }}
+        if: ${{ always() && steps.publication-context.outputs.claimed == 'true' && steps.publication-context.outputs.direct_lifecycle_recovery != 'true' && steps.publication-context.outputs.live_proceeded == 'true' && (steps.publish-event-result.outputs.completion_kind == 'superseded' || steps.publish-event-result.outcome != 'success' || (steps.publish-event-result.outputs.requeue_latest == 'true' && steps.queue-source-drift-review.outcome != 'success')) }}
         env:
           GH_TOKEN: ${{ steps.target-write-token.outputs.token }}
           TARGET_REPO: ${{ steps.publication-context.outputs.target_repo }}
@@ -2311,7 +2684,7 @@ jobs:
 
       - name: Probe GitHub pressure after publication failure
         id: publication-pressure
-        if: ${{ always() && steps.publication-context.outputs.claimed == 'true' && failure() }}
+        if: ${{ always() && steps.publication-context.outputs.claimed == 'true' && steps.publication-context.outputs.direct_lifecycle_recovery != 'true' && failure() }}
         continue-on-error: true
         env:
           GH_TOKEN: ${{ steps.target-write-token.outputs.token }}
@@ -2354,6 +2727,11 @@ jobs:
           PUBLISH_RETRY_AT: ${{ steps.publish-event-result.outputs.retry_at }}
           ERROR_FINGERPRINT: ${{ steps.publish-event-result.outputs.error_fingerprint }}
           STATE_WRITER_JSON: ${{ steps.publish-event-result.outputs.state_writer_json }}
+          DIRECT_RECOVERY_OUTCOME: ${{ steps.replay-direct-lifecycle.outputs.outcome }}
+          DIRECT_RECOVERY_COMPLETION_KIND: ${{ steps.replay-direct-lifecycle.outputs.completion_kind }}
+          DIRECT_RECOVERY_REASON_CODE: ${{ steps.replay-direct-lifecycle.outputs.reason_code }}
+          DIRECT_RECOVERY_REQUEUE_LATEST: ${{ steps.replay-direct-lifecycle.outputs.requeue_latest }}
+          DIRECT_RECOVERY_DIRECT_REQUEUE: ${{ steps.replay-direct-lifecycle.outputs.direct_requeue }}
           REVIEW_ONLY: ${{ fromJSON(steps.publication-context.outputs.decision).sourceAction == 'failed_review_shard_recovery' && 'true' || 'false' }}
         run: |
           set -euo pipefail
@@ -2361,7 +2739,28 @@ jobs:
           completion_kind=permanent_failure
           reason_code=unknown_failure
           retry_at=
-          if [ "$PUBLISH_COMPLETION_KIND" = "superseded" ] && { [ "$PUBLISH_REASON_CODE" = "remote_newer_tuple" ] || [ "$PUBLISH_REASON_CODE" = "remote_closed" ]; }; then
+          requeue_latest="$REQUEUE_LATEST"
+          direct_requeue=false
+          if [ "$DIRECT_RECOVERY_OUTCOME" = "success" ]; then
+            case "$DIRECT_RECOVERY_COMPLETION_KIND:$DIRECT_RECOVERY_REASON_CODE" in
+              published:publication_applied|superseded:remote_newer_tuple) ;;
+              *) exit 1 ;;
+            esac
+            if [ "$DIRECT_RECOVERY_REQUEUE_LATEST" != "" ] && [ "$DIRECT_RECOVERY_REQUEUE_LATEST" != "false" ]; then
+              exit 1
+            fi
+            if [ "$DIRECT_RECOVERY_DIRECT_REQUEUE" = "true" ]; then
+              if [ "$DIRECT_RECOVERY_COMPLETION_KIND" != "published" ] || [ "$DIRECT_RECOVERY_REASON_CODE" != "publication_applied" ]; then
+                exit 1
+              fi
+              direct_requeue=true
+            elif [ "$DIRECT_RECOVERY_DIRECT_REQUEUE" != "" ] && [ "$DIRECT_RECOVERY_DIRECT_REQUEUE" != "false" ]; then
+              exit 1
+            fi
+            outcome=success
+            completion_kind="$DIRECT_RECOVERY_COMPLETION_KIND"
+            reason_code="$DIRECT_RECOVERY_REASON_CODE"
+          elif [ "$PUBLISH_COMPLETION_KIND" = "superseded" ] && { [ "$PUBLISH_REASON_CODE" = "remote_newer_tuple" ] || [ "$PUBLISH_REASON_CODE" = "remote_closed" ]; }; then
             outcome=success
             completion_kind=superseded
             reason_code="$PUBLISH_REASON_CODE"
@@ -2425,6 +2824,8 @@ jobs:
           echo "outcome=$outcome" >> "$GITHUB_OUTPUT"
           echo "completion_kind=$completion_kind" >> "$GITHUB_OUTPUT"
           echo "reason_code=$reason_code" >> "$GITHUB_OUTPUT"
+          echo "requeue_latest=$requeue_latest" >> "$GITHUB_OUTPUT"
+          echo "direct_requeue=$direct_requeue" >> "$GITHUB_OUTPUT"
           if [ -n "$ERROR_FINGERPRINT" ]; then
             echo "error_fingerprint=$ERROR_FINGERPRINT" >> "$GITHUB_OUTPUT"
           fi
@@ -2453,6 +2854,16 @@ jobs:
           ERROR_FINGERPRINT: ${{ steps.exact-review-publication-result.outputs.error_fingerprint }}
           RETRY_AT: ${{ steps.exact-review-publication-result.outputs.retry_at }}
           STATE_WRITER_JSON: ${{ steps.exact-review-publication-result.outputs.state_writer_json }}
+          PUBLISH_COMPLETION_KIND: ${{ steps.publish-event-result.outputs.completion_kind }}
+          PUBLISH_REASON_CODE: ${{ steps.publish-event-result.outputs.reason_code }}
+          TERMINAL_NOOP: ${{ steps.publish-event-result.outputs.terminal_noop }}
+          TERMINAL_MISSING: ${{ steps.publish-event-result.outputs.terminal_missing }}
+          TERMINAL_CLOSED: ${{ steps.publish-event-result.outputs.terminal_closed }}
+          GUARDED_OPEN: ${{ steps.publish-event-result.outputs.guarded_open }}
+          POLICY_NOOP: ${{ steps.publish-event-result.outputs.policy_noop }}
+          REQUEUE_LATEST: ${{ steps.publish-event-result.outputs.requeue_latest }}
+          DIRECT_LIFECYCLE_REQUEUE: ${{ steps.exact-review-publication-result.outputs.direct_requeue }}
+          LEGACY_TUPLELESS: ${{ steps.legacy-exact-artifact.outputs.legacy_tupleless }}
           QUEUE_LEASE_ID: ${{ steps.publication-context.outputs.publisher_lease_id }}
           QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
           RUN_ATTEMPT: ${{ github.run_attempt }}
@@ -2485,6 +2896,27 @@ jobs:
             const retryAt = String(process.env.RETRY_AT || "").trim();
             if (retryAt && !Number.isFinite(Date.parse(retryAt))) process.exit(1);
             if (!completionKind || !reasonCode) process.exit(1);
+            const directLifecycleRequeue = process.env.DIRECT_LIFECYCLE_REQUEUE === "true";
+            const lifecycleTerminal =
+              directLifecycleRequeue || process.env.REQUEUE_LATEST === "true"
+                ? "requeue"
+                : process.env.LEGACY_TUPLELESS === "true" || ["retryable_failure", "refresh_required"].includes(completionKind)
+                  ? "requeue"
+                  : process.env.TERMINAL_MISSING === "true"
+                    ? "target_missing"
+                    : process.env.TERMINAL_CLOSED === "true" || process.env.TERMINAL_NOOP === "true"
+                      ? "target_closed"
+                      : process.env.POLICY_NOOP === "true"
+                        ? "policy_noop"
+                        : process.env.GUARDED_OPEN === "true"
+                          ? "guarded_open"
+                          : completionKind === "superseded"
+                            ? reasonCode === "remote_closed"
+                              ? "target_closed"
+                              : "superseded"
+                            : completionKind === "permanent_failure"
+                              ? "failure"
+                            : undefined;
             let stateWriter;
             try {
               const parsed = JSON.parse(process.env.STATE_WRITER_JSON || "");
@@ -2503,6 +2935,8 @@ jobs:
               ...(errorFingerprint ? { error_fingerprint: errorFingerprint } : {}),
               ...(retryAt ? { retry_at: retryAt } : {}),
               ...(outcome === "failure" && failureKind ? { failure_kind: failureKind } : {}),
+              ...(directLifecycleRequeue ? { direct_lifecycle_requeue: true } : {}),
+              ...(lifecycleTerminal ? { lifecycle_terminal_disposition: lifecycleTerminal } : {}),
               ...(stateWriter ? { state_writer: stateWriter } : {}),
             }));
           ')"
@@ -2543,6 +2977,359 @@ jobs:
       - name: Fail unsuccessful exact review publication
         if: ${{ always() && steps.publication-context.outputs.claimed == 'true' && (steps.exact-review-publication-result.outputs.outcome != 'success' || steps.complete-exact-review-publication.outcome != 'success') }}
         run: exit 1
+  event-review-terminal-finalization:
+    name: Finalize exact-review command acknowledgement
+    if: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.queue_lease_id != '' && github.event.client_payload.source_action == 'exact_review_command_acknowledgement' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Claim committed terminal finalization
+        id: finalization-context
+        env:
+          ITEM_KEY: ${{ github.event.client_payload.queue_claim.item_key }}
+          QUEUE_LEASE_ID: ${{ github.event.client_payload.queue_lease_id }}
+          QUEUE_LEASE_REVISION: ${{ github.event.client_payload.queue_claim.lease_revision }}
+          QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          printf 'claimed=false\n' >> "$GITHUB_OUTPUT"
+          queue_url="${QUEUE_URL%/}"
+          payload="$(node -e '
+            const leaseRevision = Number(process.env.QUEUE_LEASE_REVISION);
+            const runAttempt = Number(process.env.RUN_ATTEMPT);
+            if (!process.env.QUEUE_LEASE_ID || !process.env.ITEM_KEY) process.exit(1);
+            if (!Number.isInteger(leaseRevision) || leaseRevision < 1) process.exit(1);
+            if (!Number.isInteger(runAttempt) || runAttempt < 1) process.exit(1);
+            process.stdout.write(JSON.stringify({
+              lease_id: process.env.QUEUE_LEASE_ID,
+              item_key: process.env.ITEM_KEY,
+              lease_revision: leaseRevision,
+              run_id: process.env.GITHUB_RUN_ID,
+              run_attempt: runAttempt,
+            }));
+          ')"
+          response_file="$(mktemp)"
+          error_file="$(mktemp)"
+          trap 'rm -f "$response_file" "$error_file"' EXIT
+          for attempt in 1 2 3; do
+            : > "$response_file"
+            : > "$error_file"
+            if status="$(curl --silent --show-error --connect-timeout 5 --max-time 20 \
+              --output "$response_file" --write-out '%{http_code}' \
+              --request POST --header "content-type: application/json" --data "$payload" \
+              "$queue_url/internal/exact-review/claim" 2>"$error_file")"; then
+              response="$(<"$response_file")"
+              if [ "$status" = "409" ]; then
+                conflict_reason="$(RESPONSE="$response" node <<'NODE'
+                  const response = JSON.parse(process.env.RESPONSE || "{}");
+                  const safeConflicts = new Set([
+                    "lease_not_active",
+                    "lease_already_claimed",
+                    "lease_decision_unavailable",
+                    "stale_run_attempt",
+                  ]);
+                  if (!safeConflicts.has(response.error)) process.exit(1);
+                  process.stdout.write(response.error);
+          NODE
+                )" || {
+                  echo "Unexpected terminal-finalization claim conflict: $response" >&2
+                  exit 1
+                }
+                echo "::notice::Skipping terminal finalization because lease claim lost safely: $conflict_reason"
+                exit 0
+              fi
+              if [ "$status" = "200" ]; then
+                break
+              fi
+              if [[ "$status" != 5* ]]; then
+                echo "Terminal-finalization claim returned HTTP $status: $response" >&2
+                exit 1
+              fi
+            fi
+            if [ "$attempt" = "3" ]; then
+              cat "$error_file" >&2
+              echo "Terminal-finalization claim failed after retries" >&2
+              exit 1
+            fi
+            sleep "$attempt"
+          done
+          RESPONSE="$response" node <<'NODE'
+          const fs = require("node:fs");
+          const response = JSON.parse(process.env.RESPONSE || "{}");
+          const decision = response.decision;
+          const finalization = response.terminal_finalization;
+          const lifecycleProjection = response.lifecycle_projection;
+          const leaseRevision = Number(response.lease_revision);
+          const claimGeneration = Number(response.claim_generation);
+          if (
+            response.claimed !== true || response.protocol_version !== 2 ||
+            response.item_key !== process.env.ITEM_KEY ||
+            decision?.sourceAction !== "exact_review_artifact_publish" ||
+            !finalization || !["Complete", "Failed"].includes(finalization.statusState) ||
+            typeof finalization.statusDetail !== "string" ||
+            !lifecycleProjection ||
+            lifecycleProjection.canonicalTargetKey !== `${decision.targetRepo}#${decision.itemNumber}` ||
+            typeof lifecycleProjection.fenceKey !== "string" || !lifecycleProjection.fenceKey ||
+            !Number.isInteger(lifecycleProjection.revision) || lifecycleProjection.revision < 1 ||
+            !Number.isInteger(leaseRevision) || leaseRevision < 1 ||
+            !Number.isInteger(claimGeneration) || claimGeneration < 1
+          ) process.exit(1);
+          const [targetRepoOwner, targetRepoName] = String(decision.targetRepo).split("/");
+          const values = {
+            target_repo: decision.targetRepo,
+            target_repo_owner: targetRepoOwner,
+            target_repo_name: targetRepoName,
+            item_number: decision.itemNumber,
+            status_marker: decision.commandStatusMarker || "",
+            status_comment_id: decision.statusCommentId || "",
+            item_key: response.item_key,
+            lease_revision: leaseRevision,
+            lifecycle_fence_key: lifecycleProjection.fenceKey,
+            lifecycle_revision: lifecycleProjection.revision,
+            claim_generation: claimGeneration,
+            status_state: finalization.statusState,
+            status_detail: finalization.statusDetail,
+          };
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, "claimed=true\n");
+          for (const [key, value] of Object.entries(values)) {
+            fs.appendFileSync(process.env.GITHUB_OUTPUT, `${key}=${value}\n`);
+          }
+          NODE
+
+      - uses: actions/checkout@v7
+        if: ${{ steps.finalization-context.outputs.claimed == 'true' }}
+        with:
+          filter: blob:none
+          fetch-depth: 1
+
+      - uses: ./.github/actions/setup-pnpm
+        if: ${{ steps.finalization-context.outputs.claimed == 'true' }}
+        with:
+          build-script: build:repair
+
+      - name: Create target write token
+        id: target-write-token
+        if: ${{ steps.finalization-context.outputs.claimed == 'true' }}
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ env.CLAWSWEEPER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
+          owner: ${{ steps.finalization-context.outputs.target_repo_owner }}
+          repositories: ${{ steps.finalization-context.outputs.target_repo_name }}
+          permission-issues: write
+          permission-pull-requests: write
+
+      - name: Begin fenced terminal acknowledgement
+        id: terminal-acknowledgement
+        if: ${{ steps.finalization-context.outputs.claimed == 'true' && steps.target-write-token.outcome == 'success' }}
+        env:
+          ITEM_KEY: ${{ steps.finalization-context.outputs.item_key }}
+          QUEUE_LEASE_ID: ${{ github.event.client_payload.queue_lease_id }}
+          LEASE_REVISION: ${{ steps.finalization-context.outputs.lease_revision }}
+          CLAIM_GENERATION: ${{ steps.finalization-context.outputs.claim_generation }}
+          STATUS_MARKER: ${{ steps.finalization-context.outputs.status_marker }}
+          STATUS_COMMENT_ID: ${{ steps.finalization-context.outputs.status_comment_id }}
+          QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          payload="$(node -e '
+            const leaseRevision = Number(process.env.LEASE_REVISION);
+            const claimGeneration = Number(process.env.CLAIM_GENERATION);
+            const runAttempt = Number(process.env.RUN_ATTEMPT);
+            const statusMarker = process.env.STATUS_MARKER || null;
+            const statusCommentId = process.env.STATUS_COMMENT_ID === "" ? null : Number(process.env.STATUS_COMMENT_ID);
+            if (!process.env.QUEUE_LEASE_ID || !process.env.ITEM_KEY) process.exit(1);
+            if (!Number.isInteger(leaseRevision) || leaseRevision < 1 || !Number.isInteger(claimGeneration) || claimGeneration < 1 || !Number.isInteger(runAttempt) || runAttempt < 1) process.exit(1);
+            if (!statusMarker && statusCommentId === null) process.exit(1);
+            process.stdout.write(JSON.stringify({
+              lease_id: process.env.QUEUE_LEASE_ID, item_key: process.env.ITEM_KEY,
+              lease_revision: leaseRevision, claim_generation: claimGeneration,
+              run_id: process.env.GITHUB_RUN_ID, run_attempt: runAttempt,
+              ...(statusMarker ? { status_marker: statusMarker } : {}),
+              ...(statusCommentId === null ? {} : { status_comment_id: statusCommentId }),
+            }));
+          ')"
+          response="$(curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
+            --request POST --header "content-type: application/json" --data "$payload" \
+            "${QUEUE_URL%/}/internal/exact-review/terminal-finalization/attempt")"
+          jq -e '.ok == true' <<< "$response" >/dev/null
+          echo "allowed=$(jq -r '.allowed == true' <<< "$response")" >> "$GITHUB_OUTPUT"
+          echo "acknowledgement_state=$(jq -r '.acknowledgement_state // empty' <<< "$response")" >> "$GITHUB_OUTPUT"
+          echo "attempt_id=$(jq -r '.attempt_id // empty' <<< "$response")" >> "$GITHUB_OUTPUT"
+
+      - name: Update final command status once
+        id: update-final-command-status
+        if: ${{ steps.terminal-acknowledgement.outputs.allowed == 'true' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.target-write-token.outputs.token }}
+          TARGET_REPO: ${{ steps.finalization-context.outputs.target_repo }}
+          ITEM_NUMBER: ${{ steps.finalization-context.outputs.item_number }}
+          COMMAND_STATUS_MARKER: ${{ steps.finalization-context.outputs.status_marker }}
+          STATUS_COMMENT_ID: ${{ steps.finalization-context.outputs.status_comment_id }}
+          STATUS_STATE: ${{ steps.finalization-context.outputs.status_state }}
+          STATUS_DETAIL: ${{ steps.finalization-context.outputs.status_detail }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          FENCE_KEY: ${{ steps.finalization-context.outputs.lifecycle_fence_key }}
+          REVISION: ${{ steps.finalization-context.outputs.lifecycle_revision }}
+          ATTEMPT_ID: ${{ steps.terminal-acknowledgement.outputs.attempt_id }}
+          QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
+          CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
+        run: |
+          set -euo pipefail
+          pnpm run repair:update-command-status -- \
+            --repo "$TARGET_REPO" --item-number "$ITEM_NUMBER" \
+            --marker "$COMMAND_STATUS_MARKER" --status-comment-id "$STATUS_COMMENT_ID" \
+            --state "$STATUS_STATE" --detail "$STATUS_DETAIL" --run-url "$RUN_URL" \
+            --require-mutation --locked-conversation-terminal-skip --verify-terminal-status-receipt || {
+              update_status="$?"
+              failure_payload="$(node -e '
+                const revision = Number(process.env.REVISION);
+                if (!process.env.FENCE_KEY || !process.env.ATTEMPT_ID || !Number.isInteger(revision) || revision < 1) process.exit(1);
+                process.stdout.write(JSON.stringify({
+                  canonical_target_key: `${process.env.TARGET_REPO}#${process.env.ITEM_NUMBER}`,
+                  fence_key: process.env.FENCE_KEY, revision, attempt_id: process.env.ATTEMPT_ID,
+                  ...(process.env.COMMAND_STATUS_MARKER ? { status_marker: process.env.COMMAND_STATUS_MARKER } : {}),
+                  ...(process.env.STATUS_COMMENT_ID ? { status_comment_id: Number(process.env.STATUS_COMMENT_ID) } : {}),
+                }));
+              ')"
+              signature="$(PAYLOAD="$failure_payload" node -e 'const crypto=require("node:crypto"); process.stdout.write(`sha256=${crypto.createHmac("sha256", process.env.CLAWSWEEPER_WEBHOOK_SECRET).update(process.env.PAYLOAD).digest("hex")}`)')"
+              curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
+                --request POST --header "content-type: application/json" \
+                --header "x-clawsweeper-exact-review-signature: $signature" \
+                --data "$failure_payload" \
+                "${QUEUE_URL%/}/internal/exact-review/lifecycle/command-ack/failed" >/dev/null
+              exit "$update_status"
+            }
+
+      - name: Record verified terminal acknowledgement receipt
+        id: observe-verified-terminal-acknowledgement
+        if: ${{ always() && steps.finalization-context.outputs.claimed == 'true' && steps.terminal-acknowledgement.outputs.allowed == 'true' && steps.update-final-command-status.outcome == 'success' && steps.update-final-command-status.outputs.terminal_status_verified == 'true' }}
+        env:
+          TARGET_REPO: ${{ steps.finalization-context.outputs.target_repo }}
+          ITEM_NUMBER: ${{ steps.finalization-context.outputs.item_number }}
+          STATUS_MARKER: ${{ steps.finalization-context.outputs.status_marker }}
+          STATUS_COMMENT_ID: ${{ steps.finalization-context.outputs.status_comment_id }}
+          COMMAND_COMMENT_ID: ${{ steps.update-final-command-status.outputs.command_comment_id }}
+          COMPLETION_COMMENT_ID: ${{ steps.update-final-command-status.outputs.completion_comment_id }}
+          QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
+          CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
+        run: |
+          set -euo pipefail
+          payload="$(node -e '
+            const statusMarker = process.env.STATUS_MARKER || null;
+            const statusCommentId = process.env.STATUS_COMMENT_ID === "" ? null : Number(process.env.STATUS_COMMENT_ID);
+            const commandCommentId = Number(process.env.COMMAND_COMMENT_ID);
+            const completionCommentId = Number(process.env.COMPLETION_COMMENT_ID);
+            if (
+              (!statusMarker && statusCommentId === null) ||
+              (statusCommentId !== null && (!Number.isInteger(statusCommentId) || statusCommentId < 1)) ||
+              !Number.isInteger(commandCommentId) || commandCommentId < 1 ||
+              !Number.isInteger(completionCommentId) || completionCommentId < 1
+            ) process.exit(1);
+            process.stdout.write(JSON.stringify({
+              canonical_target_key: `${process.env.TARGET_REPO}#${process.env.ITEM_NUMBER}`,
+              ...(statusMarker ? { status_marker: statusMarker } : {}),
+              command_comment_id: commandCommentId,
+              completion_comment_id: completionCommentId,
+              observed_at: Date.now(),
+            }));
+          ')"
+          signature="$(PAYLOAD="$payload" node -e 'const crypto=require("node:crypto"); process.stdout.write(`sha256=${crypto.createHmac("sha256", process.env.CLAWSWEEPER_WEBHOOK_SECRET).update(process.env.PAYLOAD).digest("hex")}`)')"
+          response="$(curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
+            --request POST --header "content-type: application/json" \
+            --header "x-clawsweeper-exact-review-signature: $signature" \
+            --data "$payload" \
+            "${QUEUE_URL%/}/internal/exact-review/lifecycle/command-ack/observed")"
+          jq -e '.ok == true and .accepted == true and .acknowledgement_state == "observed"' <<< "$response" >/dev/null
+
+      - name: Complete locked terminal acknowledgement skip
+        id: complete-locked-terminal-acknowledgement
+        if: ${{ always() && steps.finalization-context.outputs.claimed == 'true' && steps.update-final-command-status.outputs.locked_conversation == 'true' }}
+        env:
+          ITEM_KEY: ${{ steps.finalization-context.outputs.item_key }}
+          QUEUE_LEASE_ID: ${{ github.event.client_payload.queue_lease_id }}
+          LEASE_REVISION: ${{ steps.finalization-context.outputs.lease_revision }}
+          CLAIM_GENERATION: ${{ steps.finalization-context.outputs.claim_generation }}
+          STATUS_MARKER: ${{ steps.finalization-context.outputs.status_marker }}
+          STATUS_COMMENT_ID: ${{ steps.finalization-context.outputs.status_comment_id }}
+          ATTEMPT_ID: ${{ steps.terminal-acknowledgement.outputs.attempt_id }}
+          QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          payload="$(node -e '
+            const leaseRevision = Number(process.env.LEASE_REVISION);
+            const claimGeneration = Number(process.env.CLAIM_GENERATION);
+            const runAttempt = Number(process.env.RUN_ATTEMPT);
+            const statusMarker = process.env.STATUS_MARKER || null;
+            const statusCommentId = process.env.STATUS_COMMENT_ID === "" ? null : Number(process.env.STATUS_COMMENT_ID);
+            if (!process.env.QUEUE_LEASE_ID || !process.env.ITEM_KEY || !process.env.ATTEMPT_ID) process.exit(1);
+            if (!Number.isInteger(leaseRevision) || leaseRevision < 1 || !Number.isInteger(claimGeneration) || claimGeneration < 1 || !Number.isInteger(runAttempt) || runAttempt < 1) process.exit(1);
+            if (!statusMarker && statusCommentId === null) process.exit(1);
+            process.stdout.write(JSON.stringify({
+              lease_id: process.env.QUEUE_LEASE_ID, item_key: process.env.ITEM_KEY,
+              lease_revision: leaseRevision, claim_generation: claimGeneration,
+              run_id: process.env.GITHUB_RUN_ID, run_attempt: runAttempt,
+              attempt_id: process.env.ATTEMPT_ID, reason: "locked_conversation",
+              ...(statusMarker ? { status_marker: statusMarker } : {}),
+              ...(statusCommentId === null ? {} : { status_comment_id: statusCommentId }),
+            }));
+          ')"
+          response="$(curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
+            --request POST --header "content-type: application/json" --data "$payload" \
+            "${QUEUE_URL%/}/internal/exact-review/terminal-finalization/skip")"
+          jq -e '.ok == true and .completed == true and .acknowledgement_state == "skipped_locked"' <<< "$response" >/dev/null
+
+      - name: Requeue unobserved terminal acknowledgement
+        if: ${{ always() && steps.finalization-context.outputs.claimed == 'true' && steps.observe-verified-terminal-acknowledgement.outcome != 'success' && !(steps.update-final-command-status.outputs.locked_conversation == 'true' && steps.complete-locked-terminal-acknowledgement.outcome == 'success') }}
+        env:
+          ITEM_KEY: ${{ steps.finalization-context.outputs.item_key }}
+          QUEUE_LEASE_ID: ${{ github.event.client_payload.queue_lease_id }}
+          LEASE_REVISION: ${{ steps.finalization-context.outputs.lease_revision }}
+          CLAIM_GENERATION: ${{ steps.finalization-context.outputs.claim_generation }}
+          QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          payload="$(node -e '
+            const leaseRevision = Number(process.env.LEASE_REVISION);
+            const claimGeneration = Number(process.env.CLAIM_GENERATION);
+            const runAttempt = Number(process.env.RUN_ATTEMPT);
+            if (!process.env.QUEUE_LEASE_ID || !process.env.ITEM_KEY || !Number.isInteger(leaseRevision) || leaseRevision < 1 || !Number.isInteger(claimGeneration) || claimGeneration < 1 || !Number.isInteger(runAttempt) || runAttempt < 1) process.exit(1);
+            process.stdout.write(JSON.stringify({
+              lease_id: process.env.QUEUE_LEASE_ID, item_key: process.env.ITEM_KEY,
+              lease_revision: leaseRevision, claim_generation: claimGeneration,
+              run_id: process.env.GITHUB_RUN_ID, run_attempt: runAttempt,
+            }));
+          ')"
+          response_file="$(mktemp)"
+          trap 'rm -f "$response_file"' EXIT
+          response_status="$(curl --silent --show-error --connect-timeout 5 --max-time 20 \
+            --write-out '%{http_code}' --output "$response_file" \
+            --request POST --header "content-type: application/json" --data "$payload" \
+            "${QUEUE_URL%/}/internal/exact-review/terminal-finalization/retry")"
+          if [ "$response_status" = "409" ]; then
+            # A GitHub acknowledgement webhook can observe and consume the
+            # terminal driver between the status mutation and this retry.
+            # The old fenced lease must not make that successful handoff fail.
+            jq -e '.error == "lease_not_active"' "$response_file" >/dev/null
+            exit 0
+          fi
+          test "$response_status" = "200"
+          jq -e '.ok == true and (.requeued == true or .completed == true)' "$response_file" >/dev/null
+
+      - name: Fail failed terminal acknowledgement
+        if: ${{ steps.update-final-command-status.outcome == 'failure' || steps.complete-locked-terminal-acknowledgement.outcome == 'failure' || steps.terminal-acknowledgement.outcome == 'failure' || steps.target-write-token.outcome == 'failure' }}
+        run: exit 1
+
   target-fanout:
     name: Fan out target repository sweeps
     if: ${{ github.event_name == 'schedule' && (github.event.schedule == '4/5 * * * *' || github.event.schedule == '41/10 * * * *' || github.event.schedule == '37 */6 * * *') }}

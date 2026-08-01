@@ -18,6 +18,7 @@ import {
 } from "./exact-review-publication-batches.ts";
 import {
   CanonicalRecordTupleConflictError,
+  DIRECT_PUBLICATION_LIFECYCLE_KINDS,
   EXACT_REVIEW_DIRECT_PUBLICATION_MAX_POST_BYTES,
   REVIEW_COVERAGE_INVENTORY_KEY,
   ExactReviewDirectPublicationStore,
@@ -29,6 +30,7 @@ import {
   validateRecordSection,
   validateRepoSlug,
   validateTupleRecordSection,
+  type DirectPublicationLifecyclePlan,
   type DirectPublicationPlan,
   type CanonicalRecordTupleMutation,
   type CanonicalCommitRecordInput,
@@ -58,6 +60,14 @@ import {
   SnapshotStoreUnavailableError,
   type RecordSnapshot,
 } from "./record-snapshots.ts";
+import {
+  commandAcknowledgementState,
+  EXACT_REVIEW_ACKNOWLEDGEMENT_ATTEMPT_LEASE_MS,
+  ExactReviewLifecycleProjectionStore,
+  lifecycleState,
+  type ExactReviewLifecycleProjection,
+  type LifecycleTerminalDisposition,
+} from "./exact-review-lifecycle.ts";
 import { sanitizedServerError } from "./error-safety.ts";
 
 type GithubAppJsonOptions = { method?: string; body?: BodyInit; errorLabel?: string };
@@ -70,10 +80,6 @@ const EXACT_REVIEW_ARTIFACT_RETENTION_RECOVERY_SOURCE_ACTION = "artifact_retenti
 const EXACT_REVIEW_SOURCE_DRIFT_REQUEUE_SOURCE_ACTION = "source_drift_requeue";
 const EXACT_REVIEW_SCHEDULED_HOT_SOURCE_ACTION = "scheduled_hot_intake";
 const EXACT_REVIEW_SCHEDULED_NORMAL_SOURCE_ACTION = "scheduled_normal_backfill";
-// Direct publication synthesizes its receipt inside the Durable Object and does
-// not have a state-batch artifact source SHA. Keep that path out of the
-// historical state-batch reconciliation below.
-const EXACT_REVIEW_DIRECT_PUBLICATION_SOURCE_SHA = "0".repeat(40);
 const EXACT_REVIEW_LOW_PRIORITY_SOURCE_ACTIONS = new Set([
   FAILED_REVIEW_SHARD_RECOVERY_SOURCE_ACTION,
   EXACT_REVIEW_ARTIFACT_RETENTION_RECOVERY_SOURCE_ACTION,
@@ -115,6 +121,10 @@ export type ExactReviewPublication = {
   liveTerminalMissing: boolean;
   liveGuardedOpen: boolean;
   producerDecision: ExactReviewBaseDecision;
+  directLifecycle?: {
+    plan: DirectPublicationLifecyclePlan;
+    receiptOutcome: "accepted" | "deduped" | "superseded";
+  };
 };
 export type ExactReviewDecision = ExactReviewBaseDecision & {
   publication?: ExactReviewPublication;
@@ -134,9 +144,25 @@ type ExactReviewParkedReason =
   | "dispatch_rejected"
   | "review_retry_exhausted"
   | "direct_publication";
+type ExactReviewLifecycleProjectionIdentity = {
+  canonicalTargetKey: string;
+  fenceKey: string;
+  revision: number;
+};
+type ExactReviewTerminalFinalization = {
+  disposition: Exclude<LifecycleTerminalDisposition, "requeue">;
+  statusState: "Complete" | "Failed";
+  statusDetail: string;
+  /**
+   * A concurrent successor can replace the mutable queue item before this
+   * acknowledgement runs. Retain the original immutable lifecycle tuple.
+   */
+  projection?: ExactReviewLifecycleProjectionIdentity;
+};
 export type ExactReviewQueueItem = {
   key: string;
   decision: ExactReviewDecision;
+  admissionDeliveryId?: string;
   ingressFingerprint?: string;
   leaseDecision?: ExactReviewDecision;
   sourceAuthorityWatermark?: { sequence: number; updatedAt?: string };
@@ -169,6 +195,11 @@ export type ExactReviewQueueItem = {
   firstFailureAt?: number;
   publicationFailureAttempts?: number;
   reviewFailureAttempts?: number;
+  /**
+   * A terminal outcome already committed for this revision. This retains only
+   * the status acknowledgement retry driver; it never re-enters publication.
+   */
+  terminalFinalization?: ExactReviewTerminalFinalization;
 };
 export type ExactReviewCompletionOutcome = "success" | "failure" | "cancelled";
 type ExactReviewPublicationFailureKind = "github_rate_limit" | "github_transient";
@@ -531,6 +562,7 @@ export class ExactReviewQueue {
   private directPublicationStore;
   private recordSnapshotStore;
   private stateWriterCoordinator;
+  private lifecycleProjectionStore;
   private readonly baselines = new WeakMap<ExactReviewQueueState, ExactReviewQueueBaseline>();
   private reviewCoverageCache: { at: number; summary: ReviewCoverageSummary } | null = null;
 
@@ -545,6 +577,7 @@ export class ExactReviewQueue {
       env.STATE_SNAPSHOTS,
     );
     this.stateWriterCoordinator = new StateWriterCoordinator(this.storage);
+    this.lifecycleProjectionStore = new ExactReviewLifecycleProjectionStore(this.storage);
     const initialize = () => this.initializeStorage();
     this.ready =
       typeof state.blockConcurrencyWhile === "function"
@@ -855,6 +888,7 @@ export class ExactReviewQueue {
         if (incomingPublicationRevision) {
           const incomingLineage = exactReviewPublicationLineage(decision);
           const matching = Object.values(state.items)
+            .filter((item) => !item.terminalFinalization)
             .map((item) => ({
               item,
               revision: exactReviewPublicationRevision(item.decision),
@@ -1014,6 +1048,8 @@ export class ExactReviewQueue {
               ({ item, revision }) =>
                 revision.sourceRevision < incomingPublicationRevision.sourceRevision &&
                 (item.state === "pending" || item.state === "parked") &&
+                (!item.terminalFinalization ||
+                  exactReviewTerminalFinalizationSharesCommandStatus(item, decision)) &&
                 !activeBatchItemKeys.has(item.key),
             )
             .sort((left, right) => left.item.key.localeCompare(right.item.key))
@@ -1043,6 +1079,31 @@ export class ExactReviewQueue {
           // Ordinary source events retain normal replacement behavior, including the
           // command-context merge for pending items.
           if (!ignoredRecovery) {
+            const pendingTerminalFinalizer =
+              Boolean(current.terminalFinalization) &&
+              (current.state === "pending" || current.state === "parked");
+            if (pendingTerminalFinalizer) {
+              const identity = exactReviewTerminalFinalizationProjection(current, current.revision);
+              const projection = this.lifecycleProjectionStore.read(
+                identity.canonicalTargetKey,
+                identity.fenceKey,
+                identity.revision,
+              );
+              this.ensureTerminalFinalizationDriver({
+                state,
+                item: current,
+                sourceDecision: current.leaseDecision ?? current.decision,
+                projection,
+                terminalFinalization: current.terminalFinalization,
+                now,
+              });
+              // A terminal acknowledgement is not review work. Once its
+              // immutable driver is retained separately (or the projection
+              // says acknowledgement is no longer required), this canonical
+              // key may safely accept the successor without inheriting the
+              // old publication or command marker.
+              current.terminalFinalization = undefined;
+            }
             const nextRevision = Math.max(
               current.revision + 1,
               this.nextExactReviewItemRevisionSync(key),
@@ -1059,6 +1120,8 @@ export class ExactReviewQueue {
             const queuesCommandFollowUp =
               bindsCommandToCurrentAuthority &&
               (current.state === "dispatching" || current.state === "leased");
+            const followUpLeaseDecision = queuesCommandFollowUp ? current.leaseDecision : undefined;
+            const followUpLeaseRevision = queuesCommandFollowUp ? current.leaseRevision : undefined;
             const attemptsReviewSupersession =
               !exactReviewQueueIsPublication(current) &&
               decision.itemKind === "pull_request" &&
@@ -1104,12 +1167,22 @@ export class ExactReviewQueue {
               current.parkedReason = undefined;
             }
             const mergeable = current.state === "pending" || current.state === "parked";
+            // A command that follows an active direct-publication lease starts a
+            // new review revision. Keep that old receipt only in leaseDecision:
+            // carrying publication/directLifecycle into the successor would make
+            // the successor look like it owns the old fenced finalization.
+            const followUpMergeBase =
+              (queuesCommandFollowUp || pendingTerminalFinalizer) &&
+              exactReviewQueueIsPublication(current)
+                ? (current.decision.publication?.producerDecision ?? current.decision)
+                : current.decision;
             current.decision = supersedesActiveReview
               ? decision
               : mergeable || queuesCommandFollowUp
-                ? mergePendingExactReviewDecision(current.decision, decision)
+                ? mergePendingExactReviewDecision(followUpMergeBase, decision)
                 : decision;
             current.revision = nextRevision;
+            current.admissionDeliveryId = deliveryId;
             current.updatedAt = now;
             // Immediacy must come from the merged decision: a pending explicit command
             // keeps its command marker through the merge, and a later plain webhook
@@ -1138,6 +1211,20 @@ export class ExactReviewQueue {
               current.lastFailureReason = undefined;
             }
             advanceExactReviewSourceAuthorityWatermark(current, decision);
+            if (followUpLeaseDecision && Number.isSafeInteger(followUpLeaseRevision)) {
+              const projection = this.lifecycleProjectionStore.read(
+                `${followUpLeaseDecision.targetRepo}#${followUpLeaseDecision.itemNumber}`,
+                key,
+                followUpLeaseRevision,
+              );
+              if (projection) {
+                this.ensureLifecycleTerminalFinalizationDriver({
+                  state,
+                  projection,
+                  now,
+                });
+              }
+            }
             ingressAdmitted = true;
           }
         } else {
@@ -1172,6 +1259,7 @@ export class ExactReviewQueue {
           state.items[key] = {
             key,
             decision,
+            admissionDeliveryId: deliveryId,
             ...(ingress ? { ingressFingerprint: ingress.fingerprint } : {}),
             state: "pending",
             revision: this.nextExactReviewItemRevisionSync(key),
@@ -1361,6 +1449,7 @@ export class ExactReviewQueue {
           item.leaseExpiresAt = now + exactReviewExecutionLeaseMs(this.env);
           item.updatedAt = now;
           await this.writeState(state);
+          this.recordLifecycleClaim(item, now);
           await this.scheduleNext(state, now);
           return json(exactReviewClaimResponse(item, claimProtocolVersion, claimGeneration));
         }
@@ -1380,6 +1469,7 @@ export class ExactReviewQueue {
           item.claimProtocolVersion = claimProtocolVersion;
           await this.writeState(state);
         }
+        this.recordLifecycleClaim(item, now);
         return json(exactReviewClaimResponse(item, claimProtocolVersion, claimGeneration));
       }
 
@@ -1393,6 +1483,7 @@ export class ExactReviewQueue {
       item.claimedAt = now;
       item.updatedAt = now;
       await this.writeState(state);
+      this.recordLifecycleClaim(item, now);
       await this.scheduleNext(state, now);
       return json(exactReviewClaimResponse(item, claimProtocolVersion, item.claimGeneration));
     }
@@ -1556,6 +1647,20 @@ export class ExactReviewQueue {
       if (body.requeue_latest !== undefined && typeof body.requeue_latest !== "boolean") {
         return json({ error: "invalid_requeue_latest" }, 400);
       }
+      const directLifecycleRequeue = body.direct_lifecycle_requeue === true;
+      if (
+        body.direct_lifecycle_requeue !== undefined &&
+        typeof body.direct_lifecycle_requeue !== "boolean"
+      ) {
+        return json({ error: "invalid_direct_lifecycle_requeue" }, 400);
+      }
+      const lifecycleTerminal =
+        body.lifecycle_terminal_disposition === undefined
+          ? undefined
+          : exactReviewLifecycleTerminalDisposition(body.lifecycle_terminal_disposition);
+      if (body.lifecycle_terminal_disposition !== undefined && !lifecycleTerminal) {
+        return json({ error: "invalid_lifecycle_terminal_disposition" }, 400);
+      }
       if (requeueLatest && outcome !== "success") {
         return json({ error: "invalid_requeue_latest_outcome" }, 400);
       }
@@ -1616,8 +1721,29 @@ export class ExactReviewQueue {
       if (failureKind && !publicationItem) {
         return json({ error: "failure_kind_outside_publication" }, 400);
       }
-      if (publicationCompletion && !publicationItem) {
+      const leasedDirectLifecycle = item.leaseDecision?.publication?.directLifecycle;
+      const directLifecycleLeasePublication =
+        item.leaseDecision?.sourceAction === EXACT_REVIEW_ARTIFACT_PUBLISH_SOURCE_ACTION &&
+        Boolean(leasedDirectLifecycle);
+      // A non-superseding command may replace the current decision while this
+      // old lease is still publishing. Its saved direct plan, not the newer
+      // decision, establishes that this completion owns the old revision.
+      const directLifecyclePublicationCompletion =
+        directLifecycleLeasePublication &&
+        outcome === "success" &&
+        (publicationCompletion?.kind === "published" ||
+          publicationCompletion?.kind === "superseded");
+      const exactDirectLifecycleRequeue =
+        directLifecyclePublicationCompletion &&
+        leasedDirectLifecycle?.plan.kind === "requeue" &&
+        publicationCompletion?.kind === "published";
+      const publicationCompletionOwnedByLease =
+        publicationItem || directLifecyclePublicationCompletion;
+      if (publicationCompletion && !publicationCompletionOwnedByLease) {
         return json({ error: "completion_kind_outside_publication" }, 400);
+      }
+      if (directLifecycleRequeue && (!exactDirectLifecycleRequeue || requeueLatest)) {
+        return json({ error: "invalid_direct_lifecycle_requeue" }, 400);
       }
       const publicationControl = this.publicationControlSync();
       const publicationDesiredCapacity = publicationItem
@@ -1640,13 +1766,47 @@ export class ExactReviewQueue {
       // The workflow reports success only after every primary review mutation has settled.
       // Complete that revision now so a later auxiliary-step failure cannot make the
       // workflow_run reconciler requeue review work that already succeeded.
-      const completionResult =
-        publicationItem && publicationCompletion
+      const lifecycleItem =
+        directLifecyclePublicationCompletion || directLifecycleRequeue
+          ? {
+              ...item,
+              // The final completion belongs to the original direct receipt. A
+              // non-superseding ingress may already have installed a newer
+              // follow-up decision on this same queue key.
+              decision: item.leaseDecision ?? item.decision,
+              leaseDecision: item.leaseDecision,
+            }
+          : item;
+      const lifecycleRevision =
+        tupleCompletion || directLifecycleRequeue
+          ? leaseRevision
+          : (item.leaseRevision ?? item.revision);
+      const lifecycleClaimGeneration =
+        tupleCompletion || directLifecycleRequeue
+          ? claimGeneration
+          : exactReviewClaimGeneration(item.claimGeneration);
+      const completionResult = directLifecycleRequeue
+        ? item.revision > leaseRevision
+          ? finishExactReviewPublicationQueueItem({
+              state,
+              item,
+              now,
+              completion: publicationCompletion!,
+              ownedRevision: leaseRevision,
+              requestedRetryAt: requestedRetryAt ?? undefined,
+              deadLetterCapacityAvailable: this.deadLetterCapacityAvailableSync(
+                exactReviewDeadLetterId(item),
+              ),
+              env: this.env,
+            })
+          : this.requeueDirectLifecyclePublicationSync(state, item, now)
+        : publicationCompletionOwnedByLease && publicationCompletion
           ? finishExactReviewPublicationQueueItem({
               state,
               item,
               now,
               completion: publicationCompletion,
+              ...(directLifecyclePublicationCompletion ? { ownedRevision: leaseRevision } : {}),
               requestedRetryAt: requestedRetryAt ?? undefined,
               requeueLatest,
               deadLetterCapacityAvailable: this.deadLetterCapacityAvailableSync(
@@ -1667,6 +1827,70 @@ export class ExactReviewQueue {
               refreshed: false,
               deadLetter: undefined,
             };
+      // A newer command revision may retain the current queue slot while this
+      // direct receipt completes. Its queue requeue is not a requeue fact for
+      // the older fenced lifecycle projection.
+      const lifecycleRequeued =
+        directLifecyclePublicationCompletion &&
+        !directLifecycleRequeue &&
+        item.revision > leaseRevision
+          ? false
+          : completionResult.requeued;
+      const lifecycleIdentity: ExactReviewLifecycleProjectionIdentity = {
+        canonicalTargetKey: `${lifecycleItem.decision.targetRepo}#${lifecycleItem.decision.itemNumber}`,
+        fenceKey: lifecycleItem.key,
+        revision: lifecycleRevision,
+      };
+      const projectionBeforeTerminalCommit = this.lifecycleProjectionStore.read(
+        lifecycleIdentity.canonicalTargetKey,
+        lifecycleIdentity.fenceKey,
+        lifecycleIdentity.revision,
+      );
+      const terminalDisposition =
+        exactReviewLifecycleCompletionDisposition({
+          projection: projectionBeforeTerminalCommit,
+          outcome,
+          publicationCompletion,
+          requeued: lifecycleRequeued,
+          parked: Boolean(completionResult.parked),
+          deadLetter: Boolean(completionResult.deadLetter),
+          lifecycleTerminal,
+        }) ??
+        projectionBeforeTerminalCommit?.terminalDisposition?.kind ??
+        null;
+      const terminalFinalization =
+        publicationCompletionOwnedByLease &&
+        !lifecycleRequeued &&
+        !completionResult.parked &&
+        exactReviewQueueHasCommandContext(lifecycleItem) &&
+        terminalDisposition &&
+        terminalDisposition !== "requeue"
+          ? exactReviewTerminalFinalization(terminalDisposition, lifecycleIdentity)
+          : null;
+      const projectionTerminalFinalization =
+        terminalFinalization && projectionBeforeTerminalCommit ? terminalFinalization : null;
+      if (projectionTerminalFinalization) {
+        if (!projectionBeforeTerminalCommit) {
+          throw new Error("missing lifecycle projection for terminal finalization");
+        }
+        this.ensureLifecycleTerminalFinalizationDriver({
+          state,
+          projection: projectionBeforeTerminalCommit,
+          terminalDisposition: projectionTerminalFinalization.disposition,
+          now,
+        });
+      } else if (terminalFinalization) {
+        // Persist the terminal decision's acknowledgement driver in the same
+        // queue transition that consumed the publishing lease. The next run is
+        // a finalizer-only dispatch, so retries cannot publish the review again.
+        state.items[item.key] = item;
+        clearExactReviewLease(item);
+        item.state = "pending";
+        item.terminalFinalization = terminalFinalization;
+        item.nextAttemptAt = now;
+        item.backoffReason = undefined;
+        item.updatedAt = now;
+      }
       const { requeued } = completionResult;
       // A successful workflow can still request requeue_latest after source
       // drift. That work did not leave its lane, so it must not improve the
@@ -1709,8 +1933,36 @@ export class ExactReviewQueue {
           : undefined,
         completionResult.deadLetter,
       );
+      this.recordLifecycleCompletion({
+        item: lifecycleItem,
+        revision: lifecycleRevision,
+        claimGeneration: lifecycleClaimGeneration,
+        runId,
+        runAttempt,
+        outcome,
+        publicationCompletion,
+        requeued: lifecycleRequeued,
+        parked: Boolean(completionResult.parked),
+        deadLetter: Boolean(completionResult.deadLetter),
+        lifecycleTerminal,
+        now,
+      });
+      const projectionAfterCompletion = this.lifecycleProjectionStore.read(
+        lifecycleIdentity.canonicalTargetKey,
+        lifecycleIdentity.fenceKey,
+        lifecycleIdentity.revision,
+      );
+      if (projectionAfterCompletion?.terminalDisposition?.kind === "requeue") {
+        if (this.cancelTerminalFinalizationDrivers(state, lifecycleIdentity)) {
+          await this.writeState(state);
+        }
+      }
       await this.scheduleNext(state, now);
-      return json({ ok: true, requeued });
+      return json({
+        ok: true,
+        requeued,
+        ...(terminalFinalization ? { terminal_finalization: true } : {}),
+      });
     }
 
     if (request.method === "POST" && url.pathname === "/state-writer-progress") {
@@ -2216,8 +2468,15 @@ export class ExactReviewQueue {
             409,
           );
         }
+        if (!deferredBatchCompletion && !validated.sourceSha) {
+          return json(
+            { error: "direct_publication_source_sha_required", fallback_required: true },
+            400,
+          );
+        }
         const accepted = this.directPublicationStore.accept(validated, now);
-        if (owned && validFence && !deferredBatchCompletion) {
+        this.recordLifecycleDirectPublication({ validated, owned, accepted, now });
+        if (owned && validFence && !deferredBatchCompletion && !owned.decision.publication) {
           const producerDecision = owned.decision.publication
             ? owned.decision.publication.producerDecision
             : (owned.leaseDecision ?? owned.decision);
@@ -2230,11 +2489,14 @@ export class ExactReviewQueue {
           ) {
             throw new Error("direct publication source run identity is unavailable");
           }
+          if (!validated.sourceSha) {
+            throw new Error("direct publication source SHA is unavailable");
+          }
           const publication: ExactReviewPublication = {
             artifactName: `exact-review-${producerRunId}-${producerRunAttempt}`,
             producerRunId,
             producerRunAttempt,
-            sourceSha: EXACT_REVIEW_DIRECT_PUBLICATION_SOURCE_SHA,
+            sourceSha: validated.sourceSha,
             itemKey: validated.fenceKey,
             protocolVersion: 2,
             leaseRevision: validated.revision,
@@ -2244,6 +2506,14 @@ export class ExactReviewQueue {
             liveTerminalMissing: false,
             liveGuardedOpen: false,
             producerDecision,
+            ...(accepted.row.lifecycle
+              ? {
+                  directLifecycle: {
+                    plan: accepted.row.lifecycle,
+                    receiptOutcome: accepted.outcome,
+                  },
+                }
+              : {}),
           };
           const publicationDecision: ExactReviewDecision = {
             ...producerDecision,
@@ -2253,31 +2523,13 @@ export class ExactReviewQueue {
           };
           owned.decision = publicationDecision;
           owned.leaseDecision = publicationDecision;
-          const completionKind =
-            accepted.outcome === "superseded" ? ("superseded" as const) : ("published" as const);
-          const terminal = finishExactReviewPublicationQueueItem({
-            state,
-            item: owned,
-            now,
-            completion: {
-              kind: completionKind,
-              reasonCode:
-                completionKind === "published" ? "publication_applied" : "remote_newer_tuple",
-            },
-            ownedRevision: validated.revision,
-            deadLetterCapacityAvailable: true,
-            env: this.env,
-          });
+          // The canonical record is durable, but its router handoff and guarded
+          // command-status edit are separate lifecycle post-effects. Keep this
+          // converted publication lease recoverable until that finalizer reports
+          // a structured publication completion.
           await this.writeState(state, {
             reviewCompleted: 1,
             publicationEnqueued: 1,
-            ...(!terminal.requeued && !terminal.parked ? { publicationCompleted: 1 } : {}),
-            ...(completionKind === "published" && !terminal.requeued
-              ? { publicationPublished: 1 }
-              : {}),
-            ...(completionKind === "superseded" && !terminal.requeued
-              ? { publicationSuperseded: 1 }
-              : {}),
           });
         }
         await this.scheduleNext(this.readStateSync(), Date.now());
@@ -2304,6 +2556,42 @@ export class ExactReviewQueue {
           400,
         );
       }
+    }
+
+    if (request.method === "POST" && url.pathname === "/lifecycle/canonical-receipt") {
+      return this.recordLifecycleCanonicalReceipt(await request.json().catch(() => null));
+    }
+
+    if (request.method === "POST" && url.pathname === "/lifecycle/router-receipt") {
+      return this.recordLifecycleRouterReceipt(await request.json().catch(() => null));
+    }
+
+    if (request.method === "POST" && url.pathname === "/lifecycle/terminal-disposition") {
+      return this.recordLifecycleTerminalDisposition(await request.json().catch(() => null));
+    }
+
+    if (request.method === "POST" && url.pathname === "/lifecycle/command-ack/attempt") {
+      return this.authorizeLifecycleCommandAcknowledgement(await request.json().catch(() => null));
+    }
+
+    if (request.method === "POST" && url.pathname === "/terminal-finalization/attempt") {
+      return this.beginTerminalFinalizationAcknowledgement(await request.json().catch(() => null));
+    }
+
+    if (request.method === "POST" && url.pathname === "/terminal-finalization/retry") {
+      return this.retryTerminalFinalization(await request.json().catch(() => null));
+    }
+
+    if (request.method === "POST" && url.pathname === "/terminal-finalization/skip") {
+      return this.skipTerminalFinalization(await request.json().catch(() => null));
+    }
+
+    if (request.method === "POST" && url.pathname === "/lifecycle/command-ack/observed") {
+      return this.observeLifecycleCommandAcknowledgement(await request.json().catch(() => null));
+    }
+
+    if (request.method === "POST" && url.pathname === "/lifecycle/command-ack/failed") {
+      return this.releaseLifecycleCommandAcknowledgement(await request.json().catch(() => null));
     }
 
     if (request.method === "POST" && url.pathname === "/review-telemetry") {
@@ -2539,7 +2827,11 @@ export class ExactReviewQueue {
       const legacyExcludedItemKeys = new Set(batchOwnedItemKeys);
       if (exactReviewPublicationBatchingEnabled(this.env)) {
         for (const item of Object.values(state.items) as ExactReviewQueueItem[]) {
-          if (item.state === "pending" && exactReviewQueueIsPublication(item)) {
+          if (
+            item.state === "pending" &&
+            exactReviewQueueIsBatchablePublication(item) &&
+            !item.terminalFinalization
+          ) {
             legacyExcludedItemKeys.add(item.key);
           }
         }
@@ -3291,6 +3583,9 @@ export class ExactReviewQueue {
       const item = checkedState.items[candidate.key];
       if (!item || item.revision !== candidate.revision || item.state !== "pending") return [];
       if (exactReviewQueueIsPublication(item)) {
+        // A committed terminal finalization holds no review/publication work;
+        // it is dispatched only to perform (or retry) the fenced status receipt.
+        if (item.terminalFinalization) return [item];
         if (checkedBatchOwnership.itemKeys.includes(item.key)) return [];
         const livePublication = livePublicationStateByCandidate.get(candidate.key);
         return !livePublication || livePublication.state.state !== "terminal" ? [item] : [];
@@ -3386,6 +3681,7 @@ export class ExactReviewQueue {
           itemKey: item.key,
           leaseId: item.leaseId,
           leaseRevision: item.leaseRevision,
+          terminalFinalization: item.terminalFinalization,
         });
       } catch (error) {
         const failure = exactReviewDispatchFailure(error);
@@ -3423,7 +3719,21 @@ export class ExactReviewQueue {
         item.dispatchFailureFingerprint = failure.failure.fingerprint;
         item.dispatchFailureDetail = failure.failure.detail;
       }
-      if (failure.attempted && failure.failure.scope === "item") {
+      if (item.terminalFinalization) {
+        // Finalizer-only dispatches must never be parked or sent through the
+        // ordinary publication recovery/dead-letter machinery: their sole
+        // durable job is the already-committed fenced acknowledgement.
+        item.state = "pending";
+        item.parkedReason = undefined;
+        item.nextAttemptAt =
+          completedAt +
+          exactReviewDispatchGlobalRetryDelayMs(
+            Math.max(1, Number(item.attempts || 0) + 1),
+            failure.failure,
+          );
+        item.backoffReason = "publication_retry";
+        item.attempts = Number(item.attempts || 0) + 1;
+      } else if (failure.attempted && failure.failure.scope === "item") {
         item.state = "parked";
         item.parkedReason = "dispatch_rejected";
         item.backoffReason = undefined;
@@ -3536,6 +3846,7 @@ export class ExactReviewQueue {
         item.revision !== candidate.revision ||
         (item.state !== "pending" && (!options.legacyReconciliation || item.state !== "parked")) ||
         !exactReviewQueueIsPublication(item) ||
+        item.terminalFinalization ||
         exactReviewQueueHasCommandContext(item) ||
         batchOwnership.itemKeys.includes(item.key) ||
         (options.legacyReconciliation === "v1" &&
@@ -4025,6 +4336,7 @@ export class ExactReviewQueue {
         (item) =>
           item.key > cursor &&
           exactReviewQueueIsPublication(item) &&
+          !item.terminalFinalization &&
           (item.state === "pending" || item.state === "parked"),
       )
       .sort((left, right) => left.key.localeCompare(right.key));
@@ -4482,6 +4794,7 @@ export class ExactReviewQueue {
         !item ||
         item.revision !== candidate.revision ||
         !exactReviewQueueIsPublication(item) ||
+        item.terminalFinalization ||
         (item.state !== "pending" && item.state !== "parked") ||
         activeBatchItemKeys.has(item.key)
       ) {
@@ -4538,12 +4851,15 @@ export class ExactReviewQueue {
       activeBatchItemKeys,
     );
     const legacyTerminalCandidates = Object.values(state.items)
-      .filter((item) =>
-        exactReviewLegacyTerminalPublicationCandidate(item, legacyAuthorityByTarget),
+      .filter(
+        (item) =>
+          !item.terminalFinalization &&
+          exactReviewLegacyTerminalPublicationCandidate(item, legacyAuthorityByTarget),
       )
       .sort((left, right) => left.createdAt - right.createdAt || left.key.localeCompare(right.key));
     const newestByTarget = new Map<string, number>();
     const versioned = Object.values(state.items).flatMap((item) => {
+      if (item.terminalFinalization) return [];
       const revision = exactReviewPublicationRevision(item.decision);
       if (!revision) return [];
       newestByTarget.set(
@@ -4916,6 +5232,12 @@ export class ExactReviewQueue {
     const activePublishers = exactReviewQueueActivePublicationCount(state);
     const excludedItemKeys = new Set<string>(batchOwnership.itemKeys);
     for (const item of Object.values(state.items)) {
+      // Direct receipts and terminal acknowledgement drivers must remain on
+      // the normal publisher. Exclude them before admission so they cannot
+      // consume a bounded batch scan slot and starve an ordinary publication.
+      if (exactReviewQueueIsPublication(item) && !exactReviewQueueIsBatchablePublication(item)) {
+        excludedItemKeys.add(item.key);
+      }
       const revision = exactReviewPublicationRevision(item.decision);
       if (
         revision &&
@@ -4939,7 +5261,11 @@ export class ExactReviewQueue {
             this.freshPublicationItemKeysSync(state, now),
             exactReviewPublicationFreshLaneMaxItems(this.env),
           )
-            .filter(exactReviewQueueIsPublication)
+            // A direct receipt has already committed its GitHub effect. Its
+            // immutable lifecycle plan must return through the fenced legacy
+            // publisher, which is the only path that replays that plan.
+            .filter(exactReviewQueueIsBatchablePublication)
+            .filter((item) => !item.terminalFinalization)
             .filter((item) => {
               const revision = exactReviewPublicationRevision(item.decision);
               return (
@@ -5000,6 +5326,7 @@ export class ExactReviewQueue {
     // requiring a terminal probe for a newer departure.
     const existingBatch = this.batchStore.fetch(claimId, leaseOwner, now);
     if (existingBatch?.state === "leased") {
+      this.recordLifecycleBatchClaim(existingBatch, state, now);
       await this.scheduleNext(state, now);
       const oldestCandidateAt = existingBatch.items.reduce(
         (oldest, membership) =>
@@ -5124,6 +5451,7 @@ export class ExactReviewQueue {
         effective_max_items: leaseSize,
       });
     }
+    this.recordLifecycleBatchClaim(batch, state, now);
     await this.scheduleNext(state, now);
     const oldestCandidateAt = batch.items.reduce(
       (oldest, membership) =>
@@ -5171,11 +5499,25 @@ export class ExactReviewQueue {
         terminalOutcome: "superseded",
       }));
     if (stale.length) {
+      const lifecycleTerminals: Array<{
+        canonicalTargetKey: string;
+        fenceKey: string;
+        revision: number;
+        kind: LifecycleTerminalDisposition;
+      }> = [];
       batch = this.batchStore.complete(batchId, leaseOwner, stale, now, {}, (accepted) => {
         const current = this.readStateSync();
         let superseded = 0;
         for (const completion of accepted) {
           const item = current.items[completion.itemKey];
+          if (item) {
+            lifecycleTerminals.push({
+              canonicalTargetKey: `${item.decision.targetRepo}#${item.decision.itemNumber}`,
+              fenceKey: completion.itemKey,
+              revision: completion.revision,
+              kind: "superseded",
+            });
+          }
           const publicationRevision = item ? exactReviewPublicationRevision(item.decision) : null;
           if (
             !item ||
@@ -5206,6 +5548,9 @@ export class ExactReviewQueue {
         });
       });
       if (!batch) return json({ error: "batch_lease_not_active" }, 409);
+      for (const terminal of lifecycleTerminals) {
+        this.recordLifecycleTerminal(terminal, now);
+      }
       state = this.readStateSync();
       await this.scheduleNext(state, now);
     }
@@ -5326,6 +5671,12 @@ export class ExactReviewQueue {
       ),
     );
     const now = Date.now();
+    const lifecycleTerminals: Array<{
+      canonicalTargetKey: string;
+      fenceKey: string;
+      revision: number;
+      kind: LifecycleTerminalDisposition;
+    }> = [];
     let batch = this.batchStore.complete(
       batchId,
       leaseOwner,
@@ -5367,7 +5718,20 @@ export class ExactReviewQueue {
           ) {
             continue;
           }
+          if (completion.terminalOutcome === "superseded") {
+            lifecycleTerminals.push({
+              canonicalTargetKey: `${item.decision.targetRepo}#${item.decision.itemNumber}`,
+              fenceKey: completion.itemKey,
+              revision: completion.revision,
+              kind: "superseded",
+            });
+          }
           if (requested.publicationCompletion) {
+            const projectionBeforeTerminalCommit = this.lifecycleProjectionStore.read(
+              `${item.decision.targetRepo}#${item.decision.itemNumber}`,
+              item.key,
+              completion.revision,
+            );
             const result = finishExactReviewPublicationQueueItem({
               state,
               item,
@@ -5379,27 +5743,116 @@ export class ExactReviewQueue {
               ),
               env: this.env,
             });
+            const terminalDisposition =
+              exactReviewLifecycleCompletionDisposition({
+                projection: projectionBeforeTerminalCommit,
+                outcome: "success",
+                publicationCompletion: requested.publicationCompletion,
+                requeued: result.requeued,
+                parked: result.parked,
+                deadLetter: Boolean(result.deadLetter),
+              }) ??
+              projectionBeforeTerminalCommit?.terminalDisposition?.kind ??
+              null;
+            const terminalFinalization =
+              !result.requeued &&
+              !result.parked &&
+              exactReviewQueueHasCommandContext(item) &&
+              terminalDisposition &&
+              terminalDisposition !== "requeue"
+                ? exactReviewTerminalFinalization(terminalDisposition, {
+                    canonicalTargetKey: `${item.decision.targetRepo}#${item.decision.itemNumber}`,
+                    fenceKey: completion.itemKey,
+                    revision: completion.revision,
+                  })
+                : null;
+            if (terminalFinalization) {
+              // Batch completion consumes membership rather than an item lease.
+              // Retain only this terminal acknowledgement driver so batching
+              // cannot publish the revision again.
+              state.items[item.key] = item;
+              clearExactReviewLease(item);
+              item.state = "pending";
+              item.terminalFinalization = terminalFinalization;
+              item.nextAttemptAt = now;
+              item.backoffReason = undefined;
+              item.updatedAt = now;
+            }
             if (result.deadLetter) {
               this.insertDeadLetterSync(result.deadLetter);
               deadLettered += 1;
+            }
+            const lifecycleTerminal = result.deadLetter
+              ? "dead_letter"
+              : result.requeued || result.parked || result.refreshed
+                ? "requeue"
+                : null;
+            if (lifecycleTerminal) {
+              lifecycleTerminals.push({
+                canonicalTargetKey: `${item.decision.targetRepo}#${item.decision.itemNumber}`,
+                fenceKey: completion.itemKey,
+                revision: completion.revision,
+                kind: lifecycleTerminal,
+              });
             }
             if (!result.requeued && !result.parked) completed += 1;
             if (result.retried) retried += 1;
             if (result.refreshed) refreshed += 1;
             continue;
           }
+          const publicationCompletion =
+            completion.terminalOutcome === "published"
+              ? ({ kind: "published", reasonCode: "publication_applied" } as const)
+              : ({ kind: "superseded", reasonCode: "remote_newer_tuple" } as const);
+          const projectionBeforeTerminalCommit = this.lifecycleProjectionStore.read(
+            `${item.decision.targetRepo}#${item.decision.itemNumber}`,
+            item.key,
+            completion.revision,
+          );
           const result = finishExactReviewPublicationQueueItem({
             state,
             item,
             now,
-            completion:
-              completion.terminalOutcome === "published"
-                ? { kind: "published", reasonCode: "publication_applied" }
-                : { kind: "superseded", reasonCode: "remote_newer_tuple" },
+            completion: publicationCompletion,
             ownedRevision: completion.revision,
             deadLetterCapacityAvailable: true,
             env: this.env,
           });
+          const terminalDisposition =
+            exactReviewLifecycleCompletionDisposition({
+              projection: projectionBeforeTerminalCommit,
+              outcome: "success",
+              publicationCompletion,
+              requeued: result.requeued,
+              parked: result.parked,
+              deadLetter: Boolean(result.deadLetter),
+            }) ??
+            projectionBeforeTerminalCommit?.terminalDisposition?.kind ??
+            null;
+          const terminalFinalization =
+            !result.requeued &&
+            !result.parked &&
+            exactReviewQueueHasCommandContext(item) &&
+            terminalDisposition &&
+            terminalDisposition !== "requeue"
+              ? exactReviewTerminalFinalization(terminalDisposition, {
+                  canonicalTargetKey: `${item.decision.targetRepo}#${item.decision.itemNumber}`,
+                  fenceKey: completion.itemKey,
+                  revision: completion.revision,
+                })
+              : null;
+          if (terminalFinalization) {
+            // Batch completion consumes membership rather than an item lease.
+            // Retain only this terminal acknowledgement driver so batching
+            // cannot publish the revision again.
+            state.items[item.key] = item;
+            clearExactReviewLease(item);
+            item.state = "pending";
+            item.terminalFinalization = terminalFinalization;
+            item.nextAttemptAt = now;
+            item.backoffReason = undefined;
+            item.updatedAt = now;
+          }
           if (!result.requeued) completed += 1;
           if (completion.terminalOutcome === "published") published += 1;
           else if (completion.terminalOutcome === "superseded") superseded += 1;
@@ -5416,6 +5869,9 @@ export class ExactReviewQueue {
       },
     );
     if (!batch) return json({ error: "batch_lease_not_active" }, 409);
+    for (const terminal of lifecycleTerminals) {
+      this.recordLifecycleTerminal(terminal, now);
+    }
     if (stateWriter?.commit_count === 1) {
       batch =
         this.batchStore.recordObservation(
@@ -5442,6 +5898,885 @@ export class ExactReviewQueue {
     });
   }
 
+  private recordLifecycleClaim(item: ExactReviewQueueItem, now: number) {
+    if (!exactReviewQueueIsPublication(item) || item.terminalFinalization || !item.claimedRunId) {
+      return;
+    }
+    const revision = item.leaseRevision ?? item.revision;
+    const sourceDecision =
+      item.decision.publication?.producerDecision ?? item.leaseDecision ?? item.decision;
+    const identity = {
+      canonicalTargetKey: `${item.decision.targetRepo}#${item.decision.itemNumber}`,
+      fenceKey: item.key,
+      revision,
+    };
+    const existing = this.lifecycleProjectionStore.read(
+      identity.canonicalTargetKey,
+      identity.fenceKey,
+      identity.revision,
+    );
+    if (existing && existing.fenceKey !== identity.fenceKey) {
+      throw new Error("conflicting lifecycle projection identity");
+    }
+    if (!existing) {
+      const commandOriginated = Boolean(
+        sourceDecision.commandStatusMarker || sourceDecision.statusCommentId,
+      );
+      this.lifecycleProjectionStore.recordAdmission({
+        ...identity,
+        deliveryId: item.admissionDeliveryId ?? `claim:${item.leaseId}:${revision}`,
+        sourceAction: sourceDecision.sourceAction,
+        commandOriginated,
+        statusMarker: sourceDecision.commandStatusMarker ?? null,
+        statusCommentId: sourceDecision.statusCommentId ?? null,
+        observedAt: now,
+      });
+    }
+    this.lifecycleProjectionStore.recordClaim({
+      ...identity,
+      claimGeneration: exactReviewClaimGeneration(item.claimGeneration),
+      runId: item.claimedRunId,
+      runAttempt: exactReviewRunAttempt(item.claimedRunAttempt),
+      observedAt: now,
+    });
+  }
+
+  private recordLifecycleBatchClaim(batch, state: ExactReviewQueueState, now: number) {
+    // A batch lease can predate runner telemetry during a rolling deployment.
+    // Its immutable admission still authorizes subsequent terminal handling,
+    // but we must not manufacture a claim or review-result fact without the
+    // runner tuple that identifies it.
+    const hasRunner =
+      Boolean(batch.runnerRunId) &&
+      Number.isSafeInteger(batch.runnerRunAttempt) &&
+      batch.runnerRunAttempt >= 1;
+    for (const membership of batch.items) {
+      const item = state.items[membership.itemKey];
+      if (!item || !exactReviewQueueIsPublication(item) || item.revision !== membership.revision) {
+        continue;
+      }
+      const sourceDecision =
+        item.decision.publication?.producerDecision ?? item.leaseDecision ?? item.decision;
+      const identity = {
+        canonicalTargetKey: `${item.decision.targetRepo}#${item.decision.itemNumber}`,
+        fenceKey: item.key,
+        revision: membership.revision,
+      };
+      const existing = this.lifecycleProjectionStore.read(
+        identity.canonicalTargetKey,
+        identity.fenceKey,
+        identity.revision,
+      );
+      if (!existing) {
+        this.lifecycleProjectionStore.recordAdmission({
+          ...identity,
+          deliveryId:
+            item.admissionDeliveryId ?? `publication:${membership.itemKey}:${membership.revision}`,
+          sourceAction: sourceDecision.sourceAction,
+          commandOriginated: Boolean(
+            sourceDecision.commandStatusMarker || sourceDecision.statusCommentId,
+          ),
+          statusMarker: sourceDecision.commandStatusMarker ?? null,
+          statusCommentId: sourceDecision.statusCommentId ?? null,
+          observedAt: now,
+        });
+      }
+      if (!hasRunner) continue;
+      this.lifecycleProjectionStore.recordClaim({
+        ...identity,
+        claimGeneration: membership.claimGeneration,
+        runId: batch.runnerRunId,
+        runAttempt: batch.runnerRunAttempt,
+        observedAt: now,
+      });
+      // Batch publication begins only after the source review is materialized;
+      // keep that immutable result even if this publication is later superseded.
+      this.lifecycleProjectionStore.recordReviewResult({
+        ...identity,
+        claimGeneration: membership.claimGeneration,
+        runId: batch.runnerRunId,
+        runAttempt: batch.runnerRunAttempt,
+        outcome: "completed",
+        observedAt: now,
+      });
+    }
+  }
+
+  private recordLifecycleTerminal(
+    identity: {
+      canonicalTargetKey: string;
+      fenceKey: string;
+      revision: number;
+      kind: LifecycleTerminalDisposition;
+    },
+    now: number,
+  ) {
+    if (
+      !this.lifecycleProjectionStore.read(
+        identity.canonicalTargetKey,
+        identity.fenceKey,
+        identity.revision,
+      )
+    ) {
+      return;
+    }
+    this.lifecycleProjectionStore.recordTerminalDisposition({
+      ...identity,
+      kind: identity.kind,
+      observedAt: now,
+    });
+  }
+
+  private recordLifecycleDirectPublication({ validated, owned, accepted, now }) {
+    const sourceDecision = owned?.decision.publication
+      ? owned.decision.publication.producerDecision
+      : (owned?.leaseDecision ?? owned?.decision);
+    const commandOriginated = Boolean(
+      sourceDecision?.commandStatusMarker || sourceDecision?.statusCommentId,
+    );
+    const identity = {
+      canonicalTargetKey: validated.canonicalTargetKey,
+      fenceKey: validated.fenceKey,
+      revision: validated.revision,
+    };
+    const existingProjection = this.lifecycleProjectionStore.read(
+      identity.canonicalTargetKey,
+      identity.fenceKey,
+      identity.revision,
+    );
+    if (existingProjection && existingProjection.fenceKey !== identity.fenceKey) {
+      throw new Error("conflicting lifecycle projection identity");
+    }
+    const statusMarker = sourceDecision?.commandStatusMarker ?? null;
+    const statusCommentId = sourceDecision?.statusCommentId ?? null;
+    if (!existingProjection) {
+      this.lifecycleProjectionStore.recordAdmission({
+        ...identity,
+        deliveryId:
+          owned?.admissionDeliveryId ?? `publication:${validated.fenceKey}:${validated.revision}`,
+        sourceAction: sourceDecision?.sourceAction ?? "exact_review_publication",
+        commandOriginated,
+        statusMarker,
+        statusCommentId,
+        observedAt: now,
+      });
+    }
+    const recordedClaim = existingProjection?.claims.find(
+      (claim) => claim.claimGeneration === validated.identity.claimGeneration,
+    );
+    const runId = recordedClaim?.runId ?? String(owned?.claimedRunId || "");
+    const runAttempt = recordedClaim?.runAttempt ?? exactReviewRunAttempt(owned?.claimedRunAttempt);
+    if (/^\d+$/.test(runId)) {
+      const claimGeneration = recordedClaim?.claimGeneration ?? validated.identity.claimGeneration;
+      this.lifecycleProjectionStore.recordClaim({
+        ...identity,
+        claimGeneration,
+        runId,
+        runAttempt,
+        observedAt: now,
+      });
+      this.lifecycleProjectionStore.recordReviewResult({
+        ...identity,
+        claimGeneration,
+        runId,
+        runAttempt,
+        outcome: "completed",
+        observedAt: now,
+      });
+    }
+    const effect = exactReviewGithubEffect(validated.operations);
+    if (effect)
+      this.lifecycleProjectionStore.recordGithubEffect({ ...identity, ...effect, observedAt: now });
+    this.lifecycleProjectionStore.recordCanonicalReceipt({
+      ...identity,
+      outcome: accepted.outcome,
+      receiptId: `direct:${validated.fenceKey}:${validated.revision}:${accepted.outcome}`,
+      observedAt: now,
+    });
+    if (accepted.outcome === "superseded") {
+      this.lifecycleProjectionStore.recordTerminalDisposition({
+        ...identity,
+        kind: "superseded",
+        observedAt: now,
+      });
+    }
+  }
+
+  private recordLifecycleCompletion({
+    item,
+    revision,
+    claimGeneration,
+    runId,
+    runAttempt,
+    outcome,
+    publicationCompletion,
+    requeued,
+    parked,
+    deadLetter,
+    lifecycleTerminal,
+    now,
+  }) {
+    const identity = {
+      canonicalTargetKey: `${item.decision.targetRepo}#${item.decision.itemNumber}`,
+      fenceKey: item.key,
+      revision,
+    };
+    const projection = this.lifecycleProjectionStore.read(
+      identity.canonicalTargetKey,
+      identity.fenceKey,
+      identity.revision,
+    );
+    if (!projection || projection.fenceKey !== identity.fenceKey) return;
+    this.lifecycleProjectionStore.recordReviewResult({
+      ...identity,
+      claimGeneration,
+      runId,
+      runAttempt,
+      outcome: outcome === "success" ? "completed" : outcome === "failure" ? "failed" : outcome,
+      observedAt: now,
+    });
+    const disposition = exactReviewLifecycleCompletionDisposition({
+      projection,
+      outcome,
+      publicationCompletion,
+      requeued,
+      parked,
+      deadLetter,
+      lifecycleTerminal,
+    });
+    if (disposition) {
+      this.lifecycleProjectionStore.recordTerminalDisposition({
+        ...identity,
+        kind: disposition,
+        observedAt: now,
+      });
+    }
+  }
+
+  private recordLifecycleCanonicalReceipt(value: unknown) {
+    const body = objectValue(value);
+    const identity = exactReviewLifecycleIdentity(body);
+    const receiptId = typeof body.receipt_id === "string" ? body.receipt_id : "";
+    const outcome = body.outcome;
+    if (
+      !identity ||
+      !receiptId ||
+      (outcome !== "accepted" && outcome !== "deduped" && outcome !== "superseded")
+    ) {
+      return json({ error: "invalid_lifecycle_canonical_receipt" }, 400);
+    }
+    try {
+      const projection = this.lifecycleProjectionStore.recordCanonicalReceipt({
+        ...identity,
+        outcome,
+        receiptId,
+        observedAt: Date.now(),
+      });
+      return json({
+        ok: true,
+        lifecycle_state: lifecycleState(projection),
+        version: projection.version,
+      });
+    } catch (error) {
+      console.warn(`lifecycle canonical receipt rejected: ${sanitizedServerError(error)}`);
+      return json({ error: "invalid_lifecycle_canonical_receipt" }, 409);
+    }
+  }
+
+  private async recordLifecycleRouterReceipt(value: unknown) {
+    const body = objectValue(value);
+    const identity = exactReviewLifecycleIdentity(body);
+    const receiptId = typeof body.receipt_id === "string" ? body.receipt_id : "";
+    const outcome = body.outcome === undefined ? "durable" : body.outcome;
+    if (!identity || !receiptId || (outcome !== "durable" && outcome !== "not_required")) {
+      return json({ error: "invalid_lifecycle_router_receipt" }, 400);
+    }
+    try {
+      const now = Date.now();
+      const projection = this.lifecycleProjectionStore.recordRouterReceipt({
+        ...identity,
+        outcome,
+        receiptId,
+        observedAt: now,
+      });
+      const completed = this.lifecycleProjectionStore.recordTerminalDisposition({
+        ...identity,
+        kind: "review_completed_routed",
+        observedAt: now,
+      });
+      const state = this.readStateSync();
+      const driverChanged = this.ensureLifecycleTerminalFinalizationDriver({
+        state,
+        projection: completed,
+        now,
+      });
+      const receiptRemoved = this.removeTerminalizedLifecycleQueueItem(state, identity);
+      if (driverChanged || receiptRemoved) {
+        await this.writeState(state);
+        await this.scheduleNext(state, now);
+      }
+      return json({
+        ok: true,
+        lifecycle_state: lifecycleState(completed),
+        version: projection.version,
+      });
+    } catch (error) {
+      console.warn(`lifecycle router receipt rejected: ${sanitizedServerError(error)}`);
+      return json({ error: "invalid_lifecycle_router_receipt" }, 409);
+    }
+  }
+
+  private ensureLifecycleTerminalFinalizationDriver({
+    state,
+    projection,
+    terminalDisposition,
+    now,
+  }: {
+    state: ExactReviewQueueState;
+    projection: ExactReviewLifecycleProjection;
+    terminalDisposition?: Exclude<LifecycleTerminalDisposition, "requeue"> | null;
+    now: number;
+  }) {
+    const identity: ExactReviewLifecycleProjectionIdentity = {
+      canonicalTargetKey: projection.canonicalTargetKey,
+      fenceKey: projection.fenceKey,
+      revision: projection.revision,
+    };
+    const disposition = terminalDisposition ?? projection.terminalDisposition?.kind;
+    const acknowledgementPending =
+      commandAcknowledgementState(projection) === "pending" ||
+      (Boolean(terminalDisposition) &&
+        projection.admission.commandOriginated &&
+        !projection.acknowledgement.observed &&
+        commandAcknowledgementState(projection) !== "skipped_locked");
+    if (
+      !disposition ||
+      disposition === "requeue" ||
+      !projection.admission.commandOriginated ||
+      !acknowledgementPending
+    ) {
+      return false;
+    }
+    const driverKey = exactReviewTerminalFinalizationDriverKey(identity);
+    const existing = state.items[driverKey];
+    if (existing) {
+      const existingIdentity = exactReviewTerminalFinalizationProjection(
+        existing,
+        existing.revision,
+      );
+      if (
+        !existing.terminalFinalization ||
+        existingIdentity.canonicalTargetKey !== identity.canonicalTargetKey ||
+        existingIdentity.fenceKey !== identity.fenceKey ||
+        existingIdentity.revision !== identity.revision
+      ) {
+        throw new Error("conflicting direct lifecycle terminal finalization driver");
+      }
+      return false;
+    }
+    const decision = exactReviewTerminalFinalizationDecision(projection);
+    state.items[driverKey] = {
+      key: driverKey,
+      decision,
+      admissionDeliveryId: `terminal-finalization:${identity.fenceKey}:${identity.revision}`,
+      state: "pending",
+      revision: identity.revision,
+      createdAt: now,
+      updatedAt: now,
+      nextAttemptAt: now,
+      attempts: 0,
+      terminalFinalization: exactReviewTerminalFinalization(disposition, identity),
+    };
+    return true;
+  }
+
+  private ensureTerminalFinalizationDriver({
+    state,
+    item,
+    sourceDecision,
+    projection,
+    terminalFinalization,
+    now,
+  }: {
+    state: ExactReviewQueueState;
+    item: ExactReviewQueueItem;
+    sourceDecision?: ExactReviewDecision;
+    projection: ExactReviewLifecycleProjection | null;
+    terminalFinalization: ExactReviewTerminalFinalization;
+    now: number;
+  }) {
+    if (projection) {
+      return this.ensureLifecycleTerminalFinalizationDriver({
+        state,
+        projection,
+        terminalDisposition: terminalFinalization.disposition,
+        now,
+      });
+    }
+    const identity = exactReviewTerminalFinalizationProjection(item, item.revision);
+    const driverKey = exactReviewTerminalFinalizationDriverKey(identity);
+    const existing = state.items[driverKey];
+    if (existing) {
+      const existingIdentity = exactReviewTerminalFinalizationProjection(
+        existing,
+        existing.revision,
+      );
+      if (
+        !existing.terminalFinalization ||
+        existingIdentity.canonicalTargetKey !== identity.canonicalTargetKey ||
+        existingIdentity.fenceKey !== identity.fenceKey ||
+        existingIdentity.revision !== identity.revision
+      ) {
+        throw new Error("conflicting terminal finalization driver");
+      }
+      return false;
+    }
+    state.items[driverKey] = {
+      key: driverKey,
+      decision: sourceDecision ?? item.leaseDecision ?? item.decision,
+      admissionDeliveryId: `terminal-finalization:${identity.fenceKey}:${identity.revision}`,
+      state: "pending",
+      revision: identity.revision,
+      createdAt: now,
+      updatedAt: now,
+      nextAttemptAt: now,
+      attempts: 0,
+      terminalFinalization: exactReviewTerminalFinalization(
+        terminalFinalization.disposition,
+        identity,
+      ),
+    };
+    return true;
+  }
+
+  private removeTerminalizedLifecycleQueueItem(
+    state: ExactReviewQueueState,
+    identity: ExactReviewLifecycleProjectionIdentity,
+  ) {
+    const item = state.items[identity.fenceKey];
+    const driverKey = exactReviewTerminalFinalizationDriverKey(identity);
+    if (
+      !item ||
+      !state.items[driverKey]?.terminalFinalization ||
+      item.revision !== identity.revision ||
+      item.terminalFinalization ||
+      (item.state !== "pending" && item.state !== "parked") ||
+      item.decision.sourceAction !== EXACT_REVIEW_ARTIFACT_PUBLISH_SOURCE_ACTION
+    ) {
+      return false;
+    }
+    delete state.items[item.key];
+    return true;
+  }
+
+  private cancelTerminalFinalizationDrivers(
+    state: ExactReviewQueueState,
+    identity: ExactReviewLifecycleProjectionIdentity,
+  ) {
+    let cancelled = false;
+    for (const item of Object.values(state.items)) {
+      if (!item.terminalFinalization) continue;
+      const driverIdentity = exactReviewTerminalFinalizationProjection(item, item.revision);
+      if (
+        driverIdentity.canonicalTargetKey !== identity.canonicalTargetKey ||
+        driverIdentity.fenceKey !== identity.fenceKey ||
+        driverIdentity.revision !== identity.revision
+      ) {
+        continue;
+      }
+      delete state.items[item.key];
+      cancelled = true;
+    }
+    return cancelled;
+  }
+
+  private authorizeLifecycleCommandAcknowledgement(value: unknown) {
+    const body = objectValue(value);
+    const identity = exactReviewLifecycleIdentity(body);
+    const statusMarker =
+      body.status_marker === undefined || body.status_marker === null
+        ? null
+        : typeof body.status_marker === "string"
+          ? body.status_marker
+          : "";
+    const statusCommentId =
+      body.status_comment_id === undefined || body.status_comment_id === null
+        ? null
+        : Number(body.status_comment_id);
+    if (
+      !identity ||
+      (statusMarker !== null && !statusMarker) ||
+      (statusCommentId !== null && (!Number.isSafeInteger(statusCommentId) || statusCommentId < 1))
+    ) {
+      return json({ error: "invalid_lifecycle_acknowledgement_attempt" }, 400);
+    }
+    try {
+      const result = this.lifecycleProjectionStore.authorizeCommandAcknowledgement({
+        ...identity,
+        statusMarker,
+        statusCommentId,
+        observedAt: Date.now(),
+      });
+      return json({
+        ok: true,
+        allowed: result.allowed,
+        lifecycle_state: result.lifecycle,
+        acknowledgement_state: result.acknowledgement,
+        ...(result.attemptId ? { attempt_id: result.attemptId } : {}),
+        version: result.projection.version,
+      });
+    } catch (error) {
+      console.warn(`lifecycle acknowledgement rejected: ${sanitizedServerError(error)}`);
+      return json({ error: "invalid_lifecycle_acknowledgement_attempt" }, 409);
+    }
+  }
+
+  private beginTerminalFinalizationAcknowledgement(value: unknown) {
+    const tuple = exactReviewTerminalFinalizationTuple(value);
+    const body = objectValue(value);
+    const statusMarker =
+      body.status_marker === undefined || body.status_marker === null
+        ? null
+        : typeof body.status_marker === "string"
+          ? body.status_marker
+          : "";
+    const statusCommentId =
+      body.status_comment_id === undefined || body.status_comment_id === null
+        ? null
+        : Number(body.status_comment_id);
+    if (
+      !tuple ||
+      (statusMarker !== null && !statusMarker) ||
+      (statusCommentId !== null && (!Number.isSafeInteger(statusCommentId) || statusCommentId < 1))
+    ) {
+      return json({ error: "invalid_terminal_finalization_acknowledgement" }, 400);
+    }
+    const now = Date.now();
+    const state = this.readStateSync();
+    const item = state.items[tuple.itemKey];
+    if (!exactReviewTerminalFinalizationLeaseActive(item, tuple, now, this.env)) {
+      return json({ error: "lease_not_active" }, 409);
+    }
+    const finalization = item.terminalFinalization!;
+    const identity = exactReviewTerminalFinalizationProjection(item, tuple.leaseRevision);
+    try {
+      this.lifecycleProjectionStore.recordTerminalDisposition({
+        ...identity,
+        kind: finalization.disposition,
+        observedAt: now,
+      });
+      const result = this.lifecycleProjectionStore.authorizeCommandAcknowledgement({
+        ...identity,
+        statusMarker,
+        statusCommentId,
+        observedAt: now,
+      });
+      return json({
+        ok: true,
+        allowed: result.allowed,
+        lifecycle_state: result.lifecycle,
+        acknowledgement_state: result.acknowledgement,
+        terminal_disposition: finalization.disposition,
+        status_state: finalization.statusState,
+        status_detail: finalization.statusDetail,
+        ...(result.attemptId ? { attempt_id: result.attemptId } : {}),
+        version: result.projection.version,
+      });
+    } catch (error) {
+      console.warn(
+        `terminal finalization acknowledgement rejected: ${sanitizedServerError(error)}`,
+      );
+      return json({ error: "invalid_terminal_finalization_acknowledgement" }, 409);
+    }
+  }
+
+  private async retryTerminalFinalization(value: unknown) {
+    const tuple = exactReviewTerminalFinalizationTuple(value);
+    if (!tuple) return json({ error: "invalid_terminal_finalization_retry" }, 400);
+    const now = Date.now();
+    const state = this.readStateSync();
+    const item = state.items[tuple.itemKey];
+    if (!exactReviewTerminalFinalizationLeaseActive(item, tuple, now, this.env)) {
+      return json({ error: "lease_not_active" }, 409);
+    }
+    const identity = exactReviewTerminalFinalizationProjection(item, tuple.leaseRevision);
+    const projection = this.lifecycleProjectionStore.read(
+      identity.canonicalTargetKey,
+      identity.fenceKey,
+      identity.revision,
+    );
+    if (projection?.acknowledgement.observed) {
+      delete state.items[item.key];
+      await this.writeState(state);
+      await this.scheduleNext(state, now);
+      return json({ ok: true, completed: true });
+    }
+    clearExactReviewLease(item);
+    item.state = "pending";
+    item.nextAttemptAt = now + EXACT_REVIEW_ACKNOWLEDGEMENT_ATTEMPT_LEASE_MS;
+    item.backoffReason = "publication_retry";
+    item.updatedAt = now;
+    await this.writeState(state);
+    await this.scheduleNext(state, now);
+    return json({ ok: true, requeued: true });
+  }
+
+  private async skipTerminalFinalization(value: unknown) {
+    const tuple = exactReviewTerminalFinalizationTuple(value);
+    const body = objectValue(value);
+    const attemptId = typeof body.attempt_id === "string" ? body.attempt_id : "";
+    const statusMarker =
+      body.status_marker === undefined || body.status_marker === null
+        ? null
+        : typeof body.status_marker === "string"
+          ? body.status_marker
+          : "";
+    const statusCommentId =
+      body.status_comment_id === undefined || body.status_comment_id === null
+        ? null
+        : Number(body.status_comment_id);
+    if (
+      !tuple ||
+      !/^ack:[1-9]\d*$/.test(attemptId) ||
+      body.reason !== "locked_conversation" ||
+      (statusMarker !== null && !statusMarker) ||
+      (statusCommentId !== null && (!Number.isSafeInteger(statusCommentId) || statusCommentId < 1))
+    ) {
+      return json({ error: "invalid_terminal_finalization_skip" }, 400);
+    }
+    const now = Date.now();
+    const state = this.readStateSync();
+    const item = state.items[tuple.itemKey];
+    if (!exactReviewTerminalFinalizationLeaseActive(item, tuple, now, this.env)) {
+      return json({ error: "lease_not_active" }, 409);
+    }
+    const identity = exactReviewTerminalFinalizationProjection(item, tuple.leaseRevision);
+    try {
+      const result = this.lifecycleProjectionStore.recordCommandAcknowledgementTerminalSkip({
+        ...identity,
+        attemptId,
+        statusMarker,
+        statusCommentId,
+        reason: "locked_conversation",
+        observedAt: now,
+      });
+      if (!result.skipped) {
+        return json({ error: "acknowledgement_not_active" }, 409);
+      }
+      delete state.items[item.key];
+      await this.writeState(state);
+      await this.scheduleNext(state, now);
+      return json({
+        ok: true,
+        completed: true,
+        lifecycle_state: lifecycleState(result.projection),
+        acknowledgement_state: commandAcknowledgementState(result.projection),
+        version: result.projection.version,
+      });
+    } catch (error) {
+      console.warn(`terminal finalization skip rejected: ${sanitizedServerError(error)}`);
+      return json({ error: "invalid_terminal_finalization_skip" }, 409);
+    }
+  }
+
+  private async observeLifecycleCommandAcknowledgement(value: unknown) {
+    const body = objectValue(value);
+    const canonicalTargetKey =
+      typeof body.canonical_target_key === "string" ? body.canonical_target_key : "";
+    const statusMarker =
+      body.status_marker === undefined || body.status_marker === null
+        ? null
+        : typeof body.status_marker === "string"
+          ? body.status_marker
+          : "";
+    const commandCommentId = Number(body.command_comment_id);
+    const completionCommentId = Number(body.completion_comment_id);
+    const observedAt = Number(body.observed_at);
+    if (
+      !canonicalTargetKey ||
+      (statusMarker !== null && !statusMarker) ||
+      !Number.isSafeInteger(commandCommentId) ||
+      commandCommentId < 1 ||
+      !Number.isSafeInteger(completionCommentId) ||
+      completionCommentId < 1 ||
+      !Number.isSafeInteger(observedAt) ||
+      observedAt < 1
+    ) {
+      return json({ error: "invalid_lifecycle_acknowledgement_receipt" }, 400);
+    }
+    try {
+      const result = this.lifecycleProjectionStore.observeCommandAcknowledgement({
+        canonicalTargetKey,
+        statusMarker,
+        commandCommentId,
+        completionCommentId,
+        observedAt,
+      });
+      if (result.accepted && result.projection) {
+        const state = this.readStateSync();
+        const drivers = Object.values(state.items).filter((item) => {
+          if (!item.terminalFinalization) return false;
+          const identity = exactReviewTerminalFinalizationProjection(item, item.revision);
+          return (
+            identity.canonicalTargetKey === result.projection?.canonicalTargetKey &&
+            identity.fenceKey === result.projection?.fenceKey &&
+            identity.revision === result.projection?.revision
+          );
+        });
+        if (drivers.length) {
+          for (const driver of drivers) delete state.items[driver.key];
+          await this.writeState(state);
+          await this.scheduleNext(state, observedAt);
+        }
+      }
+      return json({
+        ok: true,
+        accepted: result.accepted,
+        lifecycle_state: result.state,
+        acknowledgement_state: result.acknowledgement,
+        ...(result.projection ? { version: result.projection.version } : {}),
+      });
+    } catch (error) {
+      console.warn(`lifecycle acknowledgement receipt rejected: ${sanitizedServerError(error)}`);
+      return json({ error: "invalid_lifecycle_acknowledgement_receipt" }, 409);
+    }
+  }
+
+  private releaseLifecycleCommandAcknowledgement(value: unknown) {
+    const body = objectValue(value);
+    const identity = exactReviewLifecycleIdentity(body);
+    const attemptId = typeof body.attempt_id === "string" ? body.attempt_id : "";
+    const statusMarker =
+      body.status_marker === undefined || body.status_marker === null
+        ? null
+        : typeof body.status_marker === "string"
+          ? body.status_marker
+          : "";
+    const statusCommentId =
+      body.status_comment_id === undefined || body.status_comment_id === null
+        ? null
+        : Number(body.status_comment_id);
+    if (
+      !identity ||
+      !/^ack:[1-9]\d*$/.test(attemptId) ||
+      (statusMarker !== null && !statusMarker) ||
+      (statusCommentId !== null && (!Number.isSafeInteger(statusCommentId) || statusCommentId < 1))
+    ) {
+      return json({ error: "invalid_lifecycle_acknowledgement_failure" }, 400);
+    }
+    try {
+      const result = this.lifecycleProjectionStore.recordCommandAcknowledgementFailure({
+        ...identity,
+        attemptId,
+        statusMarker,
+        statusCommentId,
+        observedAt: Date.now(),
+      });
+      return json({
+        ok: true,
+        released: result.released,
+        lifecycle_state: lifecycleState(result.projection),
+        acknowledgement_state: commandAcknowledgementState(result.projection),
+        version: result.projection.version,
+      });
+    } catch (error) {
+      console.warn(`lifecycle acknowledgement release rejected: ${sanitizedServerError(error)}`);
+      return json({ error: "invalid_lifecycle_acknowledgement_failure" }, 409);
+    }
+  }
+
+  private async recordLifecycleTerminalDisposition(value: unknown) {
+    const body = objectValue(value);
+    const identity = exactReviewLifecycleIdentity(body);
+    const kind = exactReviewLifecycleTerminalDisposition(body.kind);
+    if (!identity || !kind) {
+      return json({ error: "invalid_lifecycle_terminal_disposition" }, 400);
+    }
+    try {
+      const now = Date.now();
+      const projection = this.lifecycleProjectionStore.recordTerminalDisposition({
+        ...identity,
+        kind,
+        observedAt: now,
+      });
+      const state = this.readStateSync();
+      const driverCancelled =
+        kind === "requeue" ? this.cancelTerminalFinalizationDrivers(state, identity) : false;
+      const driverChanged =
+        kind === "requeue"
+          ? false
+          : this.ensureLifecycleTerminalFinalizationDriver({
+              state,
+              projection,
+              terminalDisposition: kind,
+              now,
+            });
+      const receiptRemoved = this.removeTerminalizedLifecycleQueueItem(state, identity);
+      if (driverChanged || driverCancelled || receiptRemoved) {
+        await this.writeState(state);
+        await this.scheduleNext(state, now);
+      }
+      return json({
+        ok: true,
+        lifecycle_state: lifecycleState(projection),
+        acknowledgement_state: commandAcknowledgementState(projection),
+        version: projection.version,
+      });
+    } catch (error) {
+      console.warn(`lifecycle terminal disposition rejected: ${sanitizedServerError(error)}`);
+      return json({ error: "invalid_lifecycle_terminal_disposition" }, 409);
+    }
+  }
+
+  private requeueDirectLifecyclePublicationSync(
+    state: ExactReviewQueueState,
+    item: ExactReviewQueueItem,
+    now: number,
+  ) {
+    const publication = item.decision.publication;
+    if (publication?.directLifecycle?.plan.kind !== "requeue") {
+      throw new Error("direct lifecycle requeue requires an exact direct receipt");
+    }
+    const completedRevision = item.revision;
+    const decision: ExactReviewDecision = {
+      ...publication.producerDecision,
+      sourceAction:
+        publication.producerDecision.sourceAction === FAILED_REVIEW_SHARD_RECOVERY_SOURCE_ACTION
+          ? FAILED_REVIEW_SHARD_RECOVERY_SOURCE_ACTION
+          : EXACT_REVIEW_SOURCE_DRIFT_REQUEUE_SOURCE_ACTION,
+      supersedesInProgress: true,
+    };
+    // This is a new review revision, not a replay of the direct receipt. The
+    // old fenced projection retains its requeue terminal fact while the new
+    // item receives fresh admission and claim facts when it is dispatched.
+    clearExactReviewLease(item);
+    item.decision = decision;
+    item.admissionDeliveryId = `direct-lifecycle-requeue:${item.key}:${completedRevision}`;
+    item.ingressFingerprint = undefined;
+    item.state = "pending";
+    item.revision = Math.max(item.revision + 1, this.nextExactReviewItemRevisionSync(item.key));
+    item.createdAt = now;
+    item.updatedAt = now;
+    item.parkedReason = undefined;
+    item.parkedRecoveryAttempts = 0;
+    item.terminalFinalization = undefined;
+    item.attempts = 0;
+    item.publicationFailureAttempts = 0;
+    item.reviewFailureAttempts = 0;
+    item.firstFailureAt = undefined;
+    item.lastFailureReason = undefined;
+    clearExactReviewDispatchFailure(item);
+    Object.assign(item, exactReviewQueueDebouncedAttempt(state, decision, now, now, this.env));
+    advanceExactReviewSourceAuthorityWatermark(item, decision);
+    return {
+      requeued: true,
+      retried: false,
+      refreshed: false,
+      parked: false,
+      deadLetter: undefined,
+    };
+  }
+
   private publicationHeadRevisionSync(targetKey: string): number {
     const row = Array.from(
       this.storage.sql.exec(
@@ -5466,7 +6801,8 @@ export class ExactReviewQueue {
           item.state !== "pending" ||
           item.nextAttemptAt > now ||
           item.createdAt < cutoff ||
-          !exactReviewQueueIsPublication(item)
+          !exactReviewQueueIsPublication(item) ||
+          item.terminalFinalization
         ) {
           return [];
         }
@@ -5510,6 +6846,7 @@ export class ExactReviewQueue {
     this.directPublicationStore.ensureSchemaSync();
     this.recordSnapshotStore.ensureSchemaSync();
     this.stateWriterCoordinator.ensureSchemaSync();
+    this.lifecycleProjectionStore.ensureSchemaSync();
     let meta = this.readStorageMetaSync();
     let migratedLegacy = false;
     const legacy = this.storage.kv.get(EXACT_REVIEW_QUEUE_STATE_KEY) as
@@ -6825,7 +8162,14 @@ export class ExactReviewQueue {
     for (const item of Object.values(state.items).sort(
       (left, right) => left.updatedAt - right.updatedAt || left.key.localeCompare(right.key),
     )) {
-      if (!available || item.state !== "parked" || !exactReviewQueueIsPublication(item)) continue;
+      if (
+        !available ||
+        item.state !== "parked" ||
+        !exactReviewQueueIsPublication(item) ||
+        item.terminalFinalization
+      ) {
+        continue;
+      }
       const deadLetter = exactReviewDeadLetterInsert(
         item,
         item.lastFailureReason || "retry_exhausted",
@@ -7670,7 +9014,11 @@ export class ExactReviewQueue {
       for (const item of Object.values(state.items)) {
         // Block only new legacy admission. In-flight legacy publications must
         // retain their dispatch/lease expiry wake-ups while the rollout drains.
-        if (item.state === "pending" && exactReviewQueueIsPublication(item)) {
+        if (
+          item.state === "pending" &&
+          exactReviewQueueIsBatchablePublication(item) &&
+          !item.terminalFinalization
+        ) {
           legacyExcludedItemKeys.add(item.key);
         }
       }
@@ -8078,6 +9426,10 @@ function exactReviewPublicationFrom(value): ExactReviewPublication | null {
   const liveTerminalNoop = publication.liveTerminalNoop;
   const liveTerminalMissing = publication.liveTerminalMissing;
   const liveGuardedOpen = publication.liveGuardedOpen;
+  const hasDirectLifecycle = Object.hasOwn(publication, "directLifecycle");
+  const directLifecycle = hasDirectLifecycle
+    ? exactReviewDirectLifecycleReceiptFrom(publication.directLifecycle)
+    : undefined;
   if (!/^exact-review-\d{1,30}-[1-9]\d*$/.test(artifactName)) return null;
   if (!/^\d{1,30}$/.test(producerRunId)) return null;
   if (!Number.isSafeInteger(producerRunAttempt) || producerRunAttempt < 1) return null;
@@ -8093,6 +9445,7 @@ function exactReviewPublicationFrom(value): ExactReviewPublication | null {
   }
   if (protocolVersion === 2 && (leaseRevision === null || claimGeneration === null)) return null;
   if (!producerDecision) return null;
+  if (hasDirectLifecycle && !directLifecycle) return null;
   const liveOutcomes = [liveProceeded, liveTerminalNoop, liveTerminalMissing, liveGuardedOpen];
   if (liveOutcomes.some((outcome) => typeof outcome !== "boolean")) return null;
   if (liveOutcomes.filter(Boolean).length !== 1) return null;
@@ -8110,6 +9463,28 @@ function exactReviewPublicationFrom(value): ExactReviewPublication | null {
     liveTerminalMissing,
     liveGuardedOpen,
     producerDecision,
+    ...(directLifecycle ? { directLifecycle } : {}),
+  };
+}
+
+function exactReviewDirectLifecycleReceiptFrom(value): ExactReviewPublication["directLifecycle"] {
+  const receipt = objectValue(value);
+  const plan = objectValue(receipt.plan);
+  if (Object.keys(plan).length !== 1 || typeof plan.kind !== "string") return undefined;
+  if (!(DIRECT_PUBLICATION_LIFECYCLE_KINDS as readonly string[]).includes(plan.kind)) {
+    return undefined;
+  }
+  const receiptOutcome = receipt.receiptOutcome;
+  if (
+    receiptOutcome !== "accepted" &&
+    receiptOutcome !== "deduped" &&
+    receiptOutcome !== "superseded"
+  ) {
+    return undefined;
+  }
+  return {
+    plan: { kind: plan.kind as DirectPublicationLifecyclePlan["kind"] },
+    receiptOutcome,
   };
 }
 
@@ -8249,6 +9624,183 @@ function exactReviewClaimResponse(
     lease_revision: item.leaseRevision,
     claim_generation: claimGeneration,
     decision: item.leaseDecision,
+    ...(item.terminalFinalization
+      ? {
+          terminal_finalization: item.terminalFinalization,
+          lifecycle_projection: exactReviewTerminalFinalizationProjection(
+            item,
+            item.leaseRevision ?? item.revision,
+          ),
+        }
+      : {}),
+  };
+}
+
+type ExactReviewTerminalFinalizationTuple = {
+  leaseId: string;
+  itemKey: string;
+  leaseRevision: number;
+  claimGeneration: number;
+  runId: string;
+  runAttempt: number;
+};
+
+function exactReviewTerminalFinalizationTuple(
+  value: unknown,
+): ExactReviewTerminalFinalizationTuple | null {
+  const body = objectValue(value);
+  const leaseId = String(body.lease_id || "").trim();
+  const itemKey = String(body.item_key || "").trim();
+  const leaseRevision = Number(body.lease_revision);
+  const claimGeneration = Number(body.claim_generation);
+  const runId = String(body.run_id || "").trim();
+  const runAttempt = exactReviewRunAttempt(body.run_attempt);
+  if (
+    !leaseId ||
+    !itemKey ||
+    !/^\d+$/.test(runId) ||
+    !Number.isInteger(leaseRevision) ||
+    leaseRevision < 1 ||
+    !Number.isInteger(claimGeneration) ||
+    claimGeneration < 1 ||
+    runAttempt === null
+  ) {
+    return null;
+  }
+  return { leaseId, itemKey, leaseRevision, claimGeneration, runId, runAttempt };
+}
+
+function exactReviewTerminalFinalizationLeaseActive(
+  item: ExactReviewQueueItem | undefined,
+  tuple: ExactReviewTerminalFinalizationTuple,
+  now: number,
+  env: unknown,
+) {
+  return Boolean(
+    item &&
+    item.terminalFinalization &&
+    exactReviewQueueIsPublication(item) &&
+    item.state === "leased" &&
+    item.leaseId === tuple.leaseId &&
+    item.leaseRevision === tuple.leaseRevision &&
+    exactReviewClaimGeneration(item.claimGeneration) === tuple.claimGeneration &&
+    item.claimedRunId === tuple.runId &&
+    item.claimedRunAttempt === tuple.runAttempt &&
+    isLiveExactReviewLease(
+      item,
+      now,
+      exactReviewPublicationDispatchLeaseMs(env),
+      exactReviewHeartbeatGraceMs(env),
+    ),
+  );
+}
+
+function exactReviewTerminalFinalization(
+  disposition: Exclude<LifecycleTerminalDisposition, "requeue">,
+  projection?: ExactReviewLifecycleProjectionIdentity,
+): ExactReviewTerminalFinalization {
+  const withProjection = (finalization: Omit<ExactReviewTerminalFinalization, "projection">) => ({
+    ...finalization,
+    ...(projection ? { projection } : {}),
+  });
+  switch (disposition) {
+    case "dead_letter":
+      return withProjection({
+        disposition,
+        statusState: "Failed",
+        statusDetail:
+          "Durable publication exhausted its retry budget and was retained for operator dead-letter recovery.",
+      });
+    case "failure":
+      return withProjection({
+        disposition,
+        statusState: "Failed",
+        statusDetail:
+          "The exact review reached a durable terminal failure and needs operator attention.",
+      });
+    case "review_completed_routed":
+      return withProjection({
+        disposition,
+        statusState: "Complete",
+        statusDetail: "The durable review result and its route handoff completed.",
+      });
+    case "superseded":
+      return withProjection({
+        disposition,
+        statusState: "Complete",
+        statusDetail: "A newer review tuple already exists; this stale result was superseded.",
+      });
+    case "target_closed":
+      return withProjection({
+        disposition,
+        statusState: "Complete",
+        statusDetail: "The item is closed; no stale verdict was published.",
+      });
+    case "target_missing":
+      return withProjection({
+        disposition,
+        statusState: "Complete",
+        statusDetail:
+          "The repository is accessible but the item is missing; no stale verdict was published.",
+      });
+    case "policy_noop":
+      return withProjection({
+        disposition,
+        statusState: "Complete",
+        statusDetail: "The exact review reached a deterministic policy veto; no action was taken.",
+      });
+    case "guarded_open":
+      return withProjection({
+        disposition,
+        statusState: "Complete",
+        statusDetail:
+          "A deterministic remain-open guard blocked publication of a stale close verdict.",
+      });
+  }
+}
+
+function exactReviewTerminalFinalizationProjection(
+  item: Pick<ExactReviewQueueItem, "key" | "decision" | "terminalFinalization">,
+  revision: number,
+): ExactReviewLifecycleProjectionIdentity {
+  return (
+    item.terminalFinalization?.projection ?? {
+      canonicalTargetKey: `${item.decision.targetRepo}#${item.decision.itemNumber}`,
+      fenceKey: item.key,
+      revision,
+    }
+  );
+}
+
+function exactReviewTerminalFinalizationDriverKey(
+  identity: ExactReviewLifecycleProjectionIdentity,
+) {
+  return `terminal-finalization:${identity.fenceKey}:${identity.revision}`;
+}
+
+function exactReviewTerminalFinalizationDecision(
+  projection: ExactReviewLifecycleProjection,
+): ExactReviewDecision {
+  const separator = projection.canonicalTargetKey.lastIndexOf("#");
+  const targetRepo = projection.canonicalTargetKey.slice(0, separator);
+  const itemNumber = Number(projection.canonicalTargetKey.slice(separator + 1));
+  if (!targetRepo || !Number.isSafeInteger(itemNumber) || itemNumber < 1) {
+    throw new Error("invalid terminal finalization projection identity");
+  }
+  return {
+    targetRepo,
+    targetBranch: "main",
+    itemNumber,
+    itemKind: "issue",
+    sourceEvent: "issues",
+    sourceAction: EXACT_REVIEW_ARTIFACT_PUBLISH_SOURCE_ACTION,
+    supersedesInProgress: false,
+    ...(projection.admission.statusMarker === null
+      ? {}
+      : { commandStatusMarker: projection.admission.statusMarker }),
+    ...(projection.admission.statusCommentId === null
+      ? {}
+      : { statusCommentId: projection.admission.statusCommentId }),
   };
 }
 
@@ -8354,6 +9906,59 @@ function exactReviewPublicationCompletion(
 function exactReviewRunAttempt(value): number | null {
   const runAttempt = Number(value);
   return Number.isInteger(runAttempt) && runAttempt > 0 ? runAttempt : null;
+}
+
+function exactReviewLifecycleIdentity(value: Record<string, unknown>) {
+  const canonicalTargetKey = value.canonical_target_key;
+  const fenceKey = value.fence_key;
+  const revision = Number(value.revision);
+  if (
+    typeof canonicalTargetKey !== "string" ||
+    typeof fenceKey !== "string" ||
+    !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+#[1-9]\d*$/.test(canonicalTargetKey) ||
+    !fenceKey ||
+    fenceKey.length > 512 ||
+    /[\r\n]/.test(fenceKey) ||
+    !Number.isSafeInteger(revision) ||
+    revision < 1
+  ) {
+    return null;
+  }
+  return { canonicalTargetKey, fenceKey, revision };
+}
+
+function exactReviewGithubEffect(
+  operations: ReadonlyArray<{ section: string; content: string | null }>,
+) {
+  for (const operation of operations) {
+    if (operation.section !== "items" || operation.content === null) continue;
+    const commentId = /^review_comment_id:\s*([1-9]\d*)\s*$/m.exec(operation.content)?.[1];
+    const digest = /^review_comment_sha256:\s*([0-9a-f]{64})\s*$/m.exec(operation.content)?.[1];
+    if (!commentId || !digest) continue;
+    const parsedCommentId = Number(commentId);
+    if (Number.isSafeInteger(parsedCommentId) && parsedCommentId > 0) {
+      return { commentId: parsedCommentId, digest };
+    }
+  }
+  return null;
+}
+
+function exactReviewLifecycleTerminalDisposition(
+  value: unknown,
+): LifecycleTerminalDisposition | null {
+  return [
+    "review_completed_routed",
+    "superseded",
+    "requeue",
+    "dead_letter",
+    "target_closed",
+    "target_missing",
+    "policy_noop",
+    "guarded_open",
+    "failure",
+  ].includes(value as LifecycleTerminalDisposition)
+    ? (value as LifecycleTerminalDisposition)
+    : null;
 }
 
 function exactReviewDeadLetterIds(value): string[] | null {
@@ -8581,6 +10186,47 @@ export function exactReviewClaimedRuns(value): ExactReviewClaimedRun[] | null {
     runs.push({ runId, runAttempt, claimGeneration });
   }
   return runs;
+}
+
+function exactReviewLifecycleCompletionDisposition({
+  projection,
+  outcome,
+  publicationCompletion,
+  requeued,
+  parked,
+  deadLetter,
+  lifecycleTerminal,
+}: {
+  projection: ExactReviewLifecycleProjection | null;
+  outcome: ExactReviewCompletionOutcome;
+  publicationCompletion?: ExactReviewPublicationCompletion;
+  requeued: boolean;
+  parked: boolean;
+  deadLetter: boolean;
+  lifecycleTerminal?: LifecycleTerminalDisposition;
+}): LifecycleTerminalDisposition | null {
+  if (deadLetter) return "dead_letter";
+  if (requeued || parked) return "requeue";
+  if (lifecycleTerminal) return lifecycleTerminal;
+  if (publicationCompletion?.kind === "superseded") {
+    return publicationCompletion.reasonCode === "remote_closed" ? "target_closed" : "superseded";
+  }
+  if (publicationCompletion?.kind === "permanent_failure") return "failure";
+  if (
+    publicationCompletion?.kind === "deferred" &&
+    publicationCompletion.reasonCode === "close_coverage_deferred" &&
+    projection?.routerReceipt?.outcome === "durable"
+  ) {
+    return "review_completed_routed";
+  }
+  if (
+    publicationCompletion?.kind === "retryable_failure" ||
+    publicationCompletion?.kind === "refresh_required" ||
+    publicationCompletion?.kind === "deferred"
+  ) {
+    return "requeue";
+  }
+  return outcome === "failure" || outcome === "cancelled" ? "failure" : null;
 }
 
 function finishExactReviewPublicationQueueItem({
@@ -9050,6 +10696,7 @@ function expireExactReviewPublicationItems(state: ExactReviewQueueState, now: nu
     const publication = item.decision.publication;
     if (
       item.state !== "pending" ||
+      item.terminalFinalization ||
       !publication ||
       now < item.createdAt + EXACT_REVIEW_ARTIFACT_RETRY_MAX_MS
     ) {
@@ -9193,8 +10840,49 @@ function exactReviewQueueIsPublication(item: Pick<ExactReviewQueueItem, "decisio
   return item.decision.sourceAction === EXACT_REVIEW_ARTIFACT_PUBLISH_SOURCE_ACTION;
 }
 
+function exactReviewQueueIsBatchablePublication(
+  item: Pick<ExactReviewQueueItem, "decision" | "terminalFinalization">,
+) {
+  // A direct receipt's router/terminal plan is immutable per fenced revision.
+  // Batch publication has no lifecycle-plan replay step, so only the normal
+  // publisher may recover a pending direct receipt.
+  return (
+    exactReviewQueueIsPublication(item) &&
+    !item.terminalFinalization &&
+    !item.decision.publication?.directLifecycle
+  );
+}
+
 function exactReviewQueueHasCommandContext(item: Pick<ExactReviewQueueItem, "decision">) {
-  return Boolean(item.decision.commandStatusMarker || item.decision.statusCommentId);
+  const command = exactReviewQueueCommandStatusAddress(item.decision);
+  return Boolean(command.statusMarker || command.statusCommentId);
+}
+
+function exactReviewQueueCommandStatusAddress(decision: ExactReviewDecision) {
+  return {
+    statusMarker:
+      decision.publication?.producerDecision.commandStatusMarker ??
+      decision.commandStatusMarker ??
+      null,
+    statusCommentId:
+      decision.publication?.producerDecision.statusCommentId ?? decision.statusCommentId ?? null,
+  };
+}
+
+function exactReviewTerminalFinalizationSharesCommandStatus(
+  item: Pick<ExactReviewQueueItem, "decision">,
+  successor: ExactReviewDecision,
+) {
+  const current = exactReviewQueueCommandStatusAddress(item.decision);
+  const next = exactReviewQueueCommandStatusAddress(successor);
+  return (
+    (current.statusCommentId !== null &&
+      next.statusCommentId !== null &&
+      current.statusCommentId === next.statusCommentId) ||
+    (current.statusMarker !== null &&
+      next.statusMarker !== null &&
+      current.statusMarker === next.statusMarker)
+  );
 }
 
 type ExactReviewLegacyPublicationAuthority = {
@@ -9223,6 +10911,7 @@ function exactReviewLegacyPublicationAuthorityIndex(
   };
 
   for (const item of Object.values(state.items)) {
+    if (item.terminalFinalization) continue;
     const publication = item.decision.publication;
     const targetKey = (publication?.itemKey || item.key).toLowerCase();
     const authority = authorityFor(targetKey);
@@ -9307,6 +10996,7 @@ function exactReviewLegacyStateBatchPublicationAuthorityIndex(
   };
 
   for (const item of Object.values(state.items)) {
+    if (item.terminalFinalization) continue;
     const publication = item.decision.publication;
     const targetKey = (publication?.itemKey || item.key).toLowerCase();
     const authority = authorityFor(targetKey);
@@ -9342,7 +11032,7 @@ function exactReviewLegacyStateBatchTerminalPublicationCandidate(
   if (
     !publication ||
     publication.protocolVersion !== 2 ||
-    publication.sourceSha === EXACT_REVIEW_DIRECT_PUBLICATION_SOURCE_SHA ||
+    item.key === publication.itemKey ||
     !publication.liveProceeded ||
     !revision ||
     !exactReviewQueueIsPublication(item) ||
@@ -9614,20 +11304,28 @@ export function exactReviewQueueAdmittedItems(
 
   const admittedPublications: ExactReviewQueueItem[] = [];
   const admittedPublicationItems = new Set<string>();
-  if (!publicationAdmissionBlocked) {
-    for (const item of pendingPublications) {
-      if (activePublishers >= publicationCapacity) break;
-      // Distinct publication events may target the same durable record path. A batch
-      // must serialize those events across commits or their prepared mutations can
-      // disagree even though their queue keys and fencing revisions are independent.
-      const publicationItem = uniquePublicationItems
-        ? `${item.decision.targetRepo.toLowerCase()}#${item.decision.itemNumber}`
-        : "";
-      if (uniquePublicationItems && admittedPublicationItems.has(publicationItem)) continue;
-      activePublishers += 1;
-      if (uniquePublicationItems) admittedPublicationItems.add(publicationItem);
-      admittedPublications.push(item);
+  for (const item of pendingPublications) {
+    // Batching owns publication work, but a committed terminal driver owns no
+    // publication. It must use the normal dispatcher to reach the dedicated
+    // fenced acknowledgement finalizer.
+    if (
+      publicationAdmissionBlocked &&
+      !item.terminalFinalization &&
+      exactReviewQueueIsBatchablePublication(item)
+    ) {
+      continue;
     }
+    if (activePublishers >= publicationCapacity) break;
+    // Distinct publication events may target the same durable record path. A batch
+    // must serialize those events across commits or their prepared mutations can
+    // disagree even though their queue keys and fencing revisions are independent.
+    const publicationItem = uniquePublicationItems
+      ? `${item.decision.targetRepo.toLowerCase()}#${item.decision.itemNumber}`
+      : "";
+    if (uniquePublicationItems && admittedPublicationItems.has(publicationItem)) continue;
+    activePublishers += 1;
+    if (uniquePublicationItems) admittedPublicationItems.add(publicationItem);
+    admittedPublications.push(item);
   }
 
   // Review admission owns its capacity and is intentionally ordered first.
@@ -10499,8 +12197,9 @@ function exactReviewPublicationBatchDeparture(
     Object.values(state.items)
       .filter(
         (item) =>
-          exactReviewQueueIsPublication(item) &&
+          exactReviewQueueIsBatchablePublication(item) &&
           item.state === "pending" &&
+          !item.terminalFinalization &&
           !ownedItemKeys.has(item.key),
       )
       .sort((left, right) => left.createdAt - right.createdAt || left.key.localeCompare(right.key)),
@@ -11065,12 +12764,14 @@ async function dispatchClawsweeperItem({
   itemKey,
   leaseId,
   leaseRevision,
+  terminalFinalization,
 }: {
   token: string;
   decision: ExactReviewDecision;
   itemKey: string;
   leaseId: string;
   leaseRevision: number;
+  terminalFinalization?: ExactReviewTerminalFinalization;
 }) {
   // Keep the v1 fields during the rolling-upgrade window. Old workflows consume
   // this immutable dispatch snapshot, while v2 workflows ignore it after claim
@@ -11106,7 +12807,9 @@ async function dispatchClawsweeperItem({
         item_number: decision.itemNumber,
         item_kind: decision.itemKind,
         source_event: decision.sourceEvent,
-        source_action: decision.sourceAction,
+        source_action: terminalFinalization
+          ? "exact_review_command_acknowledgement"
+          : decision.sourceAction,
         supersedes_in_progress: decision.supersedesInProgress,
         ...(Object.keys(reviewOptions).length > 0 ? { review_options: reviewOptions } : {}),
       },

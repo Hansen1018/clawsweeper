@@ -22,7 +22,7 @@ const workflow = YAML.parse(source) as {
     {
       if: string;
       env: Record<string, string>;
-      steps: Array<{ name?: string; run?: string; uses?: string }>;
+      steps: Array<{ name?: string; if?: string; run?: string; uses?: string }>;
     }
   >;
 };
@@ -98,14 +98,38 @@ test("batch workflow signs queue ownership, isolates item failures, and commits 
   );
   assert.match(source, /--item-number "\$item_number"/);
   assert.match(prepareSource, /outcomePath\.replace\(\/\\\.json\$\/, "\.report\.md"\)/);
+  assert.match(source, /internal\/exact-review\/lifecycle\/router-receipt/);
+  assert.match(source, /internal\/exact-review\/lifecycle\/terminal-disposition/);
+  assert.match(source, /router-batch-not-required/);
+  assert.match(source, /router-batch/);
+  assert.match(source, /router-batch-proof/);
+  assert.match(source, /lifecycle_terminal="requeue"/);
+  assert.match(source, /lifecycle_terminal="target_closed"/);
+  assert.match(source, /lifecycle_terminal="target_missing"/);
+  assert.match(source, /lifecycle_terminal="superseded"/);
+  assert.doesNotMatch(source, /lifecycle_terminal="failure"/);
+  const lifecycleHandoff = source.indexOf("internal/exact-review/lifecycle/terminal-disposition");
+  const implementationDispatch = source.indexOf("dispatch-issue-implementation-candidates.mjs");
+  const postEffectsComplete = source.indexOf(".postEffectsComplete = true");
+  assert.ok(
+    lifecycleHandoff >= 0 &&
+      lifecycleHandoff < implementationDispatch &&
+      implementationDispatch < postEffectsComplete,
+  );
+  assert.doesNotMatch(source, /TARGET_GH_TOKEN/);
+  assert.doesNotMatch(source, /lifecycle\/command-ack\/attempt/);
+  assert.doesNotMatch(source, /repair:update-command-status/);
   assert.match(source, /internal\/exact-review\/enqueue/);
   assert.match(source, /source_drift_requeue/);
-  assert.match(source, /\.kind == "superseded" and \.disposition\.requeueLatestExpected == true/);
   assert.match(source, /state-receipt\.json/);
-  assert.match(source, /\.outcome == "accepted" or \.outcome == "deduped"/);
+  assert.match(source, /receipt_outcome/);
+  assert.match(source, /"permanent_failure"/);
   assert.match(source, /deferredCloseCoverageExpected == true/);
-  assert.match(source, /scheduled proof lane/);
+  assert.match(source, /lifecycle_deferred_coverage="true"/);
+  assert.match(source, /durable handoff completes this review lifecycle/);
+  assert.match(source, /jq '\.postEffectsRequired = true'/);
   assert.match(source, /jq '\.postEffectsComplete = true'/);
+  assert.match(cliSource, /outcome\.postEffectsRequired === true/);
   assert.match(source, /Capture runner start timestamp/);
   assert.match(source, /EXACT_REVIEW_BATCH_DISPATCH_ID/);
   assert.match(source, /Record batch preparation start/);
@@ -117,6 +141,31 @@ test("batch workflow signs queue ownership, isolates item failures, and commits 
   assert.match(cliSource, /optionalDispatchTelemetry/);
   assert.match(cliSource, /optionalRunnerTelemetry/);
   assert.match(cliSource, /if \(!startedAt\) return undefined;/);
+
+  const healthyMembers = workflow.jobs.publish!.steps.find(
+    (step) => step.name === "Finalize healthy members under a fenced heartbeat",
+  );
+  assert.ok(healthyMembers, "missing healthy member finalizer");
+  assert.match(
+    healthyMembers.run ?? "",
+    /permanent publisher result remains retryable until the durable/,
+  );
+  assert.match(healthyMembers.run ?? "", /\[ "\$outcome_kind" = "permanent_failure" \].*continue/s);
+  const implementationBlock = (healthyMembers.run ?? "").slice(
+    (healthyMembers.run ?? "").indexOf("# The optional implementation lane"),
+    (healthyMembers.run ?? "").indexOf('report_path="${outcome_path%.json}.report.md"'),
+  );
+  assert.match(
+    implementationBlock,
+    /\{ \[ "\$receipt_outcome" = "accepted" \] \|\| \[ "\$receipt_outcome" = "deduped" \]; \} &&/,
+  );
+  assert.doesNotMatch(implementationBlock, /superseded|permanent/);
+  assert.equal(
+    workflow.jobs.publish!.steps.some(
+      (step) => step.name === "Acknowledge terminal batch command lifecycle status",
+    ),
+    false,
+  );
 });
 
 test("exact-review producer uses direct publication with bounded legacy fallback", () => {

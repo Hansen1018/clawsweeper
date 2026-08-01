@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 import { setTimeout as sleep } from "node:timers/promises";
+import { appendFileSync } from "node:fs";
 import { ghJsonWithRetry, ghPagedWithRetry, ghText } from "./github-cli.js";
+import { isLockedConversationCommentError } from "../github-retry.js";
 import type { JsonValue, LooseRecord } from "./json-types.js";
 import { repoRoot } from "./paths.js";
 import { DEFAULT_TRUSTED_BOTS } from "./config.js";
@@ -32,6 +34,21 @@ type Options = {
   detail: string;
   runUrl: string;
   waitMs: number;
+  requireMutation: boolean;
+  lockedConversationTerminalSkip: boolean;
+  verifyTerminalStatusReceipt: boolean;
+};
+
+type CommandStatusUpdateOutcome = "completed" | "unchanged" | "skipped" | "locked_conversation";
+
+type TerminalStatusReceipt = {
+  commandCommentId: number;
+  completionCommentId: number;
+};
+
+type CommandStatusUpdateResult = {
+  outcome: CommandStatusUpdateOutcome;
+  terminalStatusReceipt?: TerminalStatusReceipt;
 };
 
 if (import.meta.url === `file://${process.argv[1]}`) {
@@ -39,7 +56,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   await runCommandStatusUpdate(options);
 }
 
-async function updateCommandStatus(options: Options) {
+async function updateCommandStatus(options: Options): Promise<CommandStatusUpdateResult> {
   const lifecycle = commandStatusLifecycle(options);
   if (!options.marker && !options.statusCommentId) {
     recordCommandProgress(lifecycle, {
@@ -47,11 +64,19 @@ async function updateCommandStatus(options: Options) {
       status: "skipped",
       mutation: false,
     });
-    return;
+    if (options.requireMutation)
+      throw new Error("command status mutation required but no address was provided");
+    return { outcome: "skipped" };
   }
   validateRepo(options.repo);
   validateItemNumber(options.itemNumber);
-  const comment = await findCommandStatusComment(options, lifecycle);
+  let comment: LooseRecord | null;
+  try {
+    comment = await findCommandStatusComment(options, lifecycle);
+  } catch (error) {
+    if (!recordTerminalLockedConversationSkip(options, lifecycle, error)) throw error;
+    return { outcome: "locked_conversation" };
+  }
   if (!comment?.id || typeof comment.body !== "string") {
     console.warn(`No command status comment found for ${options.repo}#${options.itemNumber}.`);
     recordCommandProgress(lifecycle, {
@@ -59,7 +84,18 @@ async function updateCommandStatus(options: Options) {
       status: "skipped",
       mutation: false,
     });
-    return;
+    if (options.requireMutation)
+      throw new Error("command status mutation required but no comment was found");
+    return { outcome: "skipped" };
+  }
+  const terminalStatusReceipt = verifiedTerminalStatusReceipt(comment, options);
+  if (terminalStatusReceipt) {
+    recordCommandProgress(lifecycle, {
+      state: options.state,
+      status: "unchanged",
+      mutation: false,
+    });
+    return { outcome: "unchanged", terminalStatusReceipt };
   }
   const body = mergeCommandProgressSection(comment.body, options);
   if (body === comment.body) {
@@ -68,38 +104,48 @@ async function updateCommandStatus(options: Options) {
       status: "unchanged",
       mutation: false,
     });
-    return;
+    return { outcome: "unchanged" };
   }
   const payload = writePayload(repoRoot(), `command-status-progress-${comment.id}`, { body });
-  runCommandLifecycleMutation(lifecycle, {
-    kind: "status_comment_update",
-    identity: {
-      repository: options.repo,
-      commentId: comment.id,
-      bodySha256: commentBodySha256(body),
-    },
-    component: "command_status",
-    operation: () =>
-      ghText([
-        "api",
-        `repos/${options.repo}/issues/comments/${comment.id}`,
-        "--method",
-        "PATCH",
-        "--input",
-        payload,
-      ]),
-  });
+  try {
+    runCommandLifecycleMutation(lifecycle, {
+      kind: "status_comment_update",
+      identity: {
+        repository: options.repo,
+        commentId: comment.id,
+        bodySha256: commentBodySha256(body),
+      },
+      component: "command_status",
+      operation: () =>
+        ghText([
+          "api",
+          `repos/${options.repo}/issues/comments/${comment.id}`,
+          "--method",
+          "PATCH",
+          "--input",
+          payload,
+        ]),
+    });
+  } catch (error) {
+    if (!recordTerminalLockedConversationSkip(options, lifecycle, error)) throw error;
+    return { outcome: "locked_conversation" };
+  }
   recordCommandProgress(lifecycle, {
     state: options.state,
     status: "completed",
     mutation: true,
   });
+  return { outcome: "completed" };
 }
 
 async function runCommandStatusUpdate(options: Options) {
   let commandError: unknown = null;
+  let outcome: CommandStatusUpdateOutcome | null = null;
+  let terminalStatusReceipt: TerminalStatusReceipt | undefined;
   try {
-    await updateCommandStatus(options);
+    const result = await updateCommandStatus(options);
+    outcome = result.outcome;
+    terminalStatusReceipt = result.terminalStatusReceipt;
   } catch (error) {
     commandError = error;
     recordCommandLifecycleFailure(commandStatusLifecycle(options), {
@@ -120,7 +166,43 @@ async function runCommandStatusUpdate(options: Options) {
       commandError = error;
     }
   }
+  if (!commandError && outcome === "locked_conversation" && process.env.GITHUB_OUTPUT) {
+    appendFileSync(process.env.GITHUB_OUTPUT, "locked_conversation=true\n");
+  }
+  if (!commandError && terminalStatusReceipt && process.env.GITHUB_OUTPUT) {
+    appendFileSync(
+      process.env.GITHUB_OUTPUT,
+      [
+        "terminal_status_verified=true",
+        `command_comment_id=${terminalStatusReceipt.commandCommentId}`,
+        `completion_comment_id=${terminalStatusReceipt.completionCommentId}`,
+        "",
+      ].join("\n"),
+    );
+  }
   if (commandError) throw commandError;
+}
+
+export function terminalLockedConversationSkip(
+  options: Pick<Options, "lockedConversationTerminalSkip">,
+  error: unknown,
+) {
+  return options.lockedConversationTerminalSkip && isLockedConversationCommentError(error);
+}
+
+function recordTerminalLockedConversationSkip(
+  options: Options,
+  lifecycle: CommandLifecycleInput,
+  error: unknown,
+) {
+  if (!terminalLockedConversationSkip(options, error)) return false;
+  console.warn("Command status update skipped because the conversation is locked.");
+  recordCommandProgress(lifecycle, {
+    state: "locked_conversation",
+    status: "skipped",
+    mutation: false,
+  });
+  return true;
 }
 
 function commandStatusLifecycle(options: Options): CommandLifecycleInput {
@@ -342,6 +424,80 @@ export function mergeCommandProgressSection(
   return `${body.trimEnd()}\n\n${section}`;
 }
 
+export function verifiedTerminalStatusReceipt(
+  comment: Pick<LooseRecord, "id" | "body">,
+  options: Pick<
+    Options,
+    "verifyTerminalStatusReceipt" | "marker" | "statusCommentId" | "state" | "detail"
+  >,
+): TerminalStatusReceipt | null {
+  if (!options.verifyTerminalStatusReceipt || (!options.marker && !options.statusCommentId))
+    return null;
+  const completionCommentId = Number(comment.id);
+  const commandCommentIds = commandAckCommentIdsFromBody(comment.body);
+  const statusMarkers = commandStatusMarkersFromBody(comment.body);
+  if (
+    !Number.isSafeInteger(completionCommentId) ||
+    !terminalProgressMatches(comment.body, options)
+  ) {
+    return null;
+  }
+  if (options.marker) {
+    if (
+      commandCommentIds.length !== 1 ||
+      statusMarkers.length !== 1 ||
+      statusMarkers[0] !== options.marker
+    ) {
+      return null;
+    }
+    return { commandCommentId: commandCommentIds[0]!, completionCommentId };
+  }
+  const statusCommentId = options.statusCommentId;
+  if (
+    statusCommentId === null ||
+    !Number.isSafeInteger(statusCommentId) ||
+    statusCommentId < 1 ||
+    completionCommentId !== statusCommentId ||
+    commandCommentIds.length !== 1 ||
+    statusMarkers.length !== 0
+  ) {
+    return null;
+  }
+  return { commandCommentId: commandCommentIds[0]!, completionCommentId };
+}
+
+function terminalProgressMatches(body: JsonValue, options: Pick<Options, "state" | "detail">) {
+  const progressBlocks = Array.from(
+    String(body ?? "").matchAll(
+      /<!--\s*clawsweeper-command-progress:start\s*-->([\s\S]*?)<!--\s*clawsweeper-command-progress:end\s*-->/gi,
+    ),
+  );
+  if (progressBlocks.length !== 1) return false;
+  const lines = progressBlocks[0]![1]!.split(/\r?\n/).map((line) => line.trimEnd());
+  const stateLines = lines.filter((line) => line.startsWith("- State: "));
+  const detailLines = lines.filter((line) => line.startsWith("- Detail: "));
+  return (
+    stateLines.length === 1 &&
+    detailLines.length === 1 &&
+    stateLines[0] === `- State: ${options.state}` &&
+    detailLines[0] === `- Detail: ${options.detail}`
+  );
+}
+
+function commandAckCommentIdsFromBody(body: JsonValue) {
+  return Array.from(
+    String(body ?? "").matchAll(/<!--\s*clawsweeper-command-ack:(\d+)\s*-->/g),
+    (match) => Number(match[1]),
+  ).filter((id) => Number.isSafeInteger(id) && id > 0);
+}
+
+function commandStatusMarkersFromBody(body: JsonValue) {
+  return Array.from(
+    String(body ?? "").matchAll(/<!--\s*clawsweeper-command-status:[^>]+-->/g),
+    (match) => match[0],
+  );
+}
+
 function renderCommandProgressSection(options: Pick<Options, "state" | "detail" | "runUrl">) {
   const lines = [
     PROGRESS_START,
@@ -382,6 +538,16 @@ export function parseOptions(argv: string[]): Options {
     detail: args.detail ?? process.env.COMMAND_STATUS_DETAIL ?? "",
     runUrl: args["run-url"] ?? process.env.RUN_URL ?? "",
     waitMs: Number.parseInt(args["wait-ms"] ?? process.env.COMMAND_STATUS_WAIT_MS ?? "0", 10) || 0,
+    requireMutation:
+      (args["require-mutation"] ?? process.env.COMMAND_STATUS_REQUIRE_MUTATION ?? "") === "true",
+    lockedConversationTerminalSkip:
+      (args["locked-conversation-terminal-skip"] ??
+        process.env.COMMAND_STATUS_LOCKED_CONVERSATION_TERMINAL_SKIP ??
+        "") === "true",
+    verifyTerminalStatusReceipt:
+      (args["verify-terminal-status-receipt"] ??
+        process.env.COMMAND_STATUS_VERIFY_TERMINAL_RECEIPT ??
+        "") === "true",
   };
 }
 
