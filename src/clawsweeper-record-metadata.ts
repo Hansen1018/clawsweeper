@@ -188,6 +188,10 @@ export function createRecordMetadata({
     isCloseProposal: boolean;
     commentSyncMinAgeDays: number;
     reviewCommentSyncedAt: string | undefined;
+    reviewCommentVerifiedAt?: string | undefined;
+    reviewedAt?: string | undefined;
+    lastFullReviewAt?: string | undefined;
+    guardedReviewedAt?: string | undefined;
     hasExistingReviewComment: boolean;
     needsReviewCommentBodySync: boolean;
     needsReviewCommentHashSync: boolean;
@@ -195,12 +199,29 @@ export function createRecordMetadata({
     forceReviewCommentBodySync?: boolean;
     now?: number;
   }): boolean {
+    const syncedAt = Date.parse(options.reviewCommentSyncedAt ?? "");
+    const verifiedAt = Date.parse(options.reviewCommentVerifiedAt ?? "");
+    const confirmedAt = Math.max(
+      Number.isFinite(syncedAt) ? syncedAt : 0,
+      Number.isFinite(verifiedAt) ? verifiedAt : 0,
+    );
+    const reviewedAt = Math.max(
+      Date.parse(options.reviewedAt ?? "") || 0,
+      Date.parse(options.lastFullReviewAt ?? "") || 0,
+      Date.parse(options.guardedReviewedAt ?? "") || 0,
+    );
+    const needsReviewCommentTimestampSync =
+      options.syncCommentsOnly &&
+      options.hasExistingReviewComment &&
+      (!Number.isFinite(syncedAt) ||
+        reviewedAt > confirmedAt ||
+        (options.now ?? Date.now()) - confirmedAt >= 7 * 24 * 60 * 60 * 1_000);
     if (
       !options.needsReviewCommentBodySync &&
       !options.needsReviewCommentHashSync &&
       !options.needsReviewCommentReferenceSync
     ) {
-      return false;
+      return needsReviewCommentTimestampSync;
     }
     if (!options.syncCommentsOnly || options.isCloseProposal) return true;
     if (options.forceReviewCommentBodySync && options.needsReviewCommentBodySync) return true;
