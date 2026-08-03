@@ -54,6 +54,7 @@ type TerminalStatusReceipt = {
 type CommandStatusUpdateResult = {
   outcome: CommandStatusUpdateOutcome;
   terminalStatusReceipt?: TerminalStatusReceipt;
+  terminalStatusCompletedAt?: string;
 };
 
 if (import.meta.url === `file://${process.argv[1]}`) {
@@ -113,7 +114,11 @@ async function updateCommandStatus(options: Options): Promise<CommandStatusUpdat
       status: "unchanged",
       mutation: false,
     });
-    return { outcome: "unchanged", terminalStatusReceipt };
+    return {
+      outcome: "unchanged",
+      terminalStatusReceipt,
+      terminalStatusCompletedAt: verifiedTerminalStatusCompletedAt(comment),
+    };
   }
   const body = mergeCommandProgressSection(comment.body, options);
   if (body === comment.body) {
@@ -125,8 +130,9 @@ async function updateCommandStatus(options: Options): Promise<CommandStatusUpdat
     return { outcome: "unchanged" };
   }
   const payload = writePayload(repoRoot(), `command-status-progress-${comment.id}`, { body });
+  let mutationResponse: string;
   try {
-    runCommandLifecycleMutation(lifecycle, {
+    mutationResponse = runCommandLifecycleMutation(lifecycle, {
       kind: "status_comment_update",
       identity: {
         repository: options.repo,
@@ -153,17 +159,30 @@ async function updateCommandStatus(options: Options): Promise<CommandStatusUpdat
     status: "completed",
     mutation: true,
   });
-  return { outcome: "completed" };
+  const verifiedReceipt = verifiedTerminalStatusReceipt({ ...comment, body }, options);
+  return {
+    outcome: "completed",
+    ...(verifiedReceipt
+      ? {
+          terminalStatusReceipt: verifiedReceipt,
+          terminalStatusCompletedAt: verifiedTerminalStatusCompletedAt(
+            JSON.parse(mutationResponse),
+          ),
+        }
+      : {}),
+  };
 }
 
 async function runCommandStatusUpdate(options: Options) {
   let commandError: unknown = null;
   let outcome: CommandStatusUpdateOutcome | null = null;
   let terminalStatusReceipt: TerminalStatusReceipt | undefined;
+  let terminalStatusCompletedAt: string | undefined;
   try {
     const result = await updateCommandStatus(options);
     outcome = result.outcome;
     terminalStatusReceipt = result.terminalStatusReceipt;
+    terminalStatusCompletedAt = result.terminalStatusCompletedAt;
   } catch (error) {
     commandError = error;
     recordCommandLifecycleFailure(commandStatusLifecycle(options), {
@@ -197,11 +216,20 @@ async function runCommandStatusUpdate(options: Options) {
         "terminal_status_verified=true",
         `command_comment_id=${terminalStatusReceipt.commandCommentId}`,
         `completion_comment_id=${terminalStatusReceipt.completionCommentId}`,
+        `completion_completed_at=${terminalStatusCompletedAt}`,
         "",
       ].join("\n"),
     );
   }
   if (commandError) throw commandError;
+}
+
+function verifiedTerminalStatusCompletedAt(comment: LooseRecord): string {
+  const completedAt = String(comment.updated_at ?? "").trim();
+  if (!completedAt || !Number.isFinite(Date.parse(completedAt))) {
+    throw new Error("verified terminal status comment has no valid update timestamp");
+  }
+  return completedAt;
 }
 
 export function terminalLockedConversationSkip(
@@ -262,6 +290,13 @@ async function findCommandStatusComment(
     }
     const match = selectCommandStatusComment(comments, options);
     if (match) {
+      if (
+        options.statusCommentId &&
+        Number(match.id) !== options.statusCommentId &&
+        (!exact || statusMarkerDiffersFromRequested(exact.body, options.marker))
+      ) {
+        options.statusCommentId = Number(match.id);
+      }
       pruneDuplicateCommandAckComments({ comments, keep: match, options, lifecycle });
       return match;
     }
@@ -464,14 +499,18 @@ export function verifiedTerminalStatusReceipt(
     return null;
   }
   if (options.marker) {
-    if (
-      commandCommentIds.length !== 1 ||
-      statusMarkers.length !== 1 ||
-      statusMarkers[0] !== options.marker
-    ) {
+    if (statusMarkers.length !== 1 || statusMarkers[0] !== options.marker) {
       return null;
     }
-    return { commandCommentId: commandCommentIds[0]!, completionCommentId };
+    const commandCommentId =
+      commandCommentIds.length === 1
+        ? commandCommentIds[0]!
+        : commandCommentIds.length === 0 &&
+            !hasCommandAckMarker(comment.body) &&
+            (options.statusCommentId === null || completionCommentId === options.statusCommentId)
+          ? legacyCommandCommentId(comment.body, options.marker)
+          : null;
+    return commandCommentId === null ? null : { commandCommentId, completionCommentId };
   }
   const statusCommentId = options.statusCommentId;
   if (
@@ -510,6 +549,27 @@ function commandAckCommentIdsFromBody(body: JsonValue) {
     String(body ?? "").matchAll(/<!--\s*clawsweeper-command-ack:(\d+)\s*-->/g),
     (match) => Number(match[1]),
   ).filter((id) => Number.isSafeInteger(id) && id > 0);
+}
+
+function hasCommandAckMarker(body: JsonValue) {
+  return /<!--\s*clawsweeper-command-ack:[^>]*-->/.test(String(body ?? ""));
+}
+
+function legacyCommandCommentId(body: JsonValue, statusMarker: string) {
+  const status = /^<!--\s*clawsweeper-command-status:\d+:([^:\s>]+):([^:\s>]+)\s*-->$/.exec(
+    statusMarker,
+  );
+  if (!status) return null;
+  const commands = Array.from(
+    String(body ?? "").matchAll(
+      /<!--\s*clawsweeper-command:(\d+):(?:[^>]*:)?([^:\s>]+):([^:\s>]+)\s*-->/g,
+    ),
+  );
+  if (commands.length !== 1 || commands[0]![2] !== status[1] || commands[0]![3] !== status[2]) {
+    return null;
+  }
+  const commandCommentId = Number(commands[0]![1]);
+  return Number.isSafeInteger(commandCommentId) && commandCommentId > 0 ? commandCommentId : null;
 }
 
 function commandStatusMarkersFromBody(body: JsonValue) {

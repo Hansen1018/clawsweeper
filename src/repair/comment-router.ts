@@ -113,6 +113,7 @@ import {
   isGitHubAppIntegrationAuthError,
   readLedger,
   routerDispatchReceiptKey,
+  routedCommentSourceDeliveryId,
   selectCommentsForRouting,
   shouldSuppressProcessedCommentVersion,
   stripAnsi,
@@ -224,9 +225,14 @@ if (exactCommentVersionFastPath.suppress && !exactCommentVersionFastPathCommand)
   exactCommentVersionFastPath = { suppress: false, reason: "source_drift" };
 }
 const priorDispatchClaims = new Map<string, LooseRecord>();
+const priorCommandDeliveryClaims = new Map<string, LooseRecord>();
 for (const entry of ledger.commands ?? []) {
-  if (entry.status !== "claimed") continue;
-  for (const key of dispatchClaimLookupKeys(entry)) priorDispatchClaims.set(key, entry);
+  if (entry.status === "claimed") {
+    for (const key of dispatchClaimLookupKeys(entry)) priorDispatchClaims.set(key, entry);
+  }
+  if (!["claimed", "waiting"].includes(String(entry.status ?? ""))) continue;
+  if (!entry.source_delivery_id && entry.source_delivery_conflict !== true) continue;
+  for (const key of dispatchClaimLookupKeys(entry)) priorCommandDeliveryClaims.set(key, entry);
 }
 const processedCommentVersions = forceReprocess
   ? new Set()
@@ -476,9 +482,29 @@ function routedCommandForComment(comment: JsonValue): LooseRecord | null {
   const parsed: LooseRecord = parseRoutedCommentCommand(comment, { trustedAuthors: trustedBots });
   if (!parsed) return null;
   const issueNumber = issueNumberFromUrl(comment.issue_url);
-  return {
+  const commandIdentity = {
     idempotency_key: idempotencyKey(parsed, issueNumber, comment.id, comment.updated_at),
     comment_id: String(comment.id),
+    comment_updated_at: comment.updated_at,
+    ...forcedReplayCommandFields({ forceReprocess, attemptId }),
+  };
+  const sourceDeliveryId = routedCommentSourceDeliveryId({
+    comment,
+    event: {
+      authenticated:
+        args["comment-event-auth"] === "github_webhook_v1" &&
+        args["source-event"] === "issue_comment" &&
+        isAllowedMutationActor(args["dispatch-actor"], trustedBots),
+      commentId: commentIds.size === 1 ? [...commentIds][0] : null,
+      commentUpdatedAt: args["comment-updated-at"],
+      commentBodySha256: args["comment-body-sha256"],
+      sourceDeliveryId: args["source-delivery-id"],
+    },
+    priorClaim: priorCommandDeliveryClaim(commandIdentity),
+    targetRepo,
+  });
+  return {
+    ...commandIdentity,
     comment_version_key: commentVersionKey({
       comment_id: comment.id,
       comment_updated_at: comment.updated_at,
@@ -493,6 +519,7 @@ function routedCommandForComment(comment: JsonValue): LooseRecord | null {
     comment_created_at: comment.created_at,
     comment_updated_at: comment.updated_at,
     comment_body_sha256: commentBodySha256(comment.body),
+    ...(sourceDeliveryId ? { source_delivery_id: sourceDeliveryId } : {}),
     status_comment_id:
       statusCommentId &&
       commentIds.size <= 1 &&
@@ -578,6 +605,14 @@ function actionNeedsDurableDispatchClaim(action: JsonValue) {
 function priorDispatchClaim(command: LooseRecord) {
   for (const key of dispatchClaimLookupKeys(command)) {
     const claim = priorDispatchClaims.get(key);
+    if (claim) return claim;
+  }
+  return null;
+}
+
+function priorCommandDeliveryClaim(command: LooseRecord) {
+  for (const key of dispatchClaimLookupKeys(command)) {
+    const claim = priorCommandDeliveryClaims.get(key);
     if (claim) return claim;
   }
   return null;
@@ -3269,6 +3304,9 @@ function trustedAutomationReviewLeaseBlockReason(
 }
 
 function dispatchClawSweeperReview(command: LooseRecord): LooseRecord {
+  const requiresCommandStatus = ["re_review", "autofix", "automerge"].includes(
+    String(command.intent ?? ""),
+  );
   let dispatchKey = dispatchReceiptKey(command);
   const expectedTitle = `Review event item ${command.repo}#${command.issue_number} [${dispatchKey}]`;
   const claimed = claimedDispatchState({
@@ -3278,6 +3316,10 @@ function dispatchClawSweeperReview(command: LooseRecord): LooseRecord {
     expectedTitle,
   });
   if (claimed) return { ...claimed, workflow: reviewWorkflow, repo: reviewRepo };
+  if (requiresCommandStatus) {
+    const retainedStatusComment = findExistingCommandStatusComment(command);
+    if (retainedStatusComment?.id) command.status_comment_id = Number(retainedStatusComment.id);
+  }
   dispatchKey = dispatchReceiptKey(command);
   const reviewBudget =
     command.target?.kind === "pull_request"
@@ -3288,7 +3330,7 @@ function dispatchClawSweeperReview(command: LooseRecord): LooseRecord {
   const fallbackCodexTimeoutMs = reviewBudget
     ? reviewBudget.codexTimeoutMs + MAX_MEDIA_PREPROCESSING_TIMEOUT_MS
     : null;
-  const commandStatus = ["re_review", "autofix", "automerge"].includes(String(command.intent ?? ""))
+  const commandStatus = requiresCommandStatus
     ? {
         command_status_marker: commandStatusMarker(command),
         ...(command.status_comment_id
@@ -3304,11 +3346,16 @@ function dispatchClawSweeperReview(command: LooseRecord): LooseRecord {
       item_number: String(command.issue_number),
       item_kind: command.target?.kind ?? "",
       dispatch_key: dispatchKey,
+      ...(command.source_delivery_id
+        ? { source_delivery_id: String(command.source_delivery_id) }
+        : {}),
       additional_prompt: freeformReviewPrompt(command),
       ...(reviewBudget
         ? {
-            codex_timeout_ms: reviewBudget.codexTimeoutMs,
-            media_proof_timeout_ms: reviewBudget.mediaProofTimeoutMs,
+            review_options: {
+              codex_timeout_ms: reviewBudget.codexTimeoutMs,
+              media_proof_timeout_ms: reviewBudget.mediaProofTimeoutMs,
+            },
           }
         : {}),
       ...commandStatus,
@@ -4793,6 +4840,7 @@ function postComment(command: LooseRecord, body: string) {
         payloadPath,
       ],
     );
+    issueCommentsCache.delete(Number(command.issue_number));
     const precreatedId = Number(precreated?.id ?? 0) || 0;
     const existingId = Number(existing.id ?? 0) || 0;
     if (existingStatus && precreatedId > 0 && precreatedId !== existingId) {
@@ -4830,6 +4878,7 @@ function postComment(command: LooseRecord, body: string) {
       payloadPath,
     ],
   );
+  issueCommentsCache.delete(Number(command.issue_number));
   return { mode: "created", comment_id: null };
 }
 
@@ -5087,7 +5136,8 @@ function findExistingCommandStatusComment(command: LooseRecord) {
     : ["autofix"].includes(String(command.intent ?? ""))
       ? commandStatusMarkerPrefix(command)
       : null;
-  return ghPaged(`repos/${command.repo}/issues/${command.issue_number}/comments?per_page=100`)
+  return cachedIssueComments(command.issue_number)
+    .slice()
     .reverse()
     .find((comment: JsonValue) => {
       if (!isTrustedStatusComment(comment)) return false;
