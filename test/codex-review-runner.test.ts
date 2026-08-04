@@ -20,6 +20,30 @@ import {
 } from "../dist/clawsweeper.js";
 import { closeDecision, item, tmpPrefix } from "./helpers.ts";
 
+test("Codex decision schema avoids unsupported strict-output keywords recursively", () => {
+  const schema = JSON.parse(
+    readFileSync(join(process.cwd(), "schema", "clawsweeper-decision.schema.json"), "utf8"),
+  ) as unknown;
+  const forbidden = new Set(["oneOf", "allOf", "if", "then", "uniqueItems"]);
+  const found: string[] = [];
+
+  const visit = (value: unknown, path: string): void => {
+    if (!value || typeof value !== "object") return;
+    if (Array.isArray(value)) {
+      value.forEach((entry, index) => visit(entry, `${path}[${index}]`));
+      return;
+    }
+    for (const [key, child] of Object.entries(value)) {
+      const childPath = `${path}.${key}`;
+      if (forbidden.has(key)) found.push(childPath);
+      visit(child, childPath);
+    }
+  };
+
+  visit(schema, "$");
+  assert.deepEqual(found, []);
+});
+
 test("Codex failure logs distinguish provider throttling from content output failures", () => {
   assert.equal(
     codexFailureLogKindForTest(
@@ -343,6 +367,7 @@ test("codex failure decisions expose stderr and stdout separately", () => {
     decision.evidence.find((entry) => entry.label === "codex stderr")?.detail,
     "user\nThe reviewed prompt discusses rate limits.",
   );
+  assert.equal(decision.regressionAssessment, null);
   assert.match(
     decision.evidence.find((entry) => entry.label === "codex stdout")?.detail ?? "",
     /"type":"turn.failed"/,

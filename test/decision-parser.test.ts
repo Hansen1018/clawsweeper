@@ -445,6 +445,18 @@ test("decision parser accepts non-blaming regression assessments only with norma
       parseDecision(
         closeDecision({
           regressionAssessment: {
+            confidence: "probable",
+            supportingEvidence: ["reproduction", "reproduction"],
+          },
+        }),
+      ),
+    /decision\.regressionAssessment has insufficient or duplicate supporting evidence/,
+  );
+  assert.throws(
+    () =>
+      parseDecision(
+        closeDecision({
+          regressionAssessment: {
             confidence: "confirmed",
             supportingEvidence: ["reproduction", "reviewed_change"],
           },
