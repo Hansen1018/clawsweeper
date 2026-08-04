@@ -690,6 +690,7 @@ ${extra}
       fixedSha: null,
       fixedAt: null,
       fixedPullRequest: null,
+      regressionAssessment: null,
       regressionProvenance: null,
       closeComment: "",
       workCandidate: "none",
