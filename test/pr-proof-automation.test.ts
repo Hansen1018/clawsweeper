@@ -207,6 +207,218 @@ Full review comments:
   assert.doesNotMatch(markers, /clawsweeper-verdict:pass/);
 });
 
+test("maintainer and bot proof exemptions keep readiness, ratings, and security consistent", () => {
+  const reportFor = (options: {
+    author: string;
+    association: string;
+    status?: "missing" | "mock_only" | "insufficient" | "sufficient";
+    securityAttention?: boolean;
+  }) => {
+    const status = options.status ?? "missing";
+    const sufficient = status === "sufficient";
+    const proofTier = sufficient ? "A" : status === "missing" ? "F" : "D";
+    return `${reportFrontMatter({
+      type: "pull_request",
+      number: "119610",
+      decision: "keep_open",
+      close_reason: "none",
+      review_status: "complete",
+      confidence: "high",
+      author: options.author,
+      author_association: options.association,
+      labels: JSON.stringify(["clawsweeper:automerge"]),
+      work_candidate: "none",
+      pull_head_sha: "abc123def456",
+    })}
+
+## Summary
+
+Keep this focused pull request open for maintainer review.
+
+## What This Changes
+
+Keeps pull request evidence checks aligned with their actual scope.
+
+## Best Possible Solution
+
+Continue normal maintainer review.
+
+${realBehaviorProofReportSection({
+  status,
+  evidenceKind: sufficient ? "terminal" : "none",
+  needsContributorAction: !sufficient,
+  summary: sufficient
+    ? "The maintainer supplied terminal output from the changed production path."
+    : "The reviewer did not find contributor-supplied live proof.",
+})}
+
+${prRatingReportSection({
+  overallTier: proofTier,
+  proofTier,
+  patchTier: "A",
+  summary: "The model capped readiness based on its recorded proof assessment.",
+  nextSteps: sufficient ? "- none" : "- Add real behavior proof.",
+})}
+
+${
+  options.securityAttention
+    ? `## Security Review
+
+Status: needs_attention
+
+Summary: The changed authorization boundary requires maintainer review.
+
+`
+    : ""
+}## Review Findings
+
+Overall correctness: patch is correct
+
+Overall confidence: 0.9
+
+Full review comments:
+
+- none
+`;
+  };
+
+  for (const scenario of [
+    { author: "maintainer", association: "MEMBER", status: "missing" as const },
+    { author: "owner", association: "OWNER", status: "mock_only" as const },
+    { author: "collaborator", association: "COLLABORATOR", status: "insufficient" as const },
+    { author: "dependabot[bot]", association: "NONE", status: "missing" as const },
+    { author: "app/clawsweeper", association: "NONE", status: "insufficient" as const },
+  ]) {
+    const report = reportFor(scenario);
+    const comment = renderReviewCommentFromReport(report, "none", {
+      prStatusKind: "ready_for_maintainer_look",
+    });
+    const markers = reviewAutomationMarkersFromReport(report);
+
+    assert.match(comment, /✅ \*\*Ready for maintainer review\*\*/, scenario.author);
+    assert.match(comment, /\| \*\*Overall readiness\*\* \| 🦞 diamond lobster/, scenario.author);
+    assert.match(comment, /\| \*\*Proof confidence\*\* \| 🌊 off-meta tidepool/, scenario.author);
+    assert.doesNotMatch(comment, /blocked until .*real behavior proof/i, scenario.author);
+    assert.doesNotMatch(comment, /status: 📣 needs proof/, scenario.author);
+    assert.match(markers, /clawsweeper-verdict:pass/, scenario.author);
+    assert.doesNotMatch(markers, /clawsweeper-verdict:needs-human/, scenario.author);
+  }
+
+  const suppliedComment = renderReviewCommentFromReport(
+    reportFor({ author: "maintainer", association: "MEMBER", status: "sufficient" }),
+    "none",
+  );
+  assert.match(suppliedComment, /maintainer supplied terminal output/);
+  assert.match(suppliedComment, /\| \*\*Proof confidence\*\* \| 🦞 diamond lobster/);
+
+  const contributorReport = reportFor({ author: "contributor", association: "CONTRIBUTOR" });
+  const contributorComment = renderReviewCommentFromReport(contributorReport, "none");
+  assert.match(contributorComment, /blocked until real behavior proof is added/i);
+  assert.match(
+    reviewAutomationMarkersFromReport(contributorReport),
+    /clawsweeper-verdict:needs-human/,
+  );
+
+  const securityComment = renderReviewCommentFromReport(
+    reportFor({ author: "maintainer", association: "MEMBER", securityAttention: true }),
+    "none",
+  );
+  assert.match(securityComment, /blocked by patch quality or review findings/i);
+  assert.match(securityComment, /\| \*\*Security\*\* \| Needs attention/);
+  assert.doesNotMatch(securityComment, /blocked until .*real behavior proof/i);
+});
+
+test("production-owner HTTP fault-boundary proof unblocks shared channel reliability PRs", () => {
+  const report = `${reportFrontMatter({
+    type: "pull_request",
+    number: "112370",
+    decision: "keep_open",
+    close_reason: "none",
+    review_status: "complete",
+    confidence: "high",
+    author: "contributor",
+    author_association: "CONTRIBUTOR",
+    labels: JSON.stringify(["channel: telegram", "clawsweeper:automerge"]),
+    work_candidate: "none",
+    pull_head_sha: "abc123def456",
+    pull_files: JSON.stringify([
+      "src/channels/draft-stream-loop.ts",
+      "src/channels/draft-stream-loop.test.ts",
+    ]),
+    pull_files_truncated: false,
+  })}
+
+## Summary
+
+Keep this shared channel reliability PR open for automerge.
+
+## What This Changes
+
+Preserves the newest message when an older delivery receives an HTTP 429.
+
+## Best Possible Solution
+
+Merge after the production-owner transport-boundary proof and required checks pass.
+
+${realBehaviorProofReportSection({
+  status: "sufficient",
+  evidenceKind: "terminal",
+  needsContributorAction: false,
+  summary:
+    "The real production owner and grammY HTTP client sent requests to a fault-injecting local HTTP server; the recorded 429 older → 200 newest trace confirms the after-fix ordering.",
+})}
+
+## Telegram Visible Proof
+
+Status: not_needed
+
+Summary: Shared retry and ordering work does not change visible Telegram chat behavior.
+
+## Mantis Recommendation
+
+Status: not_recommended
+
+Scenario: none
+
+Reason: The production HTTP transport boundary already proves this internal reliability change.
+
+Maintainer comment:
+
+## Review Findings
+
+Overall correctness: patch is correct
+
+Overall confidence: 0.97
+
+Full review comments:
+
+- none
+`;
+
+  const comment = renderReviewCommentFromReport(report, "none");
+  const markers = reviewAutomationMarkersFromReport(report);
+
+  assert.doesNotMatch(comment, /needs real behavior proof before merge/i);
+  assert.doesNotMatch(comment, /Mantis proof suggestion/);
+  assert.match(markers, /clawsweeper-verdict:pass/);
+  assert.doesNotMatch(markers, /clawsweeper-verdict:needs-human/);
+
+  const mockOnlyReport = report
+    .replace("Status: sufficient", "Status: mock_only")
+    .replace("Evidence kind: terminal", "Evidence kind: none")
+    .replace("Needs contributor action: false", "Needs contributor action: true")
+    .replace(
+      "The real production owner and grammY HTTP client sent requests to a fault-injecting local HTTP server; the recorded 429 older → 200 newest trace confirms the after-fix ordering.",
+      "Isolated unit tests stub the transport client and never execute the production HTTP boundary.",
+    );
+  const mockOnlyComment = renderReviewCommentFromReport(mockOnlyReport, "none");
+  const mockOnlyMarkers = reviewAutomationMarkersFromReport(mockOnlyReport);
+
+  assert.match(mockOnlyComment, /needs real behavior proof before merge/i);
+  assert.match(mockOnlyMarkers, /clawsweeper-verdict:needs-human/);
+  assert.doesNotMatch(mockOnlyMarkers, /clawsweeper-verdict:pass/);
+});
+
 test("screenshot-only browser runtime proof blocks pass markers", () => {
   const report = `${reportFrontMatter({
     type: "pull_request",

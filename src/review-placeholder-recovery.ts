@@ -2,13 +2,17 @@
 import { createHmac } from "node:crypto";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  REVIEW_RECOVERY_STUCK_LABEL,
+  runReviewRecoveryLabelBackfill,
+} from "./review-recovery-label-backfill.js";
 
 export const REVIEW_PLACEHOLDER_MARKER = "ClawSweeper status: review started.";
 export const DEFAULT_REVIEW_PLACEHOLDER_MAX_CHECKS = 20;
 export const DEFAULT_REVIEW_PLACEHOLDER_MIN_AGE_HOURS = 2;
 export const DEFAULT_REVIEW_PLACEHOLDER_MAX_RECOVERIES = 5;
 export const DEFAULT_REVIEW_PLACEHOLDER_STUCK_HOURS = 12;
-export const REVIEW_PLACEHOLDER_STUCK_LABEL = "clawsweeper-recovery-stuck";
+export const REVIEW_PLACEHOLDER_STUCK_LABEL = REVIEW_RECOVERY_STUCK_LABEL;
 export const DEFAULT_REVIEW_PLACEHOLDER_LOOKBACK_HOURS = 48;
 
 const SEARCH_PAGE_SIZE = 100;
@@ -62,6 +66,7 @@ type ReviewPlaceholderRecoveryRunOptions = {
   env?: NodeJS.ProcessEnv;
   fetchImpl?: typeof fetch;
   now?: Date;
+  reconcileRecoveryLabels?: boolean;
 };
 
 function boundedPositiveInteger(
@@ -294,23 +299,30 @@ export async function runReviewPlaceholderRecovery(
       throw new Error("POST /internal/exact-review/enqueue was not admitted");
     }
   };
-  const addLabel = async (number: number, label: string): Promise<void> => {
+  const mutateRecoveryLabel = async (
+    number: number,
+    label: string,
+    method: "POST" | "DELETE",
+  ): Promise<"removed" | "missing"> => {
     if (!targetWriteToken) {
       throw new Error("TARGET_WRITE_TOKEN is missing; cannot write labels on the target repo");
     }
-    const response = await fetchImpl(`${apiUrl}/repos/${repo}/issues/${number}/labels`, {
-      method: "POST",
+    const path = `/repos/${repo}/issues/${number}/labels${
+      method === "DELETE" ? `/${encodeURIComponent(label)}` : ""
+    }`;
+    const response = await fetchImpl(`${apiUrl}${path}`, {
+      method,
       headers: {
         accept: "application/vnd.github+json",
         authorization: `Bearer ${targetWriteToken}`,
-        "content-type": "application/json",
+        ...(method === "POST" ? { "content-type": "application/json" } : {}),
         "x-github-api-version": "2022-11-28",
       },
-      body: JSON.stringify({ labels: [label] }),
+      ...(method === "POST" ? { body: JSON.stringify({ labels: [label] }) } : {}),
     });
-    if (!response.ok) {
-      throw new Error(`POST /repos/${repo}/issues/${number}/labels returned ${response.status}`);
-    }
+    if (method === "DELETE" && response.status === 404) return "missing";
+    if (!response.ok) throw new Error(`${method} ${path} returned ${response.status}`);
+    return "removed";
   };
   const deletePlaceholderComment = async (
     number: number,
@@ -365,9 +377,10 @@ export async function runReviewPlaceholderRecovery(
     }
     return "deleted";
   };
-  const fetchPlaceholderComment = async (
+  const fetchReviewComments = async (
     number: number,
-  ): Promise<ReviewPlaceholderComment | null> => {
+    stopAtPlaceholder = false,
+  ): Promise<{ comments: ReviewPlaceholderComment[]; complete: boolean }> => {
     const marker = reviewStartStatusMarker(number);
     const comments: ReviewPlaceholderComment[] = [];
     for (let page = 1; page <= COMMENT_MAX_PAGES; page += 1) {
@@ -375,17 +388,22 @@ export async function runReviewPlaceholderRecovery(
         `/repos/${repo}/issues/${number}/comments?sort=created&direction=desc&per_page=${COMMENT_PAGE_SIZE}&page=${page}`,
       );
       comments.push(...pageComments);
-      if (pageComments.length < COMMENT_PAGE_SIZE) break;
+      if (pageComments.length < COMMENT_PAGE_SIZE) return { comments, complete: true };
       if (
+        stopAtPlaceholder &&
         pageComments.some(
           (comment) => typeof comment.body === "string" && comment.body.includes(marker),
         )
       ) {
-        break;
+        return { comments, complete: false };
       }
     }
-    return selectReviewPlaceholderComment(number, comments);
+    return { comments, complete: false };
   };
+  const fetchPlaceholderComment = async (
+    number: number,
+  ): Promise<ReviewPlaceholderComment | null> =>
+    selectReviewPlaceholderComment(number, (await fetchReviewComments(number, true)).comments);
 
   const candidates = new Map<number, { candidate: ReviewPlaceholderCandidate; closed: boolean }>();
   const updatedSince = new Date(now.getTime() - lookbackHours * 60 * 60 * 1_000).toISOString();
@@ -487,7 +505,7 @@ export async function runReviewPlaceholderRecovery(
         !candidateLabelNames(candidate).includes(REVIEW_PLACEHOLDER_STUCK_LABEL)
       ) {
         try {
-          await addLabel(number, REVIEW_PLACEHOLDER_STUCK_LABEL);
+          await mutateRecoveryLabel(number, REVIEW_PLACEHOLDER_STUCK_LABEL, "POST");
           escalated += 1;
           console.error(
             `review-placeholder recovery: escalated #${number} as stuck after repeated orphan cycles`,
@@ -524,13 +542,37 @@ export async function runReviewPlaceholderRecovery(
       );
     }
   }
+  if (options.reconcileRecoveryLabels && targetWriteToken) {
+    try {
+      const backfill = await runReviewRecoveryLabelBackfill({
+        repository: repo,
+        now,
+        maximumChecks: Math.min(maximumChecks, 100),
+        maximumRecoveries: Math.min(maximumRecoveries, 20),
+        github,
+        fetchComments: fetchReviewComments,
+        removeLabel: (number) =>
+          mutateRecoveryLabel(number, REVIEW_PLACEHOLDER_STUCK_LABEL, "DELETE"),
+        isBotComment: isClawSweeperBotComment,
+      });
+      console.log(
+        `review-recovery label reconciliation: checked=${backfill.checked} cleared=${backfill.cleared} retained=${backfill.retained} errors=${backfill.errors} matched=${backfill.matched} remaining=${backfill.remaining}`,
+      );
+    } catch (error) {
+      console.warn(
+        `review-recovery label reconciliation skipped: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
   return summary();
 }
 
 const invokedPath = process.argv[1] ? resolve(process.argv[1]) : "";
 if (invokedPath && invokedPath === fileURLToPath(import.meta.url)) {
   try {
-    const summary = await runReviewPlaceholderRecovery();
+    const summary = await runReviewPlaceholderRecovery({ reconcileRecoveryLabels: true });
     const failureReason = reviewPlaceholderRecoveryFailureReason(summary);
     if (failureReason) {
       console.error(`review-placeholder recovery failed: ${failureReason}`);
