@@ -2,6 +2,7 @@ import { maintainerDecisionFromReport } from "./decision-packets.js";
 import { AUTOFIX_LABEL, AUTOMERGE_LABEL } from "./repair/exact-review-guard-labels.js";
 import type { ReviewCommentWorkflowDependencies } from "./clawsweeper-review-comment-dependencies.js";
 import type { createReviewCommentIdentity } from "./clawsweeper-review-comment-identity.js";
+import type { PullRequestReviewReadiness } from "./clawsweeper-types.js";
 
 export function createReviewCommentAutomation(
   dependencies: ReviewCommentWorkflowDependencies & ReturnType<typeof createReviewCommentIdentity>,
@@ -10,56 +11,16 @@ export function createReviewCommentAutomation(
     reportSecurityReview,
     reportReviewFindings,
     reportOverallCorrectness,
-    reportPrRating,
     frontMatterValue,
     frontMatterStringArray,
     configSurfaceReviewRequired,
     dataModelSurfaceReviewRequired,
     realBehaviorProofBlocksMerge,
     pullHeadShaFromReport,
+    pullRequestReviewReadinessFromReport,
+    securitySensitiveRepairAllowed,
     markerAttributeValue,
   } = dependencies;
-
-  type PullRequestReviewState = "ready" | "blocked" | "needs-changes";
-
-  function pullRequestReviewStateFromReport(markdown: string): PullRequestReviewState {
-    const headSha = pullHeadShaFromReport(markdown) ?? "";
-    if (!/^[0-9a-f]{40}$/i.test(headSha)) return "blocked";
-
-    try {
-      if (maintainerDecisionFromReport(markdown)?.required) return "blocked";
-
-      if (
-        frontMatterValue(markdown, "review_status") !== "complete" ||
-        frontMatterValue(markdown, "confidence") !== "high" ||
-        frontMatterValue(markdown, "decision") !== "keep_open" ||
-        configSurfaceReviewRequired(markdown) ||
-        dataModelSurfaceReviewRequired(markdown) ||
-        frontMatterValue(markdown, "action_taken") === "skipped_pr_close_coverage_proof" ||
-        realBehaviorProofBlocksMerge(markdown)
-      ) {
-        return "blocked";
-      }
-
-      if (reportSecurityReview(markdown).status === "needs_attention") {
-        return securitySensitiveRepairAllowed(markdown) ? "needs-changes" : "blocked";
-      }
-
-      const correctness = reportOverallCorrectness(markdown);
-      if (
-        reportReviewFindings(markdown).length > 0 ||
-        frontMatterValue(markdown, "work_candidate") === "queue_fix_pr" ||
-        correctness === "patch is incorrect" ||
-        ["D", "F"].includes(reportPrRating(markdown).patchTier)
-      ) {
-        return "needs-changes";
-      }
-
-      return correctness === "patch is correct" ? "ready" : "blocked";
-    } catch {
-      return "blocked";
-    }
-  }
 
   function reviewVersionMarkerFromReport(markdown: string): string {
     const number = frontMatterValue(markdown, "number") ?? "unknown";
@@ -80,7 +41,10 @@ export function createReviewCommentAutomation(
     return `<!-- clawsweeper-review-version ${attrs} -->`;
   }
 
-  function reviewAutomationMarkersFromReport(markdown: string): string {
+  function reviewAutomationMarkersFromReport(
+    markdown: string,
+    precomputedReadiness?: PullRequestReviewReadiness,
+  ): string {
     const itemKind = frontMatterValue(markdown, "type");
     if (itemKind === "issue") {
       const decision = frontMatterValue(markdown, "decision");
@@ -120,12 +84,19 @@ export function createReviewCommentAutomation(
       `lease_comment_id=${markerAttributeValue(reviewLeaseCommentId)}`,
       `source_revision=${markerAttributeValue(sourceRevision)}`,
     ].join(" ");
+    const reviewReadiness =
+      precomputedReadiness?.headSha === headSha.toLowerCase()
+        ? precomputedReadiness
+        : pullRequestReviewReadinessFromReport(markdown);
     const reviewStateMarker = /^[0-9a-f]{40}$/i.test(headSha)
-      ? `<!-- clawsweeper-review-state:${pullRequestReviewStateFromReport(markdown)} ` +
+      ? `<!-- clawsweeper-review-state:${reviewReadiness.state} ` +
         `item=${markerAttributeValue(number)} sha=${markerAttributeValue(headSha)} v=1 -->`
       : "";
     const withReviewState = (...markers: string[]): string =>
       [...markers.filter(Boolean), reviewStateMarker].join("\n");
+    if (reviewReadiness.normalizationFailed) {
+      return withReviewState(`<!-- clawsweeper-verdict:needs-human ${baseAttrs} -->`);
+    }
     const securityNeedsAttention = reportSecurityReview(markdown).status === "needs_attention";
     const humanReviewMarkers = (): string => {
       const markers = [];
@@ -156,7 +127,11 @@ export function createReviewCommentAutomation(
     const hasRealBehaviorProofBlocker = realBehaviorProofBlocksMerge(markdown);
     if (securityNeedsAttention) {
       const markers = [`<!-- clawsweeper-security:security-sensitive ${baseAttrs} -->`];
-      if (!hasRealBehaviorProofBlocker && securitySensitiveRepairAllowed(markdown)) {
+      if (
+        reviewReadiness.state === "needs-changes" &&
+        !hasRealBehaviorProofBlocker &&
+        securitySensitiveRepairAllowed(markdown)
+      ) {
         return withReviewState(
           ...markers,
           `<!-- clawsweeper-verdict:needs-changes ${baseAttrs} -->`,
@@ -169,16 +144,19 @@ export function createReviewCommentAutomation(
       return withReviewState(`<!-- clawsweeper-verdict:needs-human ${baseAttrs} -->`);
     }
     if (decision === "keep_open") {
-      if (repairLoopPassModeFromReport(markdown)) {
+      if (reviewReadiness.state === "ready" && repairLoopPassModeFromReport(markdown)) {
         return withReviewState(`<!-- clawsweeper-verdict:pass ${baseAttrs} -->`);
       }
-      if (repairLoopFindingRepairAllowed(markdown)) {
+      if (reviewReadiness.state === "needs-changes" && repairLoopFindingRepairAllowed(markdown)) {
         return withReviewState(
           `<!-- clawsweeper-verdict:needs-changes ${baseAttrs} -->`,
           `<!-- clawsweeper-action:fix-required ${baseAttrs} finding=review-feedback -->`,
         );
       }
-      if (frontMatterValue(markdown, "work_candidate") !== "queue_fix_pr") {
+      if (
+        reviewReadiness.state !== "needs-changes" ||
+        frontMatterValue(markdown, "work_candidate") !== "queue_fix_pr"
+      ) {
         return withReviewState(`<!-- clawsweeper-verdict:needs-human ${baseAttrs} -->`);
       }
       return withReviewState(
@@ -203,14 +181,6 @@ export function createReviewCommentAutomation(
     return frontMatterStringArray(markdown, "labels").includes(AUTOFIX_LABEL)
       ? "autofix"
       : "automerge";
-  }
-
-  function securitySensitiveRepairAllowed(markdown: string): boolean {
-    const labels = frontMatterStringArray(markdown, "labels");
-    return (
-      frontMatterValue(markdown, "decision") === "keep_open" &&
-      (labels.includes(AUTOFIX_LABEL) || labels.includes(AUTOMERGE_LABEL))
-    );
   }
 
   function repairLoopFindingRepairAllowed(markdown: string): boolean {
@@ -241,7 +211,6 @@ export function createReviewCommentAutomation(
     reviewVersionMarkerFromReport,
     reviewAutomationMarkersFromReport,
     repairLoopPassModeFromReport,
-    securitySensitiveRepairAllowed,
     repairLoopFindingRepairAllowed,
     isRepairLoopPassReport,
   };

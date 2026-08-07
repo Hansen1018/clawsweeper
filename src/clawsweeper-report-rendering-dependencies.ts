@@ -16,6 +16,8 @@ import type {
   OverallCorrectness,
   PrRating,
   PublicPriority,
+  PullRequestReviewReadiness,
+  PullRequestReviewState,
   RegressionAssessment,
   RealBehaviorProof,
   VerifiedRegressionProvenance,
@@ -124,8 +126,7 @@ export interface CreateReportRenderingDependencies {
   publicLikelyOwnerRole: (role: string) => string;
   publicMantisRecommendationBlock: (recommendation: MantisRecommendation) => string;
   publicMergeReadinessBlock: (
-    rating: PrRating,
-    proof: RealBehaviorProof,
+    reviewState: PullRequestReviewState,
     priority: TriagePriority,
     bottomLine: string,
     remainingItemCount: number,
@@ -174,7 +175,10 @@ export interface CreateReportRenderingDependencies {
   reportReviewFindings: (markdown: string) => ReviewFinding[];
   reportRootCauseCluster: (markdown: string) => RootCauseClusterAssessment;
   reportSecurityReview: (markdown: string) => SecurityReview;
-  reviewAutomationMarkersFromReport: (markdown: string) => string;
+  reviewAutomationMarkersFromReport: (
+    markdown: string,
+    readiness?: PullRequestReviewReadiness,
+  ) => string;
   reviewFindingDetailedLine: (finding: ReviewFinding) => string;
   reviewFindingLocation: (finding: Pick<ReviewFinding, "file" | "lineStart" | "lineEnd">) => string;
   reviewFindingSummaryLine: (finding: ReviewFinding) => string;

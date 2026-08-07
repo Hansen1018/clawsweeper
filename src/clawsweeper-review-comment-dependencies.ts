@@ -6,6 +6,7 @@ import type {
   Item,
   OverallCorrectness,
   PrRating,
+  PullRequestReviewReadiness,
   PullRequestRef,
   ReviewFinding,
   ReviewStartStatusCommentResult,
@@ -52,6 +53,8 @@ export interface ReviewCommentWorkflowDependencies {
   sentence: ReturnType<typeof createReviewPresentation>["sentence"];
   configSurfaceReviewRequired: (markdown: string) => boolean;
   dataModelSurfaceReviewRequired: (markdown: string) => boolean;
+  pullRequestReviewReadinessFromReport: (markdown: string) => PullRequestReviewReadiness;
+  securitySensitiveRepairAllowed: (markdown: string) => boolean;
   isIssueAdvisoryLabel: ReturnType<typeof createLabelSynchronization>["isIssueAdvisoryLabel"];
   removeIssueLabel: ReturnType<typeof createLabelSynchronization>["removeIssueLabel"];
   realBehaviorProofBlocksMerge: (markdown: string) => boolean;

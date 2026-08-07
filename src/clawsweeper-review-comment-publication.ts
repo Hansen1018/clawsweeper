@@ -12,6 +12,19 @@ import {
 import type { ReviewCommentWorkflowDependencies } from "./clawsweeper-review-comment-dependencies.js";
 import type { createReviewCommentIdentity } from "./clawsweeper-review-comment-identity.js";
 import type { createReviewCommentState } from "./clawsweeper-review-comment-state.js";
+import { trailingHtmlComments } from "./review-comment-markers.js";
+
+const DURABLE_REVIEW_COMMENT_MAX_BYTES = 60 * 1024;
+
+export class DurableReviewPublicationBlockedError extends Error {
+  constructor(
+    message: string,
+    readonly syncedComment: Record<string, unknown>,
+  ) {
+    super(message);
+    this.name = "DurableReviewPublicationBlockedError";
+  }
+}
 
 export function createReviewCommentPublication(
   dependencies: ReviewCommentWorkflowDependencies &
@@ -150,20 +163,100 @@ export function createReviewCommentPublication(
     return commentPayloadFile;
   }
 
+  function markerForItem(
+    markers: readonly string[],
+    pattern: RegExp,
+    number: number,
+  ): string | undefined {
+    return [...markers].reverse().find((marker) => {
+      const match = marker.match(pattern);
+      return match && new RegExp(`\\bitem=${number}\\b`).test(match[1] ?? "");
+    });
+  }
+
+  function oversizedReviewCommentFallback(number: number, body: string, bodyBytes: number): string {
+    const markers = trailingHtmlComments(body);
+    const versionMarker = markerForItem(
+      markers,
+      /^<!--\s+clawsweeper-review-version\b([^>]*)-->$/,
+      number,
+    );
+    const versionAttributes =
+      versionMarker?.match(/^<!--\s+clawsweeper-review-version\b([^>]*)-->$/)?.[1] ?? "";
+    const stateMarker = markerForItem(
+      markers,
+      /^<!--\s+clawsweeper-review-state:[^\s>]+\b([^>]*)-->$/,
+      number,
+    );
+    const stateAttributes =
+      stateMarker?.match(/^<!--\s+clawsweeper-review-state:[^\s>]+\b([^>]*)-->$/)?.[1] ?? "";
+    const exactHead =
+      stateAttributes.match(/\bsha=([0-9a-f]{40})\b/i)?.[1]?.toLowerCase() ??
+      versionAttributes.match(/\bsha=([0-9a-f]{40})\b/i)?.[1]?.toLowerCase();
+    const verdictMarker = markerForItem(
+      markers,
+      /^<!--\s+clawsweeper-verdict:[^\s>]+\b([^>]*)-->$/,
+      number,
+    );
+    const blockedVerdict = verdictMarker?.replace(
+      /^<!--\s+clawsweeper-verdict:[^\s>]+/,
+      "<!-- clawsweeper-verdict:needs-human",
+    );
+    const blockedState = exactHead
+      ? `<!-- clawsweeper-review-state:blocked item=${number} sha=${exactHead} v=1 -->`
+      : "";
+    const fallback = [
+      "Codex review: publication failed closed.",
+      "",
+      "# ClawSweeper review",
+      "",
+      "## What this changes",
+      "",
+      "The generated durable review exceeded the bounded GitHub publication size.",
+      "",
+      "## Merge readiness",
+      "",
+      "**Blocked by review publication failure - 1 item remains**",
+      "",
+      "The previous same-head verdict is not authoritative. ClawSweeper replaced it with this bounded blocked state and stopped the apply path.",
+      "",
+      "## Before merge",
+      "",
+      "- [ ] **Retry bounded review publication (P2)** - Reduce or compact the generated review, then run a fresh exact-head review before merge.",
+      "",
+      "## Findings",
+      "",
+      `- [P2] Durable review body was ${bodyBytes} bytes; the publication limit is ${DURABLE_REVIEW_COMMENT_MAX_BYTES} bytes.`,
+      "",
+      blockedVerdict ?? "",
+      blockedState,
+      versionMarker ?? "",
+    ]
+      .filter(Boolean)
+      .join("\n");
+    return markedReviewCommentBody(number, fallback);
+  }
+
   function upsertReviewComment(
     number: number,
     body: string,
     existing = issueReviewComment(number, [body]),
-    mutationIdentity = `review_comment_upsert:${number}:${reviewCommentBodyDigest(body)}`,
-  ): Record<string, unknown> | undefined {
+    mutationIdentity?: string,
+  ): Record<string, unknown> {
     const markedBody = markedReviewCommentBody(number, body);
+    const bodyBytes = Buffer.byteLength(markedBody, "utf8");
+    const oversized = bodyBytes > DURABLE_REVIEW_COMMENT_MAX_BYTES;
+    const publicationBody = oversized
+      ? oversizedReviewCommentFallback(number, markedBody, bodyBytes)
+      : markedBody;
     const id = commentId(existing);
-    const payload = writeCommentPayload(number, markedBody);
+    const patchTargetId = id !== null && canPatchReviewComment(existing) ? id : null;
+    const payload = writeCommentPayload(number, publicationBody);
     let args: string[];
-    if (id !== null && canPatchReviewComment(existing)) {
+    if (patchTargetId !== null) {
       args = [
         "api",
-        `repos/${targetRepo()}/issues/comments/${id}`,
+        `repos/${targetRepo()}/issues/comments/${patchTargetId}`,
         "--method",
         "PATCH",
         "--input",
@@ -180,15 +273,34 @@ export function createReviewCommentPublication(
       ];
     }
     const response = ghObservedMutationCommand({
-      identity: mutationIdentity,
+      identity:
+        mutationIdentity ??
+        `review_comment_upsert:${number}:${reviewCommentBodyDigest(publicationBody)}`,
       args,
       knownNoMutation: (error) =>
         isGitHubRequiresAuthenticationError(error) || isLockedConversationCommentError(error),
     });
     const written = reviewCommentFromMutationResponse(response, args);
-    if (written) return written;
-    const fallback = issueReviewCommentWithBody(number, markedBody);
-    if (fallback) return fallback;
+    const writtenId = commentId(written);
+    const verifiedWritten =
+      writtenId !== null && (patchTargetId === null || writtenId === patchTargetId)
+        ? written
+        : undefined;
+    const synced =
+      verifiedWritten ??
+      issueReviewCommentWithBody(number, publicationBody, patchTargetId ?? undefined);
+    if (synced && oversized) {
+      throw new DurableReviewPublicationBlockedError(
+        `durable review comment for #${number} exceeded ${DURABLE_REVIEW_COMMENT_MAX_BYTES} bytes; published a blocked fallback and stopped apply`,
+        synced,
+      );
+    }
+    if (synced) return synced;
+    if (patchTargetId !== null) {
+      throw new Error(
+        `GitHub comment PATCH for #${number} did not verify target comment ${patchTargetId}`,
+      );
+    }
     throw new Error(
       `GitHub comment mutation for #${number} did not return or expose the synced review comment`,
     );

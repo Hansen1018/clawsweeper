@@ -1,4 +1,9 @@
-import type { CloseReason, ItemKind, ReviewCommentRenderOptions } from "./clawsweeper-types.js";
+import type {
+  CloseReason,
+  ItemKind,
+  PullRequestReviewReadiness,
+  ReviewCommentRenderOptions,
+} from "./clawsweeper-types.js";
 import {
   regressionAssessmentPublicLine,
   regressionProvenancePublicLine,
@@ -27,8 +32,6 @@ export function createReportCommentPresentation(
     closeReviewLineFromReport,
     collapsedDetailsBlock,
     confidenceText,
-    configSurfaceReviewRequired,
-    dataModelSurfaceReviewRequired,
     frontMatterStringArray,
     frontMatterValue,
     isReportNoneList,
@@ -41,7 +44,6 @@ export function createReportCommentPresentation(
     mergeRiskOptionsFromReport,
     neutralizeOwnedSectionSpoofing,
     publicBeforeMergeBlock,
-    publicBeforeMergeItems,
     publicChecklistText,
     publicFailedReviewReadinessBlock,
     publicMantisRecommendationBlock,
@@ -59,6 +61,7 @@ export function createReportCommentPresentation(
     publicSummaryBody,
     publicVerificationBlock,
     pullHeadShaFromReport,
+    pullRequestReviewReadinessFromReport,
     realBehaviorProofBlocksMerge,
     renderCloseCommentFromReport,
     renderDataModelWarningFromReport,
@@ -101,6 +104,7 @@ export function createReportCommentPresentation(
   function renderKeepOpenCommentFromReport(
     markdown: string,
     options: ReviewCommentRenderOptions = {},
+    precomputedReadiness?: PullRequestReviewReadiness,
   ): string {
     // Keep the full list for verification counts; only the rendered evidence list is
     // abbreviated.
@@ -133,18 +137,21 @@ export function createReportCommentPresentation(
     const mergeRiskOptions = mergeRiskOptionsFromReport(markdown);
     const reviewMetrics = reviewMetricsFromReport(markdown);
     const workReason = reportWorkCandidateReason(markdown);
-    const workCandidate = frontMatterValue(markdown, "work_candidate");
     const isPullRequest = frontMatterValue(markdown, "type") === "pull_request";
+    const reviewReadiness = isPullRequest
+      ? (precomputedReadiness ?? pullRequestReviewReadinessFromReport(markdown))
+      : undefined;
     const reviewFailed = frontMatterValue(markdown, "review_status") === "failed";
     const validation = frontMatterStringArray(markdown, "work_validation")
       .slice(0, 5)
       .map((step) =>
         isPullRequest ? publicPriorityBulletFromText(step, "P1") : `- ${stripPriorityPrefix(step)}`,
       );
-    const isRepairCandidate = workCandidate === "queue_fix_pr";
     const isRepairLoopPass = isPullRequest && Boolean(repairLoopPassModeFromReport(markdown));
     const hasRealBehaviorProofBlocker =
       isPullRequest && !reviewFailed && realBehaviorProofBlocksMerge(markdown);
+    const hasRealBehaviorProofReadinessBlocker =
+      reviewReadiness?.items.some((item) => item.label === "Add real behavior proof") ?? false;
     const summaryLine =
       neutralizeOwnedSectionSpoofing(sentence(summary)) || "_No summary provided._";
     const changeSummaryLine =
@@ -168,20 +175,19 @@ export function createReportCommentPresentation(
     const labelDetails: string[] = [];
     const evidenceDetails: string[] = [];
     const triagePriority = triagePriorityFromReport(markdown);
-    const hasReviewFindings = isPullRequest && reviewFindings.length > 0;
     const verdictLine = reviewFailed
       ? "ClawSweeper review: did not complete due to Codex infrastructure failure."
-      : hasRealBehaviorProofBlocker
-        ? "Codex review: needs real behavior proof before merge."
-        : isRepairLoopPass
-          ? "Codex review: passed."
-          : isPullRequest && isRepairCandidate
-            ? "Codex review: needs changes before merge."
-            : hasReviewFindings
-              ? "Codex review: found issues before merge."
-              : isPullRequest
-                ? "Codex review: needs maintainer review before merge."
-                : "Codex review: keeping this open for maintainer follow-up; there is still a little grit to resolve.";
+      : reviewReadiness?.state === "blocked"
+        ? hasRealBehaviorProofReadinessBlocker
+          ? "Codex review: needs real behavior proof before merge."
+          : "Codex review: blocked before merge."
+        : reviewReadiness?.state === "needs-changes"
+          ? "Codex review: needs changes before merge."
+          : isRepairLoopPass
+            ? "Codex review: passed."
+            : isPullRequest
+              ? "Codex review: needs maintainer review before merge."
+              : "Codex review: keeping this open for maintainer follow-up; there is still a little grit to resolve.";
     const lines = [`${verdictLine}${reviewFreshnessText(markdown)}`, ""];
     const prSurface = renderOpenClawPrSurfaceFromReport(markdown);
     const dataModelWarning = renderDataModelWarningFromReport(markdown);
@@ -290,26 +296,14 @@ export function createReportCommentPresentation(
     );
 
     if (isPullRequest) {
+      if (!reviewReadiness) {
+        throw new Error("pull request review rendering requires normalized readiness");
+      }
       // When patch quality itself blocks readiness, the rating's remediation steps are
       // required work, not optional rank-up advice.
       const patchQualityBlocked =
         !reviewFailed && (prRating.patchTier === "F" || prRating.patchTier === "D");
-      const beforeMergeItems = publicBeforeMergeItems({
-        reviewFailed,
-        proof: realBehaviorProof,
-        proofBlocked: hasRealBehaviorProofBlocker,
-        configSurfaceBlocked: configSurfaceReviewRequired(markdown),
-        dataModelSurfaceBlocked: dataModelSurfaceReviewRequired(markdown),
-        coverageProofBlocked:
-          frontMatterValue(markdown, "action_taken") === "skipped_pr_close_coverage_proof",
-        findings: reviewFindings,
-        securityReview,
-        risks,
-        nextStep: nextStepLine,
-        decisionPending: Boolean(decisionPacketBlock),
-        patchQualityBlocked,
-        requiredRatingSteps: patchQualityBlocked ? prRating.nextSteps : [],
-      });
+      const beforeMergeItems = reviewReadiness.items;
       lines.push("# ClawSweeper review", "");
       appendHeadingSection(lines, "What this changes", changeSummaryLine);
       if (regressionProvenanceLine) {
@@ -321,8 +315,7 @@ export function createReportCommentPresentation(
         reviewFailed
           ? publicFailedReviewReadinessBlock(markdown)
           : publicMergeReadinessBlock(
-              prRating,
-              realBehaviorProof,
+              reviewReadiness.state,
               triagePriority,
               summaryLine,
               beforeMergeItems.length,
@@ -489,6 +482,38 @@ export function createReportCommentPresentation(
     options: ReviewCommentRenderOptions = {},
   ): string {
     const decision = frontMatterValue(markdown, "decision");
+    const reviewReadiness =
+      frontMatterValue(markdown, "type") === "pull_request"
+        ? pullRequestReviewReadinessFromReport(markdown)
+        : undefined;
+    if (reviewReadiness?.normalizationFailed) {
+      const reviewedHead = reviewReadiness.headSha
+        ? `Reviewed head: \`${reviewReadiness.headSha}\`.`
+        : "The exact reviewed head could not be recovered.";
+      const body = [
+        "Codex review: blocked before merge.",
+        "",
+        "# ClawSweeper review",
+        "",
+        "## What this changes",
+        "",
+        "The generated review report could not be normalized safely.",
+        "",
+        "## Merge readiness",
+        "",
+        "**Blocked before merge.**",
+        "",
+        reviewedHead,
+        "",
+        "## Before merge",
+        "",
+        publicBeforeMergeBlock(reviewReadiness.items),
+      ].join("\n");
+      const markers = options.suppressAutomationMarkers
+        ? ""
+        : reviewAutomationMarkersFromReport(markdown, reviewReadiness);
+      return [body, markers, reviewVersionMarkerFromReport(markdown)].filter(Boolean).join("\n\n");
+    }
     let requiresMaintainerDecision = true;
     try {
       requiresMaintainerDecision = maintainerDecisionFromReport(markdown)?.required === true;
@@ -502,10 +527,10 @@ export function createReportCommentPresentation(
         reason === "unsponsored_feature_request" ||
         reason === "author_pr_budget_exceeded")
         ? renderCloseCommentFromReport(markdown, reason)
-        : renderKeepOpenCommentFromReport(markdown, options);
+        : renderKeepOpenCommentFromReport(markdown, options, reviewReadiness);
     const markers = options.suppressAutomationMarkers
       ? ""
-      : reviewAutomationMarkersFromReport(markdown);
+      : reviewAutomationMarkersFromReport(markdown, reviewReadiness);
     return [body.trimEnd(), markers, reviewVersionMarkerFromReport(markdown)]
       .filter(Boolean)
       .join("\n\n");

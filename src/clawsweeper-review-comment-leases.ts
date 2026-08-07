@@ -36,6 +36,7 @@ export function createReviewCommentLeases(
     issueReviewCommentState,
     commentId,
     commentBody,
+    supersededReviewCommentIds,
     PATCHABLE_REVIEW_COMMENT_AUTHORS,
     canPatchReviewComment,
     writeCommentPayload,
@@ -471,6 +472,33 @@ export function createReviewCommentLeases(
 
   const REVIEW_PLACEHOLDER_BODY_PATTERN = /^ClawSweeper status: review started\./i;
 
+  function cleanupSupersededReviewComments(options: {
+    number: number;
+    comments: readonly Record<string, unknown>[];
+    keepCommentIds: ReadonlySet<number>;
+  }): void {
+    const ids = supersededReviewCommentIds(options);
+    for (const id of ids) {
+      try {
+        ghObservedMutationCommand({
+          identity: `review_comment_duplicate_sweep:${options.number}:${id}`,
+          args: ["api", `repos/${targetRepo()}/issues/comments/${id}`, "--method", "DELETE"],
+        });
+        console.error(
+          `[apply] deleted superseded durable review comment ${id} for #${options.number}`,
+        );
+      } catch (error) {
+        if (error instanceof GitHubRuntimeBudgetError) throw error;
+        // The newest exact durable comment remains canonical even if cleanup must retry later.
+        console.error(
+          `[apply] could not delete superseded durable review comment ${id} for #${options.number}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+    }
+  }
+
   function supersededReviewPlaceholderCommentIds(options: {
     number: number;
     comments: readonly Record<string, unknown>[];
@@ -549,6 +577,7 @@ export function createReviewCommentLeases(
     reapExpiredDedicatedReviewStartLeases,
     reapSupersededDedicatedReviewStartLeases,
     REVIEW_PLACEHOLDER_BODY_PATTERN,
+    cleanupSupersededReviewComments,
     supersededReviewPlaceholderCommentIds,
     cleanupSupersededReviewPlaceholderComments,
   };

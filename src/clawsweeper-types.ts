@@ -1271,9 +1271,19 @@ export interface PrCloseCoverageRuntimeBudget {
   maxRuntimeMs: number;
 }
 
+export type PullRequestReviewState = "ready" | "blocked" | "needs-changes";
+
 export interface PublicBeforeMergeItem {
   label: string;
   detail: string;
+  state: Exclude<PullRequestReviewState, "ready">;
+}
+
+export interface PullRequestReviewReadiness {
+  headSha: string | null;
+  state: PullRequestReviewState;
+  items: PublicBeforeMergeItem[];
+  normalizationFailed: boolean;
 }
 
 export type StalePullRequestReviewHead = {

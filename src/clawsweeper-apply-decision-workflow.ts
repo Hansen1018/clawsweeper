@@ -42,6 +42,7 @@ import {
   STALE_INSUFFICIENT_INFO_MIN_AGE_DAYS,
 } from "./clawsweeper-policy.js";
 import { rawCommentBody } from "./clawsweeper-review-comments.js";
+import { DurableReviewPublicationBlockedError } from "./clawsweeper-review-comment-publication.js";
 import { completeActivityContextSymbol } from "./clawsweeper-types.js";
 import type {
   AcquiredReviewStartLease,
@@ -85,6 +86,7 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
     applyPrCloseCoverageProofBlockedReport,
     applyProtectedLabelReason,
     applyRuntimeBudgetYieldResults,
+    cleanupSupersededReviewComments,
     cleanupSupersededReviewPlaceholderComments,
     closeReasonApplyAgeSkipReason,
     closeReasonEnabled,
@@ -1881,19 +1883,15 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
                 break;
               continue;
             }
-            try {
-              syncedComment = upsertReviewComment(
-                number,
-                markedReviewComment,
-                existingReviewComment,
-              );
-              rememberSelfMutationUpdatedAt();
-              syncReasons.push("updated durable Codex review comment");
+            const cleanupPublishedReviewComments = (
+              publishedComment: Record<string, unknown>,
+            ): void => {
               // The durable review comment is now published, so stale "review
               // started" placeholders from failed earlier attempts are clutter.
-              const placeholderKeepCommentIds = new Set<number>();
-              const syncedCommentId = commentId(syncedComment);
-              if (syncedCommentId !== null) placeholderKeepCommentIds.add(syncedCommentId);
+              const syncedCommentId = commentId(publishedComment);
+              // Recovery must establish one authoritative comment id before any duplicate sweep.
+              if (syncedCommentId === null) return;
+              const placeholderKeepCommentIds = new Set<number>([syncedCommentId]);
               // Closures assign the active lease, so read it through a cast to
               // defeat TypeScript's stale null narrowing at this use site.
               const heldMutationLease = activeApplyMutationLease as {
@@ -1903,11 +1901,26 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
               if (heldMutationLease?.itemNumber === number) {
                 placeholderKeepCommentIds.add(heldMutationLease.lease.commentId);
               }
+              cleanupSupersededReviewComments({
+                number,
+                comments: latestLeaseState.comments,
+                keepCommentIds: placeholderKeepCommentIds,
+              });
               cleanupSupersededReviewPlaceholderComments({
                 number,
                 comments: latestLeaseState.comments,
                 keepCommentIds: placeholderKeepCommentIds,
               });
+            };
+            try {
+              syncedComment = upsertReviewComment(
+                number,
+                markedReviewComment,
+                existingReviewComment,
+              );
+              rememberSelfMutationUpdatedAt();
+              syncReasons.push("updated durable Codex review comment");
+              cleanupPublishedReviewComments(syncedComment);
               if (complete && item.labels.includes(REVIEW_RECOVERY_STUCK_LABEL)) {
                 try {
                   clearResolvedReviewRecoveryLabel({
@@ -1936,6 +1949,11 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
                 }
               }
             } catch (error) {
+              if (error instanceof DurableReviewPublicationBlockedError) {
+                rememberSelfMutationUpdatedAt();
+                cleanupPublishedReviewComments(error.syncedComment);
+                throw error;
+              }
               const commentAuthError = isGitHubRequiresAuthenticationError(error);
               if (!commentAuthError && !isLockedConversationCommentError(error)) throw error;
               const fallbackActionTaken: ActionTaken = commentAuthError

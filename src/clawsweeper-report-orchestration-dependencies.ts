@@ -26,6 +26,7 @@ import type {
   PrRating,
   PrStatusLabelKind,
   PublicPriority,
+  PullRequestReviewState,
   RegressionAssessment,
   PullRequestLiveActivity,
   RealBehaviorProof,
@@ -288,8 +289,7 @@ export interface CreateReportOrchestrationDependencies {
   publicLikelyOwnerRole: (role: string) => string;
   publicMantisRecommendationBlock: (recommendation: MantisRecommendation) => string;
   publicMergeReadinessBlock: (
-    rating: PrRating,
-    proof: RealBehaviorProof,
+    reviewState: PullRequestReviewState,
     priority: TriagePriority,
     bottomLine: string,
     remainingItemCount: number,

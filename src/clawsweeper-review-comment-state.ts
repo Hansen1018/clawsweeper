@@ -175,34 +175,78 @@ export function createReviewCommentState(
     return ghPaged<unknown>(`repos/${targetRepo()}/issues/${number}/comments`).map(asRecord);
   }
 
+  function hasExactDurableReviewMarker(number: number, comment: Record<string, unknown>): boolean {
+    const body = commentBody(comment);
+    return Boolean(body && body.trimEnd().endsWith(reviewCommentMarker(number)));
+  }
+
+  function newestReviewComment(
+    number: number,
+    comments: readonly Record<string, unknown>[],
+  ): Record<string, unknown> | undefined {
+    return [...comments].sort((left, right) => {
+      const leftReviewedAt = timestampMs(durableReviewVersion(left, number)?.reviewedAt) ?? -1;
+      const rightReviewedAt = timestampMs(durableReviewVersion(right, number)?.reviewedAt) ?? -1;
+      if (leftReviewedAt !== rightReviewedAt) return rightReviewedAt - leftReviewedAt;
+      const leftUpdatedAt = timestampMs(commentUpdatedAt(left)) ?? -1;
+      const rightUpdatedAt = timestampMs(commentUpdatedAt(right)) ?? -1;
+      if (leftUpdatedAt !== rightUpdatedAt) return rightUpdatedAt - leftUpdatedAt;
+      const leftId = commentId(left) ?? -1;
+      const rightId = commentId(right) ?? -1;
+      if (leftId !== rightId) return rightId - leftId;
+      return reviewCommentBodyDigest(commentBody(right) ?? "").localeCompare(
+        reviewCommentBodyDigest(commentBody(left) ?? ""),
+      );
+    })[0];
+  }
+
   function selectIssueReviewComment(
     number: number,
     comments: Record<string, unknown>[],
     fallbackBodies: readonly string[] = [],
   ): Record<string, unknown> | undefined {
-    const marker = reviewCommentMarker(number);
-    const markedComments = comments.filter((candidate) => {
-      const body = candidate.body;
-      return typeof body === "string" && body.includes(marker);
-    });
-    const patchableMarked = markedComments.find(canPatchReviewComment);
+    const markedComments = comments.filter((candidate) =>
+      hasExactDurableReviewMarker(number, candidate),
+    );
+    const patchableMarked = newestReviewComment(
+      number,
+      markedComments.filter(canPatchReviewComment),
+    );
     if (patchableMarked) return patchableMarked;
-    const marked = markedComments[0];
+    const marked = newestReviewComment(number, markedComments);
     if (marked) return marked;
     const exactBodies = new Set(fallbackBodies.map((body) => body.trim()).filter(Boolean));
     const exactComments = comments.filter((candidate) => {
       const body = candidate.body;
       return typeof body === "string" && exactBodies.has(body.trim());
     });
-    const patchableExact = exactComments.find(canPatchReviewComment);
+    const patchableExact = newestReviewComment(number, exactComments.filter(canPatchReviewComment));
     if (patchableExact) return patchableExact;
-    const exact = exactComments[0];
+    const exact = newestReviewComment(number, exactComments);
     if (exact) return exact;
     const codexComments = comments.filter((candidate) => {
       const body = candidate.body;
       return typeof body === "string" && isCodexReviewCommentBody(body);
     });
-    return codexComments.find(canPatchReviewComment) ?? codexComments[0];
+    return (
+      newestReviewComment(number, codexComments.filter(canPatchReviewComment)) ??
+      newestReviewComment(number, codexComments)
+    );
+  }
+
+  function supersededReviewCommentIds(options: {
+    number: number;
+    comments: readonly Record<string, unknown>[];
+    keepCommentIds: ReadonlySet<number>;
+  }): number[] {
+    return options.comments
+      .filter(
+        (comment) =>
+          canPatchReviewComment(comment) && hasExactDurableReviewMarker(options.number, comment),
+      )
+      .map(commentId)
+      .filter((id): id is number => id !== null && !options.keepCommentIds.has(id))
+      .sort((left, right) => left - right);
   }
 
   function selectDedicatedReviewStartLeaseComment(
@@ -268,16 +312,23 @@ export function createReviewCommentState(
   function issueReviewCommentWithBody(
     number: number,
     body: string,
+    expectedId?: number,
   ): Record<string, unknown> | undefined {
     const expected = body.trim();
     if (!expected) return undefined;
     const comments = ghPaged<unknown>(`repos/${targetRepo()}/issues/${number}/comments`).map(
       asRecord,
     );
-    const exactComments = comments.filter(
-      (candidate) => commentBody(candidate)?.trim() === expected,
+    const trustedExactComments = comments.filter(
+      (candidate) =>
+        canPatchReviewComment(candidate) &&
+        commentId(candidate) !== null &&
+        commentBody(candidate)?.trim() === expected,
     );
-    return exactComments.find(canPatchReviewComment) ?? exactComments[0];
+    // PATCH recovery is identity-bound; POST recovery elects the newest trusted exact comment.
+    return expectedId === undefined
+      ? newestReviewComment(number, trustedExactComments)
+      : trustedExactComments.find((candidate) => commentId(candidate) === expectedId);
   }
 
   function commentUpdatedAt(comment: Record<string, unknown> | undefined): string | undefined {
@@ -613,7 +664,10 @@ export function createReviewCommentState(
     renderReviewStartStatusComment,
     isCodexReviewCommentBody,
     fetchIssueReviewComments,
+    hasExactDurableReviewMarker,
+    newestReviewComment,
     selectIssueReviewComment,
+    supersededReviewCommentIds,
     selectDedicatedReviewStartLeaseComment,
     selectDedicatedReviewStartLeaseComments,
     issueReviewCommentState,

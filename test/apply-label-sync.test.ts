@@ -1687,7 +1687,7 @@ if (args[0] === "api" && /\\/issues\\/74481$/.test(path)) {
     assert.match(patchedBody, /clawsweeper-review-history v=1 total=1/);
     assert.match(
       patchedBody,
-      /- reviewed 2026-05-20T00:00:00\.000Z sha old-head :: needs maintainer review before merge\./,
+      /- reviewed 2026-05-20T00:00:00\.000Z sha old-head :: blocked before merge\./,
     );
     assert.doesNotMatch(patchedBody, /clawsweeper-verdict:/);
     const updatedReport = readFileSync(itemPath, "utf8");

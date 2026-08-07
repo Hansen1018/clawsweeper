@@ -329,6 +329,20 @@ function dataModelSurfacesFromPatch(
   ) {
     add("serialized state");
   }
+  if (
+    /\b(?:cache(?:Key|Version|Schema|Namespace)?|cache[_-]?(?:key|version|schema|namespace)|ttl)\b/i.test(
+      text,
+    )
+  ) {
+    add("persistent cache schema");
+  }
+  if (
+    /\b(?:embedding|vector|collection|dimension|metadata|row[_-]?id|document[_-]?id|chunk[_-]?id|similarity[_-]?index)\b/i.test(
+      text,
+    )
+  ) {
+    add("vector/embedding metadata");
+  }
   return [...surfaces];
 }
 

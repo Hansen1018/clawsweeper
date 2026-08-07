@@ -103,6 +103,11 @@ export interface CreateApplyDecisionWorkflowDependencies {
     comments: readonly Record<string, unknown>[];
     keepCommentIds: ReadonlySet<number>;
   }) => void;
+  cleanupSupersededReviewComments: (options: {
+    number: number;
+    comments: readonly Record<string, unknown>[];
+    keepCommentIds: ReadonlySet<number>;
+  }) => void;
   closeItem: (options: { number: number; kind: ItemKind; reason: CloseReason }) => void;
   closeReasonApplyAgeSkipReason: (
     item: Pick<Item, "createdAt">,
@@ -627,7 +632,7 @@ export interface CreateApplyDecisionWorkflowDependencies {
     body: string,
     existing?: Record<string, unknown>,
     mutationIdentity?: string,
-  ) => Record<string, unknown> | undefined;
+  ) => Record<string, unknown>;
   validateCloseDecision: (
     item: Pick<Item, "kind" | "labels"> & Partial<Pick<Item, "repo" | "authorAssociation">>,
     decision: Decision,

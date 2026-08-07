@@ -4821,7 +4821,9 @@ test("partition markers and import destinations reject symlinked parents", async
   assert.throws(() => recordReview(root), /symbolic link or junction/);
   assert.deepEqual(fs.readdirSync(outsidePartitions), []);
 
-  fs.rmSync(path.join(root, ".clawsweeper-repair", "action-events", "_partitions"));
+  fs.rmSync(path.join(root, ".clawsweeper-repair", "action-events", "_partitions"), {
+    recursive: true,
+  });
   recordReview(root);
   const [relativePath] = await flushWorkflowActionEvents(root, {
     env: workflowEnv(),

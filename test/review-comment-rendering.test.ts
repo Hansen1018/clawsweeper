@@ -568,8 +568,9 @@ test("pull request keep-open review comments label the change summary", () => {
       number: "74265",
       decision: "keep_open",
       close_reason: "none",
+      review_status: "complete",
       work_candidate: "none",
-      pull_head_sha: "abc123def456",
+      pull_head_sha: "abc123def456abc123def456abc123def456abcd",
       reviewed_at: "2026-05-22T04:43:12.000Z",
     })}
 
@@ -640,6 +641,16 @@ Reason: Maintainers should review the tests after the targeted lane is green.
 ## Evidence
 
 - **targeted lane:** The PR is test-only and should run the matching changed-test lane.
+
+## Review Findings
+
+Overall correctness: patch is correct
+
+Overall confidence: 0.9
+
+Full review comments:
+
+- none
 	`,
     "none",
   );
@@ -667,7 +678,7 @@ Reason: Maintainers should review the tests after the targeted lane is green.
   );
   assert.ok(comment.indexOf("## Verification") < comment.indexOf("## How this fits together"));
   assert.doesNotMatch(comment, /## Proof/);
-  assert.match(comment, /\*\*Reviewed head:\*\* `abc123def456`/);
+  assert.match(comment, /\*\*Reviewed head:\*\* `abc123def456abc123def456abc123def456abcd`/);
   assert.doesNotMatch(comment, /\*\*Workflow note:\*\*/);
   assert.match(comment, /### Workflow/);
   assert.match(
@@ -724,7 +735,10 @@ Reason: Maintainers should review the tests after the targeted lane is green.
   assert.ok(comment.indexOf("### Technical review") < comment.indexOf("### Evidence"));
   assert.ok(comment.indexOf("### Evidence") < comment.indexOf("### Rating scale"));
   assert.ok(comment.indexOf("### Rating scale") < comment.indexOf("### Workflow"));
-  assert.match(comment, /<!-- clawsweeper-verdict:needs-human item=74265 sha=abc123def456/);
+  assert.match(
+    comment,
+    /<!-- clawsweeper-verdict:needs-human item=74265 sha=abc123def456abc123def456abc123def456abcd/,
+  );
 });
 
 test("review comments include the UTC date when ET and UTC calendar dates differ", () => {
@@ -734,8 +748,9 @@ test("review comments include the UTC date when ET and UTC calendar dates differ
       number: "74266",
       decision: "keep_open",
       close_reason: "none",
+      review_status: "complete",
       work_candidate: "none",
-      pull_head_sha: "abc123def456",
+      pull_head_sha: "abc123def456abc123def456abc123def456abcd",
       reviewed_at: "2026-07-09T03:00:00.000Z",
     })}
 
@@ -749,7 +764,17 @@ Updates review timestamp formatting.
 
 ## Best Possible Solution
 
-Land the timestamp fix after targeted validation is green.
+Merge after required checks are green.
+
+## Review Findings
+
+Overall correctness: patch is correct
+
+Overall confidence: 0.9
+
+Full review comments:
+
+- none
 `,
     "none",
   );
@@ -767,6 +792,7 @@ test("issue keep-open review comments surface reproducibility in the summary", (
       number: "75877",
       decision: "keep_open",
       close_reason: "none",
+      review_status: "complete",
       work_candidate: "queue_fix_pr",
     })}
 
@@ -1008,18 +1034,18 @@ test("pull request close comments emit close-required automation markers", () =>
       repository: "openclaw/openclaw",
       type: "pull_request",
       number: 74270,
-      pull_head_sha: "abc123def456",
+      pull_head_sha: "abc123def456abc123def456abc123def456abcd",
     }),
     "implemented_on_main",
   );
 
   assert.match(
     comment,
-    /<!-- clawsweeper-verdict:close item=74270 sha=abc123def456 confidence=high updated_at=2026-05-01T00:00:00Z reviewed_at=[^ ]+ lease_owner=unknown lease_comment_id=unknown source_revision=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef action_taken=proposed_close reason=implemented_on_main -->/,
+    /<!-- clawsweeper-verdict:close item=74270 sha=abc123def456abc123def456abc123def456abcd confidence=high updated_at=2026-05-01T00:00:00Z reviewed_at=[^ ]+ lease_owner=unknown lease_comment_id=unknown source_revision=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef action_taken=proposed_close reason=implemented_on_main -->/,
   );
   assert.match(
     comment,
-    /<!-- clawsweeper-action:close-required item=74270 sha=abc123def456 confidence=high updated_at=2026-05-01T00:00:00Z reviewed_at=[^ ]+ lease_owner=unknown lease_comment_id=unknown source_revision=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef action_taken=proposed_close reason=implemented_on_main -->/,
+    /<!-- clawsweeper-action:close-required item=74270 sha=abc123def456abc123def456abc123def456abcd confidence=high updated_at=2026-05-01T00:00:00Z reviewed_at=[^ ]+ lease_owner=unknown lease_comment_id=unknown source_revision=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef action_taken=proposed_close reason=implemented_on_main -->/,
   );
   assert.doesNotMatch(comment, /clawsweeper-verdict:needs-human/);
 });
@@ -1067,8 +1093,9 @@ test("pull request review comments include dedicated security review", () => {
       number: "74265",
       decision: "keep_open",
       close_reason: "none",
+      review_status: "complete",
       work_candidate: "none",
-      pull_head_sha: "abc123def456",
+      pull_head_sha: "abc123def456abc123def456abc123def456abcd",
     })}
 
 ## Summary
@@ -1141,8 +1168,14 @@ Reason: Normal maintainer review is sufficient.
   assert.match(comment, /Agent review details/);
   assert.doesNotMatch(comment, /recent workflow maintainer/);
   assert.match(comment, /recent workflow contributor/);
-  assert.match(comment, /<!-- clawsweeper-security:security-sensitive item=74265 sha=abc123def456/);
-  assert.match(comment, /<!-- clawsweeper-verdict:needs-human item=74265 sha=abc123def456/);
+  assert.match(
+    comment,
+    /<!-- clawsweeper-security:security-sensitive item=74265 sha=abc123def456abc123def456abc123def456abcd/,
+  );
+  assert.match(
+    comment,
+    /<!-- clawsweeper-verdict:needs-human item=74265 sha=abc123def456abc123def456abc123def456abcd/,
+  );
 });
 
 test("pull request keep-open review comments surface Codex-style findings", () => {
@@ -1152,8 +1185,9 @@ test("pull request keep-open review comments surface Codex-style findings", () =
       number: "74268",
       decision: "keep_open",
       close_reason: "none",
+      review_status: "complete",
       work_candidate: "queue_fix_pr",
-      pull_head_sha: "abc123def456",
+      pull_head_sha: "abc123def456abc123def456abc123def456abcd",
     })}
 
 ## Summary
@@ -1216,8 +1250,9 @@ test("pull request keep-open review comments suppress duplicate best solution te
       number: "74266",
       decision: "keep_open",
       close_reason: "none",
+      review_status: "complete",
       work_candidate: "none",
-      pull_head_sha: "abc123def456",
+      pull_head_sha: "abc123def456abc123def456abc123def456abcd",
     })}
 
 ## Summary
@@ -1231,6 +1266,16 @@ Documents ClawSweeper self-review smoke coverage.
 ## Best Possible Solution
 
 Land this docs-only PR after maintainer review.
+
+## Review Findings
+
+Overall correctness: patch is correct
+
+Overall confidence: 0.9
+
+Full review comments:
+
+- none
 `,
     "none",
   );
@@ -1248,8 +1293,9 @@ test("pull request review comments do not priority-prefix routine no-op guidance
       number: "74269",
       decision: "keep_open",
       close_reason: "none",
+      review_status: "complete",
       work_candidate: "none",
-      pull_head_sha: "abc123def456",
+      pull_head_sha: "abc123def456abc123def456abc123def456abcd",
     })}
 
 ## Summary
@@ -1268,6 +1314,16 @@ Next rank-up steps:
 ## Best Possible Solution
 
 No ClawSweeper repair lane is needed; the submitted PR is narrow and the remaining action is normal maintainer review and CI.
+
+## Review Findings
+
+Overall correctness: patch is correct
+
+Overall confidence: 0.9
+
+Full review comments:
+
+- none
 `,
     "none",
   );
@@ -1286,7 +1342,7 @@ test("pull request next-step priority prefixes classify fail-closed work as P1",
       decision: "keep_open",
       close_reason: "none",
       work_candidate: "none",
-      pull_head_sha: "abc123def456",
+      pull_head_sha: "abc123def456abc123def456abc123def456abcd",
     })}
 
 ## Summary
@@ -1321,7 +1377,7 @@ test("pull request automerge review comments can emit pass verdicts", () => {
       review_status: "complete",
       labels: JSON.stringify(["clawsweeper:automerge"]),
       work_candidate: "none",
-      pull_head_sha: "abc123def456",
+      pull_head_sha: "abc123def456abc123def456abc123def456abcd",
     })}
 
 ## Summary
@@ -1353,7 +1409,10 @@ Full review comments:
   assert.match(comment, /## Before merge\n\nNone\./);
   assert.doesNotMatch(comment, /\[P2\] Merge after required checks are green/);
   assert.doesNotMatch(comment, /Automerge follow-up:/);
-  assert.match(comment, /<!-- clawsweeper-verdict:pass item=74453 sha=abc123def456/);
+  assert.match(
+    comment,
+    /<!-- clawsweeper-verdict:pass item=74453 sha=abc123def456abc123def456abc123def456abcd/,
+  );
   assert.doesNotMatch(comment, /clawsweeper-verdict:needs-human/);
 });
 
@@ -1367,7 +1426,7 @@ test("coverage-proof blocked PR reports do not emit repair pass verdicts", () =>
     review_status: "complete",
     labels: JSON.stringify(["clawsweeper:automerge"]),
     work_candidate: "none",
-    pull_head_sha: "abc123def456",
+    pull_head_sha: "abc123def456abc123def456abc123def456abcd",
   })}
 
 ## Summary
@@ -1482,7 +1541,15 @@ test("publishing the durable review comment sweeps superseded placeholders", () 
   const applyStart = source.indexOf('syncReasons.push("updated durable Codex review comment")');
   assert.ok(applyStart >= 0);
   const applyWindow = source.slice(applyStart, applyStart + 1200);
-  assert.match(applyWindow, /cleanupSupersededReviewPlaceholderComments\(\{/);
+  assert.match(applyWindow, /cleanupPublishedReviewComments\(syncedComment\)/);
+  const cleanupStart = source.indexOf("const cleanupPublishedReviewComments");
+  const cleanupWindow = source.slice(cleanupStart, applyStart);
+  assert.match(cleanupWindow, /cleanupSupersededReviewComments\(\{/);
+  assert.match(cleanupWindow, /cleanupSupersededReviewPlaceholderComments\(\{/);
+  assert.match(
+    source.slice(applyStart, applyStart + 2400),
+    /DurableReviewPublicationBlockedError[\s\S]*rememberSelfMutationUpdatedAt\(\);[\s\S]*cleanupPublishedReviewComments\(error\.syncedComment\)/,
+  );
 });
 
 test("completed durable publication clears a recovery escalation only after the review exists", () => {

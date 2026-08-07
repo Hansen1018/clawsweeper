@@ -1819,7 +1819,7 @@ if (args[0] === "api" && /\\/issues\\/comments\\/\\d+$/.test(path)) {
     const patchedBody = patchCall[1] ?? "";
     assert.match(
       patchedBody,
-      new RegExp(`clawsweeper-review-state:needs-changes item=321 sha=${headSha} v=1`),
+      new RegExp(`clawsweeper-review-state:blocked item=321 sha=${headSha} v=1`),
     );
     assert.doesNotMatch(patchedBody, /clawsweeper-review-state:ready/);
     assert.equal((patchedBody.match(/<!-- clawsweeper-review-state:/g) ?? []).length, 1);

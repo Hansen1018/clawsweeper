@@ -14,6 +14,7 @@ import type {
   PrRatingTier,
   PrStatusLabelKind,
   PublicPriority,
+  PullRequestReviewState,
   RealBehaviorProof,
   ReviewFinding,
   SecurityConcern,
@@ -443,35 +444,6 @@ export function createReviewPresentation({
     ].join("\n");
   }
 
-  function publicMergeReadinessResult(rating: PrRating, proof: RealBehaviorProof): string {
-    if (rating.overallTier === "NA") return "needs maintainer review before merge.";
-    switch (proof.status) {
-      case "missing":
-        return "blocked until real behavior proof is added.";
-      case "mock_only":
-        return "blocked until real behavior proof from a real setup is added.";
-      case "insufficient":
-        return "blocked until stronger real behavior proof is added.";
-      case "sufficient":
-      case "override":
-        if (rating.patchTier === "F" || rating.patchTier === "D") {
-          return "blocked by patch quality or review findings.";
-        }
-        if (
-          rating.overallTier === "S" ||
-          rating.overallTier === "A" ||
-          rating.overallTier === "B"
-        ) {
-          return "ready for maintainer review.";
-        }
-        return "needs maintainer review before merge.";
-      case "not_applicable":
-        return rating.patchTier === "F" || rating.patchTier === "D"
-          ? "blocked by patch quality or review findings."
-          : "ready for maintainer review.";
-    }
-  }
-
   function publicRatingScore(tier: PrRatingTier): number | null {
     switch (tier) {
       case "S":
@@ -494,11 +466,6 @@ export function createReviewPresentation({
   function publicRatedName(tier: PrRatingTier): string {
     const score = publicRatingScore(tier);
     return `${themedRatingName(tier)}${score === null ? "" : ` **(${score}/6)**`}`;
-  }
-
-  function publicStatusText(value: string): string {
-    const text = sentence(value);
-    return text ? `${text[0]?.toUpperCase()}${text.slice(1)}` : "";
   }
 
   function publicReviewScoresBlock(
@@ -598,20 +565,21 @@ export function createReviewPresentation({
   }
 
   function publicMergeReadinessBlock(
-    rating: PrRating,
-    proof: RealBehaviorProof,
+    reviewState: PullRequestReviewState,
     priority: TriagePriority,
     bottomLine: string,
     remainingItemCount: number,
     decisionNeeded: boolean,
     reviewedHeadSha: string,
   ): string {
-    const result = publicStatusText(publicMergeReadinessResult(rating, proof)).replace(/\.$/, "");
-    const icon = /^blocked\b/i.test(result)
-      ? "⛔"
-      : /^ready\b/i.test(result) && remainingItemCount === 0 && !decisionNeeded
-        ? "✅"
-        : "⚠️";
+    const result =
+      reviewState === "ready"
+        ? "Ready for maintainer review"
+        : reviewState === "needs-changes"
+          ? "Needs changes before merge"
+          : "Blocked before merge";
+    const icon =
+      reviewState === "ready" && remainingItemCount === 0 && !decisionNeeded ? "✅" : "⛔";
     const remaining =
       remainingItemCount > 0
         ? ` - ${remainingItemCount} ${remainingItemCount === 1 ? "item remains" : "items remain"}`

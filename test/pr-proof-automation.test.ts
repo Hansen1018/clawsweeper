@@ -94,7 +94,7 @@ test("docs-only external PRs do not require real behavior proof", () => {
     author_association: "CONTRIBUTOR",
     labels: JSON.stringify(["clawsweeper:automerge"]),
     work_candidate: "none",
-    pull_head_sha: "abc123def456",
+    pull_head_sha: "abc123def456abc123def456abc123def456abcd",
     pull_files: JSON.stringify(["docs/usage.md", "docs/plugins/building-plugins.md"]),
     pull_files_truncated: false,
   })}
@@ -165,7 +165,7 @@ test("mixed docs and source external PRs still require real behavior proof", () 
     author_association: "CONTRIBUTOR",
     labels: JSON.stringify(["clawsweeper:automerge"]),
     work_candidate: "none",
-    pull_head_sha: "abc123def456",
+    pull_head_sha: "abc123def456abc123def456abc123def456abcd",
     pull_files: JSON.stringify(["docs/usage.md", "src/runtime.ts"]),
     pull_files_truncated: false,
   })}
@@ -229,7 +229,7 @@ test("maintainer and bot proof exemptions keep readiness, ratings, and security 
       author_association: options.association,
       labels: JSON.stringify(["clawsweeper:automerge"]),
       work_candidate: "none",
-      pull_head_sha: "abc123def456",
+      pull_head_sha: "abc123def456abc123def456abc123def456abcd",
     })}
 
 ## Summary
@@ -320,7 +320,7 @@ Full review comments:
     });
     assert.match(
       renderReviewCommentFromReport(redactedReport, "none"),
-      /blocked until real behavior proof from a real setup is added/i,
+      /needs real behavior proof before merge/i,
     );
     let lookups = 0;
     assert.equal(
@@ -402,7 +402,7 @@ Full review comments:
 
   const contributorReport = reportFor({ author: "contributor", association: "CONTRIBUTOR" });
   const contributorComment = renderReviewCommentFromReport(contributorReport, "none");
-  assert.match(contributorComment, /blocked until real behavior proof is added/i);
+  assert.match(contributorComment, /needs real behavior proof before merge/i);
   assert.match(
     reviewAutomationMarkersFromReport(contributorReport),
     /clawsweeper-verdict:needs-human/,
@@ -412,7 +412,7 @@ Full review comments:
     reportFor({ author: "maintainer", association: "MEMBER", securityAttention: true }),
     "none",
   );
-  assert.match(securityComment, /blocked by patch quality or review findings/i);
+  assert.match(securityComment, /needs changes before merge/i);
   assert.match(securityComment, /\| \*\*Security\*\* \| Needs attention/);
   assert.doesNotMatch(securityComment, /blocked until .*real behavior proof/i);
 });
@@ -429,7 +429,7 @@ test("production-owner HTTP fault-boundary proof unblocks shared channel reliabi
     author_association: "CONTRIBUTOR",
     labels: JSON.stringify(["channel: telegram", "clawsweeper:automerge"]),
     work_candidate: "none",
-    pull_head_sha: "abc123def456",
+    pull_head_sha: "abc123def456abc123def456abc123def456abcd",
     pull_files: JSON.stringify([
       "src/channels/draft-stream-loop.ts",
       "src/channels/draft-stream-loop.test.ts",
@@ -520,7 +520,7 @@ test("screenshot-only browser runtime proof blocks pass markers", () => {
     author_association: "CONTRIBUTOR",
     labels: JSON.stringify(["clawsweeper:automerge"]),
     work_candidate: "none",
-    pull_head_sha: "abc123def456",
+    pull_head_sha: "abc123def456abc123def456abc123def456abcd",
   })}
 
 ## Summary
@@ -578,7 +578,7 @@ test("missing real behavior proof blocks pass and repair markers", () => {
     author_association: "CONTRIBUTOR",
     labels: JSON.stringify(["clawsweeper:automerge"]),
     work_candidate: "queue_fix_pr",
-    pull_head_sha: "abc123def456",
+    pull_head_sha: "abc123def456abc123def456abc123def456abcd",
   })}
 
 ## Summary
@@ -636,7 +636,7 @@ test("mock-only real behavior proof blocks repair markers", () => {
     author_association: "CONTRIBUTOR",
     labels: JSON.stringify(["clawsweeper:autofix"]),
     work_candidate: "queue_fix_pr",
-    pull_head_sha: "abc123def456",
+    pull_head_sha: "abc123def456abc123def456abc123def456abcd",
   })}
 
 ## Summary
@@ -736,7 +736,7 @@ test("OpenClaw contributor changelog-entry findings are normalized", () => {
       confidence: "high",
       labels: JSON.stringify(["clawsweeper:automerge"]),
       work_candidate: decision.workCandidate,
-      pull_head_sha: "abc123def456",
+      pull_head_sha: "abc123def456abc123def456abc123def456abcd",
       pr_rating_overall: decision.prRating.overallTier,
       pr_rating_proof: decision.prRating.proofTier,
       pr_rating_patch: decision.prRating.patchTier,
@@ -869,7 +869,7 @@ test("pull request automerge pass is not blocked by generic protected labels", (
       confidence: "high",
       labels: JSON.stringify(["maintainer", "size: XL", "clawsweeper:automerge"]),
       work_candidate: "manual_review",
-      pull_head_sha: "abc123def456",
+      pull_head_sha: "abc123def456abc123def456abc123def456abcd",
     })}
 
 ## Summary
@@ -899,7 +899,10 @@ Full review comments:
 
   assert.match(comment, /Codex review: passed\./);
   assert.doesNotMatch(comment, /Codex review: passed for ClawSweeper automerge/);
-  assert.match(comment, /<!-- clawsweeper-verdict:pass item=74716 sha=abc123def456/);
+  assert.match(
+    comment,
+    /<!-- clawsweeper-verdict:pass item=74716 sha=abc123def456abc123def456abc123def456abcd/,
+  );
   assert.doesNotMatch(comment, /clawsweeper-verdict:needs-human/);
 });
 
@@ -913,7 +916,7 @@ test("pull request autofix review comments can emit pass verdicts without merge 
       review_status: "complete",
       labels: JSON.stringify(["clawsweeper:autofix"]),
       work_candidate: "none",
-      pull_head_sha: "abc123def456",
+      pull_head_sha: "abc123def456abc123def456abc123def456abcd",
     })}
 
 ## Summary
@@ -946,7 +949,10 @@ Full review comments:
   assert.match(comment, /## Before merge\n\nNone\./);
   assert.doesNotMatch(comment, /\[P2\] Leave this draft open after fixes are complete/);
   assert.doesNotMatch(comment, /Autofix follow-up:/);
-  assert.match(comment, /<!-- clawsweeper-verdict:pass item=74610 sha=abc123def456/);
+  assert.match(
+    comment,
+    /<!-- clawsweeper-verdict:pass item=74610 sha=abc123def456abc123def456abc123def456abcd/,
+  );
   assert.doesNotMatch(comment, /Codex review: passed for ClawSweeper automerge/);
 });
 
@@ -960,7 +966,7 @@ test("pull request automerge review comments with findings require repair", () =
     review_status: "complete",
     labels: JSON.stringify(["clawsweeper:automerge"]),
     work_candidate: "queue_fix_pr",
-    pull_head_sha: "abc123def456",
+    pull_head_sha: "abc123def456abc123def456abc123def456abcd",
   })}
 
 ## Summary
@@ -1008,7 +1014,7 @@ test("pull request automerge findings trigger repair without work candidate fron
     confidence: "high",
     review_status: "complete",
     labels: JSON.stringify(["clawsweeper:automerge"]),
-    pull_head_sha: "abc123def456",
+    pull_head_sha: "abc123def456abc123def456abc123def456abcd",
   })}
 
 ## Review Findings
@@ -1249,6 +1255,13 @@ test("an early front matter terminator injected by a legacy scalar fails closed"
   assert.match(markers, /clawsweeper-verdict:needs-human/);
   assert.doesNotMatch(markers, /clawsweeper-verdict:needs-changes/);
   assert.doesNotMatch(markers, /clawsweeper-action:fix-required/);
-  assert.match(comment, /\| \*\*Proof confidence\*\* \| [^|]*\*\*\(1\/6\)\*\* \|/);
+  assert.ok(Buffer.byteLength(comment, "utf8") < 2048);
+  assert.match(comment, /\*\*Blocked before merge\.\*\*/);
+  assert.match(comment, /Regenerate malformed review report/);
+  assert.match(
+    comment,
+    /clawsweeper-review-state:blocked item=951 sha=1111111111111111111111111111111111111111 v=1/,
+  );
+  assert.doesNotMatch(comment, /clawsweeper-verdict:pass/);
   assert.doesNotMatch(comment, /\| \*\*Proof confidence\*\* \| [^|]*\*\*\(5\/6\)\*\* \|/);
 });
