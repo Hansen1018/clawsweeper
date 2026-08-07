@@ -286,6 +286,9 @@ export function createReportCommentHelpers(
     reviewFailed: boolean;
     proof: RealBehaviorProof;
     proofBlocked: boolean;
+    configSurfaceBlocked: boolean;
+    dataModelSurfaceBlocked: boolean;
+    coverageProofBlocked: boolean;
     findings: readonly ReviewFinding[];
     securityReview: SecurityReview;
     risks: string;
@@ -336,6 +339,30 @@ export function createReportCommentHelpers(
     }
     if (options.proofBlocked) {
       add("Add real behavior proof", publicRealBehaviorProofLine(options.proof));
+    }
+    if (options.configSurfaceBlocked) {
+      add(
+        "Review config compatibility",
+        "Confirm compatibility and upgrade impact for the changed config or default surface before merge.",
+      );
+    }
+    if (options.dataModelSurfaceBlocked) {
+      add(
+        "Add data-model compatibility proof",
+        "Confirm migration or upgrade compatibility proof before merge.",
+      );
+    }
+    if (options.coverageProofBlocked) {
+      add(
+        "Complete close-coverage proof",
+        "Complete the pull request close-coverage proof before merge.",
+      );
+    }
+    if (options.decisionPending) {
+      add(
+        "Resolve maintainer decision",
+        "Resolve the maintainer decision shown above before merge.",
+      );
     }
     for (const finding of options.findings) {
       add(`${finding.title.trim()} (${priorityLabel(finding.priority)})`, finding.body, {

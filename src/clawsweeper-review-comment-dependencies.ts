@@ -5,6 +5,7 @@ import type { createReviewPresentation } from "./clawsweeper-review-presentation
 import type {
   Item,
   OverallCorrectness,
+  PrRating,
   PullRequestRef,
   ReviewFinding,
   ReviewStartStatusCommentResult,
@@ -40,6 +41,7 @@ export interface ReviewCommentWorkflowDependencies {
   reportSecurityReview: (markdown: string) => SecurityReview;
   reportReviewFindings: (markdown: string) => ReviewFinding[];
   reportOverallCorrectness: (markdown: string) => OverallCorrectness;
+  reportPrRating: (markdown: string) => PrRating;
   ensureDir: (path: string) => void;
   frontMatterValue: (markdown: string, key: string) => string | undefined;
   replaceFrontMatterValue: (markdown: string, key: string, value: string) => string;

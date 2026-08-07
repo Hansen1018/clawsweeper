@@ -46,6 +46,7 @@ export interface CreateReportRenderingDependencies {
     },
   ) => ItemContext;
   compactPullFilePaths: (value: unknown) => string[];
+  configSurfaceReviewRequired: (markdown: string) => boolean;
   confidenceText: (score: number) => string;
   duplicateCanonicalLinks: (options: {
     reason: CloseReason;
@@ -59,6 +60,7 @@ export interface CreateReportRenderingDependencies {
     bestSolutionLine: string;
     evidence: Evidence[];
   }) => string;
+  dataModelSurfaceReviewRequired: (markdown: string) => boolean;
   ensureDir: (path: string) => void;
   fileUrl: (file: string, sha: string, line?: number) => string;
   fixedInReportText: (markdown: string) => string;

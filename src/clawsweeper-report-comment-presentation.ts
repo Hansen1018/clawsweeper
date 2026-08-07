@@ -27,6 +27,8 @@ export function createReportCommentPresentation(
     closeReviewLineFromReport,
     collapsedDetailsBlock,
     confidenceText,
+    configSurfaceReviewRequired,
+    dataModelSurfaceReviewRequired,
     frontMatterStringArray,
     frontMatterValue,
     isReportNoneList,
@@ -296,6 +298,10 @@ export function createReportCommentPresentation(
         reviewFailed,
         proof: realBehaviorProof,
         proofBlocked: hasRealBehaviorProofBlocker,
+        configSurfaceBlocked: configSurfaceReviewRequired(markdown),
+        dataModelSurfaceBlocked: dataModelSurfaceReviewRequired(markdown),
+        coverageProofBlocked:
+          frontMatterValue(markdown, "action_taken") === "skipped_pr_close_coverage_proof",
         findings: reviewFindings,
         securityReview,
         risks,
@@ -319,9 +325,7 @@ export function createReportCommentPresentation(
               realBehaviorProof,
               triagePriority,
               summaryLine,
-              // An outstanding maintainer decision is remaining work even though it
-              // lives outside the checklist.
-              beforeMergeItems.length + (decisionPacketBlock ? 1 : 0),
+              beforeMergeItems.length,
               Boolean(decisionPacketBlock),
               pullHeadShaFromReport(markdown) ?? "",
             ),
