@@ -603,7 +603,7 @@ Summary: A live session confirmed the override reaches the next request.
 
 ## Best Possible Solution
 
-Land the tests after targeted validation is green.
+Merge after required checks are green.
 
 ## Reproduction Assessment
 
@@ -635,7 +635,7 @@ Priority: low
 
 Status: none
 
-Reason: Maintainers should review the tests after the targeted lane is green.
+Reason: No ClawSweeper repair lane is needed; ordinary CI and maintainer review remain.
 
 ## Evidence
 
@@ -711,10 +711,7 @@ Full review comments:
   // Ordinary maintainer review guidance collapses out of the checklist.
   assert.match(comment, /## Before merge\n\nNone\./);
   assert.match(comment, /<summary><strong>Agent review details<\/strong><\/summary>/);
-  assert.match(
-    comment,
-    /Best possible solution:\n\nLand the tests after targeted validation is green\./,
-  );
+  assert.match(comment, /Best possible solution:\n\nMerge after required checks are green\./);
   assert.match(
     comment,
     /Do we have a high-confidence way to reproduce the issue\?\n\nNot applicable\. This is a test-only PR/,

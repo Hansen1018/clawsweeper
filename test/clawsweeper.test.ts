@@ -2548,6 +2548,12 @@ test("review prompt asks for concise public review fields", () => {
 
   assert.match(prompt, /Keep these fields concise because they become the public review comment/);
   assert.match(prompt, /one short sentence for `changeSummary`, `workReason`, `bestSolution`/);
+  assert.match(prompt, /`workCandidate` is the authoritative repair-routing signal/);
+  assert.match(prompt, /Use one gate-only sentence shaped like `Wait for CI\.`/);
+  assert.match(prompt, /<1-9 alphanumeric or hyphenated words>/);
+  assert.match(prompt, /Normalize punctuation in the proof name to hyphens/);
+  assert.match(prompt, /Do not add a\s+second\s+sentence or embed repair instructions/);
+  assert.match(prompt, /Any other `bestSolution` is\s+published\s+fail-closed/);
   assert.match(
     prompt,
     /merge\s+automation is reported by the command\/status comment and hidden markers/,

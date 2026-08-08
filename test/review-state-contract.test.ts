@@ -150,6 +150,133 @@ Reason: Merge after required checks are green.
   assert.doesNotMatch(markers, /clawsweeper-verdict:pass/);
 });
 
+test("queue_fix_pr remains actionable without parsing its reason", () => {
+  const reasons = [
+    "The bug is narrow and source-reproducible.",
+    "Merge after required checks are green.",
+    "We should replace the stale durable marker.",
+  ];
+
+  for (const reason of reasons) {
+    const report = reviewReport(
+      { work_candidate: "queue_fix_pr" },
+      `## Work Candidate
+
+Candidate: queue_fix_pr
+
+Confidence: high
+
+Priority: high
+
+Status: candidate
+
+Reason: ${reason}
+`,
+    );
+    const comment = renderReviewCommentFromReport(report, "none");
+    const markers = reviewAutomationMarkersFromReport(report);
+
+    assert.match(comment, /Complete next step/, reason);
+    assert.doesNotMatch(comment, /## Before merge\n\nNone\./, reason);
+    assert.deepEqual(
+      stateMarkers(markers),
+      [`<!-- clawsweeper-review-state:needs-changes item=120232 sha=${reviewedHead} v=1 -->`],
+      reason,
+    );
+    assert.match(markers, /clawsweeper-verdict:needs-changes/, reason);
+    assert.match(markers, /clawsweeper-action:fix-required/, reason);
+    assert.doesNotMatch(markers, /clawsweeper-verdict:pass/, reason);
+  }
+});
+
+test("non-routine best solutions fail closed without imperative parsing", () => {
+  const bestSolutions = [
+    "Replace the stale durable marker.",
+    "We should replace the stale durable marker.",
+    "Recommendation: resolve the stale durable marker.",
+    "Address what is causing the stale publication.",
+    "After merging main, resolve the conflicts.",
+    "Update complete.",
+    "Delete operation is disabled.",
+    "Restore is not required.",
+    "No ClawSweeper repair lane is needed; fix the stale marker, then normal maintainer review and CI.",
+    "Migrate the schema, then run normal CI.",
+    "Merge and migrate the schema after normal CI.",
+    "Merge after fixing the marker, then run normal CI.",
+    "Proceed with replacing the stale marker after normal CI.",
+    "Merge after required checks are green. Replace the stale durable marker.",
+    "Leave this draft open after fixes are complete.",
+    "CI checks are red.",
+    "CI checks are failing.",
+    "Required checks are pending.",
+    "Required checks are missing.",
+    "Status checks are flaky.",
+    "CI checks are unrelated.",
+    "CI checks are red but may pass on rerun.",
+    "Land the tests after targeted validation is green.",
+    "Merge after the unrelated CI state is understood.",
+  ];
+
+  for (const bestSolution of bestSolutions) {
+    const report = reviewReport().replace("Merge after required checks are green.", bestSolution);
+    const comment = renderReviewCommentFromReport(report, "none");
+    const markers = reviewAutomationMarkersFromReport(report);
+
+    assert.match(comment, /Complete next step/, bestSolution);
+    assert.doesNotMatch(comment, /## Before merge\n\nNone\./, bestSolution);
+    assert.deepEqual(
+      stateMarkers(markers),
+      [`<!-- clawsweeper-review-state:blocked item=120232 sha=${reviewedHead} v=1 -->`],
+      bestSolution,
+    );
+    assert.doesNotMatch(markers, /clawsweeper-verdict:pass/, bestSolution);
+  }
+});
+
+test("whole-sentence routine gate outcomes remain ready", () => {
+  const bestSolutions = [
+    "Validate the change with ordinary CI and maintainer review.",
+    "Proceed with normal maintainer review.",
+    "Wait for CI.",
+    "CI checks are green.",
+    "Required status checks have passed.",
+    "Merge after ordinary CI and maintainer review.",
+    "Merge after maintainer review and ordinary CI.",
+  ];
+
+  for (const bestSolution of bestSolutions) {
+    const report = reviewReport().replace("Merge after required checks are green.", bestSolution);
+    const comment = renderReviewCommentFromReport(report, "none");
+    const markers = reviewAutomationMarkersFromReport(report);
+
+    assert.match(comment, /## Before merge\n\nNone\./, bestSolution);
+    assert.deepEqual(
+      stateMarkers(markers),
+      [`<!-- clawsweeper-review-state:ready item=120232 sha=${reviewedHead} v=1 -->`],
+      bestSolution,
+    );
+    assert.doesNotMatch(markers, /clawsweeper-verdict:needs-changes/, bestSolution);
+    assert.doesNotMatch(markers, /clawsweeper-action:fix-required/, bestSolution);
+  }
+});
+
+test("missing best solutions fail closed", () => {
+  for (const replacement of ["", "- none", "None.", "_Not provided._"]) {
+    const report = reviewReport().replace("Merge after required checks are green.", replacement);
+    const comment = renderReviewCommentFromReport(report, "none");
+    const markers = reviewAutomationMarkersFromReport(report);
+
+    assert.match(comment, /Record the merge outcome/, JSON.stringify(replacement));
+    assert.doesNotMatch(comment, /## Before merge\n\nNone\./, JSON.stringify(replacement));
+    assert.deepEqual(
+      stateMarkers(markers),
+      [`<!-- clawsweeper-review-state:blocked item=120232 sha=${reviewedHead} v=1 -->`],
+      JSON.stringify(replacement),
+    );
+    assert.doesNotMatch(markers, /clawsweeper-verdict:pass/, JSON.stringify(replacement));
+  }
+});
+
 test("blocked queue candidates never emit repair markers", () => {
   const riskSection = `## Risks / Open Questions
 

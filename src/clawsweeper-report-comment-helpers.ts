@@ -275,22 +275,18 @@ export function createReportCommentHelpers(
   }
 
   function isRoutineBeforeMergeStep(value: string): boolean {
-    const text = value.trim();
+    const text = value.trim().replace(/\s+/g, " ");
     if (!text) return false;
-    if (
-      !/\b(?:merge after (?:required )?checks are green|merge after maintainer review|normal (?:ci|maintainer review)|routine (?:ci|maintainer review)|ordinary (?:ci|maintainer review)|wait for (?:required |status )?(?:ci|checks|status checks)|no further action)\b/i.test(
-        text,
-      ) &&
-      !/^(?:land|merge|ship|proceed|continue|wait)\b[^\n]{0,120}\bafter (?:normal |ordinary |routine )?maintainer review\b/i.test(
-        text,
-      )
-    ) {
-      return false;
-    }
-    if (/\b(?:do not|don['’]t|must not|never|not merge|except|unless|until)\b/i.test(text)) {
-      return false;
-    }
-    return !isActionablePriorityText(text);
+    return [
+      /^no further action(?: is required)?[.!]?$/i,
+      /^no clawsweeper repair lane is needed; the submitted pr is narrow and the remaining action is normal maintainer review and ci[.!]?$/i,
+      /^(?:continue|proceed) (?:with )?(?:normal|ordinary|routine) maintainer review(?:; clawsweeper found no patch-correctness issue)?[.!]?$/i,
+      /^validate (?:the|this) (?:change|pr|branch) with (?:normal|ordinary|routine) ci and maintainer review[.!]?$/i,
+      /^(?:ci|status|required(?: status)?) checks? (?:(?:are|were|is|was|remain|remains) (?:green|passing)|pass(?:es|ed)?(?: without (?:any )?(?:test )?failures| but (?:no failures are seen|maintainer review is still required))?|have passed)(?: and required approvals are complete)?[.!]?$/i,
+      /^(?:land|merge|ship|proceed) after the [a-z0-9-]+(?: [a-z0-9-]+){0,8} proof and required checks pass[.!]?$/i,
+      /^(?:land|merge|ship)(?: (?:(?:the|this|that) )?(?:[a-z0-9-]+ ){0,5}(?:pr|pull request|branch|change|patch|commits?|tests?|workflow|docs?|documentation|fix|implementation|release))? (?:after (?:(?:normal |ordinary |routine )?ci(?: and maintainer review)?|(?:normal |ordinary |routine )?maintainer review(?: and (?:normal |ordinary |routine )?ci)?)|after clawsweeper review and required checks are green|after (?:required )?(?:status )?checks?(?: are green| pass(?: without (?:any )?(?:test )?failures| and no failures are seen)?| and maintainer review)?|once required checks have passed)[.!]?$/i,
+      /^wait for (?:required |status )?(?:ci|checks?|status checks?)(?: to pass)?[.!]?$/i,
+    ].some((pattern) => pattern.test(text));
   }
 
   function securitySensitiveRepairAllowed(markdown: string): boolean {
@@ -484,25 +480,37 @@ export function createReportCommentHelpers(
     }
 
     const workCandidate = frontMatterValue(markdown, "work_candidate");
-    // Only actionable next-step text enters the checklist: routing rationale or other
-    // explanatory prose is not remaining merge work, and decision questions are
-    // already represented by the decision packet.
-    for (const guidance of [
-      reportWorkCandidateReason(markdown),
-      reviewSectionValue(markdown, "bestSolution"),
-    ]) {
-      const nextStep = sentence(guidance);
-      if (
-        !isRoutineBeforeMergeStep(nextStep) &&
-        !isRoutineCiOrReviewText(nextStep) &&
-        isActionablePriorityText(nextStep)
-      ) {
-        add(
-          workCandidate === "queue_fix_pr" ? "needs-changes" : "blocked",
-          `Complete next step (${publicPriorityFromText(nextStep, "P2")})`,
-          nextStep,
-        );
-      }
+    const workReason = sentence(reportWorkCandidateReason(markdown));
+    // The structured work candidate owns repair routing. Best Solution owns the
+    // desired end state and fails closed unless it names only ordinary merge gates.
+    const bestSolutionText = reviewSectionValue(markdown, "bestSolution");
+    const bestSolution = sentence(bestSolutionText);
+    const normalizedBestSolutionText = bestSolutionText
+      .trim()
+      .replace(/^[_*]+|[_*]+$/g, "")
+      .trim();
+    const bestSolutionMissing =
+      isReportNoneList(bestSolutionText) ||
+      /^(?:none|n\/a|not applicable|not provided)[.!]?$/i.test(normalizedBestSolutionText);
+    const bestSolutionRequiresWork =
+      !bestSolutionMissing && !isRoutineBeforeMergeStep(bestSolution);
+    if (bestSolutionRequiresWork) {
+      add(
+        workCandidate === "queue_fix_pr" ? "needs-changes" : "blocked",
+        `Complete next step (${publicPriorityFromText(bestSolution, "P2")})`,
+        bestSolution,
+      );
+    }
+    if (workCandidate === "queue_fix_pr" && !bestSolutionRequiresWork) {
+      const nextStep =
+        workReason || "Complete the queued branch repair before merge, then rerun review.";
+      // This records repair work only. Blocked items still win below, and the
+      // marker layer separately gates security and proof before fix-required.
+      add(
+        "needs-changes",
+        `Complete next step (${publicPriorityFromText(nextStep, "P2")})`,
+        nextStep,
+      );
     }
 
     const prRating = reportPrRating(markdown);
@@ -558,6 +566,15 @@ export function createReportCommentHelpers(
         "needs-changes",
         "Complete the queued repair",
         "Apply the queued review repair and run a fresh exact-head review before merge.",
+      );
+    }
+    // Missing summary guidance must block a false-ready report, but it must not
+    // suppress a more specific repair route already recorded by typed evidence.
+    if (bestSolutionMissing && !items.some((item) => item.state === "needs-changes")) {
+      add(
+        "blocked",
+        "Record the merge outcome",
+        "ClawSweeper must record one canonical gate-only Best Possible Solution before readiness can be published.",
       );
     }
 

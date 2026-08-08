@@ -929,7 +929,7 @@ Adds the SDK package scaffolding.
 
 ## Best Possible Solution
 
-Leave this draft open after fixes are complete.
+Continue normal maintainer review.
 
 ## Review Findings
 
@@ -945,9 +945,9 @@ Full review comments:
   );
 
   assert.match(comment, /Codex review: passed\./);
-  // Explanatory routing prose is not remaining merge work.
+  // Ordinary maintainer review is not remaining branch work.
   assert.match(comment, /## Before merge\n\nNone\./);
-  assert.doesNotMatch(comment, /\[P2\] Leave this draft open after fixes are complete/);
+  assert.doesNotMatch(comment, /\[P2\] Continue normal maintainer review/);
   assert.doesNotMatch(comment, /Autofix follow-up:/);
   assert.match(
     comment,

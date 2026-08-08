@@ -132,6 +132,20 @@ end state, `reproductionAssessment` answers whether the issue has a
 high-confidence reproduction path, `solutionAssessment` answers whether the
 current/proposed path is the best fix, and `risks` are only unresolved
 uncertainty. Do not repeat the same sentence or evidence across those fields.
+`workCandidate` is the authoritative repair-routing signal: use
+`queue_fix_pr` whenever branch repair remains, and do not put unrepresented
+before-merge work in `workReason` when the candidate is `none` or
+`manual_review`. For a PR with no remaining repair or proof action,
+`bestSolution` must name only ordinary CI, validation, and maintainer-review
+gates. Use one gate-only sentence shaped like `Wait for CI.`,
+`Continue normal maintainer review.`,
+`Validate the change with ordinary CI and maintainer review.`,
+`Merge after required checks are green.`, or
+`Merge after ordinary CI and maintainer review.` Proof-dependent PRs may use
+`Merge after the <1-9 alphanumeric or hyphenated words> proof and required
+checks pass.` Normalize punctuation in the proof name to hyphens. Do not add a
+second sentence or embed repair instructions. Any other `bestSolution` is
+published fail-closed as work to complete before merge.
 Keep these fields concise because they become the public review comment. Prefer
 one short sentence for `changeSummary`, `workReason`, `bestSolution`, and
 `securityReview.summary`; use bullets only inside `reviewFindings`,

@@ -44,6 +44,10 @@ Full review comments:
 
 Needs a repair.
 
+## Best Possible Solution
+
+Merge after required checks are green.
+
 ${securitySection}
 `);
 
@@ -66,6 +70,10 @@ ${securitySection}
 ## Summary
 
 Needs an opted-in repair.
+
+## Best Possible Solution
+
+Merge after required checks are green.
 
 ${securitySection}
 `);
@@ -91,6 +99,10 @@ ${securitySection}
 ## Summary
 
 Would otherwise pass automerge.
+
+## Best Possible Solution
+
+Merge after required checks are green.
 
 ${securitySection}
 `);
