@@ -369,7 +369,7 @@ This exact review detected a high recent filing volume before Codex failed.
       "utf8",
     );
     const ghMock = `
-const { appendFileSync } = require("fs");
+const { appendFileSync, readFileSync } = require("fs");
 const logPath = ${JSON.stringify(logPath)};
 const rawArgs = process.argv.slice(2);
 const args = rawArgs[0] === "--repo" ? rawArgs.slice(2) : rawArgs;
@@ -396,9 +396,12 @@ if (args[0] === "api" && /\\/issues\\/${number}$/.test(path)) {
   console.log(JSON.stringify([[]]));
 } else if (args[0] === "api" && /\\/issues\\/${number}\\/comments(?:\\?|$)/.test(path)) {
   if (args.includes("--method") && args.includes("POST")) {
+    const input = args[args.indexOf("--input") + 1];
+    const body = JSON.parse(readFileSync(input, "utf8")).body;
     console.log(JSON.stringify({
       id: 987486,
-      html_url: "https://github.com/openclaw/clawsweeper/issues/${number}#issuecomment-987486"
+      html_url: "https://github.com/openclaw/clawsweeper/issues/${number}#issuecomment-987486",
+      body
     }));
   } else {
     console.log(JSON.stringify([[]]));
@@ -493,7 +496,7 @@ This exact review inherited a stale bulk-filer label.
       "utf8",
     );
     const ghMock = `
-const { appendFileSync } = require("fs");
+const { appendFileSync, readFileSync } = require("fs");
 const logPath = ${JSON.stringify(logPath)};
 const rawArgs = process.argv.slice(2);
 const args = rawArgs[0] === "--repo" ? rawArgs.slice(2) : rawArgs;
@@ -520,9 +523,12 @@ if (args[0] === "api" && /\\/issues\\/${number}$/.test(path)) {
   console.log(JSON.stringify([[]]));
 } else if (args[0] === "api" && /\\/issues\\/${number}\\/comments(?:\\?|$)/.test(path)) {
   if (args.includes("--method") && args.includes("POST")) {
+    const input = args[args.indexOf("--input") + 1];
+    const body = JSON.parse(readFileSync(input, "utf8")).body;
     console.log(JSON.stringify({
       id: 987487,
-      html_url: "https://github.com/openclaw/clawsweeper/issues/${number}#issuecomment-987487"
+      html_url: "https://github.com/openclaw/clawsweeper/issues/${number}#issuecomment-987487",
+      body
     }));
   } else {
     console.log(JSON.stringify([[]]));
@@ -1460,10 +1466,12 @@ if (args[0] === "api" && /\\/issues\\/74478$/.test(path)) {
 } else if (args[0] === "api" && /\\/issues\\/74478\\/comments(?:\\?|$)/.test(path)) {
   if (args.includes("--method") && args.includes("POST")) {
     const input = args[args.indexOf("--input") + 1];
-    appendFileSync(logPath, JSON.stringify(["posted-comment-body", JSON.parse(readFileSync(input, "utf8")).body]) + "\\n");
+    const body = JSON.parse(readFileSync(input, "utf8")).body;
+    appendFileSync(logPath, JSON.stringify(["posted-comment-body", body]) + "\\n");
     console.log(JSON.stringify({
       id: 987478,
-      html_url: "https://github.com/openclaw/clawsweeper/pull/74478#issuecomment-987478"
+      html_url: "https://github.com/openclaw/clawsweeper/pull/74478#issuecomment-987478",
+      body
     }));
   } else {
     console.log(JSON.stringify([[]]));
@@ -1639,11 +1647,13 @@ if (args[0] === "api" && /\\/issues\\/74481$/.test(path)) {
   ]]));
 } else if (args[0] === "api" && /\\/issues\\/comments\\/987481$/.test(path)) {
   const input = args[args.indexOf("--input") + 1];
-  appendFileSync(logPath, JSON.stringify(["patched-review-body", JSON.parse(readFileSync(input, "utf8")).body]) + "\\n");
+  const body = JSON.parse(readFileSync(input, "utf8")).body;
+  appendFileSync(logPath, JSON.stringify(["patched-review-body", body]) + "\\n");
   console.log(JSON.stringify({
     id: 987481,
     html_url: "https://github.com/openclaw/openclaw/pull/74481#issuecomment-987481",
-    updated_at: "2026-05-19T20:11:00Z"
+    updated_at: "2026-05-19T20:11:00Z",
+    body
   }));
 } else if (args[0] === "issue" && args[1] === "edit") {
   console.log("");
@@ -2030,11 +2040,13 @@ if (args[0] === "api" && /\\/issues\\/74482$/.test(path)) {
   console.log(JSON.stringify(args.includes("--paginate") ? [comments] : comments));
 } else if (args[0] === "api" && /\\/issues\\/comments\\/987482$/.test(path)) {
   const input = args[args.indexOf("--input") + 1];
-  appendFileSync(logPath, JSON.stringify(["patched-review-body", JSON.parse(readFileSync(input, "utf8")).body]) + "\\n");
+  const body = JSON.parse(readFileSync(input, "utf8")).body;
+  appendFileSync(logPath, JSON.stringify(["patched-review-body", body]) + "\\n");
   console.log(JSON.stringify({
     id: 987482,
     html_url: "https://github.com/openclaw/openclaw/pull/74482#issuecomment-987482",
-    updated_at: "2026-07-03T21:48:00Z"
+    updated_at: "2026-07-03T21:48:00Z",
+    body
   }));
 } else if (args[0] === "issue" && args[1] === "edit") {
   console.log("");
@@ -2690,10 +2702,12 @@ if (args[0] === "api" && /\\/issues\\/74479$/.test(path)) {
   ]]));
 } else if (args[0] === "api" && /\\/issues\\/comments\\/987479$/.test(path)) {
   const input = args[args.indexOf("--input") + 1];
-  appendFileSync(logPath, JSON.stringify(["patched-review-body", JSON.parse(readFileSync(input, "utf8")).body]) + "\\n");
+  const body = JSON.parse(readFileSync(input, "utf8")).body;
+  appendFileSync(logPath, JSON.stringify(["patched-review-body", body]) + "\\n");
   console.log(JSON.stringify({
     id: 987479,
-    html_url: "https://github.com/openclaw/clawsweeper/pull/74479#issuecomment-987479"
+    html_url: "https://github.com/openclaw/clawsweeper/pull/74479#issuecomment-987479",
+    body
   }));
 } else if (args[0] === "label" && args[1] === "create") {
   console.log(JSON.stringify({ name: args[2] }));
@@ -3224,7 +3238,13 @@ if (args[0] === "api" && args[1] === "-i" && /\\/issues\\/321\\/timeline(?:\\?|$
     }]]));
   }
 } else if (args[0] === "api" && /\\/issues\\/comments\\/9321$/.test(path)) {
-  console.log(JSON.stringify({ id: 9321, html_url: "https://github.com/openclaw/clawsweeper/pull/321#issuecomment-9321" }));
+  const input = args[args.indexOf("--input") + 1];
+  const body = JSON.parse(readFileSync(input, "utf8")).body;
+  console.log(JSON.stringify({
+    id: 9321,
+    html_url: "https://github.com/openclaw/clawsweeper/pull/321#issuecomment-9321",
+    body
+  }));
 } else if (args[0] === "api" && /\\/issues\\/321\\/timeline(?:\\?|$)/.test(path)) {
   console.log(JSON.stringify([[]]));
 } else if (args[0] === "api" && /\\/issues\\/321$/.test(path)) {

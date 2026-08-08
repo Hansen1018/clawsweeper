@@ -141,6 +141,8 @@ test("oversized durable review publication replaces same-head ready state and ab
       commentId: (comment: Record<string, unknown> | undefined) =>
         typeof comment?.id === "number" ? comment.id : null,
       commentUrl: () => `https://github.com/openclaw/openclaw/pull/${itemNumber}#issuecomment-20`,
+      commentBodyMatches: (comment: Record<string, unknown> | undefined, body: string) =>
+        comment?.body === body,
       canPatchReviewComment: () => true,
     } as never);
 
@@ -324,6 +326,45 @@ test("mutation fallback verifies trusted identity before duplicate cleanup", () 
     }, /did not verify target comment 20/);
     assert.match(patchCalls[0]?.[1] ?? "", /issues\/comments\/20$/);
     assert.deepEqual(patchDeleted, []);
+
+    const staleResponseCalls: string[][] = [];
+    const staleResponsePublication = reviewCommentPublication({
+      root,
+      comments: () => initialComments,
+      state: patchState,
+      mutate: ({ args }) => {
+        staleResponseCalls.push(args);
+        return JSON.stringify(selected);
+      },
+    });
+    const staleResponseDeleted: number[] = [];
+    const staleResponseCleanup = createReviewCommentLeases({
+      targetRepo: () => "openclaw/openclaw",
+      gitHubRuntimeBudgetError: class extends Error {},
+      ghObservedMutationCommand: ({ args }: { args: string[] }) => {
+        const id = Number(args[1]?.match(/\/(\d+)$/)?.[1]);
+        if (Number.isInteger(id)) staleResponseDeleted.push(id);
+        return "";
+      },
+      supersededReviewCommentIds: patchState.supersededReviewCommentIds,
+    } as never);
+
+    assert.throws(() => {
+      const synced = staleResponsePublication.upsertReviewComment(
+        itemNumber,
+        publishedBody,
+        selectedComment,
+      );
+      const syncedId = patchState.commentId(synced);
+      if (syncedId === null) return;
+      staleResponseCleanup.cleanupSupersededReviewComments({
+        number: itemNumber,
+        comments: initialComments,
+        keepCommentIds: new Set([syncedId]),
+      });
+    }, /did not verify target comment 20/);
+    assert.match(staleResponseCalls[0]?.[1] ?? "", /issues\/comments\/20$/);
+    assert.deepEqual(staleResponseDeleted, []);
 
     const postRecoveryComments = [
       { ...older, body: publishedBody },

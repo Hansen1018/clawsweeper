@@ -55,6 +55,7 @@ export function createReviewCommentPublication(
     commentUpdatedAt,
     commentId,
     commentUrl,
+    commentBodyMatches,
     canPatchReviewComment,
   } = dependencies;
 
@@ -282,8 +283,12 @@ export function createReviewCommentPublication(
     });
     const written = reviewCommentFromMutationResponse(response, args);
     const writtenId = commentId(written);
+    // Comment identity alone cannot authorize duplicate cleanup. The mutation
+    // response must expose the exact body requested by this write.
     const verifiedWritten =
-      writtenId !== null && (patchTargetId === null || writtenId === patchTargetId)
+      writtenId !== null &&
+      (patchTargetId === null || writtenId === patchTargetId) &&
+      commentBodyMatches(written, publicationBody)
         ? written
         : undefined;
     const synced =
