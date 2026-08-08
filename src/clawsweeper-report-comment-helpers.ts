@@ -432,12 +432,14 @@ export function createReportCommentHelpers(
 
     const findings = reportReviewFindings(markdown);
     for (const finding of findings) {
+      const findingLocation = reviewFindingLocation(finding);
       add(
         "needs-changes",
         `${finding.title.trim()} (${priorityLabel(finding.priority)})`,
-        finding.body,
+        finding.body.trim() ||
+          `Resolve ${finding.title.trim()} at ${findingLocation} before merge.`,
         {
-          distinctKey: `${finding.title} ${reviewFindingLocation(finding)}`,
+          distinctKey: `${finding.title} ${findingLocation}`,
         },
       );
     }
@@ -445,9 +447,14 @@ export function createReportCommentHelpers(
     const securityReview = reportSecurityReview(markdown);
     const securityState = securitySensitiveRepairAllowed(markdown) ? "needs-changes" : "blocked";
     for (const concern of securityReview.concerns) {
-      add(securityState, `Resolve security concern: ${concern.title.trim()}`, concern.body, {
-        distinctKey: `security ${concern.title}`,
-      });
+      add(
+        securityState,
+        `Resolve security concern: ${concern.title.trim()}`,
+        concern.body.trim() || `Resolve ${concern.title.trim()} before merge.`,
+        {
+          distinctKey: `security ${concern.title}`,
+        },
+      );
     }
     if (securityReview.status === "needs_attention" && securityReview.concerns.length === 0) {
       add(securityState, "Resolve security review attention item", securityReview.summary);

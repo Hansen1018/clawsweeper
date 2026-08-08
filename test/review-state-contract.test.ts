@@ -296,6 +296,64 @@ Full review comments:
   ]);
 });
 
+test("bodyless typed blockers remain visible and non-ready", () => {
+  const scenarios = [
+    {
+      name: "finding",
+      report: reviewReport(
+        { work_candidate: "queue_fix_pr" },
+        "",
+        `## Review Findings
+
+Overall correctness: patch is incorrect
+
+Overall confidence: 0.99
+
+Full review comments:
+
+- **[P1] Preserve cleanup ownership:** \`scripts/deadcode-knip-runner.mjs:42\`
+  - confidence: 0.99
+`,
+      ),
+      action:
+        /Preserve cleanup ownership \(P1\).*Resolve Preserve cleanup ownership at scripts\/deadcode-knip-runner\.mjs:42 before merge\./s,
+      state: "needs-changes",
+    },
+    {
+      name: "security concern",
+      report: reviewReport(
+        {},
+        `## Security Review
+
+Status: needs_attention
+
+Summary: Credential scope needs review.
+
+Concerns:
+
+- **[high] Confirm credential scope:** \`src/config/schema.ts:42\`
+  - confidence: 0.91
+`,
+      ),
+      action:
+        /Resolve security concern: Confirm credential scope.*Resolve Confirm credential scope before merge\./s,
+      state: "blocked",
+    },
+  ] as const;
+
+  for (const scenario of scenarios) {
+    const comment = renderReviewCommentFromReport(scenario.report, "none");
+    const markers = reviewAutomationMarkersFromReport(scenario.report);
+    assert.doesNotMatch(comment, /## Before merge\n\nNone\./, scenario.name);
+    assert.match(comment, scenario.action, scenario.name);
+    assert.deepEqual(
+      stateMarkers(markers),
+      [`<!-- clawsweeper-review-state:${scenario.state} item=120232 sha=${reviewedHead} v=1 -->`],
+      scenario.name,
+    );
+  }
+});
+
 test("a duplicate human blocker promotes a finding to blocked state", () => {
   const duplicateBlocker = "Preserve the active review lease before duplicate cleanup.";
   const report = reviewReport(
