@@ -200,6 +200,25 @@ export function createReviewCommentState(
     })[0];
   }
 
+  function canonicalMarkedReviewComment(
+    number: number,
+    comments: readonly Record<string, unknown>[],
+  ): Record<string, unknown> | undefined {
+    const fallback = comments
+      .filter((comment) => identitylessPublicationFallback(number, comment))
+      .sort((left, right) => (commentId(right) ?? -1) - (commentId(left) ?? -1))[0];
+    if (!fallback) return newestReviewComment(number, comments);
+    const fallbackCommentId = commentId(fallback);
+    if (fallbackCommentId === null) return fallback;
+    const supersedingReviews = comments.filter((comment) => {
+      const leaseCommentId = Number(durableReviewVersion(comment, number)?.leaseCommentId);
+      return Number.isSafeInteger(leaseCommentId) && leaseCommentId > fallbackCommentId;
+    });
+    // Every review lease POST gets a fresh monotonic GitHub comment id. Only
+    // a review causally started after this POST may clear the fallback veto.
+    return newestReviewComment(number, supersedingReviews) ?? fallback;
+  }
+
   function selectIssueReviewComment(
     number: number,
     comments: Record<string, unknown>[],
@@ -208,7 +227,7 @@ export function createReviewCommentState(
     const markedComments = comments.filter((candidate) =>
       hasExactDurableReviewMarker(number, candidate),
     );
-    const patchableMarked = newestReviewComment(
+    const patchableMarked = canonicalMarkedReviewComment(
       number,
       markedComments.filter(canPatchReviewComment),
     );
@@ -374,8 +393,8 @@ export function createReviewCommentState(
     return lastValue;
   }
 
-  function durableReviewVersion(
-    comment: Record<string, unknown> | undefined,
+  function durableReviewVersionFromBody(
+    body: string,
     number: number,
   ): {
     reviewedAt: string;
@@ -384,9 +403,6 @@ export function createReviewCommentState(
     leaseOwner: string | null;
     leaseCommentId: string | null;
   } | null {
-    if (!canPatchReviewComment(comment)) return null;
-    const body = commentBody(comment);
-    if (!body) return null;
     const identity = reviewCommentMarker(number);
     const identityIndex = body.lastIndexOf(identity);
     if (identityIndex < 0 || body.slice(identityIndex + identity.length).trim()) return null;
@@ -410,6 +426,28 @@ export function createReviewCommentState(
       };
     }
     return null;
+  }
+
+  function durableReviewVersion(
+    comment: Record<string, unknown> | undefined,
+    number: number,
+  ): ReturnType<typeof durableReviewVersionFromBody> {
+    if (!canPatchReviewComment(comment)) return null;
+    const body = commentBody(comment);
+    return body ? durableReviewVersionFromBody(body, number) : null;
+  }
+
+  function identitylessPublicationFallback(
+    number: number,
+    comment: Record<string, unknown> | undefined,
+  ): boolean {
+    const body = commentBody(comment);
+    if (!comment || !canPatchReviewComment(comment) || !body) return false;
+    return (
+      body.trimStart().startsWith("Codex review: publication failed closed.") &&
+      hasExactDurableReviewMarker(number, comment) &&
+      !durableReviewVersionFromBody(body, number)
+    );
   }
 
   function reviewCommentHasCloseVerdictForCanonical(
@@ -671,7 +709,9 @@ export function createReviewCommentState(
     commentUrl,
     commentBody,
     newestReviewMarkerAttribute,
+    durableReviewVersionFromBody,
     durableReviewVersion,
+    identitylessPublicationFallback,
     reviewCommentHasCloseVerdictForCanonical,
     staleReviewCommentSyncReason,
     APPLY_SYNC_EQUIVALENT_CLOSE_MARKER_ACTIONS,

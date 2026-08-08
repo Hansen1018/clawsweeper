@@ -57,7 +57,9 @@ export function createReviewCommentPublication(
     commentUrl,
     commentBodyMatches,
     canPatchReviewComment,
+    durableReviewVersionFromBody,
     durableReviewVersion,
+    identitylessPublicationFallback,
   } = dependencies;
 
   function reviewArtifactDestination(
@@ -355,7 +357,22 @@ export function createReviewCommentPublication(
       ? oversizedReviewCommentFallback(number, markedBody, bodyBytes, existing)
       : markedBody;
     const id = commentId(existing);
-    const patchTargetId = id !== null && canPatchReviewComment(existing) ? id : null;
+    if (id !== null && identitylessPublicationFallback(number, existing)) {
+      const leaseCommentId = Number(
+        durableReviewVersionFromBody(markedBody, number)?.leaseCommentId,
+      );
+      if (!Number.isSafeInteger(leaseCommentId) || leaseCommentId <= id) {
+        throw new Error(
+          `durable review comment ${id} is a fail-closed publication fallback; a fresh review lease is required before replacement`,
+        );
+      }
+    }
+    const identitylessFallback =
+      oversized && durableReviewVersionFromBody(publicationBody, number) === null;
+    // Identity-less fallbacks need a new server id so later review leases can
+    // prove causal supersession without comparing client and server clocks.
+    const patchTargetId =
+      !identitylessFallback && id !== null && canPatchReviewComment(existing) ? id : null;
     const payload = writeCommentPayload(number, publicationBody);
     let args: string[];
     if (patchTargetId !== null) {
