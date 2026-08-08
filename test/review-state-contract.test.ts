@@ -119,6 +119,26 @@ test("rendered risks and actionable next steps force a non-ready machine state",
   }
 });
 
+test("mixed-format risks preserve actionable continuation text", () => {
+  const report = reviewReport(
+    {},
+    `## Risks / Open Questions
+
+- CI checks are green.
+  Replace the stale durable marker before merge.
+`,
+  );
+  const comment = renderReviewCommentFromReport(report, "none");
+  const markers = reviewAutomationMarkersFromReport(report);
+
+  assert.match(comment, /Replace the stale durable marker before merge\./);
+  assert.doesNotMatch(comment, /## Before merge\n\nNone\./);
+  assert.deepEqual(stateMarkers(markers), [
+    `<!-- clawsweeper-review-state:blocked item=120232 sha=${reviewedHead} v=1 -->`,
+  ]);
+  assert.doesNotMatch(markers, /clawsweeper-verdict:pass/);
+});
+
 test("routine work guidance cannot hide an actionable best solution", () => {
   const report = reviewReport(
     { work_candidate: "queue_fix_pr" },

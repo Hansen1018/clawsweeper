@@ -200,6 +200,35 @@ export function createReviewCommentState(
     })[0];
   }
 
+  function newestCausalReviewComment(
+    number: number,
+    comments: readonly Record<string, unknown>[],
+  ): Record<string, unknown> | undefined {
+    const causalReviews = comments
+      .map((comment) => ({
+        comment,
+        identity: durableReviewCausalIdentity(comment, number),
+      }))
+      .filter(
+        (
+          candidate,
+        ): candidate is {
+          comment: Record<string, unknown>;
+          identity: NonNullable<ReturnType<typeof durableReviewCausalIdentity>>;
+        } => candidate.identity !== null,
+      );
+    const latestLeaseCommentId = causalReviews.reduce(
+      (latest, candidate) => Math.max(latest, candidate.identity.leaseCommentId),
+      -1,
+    );
+    return newestReviewComment(
+      number,
+      causalReviews
+        .filter((candidate) => candidate.identity.leaseCommentId === latestLeaseCommentId)
+        .map((candidate) => candidate.comment),
+    );
+  }
+
   function canonicalMarkedReviewComment(
     number: number,
     comments: readonly Record<string, unknown>[],
@@ -207,16 +236,18 @@ export function createReviewCommentState(
     const fallback = comments
       .filter((comment) => identitylessPublicationFallback(number, comment))
       .sort((left, right) => (commentId(right) ?? -1) - (commentId(left) ?? -1))[0];
-    if (!fallback) return newestReviewComment(number, comments);
+    if (!fallback) {
+      return newestCausalReviewComment(number, comments) ?? newestReviewComment(number, comments);
+    }
     const fallbackCommentId = commentId(fallback);
     if (fallbackCommentId === null) return fallback;
     const supersedingReviews = comments.filter((comment) => {
-      const leaseCommentId = Number(durableReviewVersion(comment, number)?.leaseCommentId);
-      return Number.isSafeInteger(leaseCommentId) && leaseCommentId > fallbackCommentId;
+      const identity = durableReviewCausalIdentity(comment, number);
+      return identity !== null && identity.leaseCommentId > fallbackCommentId;
     });
     // Every review lease POST gets a fresh monotonic GitHub comment id. Only
-    // a review causally started after this POST may clear the fallback veto.
-    return newestReviewComment(number, supersedingReviews) ?? fallback;
+    // a complete review causally started after this POST may clear the veto.
+    return newestCausalReviewComment(number, supersedingReviews) ?? fallback;
   }
 
   function selectIssueReviewComment(
@@ -437,6 +468,75 @@ export function createReviewCommentState(
     return body ? durableReviewVersionFromBody(body, number) : null;
   }
 
+  function durableReviewCausalIdentityFromBody(
+    body: string,
+    number: number,
+  ): {
+    reviewedAt: string;
+    headSha: string;
+    sourceRevision: string | null;
+    leaseOwner: string;
+    leaseCommentId: number;
+    state: "ready" | "blocked" | "needs-changes";
+  } | null {
+    const identity = reviewCommentMarker(number);
+    const identityIndex = body.lastIndexOf(identity);
+    if (identityIndex < 0 || body.slice(identityIndex + identity.length).trim()) return null;
+    const markers = trailingHtmlComments(body.slice(0, identityIndex));
+    const versionMarkers = markers.filter((marker) =>
+      /^<!--\s+clawsweeper-review-version\b/.test(marker),
+    );
+    const stateMarkers = markers.filter((marker) =>
+      /^<!--\s+clawsweeper-review-state:/.test(marker),
+    );
+    if (versionMarkers.length !== 1 || stateMarkers.length !== 1) return null;
+
+    const version = durableReviewVersionFromBody(body, number);
+    const stateMatch = stateMarkers[0]?.match(
+      /^<!--\s+clawsweeper-review-state:([^\s>]+)\b([^>]*)-->$/,
+    );
+    if (!version || !stateMatch) return null;
+    const state = stateMatch[1];
+    if (state !== "ready" && state !== "blocked" && state !== "needs-changes") return null;
+    const stateAttributes = stateMatch[2] ?? "";
+    const stateAttribute = (name: string) =>
+      stateAttributes.match(new RegExp(`\\b${name}=([^\\s>]+)`))?.[1] ?? null;
+    const stateHeadSha = stateAttribute("sha")?.toLowerCase() ?? "";
+    const versionHeadSha = version.headSha?.toLowerCase() ?? "";
+    const leaseOwner = version.leaseOwner?.trim() ?? "";
+    const leaseCommentId = version.leaseCommentId ?? "";
+    if (
+      Number(stateAttribute("item")) !== number ||
+      stateAttribute("v") !== "1" ||
+      !/^[0-9a-f]{40}$/.test(stateHeadSha) ||
+      !/^[0-9a-f]{40}$/.test(versionHeadSha) ||
+      stateHeadSha !== versionHeadSha ||
+      !leaseOwner ||
+      leaseOwner === "unknown" ||
+      !/^[1-9]\d*$/.test(leaseCommentId) ||
+      !Number.isSafeInteger(Number(leaseCommentId))
+    ) {
+      return null;
+    }
+    return {
+      reviewedAt: version.reviewedAt,
+      headSha: versionHeadSha,
+      sourceRevision: version.sourceRevision,
+      leaseOwner,
+      leaseCommentId: Number(leaseCommentId),
+      state,
+    };
+  }
+
+  function durableReviewCausalIdentity(
+    comment: Record<string, unknown> | undefined,
+    number: number,
+  ): ReturnType<typeof durableReviewCausalIdentityFromBody> {
+    if (!canPatchReviewComment(comment)) return null;
+    const body = commentBody(comment);
+    return body ? durableReviewCausalIdentityFromBody(body, number) : null;
+  }
+
   function identitylessPublicationFallback(
     number: number,
     comment: Record<string, unknown> | undefined,
@@ -446,7 +546,7 @@ export function createReviewCommentState(
     return (
       body.trimStart().startsWith("Codex review: publication failed closed.") &&
       hasExactDurableReviewMarker(number, comment) &&
-      !durableReviewVersionFromBody(body, number)
+      !durableReviewCausalIdentityFromBody(body, number)
     );
   }
 
@@ -711,6 +811,7 @@ export function createReviewCommentState(
     newestReviewMarkerAttribute,
     durableReviewVersionFromBody,
     durableReviewVersion,
+    durableReviewCausalIdentityFromBody,
     identitylessPublicationFallback,
     reviewCommentHasCloseVerdictForCanonical,
     staleReviewCommentSyncReason,

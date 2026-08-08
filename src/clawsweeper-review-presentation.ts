@@ -303,21 +303,32 @@ export function createReviewPresentation({
   }
 
   function publicRiskBulletsFromText(text: string, fallback: PublicPriority): string {
-    const lines = text
-      .split("\n")
-      .map((line) => line.trim())
-      .filter(Boolean);
-    const bulletLines = lines.filter((line) => /^[-*]\s+/.test(line));
-    if (!bulletLines.length) {
-      return isRoutineCiOrReviewText(text)
-        ? publicPlainBullet(text)
-        : publicPriorityBulletFromText(text, fallback);
+    const entries: string[] = [];
+    let current: string[] = [];
+    const flush = () => {
+      const entry = current.join(" ").trim();
+      if (entry) entries.push(entry);
+      current = [];
+    };
+    for (const rawLine of text.split("\n")) {
+      const line = rawLine.trim();
+      if (!line) {
+        flush();
+        continue;
+      }
+      if (/^[-*]\s+/.test(line)) {
+        flush();
+        current.push(stripPriorityPrefix(line));
+        continue;
+      }
+      current.push(line);
     }
-    return bulletLines
-      .map((line) =>
-        isRoutineCiOrReviewText(line)
-          ? publicPlainBullet(line)
-          : publicPriorityBulletFromText(line, fallback),
+    flush();
+    return entries
+      .map((entry) =>
+        isRoutineCiOrReviewText(entry)
+          ? publicPlainBullet(entry)
+          : publicPriorityBulletFromText(entry, fallback),
       )
       .join("\n");
   }

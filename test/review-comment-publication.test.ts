@@ -295,7 +295,7 @@ test("malformed oversized fallback reuses only same-head identity and outranks o
   }
 });
 
-test("identity-less blocked fallback vetoes older ready duplicates until a fresh review", () => {
+test("identity-less blocked fallback requires a complete causally newer review", () => {
   const root = mkdtempSync(join(tmpdir(), "clawsweeper-publication-veto-"));
   try {
     const selected = {
@@ -311,7 +311,7 @@ test("identity-less blocked fallback vetoes older ready duplicates until a fresh
       updatedAt: "2026-08-07T15:01:00Z",
     });
     let published = selected;
-    let comments = [selected];
+    let comments = [olderReady, selected];
     const mutationArgs: string[][] = [];
     const state = reviewCommentState(() => comments);
     const publication = reviewCommentPublication({
@@ -322,13 +322,17 @@ test("identity-less blocked fallback vetoes older ready duplicates until a fresh
         mutationArgs.push(args);
         const input = args[args.indexOf("--input") + 1];
         assert.ok(input);
+        const replacedIds = new Set([Number(selected.id), Number(published.id), 100]);
         published = {
-          ...selected,
+          ...published,
           id: 100,
-          updated_at: "2026-08-07T16:02:00Z",
+          updated_at: mutationArgs.length === 1 ? "2026-08-07T16:02:00Z" : "2026-08-07T16:06:00Z",
           body: JSON.parse(readFileSync(input, "utf8")).body,
         };
-        comments = [olderReady, published];
+        comments = [
+          ...comments.filter((comment) => !replacedIds.has(Number(comment.id))),
+          published,
+        ];
         return JSON.stringify(published);
       },
     });
@@ -351,28 +355,80 @@ test("identity-less blocked fallback vetoes older ready duplicates until a fresh
     assert.match(mutationArgs[0]?.[1] ?? "", /issues\/120232\/comments$/);
     assert.equal(state.selectIssueReviewComment(itemNumber, comments)?.id, 100);
 
-    const staleButEdited = durableReviewComment({
-      id: 110,
-      reviewedAt: "2026-08-07T15:30:00Z",
-      updatedAt: "2026-08-07T16:03:00Z",
-      leaseCommentId: 90,
-    });
-    comments = [olderReady, published, staleButEdited];
-    assert.equal(state.selectIssueReviewComment(itemNumber, comments)?.id, 100);
-    assert.throws(
-      () => publication.upsertReviewComment(itemNumber, String(staleButEdited.body), published),
-      /fresh review lease is required/,
-    );
-    assert.equal(mutationArgs.length, 1);
-
     const freshReady = durableReviewComment({
       id: 120,
       reviewedAt: "2026-08-07T16:04:00Z",
       updatedAt: "2026-08-07T16:05:00Z",
       leaseCommentId: 120,
     });
-    comments.push(freshReady);
-    assert.equal(state.selectIssueReviewComment(itemNumber, comments)?.id, 120);
+    const malformedSuccessors = [
+      {
+        name: "missing state",
+        body: String(freshReady.body).replace(/<!-- clawsweeper-review-state:[^>]+-->\n\n/, ""),
+      },
+      {
+        name: "mismatched head",
+        body: String(freshReady.body).replace(
+          `sha=${headSha} v=1 -->`,
+          `sha=${"b".repeat(40)} v=1 -->`,
+        ),
+      },
+      {
+        name: "malformed version head",
+        body: String(freshReady.body).replace(
+          `reviewed_at=2026-08-07T16:04:00Z sha=${headSha}`,
+          "reviewed_at=2026-08-07T16:04:00Z sha=na",
+        ),
+      },
+      {
+        name: "unsupported state",
+        body: String(freshReady.body).replace(
+          "clawsweeper-review-state:ready",
+          "clawsweeper-review-state:unknown",
+        ),
+      },
+      {
+        name: "unknown lease owner",
+        body: String(freshReady.body).replace("lease_owner=fixture", "lease_owner=unknown"),
+      },
+    ];
+    for (const [index, malformed] of malformedSuccessors.entries()) {
+      const successor = {
+        ...freshReady,
+        id: 121 + index,
+        body: malformed.body,
+      };
+      comments = [olderReady, published, successor];
+      assert.equal(
+        state.durableReviewCausalIdentityFromBody(malformed.body, itemNumber),
+        null,
+        malformed.name,
+      );
+      assert.equal(state.selectIssueReviewComment(itemNumber, comments)?.id, 100, malformed.name);
+      assert.throws(
+        () => publication.upsertReviewComment(itemNumber, malformed.body, published),
+        /fresh review lease is required/,
+        malformed.name,
+      );
+      assert.equal(mutationArgs.length, 1, malformed.name);
+    }
+
+    const laterTimestampOlderLease = durableReviewComment({
+      id: 110,
+      reviewedAt: "2026-08-08T23:00:00Z",
+      updatedAt: "2026-08-08T23:01:00Z",
+      leaseCommentId: 90,
+    });
+    comments = [olderReady, published, laterTimestampOlderLease];
+    assert.equal(state.selectIssueReviewComment(itemNumber, comments)?.id, 100);
+    const synced = publication.upsertReviewComment(itemNumber, String(freshReady.body), published);
+    assert.equal(synced.id, 100);
+    assert.match(mutationArgs[1]?.[1] ?? "", /issues\/comments\/100$/);
+    assert.equal(
+      state.durableReviewCausalIdentityFromBody(String(published.body), itemNumber)?.leaseCommentId,
+      120,
+    );
+    assert.equal(state.selectIssueReviewComment(itemNumber, comments)?.id, 100);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
