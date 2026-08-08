@@ -86,8 +86,6 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
     applyPrCloseCoverageProofBlockedReport,
     applyProtectedLabelReason,
     applyRuntimeBudgetYieldResults,
-    cleanupSupersededReviewComments,
-    cleanupSupersededReviewPlaceholderComments,
     closeReasonApplyAgeSkipReason,
     closeReasonEnabled,
     closeReasonFilterText,
@@ -95,7 +93,6 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
     closingPullRequestsForIssue,
     collectItemContext,
     commentBodyMatches,
-    commentId,
     commentUpdatedAt,
     completeStaleCanonicalCommentSyncReport,
     decisionPacketsDirFromArgs,
@@ -1102,15 +1099,6 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
       }
       const earlyLeaseState = refreshReviewStartLeaseState();
       existingReviewComment = earlyLeaseState.comment;
-      if (!dryRun && existingReviewComment) {
-        const durableCommentId = commentId(existingReviewComment);
-        cleanupSupersededReviewPlaceholderComments({
-          number,
-          comments: earlyLeaseState.comments,
-          keepCommentIds:
-            durableCommentId === null ? new Set<number>() : new Set([durableCommentId]),
-        });
-      }
       if (state === "open" && earlyLeaseState.blockReason) {
         if (recordReviewLeaseSkip(earlyLeaseState.blockReason)) break;
         continue;
@@ -1883,35 +1871,6 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
                 break;
               continue;
             }
-            const cleanupPublishedReviewComments = (
-              publishedComment: Record<string, unknown>,
-            ): void => {
-              // The durable review comment is now published, so stale "review
-              // started" placeholders from failed earlier attempts are clutter.
-              const syncedCommentId = commentId(publishedComment);
-              // Recovery must establish one authoritative comment id before any duplicate sweep.
-              if (syncedCommentId === null) return;
-              const placeholderKeepCommentIds = new Set<number>([syncedCommentId]);
-              // Closures assign the active lease, so read it through a cast to
-              // defeat TypeScript's stale null narrowing at this use site.
-              const heldMutationLease = activeApplyMutationLease as {
-                itemNumber: number;
-                lease: AcquiredReviewStartLease;
-              } | null;
-              if (heldMutationLease?.itemNumber === number) {
-                placeholderKeepCommentIds.add(heldMutationLease.lease.commentId);
-              }
-              cleanupSupersededReviewComments({
-                number,
-                comments: latestLeaseState.comments,
-                keepCommentIds: placeholderKeepCommentIds,
-              });
-              cleanupSupersededReviewPlaceholderComments({
-                number,
-                comments: latestLeaseState.comments,
-                keepCommentIds: placeholderKeepCommentIds,
-              });
-            };
             try {
               syncedComment = upsertReviewComment(
                 number,
@@ -1920,7 +1879,6 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
               );
               rememberSelfMutationUpdatedAt();
               syncReasons.push("updated durable Codex review comment");
-              cleanupPublishedReviewComments(syncedComment);
               if (complete && item.labels.includes(REVIEW_RECOVERY_STUCK_LABEL)) {
                 try {
                   clearResolvedReviewRecoveryLabel({
@@ -1951,7 +1909,6 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
             } catch (error) {
               if (error instanceof DurableReviewPublicationBlockedError) {
                 rememberSelfMutationUpdatedAt();
-                cleanupPublishedReviewComments(error.syncedComment);
                 throw error;
               }
               const commentAuthError = isGitHubRequiresAuthenticationError(error);

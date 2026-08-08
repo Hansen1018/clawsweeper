@@ -186,7 +186,7 @@ test("oversized durable review publication replaces same-head ready state and ab
   }
 });
 
-test("newest exact durable comment wins and older trusted duplicates are swept", () => {
+test("newest exact durable comment wins over older trusted duplicates", () => {
   const older = durableReviewComment({
     id: 10,
     reviewedAt: "2026-08-07T15:00:00Z",
@@ -226,61 +226,6 @@ test("newest exact durable comment wins and older trusted duplicates are swept",
   } as never);
 
   assert.equal(state.selectIssueReviewComment(itemNumber, comments)?.id, 20);
-  assert.deepEqual(
-    state.supersededReviewCommentIds({
-      number: itemNumber,
-      comments,
-      keepCommentIds: new Set([20]),
-    }),
-    [10],
-  );
-
-  const deleted: number[] = [];
-  const leases = createReviewCommentLeases({
-    targetRepo: () => "openclaw/openclaw",
-    gitHubRuntimeBudgetError: class extends Error {},
-    ghObservedMutationCommand: ({ args }: { args: string[] }) => {
-      const id = Number(args[1]?.match(/\/(\d+)$/)?.[1]);
-      if (Number.isInteger(id)) deleted.push(id);
-      return "";
-    },
-    supersededReviewCommentIds: state.supersededReviewCommentIds,
-  } as never);
-  leases.cleanupSupersededReviewComments({
-    number: itemNumber,
-    comments,
-    keepCommentIds: new Set([20]),
-  });
-  assert.deepEqual(deleted, [10]);
-});
-
-test("duplicate cleanup preserves an active marker-backed legacy review lease", () => {
-  const nowMs = Date.parse("2026-08-08T00:05:00Z");
-  const legacyLease = (id: number, expiresAt: string): Record<string, unknown> => ({
-    id,
-    created_at: "2026-08-08T00:00:00Z",
-    updated_at: "2026-08-08T00:00:00Z",
-    user: { login: "clawsweeper[bot]" },
-    body: [
-      "ClawSweeper status: review started.",
-      "",
-      `<!-- clawsweeper-review-status:started item=${itemNumber} sha=${headSha} started_at=2026-08-08T00:00:00Z lease_expires_at=${expiresAt} owner=legacy-worker v=1 -->`,
-      reviewMarker,
-    ].join("\n"),
-  });
-  const active = legacyLease(40, "2026-08-08T00:10:00Z");
-  const expired = legacyLease(50, "2026-08-08T00:04:59Z");
-  const state = reviewCommentState(() => [active, expired]);
-
-  assert.deepEqual(
-    state.supersededReviewCommentIds({
-      number: itemNumber,
-      comments: [active, expired],
-      keepCommentIds: new Set(),
-      nowMs,
-    }),
-    [50],
-  );
 });
 
 test("lease election includes active legacy leases on non-canonical durable duplicates", () => {
@@ -332,7 +277,7 @@ test("lease election includes active legacy leases on non-canonical durable dupl
   );
 });
 
-test("mutation fallback verifies trusted identity before duplicate cleanup", () => {
+test("mutation fallback verifies trusted comment identity", () => {
   const root = mkdtempSync(join(tmpdir(), "clawsweeper-publication-recovery-"));
   try {
     const publishedBody = String(
@@ -380,34 +325,11 @@ test("mutation fallback verifies trusted identity before duplicate cleanup", () 
         return "";
       },
     });
-    const patchDeleted: number[] = [];
-    const patchCleanup = createReviewCommentLeases({
-      targetRepo: () => "openclaw/openclaw",
-      gitHubRuntimeBudgetError: class extends Error {},
-      ghObservedMutationCommand: ({ args }: { args: string[] }) => {
-        const id = Number(args[1]?.match(/\/(\d+)$/)?.[1]);
-        if (Number.isInteger(id)) patchDeleted.push(id);
-        return "";
-      },
-      supersededReviewCommentIds: patchState.supersededReviewCommentIds,
-    } as never);
-
-    assert.throws(() => {
-      const synced = patchPublication.upsertReviewComment(
-        itemNumber,
-        publishedBody,
-        selectedComment,
-      );
-      const syncedId = patchState.commentId(synced);
-      if (syncedId === null) return;
-      patchCleanup.cleanupSupersededReviewComments({
-        number: itemNumber,
-        comments: initialComments,
-        keepCommentIds: new Set([syncedId]),
-      });
-    }, /did not verify target comment 20/);
+    assert.throws(
+      () => patchPublication.upsertReviewComment(itemNumber, publishedBody, selectedComment),
+      /did not verify target comment 20/,
+    );
     assert.match(patchCalls[0]?.[1] ?? "", /issues\/comments\/20$/);
-    assert.deepEqual(patchDeleted, []);
 
     const staleResponseCalls: string[][] = [];
     const staleResponsePublication = reviewCommentPublication({
@@ -419,34 +341,12 @@ test("mutation fallback verifies trusted identity before duplicate cleanup", () 
         return JSON.stringify(selected);
       },
     });
-    const staleResponseDeleted: number[] = [];
-    const staleResponseCleanup = createReviewCommentLeases({
-      targetRepo: () => "openclaw/openclaw",
-      gitHubRuntimeBudgetError: class extends Error {},
-      ghObservedMutationCommand: ({ args }: { args: string[] }) => {
-        const id = Number(args[1]?.match(/\/(\d+)$/)?.[1]);
-        if (Number.isInteger(id)) staleResponseDeleted.push(id);
-        return "";
-      },
-      supersededReviewCommentIds: patchState.supersededReviewCommentIds,
-    } as never);
-
-    assert.throws(() => {
-      const synced = staleResponsePublication.upsertReviewComment(
-        itemNumber,
-        publishedBody,
-        selectedComment,
-      );
-      const syncedId = patchState.commentId(synced);
-      if (syncedId === null) return;
-      staleResponseCleanup.cleanupSupersededReviewComments({
-        number: itemNumber,
-        comments: initialComments,
-        keepCommentIds: new Set([syncedId]),
-      });
-    }, /did not verify target comment 20/);
+    assert.throws(
+      () =>
+        staleResponsePublication.upsertReviewComment(itemNumber, publishedBody, selectedComment),
+      /did not verify target comment 20/,
+    );
     assert.match(staleResponseCalls[0]?.[1] ?? "", /issues\/comments\/20$/);
-    assert.deepEqual(staleResponseDeleted, []);
 
     const postRecoveryComments = [
       { ...older, body: publishedBody },
@@ -467,24 +367,6 @@ test("mutation fallback verifies trusted identity before duplicate cleanup", () 
     const recovered = postPublication.upsertReviewComment(itemNumber, publishedBody, contributor);
     assert.equal(recovered.id, 20);
     assert.match(postCalls[0]?.[1] ?? "", /issues\/120232\/comments$/);
-
-    const postDeleted: number[] = [];
-    const postCleanup = createReviewCommentLeases({
-      targetRepo: () => "openclaw/openclaw",
-      gitHubRuntimeBudgetError: class extends Error {},
-      ghObservedMutationCommand: ({ args }: { args: string[] }) => {
-        const id = Number(args[1]?.match(/\/(\d+)$/)?.[1]);
-        if (Number.isInteger(id)) postDeleted.push(id);
-        return "";
-      },
-      supersededReviewCommentIds: postState.supersededReviewCommentIds,
-    } as never);
-    postCleanup.cleanupSupersededReviewComments({
-      number: itemNumber,
-      comments: postRecoveryComments,
-      keepCommentIds: new Set([20]),
-    });
-    assert.deepEqual(postDeleted, [10]);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

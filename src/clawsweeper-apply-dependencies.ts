@@ -98,16 +98,6 @@ export interface CreateApplyDecisionWorkflowDependencies {
     item: Item,
   ) => CanonicalPullRequestCommentSyncBlock | null;
   CLAWSWEEPER_BOT_AUTHORS: Set<string>;
-  cleanupSupersededReviewPlaceholderComments: (options: {
-    number: number;
-    comments: readonly Record<string, unknown>[];
-    keepCommentIds: ReadonlySet<number>;
-  }) => void;
-  cleanupSupersededReviewComments: (options: {
-    number: number;
-    comments: readonly Record<string, unknown>[];
-    keepCommentIds: ReadonlySet<number>;
-  }) => void;
   closeItem: (options: { number: number; kind: ItemKind; reason: CloseReason }) => void;
   closeReasonApplyAgeSkipReason: (
     item: Pick<Item, "createdAt">,

@@ -180,20 +180,6 @@ export function createReviewCommentState(
     return Boolean(body && body.trimEnd().endsWith(reviewCommentMarker(number)));
   }
 
-  function reviewStartStatusLeaseIsFresh(
-    number: number,
-    comment: Record<string, unknown>,
-    nowMs = Date.now(),
-  ): boolean {
-    const body = commentBody(comment);
-    if (!body) return false;
-    const marker = body.match(/<!--\s*clawsweeper-review-status:started\b([^>]*)-->/i);
-    const attributes = marker?.[1] ?? "";
-    if (Number(attributes.match(/\bitem=([^\s>]+)/i)?.[1]) !== number) return false;
-    const expiresAtMs = timestampMs(attributes.match(/\blease_expires_at=([^\s>]+)/i)?.[1]);
-    return expiresAtMs !== null && expiresAtMs >= nowMs;
-  }
-
   function newestReviewComment(
     number: number,
     comments: readonly Record<string, unknown>[],
@@ -246,28 +232,6 @@ export function createReviewCommentState(
       newestReviewComment(number, codexComments.filter(canPatchReviewComment)) ??
       newestReviewComment(number, codexComments)
     );
-  }
-
-  function supersededReviewCommentIds(options: {
-    number: number;
-    comments: readonly Record<string, unknown>[];
-    keepCommentIds: ReadonlySet<number>;
-    nowMs?: number;
-  }): number[] {
-    const nowMs = options.nowMs ?? Date.now();
-    return options.comments
-      .filter(
-        (comment) =>
-          canPatchReviewComment(comment) &&
-          hasExactDurableReviewMarker(options.number, comment) &&
-          // Rolling upgrades can leave the active start lease on the durable
-          // marker comment. Preserve it until expiry so duplicate cleanup
-          // cannot revoke a live worker's ownership.
-          !reviewStartStatusLeaseIsFresh(options.number, comment, nowMs),
-      )
-      .map(commentId)
-      .filter((id): id is number => id !== null && !options.keepCommentIds.has(id))
-      .sort((left, right) => left - right);
   }
 
   function selectDedicatedReviewStartLeaseComment(
@@ -695,10 +659,8 @@ export function createReviewCommentState(
     isCodexReviewCommentBody,
     fetchIssueReviewComments,
     hasExactDurableReviewMarker,
-    reviewStartStatusLeaseIsFresh,
     newestReviewComment,
     selectIssueReviewComment,
-    supersededReviewCommentIds,
     selectDedicatedReviewStartLeaseComment,
     selectDedicatedReviewStartLeaseComments,
     issueReviewCommentState,

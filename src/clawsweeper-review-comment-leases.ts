@@ -27,19 +27,14 @@ export function createReviewCommentLeases(
   const {
     targetRepo,
     heldReviewStartStatusCommentResult,
-    gitHubRuntimeBudgetError: GitHubRuntimeBudgetError,
     ghObservedMutationCommand,
     currentReviewRevision,
     pullRequestHeadSha,
-    reviewCommentMarker,
     renderReviewStartStatusComment,
     issueReviewCommentState,
     commentId,
     commentBody,
-    supersededReviewCommentIds,
-    reviewStartStatusLeaseIsFresh,
     PATCHABLE_REVIEW_COMMENT_AUTHORS,
-    canPatchReviewComment,
     writeCommentPayload,
     reviewCommentFromMutationResponse,
   } = dependencies;
@@ -269,8 +264,8 @@ export function createReviewCommentLeases(
     // Every acquisition POSTs a fresh comment: the lowest-server-id election
     // needs distinct ids per contender, so refreshing a leftover placeholder in
     // place would let two racing workers both validate ownership of the same
-    // comment. Superseded placeholders are swept when the durable review
-    // comment is published instead.
+    // comment. Publication never deletes competing lease comments because a
+    // rolling-version worker may still renew them.
     const createArgs = [
       "api",
       `repos/${targetRepo()}/issues/${options.item.number}/comments`,
@@ -471,93 +466,6 @@ export function createReviewCommentLeases(
     }
   }
 
-  const REVIEW_PLACEHOLDER_BODY_PATTERN = /^ClawSweeper status: review started\./i;
-
-  function cleanupSupersededReviewComments(options: {
-    number: number;
-    comments: readonly Record<string, unknown>[];
-    keepCommentIds: ReadonlySet<number>;
-  }): void {
-    const ids = supersededReviewCommentIds(options);
-    for (const id of ids) {
-      try {
-        ghObservedMutationCommand({
-          identity: `review_comment_duplicate_sweep:${options.number}:${id}`,
-          args: ["api", `repos/${targetRepo()}/issues/comments/${id}`, "--method", "DELETE"],
-        });
-        console.error(
-          `[apply] deleted superseded durable review comment ${id} for #${options.number}`,
-        );
-      } catch (error) {
-        if (error instanceof GitHubRuntimeBudgetError) throw error;
-        // The newest exact durable comment remains canonical even if cleanup must retry later.
-        console.error(
-          `[apply] could not delete superseded durable review comment ${id} for #${options.number}: ${
-            error instanceof Error ? error.message : String(error)
-          }`,
-        );
-      }
-    }
-  }
-
-  function supersededReviewPlaceholderCommentIds(options: {
-    number: number;
-    comments: readonly Record<string, unknown>[];
-    keepCommentIds: ReadonlySet<number>;
-    nowMs?: number;
-  }): number[] {
-    const nowMs = options.nowMs ?? Date.now();
-    const ids: number[] = [];
-    for (const comment of options.comments) {
-      const id = commentId(comment);
-      if (id === null || options.keepCommentIds.has(id)) continue;
-      if (!canPatchReviewComment(comment)) continue;
-      const body = (commentBody(comment) ?? "").trimStart();
-      // Placeholder bodies start with the status line; the durable review
-      // comment never does, and its marker is an extra guard against deletion.
-      if (!REVIEW_PLACEHOLDER_BODY_PATTERN.test(body)) continue;
-      if (body.includes(reviewCommentMarker(options.number))) continue;
-      // An unexpired lease may belong to a racing worker on a newer revision;
-      // only provably superseded placeholders are swept after publication.
-      if (reviewStartStatusLeaseIsFresh(options.number, comment, nowMs)) continue;
-      ids.push(id);
-    }
-    return ids;
-  }
-
-  function cleanupSupersededReviewPlaceholderComments(options: {
-    number: number;
-    // Pre-mutation snapshot from the apply flow; the sweep must not refetch the
-    // comment list after the durable-comment mutation (API-budget invariant).
-    comments: readonly Record<string, unknown>[];
-    keepCommentIds: ReadonlySet<number>;
-  }): void {
-    const ids = supersededReviewPlaceholderCommentIds({
-      number: options.number,
-      comments: options.comments,
-      keepCommentIds: options.keepCommentIds,
-    });
-    for (const id of ids) {
-      try {
-        ghObservedMutationCommand({
-          identity: `review_placeholder_sweep:${options.number}:${id}`,
-          args: ["api", `repos/${targetRepo()}/issues/comments/${id}`, "--method", "DELETE"],
-        });
-        console.error(
-          `[apply] deleted superseded review placeholder comment ${id} for #${options.number}`,
-        );
-      } catch (error) {
-        if (error instanceof GitHubRuntimeBudgetError) throw error;
-        // A failed sweep must never fail the publish; the next apply retries it.
-        console.error(
-          `[apply] could not delete superseded review placeholder comment ${id} for #${options.number}: ${
-            error instanceof Error ? error.message : String(error)
-          }`,
-        );
-      }
-    }
-  }
-
   return {
     reviewStartLeaseOwner,
     newReviewStartLeaseOwner,
@@ -570,9 +478,5 @@ export function createReviewCommentLeases(
     deleteOwnedDedicatedReviewStartLease,
     reapExpiredDedicatedReviewStartLeases,
     reapSupersededDedicatedReviewStartLeases,
-    REVIEW_PLACEHOLDER_BODY_PATTERN,
-    cleanupSupersededReviewComments,
-    supersededReviewPlaceholderCommentIds,
-    cleanupSupersededReviewPlaceholderComments,
   };
 }

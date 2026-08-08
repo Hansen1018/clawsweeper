@@ -2981,6 +2981,107 @@ test("a lease published during durable comment sync survives the write and block
   }
 });
 
+test("durable publication never deletes a legacy lease that can refresh concurrently", () => {
+  const root = mkdtempSync(tmpPrefix);
+  try {
+    const itemsDir = join(root, "items");
+    const closedDir = join(root, "closed");
+    const plansDir = join(root, "plans");
+    const reportPath = join(root, "apply-report.json");
+    const commentWriteLogPath = join(root, "comment-writes.log");
+    const number = 74493;
+    const headSha = "0123456789abcdef0123456789abcdef01234567";
+    const startedAt = new Date(Date.now() - 2 * 60_000).toISOString();
+    const expiredAt = new Date(Date.now() - 60_000).toISOString();
+    const refreshedAt = new Date(Date.now() + 30 * 60_000).toISOString();
+    mkdirSync(itemsDir, { recursive: true });
+    mkdirSync(plansDir, { recursive: true });
+
+    const closeReport = lowSignalCloseReport({
+      number,
+      title: "Do not delete a concurrently refreshed legacy lease",
+      pull_head_sha: headSha,
+      reviewed_at: "2026-05-01T00:00:00Z",
+    });
+    const synced = reportWithSyncedReviewComment(closeReport, number, "low_signal_unmergeable_pr");
+    writeFileSync(join(itemsDir, `${number}.md`), synced.report, "utf8");
+
+    const staleDurableComment = [
+      "Codex review: stale body that apply will replace.",
+      "",
+      `<!-- clawsweeper-review item=${number} -->`,
+    ].join("\n");
+    const legacyLeaseComment = (expiresAt: string) =>
+      [
+        "Codex review: legacy duplicate.",
+        "",
+        `<!-- clawsweeper-review-status:started item=${number} sha=${headSha} started_at=${startedAt} lease_expires_at=${expiresAt} owner=legacy-worker v=1 -->`,
+        "",
+        `<!-- clawsweeper-review item=${number} -->`,
+      ].join("\n");
+    const commentRecord = (id: number, body: string, updatedAt: string) => ({
+      id,
+      html_url: `https://github.com/openclaw/openclaw/pull/${number}#issuecomment-${id}`,
+      created_at: startedAt,
+      updated_at: updatedAt,
+      user: { login: "clawsweeper[bot]" },
+      body,
+    });
+    const canonicalId = 9000 + number;
+    const duplicateId = 8000 + number;
+    const canonical = commentRecord(canonicalId, staleDurableComment, new Date().toISOString());
+    const expiredDuplicate = commentRecord(duplicateId, legacyLeaseComment(expiredAt), startedAt);
+    const refreshedDuplicate = commentRecord(
+      duplicateId,
+      legacyLeaseComment(refreshedAt),
+      new Date().toISOString(),
+    );
+
+    withMockGh(
+      root,
+      promotionGhMock({
+        number,
+        title: "Do not delete a concurrently refreshed legacy lease",
+        headSha,
+        comment: staleDurableComment,
+        comments: [canonical, expiredDuplicate],
+        commentsAfterCommentWrite: [canonical, refreshedDuplicate],
+        commentWriteLogPath,
+      }),
+      () => {
+        runApplyDecisionsForTest({
+          targetRepo: "openclaw/openclaw",
+          itemsDir,
+          closedDir,
+          plansDir,
+          reportPath,
+          extraArgs: [
+            "--apply-kind",
+            "all",
+            "--apply-close-reasons",
+            "low_signal_unmergeable_pr",
+            "--item-numbers",
+            String(number),
+          ],
+        });
+      },
+    );
+
+    assert.deepEqual(JSON.parse(readFileSync(reportPath, "utf8")), [
+      {
+        number,
+        action: "review_comment_synced",
+        reason: "updated durable Codex review comment",
+      },
+    ]);
+    const writes = readFileSync(commentWriteLogPath, "utf8");
+    assert.match(writes, new RegExp(`/issues/comments/${canonicalId}.*--method PATCH`));
+    assert.doesNotMatch(writes, new RegExp(`/issues/comments/${duplicateId}.*--method DELETE`));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("apply defers incomplete old report actions when a same-head review finishes mid-run", () => {
   const root = mkdtempSync(tmpPrefix);
   try {
