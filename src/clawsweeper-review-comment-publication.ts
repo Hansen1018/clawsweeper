@@ -175,6 +175,40 @@ export function createReviewCommentPublication(
     });
   }
 
+  function markerAttribute(attributes: string, name: string): string | undefined {
+    return attributes.match(new RegExp(`\\b${name}=([^\\s>]+)`, "i"))?.[1];
+  }
+
+  function boundedReviewVersionMarker(
+    number: number,
+    versionAttributes: string,
+    exactHead: string | undefined,
+  ): string {
+    const reviewedAt = markerAttribute(versionAttributes, "reviewed_at");
+    if (!reviewedAt || timestampMs(reviewedAt) === null) return "";
+    const sourceRevision = markerAttribute(versionAttributes, "source_revision");
+    const leaseOwner = markerAttribute(versionAttributes, "lease_owner");
+    const leaseCommentId = markerAttribute(versionAttributes, "lease_comment_id");
+    const attrs = [
+      `item=${number}`,
+      `reviewed_at=${reviewedAt}`,
+      `sha=${exactHead ?? "na"}`,
+      ...(sourceRevision && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(sourceRevision)
+        ? [`source_revision=${sourceRevision.toLowerCase()}`]
+        : []),
+      ...(leaseOwner && /^[A-Za-z0-9._:-]{1,200}$/.test(leaseOwner)
+        ? [`lease_owner=${leaseOwner}`]
+        : []),
+      ...(leaseCommentId &&
+      /^[1-9]\d*$/.test(leaseCommentId) &&
+      Number.isSafeInteger(Number(leaseCommentId))
+        ? [`lease_comment_id=${leaseCommentId}`]
+        : []),
+      "v=1",
+    ].join(" ");
+    return `<!-- clawsweeper-review-version ${attrs} -->`;
+  }
+
   function oversizedReviewCommentFallback(number: number, body: string, bodyBytes: number): string {
     const markers = trailingHtmlComments(body);
     const versionMarker = markerForItem(
@@ -194,18 +228,16 @@ export function createReviewCommentPublication(
     const exactHead =
       stateAttributes.match(/\bsha=([0-9a-f]{40})\b/i)?.[1]?.toLowerCase() ??
       versionAttributes.match(/\bsha=([0-9a-f]{40})\b/i)?.[1]?.toLowerCase();
-    const verdictMarker = markerForItem(
-      markers,
-      /^<!--\s+clawsweeper-verdict:[^\s>]+\b([^>]*)-->$/,
-      number,
-    );
-    const blockedVerdict = verdictMarker?.replace(
-      /^<!--\s+clawsweeper-verdict:[^\s>]+/,
-      "<!-- clawsweeper-verdict:needs-human",
-    );
+    const reviewedAt = markerAttribute(versionAttributes, "reviewed_at");
+    const blockedVerdict = [
+      `item=${number}`,
+      ...(exactHead ? [`sha=${exactHead}`] : []),
+      ...(reviewedAt && timestampMs(reviewedAt) !== null ? [`reviewed_at=${reviewedAt}`] : []),
+    ].join(" ");
     const blockedState = exactHead
       ? `<!-- clawsweeper-review-state:blocked item=${number} sha=${exactHead} v=1 -->`
       : "";
+    const boundedVersion = boundedReviewVersionMarker(number, versionAttributes, exactHead);
     const fallback = [
       "Codex review: publication failed closed.",
       "",
@@ -229,13 +261,34 @@ export function createReviewCommentPublication(
       "",
       `- [P2] Durable review body was ${bodyBytes} bytes; the publication limit is ${DURABLE_REVIEW_COMMENT_MAX_BYTES} bytes.`,
       "",
-      blockedVerdict ?? "",
+      `<!-- clawsweeper-verdict:needs-human ${blockedVerdict} -->`,
       blockedState,
-      versionMarker ?? "",
+      boundedVersion,
     ]
       .filter(Boolean)
       .join("\n");
-    return markedReviewCommentBody(number, fallback);
+    const markedFallback = markedReviewCommentBody(number, fallback);
+    if (Buffer.byteLength(markedFallback, "utf8") <= DURABLE_REVIEW_COMMENT_MAX_BYTES) {
+      return markedFallback;
+    }
+    const minimalFallback = markedReviewCommentBody(
+      number,
+      [
+        "Codex review: publication failed closed.",
+        "",
+        "**Blocked by review publication failure.**",
+        "",
+        `<!-- clawsweeper-verdict:needs-human item=${number}${exactHead ? ` sha=${exactHead}` : ""} -->`,
+        blockedState,
+        boundedVersion,
+      ]
+        .filter(Boolean)
+        .join("\n"),
+    );
+    if (Buffer.byteLength(minimalFallback, "utf8") <= DURABLE_REVIEW_COMMENT_MAX_BYTES) {
+      return minimalFallback;
+    }
+    throw new Error(`bounded durable review fallback for #${number} exceeds the publication limit`);
   }
 
   function upsertReviewComment(

@@ -287,6 +287,21 @@ export function createReviewCommentState(
     );
   }
 
+  function selectLegacyReviewStartLeaseComments(
+    number: number,
+    comments: Record<string, unknown>[],
+  ): Record<string, unknown>[] {
+    return comments.filter((candidate) => {
+      const body = commentBody(candidate);
+      return Boolean(
+        canPatchReviewComment(candidate) &&
+        hasExactDurableReviewMarker(number, candidate) &&
+        body &&
+        /<!--\s*clawsweeper-review-status:started\b/i.test(body),
+      );
+    });
+  }
+
   function issueReviewCommentState(
     number: number,
     fallbackBodies: readonly string[] = [],
@@ -302,16 +317,10 @@ export function createReviewCommentState(
     const reviewComment = selectIssueReviewComment(number, comments, fallbackBodies);
     const dedicatedLeaseComments = selectDedicatedReviewStartLeaseComments(number, comments);
     const dedicatedLeaseComment = selectDedicatedReviewStartLeaseComment(number, comments);
-    const legacyLeaseComment = commentBody(reviewComment)?.includes(
-      "clawsweeper-review-status:started",
-    )
-      ? reviewComment
-      : undefined;
+    const legacyLeaseComments = selectLegacyReviewStartLeaseComments(number, comments);
     const leaseComments = [
       ...dedicatedLeaseComments,
-      ...(legacyLeaseComment && !dedicatedLeaseComments.includes(legacyLeaseComment)
-        ? [legacyLeaseComment]
-        : []),
+      ...legacyLeaseComments.filter((comment) => !dedicatedLeaseComments.includes(comment)),
     ];
     return {
       comments,

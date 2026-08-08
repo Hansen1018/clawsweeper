@@ -128,7 +128,10 @@ test("oversized durable review publication replaces same-head ready state and ab
       frontMatterValue: () => undefined,
       replaceFrontMatterValue: (markdown: string) => markdown,
       sectionValue: () => "",
-      timestampMs: () => null,
+      timestampMs: (value: string | undefined) => {
+        const parsed = Date.parse(value ?? "");
+        return Number.isFinite(parsed) ? parsed : null;
+      },
       sentence: (value: string) => value,
       normalizedLabelSet: () => new Set<string>(),
       sectionLineValue: () => undefined,
@@ -151,9 +154,9 @@ test("oversized durable review publication replaces same-head ready state and ab
       "",
       "x".repeat(70_000),
       "",
-      `<!-- clawsweeper-verdict:needs-human item=${itemNumber} sha=${headSha} confidence=high updated_at=2026-08-07T16:01:00Z reviewed_at=2026-08-07T16:00:00Z -->`,
+      `<!-- clawsweeper-verdict:needs-human item=${itemNumber} sha=${headSha} confidence=high updated_at=2026-08-07T16:01:00Z reviewed_at=2026-08-07T16:00:00Z diagnostic=${"y".repeat(70_000)} -->`,
       `<!-- clawsweeper-review-state:ready item=${itemNumber} sha=${headSha} v=1 -->`,
-      `<!-- clawsweeper-review-version item=${itemNumber} reviewed_at=2026-08-07T16:00:00Z sha=${headSha} source_revision=${"a".repeat(64)} lease_owner=fixture lease_comment_id=20 v=1 -->`,
+      `<!-- clawsweeper-review-version item=${itemNumber} reviewed_at=2026-08-07T16:00:00Z sha=${headSha} source_revision=${"a".repeat(64)} lease_owner=${"z".repeat(70_000)} lease_comment_id=20 v=1 -->`,
       reviewMarker,
     ].join("\n\n");
 
@@ -174,6 +177,7 @@ test("oversized durable review publication replaces same-head ready state and ab
       new RegExp(`<!-- clawsweeper-review-state:blocked item=${itemNumber} sha=${headSha} v=1 -->`),
     );
     assert.doesNotMatch(publishedBody, /clawsweeper-review-state:ready/);
+    assert.doesNotMatch(publishedBody, /y{100}|z{100}/);
     assert.equal((publishedBody.match(/<!-- clawsweeper-review-state:/g) ?? []).length, 1);
     assert.equal((publishedBody.match(/<!-- clawsweeper-review-version\b/g) ?? []).length, 1);
     assert.ok(publishedBody.trimEnd().endsWith(reviewMarker));
@@ -276,6 +280,55 @@ test("duplicate cleanup preserves an active marker-backed legacy review lease", 
       nowMs,
     }),
     [50],
+  );
+});
+
+test("lease election includes active legacy leases on non-canonical durable duplicates", () => {
+  const nowMs = Date.parse("2026-08-08T00:05:00Z");
+  const canonical = durableReviewComment({
+    id: 20,
+    reviewedAt: "2026-08-08T00:02:00Z",
+    updatedAt: "2026-08-08T00:02:00Z",
+  });
+  const activeLegacy = durableReviewComment({
+    id: 10,
+    reviewedAt: "2026-08-08T00:01:00Z",
+    updatedAt: "2026-08-08T00:01:00Z",
+  });
+  activeLegacy.body = String(activeLegacy.body).replace(
+    reviewMarker,
+    [
+      `<!-- clawsweeper-review-status:started item=${itemNumber} sha=${headSha} started_at=2026-08-08T00:00:00Z lease_expires_at=2026-08-08T00:10:00Z owner=legacy-worker v=1 -->`,
+      reviewMarker,
+    ].join("\n\n"),
+  );
+  const untrustedLegacy = {
+    ...activeLegacy,
+    id: 5,
+    user: { login: "reviewer" },
+  };
+  const state = reviewCommentState(() => [untrustedLegacy, activeLegacy, canonical]);
+  const snapshot = state.issueReviewCommentState(itemNumber);
+
+  assert.equal(snapshot.reviewComment?.id, 20);
+  assert.deepEqual(
+    snapshot.leaseComments.map((comment) => comment.id),
+    [10],
+  );
+
+  const leases = createReviewCommentLeases({
+    ...state,
+    targetRepo: () => "openclaw/openclaw",
+    gitHubRuntimeBudgetError: class extends Error {},
+  } as never);
+  assert.equal(
+    leases.reviewStartLeaseWinnerCommentIdForTest({
+      comments: snapshot.leaseComments,
+      itemNumber,
+      headSha,
+      nowMs,
+    }),
+    10,
   );
 });
 
