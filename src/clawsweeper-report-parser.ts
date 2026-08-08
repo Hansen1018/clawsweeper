@@ -338,6 +338,21 @@ export function createReportParser({
     };
   }
 
+  function securityReviewSummary(
+    status: SecurityReviewStatus,
+    summary: string | undefined,
+  ): string | undefined {
+    const normalized = summary?.trim();
+    if (normalized && !/^(?:-\s*)?(?:none|n\/a|not applicable)[.!]?$/i.test(normalized)) {
+      return normalized;
+    }
+    // Explicit attention must survive malformed summary text; otherwise the
+    // parser downgrades a merge blocker to the not-applicable default.
+    return status === "needs_attention"
+      ? "Resolve the security review before merge; the needs-attention result did not include a usable summary."
+      : undefined;
+  }
+
   function reportSecurityReview(markdown: string): SecurityReview {
     const section = reviewSectionValue(markdown, "securityReview");
     if (!section.trim()) return defaultSecurityReview(markdown);
@@ -345,8 +360,9 @@ export function createReportParser({
     const status = SECURITY_REVIEW_STATUSES.has(statusValue as SecurityReviewStatus)
       ? (statusValue as SecurityReviewStatus)
       : undefined;
-    const summary = sectionLineValue(section, "Summary");
-    if (!status || !summary) return defaultSecurityReview(markdown);
+    if (!status) return defaultSecurityReview(markdown);
+    const summary = securityReviewSummary(status, sectionLineValue(section, "Summary"));
+    if (!summary) return defaultSecurityReview(markdown);
     const concerns: SecurityConcern[] = [];
     let current: SecurityConcern | null = null;
     for (const line of section.split("\n")) {

@@ -339,6 +339,26 @@ Concerns:
         /Resolve security concern: Confirm credential scope.*Resolve Confirm credential scope before merge\./s,
       state: "blocked",
     },
+    ...["", "None."].map((summary, index) => ({
+      name:
+        index === 0 ? "security attention without summary" : "security attention with none summary",
+      report: reviewReport(
+        {},
+        `## Security Review
+
+Status: needs_attention
+
+Summary: ${summary}
+
+Concerns:
+
+- none
+`,
+      ),
+      action:
+        /Resolve security review attention item.*needs-attention result did not include a usable summary\./s,
+      state: "blocked" as const,
+    })),
   ] as const;
 
   for (const scenario of scenarios) {
