@@ -23,6 +23,11 @@ export function createReviewCommentAutomation(
     timestampMs,
   } = dependencies;
 
+  function canonicalReviewTimestamp(value: string | undefined): string | null {
+    const parsed = timestampMs(value);
+    return parsed === null ? null : new Date(parsed).toISOString();
+  }
+
   function reviewVersionMarkerFromReport(markdown: string): string {
     const itemKind = frontMatterValue(markdown, "type");
     if (itemKind !== "issue" && itemKind !== "pull_request") return "";
@@ -31,8 +36,8 @@ export function createReviewCommentAutomation(
     if (!/^[1-9]\d*$/.test(number) || !Number.isSafeInteger(itemNumber) || itemNumber <= 0) {
       return "";
     }
-    const reviewedAt = frontMatterValue(markdown, "reviewed_at");
-    if (!reviewedAt || timestampMs(reviewedAt) === null) return "";
+    const reviewedAt = canonicalReviewTimestamp(frontMatterValue(markdown, "reviewed_at"));
+    if (!reviewedAt) return "";
     const reportHeadSha = pullHeadShaFromReport(markdown);
     if (itemKind === "pull_request" && !/^[0-9a-f]{40}$/i.test(reportHeadSha ?? "")) return "";
     const headSha = reportHeadSha ?? "na";
@@ -60,11 +65,14 @@ export function createReviewCommentAutomation(
       const decision = frontMatterValue(markdown, "decision");
       const closeReason = frontMatterValue(markdown, "close_reason");
       if (decision !== "close" || closeReason !== "unsponsored_feature_request") return "";
+      const reportReviewedAt = frontMatterValue(markdown, "reviewed_at");
+      const reviewedAt =
+        canonicalReviewTimestamp(reportReviewedAt) ?? reportReviewedAt ?? "unknown";
       const attrs = [
         `item=${markerAttributeValue(frontMatterValue(markdown, "number") ?? "unknown")}`,
         `confidence=${markerAttributeValue(frontMatterValue(markdown, "confidence") ?? "unknown")}`,
         `updated_at=${markerAttributeValue(frontMatterValue(markdown, "item_updated_at") ?? "unknown")}`,
-        `reviewed_at=${markerAttributeValue(frontMatterValue(markdown, "reviewed_at") ?? "unknown")}`,
+        `reviewed_at=${markerAttributeValue(reviewedAt)}`,
         `source_revision=${markerAttributeValue(frontMatterValue(markdown, "item_source_revision") ?? "unknown")}`,
         `action_taken=${markerAttributeValue(frontMatterValue(markdown, "action_taken") ?? "unknown")}`,
         `reason=${markerAttributeValue(closeReason)}`,
@@ -83,7 +91,8 @@ export function createReviewCommentAutomation(
     const confidence = frontMatterValue(markdown, "confidence") ?? "unknown";
     const headSha = pullHeadShaFromReport(markdown) ?? "unknown";
     const itemUpdatedAt = frontMatterValue(markdown, "item_updated_at") ?? "unknown";
-    const reviewedAt = frontMatterValue(markdown, "reviewed_at") ?? "unknown";
+    const reportReviewedAt = frontMatterValue(markdown, "reviewed_at");
+    const reviewedAt = canonicalReviewTimestamp(reportReviewedAt) ?? reportReviewedAt ?? "unknown";
     const reviewLeaseOwner = frontMatterValue(markdown, "review_lease_owner") ?? "unknown";
     const reviewLeaseCommentId = frontMatterValue(markdown, "review_lease_comment_id") ?? "unknown";
     const sourceRevision = frontMatterValue(markdown, "item_source_revision") ?? "unknown";

@@ -506,6 +506,23 @@ test("review-state publication fails closed without a valid durable timestamp", 
   }
 });
 
+test("review timestamps canonicalize before durable identity and state emission", () => {
+  const report = reviewReport({ reviewed_at: "2026-08-08T20:00:00+02:00" });
+  const comment = renderReviewCommentFromReport(report, "none");
+  const markers = reviewAutomationMarkersFromReport(report);
+  const canonicalReviewedAt = "2026-08-08T18:00:00.000Z";
+
+  assert.match(
+    comment,
+    new RegExp(`<!-- clawsweeper-review-version item=120232 reviewed_at=${canonicalReviewedAt} `),
+  );
+  assert.match(markers, new RegExp(`\\breviewed_at=${canonicalReviewedAt}\\b`));
+  assert.deepEqual(stateMarkers(markers), [
+    `<!-- clawsweeper-review-state:ready item=120232 sha=${reviewedHead} v=1 -->`,
+  ]);
+  assert.doesNotMatch(comment, /reviewed_at=2026-08-08T20:00:00_02:00/);
+});
+
 test("malformed report input publishes one bounded blocked readiness action", () => {
   const report = reviewReport({ maintainer_decision: "{" });
   const comment = renderReviewCommentFromReport(report, "none");

@@ -10,6 +10,7 @@ import {
   createReviewCommentPublication,
   DurableReviewPublicationBlockedError,
 } from "../dist/clawsweeper-review-comment-publication.js";
+import { createReviewCommentAutomation } from "../dist/clawsweeper-review-comment-automation.js";
 import { createReviewCommentState } from "../dist/clawsweeper-review-comment-state.js";
 
 const itemNumber = 120232;
@@ -101,6 +102,38 @@ function reviewCommentPublication(options: {
     ...options.state,
   } as never);
 }
+
+test("review version timestamps round-trip through the durable parser", () => {
+  const fields: Record<string, string> = {
+    type: "pull_request",
+    number: String(itemNumber),
+    reviewed_at: "2026-08-08T20:00:00+02:00",
+    item_source_revision: "a".repeat(64),
+    review_lease_owner: "fixture",
+    review_lease_comment_id: "20",
+  };
+  const automation = createReviewCommentAutomation({
+    frontMatterValue: (_markdown: string, key: string) => fields[key],
+    pullHeadShaFromReport: () => headSha,
+    markerAttributeValue: (value: string) => value.trim().replace(/[^\w./:@-]/g, "_") || "unknown",
+    timestampMs: (value: string | undefined) => {
+      const parsed = Date.parse(value ?? "");
+      return Number.isFinite(parsed) ? parsed : null;
+    },
+  } as never);
+  const versionMarker = automation.reviewVersionMarkerFromReport("report");
+  const comment = {
+    id: 20,
+    user: { login: "clawsweeper[bot]" },
+    body: [versionMarker, reviewMarker].join("\n\n"),
+  };
+  const parsed = reviewCommentState(() => []).durableReviewVersion(comment, itemNumber);
+
+  assert.match(versionMarker, /\breviewed_at=2026-08-08T18:00:00\.000Z\b/);
+  assert.ok(parsed);
+  assert.equal(parsed.reviewedAt, "2026-08-08T18:00:00.000Z");
+  assert.equal(Date.parse(parsed.reviewedAt), Date.parse(fields.reviewed_at));
+});
 
 test("oversized durable review publication replaces same-head ready state and aborts", () => {
   const root = mkdtempSync(join(tmpdir(), "clawsweeper-publication-"));
