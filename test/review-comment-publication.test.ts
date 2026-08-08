@@ -193,9 +193,9 @@ test("oversized durable review publication replaces same-head ready state and ab
       "",
       "x".repeat(70_000),
       "",
-      `<!-- clawsweeper-verdict:needs-human item=${itemNumber} sha=${headSha} confidence=high updated_at=2026-08-07T16:01:00Z reviewed_at=2026-08-07T16:00:00Z diagnostic=${"y".repeat(70_000)} -->`,
+      `<!-- clawsweeper-verdict:needs-human item=${itemNumber} sha=${headSha} confidence=high updated_at=2026-08-07T16:01:00Z reviewed_at=2026-08-07T18:00:00+02:00 diagnostic=${"y".repeat(70_000)} -->`,
       `<!-- clawsweeper-review-state:ready item=${itemNumber} sha=${headSha} v=1 -->`,
-      `<!-- clawsweeper-review-version item=${itemNumber} reviewed_at=2026-08-07T16:00:00Z sha=${headSha} source_revision=${"a".repeat(64)} lease_owner=${"z".repeat(70_000)} lease_comment_id=20 v=1 -->`,
+      `<!-- clawsweeper-review-version item=${itemNumber} reviewed_at=2026-08-07T18:00:00+02:00 sha=${headSha} source_revision=${"a".repeat(64)} lease_owner=${"z".repeat(70_000)} lease_comment_id=20 v=1 -->`,
       reviewMarker,
     ].join("\n\n");
 
@@ -217,6 +217,8 @@ test("oversized durable review publication replaces same-head ready state and ab
     );
     assert.doesNotMatch(publishedBody, /clawsweeper-review-state:ready/);
     assert.doesNotMatch(publishedBody, /y{100}|z{100}/);
+    assert.match(publishedBody, /\breviewed_at=2026-08-07T16:00:00\.000Z\b/);
+    assert.doesNotMatch(publishedBody, /reviewed_at=2026-08-07T18:00:00[+_]02:00/);
     assert.equal((publishedBody.match(/<!-- clawsweeper-review-state:/g) ?? []).length, 1);
     assert.equal((publishedBody.match(/<!-- clawsweeper-review-version\b/g) ?? []).length, 1);
     assert.ok(publishedBody.trimEnd().endsWith(reviewMarker));
@@ -240,7 +242,7 @@ test("malformed oversized fallback reuses only same-head identity and outranks o
       });
       const current = durableReviewComment({
         id: 20,
-        reviewedAt: "2026-08-07T16:00:00Z",
+        reviewedAt: "2026-08-07T18:00:00+02:00",
         updatedAt: "2026-08-07T16:01:00Z",
       });
       let published = current;
@@ -282,7 +284,8 @@ test("malformed oversized fallback reuses only same-head identity and outranks o
       const version = state.durableReviewVersion(published, itemNumber);
       assert.ok(version);
       assert.equal(version.headSha, headSha);
-      assert.equal(version.reviewedAt, "2026-08-07T16:00:00Z");
+      assert.equal(version.reviewedAt, "2026-08-07T16:00:00.000Z");
+      assert.doesNotMatch(String(published.body), /reviewed_at=2026-08-07T18:00:00[+_]02:00/);
       assert.match(String(published.body), /clawsweeper-review-state:blocked/);
       assert.doesNotMatch(String(published.body), /clawsweeper-review-state:ready/);
       assert.equal(state.selectIssueReviewComment(itemNumber, comments)?.id, 20);

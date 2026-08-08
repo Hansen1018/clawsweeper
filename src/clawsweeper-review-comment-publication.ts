@@ -270,7 +270,7 @@ export function createReviewCommentPublication(
     const existingVersion = sourceIdentity ? null : durableReviewVersion(existing, number);
     // Reuse only the same-head identity of the authoritative comment being
     // replaced. Never invent a review timestamp for malformed report metadata.
-    const reviewVersion =
+    const selectedReviewVersion =
       sourceIdentity ??
       (exactHead
         ? existingVersion?.headSha?.toLowerCase() === exactHead
@@ -279,6 +279,16 @@ export function createReviewCommentPublication(
         : existingVersion?.headSha === null
           ? existingVersion
           : null);
+    const selectedReviewedAtMs = selectedReviewVersion
+      ? timestampMs(selectedReviewVersion.reviewedAt)
+      : null;
+    const reviewVersion =
+      selectedReviewVersion && selectedReviewedAtMs !== null
+        ? {
+            ...selectedReviewVersion,
+            reviewedAt: new Date(selectedReviewedAtMs).toISOString(),
+          }
+        : null;
     const blockedVerdict = [
       `item=${number}`,
       ...(exactHead ? [`sha=${exactHead}`] : []),
