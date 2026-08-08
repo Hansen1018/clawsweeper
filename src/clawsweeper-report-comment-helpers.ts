@@ -354,6 +354,12 @@ export function createReportCommentHelpers(
         }
       }
     };
+    const typedBlockerDetail = (value: string, fallback: string): string => {
+      const detail = value.trim();
+      return detail && !/^(?:-\s*)?(?:none|n\/a|not applicable)[.!]?$/i.test(detail)
+        ? detail
+        : fallback;
+    };
 
     const rawItemNumber = frontMatterValue(markdown, "number") ?? "";
     const itemNumber = Number(rawItemNumber);
@@ -446,8 +452,10 @@ export function createReportCommentHelpers(
       add(
         "needs-changes",
         `${finding.title.trim()} (${priorityLabel(finding.priority)})`,
-        finding.body.trim() ||
+        typedBlockerDetail(
+          finding.body,
           `Resolve ${finding.title.trim()} at ${findingLocation} before merge.`,
+        ),
         {
           distinctKey: `${finding.title} ${findingLocation}`,
         },
@@ -460,7 +468,7 @@ export function createReportCommentHelpers(
       add(
         securityState,
         `Resolve security concern: ${concern.title.trim()}`,
-        concern.body.trim() || `Resolve ${concern.title.trim()} before merge.`,
+        typedBlockerDetail(concern.body, `Resolve ${concern.title.trim()} before merge.`),
         {
           distinctKey: `security ${concern.title}`,
         },

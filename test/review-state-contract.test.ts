@@ -327,10 +327,12 @@ Full review comments:
   ]);
 });
 
-test("bodyless typed blockers remain visible and non-ready", () => {
+test("empty and none-like typed blockers remain visible and non-ready", () => {
+  const unusableBodies = ["", "None.", "- none", "N/A", "not applicable"] as const;
+  const bodyLine = (body: string) => (body ? `  - body: ${body}\n` : "");
   const scenarios = [
-    {
-      name: "finding",
+    ...unusableBodies.map((body) => ({
+      name: `finding body ${JSON.stringify(body)}`,
       report: reviewReport(
         { work_candidate: "queue_fix_pr" },
         "",
@@ -343,15 +345,15 @@ Overall confidence: 0.99
 Full review comments:
 
 - **[P1] Preserve cleanup ownership:** \`scripts/deadcode-knip-runner.mjs:42\`
-  - confidence: 0.99
+${bodyLine(body)}  - confidence: 0.99
 `,
       ),
       action:
         /Preserve cleanup ownership \(P1\).*Resolve Preserve cleanup ownership at scripts\/deadcode-knip-runner\.mjs:42 before merge\./s,
       state: "needs-changes",
-    },
-    {
-      name: "security concern",
+    })),
+    ...unusableBodies.map((body) => ({
+      name: `security concern body ${JSON.stringify(body)}`,
       report: reviewReport(
         {},
         `## Security Review
@@ -363,13 +365,13 @@ Summary: Credential scope needs review.
 Concerns:
 
 - **[high] Confirm credential scope:** \`src/config/schema.ts:42\`
-  - confidence: 0.91
+${bodyLine(body)}  - confidence: 0.91
 `,
       ),
       action:
         /Resolve security concern: Confirm credential scope.*Resolve Confirm credential scope before merge\./s,
       state: "blocked",
-    },
+    })),
     ...["", "None."].map((summary, index) => ({
       name:
         index === 0 ? "security attention without summary" : "security attention with none summary",
@@ -402,6 +404,7 @@ Concerns:
       [`<!-- clawsweeper-review-state:${scenario.state} item=120232 sha=${reviewedHead} v=1 -->`],
       scenario.name,
     );
+    assert.doesNotMatch(markers, /clawsweeper-verdict:pass/, scenario.name);
   }
 });
 
