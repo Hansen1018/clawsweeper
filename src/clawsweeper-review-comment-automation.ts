@@ -66,6 +66,9 @@ export function createReviewCommentAutomation(
     }
     if (itemKind !== "pull_request") return "";
     const number = frontMatterValue(markdown, "number") ?? "unknown";
+    const itemNumber = Number(number);
+    const hasExactItemNumber =
+      /^[1-9]\d*$/.test(number) && Number.isSafeInteger(itemNumber) && itemNumber > 0;
     const decision = frontMatterValue(markdown, "decision");
     const confidence = frontMatterValue(markdown, "confidence") ?? "unknown";
     const headSha = pullHeadShaFromReport(markdown) ?? "unknown";
@@ -88,10 +91,11 @@ export function createReviewCommentAutomation(
       precomputedReadiness?.headSha === headSha.toLowerCase()
         ? precomputedReadiness
         : pullRequestReviewReadinessFromReport(markdown);
-    const reviewStateMarker = /^[0-9a-f]{40}$/i.test(headSha)
-      ? `<!-- clawsweeper-review-state:${reviewReadiness.state} ` +
-        `item=${markerAttributeValue(number)} sha=${markerAttributeValue(headSha)} v=1 -->`
-      : "";
+    const reviewStateMarker =
+      hasExactItemNumber && /^[0-9a-f]{40}$/i.test(headSha)
+        ? `<!-- clawsweeper-review-state:${reviewReadiness.state} ` +
+          `item=${markerAttributeValue(number)} sha=${markerAttributeValue(headSha)} v=1 -->`
+        : "";
     const withReviewState = (...markers: string[]): string =>
       [...markers.filter(Boolean), reviewStateMarker].join("\n");
     if (reviewReadiness.normalizationFailed) {

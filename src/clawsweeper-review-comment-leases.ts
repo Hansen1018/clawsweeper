@@ -37,6 +37,7 @@ export function createReviewCommentLeases(
     commentId,
     commentBody,
     supersededReviewCommentIds,
+    reviewStartStatusLeaseIsFresh,
     PATCHABLE_REVIEW_COMMENT_AUTHORS,
     canPatchReviewComment,
     writeCommentPayload,
@@ -517,15 +518,8 @@ export function createReviewCommentLeases(
       if (!REVIEW_PLACEHOLDER_BODY_PATTERN.test(body)) continue;
       if (body.includes(reviewCommentMarker(options.number))) continue;
       // An unexpired lease may belong to a racing worker on a newer revision;
-      // only provably superseded placeholders (expired lease or marker-less
-      // legacy body) are swept after the durable review comment is published.
-      const marker = body.match(/<!--\s*clawsweeper-review-status:started\b([^>]*)-->/i);
-      if (marker) {
-        const expiresAtMs = Date.parse(
-          marker[1]?.match(/\blease_expires_at=([^\s>]+)/i)?.[1] ?? "",
-        );
-        if (Number.isFinite(expiresAtMs) && expiresAtMs >= nowMs) continue;
-      }
+      // only provably superseded placeholders are swept after publication.
+      if (reviewStartStatusLeaseIsFresh(options.number, comment, nowMs)) continue;
       ids.push(id);
     }
     return ids;

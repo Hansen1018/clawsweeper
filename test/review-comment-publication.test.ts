@@ -250,6 +250,35 @@ test("newest exact durable comment wins and older trusted duplicates are swept",
   assert.deepEqual(deleted, [10]);
 });
 
+test("duplicate cleanup preserves an active marker-backed legacy review lease", () => {
+  const nowMs = Date.parse("2026-08-08T00:05:00Z");
+  const legacyLease = (id: number, expiresAt: string): Record<string, unknown> => ({
+    id,
+    created_at: "2026-08-08T00:00:00Z",
+    updated_at: "2026-08-08T00:00:00Z",
+    user: { login: "clawsweeper[bot]" },
+    body: [
+      "ClawSweeper status: review started.",
+      "",
+      `<!-- clawsweeper-review-status:started item=${itemNumber} sha=${headSha} started_at=2026-08-08T00:00:00Z lease_expires_at=${expiresAt} owner=legacy-worker v=1 -->`,
+      reviewMarker,
+    ].join("\n"),
+  });
+  const active = legacyLease(40, "2026-08-08T00:10:00Z");
+  const expired = legacyLease(50, "2026-08-08T00:04:59Z");
+  const state = reviewCommentState(() => [active, expired]);
+
+  assert.deepEqual(
+    state.supersededReviewCommentIds({
+      number: itemNumber,
+      comments: [active, expired],
+      keepCommentIds: new Set(),
+      nowMs,
+    }),
+    [50],
+  );
+});
+
 test("mutation fallback verifies trusted identity before duplicate cleanup", () => {
   const root = mkdtempSync(join(tmpdir(), "clawsweeper-publication-recovery-"));
   try {

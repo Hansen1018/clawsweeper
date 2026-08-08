@@ -317,13 +317,22 @@ export function createReportCommentHelpers(
       const key = normalizePublicReviewText(
         identity ? `${identity.distinctKey} ${cleanDetail}` : cleanDetail,
       );
-      if (
-        !cleanDetail ||
-        /^none[.!]?$/i.test(rawDetail) ||
-        isReportNoneList(cleanDetail) ||
-        seen.has(key) ||
-        (!identity && items.some((item) => !publicReviewTextDiffers(item.detail, cleanDetail)))
-      ) {
+      if (!cleanDetail || /^none[.!]?$/i.test(rawDetail) || isReportNoneList(cleanDetail)) {
+        return;
+      }
+      const duplicateIndex = seen.has(key)
+        ? items.findIndex(
+            (item) =>
+              !publicReviewTextDiffers(item.detail, cleanDetail) ||
+              normalizePublicReviewText(`${item.label} ${item.detail}`) === key,
+          )
+        : !identity
+          ? items.findIndex((item) => !publicReviewTextDiffers(item.detail, cleanDetail))
+          : -1;
+      if (duplicateIndex >= 0) {
+        seen.add(key);
+        const duplicate = items[duplicateIndex];
+        if (duplicate && state === "blocked") duplicate.state = "blocked";
         return;
       }
       seen.add(key);
@@ -344,6 +353,16 @@ export function createReportCommentHelpers(
         }
       }
     };
+
+    const rawItemNumber = frontMatterValue(markdown, "number") ?? "";
+    const itemNumber = Number(rawItemNumber);
+    if (!/^[1-9]\d*$/.test(rawItemNumber) || !Number.isSafeInteger(itemNumber) || itemNumber <= 0) {
+      add(
+        "blocked",
+        "Bind the exact reviewed item",
+        "ClawSweeper must record a positive pull request number before readiness can be published.",
+      );
+    }
 
     const headSha = pullHeadShaFromReport(markdown);
     if (!headSha || !/^[0-9a-f]{40}$/i.test(headSha)) {

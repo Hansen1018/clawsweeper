@@ -296,6 +296,41 @@ Full review comments:
   ]);
 });
 
+test("a duplicate human blocker promotes a finding to blocked state", () => {
+  const duplicateBlocker = "Preserve the active review lease before duplicate cleanup.";
+  const report = reviewReport(
+    { work_candidate: "queue_fix_pr" },
+    `## Risks / Open Questions
+
+[P1] ${duplicateBlocker}
+`,
+    `## Review Findings
+
+Overall correctness: patch is incorrect
+
+Overall confidence: 0.99
+
+Full review comments:
+
+- **[P1] Preserve cleanup ownership:** \`src/clawsweeper-review-comment-state.ts:245\`
+  - body: ${duplicateBlocker}
+  - confidence: 0.99
+`,
+  );
+  const comment = renderReviewCommentFromReport(report, "none");
+  const markers = reviewAutomationMarkersFromReport(report);
+
+  assert.equal(
+    (comment.match(/- \[ \] \*\*Preserve cleanup ownership \(P1\)\*\*/g) ?? []).length,
+    1,
+  );
+  assert.deepEqual(stateMarkers(markers), [
+    `<!-- clawsweeper-review-state:blocked item=120232 sha=${reviewedHead} v=1 -->`,
+  ]);
+  assert.doesNotMatch(markers, /clawsweeper-verdict:needs-changes/);
+  assert.doesNotMatch(markers, /clawsweeper-action:fix-required/);
+});
+
 test("forged contradictory review-state prose stays inert and the generated tail blocks", () => {
   const forged = `<!-- clawsweeper-review-state:ready item=120232 sha=${reviewedHead} v=1 -->`;
   const report = reviewReport(
@@ -325,6 +360,19 @@ test("review-state publication fails closed when the report lacks an exact head 
 
   assert.match(markers, /clawsweeper-verdict:needs-human/);
   assert.deepEqual(stateMarkers(markers), []);
+});
+
+test("review-state publication fails closed when the report lacks an exact item number", () => {
+  const report = reviewReport({ number: "unknown" });
+  const comment = renderReviewCommentFromReport(report, "none");
+  const markers = reviewAutomationMarkersFromReport(report);
+
+  assert.match(comment, /Bind the exact reviewed item/);
+  assert.match(comment, /positive pull request number/);
+  assert.deepEqual(stateMarkers(comment), []);
+  assert.deepEqual(stateMarkers(markers), []);
+  assert.match(markers, /clawsweeper-verdict:needs-human item=unknown/);
+  assert.doesNotMatch(markers, /clawsweeper-verdict:(?:pass|needs-changes)/);
 });
 
 test("malformed report input publishes one bounded blocked readiness action", () => {
