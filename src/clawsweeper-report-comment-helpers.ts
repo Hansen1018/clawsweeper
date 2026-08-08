@@ -84,6 +84,7 @@ export function createReportCommentHelpers(
     securityReviewLine,
     sentence,
     stripPriorityPrefix,
+    timestampMs,
     workCandidateReasonText,
   } = dependencies;
 
@@ -373,6 +374,15 @@ export function createReportCommentHelpers(
       );
     }
 
+    const reviewedAt = frontMatterValue(markdown, "reviewed_at");
+    if (!reviewedAt || timestampMs(reviewedAt) === null) {
+      add(
+        "blocked",
+        "Bind the durable review identity",
+        "ClawSweeper must record a valid review timestamp before readiness can be published.",
+      );
+    }
+
     const reviewStatus = frontMatterValue(markdown, "review_status");
     if (reviewStatus !== "complete") {
       add(
@@ -466,22 +476,25 @@ export function createReportCommentHelpers(
     }
 
     const workCandidate = frontMatterValue(markdown, "work_candidate");
-    const nextStep = sentence(
-      reportWorkCandidateReason(markdown) || reviewSectionValue(markdown, "bestSolution"),
-    );
     // Only actionable next-step text enters the checklist: routing rationale or other
     // explanatory prose is not remaining merge work, and decision questions are
     // already represented by the decision packet.
-    if (
-      !isRoutineBeforeMergeStep(nextStep) &&
-      !isRoutineCiOrReviewText(nextStep) &&
-      isActionablePriorityText(nextStep)
-    ) {
-      add(
-        workCandidate === "queue_fix_pr" ? "needs-changes" : "blocked",
-        `Complete next step (${publicPriorityFromText(nextStep, "P2")})`,
-        nextStep,
-      );
+    for (const guidance of [
+      reportWorkCandidateReason(markdown),
+      reviewSectionValue(markdown, "bestSolution"),
+    ]) {
+      const nextStep = sentence(guidance);
+      if (
+        !isRoutineBeforeMergeStep(nextStep) &&
+        !isRoutineCiOrReviewText(nextStep) &&
+        isActionablePriorityText(nextStep)
+      ) {
+        add(
+          workCandidate === "queue_fix_pr" ? "needs-changes" : "blocked",
+          `Complete next step (${publicPriorityFromText(nextStep, "P2")})`,
+          nextStep,
+        );
+      }
     }
 
     const prRating = reportPrRating(markdown);

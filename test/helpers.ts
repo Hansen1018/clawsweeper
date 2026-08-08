@@ -236,6 +236,9 @@ export function reportFrontMatter(overrides = {}) {
   if (values.type === "pull_request" && !Object.hasOwn(values, "review_activity_cursor")) {
     Object.assign(values, { review_activity_cursor: emptyReviewedPrActivityCursor });
   }
+  if (values.type === "pull_request" && !Object.hasOwn(values, "reviewed_at")) {
+    Object.assign(values, { reviewed_at: "2026-05-01T00:00:00Z" });
+  }
   return `---
 ${Object.entries(values)
   .map(([key, value]) => `${key}: ${value}`)

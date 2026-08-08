@@ -88,7 +88,10 @@ function reviewCommentPublication(options: {
     frontMatterValue: () => undefined,
     replaceFrontMatterValue: (markdown: string) => markdown,
     sectionValue: () => "",
-    timestampMs: () => null,
+    timestampMs: (value: string | undefined) => {
+      const parsed = Date.parse(value ?? "");
+      return Number.isFinite(parsed) ? parsed : null;
+    },
     sentence: (value: string) => value,
     normalizedLabelSet: () => new Set<string>(),
     sectionLineValue: () => undefined,
@@ -183,6 +186,73 @@ test("oversized durable review publication replaces same-head ready state and ab
     assert.ok(publishedBody.trimEnd().endsWith(reviewMarker));
   } finally {
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("malformed oversized fallback reuses only same-head identity and outranks older ready state", () => {
+  const invalidVersionMarkers = [
+    "",
+    `<!-- clawsweeper-review-version item=${itemNumber} reviewed_at=2026-08-07T14:00:00Z sha=${"b".repeat(40)} v=1 -->`,
+  ];
+  for (const invalidVersionMarker of invalidVersionMarkers) {
+    const root = mkdtempSync(join(tmpdir(), "clawsweeper-publication-ordering-"));
+    try {
+      const older = durableReviewComment({
+        id: 10,
+        reviewedAt: "2026-08-07T15:00:00Z",
+        updatedAt: "2026-08-07T15:01:00Z",
+      });
+      const current = durableReviewComment({
+        id: 20,
+        reviewedAt: "2026-08-07T16:00:00Z",
+        updatedAt: "2026-08-07T16:01:00Z",
+      });
+      let published = current;
+      let comments = [older, current];
+      const state = reviewCommentState(() => comments);
+      const publication = reviewCommentPublication({
+        root,
+        comments: () => comments,
+        state,
+        mutate: ({ args }) => {
+          const input = args[args.indexOf("--input") + 1];
+          assert.ok(input);
+          const body = JSON.parse(readFileSync(input, "utf8")).body;
+          published = {
+            ...current,
+            updated_at: "2026-08-08T00:01:00Z",
+            body,
+          };
+          comments = [older, published];
+          return JSON.stringify(published);
+        },
+      });
+      const oversized = [
+        "Codex review: ready for maintainer look.",
+        "",
+        "x".repeat(70_000),
+        "",
+        `<!-- clawsweeper-verdict:needs-human item=${itemNumber} sha=${headSha} confidence=high reviewed_at=unknown -->`,
+        invalidVersionMarker,
+        reviewMarker,
+      ]
+        .filter(Boolean)
+        .join("\n\n");
+
+      assert.throws(
+        () => publication.upsertReviewComment(itemNumber, oversized, current),
+        DurableReviewPublicationBlockedError,
+      );
+      const version = state.durableReviewVersion(published, itemNumber);
+      assert.ok(version);
+      assert.equal(version.headSha, headSha);
+      assert.equal(version.reviewedAt, "2026-08-07T16:00:00Z");
+      assert.match(String(published.body), /clawsweeper-review-state:blocked/);
+      assert.doesNotMatch(String(published.body), /clawsweeper-review-state:ready/);
+      assert.equal(state.selectIssueReviewComment(itemNumber, comments)?.id, 20);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   }
 });
 

@@ -1258,10 +1258,8 @@ test("an early front matter terminator injected by a legacy scalar fails closed"
   assert.ok(Buffer.byteLength(comment, "utf8") < 2048);
   assert.match(comment, /\*\*Blocked before merge\.\*\*/);
   assert.match(comment, /Regenerate malformed review report/);
-  assert.match(
-    comment,
-    /clawsweeper-review-state:blocked item=951 sha=1111111111111111111111111111111111111111 v=1/,
-  );
+  assert.doesNotMatch(comment, /clawsweeper-review-state:/);
+  assert.doesNotMatch(comment, /clawsweeper-review-version/);
   assert.doesNotMatch(comment, /clawsweeper-verdict:pass/);
   assert.doesNotMatch(comment, /\| \*\*Proof confidence\*\* \| [^|]*\*\*\(5\/6\)\*\* \|/);
 });

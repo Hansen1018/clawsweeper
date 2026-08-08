@@ -129,7 +129,7 @@ test("review-only comments omit actionable automation markers", () => {
   const report = implementedCloseReport({
     repository: "openclaw/openclaw",
     type: "pull_request",
-    pull_head_sha: "abc123def456",
+    pull_head_sha: "abc123def456abc123def456abc123def456abcd",
   });
   const routableComment = renderReviewCommentFromReport(report, "implemented_or_shipped");
   const comment = renderReviewCommentFromReport(report, "implemented_or_shipped", {

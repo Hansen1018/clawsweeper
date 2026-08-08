@@ -57,6 +57,7 @@ export function createReviewCommentPublication(
     commentUrl,
     commentBodyMatches,
     canPatchReviewComment,
+    durableReviewVersion,
   } = dependencies;
 
   function reviewArtifactDestination(
@@ -181,35 +182,48 @@ export function createReviewCommentPublication(
 
   function boundedReviewVersionMarker(
     number: number,
-    versionAttributes: string,
-    exactHead: string | undefined,
+    identity: {
+      reviewedAt: string;
+      headSha: string | null;
+      sourceRevision: string | null;
+      leaseOwner: string | null;
+      leaseCommentId: string | null;
+    } | null,
   ): string {
-    const reviewedAt = markerAttribute(versionAttributes, "reviewed_at");
-    if (!reviewedAt || timestampMs(reviewedAt) === null) return "";
-    const sourceRevision = markerAttribute(versionAttributes, "source_revision");
-    const leaseOwner = markerAttribute(versionAttributes, "lease_owner");
-    const leaseCommentId = markerAttribute(versionAttributes, "lease_comment_id");
+    if (
+      !identity ||
+      timestampMs(identity.reviewedAt) === null ||
+      (identity.headSha !== null && !/^[0-9a-f]{40}$/i.test(identity.headSha))
+    ) {
+      return "";
+    }
     const attrs = [
       `item=${number}`,
-      `reviewed_at=${reviewedAt}`,
-      `sha=${exactHead ?? "na"}`,
-      ...(sourceRevision && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(sourceRevision)
-        ? [`source_revision=${sourceRevision.toLowerCase()}`]
+      `reviewed_at=${identity.reviewedAt}`,
+      `sha=${identity.headSha?.toLowerCase() ?? "na"}`,
+      ...(identity.sourceRevision &&
+      /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(identity.sourceRevision)
+        ? [`source_revision=${identity.sourceRevision.toLowerCase()}`]
         : []),
-      ...(leaseOwner && /^[A-Za-z0-9._:-]{1,200}$/.test(leaseOwner)
-        ? [`lease_owner=${leaseOwner}`]
+      ...(identity.leaseOwner && /^[A-Za-z0-9._:-]{1,200}$/.test(identity.leaseOwner)
+        ? [`lease_owner=${identity.leaseOwner}`]
         : []),
-      ...(leaseCommentId &&
-      /^[1-9]\d*$/.test(leaseCommentId) &&
-      Number.isSafeInteger(Number(leaseCommentId))
-        ? [`lease_comment_id=${leaseCommentId}`]
+      ...(identity.leaseCommentId &&
+      /^[1-9]\d*$/.test(identity.leaseCommentId) &&
+      Number.isSafeInteger(Number(identity.leaseCommentId))
+        ? [`lease_comment_id=${identity.leaseCommentId}`]
         : []),
       "v=1",
     ].join(" ");
     return `<!-- clawsweeper-review-version ${attrs} -->`;
   }
 
-  function oversizedReviewCommentFallback(number: number, body: string, bodyBytes: number): string {
+  function oversizedReviewCommentFallback(
+    number: number,
+    body: string,
+    bodyBytes: number,
+    existing: Record<string, unknown> | undefined,
+  ): string {
     const markers = trailingHtmlComments(body);
     const versionMarker = markerForItem(
       markers,
@@ -218,6 +232,13 @@ export function createReviewCommentPublication(
     );
     const versionAttributes =
       versionMarker?.match(/^<!--\s+clawsweeper-review-version\b([^>]*)-->$/)?.[1] ?? "";
+    const verdictMarker = markerForItem(
+      markers,
+      /^<!--\s+clawsweeper-verdict:[^\s>]+\b([^>]*)-->$/,
+      number,
+    );
+    const verdictAttributes =
+      verdictMarker?.match(/^<!--\s+clawsweeper-verdict:[^\s>]+\b([^>]*)-->$/)?.[1] ?? "";
     const stateMarker = markerForItem(
       markers,
       /^<!--\s+clawsweeper-review-state:[^\s>]+\b([^>]*)-->$/,
@@ -227,17 +248,45 @@ export function createReviewCommentPublication(
       stateMarker?.match(/^<!--\s+clawsweeper-review-state:[^\s>]+\b([^>]*)-->$/)?.[1] ?? "";
     const exactHead =
       stateAttributes.match(/\bsha=([0-9a-f]{40})\b/i)?.[1]?.toLowerCase() ??
+      verdictAttributes.match(/\bsha=([0-9a-f]{40})\b/i)?.[1]?.toLowerCase() ??
       versionAttributes.match(/\bsha=([0-9a-f]{40})\b/i)?.[1]?.toLowerCase();
-    const reviewedAt = markerAttribute(versionAttributes, "reviewed_at");
+    const sourceReviewedAt = markerAttribute(versionAttributes, "reviewed_at");
+    const sourceHead = markerAttribute(versionAttributes, "sha");
+    const sourceIdentity =
+      sourceReviewedAt &&
+      timestampMs(sourceReviewedAt) !== null &&
+      markerAttribute(versionAttributes, "v") === "1" &&
+      (exactHead ? sourceHead?.toLowerCase() === exactHead : sourceHead === "na")
+        ? {
+            reviewedAt: sourceReviewedAt,
+            headSha: exactHead ?? null,
+            sourceRevision: markerAttribute(versionAttributes, "source_revision") ?? null,
+            leaseOwner: markerAttribute(versionAttributes, "lease_owner") ?? null,
+            leaseCommentId: markerAttribute(versionAttributes, "lease_comment_id") ?? null,
+          }
+        : null;
+    const existingVersion = sourceIdentity ? null : durableReviewVersion(existing, number);
+    // Reuse only the same-head identity of the authoritative comment being
+    // replaced. Never invent a review timestamp for malformed report metadata.
+    const reviewVersion =
+      sourceIdentity ??
+      (exactHead
+        ? existingVersion?.headSha?.toLowerCase() === exactHead
+          ? existingVersion
+          : null
+        : existingVersion?.headSha === null
+          ? existingVersion
+          : null);
     const blockedVerdict = [
       `item=${number}`,
       ...(exactHead ? [`sha=${exactHead}`] : []),
-      ...(reviewedAt && timestampMs(reviewedAt) !== null ? [`reviewed_at=${reviewedAt}`] : []),
+      ...(reviewVersion ? [`reviewed_at=${reviewVersion.reviewedAt}`] : []),
     ].join(" ");
-    const blockedState = exactHead
-      ? `<!-- clawsweeper-review-state:blocked item=${number} sha=${exactHead} v=1 -->`
-      : "";
-    const boundedVersion = boundedReviewVersionMarker(number, versionAttributes, exactHead);
+    const blockedState =
+      exactHead && reviewVersion
+        ? `<!-- clawsweeper-review-state:blocked item=${number} sha=${exactHead} v=1 -->`
+        : "";
+    const boundedVersion = boundedReviewVersionMarker(number, reviewVersion);
     const fallback = [
       "Codex review: publication failed closed.",
       "",
@@ -251,7 +300,9 @@ export function createReviewCommentPublication(
       "",
       "**Blocked by review publication failure - 1 item remains**",
       "",
-      "The previous same-head verdict is not authoritative. ClawSweeper replaced it with this bounded blocked state and stopped the apply path.",
+      reviewVersion
+        ? "The previous same-head verdict is not authoritative. ClawSweeper replaced it with this bounded blocked state and stopped the apply path."
+        : "ClawSweeper stopped the apply path because it could not publish an authoritative same-head blocked state.",
       "",
       "## Before merge",
       "",
@@ -301,7 +352,7 @@ export function createReviewCommentPublication(
     const bodyBytes = Buffer.byteLength(markedBody, "utf8");
     const oversized = bodyBytes > DURABLE_REVIEW_COMMENT_MAX_BYTES;
     const publicationBody = oversized
-      ? oversizedReviewCommentFallback(number, markedBody, bodyBytes)
+      ? oversizedReviewCommentFallback(number, markedBody, bodyBytes, existing)
       : markedBody;
     const id = commentId(existing);
     const patchTargetId = id !== null && canPatchReviewComment(existing) ? id : null;

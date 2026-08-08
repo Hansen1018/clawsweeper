@@ -119,6 +119,37 @@ test("rendered risks and actionable next steps force a non-ready machine state",
   }
 });
 
+test("routine work guidance cannot hide an actionable best solution", () => {
+  const report = reviewReport(
+    { work_candidate: "queue_fix_pr" },
+    `## Work Candidate
+
+Candidate: queue_fix_pr
+
+Confidence: high
+
+Priority: high
+
+Status: candidate
+
+Reason: Merge after required checks are green.
+`,
+  ).replace(
+    "Merge after required checks are green.",
+    "Fix the durable publication path before merge.",
+  );
+  const comment = renderReviewCommentFromReport(report, "none");
+  const markers = reviewAutomationMarkersFromReport(report);
+
+  assert.match(comment, /Fix the durable publication path before merge\./);
+  assert.deepEqual(stateMarkers(markers), [
+    `<!-- clawsweeper-review-state:needs-changes item=120232 sha=${reviewedHead} v=1 -->`,
+  ]);
+  assert.match(markers, /clawsweeper-verdict:needs-changes/);
+  assert.match(markers, /clawsweeper-action:fix-required/);
+  assert.doesNotMatch(markers, /clawsweeper-verdict:pass/);
+});
+
 test("blocked queue candidates never emit repair markers", () => {
   const riskSection = `## Risks / Open Questions
 
@@ -451,6 +482,25 @@ test("review-state publication fails closed when the report lacks an exact item 
   assert.deepEqual(stateMarkers(markers), []);
   assert.match(markers, /clawsweeper-verdict:needs-human item=unknown/);
   assert.doesNotMatch(markers, /clawsweeper-verdict:(?:pass|needs-changes)/);
+});
+
+test("review-state publication fails closed without a valid durable timestamp", () => {
+  const malformed = reviewReport({ reviewed_at: "unknown" });
+  const missing = reviewReport().replace(/^reviewed_at:.*\n/m, "");
+
+  for (const report of [malformed, missing]) {
+    const comment = renderReviewCommentFromReport(report, "none");
+    const markers = reviewAutomationMarkersFromReport(report);
+
+    assert.match(comment, /Bind the durable review identity/);
+    assert.match(comment, /valid review timestamp/);
+    assert.doesNotMatch(comment, /<!-- clawsweeper-review-version\b/);
+    assert.deepEqual(stateMarkers(comment), []);
+    assert.deepEqual(stateMarkers(markers), []);
+    assert.match(markers, /clawsweeper-verdict:needs-human/);
+    assert.doesNotMatch(markers, /clawsweeper-verdict:(?:pass|needs-changes|close)/);
+    assert.doesNotMatch(markers, /clawsweeper-action:(?:fix|required|close)/);
+  }
 });
 
 test("malformed report input publishes one bounded blocked readiness action", () => {

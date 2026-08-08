@@ -20,12 +20,22 @@ export function createReviewCommentAutomation(
     pullRequestReviewReadinessFromReport,
     securitySensitiveRepairAllowed,
     markerAttributeValue,
+    timestampMs,
   } = dependencies;
 
   function reviewVersionMarkerFromReport(markdown: string): string {
-    const number = frontMatterValue(markdown, "number") ?? "unknown";
-    const reviewedAt = frontMatterValue(markdown, "reviewed_at") ?? "unknown";
-    const headSha = pullHeadShaFromReport(markdown) ?? "na";
+    const itemKind = frontMatterValue(markdown, "type");
+    if (itemKind !== "issue" && itemKind !== "pull_request") return "";
+    const number = frontMatterValue(markdown, "number") ?? "";
+    const itemNumber = Number(number);
+    if (!/^[1-9]\d*$/.test(number) || !Number.isSafeInteger(itemNumber) || itemNumber <= 0) {
+      return "";
+    }
+    const reviewedAt = frontMatterValue(markdown, "reviewed_at");
+    if (!reviewedAt || timestampMs(reviewedAt) === null) return "";
+    const reportHeadSha = pullHeadShaFromReport(markdown);
+    if (itemKind === "pull_request" && !/^[0-9a-f]{40}$/i.test(reportHeadSha ?? "")) return "";
+    const headSha = reportHeadSha ?? "na";
     const sourceRevision = frontMatterValue(markdown, "item_source_revision") ?? "unknown";
     const leaseOwner = frontMatterValue(markdown, "review_lease_owner") ?? "unknown";
     const leaseCommentId = frontMatterValue(markdown, "review_lease_comment_id") ?? "unknown";
@@ -91,8 +101,9 @@ export function createReviewCommentAutomation(
       precomputedReadiness?.headSha === headSha.toLowerCase()
         ? precomputedReadiness
         : pullRequestReviewReadinessFromReport(markdown);
+    const hasDurableReviewIdentity = Boolean(reviewVersionMarkerFromReport(markdown));
     const reviewStateMarker =
-      hasExactItemNumber && /^[0-9a-f]{40}$/i.test(headSha)
+      hasDurableReviewIdentity && hasExactItemNumber && /^[0-9a-f]{40}$/i.test(headSha)
         ? `<!-- clawsweeper-review-state:${reviewReadiness.state} ` +
           `item=${markerAttributeValue(number)} sha=${markerAttributeValue(headSha)} v=1 -->`
         : "";
@@ -111,6 +122,7 @@ export function createReviewCommentAutomation(
       return withReviewState(...markers);
     };
 
+    if (!hasDurableReviewIdentity) return humanReviewMarkers();
     try {
       if (maintainerDecisionFromReport(markdown)?.required) return humanReviewMarkers();
     } catch {
