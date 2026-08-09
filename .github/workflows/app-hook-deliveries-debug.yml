@@ -1,0 +1,141 @@
+name: app-hook-deliveries-debug
+
+# Temporary diagnostic: list ClawSweeper GitHub App webhook deliveries in a
+# time window to investigate missed pull_request intake. Prints delivery
+# metadata only; never the private key, JWT, or payload bodies.
+
+on:
+  workflow_dispatch:
+    inputs:
+      since:
+        description: Window start (ISO8601 UTC)
+        required: true
+        default: "2026-08-09T03:45:00Z"
+      until:
+        description: Window end (ISO8601 UTC)
+        required: true
+        default: "2026-08-09T04:45:00Z"
+      repo_id:
+        description: Target repository id to highlight
+        required: true
+        default: "1103012935"
+
+permissions: {}
+
+jobs:
+  deliveries:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      CLAWSWEEPER_APP_CLIENT_ID: Iv23liOECG0slfuhz093
+    steps:
+      - name: Query app hook deliveries
+        env:
+          APP_KEY: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
+          APP_CLIENT_ID: ${{ env.CLAWSWEEPER_APP_CLIENT_ID }}
+          SINCE: ${{ inputs.since }}
+          UNTIL: ${{ inputs.until }}
+          REPO_ID: ${{ inputs.repo_id }}
+        run: |
+          node - <<'EOF'
+          const crypto = require('crypto');
+          const key = process.env.APP_KEY;
+          const iss = process.env.APP_CLIENT_ID;
+          const since = process.env.SINCE;
+          const until = process.env.UNTIL;
+          const repoId = Number(process.env.REPO_ID);
+
+          function appJwt() {
+            const now = Math.floor(Date.now() / 1000);
+            const b64 = (o) => Buffer.from(JSON.stringify(o)).toString('base64url');
+            const unsigned = b64({ alg: 'RS256', typ: 'JWT' }) + '.' + b64({ iat: now - 60, exp: now + 540, iss });
+            const sig = crypto.sign('RSA-SHA256', Buffer.from(unsigned), key).toString('base64url');
+            return unsigned + '.' + sig;
+          }
+
+          const token = appJwt();
+          async function gh(path) {
+            return fetch('https://api.github.com' + path, {
+              headers: {
+                authorization: 'Bearer ' + token,
+                accept: 'application/vnd.github+json',
+                'user-agent': 'clawsweeper-hook-debug',
+              },
+            });
+          }
+
+          (async () => {
+            const rc = await gh('/app/hook/config');
+            if (rc.ok) {
+              const c = await rc.json();
+              try {
+                const u = new URL(c.url);
+                console.log('hook config: host=' + u.host + ' path_len=' + u.pathname.length +
+                  ' content_type=' + c.content_type + ' secret_set=' + Boolean(c.secret));
+              } catch {
+                console.log('hook config: url unparsable');
+              }
+            } else {
+              console.log('hook config fetch failed: ' + rc.status);
+            }
+
+            let cursor = '';
+            const all = [];
+            for (let page = 0; page < 40; page++) {
+              const path = '/app/hook/deliveries?per_page=100' + (cursor ? '&cursor=' + encodeURIComponent(cursor) : '');
+              const r = await gh(path);
+              if (!r.ok) {
+                console.log('deliveries fetch failed: ' + r.status);
+                break;
+              }
+              const batch = await r.json();
+              if (!batch.length) break;
+              all.push(...batch);
+              const oldest = batch[batch.length - 1];
+              if (oldest.delivered_at < since) break;
+              const link = r.headers.get('link') || '';
+              const m = link.match(/<([^>]+)>;\s*rel="next"/);
+              if (!m) break;
+              cursor = new URL(m[1]).searchParams.get('cursor');
+              if (!cursor) break;
+            }
+
+            console.log('fetched=' + all.length +
+              ' oldest=' + (all.length ? all[all.length - 1].delivered_at : 'none') +
+              ' newest=' + (all.length ? all[0].delivered_at : 'none'));
+
+            const win = all.filter((d) => d.delivered_at >= since && d.delivered_at <= until);
+            console.log('in window ' + since + ' .. ' + until + ': ' + win.length);
+
+            const counts = {};
+            for (const d of win) {
+              const k = d.event + '/' + (d.action || '-') + ' repo:' + d.repository_id + ' status:' + d.status_code;
+              counts[k] = (counts[k] || 0) + 1;
+            }
+            for (const [k, v] of Object.entries(counts).sort()) console.log('count ' + v + '  ' + k);
+
+            const interesting = win.filter((d) => d.repository_id === repoId && d.event === 'pull_request');
+            console.log('pull_request deliveries for repo ' + repoId + ' in window: ' + interesting.length);
+            for (const d of interesting) {
+              console.log(['delivery', d.delivered_at, d.event, d.action, 'status:' + d.status,
+                'code:' + d.status_code, 'redelivery:' + d.redelivery, 'id:' + d.id, 'guid:' + d.guid].join(' '));
+            }
+
+            for (const d of interesting.slice(0, 10)) {
+              const r = await gh('/app/hook/deliveries/' + d.id);
+              if (!r.ok) {
+                console.log('detail ' + d.id + ' fetch failed: ' + r.status);
+                continue;
+              }
+              const det = await r.json();
+              const p = (det.request && det.request.payload) || {};
+              const pr = p.number || (p.pull_request && p.pull_request.number);
+              console.log('detail id:' + d.id + ' action:' + p.action + ' pr:' + pr +
+                ' sender:' + (p.sender && p.sender.login) + ' status:' + det.status +
+                ' code:' + det.status_code + ' duration:' + det.duration);
+            }
+          })().catch((e) => {
+            console.error('ERROR: ' + e.message);
+            process.exit(1);
+          });
+          EOF
