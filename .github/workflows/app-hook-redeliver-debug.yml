@@ -23,7 +23,7 @@ jobs:
         env:
           APP_KEY: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
           APP_CLIENT_ID: ${{ env.CLAWSWEEPER_APP_CLIENT_ID }}
-          DELIVERY_IDS: "3835940328102174720"
+          DELIVERY_IDS: "3835940533012791296"
         run: |
           node - <<'EOF'
           const crypto = require('crypto');
