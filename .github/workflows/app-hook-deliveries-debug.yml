@@ -5,6 +5,11 @@ name: app-hook-deliveries-debug
 # metadata only; never the private key, JWT, or payload bodies.
 
 on:
+  push:
+    branches:
+      - steipete/confident-perlman-971032
+    paths:
+      - .github/workflows/app-hook-deliveries-debug.yml
   workflow_dispatch:
     inputs:
       since:
@@ -33,9 +38,9 @@ jobs:
         env:
           APP_KEY: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
           APP_CLIENT_ID: ${{ env.CLAWSWEEPER_APP_CLIENT_ID }}
-          SINCE: ${{ inputs.since }}
-          UNTIL: ${{ inputs.until }}
-          REPO_ID: ${{ inputs.repo_id }}
+          SINCE: ${{ inputs.since || '2026-08-09T03:45:00Z' }}
+          UNTIL: ${{ inputs.until || '2026-08-09T04:45:00Z' }}
+          REPO_ID: ${{ inputs.repo_id || '1103012935' }}
         run: |
           node - <<'EOF'
           const crypto = require('crypto');
