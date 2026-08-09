@@ -38,8 +38,8 @@ jobs:
         env:
           APP_KEY: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
           APP_CLIENT_ID: ${{ env.CLAWSWEEPER_APP_CLIENT_ID }}
-          SINCE: ${{ inputs.since || '2026-08-09T03:45:00Z' }}
-          UNTIL: ${{ inputs.until || '2026-08-09T04:45:00Z' }}
+          SINCE: ${{ inputs.since || '2026-08-09T04:05:00Z' }}
+          UNTIL: ${{ inputs.until || '2026-08-09T04:25:00Z' }}
           REPO_ID: ${{ inputs.repo_id || '1103012935' }}
         run: |
           node - <<'EOF'
@@ -86,7 +86,7 @@ jobs:
 
             let cursor = '';
             const all = [];
-            for (let page = 0; page < 40; page++) {
+            for (let page = 0; page < 150; page++) {
               const path = '/app/hook/deliveries?per_page=100' + (cursor ? '&cursor=' + encodeURIComponent(cursor) : '');
               const r = await gh(path);
               if (!r.ok) {
@@ -126,7 +126,7 @@ jobs:
                 'code:' + d.status_code, 'redelivery:' + d.redelivery, 'id:' + d.id, 'guid:' + d.guid].join(' '));
             }
 
-            for (const d of interesting.slice(0, 10)) {
+            for (const d of interesting.slice(0, 15)) {
               const r = await gh('/app/hook/deliveries/' + d.id);
               if (!r.ok) {
                 console.log('detail ' + d.id + ' fetch failed: ' + r.status);
@@ -135,9 +135,11 @@ jobs:
               const det = await r.json();
               const p = (det.request && det.request.payload) || {};
               const pr = p.number || (p.pull_request && p.pull_request.number);
+              const body = (det.response && det.response.payload) || '';
               console.log('detail id:' + d.id + ' action:' + p.action + ' pr:' + pr +
                 ' sender:' + (p.sender && p.sender.login) + ' status:' + det.status +
-                ' code:' + det.status_code + ' duration:' + det.duration);
+                ' code:' + det.status_code + ' duration:' + det.duration +
+                ' resp_len:' + String(body).length + ' resp_head:' + JSON.stringify(String(body).slice(0, 100)));
             }
           })().catch((e) => {
             console.error('ERROR: ' + e.message);
