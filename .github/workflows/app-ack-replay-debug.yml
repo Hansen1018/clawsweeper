@@ -154,7 +154,7 @@ jobs:
               method: 'POST',
               body: JSON.stringify({
                 repository_names: [repo.split('/')[1]],
-                permissions: { issues: 'write', pull_requests: 'read' },
+                permissions: { issues: 'write', pull_requests: 'write' },
               }),
             });
             const mp = await mr.json();
