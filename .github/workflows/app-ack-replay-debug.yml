@@ -1,0 +1,182 @@
+name: app-ack-replay-debug
+
+# Temporary diagnostic: replay the worker's exact fast-ack sequence (worker
+# WebCrypto JWT replica -> token mint -> comment list -> ack comment post) to
+# find which step the deployed worker throws on. Prints only statuses and ids;
+# never keys, JWTs, or tokens. The one side effect is posting the ack comment
+# that ClawSweeper should have posted on the target PR.
+
+on:
+  push:
+    branches:
+      - steipete/confident-perlman-971032
+    paths:
+      - .github/workflows/app-ack-replay-debug.yml
+
+permissions: {}
+
+jobs:
+  replay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      CLAWSWEEPER_APP_CLIENT_ID: Iv23liOECG0slfuhz093
+    steps:
+      - name: Replay fast-ack sequence
+        env:
+          APP_KEY: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
+          APP_CLIENT_ID: ${{ env.CLAWSWEEPER_APP_CLIENT_ID }}
+          TARGET_REPO: openclaw/openclaw
+          ITEM_NUMBER: "120874"
+          SOURCE_ACTION: opened
+        run: |
+          node - <<'EOF'
+          const nodeCrypto = require('crypto');
+          const rawKey = process.env.APP_KEY;
+          const iss = process.env.APP_CLIENT_ID;
+          const repo = process.env.TARGET_REPO;
+          const itemNumber = Number(process.env.ITEM_NUMBER);
+          const sourceAction = process.env.SOURCE_ACTION;
+
+          // --- verbatim worker replica (dashboard/worker.ts) ---
+          function base64UrlEncode(value) {
+            const bytes = typeof value === 'string' ? new TextEncoder().encode(value) : value;
+            let binary = '';
+            for (const byte of bytes) binary += String.fromCharCode(byte);
+            return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+          }
+          function normalizePrivateKey(value) {
+            return String(value || '').trim().replace(/\\n/g, '\n') || '';
+          }
+          function pemBody(pem, label) {
+            const pattern = new RegExp(`-----BEGIN ${label}-----([\\s\\S]+?)-----END ${label}-----`, 'm');
+            const match = String(pem).match(pattern);
+            if (!match) return null;
+            const binary = atob(match[1].replace(/\s+/g, ''));
+            return Uint8Array.from(binary, (char) => char.charCodeAt(0));
+          }
+          function concatBytes(...parts) {
+            const total = parts.reduce((sum, part) => sum + part.length, 0);
+            const output = new Uint8Array(total);
+            let offset = 0;
+            for (const part of parts) { output.set(part, offset); offset += part.length; }
+            return output;
+          }
+          function derLength(length) {
+            if (length < 0x80) return new Uint8Array([length]);
+            const bytes = [];
+            let value = length;
+            while (value > 0) { bytes.unshift(value & 0xff); value >>= 8; }
+            return new Uint8Array([0x80 | bytes.length, ...bytes]);
+          }
+          function derElement(tag, value) {
+            return concatBytes(new Uint8Array([tag]), derLength(value.length), value);
+          }
+          function wrapPkcs1PrivateKey(pkcs1) {
+            const version = new Uint8Array([0x02, 0x01, 0x00]);
+            const algorithm = new Uint8Array([
+              0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01, 0x05, 0x00,
+            ]);
+            const octetString = derElement(0x04, pkcs1);
+            return derElement(0x30, concatBytes(version, algorithm, octetString));
+          }
+          function pemToPkcs8(pem) {
+            const pkcs8 = pemBody(pem, 'PRIVATE KEY');
+            if (pkcs8) return pkcs8;
+            const pkcs1 = pemBody(pem, 'RSA PRIVATE KEY');
+            if (!pkcs1) throw new Error('GitHub App private key must be PEM encoded');
+            return wrapPkcs1PrivateKey(pkcs1);
+          }
+          async function signGithubAppJwtWorker(issuer, privateKey) {
+            const now = Math.floor(Date.now() / 1000);
+            const header = base64UrlEncode(JSON.stringify({ alg: 'RS256', typ: 'JWT' }));
+            const payload = base64UrlEncode(JSON.stringify({ iat: now - 60, exp: now + 540, iss: issuer }));
+            const input = `${header}.${payload}`;
+            const key = await crypto.subtle.importKey(
+              'pkcs8',
+              pemToPkcs8(privateKey),
+              { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
+              false,
+              ['sign'],
+            );
+            const signature = await crypto.subtle.sign('RSASSA-PKCS1-v1_5', key, new TextEncoder().encode(input));
+            return `${input}.${base64UrlEncode(new Uint8Array(signature))}`;
+          }
+          // --- end replica ---
+
+          function signNodeJwt() {
+            const now = Math.floor(Date.now() / 1000);
+            const b64 = (o) => Buffer.from(JSON.stringify(o)).toString('base64url');
+            const unsigned = b64({ alg: 'RS256', typ: 'JWT' }) + '.' + b64({ iat: now - 60, exp: now + 540, iss });
+            const sig = nodeCrypto.sign('RSA-SHA256', Buffer.from(unsigned), rawKey).toString('base64url');
+            return unsigned + '.' + sig;
+          }
+
+          async function ghStatus(path, jwt, init = {}) {
+            const r = await fetch('https://api.github.com' + path, {
+              ...init,
+              headers: {
+                authorization: 'Bearer ' + jwt,
+                accept: 'application/vnd.github+json',
+                'content-type': 'application/json',
+                'user-agent': 'clawsweeper-hook-debug',
+                ...(init.headers || {}),
+              },
+            });
+            return r;
+          }
+
+          (async () => {
+            const pem = normalizePrivateKey(rawKey);
+            const label = pem.includes('BEGIN RSA PRIVATE KEY') ? 'pkcs1' : pem.includes('BEGIN PRIVATE KEY') ? 'pkcs8' : 'unknown';
+            console.log('key format: ' + label + ' newline_escapes=' + String(rawKey).includes('\\n'));
+
+            const jwtNode = signNodeJwt();
+            const a = await ghStatus('/app', jwtNode);
+            console.log('step1 node-jwt GET /app: ' + a.status);
+
+            let jwtWeb = null;
+            try {
+              jwtWeb = await signGithubAppJwtWorker(iss, rawKey);
+              const b = await ghStatus('/app', jwtWeb);
+              console.log('step2 worker-replica-jwt GET /app: ' + b.status);
+            } catch (e) {
+              console.log('step2 worker-replica-jwt FAILED: ' + e.name + ': ' + String(e.message).slice(0, 200));
+            }
+
+            const jwt = jwtWeb || jwtNode;
+            const ir = await ghStatus('/repos/' + repo + '/installation', jwt);
+            const inst = await ir.json();
+            console.log('step3 installation: ' + ir.status);
+            if (!ir.ok) return;
+
+            const mr = await ghStatus('/app/installations/' + inst.id + '/access_tokens', jwt, {
+              method: 'POST',
+              body: JSON.stringify({
+                repository_names: [repo.split('/')[1]],
+                permissions: { issues: 'write', pull_requests: 'read' },
+              }),
+            });
+            const mp = await mr.json();
+            console.log('step4 mint(worker shape): ' + mr.status + ' selection=' + (mp.repository_selection || mp.message));
+            if (!mr.ok) return;
+            const token = mp.token;
+
+            const since = encodeURIComponent(new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString());
+            const lr = await ghStatus('/repos/' + repo + '/issues/' + itemNumber + '/comments?per_page=100&page=1&since=' + since, token);
+            const comments = await lr.json();
+            console.log('step5 list comments: ' + lr.status + ' count=' + (Array.isArray(comments) ? comments.length : 'not-array'));
+
+            const ackMarker = '<!-- clawsweeper-pr-ack:' + sourceAction + ' item=' + itemNumber + ' -->';
+            const ackBody = [ackMarker, '🦞👀', 'ClawSweeper picked this up.', '', 'Pull request received. I will update this pull request when review starts.'].join('\n');
+            const pr = await ghStatus('/repos/' + repo + '/issues/' + itemNumber + '/comments', token, {
+              method: 'POST',
+              body: JSON.stringify({ body: ackBody }),
+            });
+            const pp = await pr.json();
+            console.log('step6 post ack comment: ' + pr.status + ' id_present=' + Boolean(pp.id) + (pr.ok ? '' : ' message=' + String(pp.message).slice(0, 200)));
+          })().catch((e) => {
+            console.error('ERROR: ' + e.message);
+            process.exit(1);
+          });
+          EOF
