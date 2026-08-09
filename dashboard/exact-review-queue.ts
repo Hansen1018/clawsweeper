@@ -455,6 +455,7 @@ const DEFAULT_EXACT_REVIEW_DISPATCH_DEBOUNCE_MAX_MS = 3 * 60_000;
 const DEFAULT_EXACT_REVIEW_PENDING_SOFT_LIMIT = 300;
 const DEFAULT_EXACT_REVIEW_TARGET_RATE_PER_HOUR = 200;
 const DEFAULT_EXACT_REVIEW_TARGET_BURST = 50;
+const EXACT_REVIEW_GITHUB_THROTTLE_ADMISSION_COOLDOWN_MS = 15 * 60 * 1000;
 const EXACT_REVIEW_SCHEDULED_FEED_KEY_PREFIX = "exact-review-scheduled-feed:v1";
 type ExactReviewScheduledLane = "hot_intake" | "normal_backfill";
 type ExactReviewScheduledBucket = ExactReviewScheduledLane | "global";
@@ -1288,15 +1289,12 @@ export class ExactReviewQueue {
             );
             return { shed: true as const, reason: "backpressure" as const };
           }
-          if (
-            exactReviewScheduledLane(decision) &&
-            !this.takeScheduledReviewTokenSync(decision, now)
-          ) {
+          if (!this.takeScheduledReviewTokenSync(decision, now)) {
             state.shedSinceReset = exactReviewShedSinceReset(state) + 1;
             this.writeStateSync(state);
             this.incrementQueueMetricsSync({ reviewShed: 1, reviewShedScheduledRate: 1 });
             console.warn(
-              `exact-review admission shed: reason=scheduled_rate item=${key} lane=${exactReviewScheduledLane(decision)}`,
+              `exact-review admission shed: reason=scheduled_rate item=${key} lane=${exactReviewScheduledLane(decision) || "background"}`,
             );
             return { shed: true as const, reason: "scheduled_rate" as const };
           }
@@ -1955,6 +1953,9 @@ export class ExactReviewQueue {
         item.updatedAt = now;
       }
       const { requeued } = completionResult;
+      if (!publicationItem && retryKind === "throttle") {
+        this.deferScheduledReviewAdmissionForThrottleSync(now, requestedRetryAt ?? 0);
+      }
       // A successful workflow can still request requeue_latest after source
       // drift. That work did not leave its lane, so it must not improve the
       // operator-facing net speed until a later revision actually completes.
@@ -8012,18 +8013,30 @@ export class ExactReviewQueue {
 
   private takeScheduledReviewTokenSync(decision: ExactReviewDecision, now: number) {
     const lane = exactReviewScheduledLane(decision);
-    if (!lane) return true;
+    const lowPriority = isLowPriorityExactReviewDecision(decision);
+    if (!lane && !lowPriority) return true;
     const global = this.scheduledReviewBucketSync("global", now);
-    const bucket = this.scheduledReviewBucketSync(lane, now);
-    const admitted = global.tokens >= 1 && bucket.tokens >= 1;
+    const bucket = lane ? this.scheduledReviewBucketSync(lane, now) : null;
+    const admitted =
+      Number(global.throttleUntil || 0) <= now &&
+      (lowPriority || (global.tokens >= 1 && Number(bucket?.tokens || 0) >= 1));
     this.storage.kv.put(exactReviewScheduledFeedKey("global"), {
-      tokens: admitted ? global.tokens - 1 : global.tokens,
+      tokens: admitted && lane ? global.tokens - 1 : global.tokens,
       updatedAt: now,
+      ...(global.throttleObservedAt
+        ? {
+            throttleObservedAt: global.throttleObservedAt,
+            throttleUntil: global.throttleUntil,
+            throttleSource: global.throttleSource,
+          }
+        : {}),
     });
-    this.storage.kv.put(exactReviewScheduledFeedKey(lane), {
-      tokens: admitted ? bucket.tokens - 1 : bucket.tokens,
-      updatedAt: now,
-    });
+    if (lane && bucket) {
+      this.storage.kv.put(exactReviewScheduledFeedKey(lane), {
+        tokens: admitted ? bucket.tokens - 1 : bucket.tokens,
+        updatedAt: now,
+      });
+    }
     return admitted;
   }
 
@@ -8032,6 +8045,29 @@ export class ExactReviewQueue {
     this.storage.kv.put(exactReviewScheduledFeedKey("global"), {
       tokens: Math.max(-global.burst, global.tokens - 1),
       updatedAt: now,
+      ...(global.throttleObservedAt
+        ? {
+            throttleObservedAt: global.throttleObservedAt,
+            throttleUntil: global.throttleUntil,
+            throttleSource: global.throttleSource,
+          }
+        : {}),
+    });
+  }
+
+  private deferScheduledReviewAdmissionForThrottleSync(now: number, requestedRetryAt: number) {
+    const global = this.scheduledReviewBucketSync("global", now);
+    const throttleUntil = Math.max(
+      now + EXACT_REVIEW_GITHUB_THROTTLE_ADMISSION_COOLDOWN_MS,
+      requestedRetryAt,
+      Number(global.throttleUntil || 0),
+    );
+    this.storage.kv.put(exactReviewScheduledFeedKey("global"), {
+      tokens: global.tokens,
+      updatedAt: now,
+      throttleObservedAt: now,
+      throttleUntil,
+      throttleSource: "review_completion",
     });
   }
 
@@ -8041,6 +8077,8 @@ export class ExactReviewQueue {
     const stored = objectValue(this.storage.kv.get(exactReviewScheduledFeedKey(lane)));
     const updatedAt = Number(stored.updatedAt);
     const storedTokens = Number(stored.tokens);
+    const throttleObservedAt = Number(stored.throttleObservedAt);
+    const throttleUntil = Number(stored.throttleUntil);
     if (!Number.isFinite(updatedAt) || !Number.isFinite(storedTokens)) {
       return { tokens: burst, updatedAt: now, ratePerHour, burst };
     }
@@ -8050,6 +8088,16 @@ export class ExactReviewQueue {
       updatedAt: now,
       ratePerHour,
       burst,
+      ...(Number.isFinite(throttleObservedAt) &&
+      throttleObservedAt > 0 &&
+      Number.isFinite(throttleUntil) &&
+      throttleUntil > now
+        ? {
+            throttleObservedAt,
+            throttleUntil,
+            throttleSource: String(stored.throttleSource || "unknown"),
+          }
+        : {}),
     };
   }
 
@@ -8061,6 +8109,13 @@ export class ExactReviewQueue {
       target_rate_per_hour: global.ratePerHour,
       burst: global.burst,
       token_balance: Math.floor(global.tokens),
+      ...(global.throttleObservedAt
+        ? {
+            throttle_source: global.throttleSource,
+            throttle_observed_at: new Date(global.throttleObservedAt).toISOString(),
+            throttle_recovery_at: new Date(global.throttleUntil || 0).toISOString(),
+          }
+        : {}),
       lanes: {
         hot_intake: {
           target_rate_per_hour: hot.ratePerHour,

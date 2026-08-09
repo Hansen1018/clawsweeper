@@ -307,9 +307,9 @@ Current defaults:
 - scheduled hot intake and normal backfill: select up to 50 due items per target
   cycle, then enqueue each item through the durable exact-review queue; every
   admitted item receives its own parallel workflow
-- total review admission target: 600 items/hour across the fleet; organic work
+- total review admission target: 300 items/hour across the fleet; organic work
   consumes the budget first and scheduled backfill fills the remainder, split
-  35% hot intake and 65% normal backfill, with a 120-item burst
+  35% hot intake and 65% normal backfill, with a 30-item burst
 - review admission and pressure are computed independently from publication;
   top-level queue health describes reviews while `lanes.publication` retains
   publication backlog, retry, DLQ, and health telemetry
@@ -354,7 +354,7 @@ serializes per target repository, selects globally before sharding, and offers
 never-reviewed candidates before the oldest due tracked candidates to the
 durable queue. Queue admission is fleet-wide,
 so overlapping core and fanout cycles fill only the residual of the configured
-600/hour model-spend target after organic review demand.
+300/hour model-spend target after organic review demand.
 
 The manual quiet-system ceiling is not a promise that every operator run dispatches
 that many shards. The `mode` step checks active repair workers, exact-item sweep
@@ -384,7 +384,9 @@ run-summary funnel for selected, attempted, enqueued, deduped, shed, and deferre
 items. The queue exposes the configured rate, burst, and currently available
 token balance under `scheduled_feed` in `GET /api/exact-review-queue`. It also
 exposes backpressure and scheduled-rate shed counts separately so an operator
-can distinguish a full review queue from intentional 600/hour pacing.
+can distinguish a full review queue from intentional 300/hour pacing. The
+30-item burst bounds a cold-start cohort to roughly 900 GitHub requests at the
+observed planning average of 30 requests per completed review.
 The producer probes that field before its first enqueue and fails closed while
 an older Worker is still deployed, preventing a workflow-first rollout from
 bypassing the rate limiter.
@@ -393,11 +395,14 @@ Each hourly normal-fanout step can offer
 `50 items/target * 12 targets = 600 items/hour`. The direct five-minute hot and
 normal schedules can each offer `50 * 12 = 600 items/hour`, so either lane has
 enough candidates to keep its token bucket fed despite dedupe or uneven fleet
-distribution. At a 4.1-minute mean service time, 600/hour needs about
-`600 * 4.1 / 60 = 41` concurrent review workers, below the 120 per-target and
-128 global claim limits. The target rate, burst, and pending limit are explicit
-spend and GitHub API dials; lower them together when sustained traffic warrants
-more headroom.
+distribution. The queue admits at most 300 scheduled reviews/hour, which needs
+about `300 * 4.1 / 60 = 21` concurrent review workers at a 4.1-minute mean
+service time and budgets roughly 9,000 GitHub requests/hour. That leaves about
+6,000 requests in the shared 15,000-request installation allowance for exact
+ingress, routing, apply proof, publication, and support lanes. The target rate
+and burst are GitHub spend dials. The pending soft limit is a separate queue
+backpressure bound and should change only when queue-memory or latency evidence
+requires it, not automatically with the request budget.
 
 On saturated queues, normal planning reads the complete bounded open-item scan
 before selecting candidates. For the current largest repository this is about
