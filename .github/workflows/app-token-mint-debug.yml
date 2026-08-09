@@ -1,0 +1,83 @@
+name: app-token-mint-debug
+
+# Temporary diagnostic: reproduce the worker's fast-ack installation token mint
+# to find why acknowledgePullRequestReceipt fails. Prints only HTTP statuses,
+# error messages, and granted permission metadata; never keys, JWTs, or tokens.
+
+on:
+  push:
+    branches:
+      - steipete/confident-perlman-971032
+    paths:
+      - .github/workflows/app-token-mint-debug.yml
+
+permissions: {}
+
+jobs:
+  mint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      CLAWSWEEPER_APP_CLIENT_ID: Iv23liOECG0slfuhz093
+    steps:
+      - name: Reproduce fast-ack token mint
+        env:
+          APP_KEY: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
+          APP_CLIENT_ID: ${{ env.CLAWSWEEPER_APP_CLIENT_ID }}
+        run: |
+          node - <<'EOF'
+          const crypto = require('crypto');
+          const key = process.env.APP_KEY;
+          const iss = process.env.APP_CLIENT_ID;
+
+          function appJwt() {
+            const now = Math.floor(Date.now() / 1000);
+            const b64 = (o) => Buffer.from(JSON.stringify(o)).toString('base64url');
+            const unsigned = b64({ alg: 'RS256', typ: 'JWT' }) + '.' + b64({ iat: now - 60, exp: now + 540, iss });
+            const sig = crypto.sign('RSA-SHA256', Buffer.from(unsigned), key).toString('base64url');
+            return unsigned + '.' + sig;
+          }
+
+          (async () => {
+            const jwt = appJwt();
+            const headers = {
+              authorization: 'Bearer ' + jwt,
+              accept: 'application/vnd.github+json',
+              'content-type': 'application/json',
+              'user-agent': 'clawsweeper-hook-debug',
+            };
+            const ir = await fetch('https://api.github.com/repos/openclaw/openclaw/installation', { headers });
+            const inst = await ir.json();
+            console.log('installation lookup: ' + ir.status + ' id_present=' + Boolean(inst.id));
+            if (!ir.ok) return;
+
+            async function mint(label, body) {
+              const r = await fetch('https://api.github.com/app/installations/' + inst.id + '/access_tokens', {
+                method: 'POST',
+                headers,
+                body: JSON.stringify(body),
+              });
+              const p = await r.json();
+              const summary = {
+                status: r.status,
+                message: p.message || null,
+                granted_permissions: p.permissions || null,
+                repository_selection: p.repository_selection || null,
+                repositories_count: Array.isArray(p.repositories) ? p.repositories.length : null,
+              };
+              console.log('mint[' + label + '] ' + JSON.stringify(summary));
+            }
+
+            await mint('worker-shape repository_names', {
+              repository_names: ['openclaw'],
+              permissions: { issues: 'write', pull_requests: 'read' },
+            });
+            await mint('documented repositories', {
+              repositories: ['openclaw'],
+              permissions: { issues: 'write', pull_requests: 'read' },
+            });
+          })().catch((e) => {
+            console.error('ERROR: ' + e.message);
+            process.exit(1);
+          });
+          EOF
