@@ -1,0 +1,58 @@
+name: app-hook-redeliver-debug
+
+# Temporary diagnostic: redeliver failed GitHub App webhook deliveries by id.
+# Prints only redelivery HTTP status; never the private key or JWT.
+
+on:
+  push:
+    branches:
+      - steipete/confident-perlman-971032
+    paths:
+      - .github/workflows/app-hook-redeliver-debug.yml
+
+permissions: {}
+
+jobs:
+  redeliver:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      CLAWSWEEPER_APP_CLIENT_ID: Iv23liOECG0slfuhz093
+    steps:
+      - name: Redeliver failed deliveries
+        env:
+          APP_KEY: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
+          APP_CLIENT_ID: ${{ env.CLAWSWEEPER_APP_CLIENT_ID }}
+          DELIVERY_IDS: "3835940328102174720"
+        run: |
+          node - <<'EOF'
+          const crypto = require('crypto');
+          const key = process.env.APP_KEY;
+          const iss = process.env.APP_CLIENT_ID;
+
+          function appJwt() {
+            const now = Math.floor(Date.now() / 1000);
+            const b64 = (o) => Buffer.from(JSON.stringify(o)).toString('base64url');
+            const unsigned = b64({ alg: 'RS256', typ: 'JWT' }) + '.' + b64({ iat: now - 60, exp: now + 540, iss });
+            const sig = crypto.sign('RSA-SHA256', Buffer.from(unsigned), key).toString('base64url');
+            return unsigned + '.' + sig;
+          }
+
+          (async () => {
+            const token = appJwt();
+            for (const id of process.env.DELIVERY_IDS.split(',').map((s) => s.trim()).filter(Boolean)) {
+              const r = await fetch('https://api.github.com/app/hook/deliveries/' + id + '/attempts', {
+                method: 'POST',
+                headers: {
+                  authorization: 'Bearer ' + token,
+                  accept: 'application/vnd.github+json',
+                  'user-agent': 'clawsweeper-hook-debug',
+                },
+              });
+              console.log('redeliver ' + id + ' -> ' + r.status);
+            }
+          })().catch((e) => {
+            console.error('ERROR: ' + e.message);
+            process.exit(1);
+          });
+          EOF
