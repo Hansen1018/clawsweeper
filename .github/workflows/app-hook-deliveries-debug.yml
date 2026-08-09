@@ -93,7 +93,7 @@ jobs:
                 console.log('deliveries fetch failed: ' + r.status);
                 break;
               }
-              const batch = await r.json();
+              const batch = JSON.parse((await r.text()).replace(/"id":\s*(\d+)/g, '"id":"$1"'));
               if (!batch.length) break;
               all.push(...batch);
               const oldest = batch[batch.length - 1];
@@ -120,13 +120,14 @@ jobs:
             for (const [k, v] of Object.entries(counts).sort()) console.log('count ' + v + '  ' + k);
 
             const interesting = win.filter((d) => d.repository_id === repoId && d.event === 'pull_request');
+            const failing = win.filter((d) => d.event === 'pull_request' && d.status_code === 500 && d.repository_id === repoId);
             console.log('pull_request deliveries for repo ' + repoId + ' in window: ' + interesting.length);
             for (const d of interesting) {
               console.log(['delivery', d.delivered_at, d.event, d.action, 'status:' + d.status,
                 'code:' + d.status_code, 'redelivery:' + d.redelivery, 'id:' + d.id, 'guid:' + d.guid].join(' '));
             }
 
-            for (const d of interesting.slice(0, 15)) {
+            for (const d of failing.slice(0, 8)) {
               const r = await gh('/app/hook/deliveries/' + d.id);
               if (!r.ok) {
                 console.log('detail ' + d.id + ' fetch failed: ' + r.status);
