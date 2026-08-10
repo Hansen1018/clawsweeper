@@ -91,7 +91,7 @@
     "test:unit": "node scripts/run-node-tests.mjs unit",
     "test:repair": "pnpm run build:repair && pnpm run test:repair:no-build",
     "test:repair:no-build": "node scripts/run-node-tests.mjs repair",
-    "test:workflow-sparse-checkout": "node --test test/repair/workflow-sparse-checkout.smoke.ts",
+    "test:workflow-sparse-checkout": "node scripts/run-node-tests.mjs workflow-sparse-checkout",
     "test:coverage": "pnpm run build:all && pnpm run test:coverage:no-build",
     "test:coverage:no-build": "node scripts/run-node-tests.mjs all -- --experimental-test-coverage --test-coverage-include='dist/**/*.js' --test-coverage-exclude='dist/repair/*.test.js' --test-coverage-lines=49 --test-coverage-branches=66 --test-coverage-functions=57",
     "test:coverage:changed": "pnpm run build:repair && pnpm run test:coverage:changed:no-build",

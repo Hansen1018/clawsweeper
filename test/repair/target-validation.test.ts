@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import test from "node:test";
+import test, { afterEach } from "node:test";
 import { pathToFileURL } from "node:url";
 
 import {
@@ -43,8 +43,10 @@ import {
   validationCommandForExecution,
 } from "../../dist/repair/validation-command-utils.js";
 import { mockCommandBinEnv } from "../helpers.ts";
+import { useAutoCleanupTempDirTracker } from "../temp-dir.ts";
 
 const FAKE_TOOLCHAIN_TIMEOUT_MS = 15_000;
+const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 
 test("OpenClaw repairs require changed-surface validation even when omitted", () => {
   const cwd = packageFixture({ "check:changed": "node check.js" });
@@ -1146,7 +1148,7 @@ test("filtered pnpm validation fails when no workspace matches", () => {
     },
   );
 
-  const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-pnpm-filter-"));
+  const binDir = tempDirs.make("clawsweeper-pnpm-filter-");
   const pnpmPath = path.join(binDir, "pnpm.js");
   const logPath = path.join(binDir, "pnpm.log");
   fs.writeFileSync(
@@ -1574,7 +1576,7 @@ test("workspace selector values do not alias boolean false", () => {
 });
 
 test("workspace discovery enforces pattern and traversal budgets", () => {
-  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-workspace-budget-"));
+  const cwd = tempDirs.make("clawsweeper-workspace-budget-");
   for (const relativePath of ["packages/app", "packages/web", "packages/deep/child"]) {
     fs.mkdirSync(path.join(cwd, relativePath), { recursive: true });
     fs.writeFileSync(path.join(cwd, relativePath, "package.json"), "{}\n");
@@ -1621,7 +1623,7 @@ test("workspace discovery enforces pattern and traversal budgets", () => {
 });
 
 test("workspace discovery enforces a synchronous deadline", () => {
-  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-workspace-deadline-"));
+  const cwd = tempDirs.make("clawsweeper-workspace-deadline-");
   for (let index = 0; index < 500; index += 1) {
     fs.mkdirSync(path.join(cwd, "packages", `package-${index}`), { recursive: true });
   }
@@ -2116,7 +2118,7 @@ test("pinned-base reproduction avoids fetching unrelated missing partial-clone h
   git(source, "commit", "-m", "current base");
   const pinnedBaseRef = git(source, "rev-parse", "HEAD");
 
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-validation-promisor-"));
+  const root = tempDirs.make("clawsweeper-validation-promisor-");
   const remote = path.join(root, "origin.git");
   const target = path.join(root, "target");
   git(root, "init", "--bare", remote);
@@ -2208,7 +2210,7 @@ test("pinned-base reproduction hydrates blobs required by the older pinned snaps
   git(source, "rm", "historical.txt");
   git(source, "commit", "-m", "current checkout");
 
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-validation-pinned-blob-"));
+  const root = tempDirs.make("clawsweeper-validation-pinned-blob-");
   const remote = path.join(root, "origin.git");
   const target = path.join(root, "target");
   git(root, "init", "--bare", remote);
@@ -2303,7 +2305,7 @@ test("pinned-base reproduction does not inherit target-controlled checkout hooks
   git(cwd, "commit", "-m", "base");
   const pinnedBaseRef = git(cwd, "rev-parse", "HEAD");
 
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-validation-hooks-"));
+  const root = tempDirs.make("clawsweeper-validation-hooks-");
   const hooks = path.join(root, "hooks");
   const marker = path.join(root, "post-checkout-ran");
   fs.mkdirSync(hooks);
@@ -2650,7 +2652,7 @@ test("dependency setup permits external funding metadata in npm lockfiles", () =
     );
     git(cwd, "add", ".");
     git(cwd, "commit", "-m", "initial");
-    const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-npm-funding-bin-"));
+    const binDir = tempDirs.make("clawsweeper-npm-funding-bin-");
     const npmPath = path.join(binDir, "npm.js");
     fs.writeFileSync(
       npmPath,
@@ -2984,7 +2986,7 @@ test("dependency setup rejects target-controlled network destinations", () => {
       expected: /(?:target dependency install|validation symlink escapes target checkout)/,
       prepare() {
         const cwd = gitPackageFixture({ check: 'node -e ""' });
-        const outside = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-local-dependency-"));
+        const outside = tempDirs.make("clawsweeper-local-dependency-");
         const vendorDir = path.join(cwd, "vendor");
         fs.mkdirSync(vendorDir);
         fs.symlinkSync(outside, path.join(vendorDir, "payload"));
@@ -3182,7 +3184,7 @@ test("dependency setup accepts npm lockfile v3 tracked workspace links", () => {
   );
   git(cwd, "add", ".");
   git(cwd, "commit", "-m", "initial");
-  const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-npm-workspace-link-"));
+  const binDir = tempDirs.make("clawsweeper-npm-workspace-link-");
   const npmPath = path.join(binDir, "npm.js");
   fs.writeFileSync(npmPath, 'require("node:fs").mkdirSync("node_modules", { recursive: true });\n');
 
@@ -3386,7 +3388,7 @@ test("dependency setup rejects untracked and symlink-external local workspaces",
         `${JSON.stringify({ name: "payload", version: "1.0.0" })}\n`,
       );
     } else {
-      const outside = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-local-workspace-"));
+      const outside = tempDirs.make("clawsweeper-local-workspace-");
       fs.writeFileSync(
         path.join(outside, "package.json"),
         `${JSON.stringify({ name: "payload", version: "1.0.0" })}\n`,
@@ -3429,7 +3431,7 @@ test(
     git(cwd, "add", ".");
     git(cwd, "commit", "-m", "initial");
     attachOrigin(cwd);
-    const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-bun-setup-containment-"));
+    const binDir = tempDirs.make("clawsweeper-bun-setup-containment-");
     writeNodeCommandShim(
       binDir,
       "bun",
@@ -3482,7 +3484,7 @@ test(
     git(cwd, "add", ".");
     git(cwd, "commit", "-m", "initial");
     attachOrigin(cwd);
-    const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-npm-setup-containment-"));
+    const binDir = tempDirs.make("clawsweeper-npm-setup-containment-");
     writeNodeCommandShim(
       binDir,
       "npm",
@@ -3535,8 +3537,8 @@ test("pnpm validation reuses the prepared target version and rejects stale setup
   git(cwd, "commit", "-m", "initial");
   attachOrigin(cwd);
 
-  const hostBin = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-host-pnpm-"));
-  const preparedBin = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-target-pnpm-bin-"));
+  const hostBin = tempDirs.make("clawsweeper-host-pnpm-");
+  const preparedBin = tempDirs.make("clawsweeper-target-pnpm-bin-");
   const corepackLog = path.join(hostBin, "corepack.log");
   const hostLog = path.join(hostBin, "host-pnpm.log");
   const targetLog = path.join(preparedBin, "target-pnpm.log");
@@ -3646,8 +3648,8 @@ test(
     fs.writeFileSync(changedSource, "export const changed = true;\n");
     git(cwd, "add", "src/index.ts");
 
-    const hostBin = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-knip-prefetch-"));
-    const targetBin = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-knip-pnpm-"));
+    const hostBin = tempDirs.make("clawsweeper-knip-prefetch-");
+    const targetBin = tempDirs.make("clawsweeper-knip-pnpm-");
     const logPath = path.join(hostBin, "invocations.jsonl");
     writeNodeCommandShim(
       targetBin,
@@ -3856,7 +3858,7 @@ test(
     git(cwd, "commit", "-m", "initial");
     attachOrigin(cwd);
 
-    const hostBin = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-pnpm-refresh-"));
+    const hostBin = tempDirs.make("clawsweeper-pnpm-refresh-");
     const logPath = path.join(hostBin, "pnpm.log");
     const maliciousMarker = path.join(hostBin, "malicious-ran");
     const maliciousSource = `#!/usr/bin/env node
@@ -3919,7 +3921,7 @@ if (args[0] === "enable") {
 
 test("pnpm setup disables target pnpmfile hooks", { skip: process.platform === "win32" }, () => {
   const cwd = gitPackageFixture({ verify: 'node -e ""' });
-  const hostBin = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-pnpmfile-"));
+  const hostBin = tempDirs.make("clawsweeper-pnpmfile-");
   const maliciousMarker = path.join(hostBin, "pnpmfile-ran");
   fs.writeFileSync(
     path.join(cwd, ".pnpmfile.cjs"),
@@ -3987,7 +3989,7 @@ test(
     git(cwd, "commit", "-m", "initial");
     attachOrigin(cwd);
 
-    const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-runtime-poison-"));
+    const binDir = tempDirs.make("clawsweeper-runtime-poison-");
     const secondCommandMarker = path.join(binDir, "second-command-ran");
     writeNodeCommandShim(
       binDir,
@@ -4037,7 +4039,7 @@ test(
     git(cwd, "commit", "-m", "initial");
     attachOrigin(cwd);
 
-    const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-vendor-poison-"));
+    const binDir = tempDirs.make("clawsweeper-vendor-poison-");
     writeNodeCommandShim(
       binDir,
       "pnpm",
@@ -4083,7 +4085,7 @@ test(
     git(cwd, "commit", "-m", "initial");
     attachOrigin(cwd);
 
-    const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-arbitrary-poison-"));
+    const binDir = tempDirs.make("clawsweeper-arbitrary-poison-");
     const secondCommandMarker = path.join(binDir, "second-command-ran");
     writeNodeCommandShim(
       binDir,
@@ -4127,7 +4129,7 @@ test(
     git(cwd, "commit", "-m", "initial");
     attachOrigin(cwd);
 
-    const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-arbitrary-reset-"));
+    const binDir = tempDirs.make("clawsweeper-arbitrary-reset-");
     writeNodeCommandShim(
       binDir,
       "pnpm",
@@ -4300,7 +4302,7 @@ test("OpenClaw fresh build outputs survive aliases and intervening checks before
       fs.writeFileSync(path.join(cache, "stamp.json"), "previous trusted cache\n");
     }
 
-    const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-fresh-runtime-build-"));
+    const binDir = tempDirs.make("clawsweeper-fresh-runtime-build-");
     writeNodeCommandShim(
       binDir,
       "pnpm",
@@ -4374,7 +4376,7 @@ test("intermediate validation cannot tamper with fresh runtime outputs before ar
   git(cwd, "commit", "-m", "initial");
   attachOrigin(cwd);
 
-  const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-runtime-build-tamper-"));
+  const binDir = tempDirs.make("clawsweeper-runtime-build-tamper-");
   writeNodeCommandShim(
     binDir,
     "pnpm",
@@ -4436,7 +4438,7 @@ test("changed-gate fallback preserves and protects pending fresh runtime output"
     attachOrigin(cwd);
     fs.writeFileSync(path.join(cwd, "test", "example.test.ts"), "export const value = 2;\n");
 
-    const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-runtime-fallback-"));
+    const binDir = tempDirs.make("clawsweeper-runtime-fallback-");
     writeNodeCommandShim(
       binDir,
       "pnpm",
@@ -4517,7 +4519,7 @@ test("OpenClaw changed-gate rebuilds are disposable and restore existing runtime
       fs.writeFileSync(path.join(directory, "runtime.js"), `${output}: trusted original\n`);
     }
 
-    const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-gate-build-output-"));
+    const binDir = tempDirs.make("clawsweeper-gate-build-output-");
     writeNodeCommandShim(
       binDir,
       "pnpm",
@@ -4572,7 +4574,7 @@ test("changed-gate output restoration still rejects unrelated ignored-input pois
   fs.mkdirSync(path.dirname(dependency), { recursive: true });
   fs.writeFileSync(dependency, "safe\n");
 
-  const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-gate-build-poison-"));
+  const binDir = tempDirs.make("clawsweeper-gate-build-poison-");
   writeNodeCommandShim(
     binDir,
     "pnpm",
@@ -4615,7 +4617,7 @@ test("changed-gate output preparation failures preserve the existing compiler ca
   const cache = path.join(cwd, ".artifacts", "tsgo-cache", "state.json");
   fs.mkdirSync(path.dirname(cache), { recursive: true });
   fs.writeFileSync(cache, "trusted compiler state\n");
-  const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-gate-output-cache-"));
+  const binDir = tempDirs.make("clawsweeper-gate-output-cache-");
   writeNodeCommandShim(binDir, "pnpm", "");
 
   assert.throws(
@@ -4652,10 +4654,10 @@ test(
     const dist = path.join(cwd, "dist");
     fs.mkdirSync(dist, { recursive: true });
     fs.writeFileSync(path.join(dist, "runtime.js"), "trusted original\n");
-    const outside = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-protected-output-"));
+    const outside = tempDirs.make("clawsweeper-protected-output-");
     fs.writeFileSync(path.join(outside, "runtime.js"), "outside must survive\n");
 
-    const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-gate-build-symlink-"));
+    const binDir = tempDirs.make("clawsweeper-gate-build-symlink-");
     writeNodeCommandShim(
       binDir,
       "pnpm",
@@ -4716,7 +4718,7 @@ test("OpenClaw changed-gate compiler cache is disposable and preserves existing 
       );
     }
 
-    const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-tsgo-cache-"));
+    const binDir = tempDirs.make("clawsweeper-tsgo-cache-");
     writeNodeCommandShim(
       binDir,
       "pnpm",
@@ -4773,7 +4775,7 @@ test("OpenClaw validation disables shard timing writes without weakening ignored
     const timings = path.join(artifacts, "vitest-shard-timings.json");
     if (existingTimingArtifact) fs.writeFileSync(timings, "trusted previous timings\n");
 
-    const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-vitest-timings-"));
+    const binDir = tempDirs.make("clawsweeper-vitest-timings-");
     writeNodeCommandShim(
       binDir,
       "pnpm",
@@ -4825,7 +4827,7 @@ test("changed-gate compiler cache isolation still rejects unrelated ignored-inpu
   const artifacts = path.join(cwd, ".artifacts");
   fs.mkdirSync(artifacts, { recursive: true });
   fs.writeFileSync(path.join(artifacts, "stable.txt"), "existing artifact\n");
-  const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-tsgo-poison-"));
+  const binDir = tempDirs.make("clawsweeper-tsgo-poison-");
   writeNodeCommandShim(
     binDir,
     "pnpm",
@@ -4870,7 +4872,7 @@ test("runtime root diagnostics identify same-size poisoning even when its timest
   const timestamp = new Date("2024-01-01T00:00:00.000Z");
   fs.utimesSync(runtime, timestamp, timestamp);
 
-  const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-same-size-poison-"));
+  const binDir = tempDirs.make("clawsweeper-same-size-poison-");
   writeNodeCommandShim(
     binDir,
     "pnpm",
@@ -4911,7 +4913,7 @@ test("runtime root diagnostics identify every independently mutated ignored root
     fs.writeFileSync(input, "safe\n");
   }
 
-  const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-multiple-root-poison-"));
+  const binDir = tempDirs.make("clawsweeper-multiple-root-poison-");
   writeNodeCommandShim(
     binDir,
     "pnpm",
@@ -4960,7 +4962,7 @@ test(
       );
     }
 
-    const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-shared-root-poison-"));
+    const binDir = tempDirs.make("clawsweeper-shared-root-poison-");
     writeNodeCommandShim(
       binDir,
       "pnpm",
@@ -5004,7 +5006,7 @@ test(
       );
     }
 
-    const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-cyclic-root-poison-"));
+    const binDir = tempDirs.make("clawsweeper-cyclic-root-poison-");
     writeNodeCommandShim(
       binDir,
       "pnpm",
@@ -5047,7 +5049,7 @@ test(
       fs.symlinkSync(path.relative(directory, input), path.join(directory, "shared.js"));
     }
 
-    const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-shared-alias-removal-"));
+    const binDir = tempDirs.make("clawsweeper-shared-alias-removal-");
     writeNodeCommandShim(binDir, "pnpm", 'require("node:fs").unlinkSync("alpha/shared.js");');
 
     assert.throws(
@@ -5100,7 +5102,7 @@ test(
       );
     }
 
-    const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-cyclic-alias-removal-"));
+    const binDir = tempDirs.make("clawsweeper-cyclic-alias-removal-");
     writeNodeCommandShim(binDir, "pnpm", 'require("node:fs").unlinkSync("alpha/shared");');
 
     assert.throws(
@@ -5276,7 +5278,7 @@ test("runtime root mutation diagnostics enforce their comparison deadline", () =
     fs.mkdirSync(directory, { recursive: true });
     fs.writeFileSync(path.join(directory, "state.js"), "safe\n");
   }
-  const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-root-comparison-deadline-"));
+  const binDir = tempDirs.make("clawsweeper-root-comparison-deadline-");
   writeNodeCommandShim(
     binDir,
     "pnpm",
@@ -5341,7 +5343,7 @@ test("runtime root diagnostics ignore safe cache-directory timestamp changes", (
   fs.mkdirSync(path.dirname(runtime), { recursive: true });
   fs.writeFileSync(runtime, "safe\n");
 
-  const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-cache-mtime-poison-"));
+  const binDir = tempDirs.make("clawsweeper-cache-mtime-poison-");
   writeNodeCommandShim(
     binDir,
     "pnpm",
@@ -5385,7 +5387,7 @@ test("changed-gate merge-base fallback also isolates its disposable compiler cac
   const artifacts = path.join(cwd, ".artifacts");
   fs.mkdirSync(artifacts, { recursive: true });
   fs.writeFileSync(path.join(artifacts, "stable.txt"), "existing artifact\n");
-  const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-tsgo-fallback-"));
+  const binDir = tempDirs.make("clawsweeper-tsgo-fallback-");
   const attemptPath = path.join(binDir, "attempt");
   writeNodeCommandShim(
     binDir,
@@ -5445,7 +5447,7 @@ test("OpenClaw archive smoke cannot pass by reusing a pre-existing stale build",
   fs.mkdirSync(path.join(cwd, "dist"), { recursive: true });
   fs.writeFileSync(path.join(cwd, "dist", "runtime.js"), "stale runtime\n");
 
-  const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-stale-runtime-build-"));
+  const binDir = tempDirs.make("clawsweeper-stale-runtime-build-");
   writeNodeCommandShim(
     binDir,
     "pnpm",
@@ -5495,7 +5497,7 @@ test("OpenClaw fresh builds still reject ignored dependency poisoning before arc
   git(cwd, "commit", "-m", "initial");
   attachOrigin(cwd);
 
-  const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-runtime-build-poison-"));
+  const binDir = tempDirs.make("clawsweeper-runtime-build-poison-");
   writeNodeCommandShim(
     binDir,
     "pnpm",
@@ -5547,12 +5549,12 @@ test(
     const trustedCache = path.join(cwd, ".artifacts", "build-all-cache");
     fs.mkdirSync(trustedCache, { recursive: true });
     fs.writeFileSync(path.join(trustedCache, "stamp.json"), "trusted\n");
-    const external = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-external-cache-victim-"));
+    const external = tempDirs.make("clawsweeper-external-cache-victim-");
     const victim = path.join(external, "build-all-cache", "victim");
     fs.mkdirSync(path.dirname(victim), { recursive: true });
     fs.writeFileSync(victim, "must survive\n");
 
-    const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-runtime-cache-escape-"));
+    const binDir = tempDirs.make("clawsweeper-runtime-cache-escape-");
     writeNodeCommandShim(
       binDir,
       "pnpm",
@@ -5668,7 +5670,7 @@ test(
     git(cwd, "commit", "-m", "initial");
     attachOrigin(cwd);
 
-    const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-build-roots-"));
+    const binDir = tempDirs.make("clawsweeper-build-roots-");
     writeNodeCommandShim(
       binDir,
       "pnpm",
@@ -5728,7 +5730,7 @@ test(
     git(cwd, "commit", "-m", "initial");
     attachOrigin(cwd);
 
-    const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-runtime-symlink-"));
+    const binDir = tempDirs.make("clawsweeper-runtime-symlink-");
     const secondCommandMarker = path.join(binDir, "second-command-ran");
     writeNodeCommandShim(
       binDir,
@@ -5853,7 +5855,7 @@ test(
     git(cwd, "commit", "-m", "initial");
     attachOrigin(cwd);
 
-    const hostBin = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-pnpm-symlink-"));
+    const hostBin = tempDirs.make("clawsweeper-pnpm-symlink-");
     const externalPnpm = path.join(hostBin, "external-pnpm");
     fs.writeFileSync(
       externalPnpm,
@@ -5908,7 +5910,7 @@ test(
     git(cwd, "commit", "-m", "initial");
     attachOrigin(cwd);
 
-    const hostBin = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-corepack-shim-"));
+    const hostBin = tempDirs.make("clawsweeper-corepack-shim-");
     const distRoot = path.join(hostBin, "corepack-package", "dist");
     const corepackLib = path.join(distRoot, "lib", "corepack.cjs");
     const corepackPackageJson = path.join(path.dirname(distRoot), "package.json");
@@ -6096,7 +6098,7 @@ test("dependency setup rejects tracked source mutation", () => {
   git(cwd, "commit", "-m", "initial");
   fs.writeFileSync(path.join(cwd, "source.txt"), "candidate\n");
 
-  const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-mutating-npm-"));
+  const binDir = tempDirs.make("clawsweeper-mutating-npm-");
   const npmPath = path.join(binDir, "npm.js");
   fs.writeFileSync(
     npmPath,
@@ -6230,7 +6232,7 @@ test("checkout bindings ignore unrelated sibling worktree refs", () => {
   const cwd = gitPackageFixture({ check: 'node -e ""' });
   git(cwd, "add", ".");
   git(cwd, "commit", "-m", "initial");
-  const sibling = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-binding-sibling-"));
+  const sibling = tempDirs.make("clawsweeper-binding-sibling-");
   fs.rmSync(sibling, { recursive: true, force: true });
   git(cwd, "branch", "sibling");
   git(cwd, "worktree", "add", sibling, "sibling");
@@ -6484,7 +6486,7 @@ test("replacement branch plumbing rejects branches attached to another worktree"
   git(cwd, "commit", "-m", "initial");
   const head = git(cwd, "rev-parse", "HEAD");
   const branch = "clawsweeper/occupied";
-  const linkedWorktree = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-linked-worktree-"));
+  const linkedWorktree = tempDirs.make("clawsweeper-linked-worktree-");
   fs.rmSync(linkedWorktree, { recursive: true, force: true });
   git(cwd, "branch", branch, head);
   git(cwd, "worktree", "add", linkedWorktree, branch);
@@ -6834,7 +6836,7 @@ test(
 );
 
 test("checkpoint plumbing rejects mismatched and dirty submodules", () => {
-  const submoduleRepo = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-submodule-source-"));
+  const submoduleRepo = tempDirs.make("clawsweeper-submodule-source-");
   git(submoduleRepo, "init", "-b", "main");
   git(submoduleRepo, "config", "user.email", "clawsweeper@example.invalid");
   git(submoduleRepo, "config", "user.name", "ClawSweeper Test");
@@ -6885,7 +6887,7 @@ test("checkpoint plumbing rejects mismatched and dirty submodules", () => {
 });
 
 test("checkpoint plumbing rejects residual repositories at removed gitlinks", () => {
-  const submoduleRepo = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-residual-source-"));
+  const submoduleRepo = tempDirs.make("clawsweeper-residual-source-");
   git(submoduleRepo, "init", "-b", "main");
   git(submoduleRepo, "config", "user.email", "clawsweeper@example.invalid");
   git(submoduleRepo, "config", "user.name", "ClawSweeper Test");
@@ -6914,7 +6916,7 @@ test("checkpoint plumbing rejects residual repositories at removed gitlinks", ()
 });
 
 test("checkpoint plumbing recursively rejects ignored nested submodule dirt", () => {
-  const nestedRepo = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-nested-source-"));
+  const nestedRepo = tempDirs.make("clawsweeper-nested-source-");
   git(nestedRepo, "init", "-b", "main");
   git(nestedRepo, "config", "user.email", "clawsweeper@example.invalid");
   git(nestedRepo, "config", "user.name", "ClawSweeper Test");
@@ -6922,7 +6924,7 @@ test("checkpoint plumbing recursively rejects ignored nested submodule dirt", ()
   git(nestedRepo, "add", ".");
   git(nestedRepo, "commit", "-m", "nested");
 
-  const middleRepo = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-middle-source-"));
+  const middleRepo = tempDirs.make("clawsweeper-middle-source-");
   git(middleRepo, "init", "-b", "main");
   git(middleRepo, "config", "user.email", "clawsweeper@example.invalid");
   git(middleRepo, "config", "user.name", "ClawSweeper Test");
@@ -6966,7 +6968,7 @@ test("checkpoint plumbing recursively rejects ignored nested submodule dirt", ()
 });
 
 test("checkpoint plumbing preserves clean uninitialized gitlinks", () => {
-  const submoduleRepo = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-submodule-source-"));
+  const submoduleRepo = tempDirs.make("clawsweeper-submodule-source-");
   git(submoduleRepo, "init", "-b", "main");
   git(submoduleRepo, "config", "user.email", "clawsweeper@example.invalid");
   git(submoduleRepo, "config", "user.name", "ClawSweeper Test");
@@ -7017,7 +7019,7 @@ test("checkpoint plumbing preserves clean uninitialized gitlinks", () => {
 
 test("checkpoint plumbing preserves unchanged filtered blob OIDs", () => {
   const cwd = gitPackageFixture({ check: 'node -e ""' });
-  const filterRoot = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-filter-"));
+  const filterRoot = tempDirs.make("clawsweeper-filter-");
   const cleanFilter = path.join(filterRoot, "clean.js");
   const smudgeFilter = path.join(filterRoot, "smudge.js");
   fs.writeFileSync(
@@ -7313,7 +7315,7 @@ test(
     createTargetCheckpointWithPlumbing({ cwd, messages: ["second"], identity });
     const previousHead = git(cwd, "rev-parse", "HEAD");
 
-    const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-git-verify-failure-"));
+    const binDir = tempDirs.make("clawsweeper-git-verify-failure-");
     const marker = path.join(binDir, "commit-created");
     const realGit = execFileSync("which", ["git"], { encoding: "utf8" }).trim();
     writeNodeCommandShim(
@@ -7459,7 +7461,7 @@ test(
     git(cwd, "add", "--force", ".");
     git(cwd, "commit", "-m", "initial");
 
-    const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-workspace-install-"));
+    const binDir = tempDirs.make("clawsweeper-workspace-install-");
     const corepackPath = path.join(binDir, "corepack.js");
     const pnpmPath = path.join(binDir, "pnpm.js");
     const runtimeInput = path.join(dependencyDir, "node_modules", "generated", "state.js");
@@ -7526,7 +7528,7 @@ test(
     git(cwd, "commit", "-m", "initial");
     attachOrigin(cwd);
 
-    const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-workspace-runtime-"));
+    const binDir = tempDirs.make("clawsweeper-workspace-runtime-");
     const corepackPath = path.join(binDir, "corepack.js");
     const pnpmPath = path.join(binDir, "pnpm.js");
     const workspaceLink = path.join(consumerDir, "node_modules", "openclaw");
@@ -7591,7 +7593,7 @@ test(
     git(cwd, "add", "--force", executableLink);
     git(cwd, "commit", "-m", "initial");
 
-    const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-mode-install-"));
+    const binDir = tempDirs.make("clawsweeper-mode-install-");
     const corepackPath = path.join(binDir, "corepack.js");
     const pnpmPath = path.join(binDir, "pnpm.js");
     fs.writeFileSync(corepackPath, "");
@@ -7711,7 +7713,7 @@ test(
   { skip: process.platform === "win32" },
   () => {
     const cwd = gitPackageFixture({ check: 'node -e ""' });
-    const externalDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-external-target-"));
+    const externalDir = tempDirs.make("clawsweeper-external-target-");
     const externalFile = path.join(externalDir, "outside.txt");
     fs.writeFileSync(externalFile, "outside\n");
     fs.symlinkSync(externalFile, path.join(cwd, "outside-link"));
@@ -7749,7 +7751,7 @@ test("failing fallback validation still verifies checkout identity", () => {
   attachOrigin(cwd);
   fs.writeFileSync(path.join(cwd, "test", "example.test.ts"), "export const value = 2;\n");
 
-  const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-fallback-mutation-"));
+  const binDir = tempDirs.make("clawsweeper-fallback-mutation-");
   const pnpmPath = path.join(binDir, "pnpm.js");
   fs.writeFileSync(
     pnpmPath,
@@ -7784,7 +7786,7 @@ test("pnpm lockfile fallback requires a final frozen reinstall", () => {
   git(cwd, "add", ".");
   git(cwd, "commit", "-m", "initial");
 
-  const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-pnpm-reinstall-"));
+  const binDir = tempDirs.make("clawsweeper-pnpm-reinstall-");
   const corepackPath = path.join(binDir, "corepack.js");
   const pnpmPath = path.join(binDir, "pnpm.js");
   const logPath = path.join(binDir, "pnpm.log");
@@ -7837,7 +7839,7 @@ test("pnpm lockfile fallback restores a pre-existing untracked lockfile exactly"
   git(cwd, "add", "package.json", ".gitignore");
   git(cwd, "commit", "-m", "initial");
 
-  const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-pnpm-restore-"));
+  const binDir = tempDirs.make("clawsweeper-pnpm-restore-");
   const corepackPath = path.join(binDir, "corepack.js");
   const pnpmPath = path.join(binDir, "pnpm.js");
   const countPath = path.join(binDir, "count");
@@ -7891,7 +7893,7 @@ test("target setup shares one deadline across probes and installs", () => {
   git(cwd, "add", ".");
   git(cwd, "commit", "-m", "initial");
 
-  const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-setup-deadline-"));
+  const binDir = tempDirs.make("clawsweeper-setup-deadline-");
   const corepackPath = path.join(binDir, "corepack.js");
   const pnpmPath = path.join(binDir, "pnpm.js");
   const corepackCountPath = path.join(binDir, "corepack-count");
@@ -7973,7 +7975,7 @@ test("resolveTargetRepoToolchain keeps the OpenClaw changed gate even without co
   // Regression guard for the earlier ordering bug: if core_target_overrides is
   // ever removed but a generic openclaw fallback is kept (changed_gate: null),
   // openclaw/openclaw must still receive the pnpm check:changed gate.
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-toolchain-config-"));
+  const tmpDir = tempDirs.make("clawsweeper-toolchain-config-");
   const configPath = path.join(tmpDir, "target-repositories.json");
   fs.writeFileSync(
     configPath,
@@ -8045,7 +8047,7 @@ test("resolveTargetRepoToolchain stays total when the config file is missing", (
 test("resolveTargetRepoToolchain stays total when the config file is malformed JSON", () => {
   // P1 invariant: a corrupt config file must degrade to default behavior, not
   // throw. Same fallback shape as the missing-file case above.
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-bad-config-"));
+  const tmpDir = tempDirs.make("clawsweeper-bad-config-");
   const configPath = path.join(tmpDir, "target-repositories.json");
   fs.writeFileSync(configPath, "{not valid json,,,");
   __resetTargetRepoToolchainCache();
@@ -8111,7 +8113,7 @@ test("changed validation shares one timeout with checkout identity proof", () =>
   git(cwd, "commit", "-m", "initial");
   attachOrigin(cwd);
 
-  const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-pnpm-budget-"));
+  const binDir = tempDirs.make("clawsweeper-pnpm-budget-");
   const pnpmPath = path.join(binDir, "pnpm.js");
   fs.writeFileSync(
     pnpmPath,
@@ -8151,7 +8153,7 @@ test("validation reserves deadline to prove checkout mutation after command time
   git(cwd, "commit", "-m", "initial");
   attachOrigin(cwd);
 
-  const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-pnpm-timeout-mutation-"));
+  const binDir = tempDirs.make("clawsweeper-pnpm-timeout-mutation-");
   const pnpmPath = path.join(binDir, "pnpm.js");
   fs.writeFileSync(
     pnpmPath,
@@ -8197,7 +8199,7 @@ test(
     git(cwd, "add", ".");
     git(cwd, "commit", "-m", "initial");
     attachOrigin(cwd);
-    const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-detached-pnpm-"));
+    const binDir = tempDirs.make("clawsweeper-detached-pnpm-");
     const pnpmPath = path.join(binDir, "pnpm.js");
     const grandchild = `setTimeout(() => require("node:fs").writeFileSync(${JSON.stringify(marker)}, "escaped"), 800)`;
     const intermediate = `const { spawn } = require("node:child_process"); const child = spawn(process.execPath, ["-e", ${JSON.stringify(
@@ -8314,7 +8316,7 @@ test("target validation strips credentials and target-controlled environment inj
 });
 
 test("target validation exposes verified rustup tools without host Rust state", () => {
-  const rustupHome = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-rustup-home-"));
+  const rustupHome = tempDirs.make("clawsweeper-rustup-home-");
   const toolchainBin = path.join(rustupHome, "toolchains", "stable", "bin");
   const observationPath = path.join(rustupHome, "observed.jsonl");
   fs.mkdirSync(toolchainBin, { recursive: true });
@@ -8333,7 +8335,7 @@ fs.appendFileSync(${JSON.stringify(observationPath)}, JSON.stringify({
 `,
     );
   }
-  const rustupBin = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-rustup-bin-"));
+  const rustupBin = tempDirs.make("clawsweeper-rustup-bin-");
   writeNodeCommandShim(
     rustupBin,
     "rustup",
@@ -8434,9 +8436,9 @@ test(
   "target validation retries rustup after a transient probe failure",
   { skip: process.platform === "win32" },
   () => {
-    const rustupHome = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-rustup-retry-home-"));
+    const rustupHome = tempDirs.make("clawsweeper-rustup-retry-home-");
     const toolchainBin = path.join(rustupHome, "toolchains", "stable", "bin");
-    const rustupBin = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-rustup-retry-bin-"));
+    const rustupBin = tempDirs.make("clawsweeper-rustup-retry-bin-");
     const countPath = path.join(rustupBin, "rustup-count");
     fs.mkdirSync(toolchainBin, { recursive: true });
     for (const directory of [rustupBin, toolchainBin]) {
@@ -8486,7 +8488,7 @@ else process.exit(1);
 );
 
 test("target validation confines user-level configuration writes to a disposable profile", () => {
-  const hostHome = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-host-home-"));
+  const hostHome = tempDirs.make("clawsweeper-host-home-");
   const hostConfig = path.join(hostHome, "xdg");
   const observationPath = path.join(hostHome, "observed.json");
   const cwd = gitPackageFixture({ "check:env": "node write-global.mjs" });
@@ -8561,7 +8563,7 @@ test("compactText keeps both head and tail for long validation output", () => {
 });
 
 function packageFixture(scripts) {
-  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-validation-"));
+  const cwd = tempDirs.make("clawsweeper-validation-");
   fs.writeFileSync(
     path.join(cwd, "package.json"),
     `${JSON.stringify({ scripts, packageManager: "pnpm@10.33.0" }, null, 2)}\n`,
@@ -8585,7 +8587,7 @@ function packageFixture(scripts) {
 }
 
 function bunPackageFixture(scripts) {
-  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-validation-bun-"));
+  const cwd = tempDirs.make("clawsweeper-validation-bun-");
   fs.writeFileSync(
     path.join(cwd, "package.json"),
     `${JSON.stringify({ scripts, packageManager: "bun@1.1.0" }, null, 2)}\n`,
@@ -8604,7 +8606,7 @@ function gitBunPackageFixture(scripts) {
 }
 
 function fakeBunFixture(cwd, { failRun = false } = {}) {
-  const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-fake-bun-bin-"));
+  const binDir = tempDirs.make("clawsweeper-fake-bun-bin-");
   const logPath = path.join(binDir, "fake-bun.log");
   writeNodeCommandShim(
     binDir,
@@ -8621,7 +8623,7 @@ if (${JSON.stringify(failRun)} && process.argv[2] === "run") { console.error("sr
 }
 
 function envLoggingBunFixture() {
-  const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-fake-bun-env-bin-"));
+  const binDir = tempDirs.make("clawsweeper-fake-bun-env-bin-");
   const logPath = path.join(binDir, "fake-bun.log");
   const envLogPath = path.join(binDir, "fake-bun-env.log");
   writeNodeCommandShim(
@@ -8770,7 +8772,7 @@ function gitPackageFixture(scripts) {
 }
 
 function attachOrigin(cwd) {
-  const origin = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-validation-origin-"));
+  const origin = tempDirs.make("clawsweeper-validation-origin-");
   git(origin, "init", "--bare");
   git(cwd, "remote", "add", "origin", origin);
   git(cwd, "push", "-u", "origin", "main:main");
