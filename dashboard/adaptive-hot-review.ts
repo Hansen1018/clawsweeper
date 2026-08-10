@@ -393,8 +393,7 @@ export class AdaptiveHotReviewStore {
            FROM ${ADAPTIVE_HOT_DECISION_TABLE}
           WHERE effective_mode = ? AND status = 'dispatched'
             AND json_extract(decision_json, '$.policyVersion') = ?
-            AND json_extract(decision_json, '$.proposed.status')
-                IN ('allocated', 'observation_fallback')
+            AND json_extract(decision_json, '$.proposed.status') = 'allocated'
             AND (
               effective_mode = 'shadow'
               OR EXISTS (

@@ -11922,6 +11922,18 @@ test("adaptive hot-review observations and decisions are durable, bounded, and r
     store.recordDecision(
       adaptiveDecisionRecord({
         status: "dispatched",
+        observedAt: now - 250,
+        decisionId: "404:1:hot-intake",
+        proposedStatus: "observation_fallback",
+      }),
+      now,
+    ).accepted,
+    true,
+  );
+  assert.equal(
+    store.recordDecision(
+      adaptiveDecisionRecord({
+        status: "dispatched",
         observedAt: now - 500,
         decisionId: "401:1:hot-intake",
         proposedStatus: "queue_unavailable",
@@ -12001,7 +12013,7 @@ test("adaptive hot-review observations and decisions are durable, bounded, and r
     failed: 0,
     reviewRuntimeMs: 12_000,
   });
-  assert.equal(snapshot.recentDecisions.length, 5);
+  assert.equal(snapshot.recentDecisions.length, 6);
   assert.equal(snapshot.readiness.policyVersion, "adaptive-hot-v1");
   assert.equal(snapshot.readiness.shadow.dispatchedCycles, 1);
   assert.equal(snapshot.readiness.full10.dispatchedCycles, 2);
@@ -12048,7 +12060,7 @@ function adaptiveDecisionRecord(options: {
   mode?: "shadow" | "full";
   rolloutPercent?: 10 | 50 | 100;
   policyVersion?: string;
-  proposedStatus?: "allocated" | "queue_unavailable";
+  proposedStatus?: "allocated" | "observation_fallback" | "queue_unavailable";
   adaptiveActual?: boolean;
 }) {
   const decisionId = options.decisionId ?? "400:1:hot-intake";
