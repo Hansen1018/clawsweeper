@@ -460,10 +460,9 @@ export async function runTargetFanout(argv: string[]): Promise<void> {
       baseUrl: options.cursorStoreUrl,
       webhookSecret: process.env.CLAWSWEEPER_WEBHOOK_SECRET ?? "",
       reservationId: decisionToReserve.decisionId,
-      legacy:
-        activeAdaptiveCycle && persistLegacyCursor
-          ? { nextCursor: selection.cursor, expectedRevision: cursor.revision }
-          : null,
+      legacy: persistLegacyCursor
+        ? { nextCursor: selection.cursor, expectedRevision: cursor.revision }
+        : null,
       adaptive: {
         nextCursor: decisionToReserve.adaptiveCursor.next,
         expectedRevision: adaptiveCursor.revision,
@@ -529,7 +528,7 @@ export async function runTargetFanout(argv: string[]): Promise<void> {
     }
   }
 
-  if (!options.dryRun && persistLegacyCursor && !activeAdaptiveCycle) {
+  if (!options.dryRun && persistLegacyCursor && !activeAdaptiveCycle && !cursorPersisted) {
     cursorPersisted = await persistFanoutCursorFailOpen(
       {
         baseUrl: options.cursorStoreUrl,
