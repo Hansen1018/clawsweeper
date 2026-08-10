@@ -8,7 +8,6 @@ import test from "node:test";
 
 import {
   SCHEDULED_REVIEW_PLAN_BATCH_SIZE,
-  abortAdaptiveHotCursors,
   adaptiveHotLegacyCursor,
   allocateReviewCandidateCapacity,
   commitAdaptiveHotCursors,
@@ -27,6 +26,7 @@ import {
   reviewPlanningRepositories,
   repositoriesWithOpenItems,
   selectRepositories,
+  settleAdaptiveHotCursorsAfterDispatchFailure,
   summarizeFleetReviewCoverage,
   type InventoryConfig,
   type ListedRepository,
@@ -759,11 +759,61 @@ test("adaptive fanout aborts its cursor reservation after a dispatch failure", a
   };
 
   await reserveAdaptiveHotCursors(options);
-  await abortAdaptiveHotCursors(options);
+  assert.equal(await settleAdaptiveHotCursorsAfterDispatchFailure(options, 0), "aborted");
 
   assert.deepEqual(requests, [
     "https://queue.example/internal/state/cursors/adaptive-hot-reservation",
     "https://queue.example/internal/state/cursors/adaptive-hot-reservation/abort",
+  ]);
+});
+
+test("adaptive fanout uses at-most-once cursor settlement after partial dispatch", async () => {
+  const requests: string[] = [];
+  let reservedCursors: Array<{
+    mode: string;
+    next_cursor: number;
+    expected_revision: number;
+  }> = [];
+  const options = {
+    baseUrl: "https://queue.example",
+    webhookSecret: "reservation-secret",
+    reservationId: "502:1:hot-intake",
+    legacy: { nextCursor: 11, expectedRevision: 3 },
+    adaptive: { nextCursor: 9, expectedRevision: 4 },
+    probe: { nextCursor: 3, expectedRevision: 5 },
+    attempts: 1,
+    fetchImpl: async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      requests.push(url);
+      const parsed = JSON.parse(String(init?.body || "{}")) as {
+        reservation_id: string;
+        cursors?: Array<{ mode: string; next_cursor: number; expected_revision: number }>;
+      };
+      if (parsed.cursors) reservedCursors = parsed.cursors;
+      return Response.json(
+        {
+          ok: true,
+          reservation_id: parsed.reservation_id,
+          reservation_expires_at: "2026-08-10T13:00:00.000Z",
+          cursors: reservedCursors.map((cursor) => ({
+            ok: true,
+            mode: cursor.mode,
+            next_cursor: cursor.next_cursor,
+            revision: cursor.expected_revision + (url.endsWith("/commit") ? 1 : 0),
+            updated_at: "2026-08-10T12:00:00.000Z",
+          })),
+        },
+        { status: 202 },
+      );
+    },
+  };
+
+  await reserveAdaptiveHotCursors(options);
+  assert.equal(await settleAdaptiveHotCursorsAfterDispatchFailure(options, 1), "committed");
+
+  assert.deepEqual(requests, [
+    "https://queue.example/internal/state/cursors/adaptive-hot-reservation",
+    "https://queue.example/internal/state/cursors/adaptive-hot-reservation/commit",
   ]);
 });
 

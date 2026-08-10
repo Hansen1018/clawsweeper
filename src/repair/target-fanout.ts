@@ -500,10 +500,14 @@ export async function runTargetFanout(argv: string[]): Promise<void> {
   } catch (error) {
     if (adaptiveCursorReservation && adaptiveCursorReservationReserved) {
       try {
-        await abortAdaptiveHotCursors(adaptiveCursorReservation);
-      } catch (abortError) {
+        await settleAdaptiveHotCursorsAfterDispatchFailure(
+          adaptiveCursorReservation,
+          dispatched.length,
+        );
+      } catch (settlementError) {
+        const settlement = dispatched.length > 0 ? "commit" : "abort";
         throw new Error(
-          `GitHub dispatch failed (${errorMessage(error)}); adaptive hot-review cursor reservation abort also failed: ${errorMessage(abortError)}`,
+          `GitHub dispatch failed (${errorMessage(error)}); adaptive hot-review cursor reservation ${settlement} also failed: ${errorMessage(settlementError)}`,
         );
       }
     }
@@ -666,6 +670,26 @@ export async function abortAdaptiveHotCursors(
       `adaptive hot-review cursor reservation did not abort after dispatch failure: ${errorMessage(error)}`,
     );
   }
+}
+
+export async function settleAdaptiveHotCursorsAfterDispatchFailure(
+  options: AdaptiveHotCursorReservationOptions,
+  dispatchedCount: number,
+): Promise<"aborted" | "committed"> {
+  if (!Number.isSafeInteger(dispatchedCount) || dispatchedCount < 0) {
+    throw new Error("adaptive hot-review dispatched count must be a non-negative safe integer");
+  }
+  if (dispatchedCount === 0) {
+    await abortAdaptiveHotCursors(options);
+    return "aborted";
+  }
+  // GitHub repository_dispatch has neither rollback nor an idempotency key. Once
+  // any dispatch succeeds, advancing the complete reserved cycle is the only
+  // bounded at-most-once outcome: aborting would replay external side effects.
+  // Undispatched demand remains observable and can be offered again by the next
+  // demand/fairness decision; it is not removed from the candidate inventory.
+  await commitAdaptiveHotCursors(options);
+  return "committed";
 }
 
 function adaptiveHotCursorReservationUpdates(options: AdaptiveHotCursorReservationOptions) {

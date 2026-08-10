@@ -128,20 +128,24 @@ Modes are deliberately asymmetric:
   adaptive cursor, and the probe cursor are covered by one atomic one-hour
   Durable Object reservation before any GitHub dispatch, but their positions do
   not advance yet. After every dispatch succeeds, one commit transaction
-  advances all covered cursors. A reservation conflict dispatches nothing; a
-  dispatch failure aborts the matching reservation without advancing cursors,
-  while an unavailable abort retains the bounded lease rather than clearing an
-  uncertain owner. A commit failure after successful dispatch never marks
-  undispatched repositories processed and retains the lease for an idempotent
+  advances all covered cursors. A reservation conflict dispatches nothing. If
+  the first GitHub dispatch fails, the matching reservation aborts without
+  advancing cursors; an unavailable abort retains the bounded lease rather than
+  clearing an uncertain owner. If a later dispatch fails after an earlier one
+  succeeded, the whole reserved cursor batch commits. GitHub repository dispatch
+  has no rollback or idempotency key, so this deliberately chooses at-most-once
+  Actions dispatch over replaying already-started work. The failed and remaining
+  repositories are not removed from inventory: their due demand remains visible
+  to the next demand, novelty, probe, and 24-hour fairness rounds. A commit
+  failure after any successful dispatch retains the lease for an idempotent
   retry or bounded expiry.
   An expired lease cannot commit. A bounded ledger retains up to 80 live
   24-hour commit receipts: one for each of the 72 cycles possible at the
   contained 20-minute cadence plus eight manual/retry slots. A live receipt
   also makes its reservation identifier one-shot. These rules make a successful
   commit idempotent if its response is lost without allowing the same identity
-  to dispatch a different batch. Queue dedupe contains any already-dispatched
-  prefix if an expired lease is retried. The planned decision also persists
-  before this reservation.
+  to dispatch a different batch. The planned decision also persists before
+  this reservation.
 - `full`: uses deterministic 10%, 50%, or 100% cohorts. Non-cohort legacy slots
   remain legacy at 10% and 50%; 100% uses only the adaptive cursor and proposal.
 
