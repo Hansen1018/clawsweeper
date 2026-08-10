@@ -4,6 +4,7 @@ This fixture-only proof exercises the complete adaptive hot-review package
 without contacting a production Worker, queue, GitHub repository, or workflow.
 It combines deterministic allocator/control tests and offline replay with a
 local Wrangler Worker backed by a disposable SQLite Durable Object directory.
+The runtime pins Wrangler `4.107.0`, matching the repository dashboard scripts.
 
 The runtime scenario proves that:
 

@@ -14,6 +14,7 @@ const secret = "synthetic-adaptive-hot-proof-secret";
 const workerPort = Number(process.env.PROOF_PORT || 8797);
 const workerOrigin = `http://127.0.0.1:${workerPort}`;
 const persistence = await mkdtemp(path.join(os.tmpdir(), "adaptive-hot-review-proof-"));
+const wranglerVersion = "4.107.0";
 
 assert.ok(expectedHead, "PROOF_SOURCE_SHA is required");
 assert.equal(actualHead, expectedHead, "proof must run from the recorded exact head");
@@ -158,6 +159,7 @@ try {
     source_sha: actualHead,
     runtime: {
       worker: "local Wrangler",
+      wrangler_version: wranglerVersion,
       durable_object: "persisted SQLite ExactReviewQueue",
       restarts: 2,
       invalid_signature_status: unsigned.status,
@@ -397,10 +399,10 @@ async function assertCursors(updates, expectedCursor, expectedRevision) {
 async function startWorker(name) {
   const log = createWriteStream(path.join(outputDir, `${name}-wrangler.log`), { flags: "w" });
   const child = spawn(
-    "pnpm",
+    "npx",
     [
-      "exec",
-      "wrangler",
+      "--yes",
+      `wrangler@${wranglerVersion}`,
       "dev",
       "--config",
       "dashboard/wrangler.toml",
@@ -435,7 +437,7 @@ async function startWorker(name) {
   child.stderr.pipe(log);
   child.logStream = log;
   try {
-    await waitForHttp(new URL("/api/health", workerOrigin));
+    await waitForHttp(new URL("/api/health", workerOrigin), child);
     return child;
   } catch (error) {
     await stopWorker(child);
@@ -465,8 +467,11 @@ async function stopWorker(child) {
   await waitForPortRelease();
 }
 
-async function waitForHttp(url) {
+async function waitForHttp(url, child) {
   for (let attempt = 0; attempt < 160; attempt += 1) {
+    if (child.exitCode !== null || child.signalCode !== null) {
+      throw new Error(`Wrangler exited before ${url} became healthy`);
+    }
     try {
       const response = await fetch(url, { signal: AbortSignal.timeout(1_000) });
       if (response.ok) return;
