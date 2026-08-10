@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { createHmac, generateKeyPairSync } from "node:crypto";
+import { createHash, createHmac, generateKeyPairSync } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 
@@ -9,6 +9,7 @@ import {
   EXACT_REVIEW_DIRECT_PUBLICATION_RETENTION_MS,
   EXACT_REVIEW_DIRECT_PUBLICATION_MAX_POST_BYTES,
   ExactReviewDirectPublicationStore,
+  validateCanonicalRecordTupleMutation,
   validateDirectPublicationPlan,
   type DirectPublicationPlan,
 } from "../dashboard/exact-review-direct-publication.ts";
@@ -440,6 +441,131 @@ test("direct publication validates tuple and per-file size caps", async () => {
   });
   await assert.rejects(validateDirectPublicationPlan(invalidPath), /outside openclaw-openclaw#8/);
   assert.equal(EXACT_REVIEW_DIRECT_PUBLICATION_MAX_POST_BYTES, 4 * 1024 * 1024);
+});
+
+test("direct publication accepts repository-only path casing differences", async () => {
+  const mixedCase = directPlan("steipete/CodexBar#2516", 1, {
+    path: "records/steipete-CodexBar/items/2516.md",
+  });
+  const accepted = await validateDirectPublicationPlan(mixedCase);
+  assert.equal(accepted.operations[0]?.path, "records/steipete-codexbar/items/2516.md");
+  assert.equal(accepted.operations[0]?.repoSlug, "steipete-codexbar");
+  assert.equal(
+    accepted.operations[0]?.digest,
+    createHash("sha256").update(Buffer.from("result-1")).digest("hex"),
+  );
+
+  const storage = new TestStorage();
+  const store = new ExactReviewDirectPublicationStore(storage);
+  store.ensureSchemaSync();
+  assert.equal(store.accept(accepted, 1_000).outcome, "accepted");
+  const normalizedRetry = await validateDirectPublicationPlan(
+    directPlan("steipete/CodexBar#2516", 1, {
+      path: "records/steipete-codexbar/items/2516.md",
+    }),
+  );
+  assert.equal(store.accept(normalizedRetry, 1_001).outcome, "deduped");
+  assert.equal(store.list().length, 1);
+  assert.equal(store.readCanonical("steipete-codexbar", "items", 2516)?.content, "result-1");
+  assert.equal(store.readCanonical("steipete-CodexBar", "items", 2516), null);
+  assert.equal(
+    storage.scalar(
+      `SELECT COUNT(*) AS value FROM exact_review_canonical_records
+        WHERE repo_slug = 'steipete-CodexBar'`,
+    ),
+    0,
+  );
+  assert.equal(
+    storage.scalar(
+      `SELECT COUNT(*) AS value FROM exact_review_record_export_index
+        WHERE repo_slug = 'steipete-CodexBar'`,
+    ),
+    0,
+  );
+  assert.deepEqual(store.get(accepted.fenceKey, accepted.revision)?.operations, [
+    {
+      path: "records/steipete-codexbar/items/2516.md",
+      bytes: Buffer.byteLength("result-1"),
+      digest: createHash("sha256").update(Buffer.from("result-1")).digest("hex"),
+      deleted: false,
+    },
+  ]);
+
+  const differentRepository = structuredClone(mixedCase);
+  differentRepository.operations[0]!.path = "records/steipete-other/items/2516.md";
+  await assert.rejects(
+    validateDirectPublicationPlan(differentRepository),
+    /direct publication path is outside steipete-CodexBar#2516/,
+  );
+
+  const invalidMode = structuredClone(mixedCase);
+  invalidMode.operations[0]!.mode = "100755" as "100644";
+  await assert.rejects(
+    validateDirectPublicationPlan(invalidMode),
+    /invalid mutation mode for records\/steipete-CodexBar\/items\/2516\.md/,
+  );
+
+  const invalidBytes = structuredClone(mixedCase);
+  invalidBytes.operations[0]!.bytes += 1;
+  await assert.rejects(
+    validateDirectPublicationPlan(invalidBytes),
+    /mutation byte count does not match content/,
+  );
+});
+
+test("lowercase direct publication preserves operation bytes exactly", async () => {
+  const input = directPlan("openclaw/openclaw#806", 1);
+  const accepted = await validateDirectPublicationPlan(input);
+  assert.equal(accepted.operations[0]?.path, input.operations[0]?.path);
+  assert.equal(accepted.operations[0]?.mode, input.operations[0]?.mode);
+  assert.equal(accepted.operations[0]?.bytes, input.operations[0]?.bytes);
+  assert.equal(accepted.operations[0]?.contentBase64, input.operations[0]?.contentBase64);
+  assert.deepEqual(
+    Buffer.from(accepted.operations[0]!.contentBase64!, "base64"),
+    Buffer.from(input.operations[0]!.contentBase64!, "base64"),
+  );
+});
+
+test("canonical tuple packet references ignore only repository casing", async () => {
+  const packet = JSON.stringify({ decision: "keep-open" });
+  const packetDigest = createHash("sha256").update(packet).digest("hex");
+  const item = [
+    "---",
+    `decision_packet_sha256: ${packetDigest}`,
+    "decision_packet_path: records/steipete-CodexBar/decision-packets/2516.json",
+    "---",
+    "",
+    "review",
+  ].join("\n");
+  const mutation = {
+    deliveryId: "record-tuple:mixed-packet-path:2516",
+    key: "steipete-CodexBar/2516",
+    operations: [
+      {
+        path: "records/steipete-codexbar/items/2516.md",
+        expectedDigest: null,
+        contentBase64: Buffer.from(item).toString("base64"),
+      },
+      { path: "records/steipete-codexbar/closed/2516.md", expectedDigest: null },
+      { path: "records/steipete-codexbar/plans/2516.md", expectedDigest: null },
+      {
+        path: "records/steipete-codexbar/decision-packets/2516.json",
+        expectedDigest: null,
+        contentBase64: Buffer.from(packet).toString("base64"),
+      },
+    ],
+  };
+
+  await assert.doesNotReject(validateCanonicalRecordTupleMutation(mutation));
+
+  const wrongDigest = structuredClone(mutation);
+  wrongDigest.operations[0]!.contentBase64 = Buffer.from(
+    item.replace(packetDigest, "0".repeat(64)),
+  ).toString("base64");
+  await assert.rejects(
+    validateCanonicalRecordTupleMutation(wrongDigest),
+    /decision packet reference is inconsistent/,
+  );
 });
 
 test("publication batches atomically select ready items without duplicate active ownership", () => {
