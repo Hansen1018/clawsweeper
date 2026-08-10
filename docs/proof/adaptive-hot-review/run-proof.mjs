@@ -345,13 +345,13 @@ function decisionRecord({ observedAt, status }) {
 
 async function signedRequest(requestPath, method, payload, expectedStatus) {
   const response = await fetchSigned(requestPath, method, payload);
-  assert.equal(response.status, expectedStatus, await response.text());
-  return response;
+  const responseText = await response.text();
+  assert.equal(response.status, expectedStatus, responseText);
+  return responseText;
 }
 
 async function signedJson(requestPath, method, payload, expectedStatus) {
-  const response = await signedRequest(requestPath, method, payload, expectedStatus);
-  return response.json();
+  return JSON.parse(await signedRequest(requestPath, method, payload, expectedStatus));
 }
 
 async function fetchSigned(requestPath, method, payload) {
