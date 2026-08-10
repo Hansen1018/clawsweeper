@@ -438,7 +438,7 @@ enqueues a separate durable publication lease, and then releases its review
 lease without checking out or pushing the state repository. The queue retries
 publication independently, so a cancelled publisher does not rerun Codex. The
 source fallback uses adaptive minimum/base/maximum values of 4/24/48; production
-overrides them with 8/32/40 and enables direct
+overrides them with 50/50/50 and enables direct
 publication plus up to 8 concurrent size-8 batches. The Durable Object validates
 each artifact's workflow run, queue tuple,
 target, decision digest, file inventory, sizes, and SHA-256 hashes before a
@@ -726,9 +726,9 @@ yield when priority work is active. Exact-item runs use a durable Worker queue
 that coalesces item deliveries, leases at most 128 concurrent reviews, and admits
 up to 120 active exact reviews per target repository. Other lanes retain the
 checked-in 128-worker scheduling model. A separate 194-slot exact-review
-Actions budget supports the production maximum of 40 publisher slots, the
-enforced 16-slot control-plane reserve, and 10 additional slots of current
-configuration headroom even when all 128 review leases are active.
+Actions budget supports 50 publisher slots and the enforced 16-slot
+control-plane reserve even when all 128 review leases are active. That fully
+allocates the 194-slot budget, leaving no additional configuration headroom.
 Use `workers.max` first when turning total Codex usage up or down; use
 `lanes.repair.cluster_max_live_runs` to tune the imported legacy cluster-repair
 lane separately, and individual environment overrides only for temporary

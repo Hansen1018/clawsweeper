@@ -69,7 +69,7 @@ The mental model:
 | `workers.minimum_background`               |      16 | Target floor for background progress when enough global capacity is available.        |
 | `lanes.exact_review.max_concurrent`        |     128 | Maximum concurrent exact-item review workflow runs admitted to Codex.                 |
 | `lanes.exact_review.target_max_concurrent` |     120 | Maximum concurrent exact-item review workflow runs one target repository may consume. |
-| `lanes.exact_review.actions_budget`        |     194 | At 128 reviews and 40 publishers, preserves the 16-slot hard reserve plus 10 slots of headroom.       |
+| `lanes.exact_review.actions_budget`        |     194 | At 128 reviews and 50 publishers, preserves the 16-slot hard reserve.                 |
 | `lanes.assist.max`                         |      10 | Maximum concurrent lightweight assist jobs.                                           |
 | `lanes.repair.cluster_max_live_runs`       |       2 | Default live repair workflow cap for imported gitcrawl cluster dispatches.            |
 
@@ -188,11 +188,11 @@ those priority workers start, normal and hot-intake planners
 count them and reduce their next background wave.
 
 `EXACT_REVIEW_ACTIONS_BUDGET` is deliberately separate from the 128-slot Codex
-worker budget. Its production value is 194: 128 exact reviews, up to 40
-publisher slots, the enforced 16-slot control-plane reserve, and 10 slots of
-headroom under the current publication maximum. Full review admission therefore
-cannot reduce verdict publication to zero, while repair and broad review
-derivations remain anchored to `workers.max = 128`.
+worker budget. Its production value is 194: 128 exact reviews, 50 publisher
+slots, and the enforced 16-slot control-plane reserve. Full review admission
+therefore cannot reduce verdict publication to zero, but it leaves no additional
+configuration headroom. Repair and broad review derivations remain anchored to
+`workers.max = 128`.
 
 Fresh webhook work waits for `EXACT_REVIEW_DISPATCH_DEBOUNCE_MS` (90 seconds by
 default) so rapid edits and pushes coalesce before dispatch. Repeated pending
@@ -226,12 +226,11 @@ advance the queue revision, revoke a lease, or count as new work.
 
 Exact-review result publication has a separate adaptive Actions lane. Source
 fallback minimum, base, and maximum are 4, 24, and 48; production overrides
-them to 8, 32, and 40. The controller records GitHub
-pressure, cooldown, recovery, and demand telemetry, and can scale within that
-production range. Admission enforces a 16-slot control-plane reserve inside
-`EXACT_REVIEW_ACTIONS_BUDGET`; with 128 active exact reviews and the current
-production maximum of 40 publisher slots, another 10 slots remain as configuration
-headroom rather than protected reserve.
+them to 50, 50, and 50. The controller records GitHub pressure, cooldown,
+recovery, and demand telemetry, while the fixed production range holds capacity
+at 50. Admission enforces a 16-slot control-plane reserve inside
+`EXACT_REVIEW_ACTIONS_BUDGET`; with 128 active exact reviews and 50 publisher
+slots, the 194-slot budget leaves no additional configuration headroom.
 Its checkout, artifact handling, comment sync, and result routing are
 deterministic control-plane work: they consume GitHub runners, but not Codex
 slots. The comment router and the singleton lease reconciler follow the same

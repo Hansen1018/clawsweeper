@@ -203,9 +203,9 @@ test("production doubles exact review claims and canonical publication batches",
   assert.match(wrangler, /EXACT_REVIEW_PUBLICATION_BATCH_SIZE = "8"/);
   assert.match(wrangler, /EXACT_REVIEW_PUBLICATION_BATCH_MAX_CONCURRENT = "8"/);
   assert.match(wrangler, /EXACT_REVIEW_PUBLICATION_BATCH_DISPATCH_COOLDOWN_MS = "5000"/);
-  assert.match(wrangler, /EXACT_REVIEW_PUBLICATION_MIN_CONCURRENT = "8"/);
-  assert.match(wrangler, /EXACT_REVIEW_PUBLICATION_BASE_CONCURRENT = "32"/);
-  assert.match(wrangler, /EXACT_REVIEW_PUBLICATION_MAX_CONCURRENT = "40"/);
+  assert.match(wrangler, /EXACT_REVIEW_PUBLICATION_MIN_CONCURRENT = "50"/);
+  assert.match(wrangler, /EXACT_REVIEW_PUBLICATION_BASE_CONCURRENT = "50"/);
+  assert.match(wrangler, /EXACT_REVIEW_PUBLICATION_MAX_CONCURRENT = "50"/);
   assert.match(wrangler, /EXACT_REVIEW_TARGET_RATE_PER_HOUR = "300"/);
   assert.match(wrangler, /EXACT_REVIEW_TARGET_BURST = "30"/);
   assert.match(wrangler, /EXACT_REVIEW_PENDING_SOFT_LIMIT = "600"/);
@@ -1064,7 +1064,7 @@ test("lifecycle telemetry counts durable terminal coverage without treating ackn
   assert.equal(JSON.stringify(summary).includes("openclaw/openclaw"), false);
 });
 
-test("full review admission does not inflate staged publication capacity", () => {
+test("full exact-review admission preserves production verdict publication capacity", () => {
   const state = {
     items: Object.fromEntries(
       Array.from({ length: 128 }, (_, index) => {
@@ -1077,14 +1077,14 @@ test("full review admission does not inflate staged publication capacity", () =>
     exactReviewPublicationCapacityForState(
       {
         EXACT_REVIEW_ACTIONS_BUDGET: "194",
-        EXACT_REVIEW_PUBLICATION_MIN_CONCURRENT: "8",
-        EXACT_REVIEW_PUBLICATION_BASE_CONCURRENT: "32",
-        EXACT_REVIEW_PUBLICATION_MAX_CONCURRENT: "40",
+        EXACT_REVIEW_PUBLICATION_MIN_CONCURRENT: "50",
+        EXACT_REVIEW_PUBLICATION_BASE_CONCURRENT: "50",
+        EXACT_REVIEW_PUBLICATION_MAX_CONCURRENT: "50",
       },
       state,
       Date.now(),
     ),
-    32,
+    50,
   );
 });
 

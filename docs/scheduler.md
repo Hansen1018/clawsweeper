@@ -82,12 +82,12 @@ cohort from becoming eligible in lockstep; coordination and ordinary failure
 retries keep their existing timing.
 Review publication and apply/comment sync use separate non-dropping queues.
 The source fallback publication minimum, base, and maximum are 4, 24, and 48,
-but production overrides them to 8, 32, and 40. The adaptive controller
+but production overrides them to 50, 50, and 50. The controller still
 classifies GitHub pressure:
 a 403/429 or
 explicit rate-limit failure records a 15-minute cooldown, while GitHub 5xx
-failures record a 5-minute cooldown. Demand and recovery signals scale effective
-capacity within the production range. Production batch
+failures record a 5-minute cooldown. Demand and recovery signals remain visible,
+but the fixed production range holds effective capacity at 50. Production batch
 preparation is enabled for up to 8 concurrent size-8 batches, including 2
 fresh-lane members per batch. Direct publication is also enabled and falls back
 to the retry/batch path when the direct result is retryable. Apply/comment sync
