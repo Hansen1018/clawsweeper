@@ -8,6 +8,7 @@ import test from "node:test";
 
 import {
   SCHEDULED_REVIEW_PLAN_BATCH_SIZE,
+  adaptiveHotLegacyCursor,
   allocateReviewCandidateCapacity,
   commitActiveAdaptiveHotCursors,
   defaultLimit,
@@ -586,6 +587,25 @@ test("adaptive observation availability is scoped to the current policy", () => 
       "openclaw/clawsweeper",
     ),
     current,
+  );
+});
+
+test("active adaptive throttle preserves the legacy fairness cursor", () => {
+  assert.equal(
+    adaptiveHotLegacyCursor({
+      inputCursor: 7,
+      selectedCursor: 12,
+      dispatchSuppressed: true,
+    }),
+    7,
+  );
+  assert.equal(
+    adaptiveHotLegacyCursor({
+      inputCursor: 7,
+      selectedCursor: 12,
+      dispatchSuppressed: false,
+    }),
+    12,
   );
 });
 

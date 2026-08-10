@@ -344,17 +344,23 @@ export async function runTargetFanout(argv: string[]): Promise<void> {
       targetRepo: repository.targetRepo,
       candidateCapacity: repository.candidateCapacity,
     }));
-    const actual =
+    const activeDispatchSuppressed =
       options.adaptive.effectiveMode !== "shadow" &&
       (proposed.status === "scheduled_throttle" ||
         proposed.status === "queue_unavailable" ||
-        proposed.status === "no_capacity")
-        ? []
-        : selectAdaptiveHotActualAllocations({
-            runtime: options.adaptive,
-            legacy,
-            proposed: proposedAllocations,
-          });
+        proposed.status === "no_capacity");
+    const actual = activeDispatchSuppressed
+      ? []
+      : selectAdaptiveHotActualAllocations({
+          runtime: options.adaptive,
+          legacy,
+          proposed: proposedAllocations,
+        });
+    const nextLegacyCursor = adaptiveHotLegacyCursor({
+      inputCursor: cursor.nextCursor,
+      selectedCursor: legacySelection.cursor,
+      dispatchSuppressed: activeDispatchSuppressed,
+    });
     const repositoryByName = new Map(
       planningRepositories.map((repository) => [repository.targetRepo.toLowerCase(), repository]),
     );
@@ -368,7 +374,7 @@ export async function runTargetFanout(argv: string[]): Promise<void> {
       cursor:
         options.adaptive.effectiveMode === "full" && options.adaptive.rolloutPercent === 100
           ? proposed.nextCursor
-          : legacySelection.cursor,
+          : nextLegacyCursor,
       total: planningRepositories.length,
     };
     persistLegacyCursor = !(
@@ -397,7 +403,7 @@ export async function runTargetFanout(argv: string[]): Promise<void> {
       rolloutPercent: options.adaptive.rolloutPercent,
       canaryRepositories: options.adaptive.canaryRepositories,
       reason: adaptiveHotDecisionReason(options.adaptive, proposed.status),
-      legacyCursor: { input: cursor.nextCursor, next: legacySelection.cursor },
+      legacyCursor: { input: cursor.nextCursor, next: nextLegacyCursor },
       adaptiveCursor: { input: adaptiveCursor.nextCursor, next: proposed.nextCursor },
       adaptiveProbeCursor: {
         input: adaptiveProbeCursor.nextCursor,
@@ -690,6 +696,14 @@ export function indexCurrentAdaptiveHotObservations<
       )
       .map((observation) => [observation.targetRepo.toLowerCase(), observation] as const),
   );
+}
+
+export function adaptiveHotLegacyCursor(options: {
+  inputCursor: number;
+  selectedCursor: number;
+  dispatchSuppressed: boolean;
+}): number {
+  return options.dispatchSuppressed ? options.inputCursor : options.selectedCursor;
 }
 
 function unavailableAdaptiveHotFacts(): AdaptiveHotControlFacts {

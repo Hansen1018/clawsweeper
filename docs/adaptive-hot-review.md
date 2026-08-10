@@ -67,9 +67,9 @@ order:
 If the observation snapshot as a whole is unavailable, the allocator falls
 back to at most five repositories with one candidate each. If queue capability,
 scheduled tokens, or the global request circuit is unavailable in an active
-mode, it selects no adaptive work. Stale observations are older than six hours.
-The main adaptive and probe cursors are durable and independent from the legacy
-fanout cursor.
+mode, it selects no adaptive work and advances no legacy, adaptive, or probe
+cursor. Stale observations are older than six hours. The main adaptive and
+probe cursors are durable and independent from the legacy fanout cursor.
 
 ## Observation and feedback boundaries
 
