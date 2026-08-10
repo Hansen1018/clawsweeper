@@ -338,6 +338,16 @@ recovery progress, and last classified GitHub pressure failure. `/api/status` re
 `control_plane` compatibility field, but the dashboard no longer renders that
 low-actionability section.
 
+Production overrides publication minimum, base, and maximum capacity to 8, 32,
+and 40, while source fallback values are 4, 24, and 48. The controller records
+failure, cooldown, recovery, and demand telemetry and scales within the
+production range. The publication lane also
+exposes `batches` and `direct`: production enables up to eight concurrent size-8
+batches, reserves two fresh-lane members per batch, and enables direct
+publication with retry/batch fallback. Document effective production values from
+`dashboard/wrangler.toml`, not only fallback constants in
+`dashboard/exact-review-queue.ts`.
+
 The standalone **State writer** panel separates the repo-wide serialization
 boundary from exact-review materialization telemetry. After the coordinator
 cutover, `state_writer.coordinator` is authoritative for the active writer,
