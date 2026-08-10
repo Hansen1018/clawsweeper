@@ -294,7 +294,10 @@ export class AdaptiveHotReviewStore {
     for (const row of this.storage.sql.exec(
       `SELECT observation_json FROM (
          SELECT observation_json,
-                ROW_NUMBER() OVER (PARTITION BY target_repo, lane ORDER BY observed_at DESC, observation_id DESC) AS rank
+                ROW_NUMBER() OVER (
+                  PARTITION BY target_repo, lane, policy_version
+                  ORDER BY observed_at DESC, observation_id DESC
+                ) AS rank
            FROM ${ADAPTIVE_HOT_PLANNER_OBSERVATION_TABLE}
        ) WHERE rank = 1`,
     )) {
@@ -347,7 +350,9 @@ export class AdaptiveHotReviewStore {
     }
     observations.sort(
       (left, right) =>
-        left.targetRepo.localeCompare(right.targetRepo) || left.lane.localeCompare(right.lane),
+        left.targetRepo.localeCompare(right.targetRepo) ||
+        left.lane.localeCompare(right.lane) ||
+        left.policyVersion.localeCompare(right.policyVersion),
     );
     const recentDecisions: AdaptiveHotDecisionRecord[] = [];
     for (const row of this.storage.sql.exec(

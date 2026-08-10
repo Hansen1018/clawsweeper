@@ -11874,6 +11874,18 @@ test("adaptive hot-review observations and decisions are durable, bounded, and r
     ).ok,
     true,
   );
+  assert.equal(
+    store.recordPlannerObservation(
+      adaptivePlannerObservation({
+        observationId: "402:1:hot_intake:openclaw/clawsweeper",
+        observedAt: "2026-08-10T11:30:00.000Z",
+        admitted: 1,
+        policyVersion: "adaptive-hot-v0",
+      }),
+      now,
+    ).ok,
+    true,
+  );
   store.recordExecution({
     receiptId: "complete:openclaw/clawsweeper#1:1:1:400:1",
     targetRepo: "openclaw/clawsweeper",
@@ -11948,8 +11960,15 @@ test("adaptive hot-review observations and decisions are durable, bounded, and r
   const restarted = new AdaptiveHotReviewStore(storage);
   restarted.ensureSchemaSync();
   const snapshot = restarted.snapshot(now);
-  assert.equal(snapshot.observations.length, 1);
-  assert.deepEqual(snapshot.observations[0], {
+  assert.equal(snapshot.observations.length, 2);
+  assert.deepEqual(
+    snapshot.observations.map((observation) => observation.policyVersion),
+    ["adaptive-hot-v0", "adaptive-hot-v1"],
+  );
+  const currentPolicyObservation = snapshot.observations.find(
+    (observation) => observation.policyVersion === "adaptive-hot-v1",
+  );
+  assert.deepEqual(currentPolicyObservation, {
     targetRepo: "openclaw/clawsweeper",
     lane: "hot_intake",
     policyVersion: "adaptive-hot-v1",
@@ -11994,11 +12013,12 @@ function adaptivePlannerObservation(overrides: {
   observedAt: string;
   admitted: number;
   targetRepo?: string;
+  policyVersion?: string;
 }) {
   return {
     schemaVersion: "adaptive-hot-review-planner-observation/v1",
     observationId: overrides.observationId,
-    policyVersion: "adaptive-hot-v1",
+    policyVersion: overrides.policyVersion ?? "adaptive-hot-v1",
     runId: overrides.observationId.split(":", 1)[0],
     runAttempt: 1,
     targetRepo: overrides.targetRepo ?? "openclaw/clawsweeper",
