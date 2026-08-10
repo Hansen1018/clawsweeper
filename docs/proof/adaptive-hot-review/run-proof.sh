@@ -26,6 +26,26 @@ fi
 mkdir -p "$output_dir"
 printf '%s\n' "$actual_head" >"${output_dir}/source-head.txt"
 
+node_major="$(node -p 'process.versions.node.split(".")[0]')"
+if [[ "$node_major" -lt 24 ]]; then
+  echo "Node 24 or newer is required; found $(node --version)" >&2
+  exit 1
+fi
+export PNPM_HOME="$HOME/.local/bin"
+mkdir -p "$PNPM_HOME"
+export PATH="$PNPM_HOME:$PATH"
+if ! command -v pnpm >/dev/null 2>&1; then
+  corepack enable --install-directory "$PNPM_HOME" >/dev/null 2>&1 || true
+fi
+if ! command -v pnpm >/dev/null 2>&1; then
+  npm install -g --prefix "$HOME/.local" pnpm@11.10.0 \
+    >"${output_dir}/pnpm-install.log" 2>&1
+fi
+command -v pnpm >/dev/null 2>&1 || {
+  echo "pnpm is unavailable in the proof container" >&2
+  exit 1
+}
+
 echo "CRABBOX_PHASE:install"
 pnpm install --frozen-lockfile >"${output_dir}/install.log" 2>&1
 
