@@ -1,0 +1,426 @@
+{
+  "schemaVersion": "adaptive-hot-allocation-fixtures/v1",
+  "scenarios": [
+    {
+      "name": "capacity-bounds-twenty-repositories",
+      "input": {
+        "nowMs": 1800000000000,
+        "cursor": 0,
+        "queueCapabilityAvailable": true,
+        "availableCandidateCapacity": 128,
+        "globalTokenBalance": 10,
+        "hotTokenBalance": 10,
+        "scheduledAdmissionThrottled": false,
+        "repositoryObservationsAvailable": true,
+        "repositories": [
+          {
+            "targetRepo": "example/repo-01",
+            "observation": {
+              "observedAtMs": 1799999940000,
+              "eligibleDue": 5,
+              "sourceNovelDue": 0,
+              "oldestDueAtMs": 1799996400000,
+              "oldestUnservedAtMs": 1799996400000,
+              "lastAdmittedAtMs": 1799996400000
+            }
+          },
+          {
+            "targetRepo": "example/repo-02",
+            "observation": {
+              "observedAtMs": 1799999940000,
+              "eligibleDue": 5,
+              "sourceNovelDue": 0,
+              "oldestDueAtMs": 1799996400000,
+              "oldestUnservedAtMs": 1799996400000,
+              "lastAdmittedAtMs": 1799996400000
+            }
+          },
+          {
+            "targetRepo": "example/repo-03",
+            "observation": {
+              "observedAtMs": 1799999940000,
+              "eligibleDue": 5,
+              "sourceNovelDue": 0,
+              "oldestDueAtMs": 1799996400000,
+              "oldestUnservedAtMs": 1799996400000,
+              "lastAdmittedAtMs": 1799996400000
+            }
+          },
+          {
+            "targetRepo": "example/repo-04",
+            "observation": {
+              "observedAtMs": 1799999940000,
+              "eligibleDue": 5,
+              "sourceNovelDue": 0,
+              "oldestDueAtMs": 1799996400000,
+              "oldestUnservedAtMs": 1799996400000,
+              "lastAdmittedAtMs": 1799996400000
+            }
+          },
+          {
+            "targetRepo": "example/repo-05",
+            "observation": {
+              "observedAtMs": 1799999940000,
+              "eligibleDue": 5,
+              "sourceNovelDue": 0,
+              "oldestDueAtMs": 1799996400000,
+              "oldestUnservedAtMs": 1799996400000,
+              "lastAdmittedAtMs": 1799996400000
+            }
+          },
+          {
+            "targetRepo": "example/repo-06",
+            "observation": {
+              "observedAtMs": 1799999940000,
+              "eligibleDue": 5,
+              "sourceNovelDue": 0,
+              "oldestDueAtMs": 1799996400000,
+              "oldestUnservedAtMs": 1799996400000,
+              "lastAdmittedAtMs": 1799996400000
+            }
+          },
+          {
+            "targetRepo": "example/repo-07",
+            "observation": {
+              "observedAtMs": 1799999940000,
+              "eligibleDue": 5,
+              "sourceNovelDue": 0,
+              "oldestDueAtMs": 1799996400000,
+              "oldestUnservedAtMs": 1799996400000,
+              "lastAdmittedAtMs": 1799996400000
+            }
+          },
+          {
+            "targetRepo": "example/repo-08",
+            "observation": {
+              "observedAtMs": 1799999940000,
+              "eligibleDue": 5,
+              "sourceNovelDue": 0,
+              "oldestDueAtMs": 1799996400000,
+              "oldestUnservedAtMs": 1799996400000,
+              "lastAdmittedAtMs": 1799996400000
+            }
+          },
+          {
+            "targetRepo": "example/repo-09",
+            "observation": {
+              "observedAtMs": 1799999940000,
+              "eligibleDue": 5,
+              "sourceNovelDue": 0,
+              "oldestDueAtMs": 1799996400000,
+              "oldestUnservedAtMs": 1799996400000,
+              "lastAdmittedAtMs": 1799996400000
+            }
+          },
+          {
+            "targetRepo": "example/repo-10",
+            "observation": {
+              "observedAtMs": 1799999940000,
+              "eligibleDue": 5,
+              "sourceNovelDue": 0,
+              "oldestDueAtMs": 1799996400000,
+              "oldestUnservedAtMs": 1799996400000,
+              "lastAdmittedAtMs": 1799996400000
+            }
+          },
+          {
+            "targetRepo": "example/repo-11",
+            "observation": {
+              "observedAtMs": 1799999940000,
+              "eligibleDue": 5,
+              "sourceNovelDue": 0,
+              "oldestDueAtMs": 1799996400000,
+              "oldestUnservedAtMs": 1799996400000,
+              "lastAdmittedAtMs": 1799996400000
+            }
+          },
+          {
+            "targetRepo": "example/repo-12",
+            "observation": {
+              "observedAtMs": 1799999940000,
+              "eligibleDue": 5,
+              "sourceNovelDue": 0,
+              "oldestDueAtMs": 1799996400000,
+              "oldestUnservedAtMs": 1799996400000,
+              "lastAdmittedAtMs": 1799996400000
+            }
+          },
+          {
+            "targetRepo": "example/repo-13",
+            "observation": {
+              "observedAtMs": 1799999940000,
+              "eligibleDue": 5,
+              "sourceNovelDue": 0,
+              "oldestDueAtMs": 1799996400000,
+              "oldestUnservedAtMs": 1799996400000,
+              "lastAdmittedAtMs": 1799996400000
+            }
+          },
+          {
+            "targetRepo": "example/repo-14",
+            "observation": {
+              "observedAtMs": 1799999940000,
+              "eligibleDue": 5,
+              "sourceNovelDue": 0,
+              "oldestDueAtMs": 1799996400000,
+              "oldestUnservedAtMs": 1799996400000,
+              "lastAdmittedAtMs": 1799996400000
+            }
+          },
+          {
+            "targetRepo": "example/repo-15",
+            "observation": {
+              "observedAtMs": 1799999940000,
+              "eligibleDue": 5,
+              "sourceNovelDue": 0,
+              "oldestDueAtMs": 1799996400000,
+              "oldestUnservedAtMs": 1799996400000,
+              "lastAdmittedAtMs": 1799996400000
+            }
+          },
+          {
+            "targetRepo": "example/repo-16",
+            "observation": {
+              "observedAtMs": 1799999940000,
+              "eligibleDue": 5,
+              "sourceNovelDue": 0,
+              "oldestDueAtMs": 1799996400000,
+              "oldestUnservedAtMs": 1799996400000,
+              "lastAdmittedAtMs": 1799996400000
+            }
+          },
+          {
+            "targetRepo": "example/repo-17",
+            "observation": {
+              "observedAtMs": 1799999940000,
+              "eligibleDue": 5,
+              "sourceNovelDue": 0,
+              "oldestDueAtMs": 1799996400000,
+              "oldestUnservedAtMs": 1799996400000,
+              "lastAdmittedAtMs": 1799996400000
+            }
+          },
+          {
+            "targetRepo": "example/repo-18",
+            "observation": {
+              "observedAtMs": 1799999940000,
+              "eligibleDue": 5,
+              "sourceNovelDue": 0,
+              "oldestDueAtMs": 1799996400000,
+              "oldestUnservedAtMs": 1799996400000,
+              "lastAdmittedAtMs": 1799996400000
+            }
+          },
+          {
+            "targetRepo": "example/repo-19",
+            "observation": {
+              "observedAtMs": 1799999940000,
+              "eligibleDue": 5,
+              "sourceNovelDue": 0,
+              "oldestDueAtMs": 1799996400000,
+              "oldestUnservedAtMs": 1799996400000,
+              "lastAdmittedAtMs": 1799996400000
+            }
+          },
+          {
+            "targetRepo": "example/repo-20",
+            "observation": {
+              "observedAtMs": 1799999940000,
+              "eligibleDue": 5,
+              "sourceNovelDue": 0,
+              "oldestDueAtMs": 1799996400000,
+              "oldestUnservedAtMs": 1799996400000,
+              "lastAdmittedAtMs": 1799996400000
+            }
+          }
+        ]
+      },
+      "expect": {
+        "status": "allocated",
+        "serviceCapacity": 10,
+        "offerBudget": 15,
+        "allocatedCandidates": 15,
+        "maxRepositoryCandidates": 1,
+        "selectedRepositories": [
+          "example/repo-01",
+          "example/repo-02",
+          "example/repo-03",
+          "example/repo-04",
+          "example/repo-05",
+          "example/repo-06",
+          "example/repo-07",
+          "example/repo-08",
+          "example/repo-09",
+          "example/repo-10",
+          "example/repo-11",
+          "example/repo-12",
+          "example/repo-13",
+          "example/repo-14",
+          "example/repo-15"
+        ]
+      }
+    },
+    {
+      "name": "priority-rounds-and-bounded-probes",
+      "input": {
+        "nowMs": 1800000000000,
+        "cursor": 0,
+        "queueCapabilityAvailable": true,
+        "availableCandidateCapacity": 6,
+        "globalTokenBalance": 6,
+        "hotTokenBalance": 6,
+        "scheduledAdmissionThrottled": false,
+        "repositoryObservationsAvailable": true,
+        "repositories": [
+          {
+            "targetRepo": "openclaw/overdue",
+            "observation": {
+              "observedAtMs": 1799999940000,
+              "eligibleDue": 5,
+              "sourceNovelDue": 2,
+              "oldestDueAtMs": 1799827200000,
+              "oldestUnservedAtMs": 1799827200000,
+              "lastAdmittedAtMs": 1799827200000
+            }
+          },
+          {
+            "targetRepo": "openclaw/novel",
+            "observation": {
+              "observedAtMs": 1799999940000,
+              "eligibleDue": 4,
+              "sourceNovelDue": 1,
+              "oldestDueAtMs": 1799992800000,
+              "oldestUnservedAtMs": 1799996400000,
+              "lastAdmittedAtMs": 1799996400000
+            }
+          },
+          {
+            "targetRepo": "openclaw/ordinary-a",
+            "observation": {
+              "observedAtMs": 1799999940000,
+              "eligibleDue": 4,
+              "sourceNovelDue": 0,
+              "oldestDueAtMs": 1799985600000,
+              "oldestUnservedAtMs": 1799996400000,
+              "lastAdmittedAtMs": 1799996400000
+            }
+          },
+          {
+            "targetRepo": "openclaw/ordinary-b",
+            "observation": {
+              "observedAtMs": 1799999940000,
+              "eligibleDue": 4,
+              "sourceNovelDue": 0,
+              "oldestDueAtMs": 1799989200000,
+              "oldestUnservedAtMs": 1799996400000,
+              "lastAdmittedAtMs": 1799996400000
+            }
+          },
+          { "targetRepo": "openclaw/unknown-a", "observation": null },
+          {
+            "targetRepo": "openclaw/unknown-b",
+            "observation": {
+              "observedAtMs": 1799974800000,
+              "eligibleDue": 2,
+              "sourceNovelDue": 1,
+              "oldestDueAtMs": 1799974800000,
+              "oldestUnservedAtMs": 1799974800000,
+              "lastAdmittedAtMs": 1799974800000
+            }
+          },
+          { "targetRepo": "openclaw/unknown-c", "observation": null }
+        ]
+      },
+      "expect": {
+        "status": "allocated",
+        "offerBudget": 9,
+        "perRepositoryLimit": 2,
+        "allocatedCandidates": 9,
+        "maxRepositoryCandidates": 2,
+        "unknownProbeCount": 2,
+        "allocationOrder": [
+          "openclaw/overdue",
+          "openclaw/novel",
+          "openclaw/unknown-a",
+          "openclaw/unknown-b",
+          "openclaw/ordinary-a",
+          "openclaw/ordinary-b",
+          "openclaw/overdue",
+          "openclaw/novel",
+          "openclaw/ordinary-a"
+        ]
+      }
+    },
+    {
+      "name": "dominant-repository-is-capped",
+      "input": {
+        "nowMs": 1800000000000,
+        "cursor": 0,
+        "queueCapabilityAvailable": true,
+        "availableCandidateCapacity": 128,
+        "globalTokenBalance": 20,
+        "hotTokenBalance": 20,
+        "scheduledAdmissionThrottled": false,
+        "repositoryObservationsAvailable": true,
+        "repositories": [
+          {
+            "targetRepo": "openclaw/dominant",
+            "observation": {
+              "observedAtMs": 1799999940000,
+              "eligibleDue": 100,
+              "sourceNovelDue": 50,
+              "oldestDueAtMs": 1799827200000,
+              "oldestUnservedAtMs": 1799827200000,
+              "lastAdmittedAtMs": 1799827200000
+            }
+          }
+        ]
+      },
+      "expect": {
+        "status": "allocated",
+        "offerBudget": 30,
+        "perRepositoryLimit": 7,
+        "allocatedCandidates": 7,
+        "unusedOfferBudget": 23,
+        "maxRepositoryCandidates": 7
+      }
+    },
+    {
+      "name": "unavailable-observations-use-cursor-fallback",
+      "input": {
+        "nowMs": 1800000000000,
+        "cursor": 6,
+        "queueCapabilityAvailable": true,
+        "availableCandidateCapacity": 20,
+        "globalTokenBalance": 10,
+        "hotTokenBalance": 10,
+        "scheduledAdmissionThrottled": false,
+        "repositoryObservationsAvailable": false,
+        "repositories": [
+          { "targetRepo": "example/repo-01" },
+          { "targetRepo": "example/repo-02" },
+          { "targetRepo": "example/repo-03" },
+          { "targetRepo": "example/repo-04" },
+          { "targetRepo": "example/repo-05" },
+          { "targetRepo": "example/repo-06" },
+          { "targetRepo": "example/repo-07" },
+          { "targetRepo": "example/repo-08" }
+        ]
+      },
+      "expect": {
+        "status": "observation_fallback",
+        "offerBudget": 15,
+        "allocatedCandidates": 5,
+        "selectedRepositories": [
+          "example/repo-07",
+          "example/repo-08",
+          "example/repo-01",
+          "example/repo-02",
+          "example/repo-03"
+        ],
+        "inputCursor": 6,
+        "nextCursor": 3
+      }
+    }
+  ]
+}
