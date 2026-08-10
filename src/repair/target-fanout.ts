@@ -303,14 +303,9 @@ export async function runTargetFanout(argv: string[]): Promise<void> {
     }
     const facts = control.ok ? control.facts : unavailableAdaptiveHotFacts();
     const observationByRepository = control.ok
-      ? new Map(
-          control.snapshot.observations
-            .filter(
-              (observation) =>
-                observation.lane === "hot_intake" &&
-                observation.policyVersion === adaptivePolicy.allocation.policyVersion,
-            )
-            .map((observation) => [observation.targetRepo.toLowerCase(), observation] as const),
+      ? indexCurrentAdaptiveHotObservations(
+          control.snapshot.observations,
+          adaptivePolicy.allocation.policyVersion,
         )
       : new Map<string, AdaptiveHotRepositoryObservationSnapshot>();
     const globalCredentialCircuit = facts.activeCredentialCircuits.some(
@@ -325,7 +320,8 @@ export async function runTargetFanout(argv: string[]): Promise<void> {
       globalTokenBalance: facts.globalTokenBalance,
       hotTokenBalance: facts.hotTokenBalance,
       scheduledAdmissionThrottled: facts.scheduledAdmissionThrottled || globalCredentialCircuit,
-      repositoryObservationsAvailable: facts.repositoryObservationsAvailable,
+      repositoryObservationsAvailable:
+        facts.repositoryObservationsAvailable && observationByRepository.size > 0,
       repositories: planningRepositories.map((repository) => {
         const observation = observationByRepository.get(repository.targetRepo.toLowerCase());
         const owner = repository.targetRepo.split("/", 1)[0]?.toLowerCase() ?? "";
@@ -620,6 +616,22 @@ export async function reserveActiveAdaptiveHotCursors(options: {
     );
   }
   return { legacy: options.legacy !== null, adaptive: true, probe: true };
+}
+
+export function indexCurrentAdaptiveHotObservations<
+  Observation extends Pick<
+    AdaptiveHotRepositoryObservationSnapshot,
+    "targetRepo" | "lane" | "policyVersion"
+  >,
+>(observations: readonly Observation[], policyVersion: string): Map<string, Observation> {
+  return new Map(
+    observations
+      .filter(
+        (observation) =>
+          observation.lane === "hot_intake" && observation.policyVersion === policyVersion,
+      )
+      .map((observation) => [observation.targetRepo.toLowerCase(), observation] as const),
+  );
 }
 
 function unavailableAdaptiveHotFacts(): AdaptiveHotControlFacts {

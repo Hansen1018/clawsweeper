@@ -12,6 +12,7 @@ import {
   defaultLimit,
   fetchFanoutCursor,
   filterEligibleRepositories,
+  indexCurrentAdaptiveHotObservations,
   loadFanoutCursor,
   persistFanoutCursorFailOpen,
   planReviewFanout,
@@ -569,6 +570,22 @@ test("target fanout cursor-store outage fails open", async () => {
   } finally {
     console.error = originalError;
   }
+});
+
+test("adaptive observation availability is scoped to the current policy", () => {
+  const oldPolicy = {
+    targetRepo: "OpenClaw/ClawSweeper",
+    lane: "hot_intake",
+    policyVersion: "adaptive-hot-v0",
+  };
+  assert.equal(indexCurrentAdaptiveHotObservations([oldPolicy], "adaptive-hot-v1").size, 0);
+  const current = { ...oldPolicy, policyVersion: "adaptive-hot-v1" };
+  assert.equal(
+    indexCurrentAdaptiveHotObservations([oldPolicy, current], "adaptive-hot-v1").get(
+      "openclaw/clawsweeper",
+    ),
+    current,
+  );
 });
 
 test("active adaptive fanout reserves every required cursor before dispatch", async () => {
