@@ -577,6 +577,15 @@ export default {
         env,
         "/cursors/adaptive-hot-reservation",
       );
+    if (
+      url.pathname === "/internal/state/cursors/adaptive-hot-reservation/commit" &&
+      request.method === "PUT"
+    )
+      return authenticatedExactReviewQueueCursorRequest(
+        request,
+        env,
+        "/cursors/adaptive-hot-reservation/commit",
+      );
     const operationalCursorPath =
       /^\/internal\/state\/cursors\/(hot-intake|normal-review|audit|adaptive-hot-review|adaptive-hot-review-probe|review-placeholder-[a-f0-9]{16}-(?:open|closed))$/.exec(
         url.pathname,

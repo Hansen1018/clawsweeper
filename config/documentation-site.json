@@ -3,7 +3,13 @@
   "sections": [
     {
       "name": "Start",
-      "pages": ["README.md", "orchestration.md", "scheduler.md", "work-lane.md"]
+      "pages": [
+        "README.md",
+        "orchestration.md",
+        "scheduler.md",
+        "adaptive-hot-review.md",
+        "work-lane.md"
+      ]
     },
     {
       "name": "Review and policy",

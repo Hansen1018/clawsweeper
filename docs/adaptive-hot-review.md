@@ -118,11 +118,16 @@ Modes are deliberately asymmetric:
 - `canary`: replaces only legacy slots belonging to the explicit three-to-five
   repository allowlist. Control-plane, decision, and cursor durability are
   required for a successful active cycle. The legacy cursor when used, the main
-  adaptive cursor, and the probe cursor are reserved atomically in one Durable
-  Object transaction before any GitHub dispatch. A conflict or failed
-  reservation therefore advances none of them, produces no external dispatch,
-  and cannot repeat or skip an adaptive slice on retry. The planned decision
-  also persists before this reservation.
+  adaptive cursor, and the probe cursor are covered by one atomic one-hour
+  Durable Object reservation before any GitHub dispatch, but their positions do
+  not advance yet. After every dispatch succeeds, one commit transaction
+  advances all covered cursors. A reservation conflict dispatches nothing; a
+  dispatch or commit failure never marks undispatched repositories processed
+  and leaves the lease to block a competing active cycle until bounded expiry.
+  An expired lease cannot commit. A bounded 24-hour commit-receipt ledger makes
+  a successful commit idempotent if its response is lost. Queue dedupe contains
+  any already-dispatched prefix if an expired lease is retried. The planned
+  decision also persists before this reservation.
 - `full`: uses deterministic 10%, 50%, or 100% cohorts. Non-cohort legacy slots
   remain legacy at 10% and 50%; 100% uses only the adaptive cursor and proposal.
 

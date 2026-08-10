@@ -6337,6 +6337,8 @@ test("active adaptive cursor reservation is authenticated and atomic", async () 
     );
   }
   const reservationPath = "/internal/state/cursors/adaptive-hot-reservation";
+  const commitPath = `${reservationPath}/commit`;
+  const reservationId = "600:1:hot-intake";
   const updates = [
     { mode: "hot-intake", next_cursor: 20, expected_revision: 1 },
     { mode: "adaptive-hot-review", next_cursor: 8, expected_revision: 1 },
@@ -6347,7 +6349,7 @@ test("active adaptive cursor reservation is authenticated and atomic", async () 
       await worker.fetch(
         new Request(`https://clawsweeper.openclaw.ai${reservationPath}`, {
           method: "PUT",
-          body: JSON.stringify({ cursors: updates }),
+          body: JSON.stringify({ reservation_id: reservationId, cursors: updates }),
         }),
         env,
       )
@@ -6356,6 +6358,7 @@ test("active adaptive cursor reservation is authenticated and atomic", async () 
   );
   const conflict = await worker.fetch(
     signedRequest(reservationPath, "PUT", {
+      reservation_id: reservationId,
       cursors: updates.map((cursor) =>
         cursor.mode === "adaptive-hot-review" ? { ...cursor, expected_revision: 9 } : cursor,
       ),
@@ -6377,29 +6380,134 @@ test("active adaptive cursor reservation is authenticated and atomic", async () 
     );
   }
 
-  const written = await worker.fetch(
-    signedRequest(reservationPath, "PUT", { cursors: updates }),
+  const reserved = await worker.fetch(
+    signedRequest(reservationPath, "PUT", {
+      reservation_id: reservationId,
+      cursors: updates,
+    }),
     env,
   );
-  assert.equal(written.status, 202);
-  const writtenBody = (await written.json()) as {
+  assert.equal(reserved.status, 202);
+  const reservedBody = (await reserved.json()) as {
+    reservation_id: string;
+    reservation_expires_at: string;
+    cursors: Array<{ mode: string; next_cursor: number; revision: number; updated_at: string }>;
+  };
+  assert.equal(reservedBody.reservation_id, reservationId);
+  assert.equal(Number.isFinite(Date.parse(reservedBody.reservation_expires_at)), true);
+  assert.deepEqual(
+    reservedBody.cursors.map(({ mode, next_cursor, revision }) => ({
+      mode,
+      nextCursor: next_cursor,
+      revision,
+    })),
+    updates.map(({ mode, next_cursor, expected_revision }) => ({
+      mode,
+      nextCursor: next_cursor,
+      revision: expected_revision,
+    })),
+  );
+  assert.equal(new Set(reservedBody.cursors.map((cursor) => cursor.updated_at)).size, 1);
+  assert.equal(
+    (
+      await worker.fetch(
+        signedRequest(reservationPath, "PUT", {
+          reservation_id: "601:1:hot-intake",
+          cursors: updates,
+        }),
+        env,
+      )
+    ).status,
+    409,
+  );
+  for (const [mode, nextCursor] of [
+    ["hot-intake", 10],
+    ["adaptive-hot-review", 5],
+    ["adaptive-hot-review-probe", 2],
+  ] as const) {
+    const current = (await (
+      await worker.fetch(signedRequest(cursorPath(mode), "GET"), env)
+    ).json()) as { next_cursor: number; revision: number };
+    assert.deepEqual(
+      { nextCursor: current.next_cursor, revision: current.revision },
+      { nextCursor, revision: 1 },
+    );
+  }
+
+  const committed = await worker.fetch(
+    signedRequest(commitPath, "PUT", { reservation_id: reservationId }),
+    env,
+  );
+  assert.equal(committed.status, 202);
+  const committedBody = (await committed.json()) as {
     cursors: Array<{ mode: string; next_cursor: number; revision: number; updated_at: string }>;
   };
   assert.deepEqual(
-    writtenBody.cursors.map(({ mode, next_cursor, revision }) => ({
+    committedBody.cursors.map(({ mode, next_cursor, revision }) => ({
       mode,
       nextCursor: next_cursor,
       revision,
     })),
     updates.map(({ mode, next_cursor }) => ({ mode, nextCursor: next_cursor, revision: 2 })),
   );
-  assert.equal(new Set(writtenBody.cursors.map((cursor) => cursor.updated_at)).size, 1);
+  assert.equal(new Set(committedBody.cursors.map((cursor) => cursor.updated_at)).size, 1);
 
   queue = new ExactReviewQueue({ storage }, {});
   env = {
     CLAWSWEEPER_WEBHOOK_SECRET: secret,
     EXACT_REVIEW_QUEUE: new MemoryDurableNamespace(queue),
   };
+  for (const update of updates) {
+    const current = (await (
+      await worker.fetch(signedRequest(cursorPath(update.mode), "GET"), env)
+    ).json()) as { next_cursor: number; revision: number };
+    assert.equal(current.next_cursor, update.next_cursor);
+    assert.equal(current.revision, 2);
+  }
+
+  const retriedCommit = await worker.fetch(
+    signedRequest(commitPath, "PUT", { reservation_id: reservationId }),
+    env,
+  );
+  assert.equal(retriedCommit.status, 202);
+  assert.deepEqual(await retriedCommit.json(), committedBody);
+
+  const expiredReservationId = "602:1:hot-intake";
+  const expiredUpdates = updates.map((cursor) => ({
+    ...cursor,
+    next_cursor: cursor.next_cursor + 1,
+    expected_revision: 2,
+  }));
+  assert.equal(
+    (
+      await worker.fetch(
+        signedRequest(reservationPath, "PUT", {
+          reservation_id: expiredReservationId,
+          cursors: expiredUpdates,
+        }),
+        env,
+      )
+    ).status,
+    202,
+  );
+  const reservationKey = "adaptive-hot-cursor-reservation:v1";
+  const expiredReservation = storage.rawGet(reservationKey) as {
+    reservedAt: number;
+    expiresAt: number;
+  };
+  storage.rawPut(reservationKey, {
+    ...expiredReservation,
+    reservedAt: Date.now() - 2,
+    expiresAt: Date.now() - 1,
+  });
+  const expiredCommit = await worker.fetch(
+    signedRequest(commitPath, "PUT", { reservation_id: expiredReservationId }),
+    env,
+  );
+  assert.equal(expiredCommit.status, 409);
+  assert.deepEqual(await expiredCommit.json(), {
+    error: "adaptive_hot_cursor_reservation_expired",
+  });
   for (const update of updates) {
     const current = (await (
       await worker.fetch(signedRequest(cursorPath(update.mode), "GET"), env)

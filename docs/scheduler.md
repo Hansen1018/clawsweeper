@@ -252,11 +252,15 @@ productive lane.
 Adaptive shadow comparisons keep that legacy fail-open behavior. Canary and
 full modes require the control snapshot and planned decision to be durable,
 then reserve the main adaptive cursor, probe cursor, and any legacy cursor used
-by a mixed cohort in one transactional write before dispatch. A failed or
-revision-conflicted reservation advances none of the cursors and dispatches
-nothing, so the next cycle cannot repeat or skip an adaptive slice. The
-default-on kill switch immediately returns the next cycle to legacy selection
-without clearing queued work or rewriting adaptive cursors.
+by a mixed cohort under one one-hour transactional lease before dispatch,
+without advancing them. All covered cursors advance together only after the
+whole dispatch loop succeeds. A reservation conflict dispatches nothing; a
+dispatch or commit failure marks no undispatched repository processed and the
+lease blocks another active cycle until bounded expiry. An expired lease cannot
+commit; bounded 24-hour receipts make a successful commit idempotent across a
+lost response. The queue dedupes any successful prefix retried after expiry.
+The default-on kill switch immediately returns the next cycle to legacy
+selection without clearing queued work or rewriting adaptive cursors.
 
 Normal fanout refreshes the same signed live-open inventory consumed by
 `GET /api/review-coverage`, and both normal and hot fanout skip repositories

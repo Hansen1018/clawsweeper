@@ -6,9 +6,10 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { resolveCommand } from "../command.js";
 import {
+  commitDurableCursorBatch,
   fetchDurableCursor,
   putDurableCursor,
-  putDurableCursorBatch,
+  reserveDurableCursorBatch,
   type DurableCursorSnapshot,
   type DurableCursorStoreOptions,
 } from "../durable-cursor-store.js";
@@ -442,6 +443,7 @@ export async function runTargetFanout(argv: string[]): Promise<void> {
   let adaptiveCursorPersisted = false;
   let adaptiveProbeCursorPersisted = false;
   let adaptiveCursorCycleDurable = true;
+  let activeCursorReservation: ActiveAdaptiveHotCursorReservationOptions | null = null;
   const activeAdaptiveCycle =
     adaptiveDecision !== null && options.adaptive.effectiveMode !== "shadow";
   if (
@@ -452,9 +454,10 @@ export async function runTargetFanout(argv: string[]): Promise<void> {
     adaptiveProbeCursor
   ) {
     const decisionToReserve = adaptiveDecision;
-    const reservation = await reserveActiveAdaptiveHotCursors({
+    activeCursorReservation = {
       baseUrl: options.cursorStoreUrl,
       webhookSecret: process.env.CLAWSWEEPER_WEBHOOK_SECRET ?? "",
+      reservationId: decisionToReserve.decisionId,
       legacy: persistLegacyCursor
         ? { nextCursor: selection.cursor, expectedRevision: cursor.revision }
         : null,
@@ -466,10 +469,8 @@ export async function runTargetFanout(argv: string[]): Promise<void> {
         nextCursor: decisionToReserve.adaptiveProbeCursor.next,
         expectedRevision: adaptiveProbeCursor.revision,
       },
-    });
-    cursorPersisted = reservation.legacy;
-    adaptiveCursorPersisted = reservation.adaptive;
-    adaptiveProbeCursorPersisted = reservation.probe;
+    };
+    await reserveActiveAdaptiveHotCursors(activeCursorReservation);
   }
 
   const dispatched: string[] = [];
@@ -482,6 +483,13 @@ export async function runTargetFanout(argv: string[]): Promise<void> {
       runGh(commandArgs, dispatchEnv());
     }
     dispatched.push(repository.targetRepo);
+  }
+
+  if (!options.dryRun && activeCursorReservation) {
+    const committed = await commitActiveAdaptiveHotCursors(activeCursorReservation);
+    cursorPersisted = committed.legacy;
+    adaptiveCursorPersisted = true;
+    adaptiveProbeCursorPersisted = true;
   }
 
   if (!options.dryRun && persistLegacyCursor && !activeAdaptiveCycle) {
@@ -571,20 +579,26 @@ export async function runTargetFanout(argv: string[]): Promise<void> {
   );
 }
 
-export async function reserveActiveAdaptiveHotCursors(options: {
+type ActiveAdaptiveHotCursorReservationOptions = {
   baseUrl: string;
   webhookSecret: string;
+  reservationId: string;
   legacy: { nextCursor: number; expectedRevision: number } | null;
   adaptive: { nextCursor: number; expectedRevision: number };
   probe: { nextCursor: number; expectedRevision: number };
   attempts?: number;
   fetchImpl?: typeof fetch;
   sleep?: (milliseconds: number) => Promise<void>;
-}): Promise<{ legacy: boolean; adaptive: true; probe: true }> {
+};
+
+export async function reserveActiveAdaptiveHotCursors(
+  options: ActiveAdaptiveHotCursorReservationOptions,
+): Promise<void> {
   try {
-    await putDurableCursorBatch({
+    await reserveDurableCursorBatch({
       baseUrl: options.baseUrl,
       webhookSecret: options.webhookSecret,
+      reservationId: options.reservationId,
       ...(options.attempts === undefined ? {} : { attempts: options.attempts }),
       ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
       ...(options.sleep ? { sleep: options.sleep } : {}),
@@ -615,7 +629,51 @@ export async function reserveActiveAdaptiveHotCursors(options: {
       `adaptive hot-review cursors did not reserve before dispatch: ${errorMessage(error)}`,
     );
   }
-  return { legacy: options.legacy !== null, adaptive: true, probe: true };
+}
+
+export async function commitActiveAdaptiveHotCursors(
+  options: ActiveAdaptiveHotCursorReservationOptions,
+): Promise<{ legacy: boolean }> {
+  try {
+    await commitDurableCursorBatch({
+      baseUrl: options.baseUrl,
+      webhookSecret: options.webhookSecret,
+      reservationId: options.reservationId,
+      ...(options.attempts === undefined ? {} : { attempts: options.attempts }),
+      ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
+      ...(options.sleep ? { sleep: options.sleep } : {}),
+      updates: adaptiveHotCursorReservationUpdates(options),
+    });
+  } catch (error) {
+    throw new Error(
+      `adaptive hot-review cursors did not commit after dispatch: ${errorMessage(error)}`,
+    );
+  }
+  return { legacy: options.legacy !== null };
+}
+
+function adaptiveHotCursorReservationUpdates(options: ActiveAdaptiveHotCursorReservationOptions) {
+  return [
+    ...(options.legacy
+      ? [
+          {
+            mode: "hot-intake" as const,
+            nextCursor: options.legacy.nextCursor,
+            expectedRevision: options.legacy.expectedRevision,
+          },
+        ]
+      : []),
+    {
+      mode: "adaptive-hot-review" as const,
+      nextCursor: options.adaptive.nextCursor,
+      expectedRevision: options.adaptive.expectedRevision,
+    },
+    {
+      mode: "adaptive-hot-review-probe" as const,
+      nextCursor: options.probe.nextCursor,
+      expectedRevision: options.probe.expectedRevision,
+    },
+  ];
 }
 
 export function indexCurrentAdaptiveHotObservations<

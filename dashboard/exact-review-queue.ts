@@ -555,6 +555,11 @@ const EXACT_REVIEW_SOURCE_AUTHORITY_SEQUENCE_KEY = "exact-review-source-authorit
 // Preserve the original key prefix so existing fanout cursors survive the
 // broader operational-cursor contract introduced for bounded recovery lanes.
 const OPERATIONAL_CURSOR_KEY_PREFIX = "target-fanout-cursor:v1:";
+const ADAPTIVE_HOT_CURSOR_RESERVATION_KEY = "adaptive-hot-cursor-reservation:v1";
+const ADAPTIVE_HOT_CURSOR_RESERVATION_TTL_MS = 60 * 60 * 1_000;
+const ADAPTIVE_HOT_CURSOR_COMMIT_RECEIPTS_KEY = "adaptive-hot-cursor-commit-receipts:v1";
+const ADAPTIVE_HOT_CURSOR_COMMIT_RECEIPT_TTL_MS = 24 * 60 * 60 * 1_000;
+const ADAPTIVE_HOT_CURSOR_COMMIT_RECEIPT_LIMIT = 8;
 type OperationalCursorMode =
   | "hot-intake"
   | "normal-review"
@@ -567,6 +572,22 @@ type OperationalCursor = {
   nextCursor: number;
   revision: number;
   updatedAt: number;
+};
+type AdaptiveHotCursorReservation = {
+  reservationId: string;
+  cursors: Array<{
+    mode: "hot-intake" | "adaptive-hot-review" | "adaptive-hot-review-probe";
+    nextCursor: number;
+    expectedRevision: number;
+  }>;
+  reservedAt: number;
+  expiresAt: number;
+};
+type AdaptiveHotCursorCommitReceipt = {
+  reservationId: string;
+  cursors: OperationalCursor[];
+  committedAt: number;
+  expiresAt: number;
 };
 const EXACT_REVIEW_SOURCE_AUTHORITY_RESERVATION_PREFIX =
   "exact-review-source-authority-reservation:v1:";
@@ -727,7 +748,10 @@ export class ExactReviewQueue {
       return result.ok ? json(result, 202) : json({ error: result.error }, 400);
     }
     if (request.method === "PUT" && url.pathname === "/cursors/adaptive-hot-reservation") {
-      return this.writeAdaptiveHotCursorReservation(await request.json().catch(() => null));
+      return this.reserveAdaptiveHotCursors(await request.json().catch(() => null));
+    }
+    if (request.method === "PUT" && url.pathname === "/cursors/adaptive-hot-reservation/commit") {
+      return this.commitAdaptiveHotCursorReservation(await request.json().catch(() => null));
     }
     const operationalCursorMode = operationalCursorModeFromPath(url.pathname);
     if (operationalCursorMode && request.method === "GET") {
@@ -3375,8 +3399,9 @@ export class ExactReviewQueue {
     }
   }
 
-  private writeAdaptiveHotCursorReservation(value: unknown) {
+  private reserveAdaptiveHotCursors(value: unknown) {
     const body = objectValue(value);
+    const reservationId = String(body.reservation_id || "").trim();
     const values = Array.isArray(body.cursors) ? body.cursors : [];
     const cursors = values.map((value) => {
       const cursor = objectValue(value);
@@ -3393,6 +3418,7 @@ export class ExactReviewQueue {
       "adaptive-hot-review-probe",
     ]);
     if (
+      !validAdaptiveHotReservationId(reservationId) ||
       cursors.length < 2 ||
       cursors.length > 3 ||
       new Set(modes).size !== cursors.length ||
@@ -3410,7 +3436,21 @@ export class ExactReviewQueue {
       return json({ error: "invalid_adaptive_hot_cursor_reservation" }, 400);
     }
     try {
+      const now = Date.now();
       const result = this.storage.transactionSync(() => {
+        const storedReservation = readAdaptiveHotCursorReservation(
+          this.storage.kv.get(ADAPTIVE_HOT_CURSOR_RESERVATION_KEY),
+        );
+        if (storedReservation === "invalid") return { kind: "invalid" as const };
+        if (storedReservation && storedReservation.expiresAt > now) {
+          if (
+            storedReservation.reservationId === reservationId &&
+            JSON.stringify(storedReservation.cursors) === JSON.stringify(cursors)
+          ) {
+            return { kind: "reserved" as const, reservation: storedReservation };
+          }
+          return { kind: "busy" as const, reservation: storedReservation };
+        }
         const current: OperationalCursor[] = [];
         for (const cursor of cursors) {
           const stored = readOperationalCursor(
@@ -3426,8 +3466,107 @@ export class ExactReviewQueue {
         if (current.some((cursor) => cursor.revision >= Number.MAX_SAFE_INTEGER)) {
           return { kind: "invalid" as const };
         }
-        const updatedAt = Date.now();
-        const next: OperationalCursor[] = cursors.map((cursor, index) => ({
+        const reservation: AdaptiveHotCursorReservation = {
+          reservationId,
+          cursors,
+          reservedAt: now,
+          expiresAt: now + ADAPTIVE_HOT_CURSOR_RESERVATION_TTL_MS,
+        };
+        this.storage.kv.put(ADAPTIVE_HOT_CURSOR_RESERVATION_KEY, reservation);
+        return { kind: "reserved" as const, reservation };
+      });
+      if (result.kind === "invalid") return json({ error: "fanout_cursor_store_invalid" }, 500);
+      if (result.kind === "busy") {
+        return json(
+          {
+            error: "adaptive_hot_cursor_reservation_active",
+            reservation_expires_at: new Date(result.reservation.expiresAt).toISOString(),
+          },
+          409,
+        );
+      }
+      if (result.kind === "conflict") {
+        return json(
+          {
+            error: "fanout_cursor_revision_conflict",
+            current: result.current.map(operationalCursorJson),
+          },
+          409,
+        );
+      }
+      return json(
+        {
+          ok: true,
+          reservation_id: result.reservation.reservationId,
+          reservation_expires_at: new Date(result.reservation.expiresAt).toISOString(),
+          cursors: result.reservation.cursors.map((cursor) =>
+            operationalCursorJson({
+              mode: cursor.mode,
+              nextCursor: cursor.nextCursor,
+              revision: cursor.expectedRevision,
+              updatedAt: result.reservation.reservedAt,
+            }),
+          ),
+        },
+        202,
+      );
+    } catch (error) {
+      console.error(`adaptive hot cursor reservation failed: ${sanitizedServerError(error)}`);
+      return json({ error: "fanout_cursor_store_unavailable" }, 503);
+    }
+  }
+
+  private commitAdaptiveHotCursorReservation(value: unknown) {
+    const body = objectValue(value);
+    const reservationId = String(body.reservation_id || "").trim();
+    if (!validAdaptiveHotReservationId(reservationId)) {
+      return json({ error: "invalid_adaptive_hot_cursor_reservation" }, 400);
+    }
+    try {
+      const result = this.storage.transactionSync(() => {
+        const now = Date.now();
+        const receipts = readAdaptiveHotCursorCommitReceipts(
+          this.storage.kv.get(ADAPTIVE_HOT_CURSOR_COMMIT_RECEIPTS_KEY),
+        );
+        if (receipts === "invalid") return { kind: "invalid" as const };
+        const priorCommit = receipts.find(
+          (receipt) => receipt.reservationId === reservationId && receipt.expiresAt > now,
+        );
+        if (priorCommit) {
+          return { kind: "committed" as const, cursors: priorCommit.cursors };
+        }
+        const reservation = readAdaptiveHotCursorReservation(
+          this.storage.kv.get(ADAPTIVE_HOT_CURSOR_RESERVATION_KEY),
+        );
+        if (reservation === "invalid") return { kind: "invalid" as const };
+        if (!reservation || reservation.reservationId !== reservationId) {
+          return { kind: "missing" as const };
+        }
+        if (reservation.expiresAt <= now) {
+          this.storage.kv.delete(ADAPTIVE_HOT_CURSOR_RESERVATION_KEY);
+          return { kind: "expired" as const };
+        }
+        const current: OperationalCursor[] = [];
+        for (const cursor of reservation.cursors) {
+          const stored = readOperationalCursor(
+            this.storage.kv.get(operationalCursorKey(cursor.mode)),
+            cursor.mode,
+          );
+          if (stored === "invalid") return { kind: "invalid" as const };
+          current.push(stored ?? emptyOperationalCursor(cursor.mode));
+        }
+        if (
+          current.some(
+            (cursor, index) => cursor.revision !== reservation.cursors[index]!.expectedRevision,
+          )
+        ) {
+          return { kind: "conflict" as const, current };
+        }
+        if (current.some((cursor) => cursor.revision >= Number.MAX_SAFE_INTEGER)) {
+          return { kind: "invalid" as const };
+        }
+        const updatedAt = now;
+        const next: OperationalCursor[] = reservation.cursors.map((cursor, index) => ({
           mode: cursor.mode,
           nextCursor: cursor.nextCursor,
           revision: current[index]!.revision + 1,
@@ -3436,9 +3575,31 @@ export class ExactReviewQueue {
         for (const cursor of next) {
           this.storage.kv.put(operationalCursorKey(cursor.mode), cursor);
         }
-        return { kind: "written" as const, cursors: next };
+        const receipt: AdaptiveHotCursorCommitReceipt = {
+          reservationId,
+          cursors: next,
+          committedAt: now,
+          expiresAt: now + ADAPTIVE_HOT_CURSOR_COMMIT_RECEIPT_TTL_MS,
+        };
+        this.storage.kv.put(
+          ADAPTIVE_HOT_CURSOR_COMMIT_RECEIPTS_KEY,
+          [
+            receipt,
+            ...receipts.filter(
+              (candidate) => candidate.reservationId !== reservationId && candidate.expiresAt > now,
+            ),
+          ].slice(0, ADAPTIVE_HOT_CURSOR_COMMIT_RECEIPT_LIMIT),
+        );
+        this.storage.kv.delete(ADAPTIVE_HOT_CURSOR_RESERVATION_KEY);
+        return { kind: "committed" as const, cursors: next };
       });
       if (result.kind === "invalid") return json({ error: "fanout_cursor_store_invalid" }, 500);
+      if (result.kind === "missing") {
+        return json({ error: "adaptive_hot_cursor_reservation_missing" }, 409);
+      }
+      if (result.kind === "expired") {
+        return json({ error: "adaptive_hot_cursor_reservation_expired" }, 409);
+      }
       if (result.kind === "conflict") {
         return json(
           {
@@ -3450,7 +3611,7 @@ export class ExactReviewQueue {
       }
       return json({ ok: true, cursors: result.cursors.map(operationalCursorJson) }, 202);
     } catch (error) {
-      console.error(`adaptive hot cursor reservation failed: ${sanitizedServerError(error)}`);
+      console.error(`adaptive hot cursor commit failed: ${sanitizedServerError(error)}`);
       return json({ error: "fanout_cursor_store_unavailable" }, 503);
     }
   }
@@ -14739,6 +14900,101 @@ function readOperationalCursor(
     return "invalid";
   }
   return { mode, nextCursor, revision, updatedAt };
+}
+
+function readAdaptiveHotCursorReservation(
+  value: unknown,
+): AdaptiveHotCursorReservation | "invalid" | null {
+  if (value === undefined) return null;
+  const reservation = objectValue(value);
+  const reservationId = String(reservation.reservationId || "");
+  const reservedAt = Number(reservation.reservedAt);
+  const expiresAt = Number(reservation.expiresAt);
+  const values = Array.isArray(reservation.cursors) ? reservation.cursors : [];
+  const cursors = values.map((value) => {
+    const cursor = objectValue(value);
+    return {
+      mode: String(cursor.mode || "") as AdaptiveHotCursorReservation["cursors"][number]["mode"],
+      nextCursor: Number(cursor.nextCursor),
+      expectedRevision: Number(cursor.expectedRevision),
+    };
+  });
+  const modes = cursors.map((cursor) => cursor.mode);
+  if (
+    !validAdaptiveHotReservationId(reservationId) ||
+    !Number.isSafeInteger(reservedAt) ||
+    reservedAt < 1 ||
+    !Number.isSafeInteger(expiresAt) ||
+    expiresAt <= reservedAt ||
+    cursors.length < 2 ||
+    cursors.length > 3 ||
+    new Set(modes).size !== cursors.length ||
+    !modes.includes("adaptive-hot-review") ||
+    !modes.includes("adaptive-hot-review-probe") ||
+    cursors.some(
+      (cursor) =>
+        !["hot-intake", "adaptive-hot-review", "adaptive-hot-review-probe"].includes(cursor.mode) ||
+        !Number.isSafeInteger(cursor.nextCursor) ||
+        cursor.nextCursor < 0 ||
+        !Number.isSafeInteger(cursor.expectedRevision) ||
+        cursor.expectedRevision < 0,
+    )
+  ) {
+    return "invalid";
+  }
+  return { reservationId, cursors, reservedAt, expiresAt };
+}
+
+function readAdaptiveHotCursorCommitReceipts(
+  value: unknown,
+): AdaptiveHotCursorCommitReceipt[] | "invalid" {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.length > ADAPTIVE_HOT_CURSOR_COMMIT_RECEIPT_LIMIT) {
+    return "invalid";
+  }
+  const receipts: AdaptiveHotCursorCommitReceipt[] = [];
+  for (const rawReceipt of value) {
+    const receipt = objectValue(rawReceipt);
+    const reservationId = String(receipt.reservationId || "");
+    const committedAt = Number(receipt.committedAt);
+    const expiresAt = Number(receipt.expiresAt);
+    const rawCursors = Array.isArray(receipt.cursors) ? receipt.cursors : [];
+    const cursors: OperationalCursor[] = [];
+    for (const rawCursor of rawCursors) {
+      const cursor = objectValue(rawCursor);
+      const mode = String(cursor.mode || "") as OperationalCursorMode;
+      if (!["hot-intake", "adaptive-hot-review", "adaptive-hot-review-probe"].includes(mode)) {
+        return "invalid";
+      }
+      const parsed = readOperationalCursor(cursor, mode);
+      if (!parsed || parsed === "invalid") return "invalid";
+      cursors.push(parsed);
+    }
+    const modes = cursors.map((cursor) => cursor.mode);
+    if (
+      !validAdaptiveHotReservationId(reservationId) ||
+      !Number.isSafeInteger(committedAt) ||
+      committedAt < 1 ||
+      !Number.isSafeInteger(expiresAt) ||
+      expiresAt <= committedAt ||
+      cursors.length < 2 ||
+      cursors.length > 3 ||
+      new Set(modes).size !== cursors.length ||
+      !modes.includes("adaptive-hot-review") ||
+      !modes.includes("adaptive-hot-review-probe")
+    ) {
+      return "invalid";
+    }
+    receipts.push({ reservationId, cursors, committedAt, expiresAt });
+  }
+  if (new Set(receipts.map((receipt) => receipt.reservationId)).size !== receipts.length) {
+    return "invalid";
+  }
+  return receipts;
+}
+
+function validAdaptiveHotReservationId(value: string): boolean {
+  return /^[A-Za-z0-9:._-]{1,300}$/.test(value);
 }
 
 function operationalCursorJson(cursor: OperationalCursor) {

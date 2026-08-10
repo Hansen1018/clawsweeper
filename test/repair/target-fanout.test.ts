@@ -9,6 +9,7 @@ import test from "node:test";
 import {
   SCHEDULED_REVIEW_PLAN_BATCH_SIZE,
   allocateReviewCandidateCapacity,
+  commitActiveAdaptiveHotCursors,
   defaultLimit,
   fetchFanoutCursor,
   filterEligibleRepositories,
@@ -590,53 +591,94 @@ test("adaptive observation availability is scoped to the current policy", () => 
 
 test("active adaptive fanout reserves every required cursor before dispatch", async () => {
   const requests: Array<{ url: string; body: string }> = [];
+  const events: string[] = [];
   let dispatched = false;
-  const reserveThenDispatch = async (succeeds: boolean) => {
-    await reserveActiveAdaptiveHotCursors({
+  let reservedCursors: Array<{
+    mode: string;
+    next_cursor: number;
+    expected_revision: number;
+  }> = [];
+  const reserveThenDispatch = async (reserveSucceeds: boolean, commitSucceeds = true) => {
+    const options = {
       baseUrl: "https://queue.example",
       webhookSecret: "reservation-secret",
+      reservationId: "500:1:hot-intake",
       legacy: { nextCursor: 20, expectedRevision: 3 },
       adaptive: { nextCursor: 8, expectedRevision: 4 },
       probe: { nextCursor: 2, expectedRevision: 5 },
       attempts: 1,
       fetchImpl: async (input, init) => {
+        const url = String(input);
         const body = String(init?.body || "");
-        requests.push({ url: String(input), body });
-        if (!succeeds) {
+        requests.push({ url, body });
+        if (url.endsWith("/commit")) {
+          events.push("commit");
+          if (!commitSucceeds) {
+            return Response.json(
+              { error: "adaptive_hot_cursor_reservation_missing" },
+              { status: 409 },
+            );
+          }
+          return Response.json(
+            {
+              ok: true,
+              cursors: reservedCursors.map((cursor) => ({
+                ok: true,
+                mode: cursor.mode,
+                next_cursor: cursor.next_cursor,
+                revision: cursor.expected_revision + 1,
+                updated_at: "2026-08-10T12:01:00.000Z",
+              })),
+            },
+            { status: 202 },
+          );
+        }
+        events.push("reserve");
+        if (!reserveSucceeds) {
           return Response.json({ error: "fanout_cursor_revision_conflict" }, { status: 409 });
         }
         const parsed = JSON.parse(body) as {
+          reservation_id: string;
           cursors: Array<{
             mode: string;
             next_cursor: number;
             expected_revision: number;
           }>;
         };
+        reservedCursors = parsed.cursors;
         return Response.json(
           {
             ok: true,
+            reservation_id: parsed.reservation_id,
+            reservation_expires_at: "2026-08-10T13:00:00.000Z",
             cursors: parsed.cursors.map((cursor) => ({
               ok: true,
               mode: cursor.mode,
               next_cursor: cursor.next_cursor,
-              revision: cursor.expected_revision + 1,
+              revision: cursor.expected_revision,
               updated_at: "2026-08-10T12:00:00.000Z",
             })),
           },
           { status: 202 },
         );
       },
-    });
+    };
+    await reserveActiveAdaptiveHotCursors(options);
+    events.push("dispatch");
     dispatched = true;
+    await commitActiveAdaptiveHotCursors(options);
   };
 
   await assert.rejects(reserveThenDispatch(false), /cursors did not reserve before dispatch/);
   assert.equal(requests.length, 1);
+  assert.deepEqual(events, ["reserve"]);
   assert.equal(dispatched, false);
 
   requests.length = 0;
+  events.length = 0;
   await reserveThenDispatch(true);
-  assert.equal(requests.length, 1);
+  assert.equal(requests.length, 2);
+  assert.deepEqual(events, ["reserve", "dispatch", "commit"]);
   assert.equal(
     requests[0]?.url,
     "https://queue.example/internal/state/cursors/adaptive-hot-reservation",
@@ -647,6 +689,13 @@ test("active adaptive fanout reserves every required cursor before dispatch", as
     ),
     ["hot-intake", "adaptive-hot-review", "adaptive-hot-review-probe"],
   );
+  assert.equal(dispatched, true);
+
+  requests.length = 0;
+  events.length = 0;
+  dispatched = false;
+  await assert.rejects(reserveThenDispatch(true, false), /cursors did not commit after dispatch/);
+  assert.deepEqual(events, ["reserve", "dispatch", "commit"]);
   assert.equal(dispatched, true);
 });
 

@@ -59,16 +59,18 @@ export async function putDurableCursor<Mode extends string>(
   };
 }
 
-export async function putDurableCursorBatch<Mode extends string>(
+export async function reserveDurableCursorBatch<Mode extends string>(
   options: Omit<DurableCursorStoreOptions<Mode>, "mode"> & {
+    reservationId: string;
     updates: readonly DurableCursorBatchUpdate<Mode>[];
   },
-): Promise<DurableCursorSnapshot<Mode>[]> {
+): Promise<{ cursors: DurableCursorSnapshot<Mode>[]; expiresAt: string }> {
   if (options.updates.length < 1 || options.updates.length > 3) {
     throw new Error("durable cursor batch must contain one to three updates");
   }
   const modes = new Set<string>();
   const body = JSON.stringify({
+    reservation_id: boundedIdentifier(options.reservationId, "durable cursor reservation id"),
     cursors: options.updates.map((update) => {
       if (!update.mode || modes.has(update.mode)) {
         throw new Error("durable cursor batch modes must be non-empty and unique");
@@ -90,7 +92,39 @@ export async function putDurableCursorBatch<Mode extends string>(
     body,
     "/internal/state/cursors/adaptive-hot-reservation",
   );
-  if (!Array.isArray(payload.cursors) || payload.cursors.length !== options.updates.length) {
+  const expiresAt =
+    typeof payload.reservation_expires_at === "string" ? payload.reservation_expires_at : "";
+  if (!Number.isFinite(Date.parse(expiresAt))) {
+    throw new Error("durable cursor reservation expiry is malformed");
+  }
+  return { cursors: cursorBatchResponse(payload, options.updates, modes), expiresAt };
+}
+
+export async function commitDurableCursorBatch<Mode extends string>(
+  options: Omit<DurableCursorStoreOptions<Mode>, "mode"> & {
+    reservationId: string;
+    updates: readonly DurableCursorBatchUpdate<Mode>[];
+  },
+): Promise<DurableCursorSnapshot<Mode>[]> {
+  const modes = new Set(options.updates.map((update) => update.mode));
+  const body = JSON.stringify({
+    reservation_id: boundedIdentifier(options.reservationId, "durable cursor reservation id"),
+  });
+  const payload = await durableCursorRequest(
+    options,
+    "PUT",
+    body,
+    "/internal/state/cursors/adaptive-hot-reservation/commit",
+  );
+  return cursorBatchResponse(payload, options.updates, modes);
+}
+
+function cursorBatchResponse<Mode extends string>(
+  payload: JsonRecord,
+  updates: readonly DurableCursorBatchUpdate<Mode>[],
+  modes: Set<string>,
+): DurableCursorSnapshot<Mode>[] {
+  if (!Array.isArray(payload.cursors) || payload.cursors.length !== updates.length) {
     throw new Error("durable cursor batch response is malformed");
   }
   const cursors = payload.cursors.map((value) => {
@@ -159,6 +193,12 @@ async function durableCursorRequest<Mode extends string>(
 function nonNegativeNumber(value: unknown, label: string): number {
   const parsed = Number(value);
   if (!Number.isSafeInteger(parsed) || parsed < 0) throw new Error(`${label} must be non-negative`);
+  return parsed;
+}
+
+function boundedIdentifier(value: unknown, label: string): string {
+  const parsed = typeof value === "string" ? value.trim() : "";
+  if (!/^[A-Za-z0-9:._-]{1,300}$/.test(parsed)) throw new Error(`${label} is invalid`);
   return parsed;
 }
 
