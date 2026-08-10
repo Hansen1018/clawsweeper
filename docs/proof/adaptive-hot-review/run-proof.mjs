@@ -399,10 +399,10 @@ async function assertCursors(updates, expectedCursor, expectedRevision) {
 async function startWorker(name) {
   const log = createWriteStream(path.join(outputDir, `${name}-wrangler.log`), { flags: "w" });
   const child = spawn(
-    "npx",
+    "pnpm",
     [
-      "--yes",
-      `wrangler@${wranglerVersion}`,
+      "exec",
+      "wrangler",
       "dev",
       "--config",
       "dashboard/wrangler.toml",
