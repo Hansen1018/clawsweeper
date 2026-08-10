@@ -168,8 +168,8 @@ try {
       duplicate_observations_sent: 2,
       stored_observations: finalSnapshot.adaptive_hot_review.observations.length,
       planned_and_duplicate_dispatched_decisions_sent: 3,
-      stored_decisions: finalSnapshot.adaptive_hot_review.decisions.length,
-      final_decision_status: finalSnapshot.adaptive_hot_review.decisions[0].status,
+      stored_decisions: finalSnapshot.adaptive_hot_review.recentDecisions.length,
+      final_decision_status: finalSnapshot.adaptive_hot_review.recentDecisions[0].status,
     },
     cursor_commit: {
       reservation_id: reservationId,
@@ -189,7 +189,7 @@ try {
     },
     public_snapshot: {
       bounded_observations: finalSnapshot.adaptive_hot_review.observations.length <= 100,
-      bounded_decisions: finalSnapshot.adaptive_hot_review.decisions.length <= 100,
+      bounded_decisions: finalSnapshot.adaptive_hot_review.recentDecisions.length <= 100,
       secret_absent: true,
       persistence_path_absent: true,
     },
@@ -379,8 +379,8 @@ async function publicSnapshot() {
 function assertAdaptiveSnapshot(snapshot, observationCount, decisionCount) {
   assert.equal(snapshot.adaptive_hot_review.observations.length, observationCount);
   assert.equal(snapshot.adaptive_hot_review.observations[0].targetRepo, "example/alpha");
-  assert.equal(snapshot.adaptive_hot_review.decisions.length, decisionCount);
-  assert.equal(snapshot.adaptive_hot_review.decisions[0].status, "dispatched");
+  assert.equal(snapshot.adaptive_hot_review.recentDecisions.length, decisionCount);
+  assert.equal(snapshot.adaptive_hot_review.recentDecisions[0].status, "dispatched");
 }
 
 async function assertCursors(updates, expectedCursor, expectedRevision) {
