@@ -1783,12 +1783,15 @@ jobs:
           DIRECT_PUBLICATION_SUPERSEDED: ${{ steps.direct-exact-review-publication.outputs.superseded }}
           DIRECT_LIFECYCLE_OUTCOME: ${{ steps.finalize-direct-exact-review-lifecycle.outcome }}
           DIRECT_LIFECYCLE_REQUEUE: ${{ steps.exact-review-generation-result.outputs.direct_lifecycle_requeue }}
+          SOURCE_ACTION: ${{ fromJSON(steps.claim-exact-review-queue.outputs.decision).sourceAction || '' }}
+          SCHEDULED_SEMANTIC_NOOP: ${{ steps.live-item.outputs.scheduled_semantic_noop || 'false' }}
           RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
           set -euo pipefail
           test -n "$QUEUE_LEASE_ID"
           queue_url="${QUEUE_URL%/}"
           payload="$(node -e '
+            const fs = require("node:fs");
             const runAttempt = Number(process.env.RUN_ATTEMPT);
             const protocolVersion = Number(process.env.PROTOCOL_VERSION);
             const leaseRevision = Number(process.env.QUEUE_LEASE_REVISION);
@@ -1820,6 +1823,18 @@ jobs:
             const directLifecycleRequeue =
               directPublicationCompleted && process.env.DIRECT_LIFECYCLE_REQUEUE === "true";
             if (requeueLatest && directLifecycleRequeue) process.exit(1);
+            let cacheMetrics = {};
+            try {
+              const path = "artifacts/event/review-cache-metrics.json";
+              if (fs.existsSync(path)) cacheMetrics = JSON.parse(fs.readFileSync(path, "utf8"));
+            } catch {}
+            const metric = (name) => {
+              const value = Number(cacheMetrics[name]);
+              return Number.isSafeInteger(value) && value >= 0 ? value : 0;
+            };
+            const scheduled = ["scheduled_hot_intake", "scheduled_normal_backfill"].includes(
+              process.env.SOURCE_ACTION,
+            );
             process.stdout.write(JSON.stringify({
               lease_id: process.env.QUEUE_LEASE_ID,
               ...(protocolVersion === 2
@@ -1841,6 +1856,18 @@ jobs:
                 : {}),
               ...(directLifecycleRequeue ? { direct_lifecycle_requeue: true } : {}),
               ...(retryAt ? { retry_at: retryAt } : {}),
+              ...(scheduled
+                ? {
+                    scheduled_observation: {
+                      earlyNoop: process.env.SCHEDULED_SEMANTIC_NOOP === "true",
+                      structuralHit: metric("structural_cache_hits"),
+                      semanticHit: metric("semantic_cache_hits"),
+                      contentHit: metric("content_cache_hits"),
+                      hydrated: metric("hydrations"),
+                      reviewRuntimeMs: 0,
+                    },
+                  }
+                : {}),
             }));
           ')"
           response_file="$(mktemp)"
@@ -3513,6 +3540,11 @@ jobs:
           FANOUT_MODE: ${{ github.event.schedule == '41/10 * * * *' && 'normal-review' || (github.event.schedule == '37 */6 * * *' && 'audit' || 'hot-intake') }}
           FANOUT_LIMIT: ${{ github.event.schedule == '41/10 * * * *' && '12' || (github.event.schedule == '37 */6 * * *' && '12' || '20') }}
           REVIEW_COVERAGE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
+          CLAWSWEEPER_ADAPTIVE_HOT_MODE: ${{ vars.CLAWSWEEPER_ADAPTIVE_HOT_MODE || 'legacy' }}
+          CLAWSWEEPER_ADAPTIVE_HOT_KILL_SWITCH: ${{ vars.CLAWSWEEPER_ADAPTIVE_HOT_KILL_SWITCH || '1' }}
+          CLAWSWEEPER_ADAPTIVE_HOT_ACTIVATION_APPROVAL: ${{ vars.CLAWSWEEPER_ADAPTIVE_HOT_ACTIVATION_APPROVAL || 'none' }}
+          CLAWSWEEPER_ADAPTIVE_HOT_ROLLOUT_PERCENT: ${{ vars.CLAWSWEEPER_ADAPTIVE_HOT_ROLLOUT_PERCENT || '100' }}
+          CLAWSWEEPER_ADAPTIVE_HOT_CANARY_REPOSITORIES: ${{ vars.CLAWSWEEPER_ADAPTIVE_HOT_CANARY_REPOSITORIES || '' }}
         run: |
           set -euo pipefail
           pnpm run target-fanout -- \
@@ -3980,7 +4012,7 @@ jobs:
 
       - name: Enqueue scheduled review candidates
         id: enqueue-scheduled
-        if: ${{ steps.mode.outputs.queue_feed == 'true' && steps.select.outputs.planned_count != '0' }}
+        if: ${{ steps.mode.outputs.queue_feed == 'true' }}
         working-directory: clawsweeper
         env:
           CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
@@ -4008,6 +4040,8 @@ jobs:
             --target-repo "$target_repo" \
             --target-branch "$target_branch" \
             --queue-url "$QUEUE_URL" \
+            --run-id "${{ github.run_id }}" \
+            --run-attempt "${{ github.run_attempt }}" \
             --delivery-prefix "scheduled:${{ github.run_id }}:${{ github.run_attempt }}")"
           jq -e '.offered >= .attempted and .attempted >= (.queued + .deduped + .shed + .rejected)' <<<"$result" >/dev/null
           {

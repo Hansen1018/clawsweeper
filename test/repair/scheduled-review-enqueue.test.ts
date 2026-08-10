@@ -109,6 +109,7 @@ test("scheduled review enqueue reports the full selection-to-queue funnel and st
     backpressured: 0,
     rejected: 0,
     deferred: 1,
+    observationPublished: false,
     ageHours: { p50: 6, p90: 240, max: 240 },
   });
   assert.equal(requests.length, 3);
@@ -184,4 +185,96 @@ test("scheduled review enqueue rejects cross-repository plan candidates", async 
     }),
     /candidate repository mismatch/,
   );
+});
+
+test("scheduled review enqueue publishes a signed zero-demand planner observation", async () => {
+  const secret = "adaptive-observation-secret";
+  const writes: Array<{ url: string; body: string; signature: string }> = [];
+  const summary = await enqueueScheduledReviewPlan({
+    plan: { candidates: [], selection: [], dueBacklog: 0 },
+    lane: "hot_intake",
+    targetRepo: "OpenClaw/ClawSweeper",
+    targetBranch: "main",
+    queueUrl: "https://queue.example",
+    secret,
+    deliveryPrefix: "scheduled:200:2",
+    observation: {
+      runId: "200",
+      runAttempt: 2,
+      policyVersion: "adaptive-hot-v1",
+      observedAtMs: Date.parse("2026-08-10T12:00:00Z"),
+    },
+    fetchImpl: async (input, init) => {
+      if (!init?.method) {
+        return Response.json({ scheduled_feed: { target_rate_per_hour: 300 } });
+      }
+      writes.push({
+        url: String(input),
+        body: String(init.body),
+        signature: new Headers(init.headers).get("x-clawsweeper-exact-review-signature") ?? "",
+      });
+      return Response.json({ ok: true, accepted: true }, { status: 202 });
+    },
+  });
+
+  assert.equal(summary.observationPublished, true);
+  assert.equal(writes.length, 1);
+  assert.equal(writes[0]?.url, "https://queue.example/internal/adaptive-hot-review/observation");
+  assert.equal(
+    writes[0]?.signature,
+    `sha256=${createHmac("sha256", secret).update(writes[0]!.body).digest("hex")}`,
+  );
+  assert.deepEqual(JSON.parse(writes[0]!.body), {
+    schemaVersion: "adaptive-hot-review-planner-observation/v1",
+    observationId: "200:2:hot_intake:openclaw/clawsweeper",
+    policyVersion: "adaptive-hot-v1",
+    runId: "200",
+    runAttempt: 2,
+    targetRepo: "openclaw/clawsweeper",
+    lane: "hot_intake",
+    observedAt: "2026-08-10T12:00:00.000Z",
+    windowStartedAt: "2026-08-10T12:00:00.000Z",
+    eligibleDue: 0,
+    selected: 0,
+    offered: 0,
+    attempted: 0,
+    admitted: 0,
+    deduped: 0,
+    shed: 0,
+    deferred: 0,
+    rejected: 0,
+    throttled: 0,
+    sourceNovelDue: 0,
+    oldestDueAt: null,
+    oldestUnservedAt: null,
+  });
+});
+
+test("planner observation failure does not undo valid queue dispositions", async () => {
+  const warnings: string[] = [];
+  const originalError = console.error;
+  console.error = (...values) => warnings.push(values.join(" "));
+  try {
+    const summary = await enqueueScheduledReviewPlan({
+      plan: { candidates: [] },
+      lane: "hot_intake",
+      targetRepo: "openclaw/clawsweeper",
+      targetBranch: "main",
+      queueUrl: "https://queue.example",
+      secret: "secret",
+      deliveryPrefix: "scheduled:201:1",
+      observation: { runId: "201", runAttempt: 1, policyVersion: "adaptive-hot-v1" },
+      fetchImpl: async (_input, init) => {
+        if (!init?.method) {
+          return Response.json({ scheduled_feed: { target_rate_per_hour: 300 } });
+        }
+        return Response.json({ error: "invalid_observation" }, { status: 400 });
+      },
+    });
+    assert.equal(summary.observationPublished, false);
+    assert.equal(summary.offered, 0);
+    assert.match(warnings.at(-1) ?? "", /observation did not publish/);
+  } finally {
+    console.error = originalError;
+  }
 });

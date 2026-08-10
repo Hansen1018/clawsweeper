@@ -81,6 +81,10 @@ import {
   type GitHubRateLimitHint,
   type GitHubRequestValidationDetail,
 } from "./github-api.ts";
+import {
+  AdaptiveHotReviewStore,
+  normalizeAdaptiveHotExecutionObservation,
+} from "./adaptive-hot-review.ts";
 
 const RECENT_DURABLE_PUBLICATION_EVENTS_CACHE_MS = 60_000;
 
@@ -555,6 +559,8 @@ type OperationalCursorMode =
   | "hot-intake"
   | "normal-review"
   | "audit"
+  | "adaptive-hot-review"
+  | "adaptive-hot-review-probe"
   | `review-placeholder-${string}-${"open" | "closed"}`;
 type OperationalCursor = {
   mode: OperationalCursorMode;
@@ -648,6 +654,7 @@ export class ExactReviewQueue {
   private stateWriterCoordinator;
   private lifecycleProjectionStore;
   private lifecycleTelemetryStore;
+  private adaptiveHotReviewStore;
   private readonly random: () => number;
   private readonly baselines = new WeakMap<ExactReviewQueueState, ExactReviewQueueBaseline>();
   private reviewCoverageCache: { at: number; summary: ReviewCoverageSummary } | null = null;
@@ -671,6 +678,7 @@ export class ExactReviewQueue {
     this.stateWriterCoordinator = new StateWriterCoordinator(this.storage);
     this.lifecycleProjectionStore = new ExactReviewLifecycleProjectionStore(this.storage);
     this.lifecycleTelemetryStore = new ExactReviewLifecycleTelemetryStore(this.storage);
+    this.adaptiveHotReviewStore = new AdaptiveHotReviewStore(this.storage);
     // Direct in-process users retain the established eager setup behavior.
     // A real Durable Object has blockConcurrencyWhile; defer that setup until a
     // non-Bay request so constructing it for the public pure reader cannot
@@ -705,6 +713,21 @@ export class ExactReviewQueue {
       this.storage.kv.put(REVIEW_COVERAGE_INVENTORY_KEY, inventory);
       this.reviewCoverageCache = null;
       return json({ ok: true, accepted: true }, 202);
+    }
+    if (request.method === "POST" && url.pathname === "/adaptive-hot-review/observation") {
+      const result = this.adaptiveHotReviewStore.recordPlannerObservation(
+        await request.json().catch(() => null),
+      );
+      return result.ok ? json(result, 202) : json({ error: result.error }, 400);
+    }
+    if (request.method === "POST" && url.pathname === "/adaptive-hot-review/decision") {
+      const result = this.adaptiveHotReviewStore.recordDecision(
+        await request.json().catch(() => null),
+      );
+      return result.ok ? json(result, 202) : json({ error: result.error }, 400);
+    }
+    if (request.method === "PUT" && url.pathname === "/cursors/adaptive-hot-reservation") {
+      return this.writeAdaptiveHotCursorReservation(await request.json().catch(() => null));
     }
     const operationalCursorMode = operationalCursorModeFromPath(url.pathname);
     if (operationalCursorMode && request.method === "GET") {
@@ -1779,6 +1802,13 @@ export class ExactReviewQueue {
       }
       const outcome = exactReviewCompletionOutcome(body.outcome, "success");
       if (!outcome) return json({ error: "invalid_outcome" }, 400);
+      const adaptiveHotExecutionObservation =
+        body.scheduled_observation === undefined
+          ? undefined
+          : normalizeAdaptiveHotExecutionObservation(body.scheduled_observation);
+      if (body.scheduled_observation !== undefined && !adaptiveHotExecutionObservation) {
+        console.warn("invalid adaptive hot-review execution observation ignored");
+      }
       const failureKind =
         body.failure_kind === undefined
           ? undefined
@@ -1897,6 +1927,9 @@ export class ExactReviewQueue {
         return json({ error: "lease_protocol_not_claimed" }, 409);
       }
       const publicationItem = exactReviewQueueIsPublication(item);
+      const scheduledLane = publicationItem
+        ? null
+        : exactReviewScheduledLane(item.leaseDecision ?? item.decision);
       // Optional observability cannot alter a valid publication completion.
       // Accept writer telemetry only from currently claimed publication items.
       if (publicationItem) {
@@ -2131,6 +2164,31 @@ export class ExactReviewQueue {
           : undefined,
         completionResult.deadLetter,
       );
+      if (scheduledLane && adaptiveHotExecutionObservation) {
+        try {
+          this.adaptiveHotReviewStore.recordExecution({
+            receiptId: `complete:${item.key}:${lifecycleRevision}:${lifecycleClaimGeneration}:${runId}:${runAttempt ?? 0}`,
+            targetRepo: lifecycleItem.decision.targetRepo,
+            lane: scheduledLane,
+            observedAt: now,
+            outcome:
+              outcome === "success" && !requeued && !completionResult.parked
+                ? "success"
+                : requeued || completionResult.parked
+                  ? "retried"
+                  : "failed",
+            observation: {
+              ...adaptiveHotExecutionObservation,
+              reviewRuntimeMs: Math.max(0, now - (item.claimedAt ?? now)),
+            },
+          });
+        } catch (error) {
+          console.warn(
+            "adaptive hot-review execution observation failed",
+            sanitizedServerError(error),
+          );
+        }
+      }
       this.recordLifecycleCompletion({
         item: lifecycleItem,
         revision: lifecycleRevision,
@@ -3209,6 +3267,7 @@ export class ExactReviewQueue {
         },
         delivery_receipts: this.deliveryReceiptCountSync(),
         scheduled_feed: this.scheduledReviewFeedStatusSync(now),
+        adaptive_hot_review: this.adaptiveHotReviewStore.snapshot(now),
         reservation_claim_observability: reservationClaimObservability,
         state_writer: { ...stateWriter, coordinator: stateWriterCoordinator },
         storage_schema_version: EXACT_REVIEW_QUEUE_STORAGE_SCHEMA_VERSION,
@@ -3312,6 +3371,86 @@ export class ExactReviewQueue {
       return json(operationalCursorJson(result.cursor), 202);
     } catch (error) {
       console.error(`fanout cursor write failed: ${sanitizedServerError(error)}`);
+      return json({ error: "fanout_cursor_store_unavailable" }, 503);
+    }
+  }
+
+  private writeAdaptiveHotCursorReservation(value: unknown) {
+    const body = objectValue(value);
+    const values = Array.isArray(body.cursors) ? body.cursors : [];
+    const cursors = values.map((value) => {
+      const cursor = objectValue(value);
+      return {
+        mode: String(cursor.mode || "") as OperationalCursorMode,
+        nextCursor: Number(cursor.next_cursor),
+        expectedRevision: Number(cursor.expected_revision),
+      };
+    });
+    const modes = cursors.map((cursor) => cursor.mode);
+    const allowedModes = new Set<OperationalCursorMode>([
+      "hot-intake",
+      "adaptive-hot-review",
+      "adaptive-hot-review-probe",
+    ]);
+    if (
+      cursors.length < 2 ||
+      cursors.length > 3 ||
+      new Set(modes).size !== cursors.length ||
+      !modes.includes("adaptive-hot-review") ||
+      !modes.includes("adaptive-hot-review-probe") ||
+      cursors.some(
+        (cursor) =>
+          !allowedModes.has(cursor.mode) ||
+          !Number.isSafeInteger(cursor.nextCursor) ||
+          cursor.nextCursor < 0 ||
+          !Number.isSafeInteger(cursor.expectedRevision) ||
+          cursor.expectedRevision < 0,
+      )
+    ) {
+      return json({ error: "invalid_adaptive_hot_cursor_reservation" }, 400);
+    }
+    try {
+      const result = this.storage.transactionSync(() => {
+        const current: OperationalCursor[] = [];
+        for (const cursor of cursors) {
+          const stored = readOperationalCursor(
+            this.storage.kv.get(operationalCursorKey(cursor.mode)),
+            cursor.mode,
+          );
+          if (stored === "invalid") return { kind: "invalid" as const };
+          current.push(stored ?? emptyOperationalCursor(cursor.mode));
+        }
+        if (current.some((cursor, index) => cursor.revision !== cursors[index]!.expectedRevision)) {
+          return { kind: "conflict" as const, current };
+        }
+        if (current.some((cursor) => cursor.revision >= Number.MAX_SAFE_INTEGER)) {
+          return { kind: "invalid" as const };
+        }
+        const updatedAt = Date.now();
+        const next: OperationalCursor[] = cursors.map((cursor, index) => ({
+          mode: cursor.mode,
+          nextCursor: cursor.nextCursor,
+          revision: current[index]!.revision + 1,
+          updatedAt,
+        }));
+        for (const cursor of next) {
+          this.storage.kv.put(operationalCursorKey(cursor.mode), cursor);
+        }
+        return { kind: "written" as const, cursors: next };
+      });
+      if (result.kind === "invalid") return json({ error: "fanout_cursor_store_invalid" }, 500);
+      if (result.kind === "conflict") {
+        return json(
+          {
+            error: "fanout_cursor_revision_conflict",
+            current: result.current.map(operationalCursorJson),
+          },
+          409,
+        );
+      }
+      return json({ ok: true, cursors: result.cursors.map(operationalCursorJson) }, 202);
+    } catch (error) {
+      console.error(`adaptive hot cursor reservation failed: ${sanitizedServerError(error)}`);
       return json({ error: "fanout_cursor_store_unavailable" }, 503);
     }
   }
@@ -7294,6 +7433,7 @@ export class ExactReviewQueue {
     this.stateWriterCoordinator.ensureSchemaSync();
     this.lifecycleProjectionStore.ensureSchemaSync();
     this.lifecycleTelemetryStore.ensureSchemaSync();
+    this.adaptiveHotReviewStore.ensureSchemaSync();
     let meta = this.readStorageMetaSync();
     let migratedLegacy = false;
     const legacy = this.storage.kv.get(EXACT_REVIEW_QUEUE_STATE_KEY) as
@@ -14564,7 +14704,7 @@ function objectValue(value) {
 
 function operationalCursorModeFromPath(path: string): OperationalCursorMode | null {
   const match =
-    /^\/cursors\/(hot-intake|normal-review|audit|review-placeholder-[a-f0-9]{16}-(?:open|closed))$/.exec(
+    /^\/cursors\/(hot-intake|normal-review|audit|adaptive-hot-review|adaptive-hot-review-probe|review-placeholder-[a-f0-9]{16}-(?:open|closed))$/.exec(
       path,
     );
   return (match?.[1] as OperationalCursorMode | undefined) ?? null;

@@ -439,14 +439,42 @@ test("repository identity is case-insensitively unique", () => {
   );
 });
 
-test("stage zero remains disconnected from every live fanout and queue surface", () => {
-  for (const path of [
-    "src/repair/target-fanout.ts",
-    "src/repair/scheduled-review-enqueue.ts",
-    "dashboard/exact-review-queue.ts",
-    "dashboard/worker.ts",
-    ".github/workflows/sweep.yml",
-  ]) {
-    assert.doesNotMatch(readFileSync(path, "utf8"), /adaptive-hot-allocation/);
-  }
+test("adaptive allocation is wired through the signed planner, queue, and fanout boundaries", () => {
+  assert.match(
+    readFileSync("src/repair/target-fanout.ts", "utf8"),
+    /allocateAdaptiveHotReviewCapacity/,
+  );
+  assert.match(
+    readFileSync("src/repair/scheduled-review-enqueue.ts", "utf8"),
+    /publishAdaptiveHotPlannerObservation/,
+  );
+  assert.match(
+    readFileSync("dashboard/exact-review-queue.ts", "utf8"),
+    /adaptive-hot-review\/decision/,
+  );
+  assert.match(
+    readFileSync("dashboard/worker.ts", "utf8"),
+    /internal\/adaptive-hot-review\/observation/,
+  );
+  const workflow = readFileSync(".github/workflows/sweep.yml", "utf8");
+  assert.match(workflow, /CLAWSWEEPER_ADAPTIVE_HOT_MODE/);
+  assert.match(workflow, /CLAWSWEEPER_ADAPTIVE_HOT_KILL_SWITCH/);
+});
+
+test("adaptive hot-review telemetry replays without a live queue or GitHub mutation", () => {
+  const output = execFileSync(
+    process.execPath,
+    ["scripts/evaluate-hot-allocation.mjs", "test/fixtures/adaptive-hot-allocation/replay.json"],
+    { encoding: "utf8" },
+  );
+  const replay = JSON.parse(output) as {
+    schemaVersion: string;
+    decision: { status: string; allocations: Array<{ targetRepo: string }> };
+  };
+  assert.equal(replay.schemaVersion, "adaptive-hot-review-replay-output/v1");
+  assert.equal(replay.decision.status, "allocated");
+  assert.deepEqual(
+    replay.decision.allocations.map((allocation) => allocation.targetRepo),
+    ["example/active", "example/unknown"],
+  );
 });

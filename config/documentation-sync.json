@@ -68,6 +68,39 @@
       ]
     },
     {
+      "path": "config/automation-limits.json",
+      "expect": {
+        "scheduled_review.adaptive_hot.default_mode": "legacy",
+        "scheduled_review.adaptive_hot.kill_switch_default": "true",
+        "scheduled_review.adaptive_hot.fairness_objective_ms": "86400000",
+        "scheduled_review.adaptive_hot.max_offer_budget": "30",
+        "scheduled_review.adaptive_hot.max_repositories": "20",
+        "scheduled_review.adaptive_hot.max_repository_candidates": "10",
+        "scheduled_review.adaptive_hot.shadow_min_duration_ms": "604800000",
+        "scheduled_review.adaptive_hot.shadow_min_cycles": "21",
+        "scheduled_review.adaptive_hot.canary_min_duration_ms": "86400000",
+        "scheduled_review.adaptive_hot.canary_min_cycles": "3"
+      },
+      "claims": [
+        {
+          "document": "docs/adaptive-hot-review.md",
+          "text": "The allocator selects no more than {{scheduled_review.adaptive_hot.max_repositories}} repositories. One repository receives no more than 25% of service capacity, with an integer minimum of one and an absolute cap of {{scheduled_review.adaptive_hot.max_repository_candidates}} candidates."
+        },
+        {
+          "document": "docs/adaptive-hot-review.md",
+          "text": "offer budget = min(ceil(service capacity * 1.5), {{scheduled_review.adaptive_hot.max_offer_budget}})"
+        },
+        {
+          "document": "docs/adaptive-hot-review.md",
+          "text": "at least {{scheduled_review.adaptive_hot.shadow_min_cycles}} durable shadow dispatch decisions spanning seven days"
+        },
+        {
+          "document": "docs/adaptive-hot-review.md",
+          "text": "at least {{scheduled_review.adaptive_hot.canary_min_cycles}} durable canary dispatch decisions spanning 24 hours"
+        }
+      ]
+    },
+    {
       "path": "config/target-repositories.json",
       "expect": {
         "generic_fallbacks.0.apply_close_rules.issue.0": "implemented_on_main",

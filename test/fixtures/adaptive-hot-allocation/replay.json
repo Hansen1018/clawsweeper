@@ -1,0 +1,116 @@
+{
+  "schemaVersion": "adaptive-hot-review-replay-input/v1",
+  "nowMs": 1786363200000,
+  "cursor": 0,
+  "probeCursor": 0,
+  "facts": {
+    "queueCapabilityAvailable": true,
+    "availableCandidateCapacity": 10,
+    "globalTokenBalance": 8,
+    "hotTokenBalance": 6,
+    "scheduledAdmissionThrottled": false,
+    "repositoryObservationsAvailable": true,
+    "activeCredentialCircuits": [],
+    "githubRequestMetricsUpdatedAt": "2026-08-10T11:55:00.000Z"
+  },
+  "repositories": [
+    { "targetRepo": "example/active" },
+    { "targetRepo": "example/quiet" },
+    { "targetRepo": "example/unknown" }
+  ],
+  "snapshot": {
+    "schemaVersion": "adaptive-hot-review-control-snapshot/v1",
+    "generatedAt": "2026-08-10T12:00:00.000Z",
+    "observations": [
+      {
+        "targetRepo": "example/active",
+        "lane": "hot_intake",
+        "policyVersion": "adaptive-hot-v1",
+        "observedAt": "2026-08-10T11:55:00.000Z",
+        "windowStartedAt": "2026-08-10T10:00:00.000Z",
+        "eligibleDue": 5,
+        "selected": 5,
+        "offered": 5,
+        "attempted": 5,
+        "admitted": 3,
+        "deduped": 1,
+        "shed": 0,
+        "deferred": 0,
+        "rejected": 0,
+        "throttled": 0,
+        "sourceNovelDue": 2,
+        "oldestDueAt": "2026-08-10T10:00:00.000Z",
+        "oldestUnservedAt": "2026-08-10T10:00:00.000Z",
+        "lastAdmittedAt": "2026-08-10T11:55:00.000Z",
+        "lastSuccessfulAt": "2026-08-10T11:58:00.000Z",
+        "plannerSamples": 3,
+        "executionSamples": 2,
+        "earlyNoop": 0,
+        "structuralHit": 1,
+        "semanticHit": 0,
+        "contentHit": 0,
+        "hydrated": 1,
+        "successful": 2,
+        "retried": 0,
+        "failed": 0,
+        "reviewRuntimeMs": 24000
+      },
+      {
+        "targetRepo": "example/quiet",
+        "lane": "hot_intake",
+        "policyVersion": "adaptive-hot-v1",
+        "observedAt": "2026-08-10T11:55:00.000Z",
+        "windowStartedAt": "2026-08-10T10:00:00.000Z",
+        "eligibleDue": 0,
+        "selected": 0,
+        "offered": 0,
+        "attempted": 0,
+        "admitted": 0,
+        "deduped": 0,
+        "shed": 0,
+        "deferred": 0,
+        "rejected": 0,
+        "throttled": 0,
+        "sourceNovelDue": 0,
+        "oldestDueAt": null,
+        "oldestUnservedAt": null,
+        "lastAdmittedAt": null,
+        "lastSuccessfulAt": null,
+        "plannerSamples": 3,
+        "executionSamples": 0,
+        "earlyNoop": 0,
+        "structuralHit": 0,
+        "semanticHit": 0,
+        "contentHit": 0,
+        "hydrated": 0,
+        "successful": 0,
+        "retried": 0,
+        "failed": 0,
+        "reviewRuntimeMs": 0
+      }
+    ],
+    "recentDecisions": [],
+    "readiness": {
+      "shadow": {
+        "firstDispatchedAt": null,
+        "lastDispatchedAt": null,
+        "dispatchedCycles": 0
+      },
+      "canary": {
+        "firstDispatchedAt": null,
+        "lastDispatchedAt": null,
+        "dispatchedCycles": 0
+      },
+      "full10": {
+        "firstDispatchedAt": null,
+        "lastDispatchedAt": null,
+        "dispatchedCycles": 0
+      },
+      "full50": {
+        "firstDispatchedAt": null,
+        "lastDispatchedAt": null,
+        "dispatchedCycles": 0
+      }
+    }
+  }
+}

@@ -296,6 +296,9 @@ test("review and apply primary boundaries ignore ledger-only failures", () => {
   assert.match(exactPrimary.run ?? "", /REVIEW_OUTCOME.*cancelled/);
   assert.match(exactPrimary.run ?? "", /PUBLICATION_QUEUE_OUTCOME.*success/);
   assert.match(exactQueue.env?.PRIMARY_OUTCOME ?? "", /exact-review-generation-result/);
+  assert.match(exactQueue.env?.SOURCE_ACTION ?? "", /sourceAction/);
+  assert.match(exactQueue.run ?? "", /review-cache-metrics\.json/);
+  assert.match(exactQueue.run ?? "", /scheduled_observation/);
   assert.doesNotMatch(exactQueue.run ?? "", /JOB_STATUS|job\.status/);
   assert.ok(exactSteps.indexOf(exactUpload) < exactSteps.indexOf(exactQueue));
   assert.ok(exactSteps.indexOf(exactUpload) < exactSteps.indexOf(exactPublicationQueue));
@@ -5340,8 +5343,12 @@ test("scheduled reviews feed the durable queue instead of one-item matrix worker
   assert.match(modeBlock, /requested_batch_size="\$queue_candidate_capacity"/);
   assert.match(modeBlock, /batch_size="\$requested_batch_size"[\s\S]*shard_count="1"/);
   assert.match(enqueueBlock, /repair:scheduled-review-enqueue/);
+  assert.match(enqueueBlock, /if: \$\{\{ steps\.mode\.outputs\.queue_feed == 'true' \}\}/);
+  assert.doesNotMatch(enqueueBlock, /planned_count != '0'/);
   assert.match(enqueueBlock, /gh api "repos\/\$target_repo" --jq '\.default_branch \/\/ empty'/);
   assert.match(enqueueBlock, /--target-branch "\$target_branch"/);
+  assert.match(enqueueBlock, /--run-id "\$\{\{ github\.run_id \}\}"/);
+  assert.match(enqueueBlock, /--run-attempt "\$\{\{ github\.run_attempt \}\}"/);
   assert.doesNotMatch(
     enqueueBlock,
     /--target-branch "\$\{\{ steps\.target\.outputs\.target_branch \}\}"/,
@@ -5410,6 +5417,18 @@ test("hot fleet fanout runs every 20 minutes without changing other schedules", 
   assert.match(
     fanoutBlock,
     /FANOUT_LIMIT: \$\{\{ github\.event\.schedule == '41\/10 \* \* \* \*' && '12' \|\| \(github\.event\.schedule == '37 \*\/6 \* \* \*' && '12' \|\| '20'\) \}\}/,
+  );
+  assert.match(
+    fanoutBlock,
+    /CLAWSWEEPER_ADAPTIVE_HOT_MODE: \$\{\{ vars\.CLAWSWEEPER_ADAPTIVE_HOT_MODE \|\| 'legacy' \}\}/,
+  );
+  assert.match(
+    fanoutBlock,
+    /CLAWSWEEPER_ADAPTIVE_HOT_KILL_SWITCH: \$\{\{ vars\.CLAWSWEEPER_ADAPTIVE_HOT_KILL_SWITCH \|\| '1' \}\}/,
+  );
+  assert.match(
+    fanoutBlock,
+    /CLAWSWEEPER_ADAPTIVE_HOT_ACTIVATION_APPROVAL: \$\{\{ vars\.CLAWSWEEPER_ADAPTIVE_HOT_ACTIVATION_APPROVAL \|\| 'none' \}\}/,
   );
 });
 

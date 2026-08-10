@@ -380,6 +380,25 @@ workflow dispatch, queue retry, replay, acknowledgement, or gate control.
 Expired circuit observations remain visible as `active: false` for diagnosis;
 new work resumes automatically after the deadline and bounded item jitter.
 
+## Adaptive Hot-Review Visibility
+
+`GET /api/exact-review-queue` includes an observer-only
+`adaptive_hot_review` snapshot. It contains the latest bounded planner funnel
+per repository and lane, aggregate scheduled execution/cache outcomes, the 100
+most recent proposed-versus-actual decisions, and shadow/canary readiness
+windows. The Durable Object retains no more than 640 decisions and 14 days of
+adaptive observations. Signed writes use
+`/internal/adaptive-hot-review/observation` and
+`/internal/adaptive-hot-review/decision`; the public status endpoint cannot
+write, activate, replay, or clear them.
+
+Use this surface to compare legacy and adaptive offer volume, fairness age,
+dedupe/shedding, no-op/cache rate, runtime, retry/error rate, token pressure,
+and active credential circuits. Publication depth is deliberately not a
+repository-demand signal. See
+[Adaptive scheduled hot review](adaptive-hot-review.md) for the sanitized
+offline replay format, activation gates, and one-variable kill-switch rollback.
+
 The standalone **State writer** panel separates the repo-wide serialization
 boundary from exact-review materialization telemetry. After the coordinator
 cutover, `state_writer.coordinator` is authoritative for the active writer,

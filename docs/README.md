@@ -20,6 +20,7 @@ manual.
 | Understand the product boundary                     | [Project vision](../VISION.md)                | [Orchestration](orchestration.md)                   |
 | Set up a development checkout                       | [Contributing](../CONTRIBUTING.md)            | [Local run](../README.md#local-run)                 |
 | Understand review and scheduling                    | [Scheduler](scheduler.md)                     | [Automation limits](limits.md)                      |
+| Operate adaptive hot review                         | [Adaptive scheduled hot review](adaptive-hot-review.md) | [Live dashboard](live-dashboard.md)          |
 | Add or operate a target repository                  | [Target repositories](target-repositories.md) | [Target dispatcher](target-dispatcher.md)           |
 | Inspect production without mutation                 | [Live dashboard](live-dashboard.md)           | [OpenClaw Bay](openclaw-bay-demo.md)                |
 | Inspect observer routes and configuration ownership | [Public observer API](public-api.md)          | [Operator configuration](operator-configuration.md) |
@@ -55,6 +56,8 @@ everything else requires human comparison with current main.
   and repair shape
 - [Scheduler](scheduler.md) — active and volatile; scheduled and exact-event
   execution behavior
+- [Adaptive scheduled hot review](adaptive-hot-review.md) — active but
+  default-disabled; allocation, observation, rollout, replay, and rollback
 - [State storage](state-storage.md) — active; Worker, R2, and Git-backed state
   ownership
 - [Action ledger](action-ledger.md) — active; mutation receipts and replay
@@ -69,6 +72,8 @@ everything else requires human comparison with current main.
 - [Target repositories](target-repositories.md) — active; profiles, generic
   fallbacks, inventory, and apply membership
 - [Target dispatcher](target-dispatcher.md) — active; exact-event integration
+- [Adaptive scheduled hot review](adaptive-hot-review.md) — active operator
+  controls for fleet hot-review allocation
 - [OpenClaw event hooks](openclaw-event-hooks.md) — active; event routes
 - [Local branch review](commit-sweeper.md) — active local/GitHub-isolated
   replacement for hosted commit review

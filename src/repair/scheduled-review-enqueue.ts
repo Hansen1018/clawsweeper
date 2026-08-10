@@ -2,6 +2,12 @@
 import { createHmac } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
+import { publishAdaptiveHotPlannerObservation } from "./adaptive-hot-control-plane.js";
+import {
+  ADAPTIVE_HOT_PLANNER_OBSERVATION_SCHEMA_VERSION,
+  type AdaptiveHotPlannerObservation,
+} from "./adaptive-hot-review-contract.js";
+import { readAdaptiveHotRuntimePolicy } from "./adaptive-hot-runtime.js";
 import { parseArgs } from "./lib.js";
 
 type ScheduledReviewLane = "hot_intake" | "normal_backfill";
@@ -15,7 +21,8 @@ type PlanCandidate = {
 
 type ScheduledReviewPlan = {
   candidates: PlanCandidate[];
-  selection?: Array<{ ageMs?: number }>;
+  selection?: Array<{ ageMs?: number; bucket?: string; nextDueAt?: string }>;
+  dueBacklog?: number;
 };
 
 export type ScheduledReviewEnqueueSummary = {
@@ -29,6 +36,7 @@ export type ScheduledReviewEnqueueSummary = {
   backpressured: number;
   rejected: number;
   deferred: number;
+  observationPublished: boolean;
   ageHours: { p50: number | null; p90: number | null; max: number | null };
 };
 
@@ -40,6 +48,12 @@ type EnqueueOptions = {
   queueUrl: string;
   secret: string;
   deliveryPrefix: string;
+  observation?: {
+    runId: string;
+    runAttempt: number;
+    policyVersion: string;
+    observedAtMs?: number;
+  };
   fetchImpl?: typeof fetch;
 };
 
@@ -88,6 +102,7 @@ export async function enqueueScheduledReviewPlan(
     backpressured: 0,
     rejected: 0,
     deferred: 0,
+    observationPublished: false,
     ageHours: {
       p50: percentileHours(0.5),
       p90: percentileHours(0.9),
@@ -143,6 +158,57 @@ export async function enqueueScheduledReviewPlan(
     }
   }
 
+  if (options.observation) {
+    const observedAtMs = options.observation.observedAtMs ?? Date.now();
+    const oldestAgeMs = ages.at(-1) ?? 0;
+    const oldestObservedAt = new Date(Math.max(0, observedAtMs - oldestAgeMs)).toISOString();
+    const sourceNovelDue = (options.plan.selection ?? []).filter(
+      (selection) => selection.bucket === "hot_issue" || selection.bucket === "hot_pull_request",
+    ).length;
+    const eligibleDue = Math.max(
+      options.plan.candidates.length,
+      nonNegativeInteger(options.plan.dueBacklog) ?? options.plan.candidates.length,
+    );
+    const unservedDue = Math.max(0, eligibleDue - summary.queued - summary.deduped);
+    const observation: AdaptiveHotPlannerObservation = {
+      schemaVersion: ADAPTIVE_HOT_PLANNER_OBSERVATION_SCHEMA_VERSION,
+      observationId: `${options.observation.runId}:${options.observation.runAttempt}:${options.lane}:${options.targetRepo.toLowerCase()}`,
+      policyVersion: options.observation.policyVersion,
+      runId: options.observation.runId,
+      runAttempt: options.observation.runAttempt,
+      targetRepo: options.targetRepo.toLowerCase(),
+      lane: options.lane,
+      observedAt: new Date(observedAtMs).toISOString(),
+      windowStartedAt: oldestObservedAt,
+      eligibleDue,
+      selected: options.plan.candidates.length,
+      offered: summary.offered,
+      attempted: summary.attempted,
+      admitted: summary.queued,
+      deduped: summary.deduped,
+      shed: summary.shed,
+      deferred: summary.deferred,
+      rejected: summary.rejected,
+      throttled: summary.rateLimited,
+      sourceNovelDue: Math.min(eligibleDue, sourceNovelDue),
+      oldestDueAt: eligibleDue > 0 ? oldestObservedAt : null,
+      oldestUnservedAt: unservedDue > 0 ? oldestObservedAt : null,
+    };
+    try {
+      await publishAdaptiveHotPlannerObservation({
+        queueUrl: options.queueUrl,
+        webhookSecret: options.secret,
+        observation,
+        fetchImpl,
+      });
+      summary.observationPublished = true;
+    } catch (error) {
+      console.error(
+        `[scheduled-review-enqueue] WARNING: adaptive observation did not publish; queue dispositions remain valid: ${errorMessage(error)}`,
+      );
+    }
+  }
+
   return summary;
 }
 
@@ -170,8 +236,17 @@ function readPlan(filePath: string): ScheduledReviewPlan {
   return {
     candidates: parsed.candidates as PlanCandidate[],
     ...(Array.isArray(parsed.selection)
-      ? { selection: parsed.selection as Array<{ ageMs?: number }> }
+      ? {
+          selection: parsed.selection as Array<{
+            ageMs?: number;
+            bucket?: string;
+            nextDueAt?: string;
+          }>,
+        }
       : {}),
+    ...(nonNegativeInteger(parsed.dueBacklog) === null
+      ? {}
+      : { dueBacklog: nonNegativeInteger(parsed.dueBacklog)! }),
   };
 }
 
@@ -185,6 +260,17 @@ function scheduledReviewLane(value: unknown): ScheduledReviewLane {
   throw new Error("--lane must be hot_intake or normal_backfill");
 }
 
+function nonNegativeInteger(value: unknown): number | null {
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null;
+}
+
+function errorMessage(error: unknown): string {
+  return (error instanceof Error ? error.message : String(error))
+    .replace(/[\r\n]+/g, " ")
+    .slice(0, 300);
+}
+
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
   const result = await enqueueScheduledReviewPlan({
@@ -195,6 +281,14 @@ async function main(): Promise<void> {
     queueUrl: requiredString(args["queue-url"], "--queue-url"),
     secret: requiredString(process.env.CLAWSWEEPER_WEBHOOK_SECRET, "CLAWSWEEPER_WEBHOOK_SECRET"),
     deliveryPrefix: requiredString(args["delivery-prefix"], "--delivery-prefix"),
+    observation: {
+      runId: requiredString(args["run-id"], "--run-id"),
+      runAttempt: Number(requiredString(args["run-attempt"], "--run-attempt")),
+      policyVersion:
+        typeof args["policy-version"] === "string" && args["policy-version"].trim()
+          ? args["policy-version"].trim()
+          : readAdaptiveHotRuntimePolicy().allocation.policyVersion,
+    },
   });
   process.stdout.write(`${JSON.stringify(result)}\n`);
 }

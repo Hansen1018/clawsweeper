@@ -564,8 +564,21 @@ export default {
       return authenticatedExactReviewQueueRequest(request, env, "/source-authority");
     if (url.pathname === "/internal/review-coverage/inventory" && request.method === "POST")
       return authenticatedExactReviewQueueRequest(request, env, "/review-coverage/inventory");
+    if (url.pathname === "/internal/adaptive-hot-review/observation" && request.method === "POST")
+      return authenticatedExactReviewQueueRequest(request, env, "/adaptive-hot-review/observation");
+    if (url.pathname === "/internal/adaptive-hot-review/decision" && request.method === "POST")
+      return authenticatedExactReviewQueueRequest(request, env, "/adaptive-hot-review/decision");
+    if (
+      url.pathname === "/internal/state/cursors/adaptive-hot-reservation" &&
+      request.method === "PUT"
+    )
+      return authenticatedExactReviewQueueCursorRequest(
+        request,
+        env,
+        "/cursors/adaptive-hot-reservation",
+      );
     const operationalCursorPath =
-      /^\/internal\/state\/cursors\/(hot-intake|normal-review|audit|review-placeholder-[a-f0-9]{16}-(?:open|closed))$/.exec(
+      /^\/internal\/state\/cursors\/(hot-intake|normal-review|audit|adaptive-hot-review|adaptive-hot-review-probe|review-placeholder-[a-f0-9]{16}-(?:open|closed))$/.exec(
         url.pathname,
       );
     if (operationalCursorPath && (request.method === "GET" || request.method === "PUT"))

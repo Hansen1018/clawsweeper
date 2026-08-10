@@ -43,6 +43,7 @@ import {
   lifecycleState,
 } from "../dashboard/exact-review-lifecycle.ts";
 import { ExactReviewLifecycleTelemetryStore } from "../dashboard/exact-review-lifecycle-telemetry.ts";
+import { AdaptiveHotReviewStore } from "../dashboard/adaptive-hot-review.ts";
 import { LIVE_ACTIVITY_SOURCE_LIMIT, liveActivityBaySnapshot } from "../dashboard/live-activity.ts";
 import { captureCanonicalRecordBaseline } from "../dist/repair/canonical-record-baseline.js";
 import { publishMainWithStateAppend } from "../dist/repair/publish-main.js";
@@ -6297,6 +6298,246 @@ test("authenticated fanout cursors round-trip through durable storage", async ()
   assert.deepEqual(await (await worker.fetch(request("GET"), env)).json(), written);
 });
 
+test("active adaptive cursor reservation is authenticated and atomic", async () => {
+  const storage = new MemoryDurableStorage();
+  const secret = "adaptive-cursor-reservation-secret";
+  let queue = new ExactReviewQueue({ storage }, {});
+  let env = {
+    CLAWSWEEPER_WEBHOOK_SECRET: secret,
+    EXACT_REVIEW_QUEUE: new MemoryDurableNamespace(queue),
+  };
+  const signedRequest = (path: string, method: "GET" | "PUT", payload?: unknown) => {
+    const body = method === "PUT" ? JSON.stringify(payload) : "";
+    return new Request(`https://clawsweeper.openclaw.ai${path}`, {
+      method,
+      headers: {
+        "content-type": "application/json",
+        "x-clawsweeper-exact-review-signature": `sha256=${createHmac("sha256", secret).update(body).digest("hex")}`,
+      },
+      ...(method === "PUT" ? { body } : {}),
+    });
+  };
+  const cursorPath = (mode: string) => `/internal/state/cursors/${mode}`;
+  for (const [mode, nextCursor] of [
+    ["hot-intake", 10],
+    ["adaptive-hot-review", 5],
+    ["adaptive-hot-review-probe", 2],
+  ] as const) {
+    assert.equal(
+      (
+        await worker.fetch(
+          signedRequest(cursorPath(mode), "PUT", {
+            next_cursor: nextCursor,
+            expected_revision: 0,
+          }),
+          env,
+        )
+      ).status,
+      202,
+    );
+  }
+  const reservationPath = "/internal/state/cursors/adaptive-hot-reservation";
+  const updates = [
+    { mode: "hot-intake", next_cursor: 20, expected_revision: 1 },
+    { mode: "adaptive-hot-review", next_cursor: 8, expected_revision: 1 },
+    { mode: "adaptive-hot-review-probe", next_cursor: 3, expected_revision: 1 },
+  ];
+  assert.equal(
+    (
+      await worker.fetch(
+        new Request(`https://clawsweeper.openclaw.ai${reservationPath}`, {
+          method: "PUT",
+          body: JSON.stringify({ cursors: updates }),
+        }),
+        env,
+      )
+    ).status,
+    401,
+  );
+  const conflict = await worker.fetch(
+    signedRequest(reservationPath, "PUT", {
+      cursors: updates.map((cursor) =>
+        cursor.mode === "adaptive-hot-review" ? { ...cursor, expected_revision: 9 } : cursor,
+      ),
+    }),
+    env,
+  );
+  assert.equal(conflict.status, 409);
+  for (const [mode, nextCursor] of [
+    ["hot-intake", 10],
+    ["adaptive-hot-review", 5],
+    ["adaptive-hot-review-probe", 2],
+  ] as const) {
+    const current = (await (
+      await worker.fetch(signedRequest(cursorPath(mode), "GET"), env)
+    ).json()) as { next_cursor: number; revision: number };
+    assert.deepEqual(
+      { nextCursor: current.next_cursor, revision: current.revision },
+      { nextCursor, revision: 1 },
+    );
+  }
+
+  const written = await worker.fetch(
+    signedRequest(reservationPath, "PUT", { cursors: updates }),
+    env,
+  );
+  assert.equal(written.status, 202);
+  const writtenBody = (await written.json()) as {
+    cursors: Array<{ mode: string; next_cursor: number; revision: number; updated_at: string }>;
+  };
+  assert.deepEqual(
+    writtenBody.cursors.map(({ mode, next_cursor, revision }) => ({
+      mode,
+      nextCursor: next_cursor,
+      revision,
+    })),
+    updates.map(({ mode, next_cursor }) => ({ mode, nextCursor: next_cursor, revision: 2 })),
+  );
+  assert.equal(new Set(writtenBody.cursors.map((cursor) => cursor.updated_at)).size, 1);
+
+  queue = new ExactReviewQueue({ storage }, {});
+  env = {
+    CLAWSWEEPER_WEBHOOK_SECRET: secret,
+    EXACT_REVIEW_QUEUE: new MemoryDurableNamespace(queue),
+  };
+  for (const update of updates) {
+    const current = (await (
+      await worker.fetch(signedRequest(cursorPath(update.mode), "GET"), env)
+    ).json()) as { next_cursor: number; revision: number };
+    assert.equal(current.next_cursor, update.next_cursor);
+    assert.equal(current.revision, 2);
+  }
+});
+
+test("signed adaptive hot-review telemetry routes through the Worker and survives restart", async () => {
+  const storage = new MemoryDurableStorage();
+  const secret = "adaptive-hot-route-secret";
+  let queue = new ExactReviewQueue({ storage }, {});
+  let env = {
+    CLAWSWEEPER_WEBHOOK_SECRET: secret,
+    EXACT_REVIEW_QUEUE: new MemoryDurableNamespace(queue),
+  };
+  const observation = adaptivePlannerObservation({
+    observationId: "410:1:hot_intake:openclaw/clawsweeper",
+    observedAt: new Date().toISOString(),
+    admitted: 1,
+  });
+  const body = JSON.stringify(observation);
+  const url = "https://clawsweeper.openclaw.ai/internal/adaptive-hot-review/observation";
+  assert.equal((await worker.fetch(new Request(url, { method: "POST", body }), env)).status, 401);
+  const accepted = await worker.fetch(
+    new Request(url, {
+      method: "POST",
+      body,
+      headers: {
+        "content-type": "application/json",
+        "x-clawsweeper-exact-review-signature": `sha256=${createHmac("sha256", secret).update(body).digest("hex")}`,
+      },
+    }),
+    env,
+  );
+  assert.equal(accepted.status, 202);
+
+  queue = new ExactReviewQueue({ storage }, {});
+  env = {
+    CLAWSWEEPER_WEBHOOK_SECRET: secret,
+    EXACT_REVIEW_QUEUE: new MemoryDurableNamespace(queue),
+  };
+  const status = await worker.fetch(
+    new Request("https://clawsweeper.openclaw.ai/api/exact-review-queue"),
+    env,
+  );
+  assert.equal(status.status, 200);
+  const snapshot = (await status.json()).adaptive_hot_review;
+  assert.equal(snapshot.observations.length, 1);
+  assert.equal(snapshot.observations[0].targetRepo, "openclaw/clawsweeper");
+});
+
+test("only a fenced scheduled lease completion records adaptive execution outcomes", async () => {
+  const storage = new MemoryDurableStorage();
+  const item = leasedExactReviewQueueItem(412, "4120");
+  item.decision.sourceAction = "scheduled_hot_intake";
+  item.leaseDecision.sourceAction = "scheduled_hot_intake";
+  await storage.put("exact-review-queue", { deliveries: {}, items: { [item.key]: item } });
+  const queue = new ExactReviewQueue({ storage }, {});
+  const observedAt = new Date().toISOString();
+  assert.equal(
+    (
+      await queue.fetch(
+        new Request("https://clawsweeper-exact-review-queue/adaptive-hot-review/observation", {
+          method: "POST",
+          body: JSON.stringify(
+            adaptivePlannerObservation({
+              observationId: "4120:1:hot_intake:openclaw/openclaw",
+              observedAt,
+              admitted: 1,
+              targetRepo: "openclaw/openclaw",
+            }),
+          ),
+        }),
+      )
+    ).status,
+    202,
+  );
+  const completed = await queue.fetch(
+    new Request("https://clawsweeper-exact-review-queue/complete", {
+      method: "POST",
+      body: JSON.stringify({
+        lease_id: item.leaseId,
+        item_key: item.key,
+        lease_revision: item.leaseRevision,
+        claim_generation: item.claimGeneration,
+        run_id: item.claimedRunId,
+        run_attempt: item.claimedRunAttempt,
+        outcome: "success",
+        scheduled_observation: {
+          earlyNoop: false,
+          structuralHit: 1,
+          semanticHit: 0,
+          contentHit: 0,
+          hydrated: 0,
+          reviewRuntimeMs: 0,
+        },
+      }),
+    }),
+  );
+  assert.equal(completed.status, 200);
+  const stats = await (
+    await queue.fetch(new Request("https://clawsweeper-exact-review-queue/stats"))
+  ).json();
+  assert.equal(stats.adaptive_hot_review.observations[0].executionSamples, 1);
+  assert.equal(stats.adaptive_hot_review.observations[0].structuralHit, 1);
+  assert.equal(stats.adaptive_hot_review.observations[0].successful, 1);
+
+  const replay = await queue.fetch(
+    new Request("https://clawsweeper-exact-review-queue/complete", {
+      method: "POST",
+      body: JSON.stringify({
+        lease_id: item.leaseId,
+        item_key: item.key,
+        lease_revision: item.leaseRevision,
+        claim_generation: item.claimGeneration,
+        run_id: item.claimedRunId,
+        run_attempt: item.claimedRunAttempt,
+        scheduled_observation: {
+          earlyNoop: false,
+          structuralHit: 99,
+          semanticHit: 0,
+          contentHit: 0,
+          hydrated: 0,
+          reviewRuntimeMs: 0,
+        },
+      }),
+    }),
+  );
+  assert.notEqual(replay.status, 200);
+  const afterReplay = await (
+    await queue.fetch(new Request("https://clawsweeper-exact-review-queue/stats"))
+  ).json();
+  assert.equal(afterReplay.adaptive_hot_review.observations[0].executionSamples, 1);
+  assert.equal(afterReplay.adaptive_hot_review.observations[0].structuralHit, 1);
+});
+
 test("placeholder recovery cursor survives queue reconstruction", async () => {
   const storage = new MemoryDurableStorage();
   const secret = "placeholder-cursor-secret";
@@ -11372,6 +11613,285 @@ class MemoryDurableNamespace {
   get() {
     return this.stub;
   }
+}
+
+test("adaptive hot-review observations and decisions are durable, bounded, and replayable", () => {
+  const now = Date.parse("2026-08-10T12:00:00Z");
+  const storage = new MemoryDurableStorage();
+  const store = new AdaptiveHotReviewStore(storage);
+  store.ensureSchemaSync();
+
+  const first = adaptivePlannerObservation({
+    observationId: "400:1:hot_intake:openclaw/clawsweeper",
+    observedAt: "2026-08-10T10:00:00.000Z",
+    admitted: 1,
+  });
+  assert.deepEqual(store.recordPlannerObservation(first, now), {
+    ok: true,
+    accepted: true,
+    duplicate: false,
+  });
+  assert.deepEqual(store.recordPlannerObservation(first, now), {
+    ok: true,
+    accepted: false,
+    duplicate: true,
+  });
+  assert.equal(
+    store.recordPlannerObservation(
+      adaptivePlannerObservation({
+        observationId: "401:1:hot_intake:openclaw/clawsweeper",
+        observedAt: "2026-08-10T11:00:00.000Z",
+        admitted: 0,
+      }),
+      now,
+    ).ok,
+    true,
+  );
+  store.recordExecution({
+    receiptId: "complete:openclaw/clawsweeper#1:1:1:400:1",
+    targetRepo: "openclaw/clawsweeper",
+    lane: "hot_intake",
+    observedAt: now - 30 * 60_000,
+    outcome: "success",
+    observation: {
+      earlyNoop: false,
+      structuralHit: 1,
+      semanticHit: 0,
+      contentHit: 0,
+      hydrated: 0,
+      reviewRuntimeMs: 12_000,
+    },
+  });
+  const planned = adaptiveDecisionRecord({ status: "planned", observedAt: now - 1_000 });
+  const dispatched = adaptiveDecisionRecord({ status: "dispatched", observedAt: now });
+  assert.equal(store.recordDecision(planned, now).accepted, true);
+  assert.equal(store.recordDecision(dispatched, now).updated, true);
+  assert.equal(store.recordDecision(planned, now).stale, true);
+  assert.equal(
+    store.recordDecision(
+      adaptiveDecisionRecord({
+        status: "dispatched",
+        observedAt: now - 2_000,
+        decisionId: "399:1:hot-intake",
+        policyVersion: "adaptive-hot-v0",
+      }),
+      now,
+    ).accepted,
+    true,
+  );
+  assert.equal(
+    store.recordDecision(
+      adaptiveDecisionRecord({
+        status: "dispatched",
+        observedAt: now - 500,
+        decisionId: "401:1:hot-intake",
+        proposedStatus: "queue_unavailable",
+      }),
+      now,
+    ).accepted,
+    true,
+  );
+  assert.equal(
+    store.recordDecision(
+      adaptiveDecisionRecord({
+        status: "dispatched",
+        observedAt: now - 24 * 60 * 60_000,
+        decisionId: "402:1:hot-intake",
+        mode: "full",
+        rolloutPercent: 10,
+      }),
+      now,
+    ).accepted,
+    true,
+  );
+  assert.equal(
+    store.recordDecision(
+      adaptiveDecisionRecord({
+        status: "dispatched",
+        observedAt: now,
+        decisionId: "403:1:hot-intake",
+        mode: "full",
+        rolloutPercent: 10,
+      }),
+      now,
+    ).accepted,
+    true,
+  );
+
+  const restarted = new AdaptiveHotReviewStore(storage);
+  restarted.ensureSchemaSync();
+  const snapshot = restarted.snapshot(now);
+  assert.equal(snapshot.observations.length, 1);
+  assert.deepEqual(snapshot.observations[0], {
+    targetRepo: "openclaw/clawsweeper",
+    lane: "hot_intake",
+    policyVersion: "adaptive-hot-v1",
+    observedAt: "2026-08-10T11:00:00.000Z",
+    windowStartedAt: "2026-08-10T10:00:00.000Z",
+    eligibleDue: 4,
+    selected: 2,
+    offered: 2,
+    attempted: 2,
+    admitted: 0,
+    deduped: 0,
+    shed: 0,
+    deferred: 0,
+    rejected: 0,
+    throttled: 0,
+    sourceNovelDue: 1,
+    oldestDueAt: "2026-08-10T10:00:00.000Z",
+    oldestUnservedAt: "2026-08-10T10:00:00.000Z",
+    lastAdmittedAt: "2026-08-10T10:00:00.000Z",
+    lastSuccessfulAt: "2026-08-10T11:30:00.000Z",
+    plannerSamples: 2,
+    executionSamples: 1,
+    earlyNoop: 0,
+    structuralHit: 1,
+    semanticHit: 0,
+    contentHit: 0,
+    hydrated: 0,
+    successful: 1,
+    retried: 0,
+    failed: 0,
+    reviewRuntimeMs: 12_000,
+  });
+  assert.equal(snapshot.recentDecisions.length, 5);
+  assert.equal(snapshot.readiness.policyVersion, "adaptive-hot-v1");
+  assert.equal(snapshot.readiness.shadow.dispatchedCycles, 1);
+  assert.equal(snapshot.readiness.full10.dispatchedCycles, 2);
+  assert.equal(snapshot.readiness.full50.dispatchedCycles, 0);
+});
+
+function adaptivePlannerObservation(overrides: {
+  observationId: string;
+  observedAt: string;
+  admitted: number;
+  targetRepo?: string;
+}) {
+  return {
+    schemaVersion: "adaptive-hot-review-planner-observation/v1",
+    observationId: overrides.observationId,
+    policyVersion: "adaptive-hot-v1",
+    runId: overrides.observationId.split(":", 1)[0],
+    runAttempt: 1,
+    targetRepo: overrides.targetRepo ?? "openclaw/clawsweeper",
+    lane: "hot_intake",
+    observedAt: overrides.observedAt,
+    windowStartedAt: "2026-08-10T10:00:00.000Z",
+    eligibleDue: 4,
+    selected: 2,
+    offered: 2,
+    attempted: 2,
+    admitted: overrides.admitted,
+    deduped: 0,
+    shed: 0,
+    deferred: 0,
+    rejected: 0,
+    throttled: 0,
+    sourceNovelDue: 1,
+    oldestDueAt: "2026-08-10T10:00:00.000Z",
+    oldestUnservedAt: "2026-08-10T10:00:00.000Z",
+  };
+}
+
+function adaptiveDecisionRecord(options: {
+  status: "planned" | "dispatched";
+  observedAt: number;
+  decisionId?: string;
+  mode?: "shadow" | "full";
+  rolloutPercent?: 10 | 50 | 100;
+  policyVersion?: string;
+  proposedStatus?: "allocated" | "queue_unavailable";
+  adaptiveActual?: boolean;
+}) {
+  const decisionId = options.decisionId ?? "400:1:hot-intake";
+  const mode = options.mode ?? "shadow";
+  return {
+    schemaVersion: "adaptive-hot-review-decision-record/v1",
+    decisionId,
+    runId: decisionId.split(":", 1)[0],
+    runAttempt: 1,
+    observedAt: new Date(options.observedAt).toISOString(),
+    requestedMode: mode,
+    effectiveMode: mode,
+    status: options.status,
+    policyVersion: options.policyVersion ?? "adaptive-hot-v1",
+    killSwitch: false,
+    activationApproval: "none",
+    rolloutPercent: options.rolloutPercent ?? 100,
+    canaryRepositories: [],
+    reason: "shadow_comparison",
+    legacyCursor: { input: 0, next: 1 },
+    adaptiveCursor: { input: 0, next: 1 },
+    adaptiveProbeCursor: { input: 0, next: 0 },
+    actual: [
+      {
+        targetRepo: "openclaw/clawsweeper",
+        candidateCapacity: 50,
+        source: (options.adaptiveActual ?? mode !== "shadow") ? "adaptive" : "legacy",
+      },
+    ],
+    proposed: {
+      schemaVersion: "adaptive-hot-allocation-decision/v1",
+      policyVersion: options.policyVersion ?? "adaptive-hot-v1",
+      status: options.proposedStatus ?? "allocated",
+      serviceCapacity: 10,
+      offerBudget: 15,
+      perRepositoryLimit: 3,
+      repositoryLimit: 20,
+      repositoriesConsidered: 1,
+      credentialBlockedRepositories: 0,
+      unknownProbeCount: 0,
+      allocations: [
+        {
+          targetRepo: "openclaw/clawsweeper",
+          candidateCapacity: 3,
+          initialReason: "ordinary_demand",
+          observationStatus: "fresh",
+        },
+      ],
+      allocationTrace: [
+        {
+          sequence: 1,
+          targetRepo: "openclaw/clawsweeper",
+          reason: "ordinary_demand",
+          candidateNumber: 1,
+        },
+      ],
+      unusedOfferBudget: 12,
+      inputCursor: 0,
+      nextCursor: 1,
+      cursorAdvanced: true,
+      inputProbeCursor: 0,
+      nextProbeCursor: 0,
+      probeCursorAdvanced: false,
+    },
+    control: {
+      queueCapabilityAvailable: true,
+      availableCandidateCapacity: 10,
+      globalTokenBalance: 10,
+      hotTokenBalance: 10,
+      scheduledAdmissionThrottled: false,
+      repositoryObservationsAvailable: true,
+      activeCredentialCircuits: [],
+      githubRequestMetricsUpdatedAt: null,
+    },
+    comparison: {
+      legacyRepositoryCount: 1,
+      legacyOfferBudget: 50,
+      adaptiveRepositoryCount: 1,
+      adaptiveOfferBudget: 3,
+      predictedOfferReduction: 47,
+      observedPlannerSamples: 2,
+      observedAttempted: 4,
+      observedDedupedOrShed: 0,
+      estimatedAvoidedDedupeOrShed: 0,
+      overdueRepositoriesBefore: 0,
+      overdueRepositoriesSelected: 0,
+      oldestUnservedAgeBeforeMs: null,
+      oldestUnservedAgeAfterProposalMs: null,
+    },
+  };
 }
 
 test("public durable publication event endpoint returns bounded aggregate-only window data", async () => {

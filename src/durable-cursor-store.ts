@@ -18,6 +18,12 @@ export type DurableCursorStoreOptions<Mode extends string = string> = {
   sleep?: (milliseconds: number) => Promise<void>;
 };
 
+export type DurableCursorBatchUpdate<Mode extends string = string> = {
+  mode: Mode;
+  nextCursor: number;
+  expectedRevision: number;
+};
+
 export async function fetchDurableCursor<Mode extends string>(
   options: DurableCursorStoreOptions<Mode>,
 ): Promise<DurableCursorSnapshot<Mode>> {
@@ -53,10 +59,65 @@ export async function putDurableCursor<Mode extends string>(
   };
 }
 
+export async function putDurableCursorBatch<Mode extends string>(
+  options: Omit<DurableCursorStoreOptions<Mode>, "mode"> & {
+    updates: readonly DurableCursorBatchUpdate<Mode>[];
+  },
+): Promise<DurableCursorSnapshot<Mode>[]> {
+  if (options.updates.length < 1 || options.updates.length > 3) {
+    throw new Error("durable cursor batch must contain one to three updates");
+  }
+  const modes = new Set<string>();
+  const body = JSON.stringify({
+    cursors: options.updates.map((update) => {
+      if (!update.mode || modes.has(update.mode)) {
+        throw new Error("durable cursor batch modes must be non-empty and unique");
+      }
+      modes.add(update.mode);
+      return {
+        mode: update.mode,
+        next_cursor: nonNegativeNumber(update.nextCursor, "durable cursor next_cursor"),
+        expected_revision: nonNegativeNumber(
+          update.expectedRevision,
+          "durable cursor expected_revision",
+        ),
+      };
+    }),
+  });
+  const payload = await durableCursorRequest(
+    options,
+    "PUT",
+    body,
+    "/internal/state/cursors/adaptive-hot-reservation",
+  );
+  if (!Array.isArray(payload.cursors) || payload.cursors.length !== options.updates.length) {
+    throw new Error("durable cursor batch response is malformed");
+  }
+  const cursors = payload.cursors.map((value) => {
+    const cursor = record(value, "durable cursor batch response item");
+    const mode = String(cursor.mode) as Mode;
+    if (!modes.has(mode)) throw new Error("durable cursor batch response mode mismatch");
+    return {
+      mode,
+      nextCursor: nonNegativeNumber(cursor.next_cursor, "durable cursor next_cursor"),
+      revision: nonNegativeNumber(cursor.revision, "durable cursor revision"),
+      updatedAt:
+        typeof cursor.updated_at === "string" || cursor.updated_at === null
+          ? cursor.updated_at
+          : null,
+    };
+  });
+  if (new Set(cursors.map((cursor) => cursor.mode)).size !== modes.size) {
+    throw new Error("durable cursor batch response modes are not unique");
+  }
+  return cursors;
+}
+
 async function durableCursorRequest<Mode extends string>(
-  options: DurableCursorStoreOptions<Mode>,
+  options: Omit<DurableCursorStoreOptions<Mode>, "mode"> & { mode?: Mode },
   method: "GET" | "PUT",
   body: string,
+  requestPath = `/internal/state/cursors/${encodeURIComponent(String(options.mode || ""))}`,
 ): Promise<JsonRecord> {
   const baseUrl = options.baseUrl.replace(/\/$/, "");
   if (!baseUrl.startsWith("https://")) throw new Error("durable cursor store URL must use HTTPS");
@@ -79,10 +140,7 @@ async function durableCursorRequest<Mode extends string>(
         signal: AbortSignal.timeout(5_000),
       };
       if (method === "PUT") init.body = body;
-      const response = await request(
-        `${baseUrl}/internal/state/cursors/${encodeURIComponent(options.mode)}`,
-        init,
-      );
+      const response = await request(`${baseUrl}${requestPath}`, init);
       const payload = record(await response.json().catch(() => ({})), "durable cursor response");
       if (response.ok && payload.ok === true) return payload;
       lastFailure =

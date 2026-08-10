@@ -203,6 +203,14 @@ manual workflow inputs. Scheduled fanout uses:
 - normal review: `41/10 * * * *`, 12 target repositories per cursor step
 - audit: `37 */6 * * *`, 12 target repositories per cursor step
 
+The hot value `20` is a repository limit, not a per-repository candidate
+budget. With the checked-in `legacy` mode and default-on adaptive kill switch,
+each selected repository still receives the normal 50-candidate planning
+window. The adaptive implementation can instead bound a whole-cycle offer by
+queue capacity and scheduled tokens, then cap one repository at 10 candidates;
+it remains inactive until maintainers complete the documented shadow/canary
+sequence. See [Adaptive scheduled hot review](adaptive-hot-review.md).
+
 [PR #1007](https://github.com/openclaw/clawsweeper/pull/1007) is directly
 relevant but was insufficient for the observed `openclaw/libterminal#41`
 path. It was intended to recognize structurally proven ClawSweeper-owned
@@ -240,6 +248,15 @@ not generated Git state. Reads and writes use a monotonic revision. If the
 canonical cursor endpoint is unavailable, fanout warns and continues dispatch
 from a safe default; cursor persistence failure after dispatch never fails the
 productive lane.
+
+Adaptive shadow comparisons keep that legacy fail-open behavior. Canary and
+full modes require the control snapshot and planned decision to be durable,
+then reserve the main adaptive cursor, probe cursor, and any legacy cursor used
+by a mixed cohort in one transactional write before dispatch. A failed or
+revision-conflicted reservation advances none of the cursors and dispatches
+nothing, so the next cycle cannot repeat or skip an adaptive slice. The
+default-on kill switch immediately returns the next cycle to legacy selection
+without clearing queued work or rewriting adaptive cursors.
 
 Normal fanout refreshes the same signed live-open inventory consumed by
 `GET /api/review-coverage`, and both normal and hot fanout skip repositories

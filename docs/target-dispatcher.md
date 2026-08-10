@@ -37,6 +37,13 @@ entry only when the repo needs explicit review guidance, toolchain settings, or
 different close rules. Dashboard and scheduled-fanout membership are configured
 separately.
 
+Scheduled membership does not grant a repository a fixed expensive-review
+share. The central hot-review fanout may collect signed planner observations
+and, only after separate maintainer activation, allocate its bounded candidate
+budget adaptively. Target repositories do not set those rollout variables and
+the target dispatcher does not participate in activation. See
+[Adaptive scheduled hot review](adaptive-hot-review.md).
+
 Exact event reviews enable related issue GitHub Search by default so newly
 opened issues get stronger duplicate and adjacent-report context. Set repository
 variable `CLAWSWEEPER_RELATED_GITHUB_SEARCH=0` on `openclaw/clawsweeper` to turn

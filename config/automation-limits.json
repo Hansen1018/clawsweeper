@@ -17,5 +17,29 @@
     "repair": {
       "cluster_max_live_runs": 2
     }
+  },
+  "scheduled_review": {
+    "adaptive_hot": {
+      "policy_version": "adaptive-hot-v1",
+      "default_mode": "legacy",
+      "kill_switch_default": true,
+      "fairness_objective_ms": 86400000,
+      "observation_max_age_ms": 21600000,
+      "over_offer_numerator": 3,
+      "over_offer_denominator": 2,
+      "max_offer_budget": 30,
+      "max_repositories": 20,
+      "unknown_probe_limit": 2,
+      "unavailable_observation_fallback_limit": 5,
+      "repository_share_numerator": 1,
+      "repository_share_denominator": 4,
+      "max_repository_candidates": 10,
+      "shadow_min_duration_ms": 604800000,
+      "shadow_min_cycles": 21,
+      "canary_min_duration_ms": 86400000,
+      "canary_min_cycles": 3,
+      "decision_retention_ms": 1209600000,
+      "decision_retention_max": 640
+    }
   }
 }

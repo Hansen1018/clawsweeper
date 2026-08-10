@@ -8,11 +8,30 @@ import { resolveCommand } from "../command.js";
 import {
   fetchDurableCursor,
   putDurableCursor,
+  putDurableCursorBatch,
   type DurableCursorSnapshot,
   type DurableCursorStoreOptions,
 } from "../durable-cursor-store.js";
 import { fetchExactReviewQueuePressure } from "../queue-pressure.js";
 import { coverageTrackedCountsFromManifest } from "../review-coverage-manifest.js";
+import { allocateAdaptiveHotReviewCapacity } from "./adaptive-hot-allocation.js";
+import {
+  fetchAdaptiveHotControlPlane,
+  publishAdaptiveHotDecision,
+} from "./adaptive-hot-control-plane.js";
+import type {
+  AdaptiveHotControlFacts,
+  AdaptiveHotDecisionRecord,
+  AdaptiveHotRepositoryObservationSnapshot,
+} from "./adaptive-hot-review-contract.js";
+import { ADAPTIVE_HOT_DECISION_RECORD_SCHEMA_VERSION } from "./adaptive-hot-review-contract.js";
+import {
+  assertAdaptiveHotActivationReady,
+  readAdaptiveHotRuntimePolicy,
+  resolveAdaptiveHotRuntimeOptions,
+  selectAdaptiveHotActualAllocations,
+  type AdaptiveHotRuntimeOptions,
+} from "./adaptive-hot-runtime.js";
 import { parseArgs, repoRoot } from "./lib.js";
 
 type JsonRecord = Record<string, unknown>;
@@ -101,7 +120,10 @@ interface FanoutOptions {
   ref: string;
   dryRun: boolean;
   owners: readonly string[] | undefined;
+  adaptive: AdaptiveHotRuntimeOptions;
 }
+
+type AdaptiveHotCursorMode = "adaptive-hot-review" | "adaptive-hot-review-probe";
 
 const PUBLIC_INVENTORY_TOKEN = "__public__";
 export const SCHEDULED_REVIEW_PLAN_BATCH_SIZE = 50;
@@ -110,6 +132,7 @@ export async function runTargetFanout(argv: string[]): Promise<void> {
   const args = parseArgs(argv);
   const mode = fanoutMode(stringArg(args.mode, "hot-intake"));
   const config = readInventoryConfig();
+  const adaptivePolicy = readAdaptiveHotRuntimePolicy();
   const options: FanoutOptions = {
     mode,
     limit: positiveNumber(stringArg(args.limit, defaultLimit(mode)), "limit"),
@@ -122,6 +145,29 @@ export async function runTargetFanout(argv: string[]): Promise<void> {
     ref: stringArg(args.ref, "main"),
     dryRun: Boolean(args["dry-run"]),
     owners: csvArg(args.owners),
+    adaptive: resolveAdaptiveHotRuntimeOptions({
+      policy: adaptivePolicy,
+      mode: stringArg(
+        args["adaptive-mode"],
+        process.env.CLAWSWEEPER_ADAPTIVE_HOT_MODE ?? adaptivePolicy.defaultMode,
+      ),
+      killSwitch: stringArg(
+        args["adaptive-kill-switch"],
+        process.env.CLAWSWEEPER_ADAPTIVE_HOT_KILL_SWITCH ?? "",
+      ),
+      activationApproval: stringArg(
+        args["adaptive-activation-approval"],
+        process.env.CLAWSWEEPER_ADAPTIVE_HOT_ACTIVATION_APPROVAL ?? "none",
+      ),
+      rolloutPercent: stringArg(
+        args["adaptive-rollout-percent"],
+        process.env.CLAWSWEEPER_ADAPTIVE_HOT_ROLLOUT_PERCENT ?? "100",
+      ),
+      canaryRepositories: stringArg(
+        args["adaptive-canary-repositories"],
+        process.env.CLAWSWEEPER_ADAPTIVE_HOT_CANARY_REPOSITORIES ?? "",
+      ),
+    }),
   };
 
   const repositories = await loadEligibleRepositories(config, options.owners);
@@ -200,6 +246,13 @@ export async function runTargetFanout(argv: string[]): Promise<void> {
     mode,
   });
   let selection: SelectionResult;
+  let adaptiveDecision: AdaptiveHotDecisionRecord | null = null;
+  let adaptiveCursor: (DurableCursorSnapshot<AdaptiveHotCursorMode> & { loaded: boolean }) | null =
+    null;
+  let adaptiveProbeCursor:
+    | (DurableCursorSnapshot<AdaptiveHotCursorMode> & { loaded: boolean })
+    | null = null;
+  let persistLegacyCursor = true;
   if (mode === "normal-review") {
     const fallbackCapacity =
       SCHEDULED_REVIEW_PLAN_BATCH_SIZE * Math.min(options.limit, planningRepositories.length);
@@ -213,6 +266,164 @@ export async function runTargetFanout(argv: string[]): Promise<void> {
       cursor: cursor.nextCursor,
       candidateCapacity: reviewCandidateCapacity,
     });
+  } else if (mode === "hot-intake" && options.adaptive.effectiveMode !== "legacy") {
+    const legacySelection = selectRepositories(planningRepositories, {
+      limit: options.limit,
+      cursor: cursor.nextCursor,
+    });
+    [adaptiveCursor, adaptiveProbeCursor] = await Promise.all([
+      loadAdaptiveHotCursor({
+        baseUrl: options.cursorStoreUrl,
+        webhookSecret: process.env.CLAWSWEEPER_WEBHOOK_SECRET ?? "",
+        mode: "adaptive-hot-review",
+      }),
+      loadAdaptiveHotCursor({
+        baseUrl: options.cursorStoreUrl,
+        webhookSecret: process.env.CLAWSWEEPER_WEBHOOK_SECRET ?? "",
+        mode: "adaptive-hot-review-probe",
+      }),
+    ]);
+    if (
+      options.adaptive.effectiveMode !== "shadow" &&
+      (!adaptiveCursor.loaded || !adaptiveProbeCursor.loaded)
+    ) {
+      throw new Error("adaptive hot-review cursors must be durable before active dispatch");
+    }
+    const control = await fetchAdaptiveHotControlPlane({ queueUrl: options.cursorStoreUrl });
+    if (!control.ok && options.adaptive.effectiveMode !== "shadow") {
+      throw new Error(`adaptive hot-review control plane unavailable: ${control.reason}`);
+    }
+    if (control.ok) {
+      assertAdaptiveHotActivationReady({
+        runtime: options.adaptive,
+        policy: adaptivePolicy,
+        control: control.snapshot,
+        nowMs: Date.now(),
+      });
+    }
+    const facts = control.ok ? control.facts : unavailableAdaptiveHotFacts();
+    const observationByRepository = control.ok
+      ? new Map(
+          control.snapshot.observations
+            .filter(
+              (observation) =>
+                observation.lane === "hot_intake" &&
+                observation.policyVersion === adaptivePolicy.allocation.policyVersion,
+            )
+            .map((observation) => [observation.targetRepo.toLowerCase(), observation] as const),
+        )
+      : new Map<string, AdaptiveHotRepositoryObservationSnapshot>();
+    const globalCredentialCircuit = facts.activeCredentialCircuits.some(
+      (circuit) => circuit.scope === "repository_actions",
+    );
+    const proposed = allocateAdaptiveHotReviewCapacity({
+      nowMs: Date.now(),
+      cursor: adaptiveCursor.nextCursor,
+      probeCursor: adaptiveProbeCursor.nextCursor,
+      queueCapabilityAvailable: facts.queueCapabilityAvailable,
+      availableCandidateCapacity: facts.availableCandidateCapacity,
+      globalTokenBalance: facts.globalTokenBalance,
+      hotTokenBalance: facts.hotTokenBalance,
+      scheduledAdmissionThrottled: facts.scheduledAdmissionThrottled || globalCredentialCircuit,
+      repositoryObservationsAvailable: facts.repositoryObservationsAvailable,
+      repositories: planningRepositories.map((repository) => {
+        const observation = observationByRepository.get(repository.targetRepo.toLowerCase());
+        const owner = repository.targetRepo.split("/", 1)[0]?.toLowerCase() ?? "";
+        return {
+          targetRepo: repository.targetRepo,
+          observation: observation ? allocatorObservation(observation) : null,
+          credentialBlocked: facts.activeCredentialCircuits.some(
+            (circuit) => circuit.scope === "target_app" && circuit.targetOwner === owner,
+          ),
+        };
+      }),
+      policy: adaptivePolicy.allocation,
+    });
+    const legacy = legacySelection.repositories.map((repository) => ({
+      targetRepo: repository.targetRepo,
+      candidateCapacity: SCHEDULED_REVIEW_PLAN_BATCH_SIZE,
+    }));
+    const proposedAllocations = proposed.allocations.map((repository) => ({
+      targetRepo: repository.targetRepo,
+      candidateCapacity: repository.candidateCapacity,
+    }));
+    const actual =
+      options.adaptive.effectiveMode !== "shadow" &&
+      (proposed.status === "scheduled_throttle" ||
+        proposed.status === "queue_unavailable" ||
+        proposed.status === "no_capacity")
+        ? []
+        : selectAdaptiveHotActualAllocations({
+            runtime: options.adaptive,
+            legacy,
+            proposed: proposedAllocations,
+          });
+    const repositoryByName = new Map(
+      planningRepositories.map((repository) => [repository.targetRepo.toLowerCase(), repository]),
+    );
+    selection = {
+      repositories: actual.flatMap((allocation) => {
+        const repository = repositoryByName.get(allocation.targetRepo.toLowerCase());
+        return repository
+          ? [{ ...repository, candidateCapacity: allocation.candidateCapacity }]
+          : [];
+      }),
+      cursor:
+        options.adaptive.effectiveMode === "full" && options.adaptive.rolloutPercent === 100
+          ? proposed.nextCursor
+          : legacySelection.cursor,
+      total: planningRepositories.length,
+    };
+    persistLegacyCursor = !(
+      options.adaptive.effectiveMode === "full" && options.adaptive.rolloutPercent === 100
+    );
+    if (options.adaptive.effectiveMode !== "shadow" && persistLegacyCursor && !cursor.loaded) {
+      throw new Error("legacy hot-intake cursor must be durable before active adaptive dispatch");
+    }
+    const runId = stringArg(args["run-id"], process.env.GITHUB_RUN_ID ?? "0");
+    const runAttempt = positiveNumber(
+      stringArg(args["run-attempt"], process.env.GITHUB_RUN_ATTEMPT ?? "1"),
+      "run-attempt",
+    );
+    adaptiveDecision = {
+      schemaVersion: ADAPTIVE_HOT_DECISION_RECORD_SCHEMA_VERSION,
+      decisionId: `${runId}:${runAttempt}:hot-intake`,
+      runId,
+      runAttempt,
+      observedAt: new Date().toISOString(),
+      requestedMode: options.adaptive.requestedMode,
+      effectiveMode: options.adaptive.effectiveMode,
+      status: "planned",
+      policyVersion: adaptivePolicy.allocation.policyVersion,
+      killSwitch: options.adaptive.killSwitch,
+      activationApproval: options.adaptive.activationApproval,
+      rolloutPercent: options.adaptive.rolloutPercent,
+      canaryRepositories: options.adaptive.canaryRepositories,
+      reason: adaptiveHotDecisionReason(options.adaptive, proposed.status),
+      legacyCursor: { input: cursor.nextCursor, next: legacySelection.cursor },
+      adaptiveCursor: { input: adaptiveCursor.nextCursor, next: proposed.nextCursor },
+      adaptiveProbeCursor: {
+        input: adaptiveProbeCursor.nextCursor,
+        next: proposed.nextProbeCursor,
+      },
+      actual,
+      proposed,
+      control: facts,
+      comparison: adaptiveHotDecisionComparison({
+        nowMs: Date.now(),
+        fairnessObjectiveMs: adaptivePolicy.allocation.fairnessObjectiveMs,
+        legacy,
+        proposed,
+        observations: [...observationByRepository.values()],
+      }),
+    };
+    if (args._[0] !== "plan" && !options.dryRun) {
+      await publishAdaptiveHotDecisionForMode(
+        adaptiveDecision,
+        options.adaptive,
+        options.cursorStoreUrl,
+      );
+    }
   } else {
     selection = selectRepositories(planningRepositories, {
       limit: options.limit,
@@ -225,8 +436,44 @@ export async function runTargetFanout(argv: string[]): Promise<void> {
   );
 
   if (args._[0] === "plan") {
-    process.stdout.write(`${JSON.stringify({ ...selection, commands }, null, 2)}\n`);
+    process.stdout.write(
+      `${JSON.stringify({ ...selection, commands, adaptive_hot_review: adaptiveDecision }, null, 2)}\n`,
+    );
     return;
+  }
+
+  let cursorPersisted = false;
+  let adaptiveCursorPersisted = false;
+  let adaptiveProbeCursorPersisted = false;
+  let adaptiveCursorCycleDurable = true;
+  const activeAdaptiveCycle =
+    adaptiveDecision !== null && options.adaptive.effectiveMode !== "shadow";
+  if (
+    !options.dryRun &&
+    activeAdaptiveCycle &&
+    adaptiveDecision &&
+    adaptiveCursor &&
+    adaptiveProbeCursor
+  ) {
+    const decisionToReserve = adaptiveDecision;
+    const reservation = await reserveActiveAdaptiveHotCursors({
+      baseUrl: options.cursorStoreUrl,
+      webhookSecret: process.env.CLAWSWEEPER_WEBHOOK_SECRET ?? "",
+      legacy: persistLegacyCursor
+        ? { nextCursor: selection.cursor, expectedRevision: cursor.revision }
+        : null,
+      adaptive: {
+        nextCursor: decisionToReserve.adaptiveCursor.next,
+        expectedRevision: adaptiveCursor.revision,
+      },
+      probe: {
+        nextCursor: decisionToReserve.adaptiveProbeCursor.next,
+        expectedRevision: adaptiveProbeCursor.revision,
+      },
+    });
+    cursorPersisted = reservation.legacy;
+    adaptiveCursorPersisted = reservation.adaptive;
+    adaptiveProbeCursorPersisted = reservation.probe;
   }
 
   const dispatched: string[] = [];
@@ -241,17 +488,65 @@ export async function runTargetFanout(argv: string[]): Promise<void> {
     dispatched.push(repository.targetRepo);
   }
 
-  const cursorPersisted = options.dryRun
-    ? false
-    : await persistFanoutCursorFailOpen(
-        {
-          baseUrl: options.cursorStoreUrl,
-          webhookSecret: process.env.CLAWSWEEPER_WEBHOOK_SECRET ?? "",
-          mode,
-        },
-        selection.cursor,
-        cursor.revision,
+  if (!options.dryRun && persistLegacyCursor && !activeAdaptiveCycle) {
+    cursorPersisted = await persistFanoutCursorFailOpen(
+      {
+        baseUrl: options.cursorStoreUrl,
+        webhookSecret: process.env.CLAWSWEEPER_WEBHOOK_SECRET ?? "",
+        mode,
+      },
+      selection.cursor,
+      cursor.revision,
+    );
+  }
+  if (
+    !options.dryRun &&
+    !activeAdaptiveCycle &&
+    adaptiveDecision &&
+    adaptiveCursor &&
+    adaptiveProbeCursor
+  ) {
+    adaptiveCursorPersisted = await persistAdaptiveHotCursor(
+      {
+        baseUrl: options.cursorStoreUrl,
+        webhookSecret: process.env.CLAWSWEEPER_WEBHOOK_SECRET ?? "",
+        mode: "adaptive-hot-review",
+      },
+      adaptiveDecision.adaptiveCursor.next,
+      adaptiveCursor.revision,
+      adaptiveDecision.adaptiveCursor.next !== adaptiveDecision.adaptiveCursor.input,
+    );
+    adaptiveProbeCursorPersisted = await persistAdaptiveHotCursor(
+      {
+        baseUrl: options.cursorStoreUrl,
+        webhookSecret: process.env.CLAWSWEEPER_WEBHOOK_SECRET ?? "",
+        mode: "adaptive-hot-review-probe",
+      },
+      adaptiveDecision.adaptiveProbeCursor.next,
+      adaptiveProbeCursor.revision,
+      adaptiveDecision.adaptiveProbeCursor.next !== adaptiveDecision.adaptiveProbeCursor.input,
+    );
+    adaptiveCursorCycleDurable =
+      (adaptiveCursorPersisted || !adaptiveDecision.proposed.cursorAdvanced) &&
+      (adaptiveProbeCursorPersisted || !adaptiveDecision.proposed.probeCursorAdvanced);
+    if (!adaptiveCursorCycleDurable) {
+      console.error(
+        "[target-fanout] WARNING: adaptive shadow dispatch remains legacy-authoritative, but this comparison will not count toward readiness because its cursor did not persist",
       );
+    }
+  }
+  if (adaptiveDecision && !options.dryRun && adaptiveCursorCycleDurable) {
+    adaptiveDecision = {
+      ...adaptiveDecision,
+      status: "dispatched",
+      observedAt: new Date().toISOString(),
+    };
+    await publishAdaptiveHotDecisionForMode(
+      adaptiveDecision,
+      options.adaptive,
+      options.cursorStoreUrl,
+    );
+  }
   process.stdout.write(
     `${JSON.stringify(
       {
@@ -262,6 +557,9 @@ export async function runTargetFanout(argv: string[]): Promise<void> {
         dry_run: options.dryRun,
         cursor_loaded: cursor.loaded,
         cursor_persisted: cursorPersisted,
+        adaptive_cursor_persisted: adaptiveCursorPersisted,
+        adaptive_probe_cursor_persisted: adaptiveProbeCursorPersisted,
+        adaptive_hot_review: adaptiveDecision,
         review_candidate_capacity: reviewCandidateCapacity,
         candidate_batches: Object.fromEntries(
           selection.repositories.flatMap((repository) =>
@@ -275,6 +573,223 @@ export async function runTargetFanout(argv: string[]): Promise<void> {
       2,
     )}\n`,
   );
+}
+
+export async function reserveActiveAdaptiveHotCursors(options: {
+  baseUrl: string;
+  webhookSecret: string;
+  legacy: { nextCursor: number; expectedRevision: number } | null;
+  adaptive: { nextCursor: number; expectedRevision: number };
+  probe: { nextCursor: number; expectedRevision: number };
+  attempts?: number;
+  fetchImpl?: typeof fetch;
+  sleep?: (milliseconds: number) => Promise<void>;
+}): Promise<{ legacy: boolean; adaptive: true; probe: true }> {
+  try {
+    await putDurableCursorBatch({
+      baseUrl: options.baseUrl,
+      webhookSecret: options.webhookSecret,
+      ...(options.attempts === undefined ? {} : { attempts: options.attempts }),
+      ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
+      ...(options.sleep ? { sleep: options.sleep } : {}),
+      updates: [
+        ...(options.legacy
+          ? [
+              {
+                mode: "hot-intake" as const,
+                nextCursor: options.legacy.nextCursor,
+                expectedRevision: options.legacy.expectedRevision,
+              },
+            ]
+          : []),
+        {
+          mode: "adaptive-hot-review" as const,
+          nextCursor: options.adaptive.nextCursor,
+          expectedRevision: options.adaptive.expectedRevision,
+        },
+        {
+          mode: "adaptive-hot-review-probe" as const,
+          nextCursor: options.probe.nextCursor,
+          expectedRevision: options.probe.expectedRevision,
+        },
+      ],
+    });
+  } catch (error) {
+    throw new Error(
+      `adaptive hot-review cursors did not reserve before dispatch: ${errorMessage(error)}`,
+    );
+  }
+  return { legacy: options.legacy !== null, adaptive: true, probe: true };
+}
+
+function unavailableAdaptiveHotFacts(): AdaptiveHotControlFacts {
+  return {
+    queueCapabilityAvailable: false,
+    availableCandidateCapacity: 0,
+    globalTokenBalance: 0,
+    hotTokenBalance: 0,
+    scheduledAdmissionThrottled: false,
+    repositoryObservationsAvailable: false,
+    activeCredentialCircuits: [],
+    githubRequestMetricsUpdatedAt: null,
+  };
+}
+
+function adaptiveHotDecisionComparison(options: {
+  nowMs: number;
+  fairnessObjectiveMs: number;
+  legacy: Array<{ targetRepo: string; candidateCapacity: number }>;
+  proposed: AdaptiveHotDecisionRecord["proposed"];
+  observations: AdaptiveHotRepositoryObservationSnapshot[];
+}): AdaptiveHotDecisionRecord["comparison"] {
+  const legacyOfferBudget = options.legacy.reduce(
+    (total, repository) => total + repository.candidateCapacity,
+    0,
+  );
+  const adaptiveOfferBudget = options.proposed.allocations.reduce(
+    (total, repository) => total + repository.candidateCapacity,
+    0,
+  );
+  const predictedOfferReduction = Math.max(0, legacyOfferBudget - adaptiveOfferBudget);
+  const observedPlannerSamples = options.observations.reduce(
+    (total, observation) => total + observation.plannerSamples,
+    0,
+  );
+  const observedAttempted = options.observations.reduce(
+    (total, observation) => total + observation.attempted,
+    0,
+  );
+  const observedDedupedOrShed = options.observations.reduce(
+    (total, observation) => total + observation.deduped + observation.shed,
+    0,
+  );
+  const allocationByRepository = new Map(
+    options.proposed.allocations.map((allocation) => [
+      allocation.targetRepo.toLowerCase(),
+      allocation.candidateCapacity,
+    ]),
+  );
+  const overdue = options.observations.flatMap((observation) => {
+    const oldestUnservedAtMs = nullableTimestampMs(observation.oldestUnservedAt);
+    const ageMs = oldestUnservedAtMs === null ? null : options.nowMs - oldestUnservedAtMs;
+    return ageMs !== null && ageMs >= options.fairnessObjectiveMs ? [{ observation, ageMs }] : [];
+  });
+  const overdueAfter = overdue.filter(({ observation }) => {
+    const allocation = allocationByRepository.get(observation.targetRepo.toLowerCase()) ?? 0;
+    return observation.eligibleDue > allocation;
+  });
+  return {
+    legacyRepositoryCount: options.legacy.length,
+    legacyOfferBudget,
+    adaptiveRepositoryCount: options.proposed.allocations.length,
+    adaptiveOfferBudget,
+    predictedOfferReduction,
+    observedPlannerSamples,
+    observedAttempted,
+    observedDedupedOrShed,
+    estimatedAvoidedDedupeOrShed:
+      observedAttempted > 0
+        ? Math.floor((predictedOfferReduction * observedDedupedOrShed) / observedAttempted)
+        : null,
+    overdueRepositoriesBefore: overdue.length,
+    overdueRepositoriesSelected: overdue.filter(({ observation }) =>
+      allocationByRepository.has(observation.targetRepo.toLowerCase()),
+    ).length,
+    oldestUnservedAgeBeforeMs:
+      overdue.length > 0 ? Math.max(...overdue.map(({ ageMs }) => ageMs)) : null,
+    oldestUnservedAgeAfterProposalMs:
+      overdueAfter.length > 0 ? Math.max(...overdueAfter.map(({ ageMs }) => ageMs)) : null,
+  };
+}
+
+function allocatorObservation(observation: AdaptiveHotRepositoryObservationSnapshot) {
+  const observedAtMs = Date.parse(observation.observedAt);
+  const oldestDueAtMs = nullableTimestampMs(observation.oldestDueAt);
+  const oldestUnservedAtMs = nullableTimestampMs(observation.oldestUnservedAt);
+  const lastAdmittedAtMs = nullableTimestampMs(observation.lastAdmittedAt);
+  return {
+    observedAtMs,
+    eligibleDue: observation.eligibleDue,
+    sourceNovelDue: observation.sourceNovelDue,
+    oldestDueAtMs,
+    oldestUnservedAtMs,
+    lastAdmittedAtMs,
+    reviewRuntimeMs:
+      observation.executionSamples > 0
+        ? Math.floor(observation.reviewRuntimeMs / observation.executionSamples)
+        : null,
+  };
+}
+
+function nullableTimestampMs(value: string | null): number | null {
+  if (!value) return null;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function adaptiveHotDecisionReason(
+  runtime: AdaptiveHotRuntimeOptions,
+  proposedStatus: string,
+): string {
+  if (runtime.killSwitch) return "kill_switch";
+  if (proposedStatus !== "allocated" && proposedStatus !== "observation_fallback") {
+    return proposedStatus;
+  }
+  if (runtime.effectiveMode === "shadow") return "shadow_comparison";
+  if (runtime.effectiveMode === "canary") return "bounded_canary";
+  return runtime.rolloutPercent === 100
+    ? "adaptive_full"
+    : `adaptive_rollout_${runtime.rolloutPercent}`;
+}
+
+async function publishAdaptiveHotDecisionForMode(
+  decision: AdaptiveHotDecisionRecord,
+  runtime: AdaptiveHotRuntimeOptions,
+  queueUrl: string,
+): Promise<void> {
+  try {
+    await publishAdaptiveHotDecision({
+      queueUrl,
+      webhookSecret: process.env.CLAWSWEEPER_WEBHOOK_SECRET ?? "",
+      decision,
+    });
+  } catch (error) {
+    if (runtime.effectiveMode !== "shadow") throw error;
+    console.error(
+      `[target-fanout] WARNING: adaptive shadow decision did not publish; legacy dispatch remains authoritative: ${errorMessage(error)}`,
+    );
+  }
+}
+
+async function loadAdaptiveHotCursor(
+  options: DurableCursorStoreOptions<AdaptiveHotCursorMode>,
+): Promise<DurableCursorSnapshot<AdaptiveHotCursorMode> & { loaded: boolean }> {
+  try {
+    return { ...(await fetchDurableCursor(options)), loaded: true };
+  } catch (error) {
+    console.error(
+      `[target-fanout] WARNING: canonical ${options.mode} cursor is unavailable; using cursor 0 for this comparison: ${errorMessage(error)}`,
+    );
+    return { mode: options.mode, nextCursor: 0, revision: 0, updatedAt: null, loaded: false };
+  }
+}
+
+async function persistAdaptiveHotCursor(
+  options: DurableCursorStoreOptions<AdaptiveHotCursorMode>,
+  nextCursor: number,
+  expectedRevision: number,
+  changed: boolean,
+): Promise<boolean> {
+  if (!changed) return true;
+  try {
+    await putDurableCursor(options, nextCursor, expectedRevision);
+    return true;
+  } catch (error) {
+    console.error(
+      `[target-fanout] WARNING: canonical ${options.mode} cursor did not persist: ${errorMessage(error)}`,
+    );
+    return false;
+  }
 }
 
 function candidateCapacityFor(repository: SelectedRepository): number | undefined {

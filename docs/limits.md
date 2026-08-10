@@ -98,6 +98,37 @@ by default.
 | `repair_live_runs.cluster_default`                  |       2 | Live repair run cap for imported gitcrawl cluster dispatches.                         |
 | `issue_implementation.dispatches_per_sweep_default` |       5 | Maximum implementation intake jobs queued from one review publish run.                |
 
+## Adaptive Scheduled Hot Review
+
+The adaptive allocator is delivered behind a default-on kill switch. The
+checked-in workflow still requests `legacy`, and the 20-minute hot-fanout
+schedule plus the queue's 300/hour, burst-30 admission contract are unchanged.
+These values bound a proposed allocation before any repository planner runs;
+they do not reserve workers or bypass queue admission.
+
+| Name                                                                   |    Current | Meaning                                                                    |
+| ---------------------------------------------------------------------- | ---------: | -------------------------------------------------------------------------- |
+| `scheduled_review.adaptive_hot.fairness_objective_ms`                  |   86400000 | Age at which observed unserved work receives the overdue fairness round.   |
+| `scheduled_review.adaptive_hot.observation_max_age_ms`                 |   21600000 | Maximum age of a planner observation before it enters the probe lane.      |
+| `scheduled_review.adaptive_hot.over_offer_numerator`                   |          3 | Numerator for the 1.5x queue-over-offer allowance.                         |
+| `scheduled_review.adaptive_hot.over_offer_denominator`                 |          2 | Denominator for the 1.5x queue-over-offer allowance.                       |
+| `scheduled_review.adaptive_hot.max_offer_budget`                       |         30 | Absolute candidates offered by one adaptive fleet cycle.                   |
+| `scheduled_review.adaptive_hot.max_repositories`                       |         20 | Absolute repositories selected by one adaptive fleet cycle.                |
+| `scheduled_review.adaptive_hot.unknown_probe_limit`                    |          2 | Maximum stale, missing, or malformed repositories probed per cycle.         |
+| `scheduled_review.adaptive_hot.unavailable_observation_fallback_limit` |          5 | One-candidate repository probes when the observation service is unavailable. |
+| `scheduled_review.adaptive_hot.repository_share_numerator`            |          1 | Numerator of the per-repository service-capacity share.                    |
+| `scheduled_review.adaptive_hot.repository_share_denominator`          |          4 | Denominator of the per-repository service-capacity share.                  |
+| `scheduled_review.adaptive_hot.max_repository_candidates`             |         10 | Absolute candidate cap for one repository in one adaptive cycle.           |
+| `scheduled_review.adaptive_hot.shadow_min_duration_ms`                 |  604800000 | Minimum seven-day comparison window before canary can pass readiness.       |
+| `scheduled_review.adaptive_hot.shadow_min_cycles`                      |         21 | Minimum durable dispatched shadow decisions before canary readiness.       |
+| `scheduled_review.adaptive_hot.canary_min_duration_ms`                 |   86400000 | Minimum 24-hour canary window before full-mode readiness.                   |
+| `scheduled_review.adaptive_hot.canary_min_cycles`                      |          3 | Minimum durable dispatched canary decisions before full readiness.         |
+| `scheduled_review.adaptive_hot.decision_retention_ms`                  | 1209600000 | Fourteen-day adaptive decision and observation retention window.           |
+| `scheduled_review.adaptive_hot.decision_retention_max`                 |        640 | Maximum durable adaptive decision records.                                 |
+
+See [Adaptive scheduled hot review](adaptive-hot-review.md) for mode,
+activation, replay, and rollback semantics.
+
 Formula summary:
 
 - normal review: 70% of `workers.max`
