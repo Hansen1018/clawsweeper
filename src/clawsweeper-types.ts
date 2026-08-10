@@ -882,6 +882,7 @@ export interface PlanCandidateResult {
   dueBacklog: number;
   activeCodexTarget: number;
   oldestUnreviewedAt: string | undefined;
+  oldestUnselectedDueAt: string | undefined;
   capacityReason: string;
   floorBackfill: number;
   selection: PlanSelectionTelemetry[];

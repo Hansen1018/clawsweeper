@@ -255,6 +255,62 @@ test("scheduled review enqueue preserves backlog-wide age in a zero-offer observ
   });
 });
 
+test("planner observation advances to the oldest item that remains unserved", async () => {
+  const writes: Array<{ url: string; body: string }> = [];
+  const summary = await enqueueScheduledReviewPlan({
+    plan: {
+      candidates: [
+        {
+          repo: "openclaw/clawsweeper",
+          number: 1,
+          kind: "issue",
+          updatedAt: "2026-08-10T10:00:00Z",
+        },
+        {
+          repo: "openclaw/clawsweeper",
+          number: 2,
+          kind: "pull_request",
+          updatedAt: "2026-08-10T11:00:00Z",
+        },
+      ],
+      selection: [{ ageMs: 48 * 3_600_000 }, { ageMs: 24 * 3_600_000 }],
+      dueBacklog: 3,
+      oldestUnreviewedAt: "2026-08-08T12:00:00Z",
+      oldestUnselectedDueAt: "2026-08-10T00:00:00Z",
+    },
+    lane: "hot_intake",
+    targetRepo: "openclaw/clawsweeper",
+    targetBranch: "main",
+    queueUrl: "https://queue.example",
+    secret: "adaptive-remaining-age-secret",
+    deliveryPrefix: "scheduled:remaining-age:1",
+    observation: {
+      runId: "202",
+      runAttempt: 1,
+      policyVersion: "adaptive-hot-v1",
+      observedAtMs: Date.parse("2026-08-10T12:00:00Z"),
+    },
+    fetchImpl: async (input, init) => {
+      if (!init?.method) {
+        return Response.json({ scheduled_feed: { target_rate_per_hour: 300 } });
+      }
+      writes.push({ url: String(input), body: String(init.body) });
+      return Response.json(
+        String(input).endsWith("/internal/exact-review/enqueue")
+          ? { ok: true, queued: true }
+          : { ok: true, accepted: true },
+        { status: 202 },
+      );
+    },
+  });
+
+  assert.equal(summary.queued, 2);
+  assert.equal(summary.observationPublished, true);
+  const observation = JSON.parse(writes.at(-1)!.body);
+  assert.equal(observation.oldestDueAt, "2026-08-08T12:00:00.000Z");
+  assert.equal(observation.oldestUnservedAt, "2026-08-10T00:00:00.000Z");
+});
+
 test("planner observation failure does not undo valid queue dispositions", async () => {
   const warnings: string[] = [];
   const originalError = console.error;

@@ -24,6 +24,7 @@ type ScheduledReviewPlan = {
   selection?: Array<{ ageMs?: number; bucket?: string; nextDueAt?: string }>;
   dueBacklog?: number;
   oldestUnreviewedAt?: string;
+  oldestUnselectedDueAt?: string;
 };
 
 export type ScheduledReviewEnqueueSummary = {
@@ -110,6 +111,7 @@ export async function enqueueScheduledReviewPlan(
       max: percentileHours(1),
     },
   };
+  const servedCandidateIndices = new Set<number>();
 
   for (const [index, candidate] of options.plan.candidates.entries()) {
     const payload = JSON.stringify({
@@ -143,9 +145,13 @@ export async function enqueueScheduledReviewPlan(
         `scheduled review queue rejected ${candidate.repo}#${candidate.number}: HTTP ${response.status}`,
       );
     }
-    if (body.queued === true) summary.queued += 1;
-    else if (body.deduped === true) summary.deduped += 1;
-    else if (body.shed === true) {
+    if (body.queued === true) {
+      summary.queued += 1;
+      servedCandidateIndices.add(index);
+    } else if (body.deduped === true) {
+      summary.deduped += 1;
+      servedCandidateIndices.add(index);
+    } else if (body.shed === true) {
       summary.shed += 1;
       if (body.reason === "scheduled_rate") summary.rateLimited += 1;
       else summary.backpressured += 1;
@@ -176,6 +182,24 @@ export async function enqueueScheduledReviewPlan(
         ? Math.min(selectedOldestAtMs, backlogOldestAtMs)
         : selectedOldestAtMs,
     ).toISOString();
+    const selectedUnservedAges = (options.plan.selection ?? [])
+      .flatMap((selection, index) => {
+        const age = Number(selection.ageMs);
+        return !servedCandidateIndices.has(index) && Number.isFinite(age) && age >= 0 ? [age] : [];
+      })
+      .sort((left, right) => left - right);
+    const selectedOldestUnservedAtMs = selectedUnservedAges.length
+      ? Math.max(0, observedAtMs - selectedUnservedAges.at(-1)!)
+      : null;
+    const unselectedOldestAtMs =
+      timestampMs(options.plan.oldestUnselectedDueAt) ??
+      (options.plan.candidates.length === 0 ? backlogOldestAtMs : null);
+    const oldestUnservedAtMs = [selectedOldestUnservedAtMs, unselectedOldestAtMs]
+      .filter((value): value is number => value !== null && value <= observedAtMs)
+      .reduce<number | null>(
+        (oldest, value) => (oldest === null ? value : Math.min(oldest, value)),
+        null,
+      );
     const observation: AdaptiveHotPlannerObservation = {
       schemaVersion: ADAPTIVE_HOT_PLANNER_OBSERVATION_SCHEMA_VERSION,
       observationId: `${options.observation.runId}:${options.observation.runAttempt}:${options.lane}:${options.targetRepo.toLowerCase()}`,
@@ -198,7 +222,10 @@ export async function enqueueScheduledReviewPlan(
       throttled: summary.rateLimited,
       sourceNovelDue: Math.min(eligibleDue, sourceNovelDue),
       oldestDueAt: eligibleDue > 0 ? oldestObservedAt : null,
-      oldestUnservedAt: unservedDue > 0 ? oldestObservedAt : null,
+      oldestUnservedAt:
+        unservedDue > 0 && oldestUnservedAtMs !== null
+          ? new Date(oldestUnservedAtMs).toISOString()
+          : null,
     };
     try {
       await publishAdaptiveHotPlannerObservation({
@@ -240,6 +267,7 @@ function readPlan(filePath: string): ScheduledReviewPlan {
   const parsed = JSON.parse(readFileSync(filePath, "utf8")) as Record<string, unknown>;
   if (!Array.isArray(parsed.candidates)) throw new Error("scheduled review plan has no candidates");
   const oldestUnreviewedAt = optionalTimestamp(parsed.oldestUnreviewedAt);
+  const oldestUnselectedDueAt = optionalTimestamp(parsed.oldestUnselectedDueAt);
   return {
     candidates: parsed.candidates as PlanCandidate[],
     ...(Array.isArray(parsed.selection)
@@ -255,6 +283,7 @@ function readPlan(filePath: string): ScheduledReviewPlan {
       ? {}
       : { dueBacklog: nonNegativeInteger(parsed.dueBacklog)! }),
     ...(oldestUnreviewedAt ? { oldestUnreviewedAt } : {}),
+    ...(oldestUnselectedDueAt ? { oldestUnselectedDueAt } : {}),
   };
 }
 

@@ -184,6 +184,16 @@ export function createReviewPlanningSelection(
     }
     return oldest;
   }
+  function oldestDueReferenceAt(candidates: readonly DueCandidate[]): string | undefined {
+    let oldestMs = Number.POSITIVE_INFINITY;
+    for (const candidate of candidates) {
+      const createdAtMs = Date.parse(candidate.item.createdAt);
+      const referenceAtMs = candidate.reviewedAt > 0 ? candidate.reviewedAt : createdAtMs;
+      if (!Number.isFinite(referenceAtMs) || referenceAtMs >= oldestMs) continue;
+      oldestMs = referenceAtMs;
+    }
+    return Number.isFinite(oldestMs) ? new Date(oldestMs).toISOString() : undefined;
+  }
   function planCapacityReason(options: {
     selectedCount: number;
     dueBacklog: number;
@@ -263,6 +273,7 @@ export function createReviewPlanningSelection(
         dueBacklog: candidates.length,
         activeCodexTarget: activeCodexTarget(shards),
         oldestUnreviewedAt: undefined,
+        oldestUnselectedDueAt: undefined,
         floorBackfill: 0,
         selection: [],
         capacityReason: planCapacityReason({
@@ -286,6 +297,7 @@ export function createReviewPlanningSelection(
         dueBacklog: candidates.length,
         activeCodexTarget: activeCodexTarget(shards),
         oldestUnreviewedAt: undefined,
+        oldestUnselectedDueAt: undefined,
         floorBackfill: 0,
         selection: [],
         capacityReason: planCapacityReason({
@@ -326,6 +338,7 @@ export function createReviewPlanningSelection(
       }
       const selected = selectDueCandidates(due, capacity, compareHotIntakeDueCandidates, now);
       const candidates = selected.map(({ item }) => item);
+      const selectedSet = new Set(selected);
       const shards = Array.from(
         { length: Math.max(1, Math.min(shardCount, candidates.length || 1)) },
         (_, shard) => ({ shard, itemNumbers: [] as number[] }),
@@ -341,6 +354,9 @@ export function createReviewPlanningSelection(
         dueBacklog: due.length,
         activeCodexTarget: activeCodexTarget(shards),
         oldestUnreviewedAt: oldestUnreviewedAt(due),
+        oldestUnselectedDueAt: oldestDueReferenceAt(
+          due.filter((candidate) => !selectedSet.has(candidate)),
+        ),
         floorBackfill: 0,
         selection: planSelectionTelemetry(selected, now),
         capacityReason: planCapacityReason({
@@ -392,6 +408,7 @@ export function createReviewPlanningSelection(
     );
     const floorBackfill = selected.filter((candidate) => !due.includes(candidate)).length;
     const candidates = selected.map(({ item }) => item);
+    const selectedSet = new Set(selected);
     const shards = shardItemNumbers(
       candidates.map((item) => item.number),
       shardCount,
@@ -405,6 +422,9 @@ export function createReviewPlanningSelection(
       dueBacklog: due.length,
       activeCodexTarget: activeCodexTarget(shards),
       oldestUnreviewedAt: oldestUnreviewedAt(due),
+      oldestUnselectedDueAt: oldestDueReferenceAt(
+        due.filter((candidate) => !selectedSet.has(candidate)),
+      ),
       floorBackfill,
       selection: planSelectionTelemetry(selected, now),
       capacityReason: planCapacityReason({
@@ -425,6 +445,7 @@ export function createReviewPlanningSelection(
     shardItemNumbers,
     activeCodexTarget,
     oldestUnreviewedAt,
+    oldestDueReferenceAt,
     planCapacityReason,
     planSelectionTelemetry,
     planCandidates,

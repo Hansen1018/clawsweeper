@@ -81,6 +81,11 @@ queue admissions. An observation written under a different policy version is
 retained for comparison but treated as unknown by the current allocator; a
 policy change never reinterprets historical demand.
 
+`oldestUnservedAt` advances after admission to the oldest selected item that
+was not queued or deduped, or to the plan's exact oldest unselected due item.
+It remains unknown when neither timestamp is observable; an admitted item is
+never reused as a fairness signal.
+
 Scheduled lease completion may attach aggregate structural, semantic, content,
 hydration, early-no-op, outcome, retry, and runtime facts. The Durable Object
 accepts those facts only on a currently claimed scheduled review item and
