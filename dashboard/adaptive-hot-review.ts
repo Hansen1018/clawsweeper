@@ -24,6 +24,7 @@ const ADAPTIVE_HOT_RETENTION_MS = 14 * 24 * 60 * 60 * 1_000;
 const ADAPTIVE_HOT_PLANNER_RETENTION_MAX = 20_000;
 const ADAPTIVE_HOT_EXECUTION_RETENTION_MAX = 20_000;
 const ADAPTIVE_HOT_DECISION_RETENTION_MAX = 640;
+const ADAPTIVE_HOT_PUBLIC_OBSERVATION_LIMIT = 100;
 const ADAPTIVE_HOT_PUBLIC_DECISION_LIMIT = 100;
 
 export class AdaptiveHotReviewStore {
@@ -293,13 +294,16 @@ export class AdaptiveHotReviewStore {
     const observations: AdaptiveHotRepositoryObservationSnapshot[] = [];
     for (const row of this.storage.sql.exec(
       `SELECT observation_json FROM (
-         SELECT observation_json,
+         SELECT observation_json, target_repo, lane, policy_version, observed_at, observation_id,
                 ROW_NUMBER() OVER (
                   PARTITION BY target_repo, lane, policy_version
                   ORDER BY observed_at DESC, observation_id DESC
                 ) AS rank
            FROM ${ADAPTIVE_HOT_PLANNER_OBSERVATION_TABLE}
-       ) WHERE rank = 1`,
+       ) WHERE rank = 1
+         ORDER BY observed_at DESC, observation_id DESC, target_repo, lane, policy_version
+         LIMIT ?`,
+      ADAPTIVE_HOT_PUBLIC_OBSERVATION_LIMIT,
     )) {
       const latest = normalizeAdaptiveHotPlannerObservationJson(String(row.observation_json || ""));
       if (!latest) continue;

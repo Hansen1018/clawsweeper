@@ -12020,6 +12020,36 @@ test("adaptive hot-review observations and decisions are durable, bounded, and r
   assert.equal(snapshot.readiness.full50.dispatchedCycles, 0);
 });
 
+test("adaptive hot-review public observations retain the newest one hundred partitions", () => {
+  const now = Date.parse("2026-08-10T12:00:00Z");
+  const storage = new MemoryDurableStorage();
+  const store = new AdaptiveHotReviewStore(storage);
+  store.ensureSchemaSync();
+
+  for (let index = 0; index < 101; index += 1) {
+    const suffix = String(index).padStart(3, "0");
+    const result = store.recordPlannerObservation(
+      adaptivePlannerObservation({
+        observationId: `${500 + index}:1:hot_intake:openclaw/repo-${suffix}`,
+        observedAt: new Date(now - (index + 1) * 1_000).toISOString(),
+        admitted: 1,
+        targetRepo: `openclaw/repo-${suffix}`,
+      }),
+      now,
+    );
+    assert.equal(result.ok, true);
+  }
+
+  const snapshot = store.snapshot(now);
+  assert.equal(snapshot.observations.length, 100);
+  assert.equal(snapshot.observations[0]?.targetRepo, "openclaw/repo-000");
+  assert.equal(snapshot.observations.at(-1)?.targetRepo, "openclaw/repo-099");
+  assert.equal(
+    snapshot.observations.some((observation) => observation.targetRepo === "openclaw/repo-100"),
+    false,
+  );
+});
+
 function adaptivePlannerObservation(overrides: {
   observationId: string;
   observedAt: string;
