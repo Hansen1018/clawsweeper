@@ -559,7 +559,10 @@ const ADAPTIVE_HOT_CURSOR_RESERVATION_KEY = "adaptive-hot-cursor-reservation:v1"
 const ADAPTIVE_HOT_CURSOR_RESERVATION_TTL_MS = 60 * 60 * 1_000;
 const ADAPTIVE_HOT_CURSOR_COMMIT_RECEIPTS_KEY = "adaptive-hot-cursor-commit-receipts:v1";
 const ADAPTIVE_HOT_CURSOR_COMMIT_RECEIPT_TTL_MS = 24 * 60 * 60 * 1_000;
-const ADAPTIVE_HOT_CURSOR_COMMIT_RECEIPT_LIMIT = 8;
+// The scheduled lane can commit 72 times in 24 hours at the contained
+// 20-minute cadence. Keep one full day plus eight bounded manual/retry slots so
+// ordinary traffic cannot evict an otherwise-live lost-response receipt.
+const ADAPTIVE_HOT_CURSOR_COMMIT_RECEIPT_LIMIT = 80;
 type OperationalCursorMode =
   | "hot-intake"
   | "normal-review"
@@ -3438,6 +3441,17 @@ export class ExactReviewQueue {
     try {
       const now = Date.now();
       const result = this.storage.transactionSync(() => {
+        const receipts = readAdaptiveHotCursorCommitReceipts(
+          this.storage.kv.get(ADAPTIVE_HOT_CURSOR_COMMIT_RECEIPTS_KEY),
+        );
+        if (receipts === "invalid") return { kind: "invalid" as const };
+        if (
+          receipts.some(
+            (receipt) => receipt.reservationId === reservationId && receipt.expiresAt > now,
+          )
+        ) {
+          return { kind: "committed" as const };
+        }
         const storedReservation = readAdaptiveHotCursorReservation(
           this.storage.kv.get(ADAPTIVE_HOT_CURSOR_RESERVATION_KEY),
         );
@@ -3476,6 +3490,9 @@ export class ExactReviewQueue {
         return { kind: "reserved" as const, reservation };
       });
       if (result.kind === "invalid") return json({ error: "fanout_cursor_store_invalid" }, 500);
+      if (result.kind === "committed") {
+        return json({ error: "adaptive_hot_cursor_reservation_already_committed" }, 409);
+      }
       if (result.kind === "busy") {
         return json(
           {

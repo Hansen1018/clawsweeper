@@ -257,8 +257,11 @@ without advancing them. All covered cursors advance together only after the
 whole dispatch loop succeeds. A reservation conflict dispatches nothing; a
 dispatch or commit failure marks no undispatched repository processed and the
 lease blocks another active cycle until bounded expiry. An expired lease cannot
-commit; bounded 24-hour receipts make a successful commit idempotent across a
-lost response. The queue dedupes any successful prefix retried after expiry.
+commit; up to 80 live 24-hour receipts cover the 72 scheduled cycles possible
+at the contained 20-minute cadence plus eight manual/retry slots. A live receipt
+also makes its reservation identity one-shot, so a successful commit is
+idempotent across a lost response but cannot acknowledge a different batch.
+The queue dedupes any successful prefix retried after expiry.
 The default-on kill switch immediately returns the next cycle to legacy
 selection without clearing queued work or rewriting adaptive cursors.
 

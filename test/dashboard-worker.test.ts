@@ -6472,6 +6472,22 @@ test("active adaptive cursor reservation is authenticated and atomic", async () 
   assert.equal(retriedCommit.status, 202);
   assert.deepEqual(await retriedCommit.json(), committedBody);
 
+  const reusedCommittedId = await worker.fetch(
+    signedRequest(reservationPath, "PUT", {
+      reservation_id: reservationId,
+      cursors: updates.map((cursor) => ({
+        ...cursor,
+        next_cursor: cursor.next_cursor + 1,
+        expected_revision: 2,
+      })),
+    }),
+    env,
+  );
+  assert.equal(reusedCommittedId.status, 409);
+  assert.deepEqual(await reusedCommittedId.json(), {
+    error: "adaptive_hot_cursor_reservation_already_committed",
+  });
+
   const expiredReservationId = "602:1:hot-intake";
   const expiredUpdates = updates.map((cursor) => ({
     ...cursor,
@@ -6515,6 +6531,62 @@ test("active adaptive cursor reservation is authenticated and atomic", async () 
     assert.equal(current.next_cursor, update.next_cursor);
     assert.equal(current.revision, 2);
   }
+});
+
+test("adaptive cursor receipts cover a full day at the 20-minute cadence", async () => {
+  const storage = new MemoryDurableStorage();
+  const secret = "adaptive-cursor-receipt-window-secret";
+  let queue = new ExactReviewQueue({ storage }, {});
+  let env = {
+    CLAWSWEEPER_WEBHOOK_SECRET: secret,
+    EXACT_REVIEW_QUEUE: new MemoryDurableNamespace(queue),
+  };
+  const signedRequest = (path: string, payload: unknown) => {
+    const body = JSON.stringify(payload);
+    return new Request(`https://clawsweeper.openclaw.ai${path}`, {
+      method: "PUT",
+      headers: {
+        "content-type": "application/json",
+        "x-clawsweeper-exact-review-signature": `sha256=${createHmac("sha256", secret).update(body).digest("hex")}`,
+      },
+      body,
+    });
+  };
+  const reservationPath = "/internal/state/cursors/adaptive-hot-reservation";
+  const commitPath = `${reservationPath}/commit`;
+  let firstCommit: unknown;
+
+  for (let cycle = 0; cycle < 72; cycle += 1) {
+    const reservationId = `${700 + cycle}:1:hot-intake`;
+    const cursors = [
+      { mode: "adaptive-hot-review", next_cursor: cycle + 1, expected_revision: cycle },
+      { mode: "adaptive-hot-review-probe", next_cursor: cycle + 1, expected_revision: cycle },
+    ];
+    const reserved = await worker.fetch(
+      signedRequest(reservationPath, { reservation_id: reservationId, cursors }),
+      env,
+    );
+    assert.equal(reserved.status, 202);
+    const committed = await worker.fetch(
+      signedRequest(commitPath, { reservation_id: reservationId }),
+      env,
+    );
+    assert.equal(committed.status, 202);
+    if (cycle === 0) firstCommit = await committed.json();
+  }
+
+  assert.equal((storage.rawGet("adaptive-hot-cursor-commit-receipts:v1") as unknown[]).length, 72);
+  queue = new ExactReviewQueue({ storage }, {});
+  env = {
+    CLAWSWEEPER_WEBHOOK_SECRET: secret,
+    EXACT_REVIEW_QUEUE: new MemoryDurableNamespace(queue),
+  };
+  const retriedFirstCommit = await worker.fetch(
+    signedRequest(commitPath, { reservation_id: "700:1:hot-intake" }),
+    env,
+  );
+  assert.equal(retriedFirstCommit.status, 202);
+  assert.deepEqual(await retriedFirstCommit.json(), firstCommit);
 });
 
 test("signed adaptive hot-review telemetry routes through the Worker and survives restart", async () => {

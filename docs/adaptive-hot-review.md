@@ -124,10 +124,14 @@ Modes are deliberately asymmetric:
   advances all covered cursors. A reservation conflict dispatches nothing; a
   dispatch or commit failure never marks undispatched repositories processed
   and leaves the lease to block a competing active cycle until bounded expiry.
-  An expired lease cannot commit. A bounded 24-hour commit-receipt ledger makes
-  a successful commit idempotent if its response is lost. Queue dedupe contains
-  any already-dispatched prefix if an expired lease is retried. The planned
-  decision also persists before this reservation.
+  An expired lease cannot commit. A bounded ledger retains up to 80 live
+  24-hour commit receipts: one for each of the 72 cycles possible at the
+  contained 20-minute cadence plus eight manual/retry slots. A live receipt
+  also makes its reservation identifier one-shot. These rules make a successful
+  commit idempotent if its response is lost without allowing the same identity
+  to dispatch a different batch. Queue dedupe contains any already-dispatched
+  prefix if an expired lease is retried. The planned decision also persists
+  before this reservation.
 - `full`: uses deterministic 10%, 50%, or 100% cohorts. Non-cohort legacy slots
   remain legacy at 10% and 50%; 100% uses only the adaptive cursor and proposal.
 
@@ -159,6 +163,12 @@ node scripts/evaluate-hot-allocation.mjs path/to/replay.json
 The output includes the complete deterministic allocation decision and, when
 an expected decision is supplied, an allocation comparison. The command does
 not call GitHub, the Worker, the queue, or Actions.
+
+For a disconnected end-to-end development proof, use the fixture-only
+[Docker/Crabbox harness](proof/adaptive-hot-review/README.md). It combines this
+replay and the focused control-plane tests with a disposable local Wrangler
+Worker and SQLite Durable Object restart. It refuses an unrecorded checkout
+head and does not activate or contact production.
 
 ## Rollout and rollback
 
