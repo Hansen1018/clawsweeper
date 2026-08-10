@@ -106,6 +106,46 @@ try {
     error: "adaptive_hot_cursor_reservation_already_committed",
   });
 
+  const failedDispatchReservationId = "900002:1:hot-intake";
+  const failedDispatchCursorUpdates = cursorUpdates.map((cursor) => ({
+    ...cursor,
+    next_cursor: cursor.next_cursor + 1,
+    expected_revision: 1,
+  }));
+  await signedJson(
+    "/internal/state/cursors/adaptive-hot-reservation",
+    "PUT",
+    {
+      reservation_id: failedDispatchReservationId,
+      cursors: failedDispatchCursorUpdates,
+    },
+    202,
+  );
+  const aborted = await signedJson(
+    "/internal/state/cursors/adaptive-hot-reservation/abort",
+    "PUT",
+    { reservation_id: failedDispatchReservationId },
+    202,
+  );
+  assert.deepEqual(aborted, { ok: true, aborted: true });
+  await assertCursors(cursorUpdates, undefined, 1);
+
+  const recoveredReservationId = "900003:1:hot-intake";
+  await signedJson(
+    "/internal/state/cursors/adaptive-hot-reservation",
+    "PUT",
+    { reservation_id: recoveredReservationId, cursors: failedDispatchCursorUpdates },
+    202,
+  );
+  const recoveredAbort = await signedJson(
+    "/internal/state/cursors/adaptive-hot-reservation/abort",
+    "PUT",
+    { reservation_id: recoveredReservationId },
+    202,
+  );
+  assert.deepEqual(recoveredAbort, { ok: true, aborted: true });
+  await assertCursors(cursorUpdates, undefined, 1);
+
   const finalSnapshot = await publicSnapshot();
   assertAdaptiveSnapshot(finalSnapshot, 1, 1);
   const publicJson = JSON.stringify(finalSnapshot);
@@ -140,6 +180,11 @@ try {
       retry_after_restart_identical: true,
       committed_identity_reuse_status: reusedReservation.status,
     },
+    cursor_abort: {
+      failed_dispatch_reservation_id: failedDispatchReservationId,
+      cursors_unchanged: true,
+      replacement_reservation_acquired: true,
+    },
     public_snapshot: {
       bounded_observations: finalSnapshot.adaptive_hot_review.observations.length <= 100,
       bounded_decisions: finalSnapshot.adaptive_hot_review.decisions.length <= 100,
@@ -164,6 +209,7 @@ try {
       "- Atomic commit: all three cursors advanced to revision 1 with one timestamp.",
       "- Lost-response retry: the same commit receipt was returned after a second restart.",
       `- One-shot identity: reusing the committed reservation ID returned HTTP ${reusedReservation.status}.`,
+      "- Dispatch failure recovery: abort left all cursors unchanged and allowed an immediate replacement reservation.",
       "- Public snapshot: bounded output omitted the synthetic secret and disposable persistence path.",
       "",
       "RESULT: PASS",
@@ -177,6 +223,7 @@ try {
   console.log("cursor fencing: unchanged before commit; 3 cursors advanced atomically");
   console.log("commit retry after second restart: identical durable receipt");
   console.log(`committed reservation identity reuse: HTTP ${reusedReservation.status}`);
+  console.log("dispatch failure recovery: aborted unchanged; replacement reservation acquired");
   console.log("public snapshot: bounded and sanitized");
   console.log("RESULT: PASS");
 } finally {

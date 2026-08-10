@@ -249,19 +249,24 @@ canonical cursor endpoint is unavailable, fanout warns and continues dispatch
 from a safe default; cursor persistence failure after dispatch never fails the
 productive lane.
 
-Adaptive shadow comparisons keep that legacy fail-open behavior. Canary and
-full modes require the control snapshot and planned decision to be durable,
-then reserve the main adaptive cursor, probe cursor, and any legacy cursor used
-by a mixed cohort under one one-hour transactional lease before dispatch,
-without advancing them. All covered cursors advance together only after the
-whole dispatch loop succeeds. A reservation conflict dispatches nothing; a
-dispatch or commit failure marks no undispatched repository processed and the
-lease blocks another active cycle until bounded expiry. An expired lease cannot
-commit; up to 80 live 24-hour receipts cover the 72 scheduled cycles possible
-at the contained 20-minute cadence plus eight manual/retry slots. A live receipt
-also makes its reservation identity one-shot, so a successful commit is
-idempotent across a lost response but cannot acknowledge a different batch.
-The queue dedupes any successful prefix retried after expiry.
+Adaptive shadow comparisons keep that legacy fail-open behavior while reserving
+and committing the main adaptive and probe cursors as one batch. A shadow batch
+failure does not block legacy dispatch and does not count toward readiness.
+Canary and full modes require the control snapshot and planned decision to be
+durable, then reserve those two cursors plus any legacy cursor used by a mixed
+cohort under one one-hour transactional lease before dispatch, without
+advancing them. All covered cursors advance together only after the whole
+dispatch loop succeeds. A reservation conflict dispatches nothing. A GitHub
+dispatch failure aborts the matching lease without advancing cursors; if the
+abort endpoint is unavailable, the lease remains bounded instead of risking
+release of an uncertain owner. A commit failure after successful dispatch marks
+no undispatched repository processed and retains the lease for retry or bounded
+expiry. An expired lease cannot commit; up to 80 live 24-hour receipts cover the
+72 scheduled cycles possible at the contained 20-minute cadence plus eight
+manual/retry slots. A live receipt also makes its reservation identity one-shot,
+so a successful commit is idempotent across a lost response but cannot
+acknowledge a different batch. The queue dedupes any successful prefix retried
+after expiry.
 The default-on kill switch immediately returns the next cycle to legacy
 selection without clearing queued work or rewriting adaptive cursors.
 

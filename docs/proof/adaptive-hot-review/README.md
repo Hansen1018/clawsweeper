@@ -12,7 +12,9 @@ The runtime scenario proves that:
 - an active cursor reservation does not advance any cursor before commit;
 - the reservation survives a restart, commits all three cursors atomically,
   and returns the same receipt when the commit response is retried after a
-  second restart; and
+  second restart;
+- a separate failed-dispatch reservation aborts without moving cursors and a
+  replacement reservation can be acquired immediately; and
 - the bounded public snapshot contains neither the synthetic signing secret
   nor local persistence paths.
 

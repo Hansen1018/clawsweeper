@@ -6338,6 +6338,7 @@ test("active adaptive cursor reservation is authenticated and atomic", async () 
   }
   const reservationPath = "/internal/state/cursors/adaptive-hot-reservation";
   const commitPath = `${reservationPath}/commit`;
+  const abortPath = `${reservationPath}/abort`;
   const reservationId = "600:1:hot-intake";
   const updates = [
     { mode: "hot-intake", next_cursor: 20, expected_revision: 1 },
@@ -6379,6 +6380,44 @@ test("active adaptive cursor reservation is authenticated and atomic", async () 
       { nextCursor, revision: 1 },
     );
   }
+
+  const abortedReservationId = "599:1:hot-intake";
+  assert.equal(
+    (
+      await worker.fetch(
+        signedRequest(reservationPath, "PUT", {
+          reservation_id: abortedReservationId,
+          cursors: updates,
+        }),
+        env,
+      )
+    ).status,
+    202,
+  );
+  assert.equal(
+    (
+      await worker.fetch(
+        new Request(`https://clawsweeper.openclaw.ai${abortPath}`, {
+          method: "PUT",
+          body: JSON.stringify({ reservation_id: abortedReservationId }),
+        }),
+        env,
+      )
+    ).status,
+    401,
+  );
+  const aborted = await worker.fetch(
+    signedRequest(abortPath, "PUT", { reservation_id: abortedReservationId }),
+    env,
+  );
+  assert.equal(aborted.status, 202);
+  assert.deepEqual(await aborted.json(), { ok: true, aborted: true });
+  const repeatedAbort = await worker.fetch(
+    signedRequest(abortPath, "PUT", { reservation_id: abortedReservationId }),
+    env,
+  );
+  assert.equal(repeatedAbort.status, 202);
+  assert.deepEqual(await repeatedAbort.json(), { ok: true, aborted: false });
 
   const reserved = await worker.fetch(
     signedRequest(reservationPath, "PUT", {
@@ -6451,6 +6490,14 @@ test("active adaptive cursor reservation is authenticated and atomic", async () 
     updates.map(({ mode, next_cursor }) => ({ mode, nextCursor: next_cursor, revision: 2 })),
   );
   assert.equal(new Set(committedBody.cursors.map((cursor) => cursor.updated_at)).size, 1);
+  const abortCommitted = await worker.fetch(
+    signedRequest(abortPath, "PUT", { reservation_id: reservationId }),
+    env,
+  );
+  assert.equal(abortCommitted.status, 409);
+  assert.deepEqual(await abortCommitted.json(), {
+    error: "adaptive_hot_cursor_reservation_already_committed",
+  });
 
   queue = new ExactReviewQueue({ storage }, {});
   env = {

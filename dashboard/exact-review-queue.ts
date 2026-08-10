@@ -756,6 +756,9 @@ export class ExactReviewQueue {
     if (request.method === "PUT" && url.pathname === "/cursors/adaptive-hot-reservation/commit") {
       return this.commitAdaptiveHotCursorReservation(await request.json().catch(() => null));
     }
+    if (request.method === "PUT" && url.pathname === "/cursors/adaptive-hot-reservation/abort") {
+      return this.abortAdaptiveHotCursorReservation(await request.json().catch(() => null));
+    }
     const operationalCursorMode = operationalCursorModeFromPath(url.pathname);
     if (operationalCursorMode && request.method === "GET") {
       return this.readOperationalCursor(operationalCursorMode);
@@ -3629,6 +3632,47 @@ export class ExactReviewQueue {
       return json({ ok: true, cursors: result.cursors.map(operationalCursorJson) }, 202);
     } catch (error) {
       console.error(`adaptive hot cursor commit failed: ${sanitizedServerError(error)}`);
+      return json({ error: "fanout_cursor_store_unavailable" }, 503);
+    }
+  }
+
+  private abortAdaptiveHotCursorReservation(value: unknown) {
+    const body = objectValue(value);
+    const reservationId = String(body.reservation_id || "").trim();
+    if (!validAdaptiveHotReservationId(reservationId)) {
+      return json({ error: "invalid_adaptive_hot_cursor_reservation" }, 400);
+    }
+    try {
+      const result = this.storage.transactionSync(() => {
+        const now = Date.now();
+        const receipts = readAdaptiveHotCursorCommitReceipts(
+          this.storage.kv.get(ADAPTIVE_HOT_CURSOR_COMMIT_RECEIPTS_KEY),
+        );
+        if (receipts === "invalid") return { kind: "invalid" as const };
+        if (
+          receipts.some(
+            (receipt) => receipt.reservationId === reservationId && receipt.expiresAt > now,
+          )
+        ) {
+          return { kind: "committed" as const };
+        }
+        const reservation = readAdaptiveHotCursorReservation(
+          this.storage.kv.get(ADAPTIVE_HOT_CURSOR_RESERVATION_KEY),
+        );
+        if (reservation === "invalid") return { kind: "invalid" as const };
+        if (reservation?.reservationId !== reservationId) {
+          return { kind: "absent" as const };
+        }
+        this.storage.kv.delete(ADAPTIVE_HOT_CURSOR_RESERVATION_KEY);
+        return { kind: "aborted" as const };
+      });
+      if (result.kind === "invalid") return json({ error: "fanout_cursor_store_invalid" }, 500);
+      if (result.kind === "committed") {
+        return json({ error: "adaptive_hot_cursor_reservation_already_committed" }, 409);
+      }
+      return json({ ok: true, aborted: result.kind === "aborted" }, 202);
+    } catch (error) {
+      console.error(`adaptive hot cursor abort failed: ${sanitizedServerError(error)}`);
       return json({ error: "fanout_cursor_store_unavailable" }, 503);
     }
   }

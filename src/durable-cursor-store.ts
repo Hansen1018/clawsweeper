@@ -119,6 +119,26 @@ export async function commitDurableCursorBatch<Mode extends string>(
   return cursorBatchResponse(payload, options.updates, modes);
 }
 
+export async function abortDurableCursorBatch<Mode extends string>(
+  options: Omit<DurableCursorStoreOptions<Mode>, "mode"> & {
+    reservationId: string;
+  },
+): Promise<boolean> {
+  const body = JSON.stringify({
+    reservation_id: boundedIdentifier(options.reservationId, "durable cursor reservation id"),
+  });
+  const payload = await durableCursorRequest(
+    options,
+    "PUT",
+    body,
+    "/internal/state/cursors/adaptive-hot-reservation/abort",
+  );
+  if (typeof payload.aborted !== "boolean") {
+    throw new Error("durable cursor abort response is malformed");
+  }
+  return payload.aborted;
+}
+
 function cursorBatchResponse<Mode extends string>(
   payload: JsonRecord,
   updates: readonly DurableCursorBatchUpdate<Mode>[],

@@ -8,9 +8,10 @@ import test from "node:test";
 
 import {
   SCHEDULED_REVIEW_PLAN_BATCH_SIZE,
+  abortAdaptiveHotCursors,
   adaptiveHotLegacyCursor,
   allocateReviewCandidateCapacity,
-  commitActiveAdaptiveHotCursors,
+  commitAdaptiveHotCursors,
   defaultLimit,
   fetchFanoutCursor,
   filterEligibleRepositories,
@@ -20,7 +21,7 @@ import {
   planReviewFanout,
   publishReviewCoverageInventory,
   putFanoutCursor,
-  reserveActiveAdaptiveHotCursors,
+  reserveAdaptiveHotCursors,
   renderFleetReviewCoverage,
   reviewCoverageInventorySnapshot,
   reviewPlanningRepositories,
@@ -683,10 +684,10 @@ test("active adaptive fanout reserves every required cursor before dispatch", as
         );
       },
     };
-    await reserveActiveAdaptiveHotCursors(options);
+    await reserveAdaptiveHotCursors(options);
     events.push("dispatch");
     dispatched = true;
-    await commitActiveAdaptiveHotCursors(options);
+    await commitAdaptiveHotCursors(options);
   };
 
   await assert.rejects(reserveThenDispatch(false), /cursors did not reserve before dispatch/);
@@ -717,6 +718,53 @@ test("active adaptive fanout reserves every required cursor before dispatch", as
   await assert.rejects(reserveThenDispatch(true, false), /cursors did not commit after dispatch/);
   assert.deepEqual(events, ["reserve", "dispatch", "commit"]);
   assert.equal(dispatched, true);
+});
+
+test("adaptive fanout aborts its cursor reservation after a dispatch failure", async () => {
+  const requests: string[] = [];
+  const options = {
+    baseUrl: "https://queue.example",
+    webhookSecret: "reservation-secret",
+    reservationId: "501:1:hot-intake",
+    legacy: null,
+    adaptive: { nextCursor: 9, expectedRevision: 4 },
+    probe: { nextCursor: 3, expectedRevision: 5 },
+    attempts: 1,
+    fetchImpl: async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      requests.push(url);
+      if (url.endsWith("/abort")) {
+        return Response.json({ ok: true, aborted: true }, { status: 202 });
+      }
+      const parsed = JSON.parse(String(init?.body || "{}")) as {
+        reservation_id: string;
+        cursors: Array<{ mode: string; next_cursor: number; expected_revision: number }>;
+      };
+      return Response.json(
+        {
+          ok: true,
+          reservation_id: parsed.reservation_id,
+          reservation_expires_at: "2026-08-10T13:00:00.000Z",
+          cursors: parsed.cursors.map((cursor) => ({
+            ok: true,
+            mode: cursor.mode,
+            next_cursor: cursor.next_cursor,
+            revision: cursor.expected_revision,
+            updated_at: "2026-08-10T12:00:00.000Z",
+          })),
+        },
+        { status: 202 },
+      );
+    },
+  };
+
+  await reserveAdaptiveHotCursors(options);
+  await abortAdaptiveHotCursors(options);
+
+  assert.deepEqual(requests, [
+    "https://queue.example/internal/state/cursors/adaptive-hot-reservation",
+    "https://queue.example/internal/state/cursors/adaptive-hot-reservation/abort",
+  ]);
 });
 
 test("normal target fanout dispatches even when canonical storage is unavailable", () => {

@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { resolveCommand } from "../command.js";
 import {
+  abortDurableCursorBatch,
   commitDurableCursorBatch,
   fetchDurableCursor,
   putDurableCursor,
@@ -449,24 +450,20 @@ export async function runTargetFanout(argv: string[]): Promise<void> {
   let adaptiveCursorPersisted = false;
   let adaptiveProbeCursorPersisted = false;
   let adaptiveCursorCycleDurable = true;
-  let activeCursorReservation: ActiveAdaptiveHotCursorReservationOptions | null = null;
+  let adaptiveCursorReservation: AdaptiveHotCursorReservationOptions | null = null;
+  let adaptiveCursorReservationReserved = false;
   const activeAdaptiveCycle =
     adaptiveDecision !== null && options.adaptive.effectiveMode !== "shadow";
-  if (
-    !options.dryRun &&
-    activeAdaptiveCycle &&
-    adaptiveDecision &&
-    adaptiveCursor &&
-    adaptiveProbeCursor
-  ) {
+  if (!options.dryRun && adaptiveDecision && adaptiveCursor && adaptiveProbeCursor) {
     const decisionToReserve = adaptiveDecision;
-    activeCursorReservation = {
+    adaptiveCursorReservation = {
       baseUrl: options.cursorStoreUrl,
       webhookSecret: process.env.CLAWSWEEPER_WEBHOOK_SECRET ?? "",
       reservationId: decisionToReserve.decisionId,
-      legacy: persistLegacyCursor
-        ? { nextCursor: selection.cursor, expectedRevision: cursor.revision }
-        : null,
+      legacy:
+        activeAdaptiveCycle && persistLegacyCursor
+          ? { nextCursor: selection.cursor, expectedRevision: cursor.revision }
+          : null,
       adaptive: {
         nextCursor: decisionToReserve.adaptiveCursor.next,
         expectedRevision: adaptiveCursor.revision,
@@ -476,26 +473,56 @@ export async function runTargetFanout(argv: string[]): Promise<void> {
         expectedRevision: adaptiveProbeCursor.revision,
       },
     };
-    await reserveActiveAdaptiveHotCursors(activeCursorReservation);
+    try {
+      await reserveAdaptiveHotCursors(adaptiveCursorReservation);
+      adaptiveCursorReservationReserved = true;
+    } catch (error) {
+      adaptiveCursorCycleDurable = false;
+      if (activeAdaptiveCycle) throw error;
+      console.error(
+        `[target-fanout] WARNING: adaptive shadow dispatch remains legacy-authoritative, but this comparison will not count toward readiness because its cursor batch did not reserve: ${errorMessage(error)}`,
+      );
+    }
   }
 
   const dispatched: string[] = [];
-  for (const [index, repository] of selection.repositories.entries()) {
-    const commandArgs = commands[index];
-    if (!commandArgs) continue;
-    if (options.dryRun) {
-      console.log(`dry-run ${commandArgs.join(" ")}`);
-    } else {
-      runGh(commandArgs, dispatchEnv());
+  try {
+    for (const [index, repository] of selection.repositories.entries()) {
+      const commandArgs = commands[index];
+      if (!commandArgs) continue;
+      if (options.dryRun) {
+        console.log(`dry-run ${commandArgs.join(" ")}`);
+      } else {
+        runGh(commandArgs, dispatchEnv());
+      }
+      dispatched.push(repository.targetRepo);
     }
-    dispatched.push(repository.targetRepo);
+  } catch (error) {
+    if (adaptiveCursorReservation && adaptiveCursorReservationReserved) {
+      try {
+        await abortAdaptiveHotCursors(adaptiveCursorReservation);
+      } catch (abortError) {
+        throw new Error(
+          `GitHub dispatch failed (${errorMessage(error)}); adaptive hot-review cursor reservation abort also failed: ${errorMessage(abortError)}`,
+        );
+      }
+    }
+    throw error;
   }
 
-  if (!options.dryRun && activeCursorReservation) {
-    const committed = await commitActiveAdaptiveHotCursors(activeCursorReservation);
-    cursorPersisted = committed.legacy;
-    adaptiveCursorPersisted = true;
-    adaptiveProbeCursorPersisted = true;
+  if (!options.dryRun && adaptiveCursorReservation && adaptiveCursorReservationReserved) {
+    try {
+      const committed = await commitAdaptiveHotCursors(adaptiveCursorReservation);
+      cursorPersisted = committed.legacy;
+      adaptiveCursorPersisted = true;
+      adaptiveProbeCursorPersisted = true;
+    } catch (error) {
+      adaptiveCursorCycleDurable = false;
+      if (activeAdaptiveCycle) throw error;
+      console.error(
+        `[target-fanout] WARNING: adaptive shadow dispatch remains legacy-authoritative, but this comparison will not count toward readiness because its cursor batch did not commit: ${errorMessage(error)}`,
+      );
+    }
   }
 
   if (!options.dryRun && persistLegacyCursor && !activeAdaptiveCycle) {
@@ -508,42 +535,6 @@ export async function runTargetFanout(argv: string[]): Promise<void> {
       selection.cursor,
       cursor.revision,
     );
-  }
-  if (
-    !options.dryRun &&
-    !activeAdaptiveCycle &&
-    adaptiveDecision &&
-    adaptiveCursor &&
-    adaptiveProbeCursor
-  ) {
-    adaptiveCursorPersisted = await persistAdaptiveHotCursor(
-      {
-        baseUrl: options.cursorStoreUrl,
-        webhookSecret: process.env.CLAWSWEEPER_WEBHOOK_SECRET ?? "",
-        mode: "adaptive-hot-review",
-      },
-      adaptiveDecision.adaptiveCursor.next,
-      adaptiveCursor.revision,
-      adaptiveDecision.adaptiveCursor.next !== adaptiveDecision.adaptiveCursor.input,
-    );
-    adaptiveProbeCursorPersisted = await persistAdaptiveHotCursor(
-      {
-        baseUrl: options.cursorStoreUrl,
-        webhookSecret: process.env.CLAWSWEEPER_WEBHOOK_SECRET ?? "",
-        mode: "adaptive-hot-review-probe",
-      },
-      adaptiveDecision.adaptiveProbeCursor.next,
-      adaptiveProbeCursor.revision,
-      adaptiveDecision.adaptiveProbeCursor.next !== adaptiveDecision.adaptiveProbeCursor.input,
-    );
-    adaptiveCursorCycleDurable =
-      (adaptiveCursorPersisted || !adaptiveDecision.proposed.cursorAdvanced) &&
-      (adaptiveProbeCursorPersisted || !adaptiveDecision.proposed.probeCursorAdvanced);
-    if (!adaptiveCursorCycleDurable) {
-      console.error(
-        "[target-fanout] WARNING: adaptive shadow dispatch remains legacy-authoritative, but this comparison will not count toward readiness because its cursor did not persist",
-      );
-    }
   }
   if (adaptiveDecision && !options.dryRun && adaptiveCursorCycleDurable) {
     adaptiveDecision = {
@@ -585,7 +576,7 @@ export async function runTargetFanout(argv: string[]): Promise<void> {
   );
 }
 
-type ActiveAdaptiveHotCursorReservationOptions = {
+type AdaptiveHotCursorReservationOptions = {
   baseUrl: string;
   webhookSecret: string;
   reservationId: string;
@@ -597,8 +588,8 @@ type ActiveAdaptiveHotCursorReservationOptions = {
   sleep?: (milliseconds: number) => Promise<void>;
 };
 
-export async function reserveActiveAdaptiveHotCursors(
-  options: ActiveAdaptiveHotCursorReservationOptions,
+export async function reserveAdaptiveHotCursors(
+  options: AdaptiveHotCursorReservationOptions,
 ): Promise<void> {
   try {
     await reserveDurableCursorBatch({
@@ -637,8 +628,8 @@ export async function reserveActiveAdaptiveHotCursors(
   }
 }
 
-export async function commitActiveAdaptiveHotCursors(
-  options: ActiveAdaptiveHotCursorReservationOptions,
+export async function commitAdaptiveHotCursors(
+  options: AdaptiveHotCursorReservationOptions,
 ): Promise<{ legacy: boolean }> {
   try {
     await commitDurableCursorBatch({
@@ -658,7 +649,26 @@ export async function commitActiveAdaptiveHotCursors(
   return { legacy: options.legacy !== null };
 }
 
-function adaptiveHotCursorReservationUpdates(options: ActiveAdaptiveHotCursorReservationOptions) {
+export async function abortAdaptiveHotCursors(
+  options: AdaptiveHotCursorReservationOptions,
+): Promise<void> {
+  try {
+    await abortDurableCursorBatch({
+      baseUrl: options.baseUrl,
+      webhookSecret: options.webhookSecret,
+      reservationId: options.reservationId,
+      ...(options.attempts === undefined ? {} : { attempts: options.attempts }),
+      ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
+      ...(options.sleep ? { sleep: options.sleep } : {}),
+    });
+  } catch (error) {
+    throw new Error(
+      `adaptive hot-review cursor reservation did not abort after dispatch failure: ${errorMessage(error)}`,
+    );
+  }
+}
+
+function adaptiveHotCursorReservationUpdates(options: AdaptiveHotCursorReservationOptions) {
   return [
     ...(options.legacy
       ? [
@@ -855,24 +865,6 @@ async function loadAdaptiveHotCursor(
       `[target-fanout] WARNING: canonical ${options.mode} cursor is unavailable; using cursor 0 for this comparison: ${errorMessage(error)}`,
     );
     return { mode: options.mode, nextCursor: 0, revision: 0, updatedAt: null, loaded: false };
-  }
-}
-
-async function persistAdaptiveHotCursor(
-  options: DurableCursorStoreOptions<AdaptiveHotCursorMode>,
-  nextCursor: number,
-  expectedRevision: number,
-  changed: boolean,
-): Promise<boolean> {
-  if (!changed) return true;
-  try {
-    await putDurableCursor(options, nextCursor, expectedRevision);
-    return true;
-  } catch (error) {
-    console.error(
-      `[target-fanout] WARNING: canonical ${options.mode} cursor did not persist: ${errorMessage(error)}`,
-    );
-    return false;
   }
 }
 

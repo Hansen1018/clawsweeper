@@ -119,7 +119,9 @@ Modes are deliberately asymmetric:
   remain authoritative. Planner and execution observations may still collect.
 - `shadow`: computes and durably records the adaptive proposal, but dispatches
   the exact legacy repository list and 50-candidate capacities. A telemetry or
-  adaptive-cursor write failure warns without blocking legacy work.
+  adaptive-cursor batch failure warns without blocking legacy work or counting
+  the comparison toward readiness. The main and probe cursors reserve and
+  commit atomically; the legacy cursor remains independently authoritative.
 - `canary`: replaces only legacy slots belonging to the explicit three-to-five
   repository allowlist. Control-plane, decision, and cursor durability are
   required for a successful active cycle. The legacy cursor when used, the main
@@ -127,8 +129,11 @@ Modes are deliberately asymmetric:
   Durable Object reservation before any GitHub dispatch, but their positions do
   not advance yet. After every dispatch succeeds, one commit transaction
   advances all covered cursors. A reservation conflict dispatches nothing; a
-  dispatch or commit failure never marks undispatched repositories processed
-  and leaves the lease to block a competing active cycle until bounded expiry.
+  dispatch failure aborts the matching reservation without advancing cursors,
+  while an unavailable abort retains the bounded lease rather than clearing an
+  uncertain owner. A commit failure after successful dispatch never marks
+  undispatched repositories processed and retains the lease for an idempotent
+  retry or bounded expiry.
   An expired lease cannot commit. A bounded ledger retains up to 80 live
   24-hour commit receipts: one for each of the 72 cycles possible at the
   contained 20-minute cadence plus eight manual/retry slots. A live receipt
