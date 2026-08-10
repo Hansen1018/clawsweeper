@@ -187,11 +187,16 @@ test("scheduled review enqueue rejects cross-repository plan candidates", async 
   );
 });
 
-test("scheduled review enqueue publishes a signed zero-demand planner observation", async () => {
+test("scheduled review enqueue preserves backlog-wide age in a zero-offer observation", async () => {
   const secret = "adaptive-observation-secret";
   const writes: Array<{ url: string; body: string; signature: string }> = [];
   const summary = await enqueueScheduledReviewPlan({
-    plan: { candidates: [], selection: [], dueBacklog: 0 },
+    plan: {
+      candidates: [],
+      selection: [],
+      dueBacklog: 7,
+      oldestUnreviewedAt: "2026-08-08T09:00:00Z",
+    },
     lane: "hot_intake",
     targetRepo: "OpenClaw/ClawSweeper",
     targetBranch: "main",
@@ -233,8 +238,8 @@ test("scheduled review enqueue publishes a signed zero-demand planner observatio
     targetRepo: "openclaw/clawsweeper",
     lane: "hot_intake",
     observedAt: "2026-08-10T12:00:00.000Z",
-    windowStartedAt: "2026-08-10T12:00:00.000Z",
-    eligibleDue: 0,
+    windowStartedAt: "2026-08-08T09:00:00.000Z",
+    eligibleDue: 7,
     selected: 0,
     offered: 0,
     attempted: 0,
@@ -245,8 +250,8 @@ test("scheduled review enqueue publishes a signed zero-demand planner observatio
     rejected: 0,
     throttled: 0,
     sourceNovelDue: 0,
-    oldestDueAt: null,
-    oldestUnservedAt: null,
+    oldestDueAt: "2026-08-08T09:00:00.000Z",
+    oldestUnservedAt: "2026-08-08T09:00:00.000Z",
   });
 });
 

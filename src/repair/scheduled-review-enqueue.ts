@@ -23,6 +23,7 @@ type ScheduledReviewPlan = {
   candidates: PlanCandidate[];
   selection?: Array<{ ageMs?: number; bucket?: string; nextDueAt?: string }>;
   dueBacklog?: number;
+  oldestUnreviewedAt?: string;
 };
 
 export type ScheduledReviewEnqueueSummary = {
@@ -160,8 +161,6 @@ export async function enqueueScheduledReviewPlan(
 
   if (options.observation) {
     const observedAtMs = options.observation.observedAtMs ?? Date.now();
-    const oldestAgeMs = ages.at(-1) ?? 0;
-    const oldestObservedAt = new Date(Math.max(0, observedAtMs - oldestAgeMs)).toISOString();
     const sourceNovelDue = (options.plan.selection ?? []).filter(
       (selection) => selection.bucket === "hot_issue" || selection.bucket === "hot_pull_request",
     ).length;
@@ -170,6 +169,13 @@ export async function enqueueScheduledReviewPlan(
       nonNegativeInteger(options.plan.dueBacklog) ?? options.plan.candidates.length,
     );
     const unservedDue = Math.max(0, eligibleDue - summary.queued - summary.deduped);
+    const selectedOldestAtMs = Math.max(0, observedAtMs - (ages.at(-1) ?? 0));
+    const backlogOldestAtMs = timestampMs(options.plan.oldestUnreviewedAt);
+    const oldestObservedAt = new Date(
+      backlogOldestAtMs !== null && backlogOldestAtMs <= observedAtMs
+        ? Math.min(selectedOldestAtMs, backlogOldestAtMs)
+        : selectedOldestAtMs,
+    ).toISOString();
     const observation: AdaptiveHotPlannerObservation = {
       schemaVersion: ADAPTIVE_HOT_PLANNER_OBSERVATION_SCHEMA_VERSION,
       observationId: `${options.observation.runId}:${options.observation.runAttempt}:${options.lane}:${options.targetRepo.toLowerCase()}`,
@@ -233,6 +239,7 @@ function validateCandidate(candidate: PlanCandidate, targetRepo: string): void {
 function readPlan(filePath: string): ScheduledReviewPlan {
   const parsed = JSON.parse(readFileSync(filePath, "utf8")) as Record<string, unknown>;
   if (!Array.isArray(parsed.candidates)) throw new Error("scheduled review plan has no candidates");
+  const oldestUnreviewedAt = optionalTimestamp(parsed.oldestUnreviewedAt);
   return {
     candidates: parsed.candidates as PlanCandidate[],
     ...(Array.isArray(parsed.selection)
@@ -247,6 +254,7 @@ function readPlan(filePath: string): ScheduledReviewPlan {
     ...(nonNegativeInteger(parsed.dueBacklog) === null
       ? {}
       : { dueBacklog: nonNegativeInteger(parsed.dueBacklog)! }),
+    ...(oldestUnreviewedAt ? { oldestUnreviewedAt } : {}),
   };
 }
 
@@ -263,6 +271,16 @@ function scheduledReviewLane(value: unknown): ScheduledReviewLane {
 function nonNegativeInteger(value: unknown): number | null {
   const parsed = Number(value);
   return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null;
+}
+
+function optionalTimestamp(value: unknown): string | undefined {
+  const parsed = timestampMs(value);
+  return parsed === null ? undefined : new Date(parsed).toISOString();
+}
+
+function timestampMs(value: unknown): number | null {
+  const parsed = Date.parse(typeof value === "string" ? value : "");
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
 }
 
 function errorMessage(error: unknown): string {
