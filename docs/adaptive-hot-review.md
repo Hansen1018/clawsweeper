@@ -6,8 +6,9 @@
   `src/repair/adaptive-hot-allocation.ts`,
   `src/repair/adaptive-hot-runtime.ts`, `src/repair/target-fanout.ts`,
   `dashboard/adaptive-hot-review.ts`, and `.github/workflows/sweep.yml`
-- Last verified: PR #1110 implementation branch; replace with the merge revision
-  before production activation
+- Last verified: [PR #1110](https://github.com/openclaw/clawsweeper/pull/1110)
+  implementation branch; replace with the merge revision before production
+  activation
 - Update when: observation schemas, allocation rounds, caps, readiness gates,
   activation variables, queue pressure fields, or rollback behavior change
 
@@ -161,8 +162,10 @@ windows are measured from the first to the last qualifying comparison, so an
 old burst cannot age into eligibility. These time-and-cycle gates prevent
 accidental stage skipping; they do not replace
 maintainer review of yield, cost, fairness, and incidents. Granting the approval
-value also records that the maintainer checked the separate #1102 quota/circuit
-and #1088 self-feedback evidence required by the rollout plan.
+value also records that the maintainer checked the separate
+[#1102 quota/circuit](https://github.com/openclaw/clawsweeper/pull/1102) and
+[#1088 self-feedback](https://github.com/openclaw/clawsweeper/pull/1088)
+evidence required by the rollout plan.
 
 ## Offline replay
 
