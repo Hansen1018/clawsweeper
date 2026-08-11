@@ -9,6 +9,8 @@ const DEFAULT_OUTPUT = ".artifacts/exact-review-dlq/inventory.json";
 const MAX_SELECTED_IDS = 2;
 const MAX_RECONCILE_TARGETS = 100;
 const MAX_RECONCILE_RECOVERIES = 10;
+const MAX_PARKED_RECONCILE_RECOVERIES = 5;
+const MAX_PARKED_INVENTORY_PAGE_SIZE = 50;
 const MAX_TERMINAL_TARGET_RECHECKS = 10;
 const MAX_RESOLUTION_IDS = 20;
 const MAX_INVENTORY_ROWS = 10_000;
@@ -17,6 +19,8 @@ const MAX_RECONCILE_INVENTORY_REFRESHES = 2;
 const GRAPHQL_IDENTITY_BATCH_SIZE = 40;
 const ACTIVE_RECOVERY_REASONS = new Set(["fresh_review_already_active", "publication_item_active"]);
 const IDEMPOTENCY_KEY = /^[A-Za-z0-9:._-]{1,200}$/;
+const OPERATOR_REQUEST_TIMEOUT_MS = 20_000;
+const OPERATOR_DEADLINE_SETTLE_MS = 25;
 
 class DeadLetterInventoryChangedError extends Error {
   constructor(summary, rowIds, targetKeys, blockedGroups) {
@@ -30,7 +34,7 @@ class DeadLetterInventoryChangedError extends Error {
 }
 
 const HELP = `Usage:
-  node scripts/exact-review-dead-letter-operator.mjs --action <inventory|recover-fresh|resolve|reconcile> [options]
+  node scripts/exact-review-dead-letter-operator.mjs --action <inventory|recover-fresh|resolve|reconcile|reconcile-parked> [options]
 
 Options:
   --action <action>             Required operator action
@@ -38,7 +42,7 @@ Options:
   --idempotency-key <key>       Required for recover-fresh
   --note <text>                 Required for resolve
   --max-targets <count>         Reconcile at most 1-100 canonical targets (default 100)
-  --max-recoveries <count>      Queue at most 0-10 fresh reviews (default 10)
+  --max-recoveries <count>      Queue at most 0-10 DLQ or 0-5 parked reviews (default 10)
   --execute                     Apply the selected mutation; otherwise preview only
   --output <path>               Inventory artifact path
   -h, --help                    Show this help
@@ -57,6 +61,20 @@ async function main(argv) {
   const secret = String(process.env.CLAWSWEEPER_WEBHOOK_SECRET || "");
   if (!queueUrl || !secret) {
     throw new Error("EXACT_REVIEW_QUEUE_URL and CLAWSWEEPER_WEBHOOK_SECRET are required");
+  }
+
+  if (args.action === "reconcile-parked") {
+    const deadlineAt = parkedReconcileDeadlineAt();
+    const inventory = await loadParkedReviewInventory({
+      queueUrl,
+      secret,
+      maxRows: args.maxTargets,
+      deadlineAt,
+    });
+    await mkdir(dirname(resolve(args.output)), { recursive: true });
+    await writeFile(args.output, `${JSON.stringify(inventory, null, 2)}\n`, "utf8");
+    await reconcileParkedReviews({ inventory, queueUrl, secret, args, deadlineAt });
+    return;
   }
 
   let inventory = await loadInventory({
@@ -215,6 +233,7 @@ function parseArgs(argv) {
     execute: false,
     maxTargets: MAX_RECONCILE_TARGETS,
     maxRecoveries: MAX_RECONCILE_RECOVERIES,
+    maxRecoveriesProvided: false,
     output: DEFAULT_OUTPUT,
     help: false,
   };
@@ -234,6 +253,7 @@ function parseArgs(argv) {
     else if (value === "--max-targets") {
       args.maxTargets = boundedInteger(argv[++index], "--max-targets", 1, MAX_RECONCILE_TARGETS);
     } else if (value === "--max-recoveries") {
+      args.maxRecoveriesProvided = true;
       args.maxRecoveries = boundedInteger(
         argv[++index],
         "--max-recoveries",
@@ -244,11 +264,29 @@ function parseArgs(argv) {
     else throw new Error(`unknown option ${value}; use --help`);
   }
   if (args.help) return args;
-  if (!["inventory", "recover-fresh", "resolve", "reconcile"].includes(args.action)) {
-    throw new Error("--action must be inventory, recover-fresh, resolve, or reconcile");
+  if (
+    !["inventory", "recover-fresh", "resolve", "reconcile", "reconcile-parked"].includes(
+      args.action,
+    )
+  ) {
+    throw new Error(
+      "--action must be inventory, recover-fresh, resolve, reconcile, or reconcile-parked",
+    );
   }
   if (!args.output) throw new Error("--output is required");
-  if (args.action !== "inventory" && args.action !== "reconcile") {
+  if (args.action === "reconcile-parked" && !args.maxRecoveriesProvided) {
+    args.maxRecoveries = MAX_PARKED_RECONCILE_RECOVERIES;
+  }
+  if (args.action === "reconcile-parked" && args.maxRecoveries > MAX_PARKED_RECONCILE_RECOVERIES) {
+    throw new Error(
+      `--max-recoveries must be between 0 and ${MAX_PARKED_RECONCILE_RECOVERIES} for reconcile-parked`,
+    );
+  }
+  if (
+    args.action !== "inventory" &&
+    args.action !== "reconcile" &&
+    args.action !== "reconcile-parked"
+  ) {
     if (args.ids.length < 1 || args.ids.length > MAX_SELECTED_IDS) {
       throw new Error(`mutation actions require between 1 and ${MAX_SELECTED_IDS} --ids`);
     }
@@ -634,11 +672,351 @@ async function reconcileDeadLetters({ inventory, queueUrl, secret, args, progres
   printResult(summary);
 }
 
-async function readQueuePressure(queueUrl) {
+async function reconcileParkedReviews({ inventory, queueUrl, secret, args, deadlineAt }) {
+  const pressure = parkedReconcileDeadlineReached(deadlineAt)
+    ? { status: "unknown", availableSlots: 0 }
+    : await readQueuePressure(queueUrl, deadlineAt);
+  const summary = {
+    action: "reconcile-parked",
+    dry_run: !args.execute,
+    inventory_complete: inventory.complete,
+    queue_pressure: pressure.status,
+    inspected_targets: 0,
+    terminal_targets: 0,
+    repository_gone_targets: 0,
+    resolved_targets: 0,
+    open_targets: 0,
+    recovered_targets: 0,
+    skipped_targets: 0,
+  };
+  const stopForDeadline = (skippedTargets) => {
+    summary.deadline_reached = true;
+    summary.skipped_targets += skippedTargets;
+    printResult(summary);
+  };
+  const terminal = [];
+  const recoverable = [];
+  const selectedRows = inventory.parked_reviews.slice(0, args.maxTargets);
+  if (inventory.deadline_reached || parkedReconcileDeadlineReached(deadlineAt)) {
+    stopForDeadline(selectedRows.length);
+    return;
+  }
+  for (const [index, row] of selectedRows.entries()) {
+    if (row.excluded_reason) {
+      summary.skipped_targets += 1;
+      continue;
+    }
+    if (parkedReconcileDeadlineReached(deadlineAt)) {
+      stopForDeadline(selectedRows.length - index + terminal.length + recoverable.length);
+      return;
+    }
+    summary.inspected_targets += 1;
+    let target;
+    try {
+      target = await inspectParkedReviewTarget(`${row.target_repo}#${row.item_number}`, deadlineAt);
+    } catch {
+      if (parkedReconcileDeadlineReached(deadlineAt)) {
+        stopForDeadline(selectedRows.length - index + terminal.length + recoverable.length);
+        return;
+      }
+      summary.skipped_targets += 1;
+      continue;
+    }
+    if (target.state === "closed" || target.state === "repository_gone") {
+      terminal.push({ row, target });
+      summary.terminal_targets += 1;
+      if (target.state === "repository_gone") summary.repository_gone_targets += 1;
+    } else if (target.state === "open") {
+      summary.open_targets += 1;
+      if (recoverable.length < args.maxRecoveries) recoverable.push({ row, target });
+      else summary.skipped_targets += 1;
+    } else {
+      summary.skipped_targets += 1;
+    }
+  }
+
+  for (const [index, candidate] of terminal.entries()) {
+    if (parkedReconcileDeadlineReached(deadlineAt)) {
+      stopForDeadline(terminal.length - index + recoverable.length);
+      return;
+    }
+    if (!args.execute) {
+      summary.resolved_targets += 1;
+      continue;
+    }
+    let current;
+    try {
+      current = await inspectParkedReviewTarget(candidate.target.requested_target, deadlineAt);
+    } catch {
+      if (parkedReconcileDeadlineReached(deadlineAt)) {
+        stopForDeadline(terminal.length - index + recoverable.length);
+        return;
+      }
+      summary.skipped_targets += 1;
+      continue;
+    }
+    if (current.state !== candidate.target.state) {
+      summary.skipped_targets += 1;
+      continue;
+    }
+    let result;
+    try {
+      result = await signedPost({
+        queueUrl,
+        secret,
+        path: "/internal/exact-review/parked-reviews/resolve",
+        payload: {
+          items: [parkedMutationItem(candidate.row)],
+          note:
+            current.state === "repository_gone"
+              ? `automatic reconciliation: repository for ${current.requested_target} no longer exists`
+              : `automatic reconciliation: GitHub target ${current.canonical_target} is terminal`,
+        },
+        deadlineAt,
+      });
+    } catch (error) {
+      if (parkedReconcileDeadlineReached(deadlineAt)) {
+        stopForDeadline(terminal.length - index + recoverable.length);
+        return;
+      }
+      throw error;
+    }
+    summary.resolved_targets += requiredCount(result, "resolved");
+    summary.skipped_targets += requiredCount(result, "skipped");
+  }
+
+  if (recoverable.length && pressure.status === "idle") {
+    const available = Math.min(args.maxRecoveries, pressure.availableSlots);
+    const admitted = [];
+    const selectedRecoveries = recoverable.slice(0, available);
+    summary.skipped_targets += recoverable.length - selectedRecoveries.length;
+    for (const [index, candidate] of selectedRecoveries.entries()) {
+      if (parkedReconcileDeadlineReached(deadlineAt)) {
+        stopForDeadline(admitted.length + selectedRecoveries.length - index);
+        return;
+      }
+      let current;
+      try {
+        current = await inspectParkedReviewTarget(candidate.target.requested_target, deadlineAt);
+      } catch {
+        if (parkedReconcileDeadlineReached(deadlineAt)) {
+          stopForDeadline(admitted.length + selectedRecoveries.length - index);
+          return;
+        }
+        summary.skipped_targets += 1;
+        continue;
+      }
+      if (current.state !== "open" || current.node_id !== candidate.target.node_id) {
+        summary.skipped_targets += 1;
+        continue;
+      }
+      admitted.push(candidate.row);
+    }
+    if (!args.execute) {
+      summary.recovered_targets += admitted.length;
+    } else if (admitted.length) {
+      if (parkedReconcileDeadlineReached(deadlineAt)) {
+        stopForDeadline(admitted.length);
+        return;
+      }
+      const identity = admitted
+        .map((row) => `${row.item_key}:${row.revision}:${row.updated_at_ms}`)
+        .sort()
+        .join("\n");
+      let result;
+      try {
+        result = await signedPost({
+          queueUrl,
+          secret,
+          path: "/internal/exact-review/parked-reviews/recover-fresh",
+          payload: {
+            items: admitted.map(parkedMutationItem),
+            idempotency_key: `parked-reconcile:${createHash("sha256").update(identity).digest("hex")}`,
+          },
+          deadlineAt,
+        });
+      } catch (error) {
+        if (parkedReconcileDeadlineReached(deadlineAt)) {
+          stopForDeadline(admitted.length);
+          return;
+        }
+        throw error;
+      }
+      summary.recovered_targets +=
+        requiredCount(result, "recovered") + requiredCount(result, "deduped");
+      summary.skipped_targets += requiredCount(result, "skipped");
+    }
+  } else {
+    summary.skipped_targets += recoverable.length;
+  }
+  printResult(summary);
+}
+
+async function loadParkedReviewInventory({ queueUrl, secret, maxRows, deadlineAt }) {
+  const rows = [];
+  let cursor = "";
+  let complete = false;
+  let deadlineReached = false;
+  while (rows.length < maxRows) {
+    if (parkedReconcileDeadlineReached(deadlineAt)) {
+      deadlineReached = true;
+      break;
+    }
+    const limit = Math.min(MAX_PARKED_INVENTORY_PAGE_SIZE, maxRows - rows.length);
+    let page;
+    try {
+      page = await signedPost({
+        queueUrl,
+        secret,
+        path: "/internal/exact-review/parked-reviews/list",
+        payload: { limit, ...(cursor ? { cursor } : {}) },
+        deadlineAt,
+      });
+    } catch (error) {
+      if (!parkedReconcileDeadlineReached(deadlineAt)) throw error;
+      deadlineReached = true;
+      break;
+    }
+    const pageRows = Array.isArray(page.parked_reviews) ? page.parked_reviews : [];
+    rows.push(...pageRows.map(sanitizeParkedReviewRow));
+    cursor = String(page.next_cursor || "");
+    if (!cursor) {
+      complete = true;
+      break;
+    }
+    if (!pageRows.length) throw new Error("parked review inventory cursor did not advance");
+  }
+  return {
+    generated_at: new Date().toISOString(),
+    complete,
+    ...(deadlineReached ? { deadline_reached: true } : {}),
+    next_cursor: complete ? null : cursor,
+    summary: {
+      rows: rows.length,
+      by_reason: countBy(rows, (row) => row.parked_reason || "unknown"),
+    },
+    parked_reviews: rows,
+  };
+}
+
+function sanitizeParkedReviewRow(row) {
+  const value = row && typeof row === "object" ? row : {};
+  const itemKey = String(value.item_key || "");
+  const revision = Number(value.revision);
+  const targetRepo = String(value.target_repo || "");
+  const itemNumber = Number(value.item_number);
+  const updatedAtMs = Number(value.updated_at_ms);
+  const excludedReason =
+    value.excluded_reason === undefined ? null : String(value.excluded_reason || "");
+  if (
+    !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+#[1-9]\d*$/.test(itemKey) ||
+    !Number.isSafeInteger(revision) ||
+    revision < 1 ||
+    !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(targetRepo) ||
+    !Number.isSafeInteger(itemNumber) ||
+    itemNumber < 1 ||
+    !Number.isSafeInteger(updatedAtMs) ||
+    updatedAtMs < 1 ||
+    (excludedReason !== null && excludedReason !== "command_context")
+  ) {
+    throw new Error("parked review inventory returned an invalid row");
+  }
+  return {
+    item_key: itemKey,
+    revision,
+    target_repo: targetRepo,
+    item_number: itemNumber,
+    item_kind: String(value.item_kind || ""),
+    excluded_reason: excludedReason,
+    parked_reason: String(value.parked_reason || "") || null,
+    parked_recovery_attempts: Number(value.parked_recovery_attempts || 0),
+    first_failed_at: value.first_failed_at ? String(value.first_failed_at) : null,
+    last_failure_reason: String(value.last_failure_reason || "") || null,
+    updated_at: String(value.updated_at || ""),
+    updated_at_ms: updatedAtMs,
+  };
+}
+
+function parkedMutationItem(row) {
+  return { item_key: row.item_key, revision: row.revision, updated_at_ms: row.updated_at_ms };
+}
+
+function parkedReconcileDeadlineAt() {
+  const raw = String(process.env.EXACT_REVIEW_RECONCILE_DEADLINE_MS || "").trim();
+  if (!raw) return Number.POSITIVE_INFINITY;
+  const deadlineAt = Number(raw);
+  if (!Number.isSafeInteger(deadlineAt) || deadlineAt < 1) {
+    throw new Error("EXACT_REVIEW_RECONCILE_DEADLINE_MS must be a positive epoch millisecond");
+  }
+  return deadlineAt;
+}
+
+function parkedReconcileDeadlineReached(deadlineAt) {
+  return Number.isFinite(deadlineAt) && Date.now() + OPERATOR_DEADLINE_SETTLE_MS >= deadlineAt;
+}
+
+function operatorRequestSignal(deadlineAt = Number.POSITIVE_INFINITY) {
+  if (parkedReconcileDeadlineReached(deadlineAt)) {
+    throw new Error("exact-review reconciliation deadline reached");
+  }
+  const remaining = Number.isFinite(deadlineAt)
+    ? Math.max(1, deadlineAt - Date.now())
+    : OPERATOR_REQUEST_TIMEOUT_MS;
+  return AbortSignal.timeout(Math.min(OPERATOR_REQUEST_TIMEOUT_MS, remaining));
+}
+
+async function inspectParkedReviewTarget(target, deadlineAt = Number.POSITIVE_INFINITY) {
+  const apiUrl = String(process.env.GITHUB_API_URL || "https://api.github.com").replace(/\/$/, "");
+  const token = String(process.env.GITHUB_TOKEN || "");
+  const match = /^([^/]+)\/([^#]+)#([1-9]\d*)$/.exec(target);
+  if (!match) throw new Error(`invalid parked review target: ${target}`);
+  const [, owner, repo, number] = match;
+  const headers = {
+    accept: "application/vnd.github+json",
+    "user-agent": "clawsweeper-parked-review-operator",
+    ...(token ? { authorization: `Bearer ${token}` } : {}),
+  };
+  const response = await fetch(
+    `${apiUrl}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues/${number}`,
+    { headers, signal: operatorRequestSignal(deadlineAt) },
+  );
+  if (response.status === 404) {
+    const repository = await fetch(
+      `${apiUrl}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`,
+      { headers, signal: operatorRequestSignal(deadlineAt) },
+    );
+    if (repository.status === 404) {
+      return {
+        state: "repository_gone",
+        requested_target: normalizeRecoveryTargetKey(target),
+        canonical_target: normalizeRecoveryTargetKey(target),
+        node_id: null,
+      };
+    }
+    throw new Error(`parked review target is missing from an existing repository: ${target}`);
+  }
+  if (!response.ok) throw new Error(`parked review target check failed for ${target}`);
+  const item = await response.json();
+  if (
+    typeof item?.node_id !== "string" ||
+    !item.node_id ||
+    !["open", "closed"].includes(String(item.state || "").toLowerCase())
+  ) {
+    throw new Error(`parked review target check returned an invalid identity for ${target}`);
+  }
+  return {
+    state: String(item.state).toLowerCase(),
+    requested_target: normalizeRecoveryTargetKey(target),
+    canonical_target: canonicalGitHubTarget(item, target),
+    node_id: item.node_id,
+  };
+}
+
+async function readQueuePressure(queueUrl, deadlineAt = Number.POSITIVE_INFINITY) {
   try {
     const response = await fetch(`${queueUrl}/api/exact-review-queue`, {
       cache: "no-store",
-      signal: AbortSignal.timeout(20_000),
+      signal: operatorRequestSignal(deadlineAt),
     });
     if (!response.ok || response.headers.get("x-clawsweeper-cache") === "stale") {
       return { status: "unknown", availableSlots: 0 };
@@ -898,7 +1276,13 @@ function countBy(rows, keyFor) {
   );
 }
 
-async function signedPost({ queueUrl, secret, path, payload }) {
+async function signedPost({
+  queueUrl,
+  secret,
+  path,
+  payload,
+  deadlineAt = Number.POSITIVE_INFINITY,
+}) {
   const body = JSON.stringify(payload);
   const signature = `sha256=${createHmac("sha256", secret).update(body).digest("hex")}`;
   const response = await fetch(`${queueUrl}${path}`, {
@@ -908,7 +1292,7 @@ async function signedPost({ queueUrl, secret, path, payload }) {
       "x-clawsweeper-exact-review-signature": signature,
     },
     body,
-    signal: AbortSignal.timeout(20_000),
+    signal: operatorRequestSignal(deadlineAt),
   });
   const text = await response.text();
   if (!response.ok) throw new Error(`${path} returned ${response.status}`);

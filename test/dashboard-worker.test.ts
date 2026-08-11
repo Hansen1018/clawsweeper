@@ -4013,6 +4013,65 @@ test("fresh dead-letter recovery is available only through the signed internal r
   });
 });
 
+test("parked review inventory and mutations require the operator signature", async () => {
+  const queue = new ExactReviewQueue({ storage: new MemoryDurableStorage() }, {});
+  const env = {
+    CLAWSWEEPER_WEBHOOK_SECRET: "test-token-placeholder",
+    EXACT_REVIEW_OPERATOR_SECRET: "operator-token-placeholder",
+    EXACT_REVIEW_QUEUE: new MemoryDurableNamespace(queue),
+  };
+  const requests = [
+    { path: "list", payload: { limit: 5 } },
+    {
+      path: "resolve",
+      payload: {
+        items: [{ item_key: "openclaw/gogcli#1", revision: 1, updated_at_ms: 1 }],
+        note: "terminal target",
+      },
+    },
+    {
+      path: "recover-fresh",
+      payload: {
+        items: [{ item_key: "openclaw/gogcli#1", revision: 1, updated_at_ms: 1 }],
+        idempotency_key: "parked-reconcile:test",
+      },
+    },
+  ];
+  for (const { path, payload } of requests) {
+    const body = JSON.stringify(payload);
+    const url = `https://clawsweeper.openclaw.ai/internal/exact-review/parked-reviews/${path}`;
+    assert.equal((await worker.fetch(new Request(url, { method: "POST", body }), env)).status, 401);
+    const sharedSignature = `sha256=${createHmac("sha256", "test-token-placeholder").update(body).digest("hex")}`;
+    assert.equal(
+      (
+        await worker.fetch(
+          new Request(url, {
+            method: "POST",
+            headers: { "x-clawsweeper-exact-review-signature": sharedSignature },
+            body,
+          }),
+          env,
+        )
+      ).status,
+      401,
+    );
+    const operatorSignature = `sha256=${createHmac("sha256", "operator-token-placeholder").update(body).digest("hex")}`;
+    assert.equal(
+      (
+        await worker.fetch(
+          new Request(url, {
+            method: "POST",
+            headers: { "x-clawsweeper-exact-review-signature": operatorSignature },
+            body,
+          }),
+          env,
+        )
+      ).status,
+      200,
+    );
+  }
+});
+
 test("direct publication endpoint authenticates, dedupes, and returns a structured 413", async () => {
   const storage = new MemoryDurableStorage();
   const leased = leasedExactReviewQueueItem(701, "7010");
@@ -16446,6 +16505,382 @@ test("exact-review queue removes a terminal dispatch rejection after parked reco
   } finally {
     harness.restore();
   }
+});
+
+test("parked review operator routes paginate, resolve, and recover idempotently within caps", async () => {
+  const storage = new MemoryDurableStorage();
+  const now = Date.parse("2026-08-10T12:00:00.000Z");
+  const items = Object.fromEntries(
+    Array.from({ length: 8 }, (_, index) => {
+      const item = leasedExactReviewQueueItem(114_000 + index, `91400${index}`);
+      item.state = "parked";
+      item.parkedReason = index === 7 ? "dead_letter_capacity" : "review_retry_exhausted";
+      item.parkedRecoveryAttempts = index === 6 ? 2 : 3;
+      item.parkedRecoveryAt = undefined;
+      item.attempts = 8;
+      item.reviewFailureAttempts = 8;
+      item.firstFailureAt = now - 60_000;
+      item.updatedAt = now + index;
+      return [item.key, item];
+    }),
+  );
+  await storage.put("exact-review-queue", { deliveries: {}, items });
+  const queue = new ExactReviewQueue(
+    { storage },
+    { EXACT_REVIEW_DISPATCH_DEBOUNCE_MS: "0", EXACT_REVIEW_QUEUE_MAX_CONCURRENT: "10" },
+  );
+
+  const first = await (
+    await queue.fetch(
+      new Request("https://clawsweeper-exact-review-queue/parked-reviews/list", {
+        method: "POST",
+        body: JSON.stringify({ limit: 2 }),
+      }),
+    )
+  ).json();
+  assert.equal(first.parked_reviews.length, 2);
+  const all = await (
+    await queue.fetch(
+      new Request("https://clawsweeper-exact-review-queue/parked-reviews/list", {
+        method: "POST",
+        body: JSON.stringify({ limit: 50 }),
+      }),
+    )
+  ).json();
+  assert.equal(all.parked_reviews.length, 6);
+  assert.equal(
+    all.parked_reviews.some((item) => item.item_key === "openclaw/openclaw#114006"),
+    false,
+  );
+  assert.equal(
+    all.parked_reviews.some((item) => item.item_key === "openclaw/openclaw#114007"),
+    false,
+  );
+  assert.equal(first.parked_reviews[0].item_key, "openclaw/openclaw#114000");
+  assert.deepEqual(
+    Object.keys(first.parked_reviews[0]).sort(),
+    [
+      "first_failed_at",
+      "item_key",
+      "item_kind",
+      "last_failure_reason",
+      "parked_reason",
+      "parked_recovery_attempts",
+      "revision",
+      "target_repo",
+      "item_number",
+      "updated_at",
+      "updated_at_ms",
+    ].sort(),
+  );
+  assert.equal(first.parked_reviews[0].parked_recovery_attempts, 3);
+  assert.equal(first.parked_reviews[0].last_failure_reason, "review_retry_exhausted");
+  assert.equal(first.next_cursor, "openclaw/openclaw#114001");
+
+  const second = await (
+    await queue.fetch(
+      new Request("https://clawsweeper-exact-review-queue/parked-reviews/list", {
+        method: "POST",
+        body: JSON.stringify({ limit: 2, cursor: first.next_cursor }),
+      }),
+    )
+  ).json();
+  assert.deepEqual(
+    second.parked_reviews.map((item) => item.item_key),
+    ["openclaw/openclaw#114002", "openclaw/openclaw#114003"],
+  );
+
+  const ineligible = [6, 7].map((index) => ({
+    item_key: `openclaw/openclaw#${114_000 + index}`,
+    revision: 1,
+    updated_at_ms: now + index,
+  }));
+  const earlyResolve = await queue.fetch(
+    new Request("https://clawsweeper-exact-review-queue/parked-reviews/resolve", {
+      method: "POST",
+      body: JSON.stringify({ items: ineligible, note: "must remain parked" }),
+    }),
+  );
+  assert.deepEqual(await earlyResolve.json(), { ok: true, resolved: 0, skipped: 2 });
+  const earlyRecover = await queue.fetch(
+    new Request("https://clawsweeper-exact-review-queue/parked-reviews/recover-fresh", {
+      method: "POST",
+      body: JSON.stringify({
+        items: ineligible,
+        idempotency_key: "parked-reconcile:ineligible",
+      }),
+    }),
+  );
+  assert.deepEqual(await earlyRecover.json(), {
+    ok: true,
+    recovered: 0,
+    deduped: 0,
+    skipped: 2,
+  });
+  const guarded = (await storage.get("exact-review-queue")) as {
+    items: Record<
+      string,
+      { state: string; parkedRecoveryAttempts?: number; parkedReason?: string }
+    >;
+  };
+  assert.equal(guarded.items["openclaw/openclaw#114006"].state, "parked");
+  assert.equal(guarded.items["openclaw/openclaw#114006"].parkedRecoveryAttempts, 2);
+  assert.equal(guarded.items["openclaw/openclaw#114007"].state, "parked");
+  assert.equal(guarded.items["openclaw/openclaw#114007"].parkedReason, "dead_letter_capacity");
+
+  const terminal = first.parked_reviews[0];
+  const resolved = await queue.fetch(
+    new Request("https://clawsweeper-exact-review-queue/parked-reviews/resolve", {
+      method: "POST",
+      body: JSON.stringify({
+        items: [
+          {
+            item_key: terminal.item_key,
+            revision: terminal.revision,
+            updated_at_ms: terminal.updated_at_ms,
+          },
+        ],
+        note: "automatic reconciliation: terminal test target",
+      }),
+    }),
+  );
+  assert.deepEqual(await resolved.json(), { ok: true, resolved: 1, skipped: 0 });
+
+  const recoverable = first.parked_reviews[1];
+  const recoveryPayload = {
+    items: [
+      {
+        item_key: recoverable.item_key,
+        revision: recoverable.revision,
+        updated_at_ms: recoverable.updated_at_ms,
+      },
+    ],
+    idempotency_key: "parked-reconcile:test:114001",
+  };
+  const observed = (await storage.get("exact-review-queue")) as {
+    items: Record<string, { updatedAt: number }>;
+  };
+  observed.items[recoverable.item_key].updatedAt += 5 * 60_000;
+  await storage.put("exact-review-queue", observed);
+  const recover = () =>
+    queue.fetch(
+      new Request("https://clawsweeper-exact-review-queue/parked-reviews/recover-fresh", {
+        method: "POST",
+        body: JSON.stringify(recoveryPayload),
+      }),
+    );
+  assert.deepEqual(await (await recover()).json(), {
+    ok: true,
+    recovered: 1,
+    deduped: 0,
+    skipped: 0,
+  });
+  assert.deepEqual(await (await recover()).json(), {
+    ok: true,
+    recovered: 0,
+    deduped: 1,
+    skipped: 0,
+  });
+  const state = (await storage.get("exact-review-queue")) as {
+    items: Record<
+      string,
+      {
+        state: string;
+        attempts: number;
+        reviewFailureAttempts?: number;
+        parkedReason?: string;
+        parkedRecoveryAttempts?: number;
+      }
+    >;
+  };
+  assert.equal(state.items[terminal.item_key], undefined);
+  assert.equal(state.items[recoverable.item_key].state, "pending");
+  assert.equal(state.items[recoverable.item_key].attempts, 0);
+  assert.equal(state.items[recoverable.item_key].reviewFailureAttempts, 0);
+  assert.equal(state.items[recoverable.item_key].parkedReason, undefined);
+  assert.equal(state.items[recoverable.item_key].parkedRecoveryAttempts, 0);
+
+  assert.equal(
+    (
+      await queue.fetch(
+        new Request("https://clawsweeper-exact-review-queue/parked-reviews/list", {
+          method: "POST",
+          body: JSON.stringify({ limit: 51 }),
+        }),
+      )
+    ).status,
+    400,
+  );
+  assert.equal(
+    (
+      await queue.fetch(
+        new Request("https://clawsweeper-exact-review-queue/parked-reviews/recover-fresh", {
+          method: "POST",
+          body: JSON.stringify({
+            items: second.parked_reviews
+              .concat([
+                {
+                  ...second.parked_reviews[0],
+                  item_key: "openclaw/openclaw#114004",
+                  updated_at_ms: now + 4,
+                },
+                {
+                  ...second.parked_reviews[0],
+                  item_key: "openclaw/openclaw#114005",
+                  updated_at_ms: now + 5,
+                },
+                {
+                  ...second.parked_reviews[0],
+                  item_key: "openclaw/openclaw#114006",
+                  updated_at_ms: now + 6,
+                },
+                {
+                  ...second.parked_reviews[0],
+                  item_key: "openclaw/openclaw#114007",
+                  updated_at_ms: now + 7,
+                },
+              ])
+              .map((item) => ({
+                item_key: item.item_key,
+                revision: item.revision,
+                updated_at_ms: item.updated_at_ms,
+              })),
+            idempotency_key: "parked-reconcile:over-cap",
+          }),
+        }),
+      )
+    ).status,
+    400,
+  );
+});
+
+test("parked review operator routes flag and refuse both command-context variants", async () => {
+  const storage = new MemoryDurableStorage();
+  const now = Date.parse("2026-08-10T12:30:00.000Z");
+  const ordinary = leasedExactReviewQueueItem(114_020, "914020");
+  const markerOnly = leasedExactReviewQueueItem(114_021, "914021");
+  const commentOnly = leasedExactReviewQueueItem(114_022, "914022");
+  for (const item of [ordinary, markerOnly, commentOnly]) {
+    item.state = "parked";
+    item.parkedReason = "review_retry_exhausted";
+    item.parkedRecoveryAttempts = 3;
+    item.parkedRecoveryAt = undefined;
+    item.attempts = 8;
+    item.reviewFailureAttempts = 8;
+    item.updatedAt = now;
+  }
+  markerOnly.decision.commandStatusMarker =
+    "<!-- clawsweeper-command-status:114021:re_review:parked -->";
+  commentOnly.decision.statusCommentId = 914_022;
+  await storage.put("exact-review-queue", {
+    deliveries: {},
+    items: {
+      [ordinary.key]: ordinary,
+      [markerOnly.key]: markerOnly,
+      [commentOnly.key]: commentOnly,
+    },
+  });
+  const queue = new ExactReviewQueue({ storage }, { EXACT_REVIEW_DISPATCH_DEBOUNCE_MS: "0" });
+
+  const inventory = await (
+    await queue.fetch(
+      new Request("https://clawsweeper-exact-review-queue/parked-reviews/list", {
+        method: "POST",
+        body: JSON.stringify({ limit: 50 }),
+      }),
+    )
+  ).json();
+  assert.equal(inventory.parked_reviews.length, 3);
+  const ordinaryRow = inventory.parked_reviews.find((row) => row.item_key === ordinary.key);
+  const commandRows = [markerOnly, commentOnly].map((command) =>
+    inventory.parked_reviews.find((row) => row.item_key === command.key),
+  );
+  assert.equal(ordinaryRow.excluded_reason, undefined);
+  assert.deepEqual(
+    commandRows.map((row) => row.excluded_reason),
+    ["command_context", "command_context"],
+  );
+  const commandMutations = commandRows.map((row) => ({
+    item_key: row.item_key,
+    revision: row.revision,
+    updated_at_ms: row.updated_at_ms,
+  }));
+
+  const resolve = await queue.fetch(
+    new Request("https://clawsweeper-exact-review-queue/parked-reviews/resolve", {
+      method: "POST",
+      body: JSON.stringify({
+        items: commandMutations,
+        note: "must remain parked for command acknowledgement",
+      }),
+    }),
+  );
+  assert.deepEqual(await resolve.json(), { ok: true, resolved: 0, skipped: 2 });
+  const recover = await queue.fetch(
+    new Request("https://clawsweeper-exact-review-queue/parked-reviews/recover-fresh", {
+      method: "POST",
+      body: JSON.stringify({
+        items: commandMutations,
+        idempotency_key: "parked-reconcile:command-context",
+      }),
+    }),
+  );
+  assert.deepEqual(await recover.json(), {
+    ok: true,
+    recovered: 0,
+    deduped: 0,
+    skipped: 2,
+  });
+
+  const ordinaryRecover = await queue.fetch(
+    new Request("https://clawsweeper-exact-review-queue/parked-reviews/recover-fresh", {
+      method: "POST",
+      body: JSON.stringify({
+        items: [
+          {
+            item_key: ordinaryRow.item_key,
+            revision: ordinaryRow.revision,
+            updated_at_ms: ordinaryRow.updated_at_ms,
+          },
+        ],
+        idempotency_key: "parked-reconcile:ordinary",
+      }),
+    }),
+  );
+  assert.deepEqual(await ordinaryRecover.json(), {
+    ok: true,
+    recovered: 1,
+    deduped: 0,
+    skipped: 0,
+  });
+
+  const after = (await storage.get("exact-review-queue")) as {
+    items: Record<
+      string,
+      {
+        state: string;
+        revision: number;
+        attempts: number;
+        parkedReason?: string;
+        parkedRecoveryAttempts?: number;
+        decision: { commandStatusMarker?: string; statusCommentId?: number };
+      }
+    >;
+  };
+  assert.equal(after.items[ordinary.key].state, "pending");
+  assert.equal(after.items[ordinary.key].parkedRecoveryAttempts, 0);
+  for (const [index, command] of [markerOnly, commentOnly].entries()) {
+    assert.equal(after.items[command.key].state, "parked");
+    assert.equal(after.items[command.key].revision, commandRows[index].revision);
+    assert.equal(after.items[command.key].attempts, 8);
+    assert.equal(after.items[command.key].parkedReason, "review_retry_exhausted");
+    assert.equal(after.items[command.key].parkedRecoveryAttempts, 3);
+  }
+  assert.equal(
+    after.items[markerOnly.key].decision.commandStatusMarker,
+    "<!-- clawsweeper-command-status:114021:re_review:parked -->",
+  );
+  assert.equal(after.items[commentOnly.key].decision.statusCommentId, 914_022);
 });
 
 test("exact-review admission requeue_latest resets failures instead of parking at the review ceiling", async () => {
