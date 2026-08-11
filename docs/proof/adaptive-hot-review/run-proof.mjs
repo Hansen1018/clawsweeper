@@ -44,6 +44,18 @@ try {
 
   await signedRequest("/internal/adaptive-hot-review/observation", "POST", observation, 202);
   await signedRequest("/internal/adaptive-hot-review/observation", "POST", observation, 202);
+  const allocatorSnapshot = await signedJson(
+    "/internal/adaptive-hot-review/control-plane",
+    "POST",
+    {
+      policyVersion: "adaptive-hot-v1",
+      lane: "hot_intake",
+      targetRepositories: ["example/alpha"],
+    },
+    200,
+  );
+  assert.equal(allocatorSnapshot.adaptive_hot_review.observations.length, 1);
+  assert.equal(allocatorSnapshot.adaptive_hot_review.observations[0].targetRepo, "example/alpha");
 
   const planned = decisionRecord({ observedAt, status: "planned" });
   const dispatched = decisionRecord({ observedAt, status: "dispatched" });
@@ -64,16 +76,12 @@ try {
     202,
   );
   assert.equal(reserved.reservation_id, reservationId);
-  const blockedDirectWrite = await fetchSigned(
-    "/internal/state/cursors/hot-intake",
-    "PUT",
-    { next_cursor: 99, expected_revision: 0 },
-  );
+  const blockedDirectWrite = await fetchSigned("/internal/state/cursors/hot-intake", "PUT", {
+    next_cursor: 99,
+    expected_revision: 0,
+  });
   assert.equal(blockedDirectWrite.status, 409);
-  assert.equal(
-    (await blockedDirectWrite.json()).error,
-    "adaptive_hot_cursor_reservation_active",
-  );
+  assert.equal((await blockedDirectWrite.json()).error, "adaptive_hot_cursor_reservation_active");
   await assertCursors(cursorUpdates, 0, 0);
 
   await stopWorker(worker);
@@ -186,7 +194,10 @@ try {
   assert.equal(recoveredSummary.adaptive_cursor_persisted, true);
   assert.equal(recoveredSummary.adaptive_probe_cursor_persisted, true);
   const commandCursors = await readCursors(cursorUpdates);
-  assert.equal(commandCursors.every((cursor) => cursor.revision === 2), true);
+  assert.equal(
+    commandCursors.every((cursor) => cursor.revision === 2),
+    true,
+  );
 
   const shadowCommitFault = await runTargetFanoutCommand({
     ghPath: ghProof.path,
@@ -298,6 +309,8 @@ try {
       durable_object: "persisted SQLite ExactReviewQueue",
       restarts: 2,
       invalid_signature_status: unsigned.status,
+      authenticated_allocator_observations:
+        allocatorSnapshot.adaptive_hot_review.observations.length,
       loopback_tls_proxy: true,
     },
     telemetry: {
@@ -369,6 +382,7 @@ try {
       "",
       `- Exact head: ${actualHead}.`,
       `- Auth boundary: unsigned observation returned HTTP ${unsigned.status}.`,
+      "- Allocator boundary: a signed current-policy hot-lane view returned the eligible repository independently of the bounded public projection.",
       "- Telemetry: duplicate observation and decision receipts collapsed to one durable record each across a restart.",
       "- Cursor fencing: reservation left all three cursors at revision 0 until the post-restart commit.",
       `- Direct-write fencing: a covered cursor write during the reservation returned HTTP ${blockedDirectWrite.status}.`,
@@ -389,15 +403,22 @@ try {
 
   console.log(`exact head: ${actualHead}`);
   console.log(`auth boundary: HTTP ${unsigned.status}`);
+  console.log("allocator view: signed current-policy hot lane returned 1 observation");
   console.log("telemetry persistence: 1 observation, 1 dispatched decision after restart");
   console.log("cursor fencing: unchanged before commit; 3 cursors advanced atomically");
   console.log("commit retry after second restart: identical durable receipt");
   console.log(`committed reservation identity reuse: HTTP ${reusedReservation.status}`);
   console.log(`direct write during reservation: HTTP ${blockedDirectWrite.status}`);
   console.log("dispatch failure recovery: aborted unchanged; replacement reservation acquired");
-  console.log("actual target-fanout: injected zero-dispatch failure aborted; recovery dispatched 2 and committed");
-  console.log("shadow commit failure: legacy cursor advanced; next cycle selected the next repository");
-  console.log("kill switch rollback: malformed inactive controls bypassed; legacy dispatch persisted");
+  console.log(
+    "actual target-fanout: injected zero-dispatch failure aborted; recovery dispatched 2 and committed",
+  );
+  console.log(
+    "shadow commit failure: legacy cursor advanced; next cycle selected the next repository",
+  );
+  console.log(
+    "kill switch rollback: malformed inactive controls bypassed; legacy dispatch persisted",
+  );
   console.log("public snapshot: bounded and sanitized");
   console.log("RESULT: PASS");
 } finally {
@@ -549,7 +570,12 @@ async function publicSnapshot() {
   return response.json();
 }
 
-function assertAdaptiveSnapshot(snapshot, observationCount, decisionCount, latestStatus = "dispatched") {
+function assertAdaptiveSnapshot(
+  snapshot,
+  observationCount,
+  decisionCount,
+  latestStatus = "dispatched",
+) {
   assert.equal(snapshot.adaptive_hot_review.observations.length, observationCount);
   assert.equal(snapshot.adaptive_hot_review.observations[0].targetRepo, "example/alpha");
   assert.equal(snapshot.adaptive_hot_review.recentDecisions.length, decisionCount);

@@ -102,6 +102,15 @@ round-by-round reasons, offer reduction, an observation-based dedupe/shed
 avoidance estimate, and fairness age before and after the bounded proposal.
 Those estimates are diagnostic comparisons, not admission inputs.
 
+The 100-partition public projection is display-only. Adaptive fanout signs its
+current policy version, hot lane, and eligible repository inventory to
+`POST /internal/adaptive-hot-review/control-plane`; the Durable Object returns
+the matching retained observations through that authenticated boundary. The
+allocator therefore does not lose fleet observations when normal-lane, older
+policy, or other public partitions fill the dashboard cap. An unavailable or
+invalid private view follows the same shadow fail-open and active-mode
+fail-closed rules as the rest of the control plane.
+
 ## Modes and controls
 
 The target-fanout job reads these repository variables:

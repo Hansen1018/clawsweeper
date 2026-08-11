@@ -299,7 +299,12 @@ export async function runTargetFanout(argv: string[]): Promise<void> {
     ) {
       throw new Error("adaptive hot-review cursors must be durable before active dispatch");
     }
-    const control = await fetchAdaptiveHotControlPlane({ queueUrl: options.cursorStoreUrl });
+    const control = await fetchAdaptiveHotControlPlane({
+      queueUrl: options.cursorStoreUrl,
+      webhookSecret: process.env.CLAWSWEEPER_WEBHOOK_SECRET ?? "",
+      policyVersion: adaptive.policy.allocation.policyVersion,
+      targetRepositories: planningRepositories.map((repository) => repository.targetRepo),
+    });
     if (!control.ok && adaptive.runtime.effectiveMode !== "shadow") {
       throw new Error(`adaptive hot-review control plane unavailable: ${control.reason}`);
     }

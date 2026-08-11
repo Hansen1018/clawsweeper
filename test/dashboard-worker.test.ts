@@ -6689,6 +6689,33 @@ test("signed adaptive hot-review telemetry routes through the Worker and survive
   const snapshot = (await status.json()).adaptive_hot_review;
   assert.equal(snapshot.observations.length, 1);
   assert.equal(snapshot.observations[0].targetRepo, "openclaw/clawsweeper");
+
+  const allocatorBody = JSON.stringify({
+    policyVersion: "adaptive-hot-v1",
+    lane: "hot_intake",
+    targetRepositories: ["openclaw/clawsweeper"],
+  });
+  const allocatorUrl = "https://clawsweeper.openclaw.ai/internal/adaptive-hot-review/control-plane";
+  assert.equal(
+    (await worker.fetch(new Request(allocatorUrl, { method: "POST", body: allocatorBody }), env))
+      .status,
+    401,
+  );
+  const allocatorResponse = await worker.fetch(
+    new Request(allocatorUrl, {
+      method: "POST",
+      body: allocatorBody,
+      headers: {
+        "content-type": "application/json",
+        "x-clawsweeper-exact-review-signature": `sha256=${createHmac("sha256", secret).update(allocatorBody).digest("hex")}`,
+      },
+    }),
+    env,
+  );
+  assert.equal(allocatorResponse.status, 200);
+  const allocatorSnapshot = (await allocatorResponse.json()).adaptive_hot_review;
+  assert.equal(allocatorSnapshot.observations.length, 1);
+  assert.equal(allocatorSnapshot.observations[0].targetRepo, "openclaw/clawsweeper");
 });
 
 test("only a fenced scheduled lease completion records adaptive execution outcomes", async () => {
@@ -12060,6 +12087,20 @@ test("adaptive hot-review public observations retain the newest one hundred part
     snapshot.observations.some((observation) => observation.targetRepo === "openclaw/repo-100"),
     false,
   );
+
+  const allocatorSnapshot = store.allocatorSnapshot(
+    {
+      policyVersion: "adaptive-hot-v1",
+      lane: "hot_intake",
+      targetRepositories: Array.from(
+        { length: 101 },
+        (_, index) => `openclaw/repo-${String(index).padStart(3, "0")}`,
+      ),
+    },
+    now,
+  );
+  assert.equal(allocatorSnapshot.observations.length, 101);
+  assert.equal(allocatorSnapshot.observations.at(-1)?.targetRepo, "openclaw/repo-100");
 });
 
 test("adaptive hot-review public decisions use an allowlisted normalized projection", () => {

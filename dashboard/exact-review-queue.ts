@@ -1,4 +1,5 @@
 import { stableJson } from "../src/stable-json.ts";
+import { isAdaptiveHotRepositorySlug } from "../src/repair/adaptive-hot-review-contract.ts";
 import {
   normalizeStateWriterOperation,
   normalizeStateWriterProgress,
@@ -90,6 +91,7 @@ const RECENT_DURABLE_PUBLICATION_EVENTS_CACHE_MS = 60_000;
 
 const GITHUB_TIMEOUT_MS = 4500;
 const CLAWSWEEPER_REVIEW_REPO = "openclaw/clawsweeper";
+const ADAPTIVE_HOT_ALLOCATOR_TARGET_MAX = 20_000;
 
 const FAILED_REVIEW_SHARD_RECOVERY_SOURCE_ACTION = "failed_review_shard_recovery";
 const EXACT_REVIEW_ARTIFACT_PUBLISH_SOURCE_ACTION = "exact_review_artifact_publish";
@@ -743,6 +745,36 @@ export class ExactReviewQueue {
         await request.json().catch(() => null),
       );
       return result.ok ? json(result, 202) : json({ error: result.error }, 400);
+    }
+    if (request.method === "POST" && url.pathname === "/adaptive-hot-review/control-plane") {
+      const body = objectValue(await request.json().catch(() => null));
+      const policyVersion = String(body.policyVersion || "").trim();
+      const lane = String(body.lane || "");
+      const targetRepositories = Array.isArray(body.targetRepositories)
+        ? body.targetRepositories.map((repository) => String(repository).trim().toLowerCase())
+        : [];
+      if (
+        !policyVersion ||
+        policyVersion.length > 100 ||
+        [...policyVersion].some((character) => {
+          const point = character.codePointAt(0) ?? 0;
+          return point <= 31 || point === 127;
+        }) ||
+        lane !== "hot_intake" ||
+        targetRepositories.length > ADAPTIVE_HOT_ALLOCATOR_TARGET_MAX ||
+        new Set(targetRepositories).size !== targetRepositories.length ||
+        targetRepositories.some((repository) => !isAdaptiveHotRepositorySlug(repository))
+      ) {
+        return json({ error: "invalid_adaptive_hot_control_plane_request" }, 400);
+      }
+      return json({
+        ok: true,
+        adaptive_hot_review: this.adaptiveHotReviewStore.allocatorSnapshot({
+          policyVersion,
+          lane,
+          targetRepositories,
+        }),
+      });
     }
     if (request.method === "POST" && url.pathname === "/adaptive-hot-review/decision") {
       const result = this.adaptiveHotReviewStore.recordDecision(

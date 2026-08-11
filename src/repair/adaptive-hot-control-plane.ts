@@ -20,6 +20,9 @@ export type AdaptiveHotControlPlaneResult =
 
 export async function fetchAdaptiveHotControlPlane(options: {
   queueUrl: string;
+  webhookSecret: string;
+  policyVersion: string;
+  targetRepositories: readonly string[];
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
 }): Promise<AdaptiveHotControlPlaneResult> {
@@ -27,13 +30,45 @@ export async function fetchAdaptiveHotControlPlane(options: {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), options.timeoutMs ?? 10_000);
   try {
-    const response = await request(
-      new URL("/api/exact-review-queue", `${options.queueUrl.replace(/\/+$/, "")}/`),
-      { signal: controller.signal },
-    );
+    const baseUrl = options.queueUrl.replace(/\/+$/, "");
+    if (!baseUrl.startsWith("https://")) {
+      return { ok: false, reason: "adaptive hot-review URL must use HTTPS" };
+    }
+    if (!options.webhookSecret) {
+      return { ok: false, reason: "adaptive hot-review webhook secret is required" };
+    }
+    const allocatorRequestBody = JSON.stringify({
+      policyVersion: options.policyVersion,
+      lane: "hot_intake",
+      targetRepositories: options.targetRepositories,
+    });
+    const signature = `sha256=${createHmac("sha256", options.webhookSecret)
+      .update(allocatorRequestBody)
+      .digest("hex")}`;
+    const [response, allocatorResponse] = await Promise.all([
+      request(new URL("/api/exact-review-queue", `${baseUrl}/`), {
+        signal: controller.signal,
+      }),
+      request(new URL("/internal/adaptive-hot-review/control-plane", `${baseUrl}/`), {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-clawsweeper-exact-review-signature": signature,
+        },
+        body: allocatorRequestBody,
+        signal: controller.signal,
+      }),
+    ]);
     if (!response.ok) return { ok: false, reason: `http_${response.status}` };
+    if (!allocatorResponse.ok) {
+      return { ok: false, reason: `allocator_http_${allocatorResponse.status}` };
+    }
     const body = record(await response.json(), "exact-review queue status");
-    const snapshot = adaptiveHotControlSnapshot(body.adaptive_hot_review);
+    const allocatorBody = record(
+      await allocatorResponse.json(),
+      "adaptive hot-review allocator status",
+    );
+    const snapshot = adaptiveHotControlSnapshot(allocatorBody.adaptive_hot_review);
     const review = record(record(body.lanes, "lanes").review, "lanes.review");
     const publication = record(record(body.lanes, "lanes").publication, "lanes.publication");
     const scheduledFeed = record(body.scheduled_feed, "scheduled_feed");

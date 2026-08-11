@@ -566,6 +566,12 @@ export default {
       return authenticatedExactReviewQueueRequest(request, env, "/review-coverage/inventory");
     if (url.pathname === "/internal/adaptive-hot-review/observation" && request.method === "POST")
       return authenticatedExactReviewQueueRequest(request, env, "/adaptive-hot-review/observation");
+    if (url.pathname === "/internal/adaptive-hot-review/control-plane" && request.method === "POST")
+      return authenticatedExactReviewQueueRequest(
+        request,
+        env,
+        "/adaptive-hot-review/control-plane",
+      );
     if (url.pathname === "/internal/adaptive-hot-review/decision" && request.method === "POST")
       return authenticatedExactReviewQueueRequest(request, env, "/adaptive-hot-review/decision");
     if (

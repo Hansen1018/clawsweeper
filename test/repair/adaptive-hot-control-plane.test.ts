@@ -8,10 +8,29 @@ import {
 } from "../../dist/repair/adaptive-hot-control-plane.js";
 
 test("adaptive control plane combines queue, token, throttle, and circuit facts", async () => {
+  const secret = "control-plane-secret";
   const result = await fetchAdaptiveHotControlPlane({
     queueUrl: "https://queue.example",
-    fetchImpl: async () =>
-      Response.json({
+    webhookSecret: secret,
+    policyVersion: "adaptive-hot-v1",
+    targetRepositories: ["openclaw/clawsweeper"],
+    fetchImpl: async (input, init) => {
+      const url = new URL(String(input));
+      if (url.pathname === "/internal/adaptive-hot-review/control-plane") {
+        const body = String(init?.body);
+        assert.equal(init?.method, "POST");
+        assert.deepEqual(JSON.parse(body), {
+          policyVersion: "adaptive-hot-v1",
+          lane: "hot_intake",
+          targetRepositories: ["openclaw/clawsweeper"],
+        });
+        assert.equal(
+          new Headers(init?.headers).get("x-clawsweeper-exact-review-signature"),
+          `sha256=${createHmac("sha256", secret).update(body).digest("hex")}`,
+        );
+        return Response.json({ ok: true, adaptive_hot_review: emptySnapshot() });
+      }
+      return Response.json({
         lanes: {
           review: { capacity: 30, active: 8, pending: 7 },
           publication: {
@@ -37,8 +56,8 @@ test("adaptive control plane combines queue, token, throttle, and circuit facts"
           throttle_recovery_at: "2099-01-01T00:00:00Z",
           lanes: { hot_intake: { token_balance: 9 } },
         },
-        adaptive_hot_review: emptySnapshot(),
-      }),
+      });
+    },
   });
   assert.equal(result.ok, true);
   if (!result.ok) return;
@@ -63,6 +82,50 @@ test("adaptive control plane combines queue, token, throttle, and circuit facts"
     ],
     githubRequestMetricsUpdatedAt: "2026-08-10T12:00:00.000Z",
   });
+});
+
+test("adaptive allocator uses the signed fleet view beyond the public partition cap", async () => {
+  const targetRepositories = Array.from(
+    { length: 101 },
+    (_, index) => `example/repo-${String(index).padStart(3, "0")}`,
+  );
+  const observations = targetRepositories.map((targetRepo) => ({ targetRepo }));
+  const result = await fetchAdaptiveHotControlPlane({
+    queueUrl: "https://queue.example",
+    webhookSecret: "fleet-view-secret",
+    policyVersion: "adaptive-hot-v1",
+    targetRepositories,
+    fetchImpl: async (input) => {
+      const url = new URL(String(input));
+      if (url.pathname === "/internal/adaptive-hot-review/control-plane") {
+        return Response.json({
+          ok: true,
+          adaptive_hot_review: { ...emptySnapshot(), observations },
+        });
+      }
+      return Response.json({
+        lanes: {
+          review: { capacity: 300, active: 0, pending: 0 },
+          publication: { credential_circuits: [], github_request_metrics: null },
+        },
+        scheduled_feed: {
+          token_balance: 300,
+          throttle_recovery_at: null,
+          lanes: { hot_intake: { token_balance: 300 } },
+        },
+        adaptive_hot_review: {
+          ...emptySnapshot(),
+          observations: observations.slice(0, 100),
+        },
+      });
+    },
+  });
+
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.equal(result.snapshot.observations.length, 101);
+  assert.equal(result.snapshot.observations.at(-1)?.targetRepo, "example/repo-100");
+  assert.equal(result.facts.repositoryObservationsAvailable, true);
 });
 
 test("adaptive decision writes use the existing signed queue boundary", async () => {

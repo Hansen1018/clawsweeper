@@ -17,6 +17,7 @@ import {
   type AdaptiveHotDecisionRecord,
   type AdaptiveHotExecutionObservation,
   type AdaptiveHotActualAllocation,
+  type AdaptiveHotPlannerLane,
   type AdaptiveHotPlannerObservation,
   type AdaptiveHotRepositoryObservationSnapshot,
 } from "../src/repair/adaptive-hot-review-contract.ts";
@@ -267,6 +268,42 @@ export class AdaptiveHotReviewStore {
   }
 
   snapshot(now = Date.now()): AdaptiveHotControlSnapshot {
+    return this.buildSnapshot({
+      now,
+      policyVersion: null,
+      lane: null,
+      targetRepositories: null,
+      observationLimit: ADAPTIVE_HOT_PUBLIC_OBSERVATION_LIMIT,
+    });
+  }
+
+  allocatorSnapshot(
+    options: {
+      policyVersion: string;
+      lane: AdaptiveHotPlannerLane;
+      targetRepositories: readonly string[];
+    },
+    now = Date.now(),
+  ): AdaptiveHotControlSnapshot {
+    return this.buildSnapshot({
+      now,
+      policyVersion: options.policyVersion,
+      lane: options.lane,
+      targetRepositories: new Set(
+        options.targetRepositories.map((repository) => repository.toLowerCase()),
+      ),
+      observationLimit: ADAPTIVE_HOT_PLANNER_RETENTION_MAX,
+    });
+  }
+
+  private buildSnapshot(options: {
+    now: number;
+    policyVersion: string | null;
+    lane: AdaptiveHotPlannerLane | null;
+    targetRepositories: ReadonlySet<string> | null;
+    observationLimit: number;
+  }): AdaptiveHotControlSnapshot {
+    const { now } = options;
     this.storage.transactionSync(() => this.pruneSync(now));
     const plannerTotals = new Map<string, Record<string, number>>();
     for (const row of this.storage.sql.exec(
@@ -335,13 +372,21 @@ export class AdaptiveHotReviewStore {
                   ORDER BY observed_at DESC, observation_id DESC
                 ) AS rank
            FROM ${ADAPTIVE_HOT_PLANNER_OBSERVATION_TABLE}
+          WHERE (? IS NULL OR policy_version = ?)
+            AND (? IS NULL OR lane = ?)
        ) WHERE rank = 1
          ORDER BY observed_at DESC, observation_id DESC, target_repo, lane, policy_version
          LIMIT ?`,
-      ADAPTIVE_HOT_PUBLIC_OBSERVATION_LIMIT,
+      options.policyVersion,
+      options.policyVersion,
+      options.lane,
+      options.lane,
+      options.observationLimit,
     )) {
       const latest = normalizeAdaptiveHotPlannerObservationJson(String(row.observation_json || ""));
       if (!latest) continue;
+      if (options.targetRepositories && !options.targetRepositories.has(latest.targetRepo))
+        continue;
       const planner =
         plannerTotals.get(
           repoLanePolicyKey(latest.targetRepo, latest.lane, latest.policyVersion),
@@ -402,7 +447,8 @@ export class AdaptiveHotReviewStore {
       const decision = normalizeAdaptiveHotDecisionJson(String(row.decision_json || ""));
       if (decision) recentDecisions.push(decision);
     }
-    const readinessPolicyVersion = recentDecisions[0]?.policyVersion ?? null;
+    const readinessPolicyVersion =
+      options.policyVersion ?? recentDecisions[0]?.policyVersion ?? null;
     return {
       schemaVersion: ADAPTIVE_HOT_CONTROL_SNAPSHOT_SCHEMA_VERSION,
       generatedAt: new Date(now).toISOString(),
