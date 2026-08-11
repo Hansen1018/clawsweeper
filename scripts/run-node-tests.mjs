@@ -34,6 +34,7 @@ const TARGET_PATTERNS = Object.freeze({
   all: ["test/*.test.ts", "test/repair/*.test.ts", "dist/repair/*.test.js"],
   "codex-process": ["test/codex-process.test.ts"],
   "fix-prompt-builder": ["dist/repair/fix-prompt-builder.test.js"],
+  "target-validation": ["test/repair/target-validation.test.ts"],
   "workflow-sparse-checkout": ["test/repair/workflow-sparse-checkout.smoke.ts"],
 });
 
@@ -50,6 +51,7 @@ Targets:
   all                 all unit and repair targets
   codex-process       test/codex-process.test.ts
   fix-prompt-builder  dist/repair/fix-prompt-builder.test.js
+  target-validation   test/repair/target-validation.test.ts
   workflow-sparse-checkout  test/repair/workflow-sparse-checkout.smoke.ts
 
 Options:

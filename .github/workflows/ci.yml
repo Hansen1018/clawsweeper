@@ -80,4 +80,3 @@ jobs:
         run: >
           node scripts/run-node-tests.mjs codex-process -- --test-name-pattern
           "escaped Windows launchers|extensionless Windows node shebang shims|CODEX_BIN and preserves argv|timeout errors|app-server mode"
-          test/codex-process.test.ts
