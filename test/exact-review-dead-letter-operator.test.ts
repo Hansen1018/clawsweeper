@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
 import { spawn } from "node:child_process";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import test from "node:test";
 import YAML from "yaml";
 import { readFileSync } from "node:fs";
@@ -212,6 +213,8 @@ test("parked review reconciliation plans by default and executes terminal resolv
       open_targets: 1,
       recovered_targets: 1,
       skipped_targets: 1,
+      skip_reasons: {},
+      skip_samples: [],
     });
     assert.equal(mutations.length, 0);
 
@@ -233,6 +236,8 @@ test("parked review reconciliation plans by default and executes terminal resolv
       open_targets: 1,
       recovered_targets: 1,
       skipped_targets: 1,
+      skip_reasons: {},
+      skip_samples: [],
     });
     assert.equal(mutations.filter((entry) => entry.url?.endsWith("/resolve")).length, 2);
     const recovery = mutations.find((entry) => entry.url?.endsWith("/recover-fresh"));
@@ -258,6 +263,86 @@ test("parked review reconciliation plans by default and executes terminal resolv
     );
     assert.equal(overCap.code, 1);
     assert.match(overCap.stderr, /between 0 and 5 for reconcile-parked/);
+  } finally {
+    server.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("parked review reconciliation reports bounded HTTP and timeout skip diagnostics", async () => {
+  const secret = "test-parked-review-skip-reasons";
+  const parkedRows = [
+    parkedRow("openclaw/repo#1", "openclaw/repo", 1, 1_000),
+    parkedRow("openclaw/repo#2", "openclaw/repo", 2, 2_000),
+    parkedRow("openclaw/repo#3", "openclaw/repo", 3, 3_000),
+    parkedRow("openclaw/repo#4", "openclaw/repo", 4, 4_000),
+  ];
+  const server = createServer(async (request, response) => {
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    if (request.url === "/api/exact-review-queue") {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({ pressure: { status: "idle", active: 0, capacity: 128 } }));
+      return;
+    }
+    if (request.url === "/repos/openclaw/repo/issues/1") {
+      response.writeHead(403, { "content-type": "application/json" });
+      response.end(JSON.stringify({ message: "Resource not accessible by integration" }));
+      return;
+    }
+    const body = Buffer.concat(chunks).toString("utf8");
+    const expected = `sha256=${createHmac("sha256", secret).update(body).digest("hex")}`;
+    assert.equal(request.headers["x-clawsweeper-exact-review-signature"], expected);
+    assert.ok(request.url?.endsWith("/parked-reviews/list"));
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ ok: true, parked_reviews: parkedRows, next_cursor: null }));
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  const directory = await mkdtemp(join(tmpdir(), "clawsweeper-parked-skip-reasons-"));
+  try {
+    const preloadPath = join(directory, "timeout-fetch.mjs");
+    await writeFile(
+      preloadPath,
+      `const nativeFetch = globalThis.fetch;\n` +
+        `globalThis.fetch = (input, init) => /\\/issues\\/[2-4]$/.test(String(input))\n` +
+        `  ? Promise.reject(new DOMException("The operation was aborted due to timeout", "TimeoutError"))\n` +
+        `  : nativeFetch(input, init);\n`,
+      "utf8",
+    );
+    const result = await runOperator(
+      [
+        "--action",
+        "reconcile-parked",
+        "--max-targets",
+        "100",
+        "--output",
+        join(directory, "inventory.json"),
+      ],
+      `http://127.0.0.1:${address.port}`,
+      secret,
+      { NODE_OPTIONS: `--import=${pathToFileURL(preloadPath).href}` },
+    );
+    assert.equal(result.code, 0, result.stderr);
+    const summary = JSON.parse(result.stdout);
+    assert.deepEqual(summary.skip_reasons, { http_403: 1, timeout: 3 });
+    assert.deepEqual(summary.skip_samples, [
+      {
+        target: "openclaw/repo#1",
+        reason: "parked review target check failed for openclaw/repo#1 with 403",
+      },
+      {
+        target: "openclaw/repo#2",
+        reason: "The operation was aborted due to timeout",
+      },
+      {
+        target: "openclaw/repo#3",
+        reason: "The operation was aborted due to timeout",
+      },
+    ]);
+    assert.equal(summary.inspected_targets, 4);
+    assert.equal(summary.skipped_targets, 4);
   } finally {
     server.close();
     await rm(directory, { recursive: true, force: true });
@@ -334,6 +419,8 @@ test("parked review reconciliation stops safely at the workflow deadline", async
       open_targets: 0,
       recovered_targets: 0,
       skipped_targets: 3,
+      skip_reasons: {},
+      skip_samples: [],
       deadline_reached: true,
     });
     assert.equal(mutations, 0);
@@ -473,6 +560,8 @@ test("automatic reconciliation resolves terminal rows and recovers one fresh rev
       duplicate_rows: 1,
       active_review_rows: 0,
       skipped_targets: 1,
+      skip_reasons: {},
+      skip_samples: [],
     });
     const recovery = mutations.filter((entry) => entry.url?.endsWith("/recover-fresh"));
     assert.equal(recovery.length, 1);
@@ -2228,6 +2317,94 @@ test("inaccessible canonical targets cannot starve independently invalid dead le
   assert.equal(JSON.parse(scenario.first.stdout).invalid_rows, 1);
 });
 
+test("serial canonical discovery attributes a failure only to the target that threw", async () => {
+  const scenario = await automaticReconcileScenario({
+    rows: [
+      row("first", "publication:first", 1, "retry_exhausted", true, "eligible", "openclaw/first#1"),
+      row(
+        "second",
+        "publication:second",
+        2,
+        "retry_exhausted",
+        true,
+        "eligible",
+        "openclaw/second#2",
+      ),
+      row("third", "publication:third", 3, "retry_exhausted", true, "eligible", "openclaw/third#3"),
+    ],
+    failedRepository: "first",
+    failedStatus: 403,
+  });
+
+  assert.equal(scenario.first.code, 0, scenario.first.stderr);
+  const summary = JSON.parse(scenario.first.stdout);
+  assert.deepEqual(summary.skip_reasons, { http_403: 1, not_inspected_abort: 2 });
+  assert.deepEqual(summary.skip_samples, [
+    {
+      target: "openclaw/first#1",
+      reason: "live target check failed for openclaw/first#1 (403)",
+    },
+    {
+      target: "openclaw/second#2",
+      reason:
+        "canonical target was not inspected because canonical discovery aborted after another target inspection failed",
+    },
+    {
+      target: "openclaw/third#3",
+      reason:
+        "canonical target was not inspected because canonical discovery aborted after another target inspection failed",
+    },
+  ]);
+  assert.equal(summary.skipped_targets, 3);
+  assert.equal(scenario.restRequests, 1);
+  assert.equal(scenario.recoveries.length, 0);
+  assert.equal(scenario.resolutions.length, 0);
+});
+
+test("serial recovery revalidation attributes a failure only to the target that threw", async () => {
+  const scenario = await automaticReconcileScenario({
+    rows: [
+      row("first", "publication:first", 1, "retry_exhausted", true, "eligible", "openclaw/repo#1"),
+      row(
+        "second",
+        "publication:second",
+        2,
+        "retry_exhausted",
+        true,
+        "eligible",
+        "openclaw/repo#2",
+      ),
+      row("third", "publication:third", 3, "retry_exhausted", true, "eligible", "openclaw/repo#3"),
+    ],
+    failTargetOnInspection: 1,
+    failedStatus: 403,
+  });
+
+  assert.equal(scenario.first.code, 0, scenario.first.stderr);
+  const summary = JSON.parse(scenario.first.stdout);
+  assert.deepEqual(summary.skip_reasons, { http_403: 1, not_inspected_abort: 2 });
+  assert.deepEqual(summary.skip_samples, [
+    {
+      target: "openclaw/repo#1",
+      reason: "live target check failed for openclaw/repo#1 (403)",
+    },
+    {
+      target: "openclaw/repo#2",
+      reason:
+        "canonical target was not inspected because canonical discovery aborted after another target inspection failed",
+    },
+    {
+      target: "openclaw/repo#3",
+      reason:
+        "canonical target was not inspected because canonical discovery aborted after another target inspection failed",
+    },
+  ]);
+  assert.equal(summary.skipped_targets, 3);
+  assert.equal(scenario.restRequests, 4);
+  assert.equal(scenario.recoveries.length, 0);
+  assert.equal(scenario.resolutions.length, 0);
+});
+
 test("automatic recovery refuses a pull request whose current head has advanced", async () => {
   const item = row(
     "stale",
@@ -2286,6 +2463,7 @@ async function automaticReconcileScenario(options) {
   let inventoryRequests = 0;
   let graphqlRequests = 0;
   let restRequests = 0;
+  const restRequestsByNumber = new Map();
   let duplicateFailurePending = options.failFirstDuplicateCleanup === true;
   let duplicateSkipsRemaining =
     options.skipDuplicateCleanupCount ?? Number(options.skipFirstDuplicateCleanup === true);
@@ -2353,6 +2531,7 @@ async function automaticReconcileScenario(options) {
     if (request.url?.startsWith("/repos/")) {
       restRequests += 1;
       const number = Number(request.url.split("/").at(-1));
+      restRequestsByNumber.set(number, (restRequestsByNumber.get(number) || 0) + 1);
       if (request.url.includes("/pulls/")) {
         response.writeHead(200, { "content-type": "application/json" });
         response.end(
@@ -2371,9 +2550,10 @@ async function automaticReconcileScenario(options) {
       if (
         (options.failedRepository &&
           request.url.includes(`/${options.failedRepository}/issues/`)) ||
+        (options.failTargetOnInspection === number && restRequestsByNumber.get(number) >= 2) ||
         (options.failTargetAfterCleanup === number && resolutions.length >= 2)
       ) {
-        response.writeHead(503, { "content-type": "application/json" });
+        response.writeHead(options.failedStatus ?? 503, { "content-type": "application/json" });
         response.end(JSON.stringify({ error: "temporary" }));
         return;
       }
