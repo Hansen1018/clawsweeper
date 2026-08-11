@@ -1864,7 +1864,7 @@ jobs:
                       semanticHit: metric("semantic_cache_hits"),
                       contentHit: metric("content_cache_hits"),
                       hydrated: metric("hydrations"),
-                      reviewRuntimeMs: 0,
+                      reviewRuntimeMs: metric("review_runtime_ms"),
                     },
                   }
                 : {}),

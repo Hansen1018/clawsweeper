@@ -299,6 +299,8 @@ test("review and apply primary boundaries ignore ledger-only failures", () => {
   assert.match(exactQueue.env?.SOURCE_ACTION ?? "", /sourceAction/);
   assert.match(exactQueue.run ?? "", /review-cache-metrics\.json/);
   assert.match(exactQueue.run ?? "", /scheduled_observation/);
+  assert.match(exactQueue.run ?? "", /reviewRuntimeMs: metric\("review_runtime_ms"\)/);
+  assert.doesNotMatch(exactQueue.run ?? "", /reviewRuntimeMs: 0/);
   assert.doesNotMatch(exactQueue.run ?? "", /JOB_STATUS|job\.status/);
   assert.ok(exactSteps.indexOf(exactUpload) < exactSteps.indexOf(exactQueue));
   assert.ok(exactSteps.indexOf(exactUpload) < exactSteps.indexOf(exactPublicationQueue));

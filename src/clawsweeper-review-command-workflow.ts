@@ -143,6 +143,7 @@ export function createReviewCommandWorkflow(dependencies: CreateReviewCommandWor
   } = dependencies;
 
   function reviewCommand(args: Args): void {
+    const reviewStartedAtMs = Date.now();
     const preparation = prepareReviewCommand(args, dependencies);
     const {
       localRange,
@@ -1531,6 +1532,7 @@ export function createReviewCommandWorkflow(dependencies: CreateReviewCommandWor
             ),
             content_cache_hits: contentCacheHits,
             hydrations: hydrationRuns,
+            review_runtime_ms: Math.max(0, Date.now() - reviewStartedAtMs),
           },
           null,
           2,

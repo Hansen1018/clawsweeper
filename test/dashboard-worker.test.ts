@@ -6734,7 +6734,7 @@ test("only a fenced scheduled lease completion records adaptive execution outcom
           semanticHit: 0,
           contentHit: 0,
           hydrated: 0,
-          reviewRuntimeMs: 0,
+          reviewRuntimeMs: 12_345,
         },
       }),
     }),
@@ -6745,6 +6745,7 @@ test("only a fenced scheduled lease completion records adaptive execution outcom
   ).json();
   assert.equal(stats.adaptive_hot_review.observations[0].executionSamples, 1);
   assert.equal(stats.adaptive_hot_review.observations[0].structuralHit, 1);
+  assert.equal(stats.adaptive_hot_review.observations[0].reviewRuntimeMs, 12_345);
   assert.equal(stats.adaptive_hot_review.observations[0].successful, 1);
 
   const replay = await queue.fetch(

@@ -2209,7 +2209,6 @@ export class ExactReviewQueue {
                   : "failed",
             observation: {
               ...adaptiveHotExecutionObservation,
-              reviewRuntimeMs: Math.max(0, now - (item.claimedAt ?? now)),
             },
           });
         } catch (error) {

@@ -277,6 +277,8 @@ test("scheduled delivery serves an unchanged item from the structural cache", ()
     const metrics = JSON.parse(
       readFileSync(join(artifactDir, "review-cache-metrics.json"), "utf8"),
     );
+    assert.equal(Number.isSafeInteger(metrics.review_runtime_ms), true);
+    assert.equal(metrics.review_runtime_ms >= 0, true);
     assert.equal(metrics.structural_cache_hits, 1);
     assert.equal(metrics.hydrations, 0);
   } finally {
