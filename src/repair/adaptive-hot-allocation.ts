@@ -290,16 +290,21 @@ export function allocateAdaptiveHotReviewCapacity(
   const ordinary = freshDemand
     .filter((repository) => !overdueKeys.has(repository.key) && !novelKeys.has(repository.key))
     .sort(compareOrdinary);
+  const ordinaryReservation = ordinary.length > 0 ? 1 : 0;
+  const canAssignPriority = () =>
+    allocationTrace.length < offerBudget - ordinaryReservation &&
+    allocations.size < repositoryLimit - ordinaryReservation;
 
   for (const repository of overdue) {
+    if (!canAssignPriority()) break;
     if (!assign(repository, "overdue_fairness")) break;
   }
   for (const repository of novel) {
+    if (!canAssignPriority()) break;
     if (!assign(repository, "source_novelty")) break;
   }
 
   let nextProbeCursor = inputProbeCursor;
-  const ordinaryReservation = ordinary.length > 0 ? 1 : 0;
   const probeSlots = Math.max(
     0,
     Math.min(

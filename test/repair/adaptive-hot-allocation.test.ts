@@ -219,6 +219,47 @@ test("priority selections cannot reset ordinary fairness progress", () => {
   assert.deepEqual(servedOrdinaryRepositories, ordinaryRepositories);
 });
 
+test("priority rounds preserve the final constrained-cycle slot for ordinary demand", () => {
+  const repositories = [
+    ...Array.from({ length: 3 }, (_, index) => ({
+      targetRepo: `example/overdue-${index + 1}`,
+      observation: observation({
+        eligibleDue: 10,
+        oldestUnservedAtMs: NOW_MS - 48 * 60 * 60_000,
+      }),
+    })),
+    {
+      targetRepo: "example/ordinary",
+      observation: observation({
+        eligibleDue: 10,
+        oldestUnservedAtMs: NOW_MS - 60 * 60_000,
+      }),
+    },
+  ];
+
+  const decision = allocateAdaptiveHotReviewCapacity(
+    allocationInput({
+      availableCandidateCapacity: 2,
+      globalTokenBalance: 2,
+      hotTokenBalance: 2,
+      repositories,
+    }),
+  );
+
+  assert.equal(decision.offerBudget, 3);
+  assert.deepEqual(
+    decision.allocations.map(({ targetRepo, initialReason }) => ({
+      targetRepo,
+      initialReason,
+    })),
+    [
+      { targetRepo: "example/overdue-1", initialReason: "overdue_fairness" },
+      { targetRepo: "example/overdue-2", initialReason: "overdue_fairness" },
+      { targetRepo: "example/ordinary", initialReason: "ordinary_demand" },
+    ],
+  );
+});
+
 test("unknown probes advance independently from fresh-demand cursor ties", () => {
   const repositories = [
     { targetRepo: "example/unknown-a", observation: null },
