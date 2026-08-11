@@ -879,6 +879,8 @@ process.exit(2);
         CLAWSWEEPER_WEBHOOK_SECRET: "cursor-secret",
         CLAWSWEEPER_INVENTORY_TOKEN_OPENCLAW: "inventory-openclaw",
         CLAWSWEEPER_INVENTORY_TOKEN_STEIPETE: "inventory-steipete",
+        CLAWSWEEPER_ADAPTIVE_HOT_MODE: "not-a-mode",
+        CLAWSWEEPER_ADAPTIVE_HOT_ROLLOUT_PERCENT: "not-a-percent",
       },
     },
   );
@@ -956,7 +958,7 @@ process.exit(2);
     [
       "dist/repair/target-fanout.js",
       "--mode",
-      "hot-intake",
+      "audit",
       "--limit",
       "1",
       "--cursor-store-url",
@@ -972,6 +974,8 @@ process.exit(2);
         ...process.env,
         ...mockGhBinEnv(ghPath),
         CLAWSWEEPER_INVENTORY_TOKEN_OPENCLAW: "inventory-openclaw",
+        CLAWSWEEPER_ADAPTIVE_HOT_MODE: "not-a-mode",
+        CLAWSWEEPER_ADAPTIVE_HOT_KILL_SWITCH: "not-a-boolean",
       },
     },
   );
@@ -986,7 +990,7 @@ process.exit(2);
     .trim()
     .split("\n")
     .map((line) => JSON.parse(line) as string[]);
-  assert.equal(calls.filter((call) => call[0] === "api" && call[1] === "graphql").length, 1);
+  assert.equal(calls.filter((call) => call[0] === "api" && call[1] === "graphql").length, 0);
   assert.equal(calls.filter((call) => call[1]?.endsWith("/dispatches")).length, 0);
 });
 

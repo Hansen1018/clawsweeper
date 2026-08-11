@@ -3,7 +3,9 @@ import assert from "node:assert/strict";
 import { spawn, execFileSync } from "node:child_process";
 import { createHmac } from "node:crypto";
 import { createWriteStream } from "node:fs";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { request as httpRequest } from "node:http";
+import { createServer as createHttpsServer } from "node:https";
 import os from "node:os";
 import path from "node:path";
 
@@ -13,6 +15,8 @@ const actualHead = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8"
 const secret = "synthetic-adaptive-hot-proof-secret";
 const workerPort = Number(process.env.PROOF_PORT || 8797);
 const workerOrigin = `http://127.0.0.1:${workerPort}`;
+const proxyPort = workerPort + 1;
+const proxyOrigin = `https://127.0.0.1:${proxyPort}`;
 const persistence = await mkdtemp(path.join(os.tmpdir(), "adaptive-hot-review-proof-"));
 const wranglerVersion = "4.107.0";
 
@@ -21,8 +25,10 @@ assert.equal(actualHead, expectedHead, "proof must run from the recorded exact h
 await mkdir(outputDir, { recursive: true });
 
 let worker;
+let proxy;
 try {
   worker = await startWorker("initial");
+  proxy = await startTlsProxy();
 
   const now = new Date();
   const observedAt = now.toISOString();
@@ -57,6 +63,16 @@ try {
     202,
   );
   assert.equal(reserved.reservation_id, reservationId);
+  const blockedDirectWrite = await fetchSigned(
+    "/internal/state/cursors/hot-intake",
+    "PUT",
+    { next_cursor: 99, expected_revision: 0 },
+  );
+  assert.equal(blockedDirectWrite.status, 409);
+  assert.equal(
+    (await blockedDirectWrite.json()).error,
+    "adaptive_hot_cursor_reservation_active",
+  );
   await assertCursors(cursorUpdates, 0, 0);
 
   await stopWorker(worker);
@@ -147,8 +163,47 @@ try {
   assert.deepEqual(recoveredAbort, { ok: true, aborted: true });
   await assertCursors(cursorUpdates, undefined, 1);
 
+  const ghProof = await createFixtureGh();
+  const failedCommand = await runTargetFanoutCommand({
+    ghPath: ghProof.path,
+    runId: "900010",
+    dispatchMode: "fail",
+  });
+  assert.notEqual(failedCommand.status, 0);
+  assert.match(failedCommand.stderr, /synthetic dispatch failure/);
+  await assertCursors(cursorUpdates, undefined, 1);
+
+  const recoveredCommand = await runTargetFanoutCommand({
+    ghPath: ghProof.path,
+    runId: "900011",
+    dispatchMode: "success",
+  });
+  assert.equal(recoveredCommand.status, 0, recoveredCommand.stderr);
+  const recoveredSummary = JSON.parse(recoveredCommand.stdout);
+  assert.deepEqual(recoveredSummary.dispatched, ["example/alpha", "example/beta"]);
+  assert.equal(recoveredSummary.cursor_persisted, true);
+  assert.equal(recoveredSummary.adaptive_cursor_persisted, true);
+  assert.equal(recoveredSummary.adaptive_probe_cursor_persisted, true);
+  const commandCursors = await readCursors(cursorUpdates);
+  assert.equal(commandCursors.every((cursor) => cursor.revision === 2), true);
+  const dispatchLog = (await readFile(ghProof.logPath, "utf8"))
+    .trim()
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+  assert.deepEqual(
+    dispatchLog
+      .filter((entry) => entry.kind === "dispatch")
+      .map((entry) => ({ mode: entry.mode, repo: entry.repo })),
+    [
+      { mode: "fail", repo: "example/alpha" },
+      { mode: "success", repo: "example/alpha" },
+      { mode: "success", repo: "example/beta" },
+    ],
+  );
+
   const finalSnapshot = await publicSnapshot();
-  assertAdaptiveSnapshot(finalSnapshot, 1, 1);
+  assertAdaptiveSnapshot(finalSnapshot, 1, 3);
   const publicJson = JSON.stringify(finalSnapshot);
   assert.equal(publicJson.includes(secret), false);
   assert.equal(publicJson.includes(persistence), false);
@@ -163,6 +218,7 @@ try {
       durable_object: "persisted SQLite ExactReviewQueue",
       restarts: 2,
       invalid_signature_status: unsigned.status,
+      loopback_tls_proxy: true,
     },
     telemetry: {
       duplicate_observations_sent: 2,
@@ -181,11 +237,23 @@ try {
       })),
       retry_after_restart_identical: true,
       committed_identity_reuse_status: reusedReservation.status,
+      direct_write_during_reservation_status: blockedDirectWrite.status,
     },
     cursor_abort: {
       failed_dispatch_reservation_id: failedDispatchReservationId,
       cursors_unchanged: true,
       replacement_reservation_acquired: true,
+    },
+    target_fanout_command: {
+      actual_cli: "dist/repair/target-fanout.js",
+      queue_boundary: "loopback TLS proxy to local Wrangler",
+      github_boundary: "disconnected deterministic fixture",
+      injected_failure_exit_status: failedCommand.status,
+      cursors_unchanged_after_zero_dispatches: true,
+      recovery_exit_status: recoveredCommand.status,
+      recovery_dispatched: recoveredSummary.dispatched,
+      committed_cursors: commandCursors,
+      dispatch_trace: dispatchLog.filter((entry) => entry.kind === "dispatch"),
     },
     public_snapshot: {
       bounded_observations: finalSnapshot.adaptive_hot_review.observations.length <= 100,
@@ -208,10 +276,13 @@ try {
       `- Auth boundary: unsigned observation returned HTTP ${unsigned.status}.`,
       "- Telemetry: duplicate observation and decision receipts collapsed to one durable record each across a restart.",
       "- Cursor fencing: reservation left all three cursors at revision 0 until the post-restart commit.",
+      `- Direct-write fencing: a covered cursor write during the reservation returned HTTP ${blockedDirectWrite.status}.`,
       "- Atomic commit: all three cursors advanced to revision 1 with one timestamp.",
       "- Lost-response retry: the same commit receipt was returned after a second restart.",
       `- One-shot identity: reusing the committed reservation ID returned HTTP ${reusedReservation.status}.`,
       "- Dispatch failure recovery: abort left all cursors unchanged and allowed an immediate replacement reservation.",
+      "- Actual command boundary: target-fanout crossed loopback TLS into local Wrangler; an injected zero-dispatch failure aborted unchanged, then a new run dispatched two sanitized repositories and committed all cursor revisions.",
+      "- GitHub boundary: a deterministic local gh fixture recorded dispatch intent; no GitHub API or workflow was contacted.",
       "- Public snapshot: bounded output omitted the synthetic secret and disposable persistence path.",
       "",
       "RESULT: PASS",
@@ -225,10 +296,13 @@ try {
   console.log("cursor fencing: unchanged before commit; 3 cursors advanced atomically");
   console.log("commit retry after second restart: identical durable receipt");
   console.log(`committed reservation identity reuse: HTTP ${reusedReservation.status}`);
+  console.log(`direct write during reservation: HTTP ${blockedDirectWrite.status}`);
   console.log("dispatch failure recovery: aborted unchanged; replacement reservation acquired");
+  console.log("actual target-fanout: injected zero-dispatch failure aborted; recovery dispatched 2 and committed");
   console.log("public snapshot: bounded and sanitized");
   console.log("RESULT: PASS");
 } finally {
+  await stopProxy(proxy);
   await stopWorker(worker);
   await rm(persistence, { recursive: true, force: true });
 }
@@ -394,6 +468,176 @@ async function assertCursors(updates, expectedCursor, expectedRevision) {
     assert.equal(cursor.next_cursor, expectedCursor ?? update.next_cursor);
     assert.equal(cursor.revision, expectedRevision);
   }
+}
+
+async function readCursors(updates) {
+  const cursors = [];
+  for (const update of updates) {
+    const cursor = await signedJson(
+      `/internal/state/cursors/${update.mode}`,
+      "GET",
+      undefined,
+      200,
+    );
+    cursors.push({
+      mode: cursor.mode,
+      next_cursor: cursor.next_cursor,
+      revision: cursor.revision,
+    });
+  }
+  return cursors;
+}
+
+async function createFixtureGh() {
+  const ghPath = path.join(persistence, "fixture-gh.cjs");
+  const logPath = path.join(persistence, "gh-dispatch.jsonl");
+  await writeFile(
+    ghPath,
+    `const { appendFileSync } = require("node:fs");
+const args = process.argv.slice(2);
+if (args[0] === "repo" && args[1] === "list") {
+  process.stdout.write(JSON.stringify([
+    {nameWithOwner:"example/alpha",isArchived:false,isDisabled:false,isFork:false,hasIssuesEnabled:true,visibility:"PUBLIC",defaultBranchRef:{name:"main"}},
+    {nameWithOwner:"example/beta",isArchived:false,isDisabled:false,isFork:false,hasIssuesEnabled:true,visibility:"PUBLIC",defaultBranchRef:{name:"main"}}
+  ]));
+  process.exit(0);
+}
+if (args[0] === "api" && args[1] === "graphql") {
+  process.stdout.write(JSON.stringify({data:{
+    r0:{issues:{totalCount:4},pullRequests:{totalCount:1}},
+    r1:{issues:{totalCount:2},pullRequests:{totalCount:1}}
+  }}));
+  process.exit(0);
+}
+if (args[0] === "api" && args[1]?.endsWith("/dispatches")) {
+  const repoArg = args.find((entry) => entry.startsWith("client_payload[target_repo]=")) || "";
+  const repo = repoArg.slice(repoArg.indexOf("=") + 1);
+  appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({kind:"dispatch",mode:process.env.PROOF_GH_DISPATCH_MODE,repo}) + "\\n");
+  if (process.env.PROOF_GH_DISPATCH_MODE === "fail") {
+    process.stderr.write("synthetic dispatch failure\\n");
+    process.exit(1);
+  }
+  process.exit(0);
+}
+process.stderr.write("unexpected gh fixture command: " + args.join(" ") + "\\n");
+process.exit(2);
+`,
+  );
+  return { path: ghPath, logPath };
+}
+
+function runTargetFanoutCommand({ ghPath, runId, dispatchMode }) {
+  const child = spawn(
+    process.execPath,
+    [
+      "dist/repair/target-fanout.js",
+      "--mode",
+      "hot-intake",
+      "--limit",
+      "2",
+      "--owners",
+      "example",
+      "--cursor-store-url",
+      proxyOrigin,
+      "--repo",
+      "example/control",
+      "--adaptive-mode",
+      "shadow",
+      "--adaptive-kill-switch",
+      "false",
+      "--run-id",
+      runId,
+      "--run-attempt",
+      "1",
+    ],
+    {
+      cwd: process.cwd(),
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        GH_BIN: process.execPath,
+        GH_BIN_ARGS: JSON.stringify([ghPath]),
+        CLAWSWEEPER_INVENTORY_TOKEN_EXAMPLE: "synthetic-inventory-token",
+        CLAWSWEEPER_DISPATCH_TOKEN: "synthetic-dispatch-token",
+        CLAWSWEEPER_WEBHOOK_SECRET: secret,
+        NODE_TLS_REJECT_UNAUTHORIZED: "0",
+        PROOF_GH_DISPATCH_MODE: dispatchMode,
+      },
+    },
+  );
+  return new Promise((resolve, reject) => {
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
+    child.once("error", reject);
+    child.once("close", (status) => resolve({ status, stdout, stderr }));
+  });
+}
+
+async function startTlsProxy() {
+  const keyPath = path.join(persistence, "loopback.key");
+  const certPath = path.join(persistence, "loopback.crt");
+  execFileSync(
+    "openssl",
+    [
+      "req",
+      "-x509",
+      "-newkey",
+      "rsa:2048",
+      "-nodes",
+      "-keyout",
+      keyPath,
+      "-out",
+      certPath,
+      "-days",
+      "1",
+      "-subj",
+      "/CN=127.0.0.1",
+      "-addext",
+      "subjectAltName=IP:127.0.0.1",
+    ],
+    { stdio: "ignore" },
+  );
+  const server = createHttpsServer(
+    { key: await readFile(keyPath), cert: await readFile(certPath) },
+    (request, response) => {
+      const upstream = httpRequest(
+        {
+          hostname: "127.0.0.1",
+          port: workerPort,
+          path: request.url,
+          method: request.method,
+          headers: request.headers,
+        },
+        (upstreamResponse) => {
+          response.writeHead(upstreamResponse.statusCode || 502, upstreamResponse.headers);
+          upstreamResponse.pipe(response);
+        },
+      );
+      upstream.on("error", (error) => {
+        response.writeHead(502, { "content-type": "text/plain" });
+        response.end(`loopback proxy error: ${error.message}`);
+      });
+      request.pipe(upstream);
+    },
+  );
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(proxyPort, "127.0.0.1", resolve);
+  });
+  return server;
+}
+
+async function stopProxy(server) {
+  if (!server?.listening) return;
+  await new Promise((resolve, reject) =>
+    server.close((error) => (error ? reject(error) : resolve())),
+  );
 }
 
 async function startWorker(name) {

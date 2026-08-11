@@ -6394,6 +6394,17 @@ test("active adaptive cursor reservation is authenticated and atomic", async () 
     ).status,
     202,
   );
+  for (const update of updates) {
+    const blocked = await worker.fetch(
+      signedRequest(cursorPath(update.mode), "PUT", {
+        next_cursor: update.next_cursor + 100,
+        expected_revision: update.expected_revision,
+      }),
+      env,
+    );
+    assert.equal(blocked.status, 409);
+    assert.equal((await blocked.json()).error, "adaptive_hot_cursor_reservation_active");
+  }
   assert.equal(
     (
       await worker.fetch(

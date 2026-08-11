@@ -16,6 +16,9 @@ The runtime scenario proves that:
   second restart;
 - a separate failed-dispatch reservation aborts without moving cursors and a
   replacement reservation can be acquired immediately; and
+- the actual built `target-fanout` command crosses a loopback-only TLS proxy to
+  the local Worker, aborts after a deterministic zero-dispatch fault, then
+  recovers by recording two synthetic dispatches and committing its batch; and
 - the bounded public snapshot contains neither the synthetic signing secret
   nor local persistence paths.
 
@@ -38,7 +41,11 @@ The script writes logs, deterministic replay output, a machine-readable
 argument does not match the checkout head or when the checkout has staged,
 unstaged, or untracked changes.
 
-This is development proof only. It does not deploy the Worker, dispatch a
-workflow, activate shadow/canary/full mode, change the 20-minute schedule or
+The command proof replaces `gh` with a fixture executable and uses only
+sanitized `example/*` repositories. It records the exact dispatch arguments but
+does not contact GitHub.
+
+This is development proof only. It does not deploy the Worker, dispatch a live
+workflow, activate production shadow/canary/full mode, change the 20-minute schedule or
 300/hour burst-30 admission contract, or mutate live gates, queues, leases, or
 cursors.

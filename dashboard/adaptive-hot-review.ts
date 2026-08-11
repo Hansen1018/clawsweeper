@@ -20,6 +20,7 @@ import {
   type AdaptiveHotPlannerObservation,
   type AdaptiveHotRepositoryObservationSnapshot,
 } from "../src/repair/adaptive-hot-review-contract.ts";
+import automationLimits from "../config/automation-limits.json" with { type: "json" };
 
 type DurableStorage = {
   sql: { exec: (query: string, ...bindings: unknown[]) => Iterable<Record<string, unknown>> };
@@ -29,10 +30,12 @@ type DurableStorage = {
 const ADAPTIVE_HOT_PLANNER_OBSERVATION_TABLE = "adaptive_hot_planner_observations";
 const ADAPTIVE_HOT_EXECUTION_OBSERVATION_TABLE = "adaptive_hot_execution_observations";
 const ADAPTIVE_HOT_DECISION_TABLE = "adaptive_hot_decisions";
-const ADAPTIVE_HOT_RETENTION_MS = 14 * 24 * 60 * 60 * 1_000;
+const ADAPTIVE_HOT_RETENTION_MS =
+  automationLimits.scheduled_review.adaptive_hot.decision_retention_ms;
 const ADAPTIVE_HOT_PLANNER_RETENTION_MAX = 20_000;
 const ADAPTIVE_HOT_EXECUTION_RETENTION_MAX = 20_000;
-const ADAPTIVE_HOT_DECISION_RETENTION_MAX = 640;
+const ADAPTIVE_HOT_DECISION_RETENTION_MAX =
+  automationLimits.scheduled_review.adaptive_hot.decision_retention_max;
 const ADAPTIVE_HOT_PUBLIC_OBSERVATION_LIMIT = 100;
 const ADAPTIVE_HOT_PUBLIC_DECISION_LIMIT = 100;
 const ADAPTIVE_HOT_ALLOCATION_STATUSES = new Set<AdaptiveHotAllocationStatus>([

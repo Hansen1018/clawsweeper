@@ -3370,6 +3370,21 @@ export class ExactReviewQueue {
     }
     try {
       const result = this.storage.transactionSync(() => {
+        const now = Date.now();
+        const reservation = readAdaptiveHotCursorReservation(
+          this.storage.kv.get(ADAPTIVE_HOT_CURSOR_RESERVATION_KEY),
+        );
+        if (reservation === "invalid") return { kind: "invalid" as const };
+        if (
+          reservation &&
+          reservation.expiresAt > now &&
+          reservation.cursors.some((cursor) => cursor.mode === mode)
+        ) {
+          return { kind: "reserved" as const, reservation };
+        }
+        if (reservation && reservation.expiresAt <= now) {
+          this.storage.kv.delete(ADAPTIVE_HOT_CURSOR_RESERVATION_KEY);
+        }
         const stored = readOperationalCursor(this.storage.kv.get(operationalCursorKey(mode)), mode);
         if (stored === "invalid") return { kind: "invalid" as const };
         const current = stored ?? emptyOperationalCursor(mode);
@@ -3383,12 +3398,21 @@ export class ExactReviewQueue {
           mode,
           nextCursor,
           revision: current.revision + 1,
-          updatedAt: Date.now(),
+          updatedAt: now,
         };
         this.storage.kv.put(operationalCursorKey(mode), next);
         return { kind: "written" as const, cursor: next };
       });
       if (result.kind === "invalid") return json({ error: "fanout_cursor_store_invalid" }, 500);
+      if (result.kind === "reserved") {
+        return json(
+          {
+            error: "adaptive_hot_cursor_reservation_active",
+            reservation_expires_at: new Date(result.reservation.expiresAt).toISOString(),
+          },
+          409,
+        );
+      }
       if (result.kind === "conflict") {
         return json(
           {

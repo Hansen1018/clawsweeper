@@ -122,7 +122,6 @@ interface FanoutOptions {
   ref: string;
   dryRun: boolean;
   owners: readonly string[] | undefined;
-  adaptive: AdaptiveHotRuntimeOptions;
 }
 
 type AdaptiveHotCursorMode = "adaptive-hot-review" | "adaptive-hot-review-probe";
@@ -134,7 +133,6 @@ export async function runTargetFanout(argv: string[]): Promise<void> {
   const args = parseArgs(argv);
   const mode = fanoutMode(stringArg(args.mode, "hot-intake"));
   const config = readInventoryConfig();
-  const adaptivePolicy = readAdaptiveHotRuntimePolicy();
   const options: FanoutOptions = {
     mode,
     limit: positiveNumber(stringArg(args.limit, defaultLimit(mode)), "limit"),
@@ -147,29 +145,6 @@ export async function runTargetFanout(argv: string[]): Promise<void> {
     ref: stringArg(args.ref, "main"),
     dryRun: Boolean(args["dry-run"]),
     owners: csvArg(args.owners),
-    adaptive: resolveAdaptiveHotRuntimeOptions({
-      policy: adaptivePolicy,
-      mode: stringArg(
-        args["adaptive-mode"],
-        process.env.CLAWSWEEPER_ADAPTIVE_HOT_MODE ?? adaptivePolicy.defaultMode,
-      ),
-      killSwitch: stringArg(
-        args["adaptive-kill-switch"],
-        process.env.CLAWSWEEPER_ADAPTIVE_HOT_KILL_SWITCH ?? "",
-      ),
-      activationApproval: stringArg(
-        args["adaptive-activation-approval"],
-        process.env.CLAWSWEEPER_ADAPTIVE_HOT_ACTIVATION_APPROVAL ?? "none",
-      ),
-      rolloutPercent: stringArg(
-        args["adaptive-rollout-percent"],
-        process.env.CLAWSWEEPER_ADAPTIVE_HOT_ROLLOUT_PERCENT ?? "100",
-      ),
-      canaryRepositories: stringArg(
-        args["adaptive-canary-repositories"],
-        process.env.CLAWSWEEPER_ADAPTIVE_HOT_CANARY_REPOSITORIES ?? "",
-      ),
-    }),
   };
 
   const repositories = await loadEligibleRepositories(config, options.owners);
@@ -205,6 +180,39 @@ export async function runTargetFanout(argv: string[]): Promise<void> {
     );
     return;
   }
+
+  const adaptive =
+    mode === "hot-intake"
+      ? (() => {
+          const policy = readAdaptiveHotRuntimePolicy();
+          return {
+            policy,
+            runtime: resolveAdaptiveHotRuntimeOptions({
+              policy,
+              mode: stringArg(
+                args["adaptive-mode"],
+                process.env.CLAWSWEEPER_ADAPTIVE_HOT_MODE ?? policy.defaultMode,
+              ),
+              killSwitch: stringArg(
+                args["adaptive-kill-switch"],
+                process.env.CLAWSWEEPER_ADAPTIVE_HOT_KILL_SWITCH ?? "",
+              ),
+              activationApproval: stringArg(
+                args["adaptive-activation-approval"],
+                process.env.CLAWSWEEPER_ADAPTIVE_HOT_ACTIVATION_APPROVAL ?? "none",
+              ),
+              rolloutPercent: stringArg(
+                args["adaptive-rollout-percent"],
+                process.env.CLAWSWEEPER_ADAPTIVE_HOT_ROLLOUT_PERCENT ?? "100",
+              ),
+              canaryRepositories: stringArg(
+                args["adaptive-canary-repositories"],
+                process.env.CLAWSWEEPER_ADAPTIVE_HOT_CANARY_REPOSITORIES ?? "",
+              ),
+            }),
+          };
+        })()
+      : null;
 
   let planningRepositories: readonly SelectedRepository[] = repositories;
   let reviewCandidateCapacity: number | null = null;
@@ -268,7 +276,7 @@ export async function runTargetFanout(argv: string[]): Promise<void> {
       cursor: cursor.nextCursor,
       candidateCapacity: reviewCandidateCapacity,
     });
-  } else if (mode === "hot-intake" && options.adaptive.effectiveMode !== "legacy") {
+  } else if (mode === "hot-intake" && adaptive && adaptive.runtime.effectiveMode !== "legacy") {
     const legacySelection = selectRepositories(planningRepositories, {
       limit: options.limit,
       cursor: cursor.nextCursor,
@@ -286,19 +294,19 @@ export async function runTargetFanout(argv: string[]): Promise<void> {
       }),
     ]);
     if (
-      options.adaptive.effectiveMode !== "shadow" &&
+      adaptive.runtime.effectiveMode !== "shadow" &&
       (!adaptiveCursor.loaded || !adaptiveProbeCursor.loaded)
     ) {
       throw new Error("adaptive hot-review cursors must be durable before active dispatch");
     }
     const control = await fetchAdaptiveHotControlPlane({ queueUrl: options.cursorStoreUrl });
-    if (!control.ok && options.adaptive.effectiveMode !== "shadow") {
+    if (!control.ok && adaptive.runtime.effectiveMode !== "shadow") {
       throw new Error(`adaptive hot-review control plane unavailable: ${control.reason}`);
     }
     if (control.ok) {
       assertAdaptiveHotActivationReady({
-        runtime: options.adaptive,
-        policy: adaptivePolicy,
+        runtime: adaptive.runtime,
+        policy: adaptive.policy,
         control: control.snapshot,
         nowMs: Date.now(),
       });
@@ -307,7 +315,7 @@ export async function runTargetFanout(argv: string[]): Promise<void> {
     const observationByRepository = control.ok
       ? indexCurrentAdaptiveHotObservations(
           control.snapshot.observations,
-          adaptivePolicy.allocation.policyVersion,
+          adaptive.policy.allocation.policyVersion,
         )
       : new Map<string, AdaptiveHotRepositoryObservationSnapshot>();
     const globalCredentialCircuit = facts.activeCredentialCircuits.some(
@@ -335,7 +343,7 @@ export async function runTargetFanout(argv: string[]): Promise<void> {
           ),
         };
       }),
-      policy: adaptivePolicy.allocation,
+      policy: adaptive.policy.allocation,
     });
     const legacy = legacySelection.repositories.map((repository) => ({
       targetRepo: repository.targetRepo,
@@ -346,14 +354,14 @@ export async function runTargetFanout(argv: string[]): Promise<void> {
       candidateCapacity: repository.candidateCapacity,
     }));
     const activeDispatchSuppressed =
-      options.adaptive.effectiveMode !== "shadow" &&
+      adaptive.runtime.effectiveMode !== "shadow" &&
       (proposed.status === "scheduled_throttle" ||
         proposed.status === "queue_unavailable" ||
         proposed.status === "no_capacity");
     const actual = activeDispatchSuppressed
       ? []
       : selectAdaptiveHotActualAllocations({
-          runtime: options.adaptive,
+          runtime: adaptive.runtime,
           legacy,
           proposed: proposedAllocations,
         });
@@ -373,15 +381,15 @@ export async function runTargetFanout(argv: string[]): Promise<void> {
           : [];
       }),
       cursor:
-        options.adaptive.effectiveMode === "full" && options.adaptive.rolloutPercent === 100
+        adaptive.runtime.effectiveMode === "full" && adaptive.runtime.rolloutPercent === 100
           ? proposed.nextCursor
           : nextLegacyCursor,
       total: planningRepositories.length,
     };
     persistLegacyCursor = !(
-      options.adaptive.effectiveMode === "full" && options.adaptive.rolloutPercent === 100
+      adaptive.runtime.effectiveMode === "full" && adaptive.runtime.rolloutPercent === 100
     );
-    if (options.adaptive.effectiveMode !== "shadow" && persistLegacyCursor && !cursor.loaded) {
+    if (adaptive.runtime.effectiveMode !== "shadow" && persistLegacyCursor && !cursor.loaded) {
       throw new Error("legacy hot-intake cursor must be durable before active adaptive dispatch");
     }
     const runId = stringArg(args["run-id"], process.env.GITHUB_RUN_ID ?? "0");
@@ -395,15 +403,15 @@ export async function runTargetFanout(argv: string[]): Promise<void> {
       runId,
       runAttempt,
       observedAt: new Date().toISOString(),
-      requestedMode: options.adaptive.requestedMode,
-      effectiveMode: options.adaptive.effectiveMode,
+      requestedMode: adaptive.runtime.requestedMode,
+      effectiveMode: adaptive.runtime.effectiveMode,
       status: "planned",
-      policyVersion: adaptivePolicy.allocation.policyVersion,
-      killSwitch: options.adaptive.killSwitch,
-      activationApproval: options.adaptive.activationApproval,
-      rolloutPercent: options.adaptive.rolloutPercent,
-      canaryRepositories: options.adaptive.canaryRepositories,
-      reason: adaptiveHotDecisionReason(options.adaptive, proposed.status),
+      policyVersion: adaptive.policy.allocation.policyVersion,
+      killSwitch: adaptive.runtime.killSwitch,
+      activationApproval: adaptive.runtime.activationApproval,
+      rolloutPercent: adaptive.runtime.rolloutPercent,
+      canaryRepositories: adaptive.runtime.canaryRepositories,
+      reason: adaptiveHotDecisionReason(adaptive.runtime, proposed.status),
       legacyCursor: { input: cursor.nextCursor, next: nextLegacyCursor },
       adaptiveCursor: { input: adaptiveCursor.nextCursor, next: proposed.nextCursor },
       adaptiveProbeCursor: {
@@ -415,7 +423,7 @@ export async function runTargetFanout(argv: string[]): Promise<void> {
       control: facts,
       comparison: adaptiveHotDecisionComparison({
         nowMs: Date.now(),
-        fairnessObjectiveMs: adaptivePolicy.allocation.fairnessObjectiveMs,
+        fairnessObjectiveMs: adaptive.policy.allocation.fairnessObjectiveMs,
         legacy,
         proposed,
         observations: [...observationByRepository.values()],
@@ -424,7 +432,7 @@ export async function runTargetFanout(argv: string[]): Promise<void> {
     if (args._[0] !== "plan" && !options.dryRun) {
       await publishAdaptiveHotDecisionForMode(
         adaptiveDecision,
-        options.adaptive,
+        adaptive.runtime,
         options.cursorStoreUrl,
       );
     }
@@ -453,7 +461,7 @@ export async function runTargetFanout(argv: string[]): Promise<void> {
   let adaptiveCursorReservation: AdaptiveHotCursorReservationOptions | null = null;
   let adaptiveCursorReservationReserved = false;
   const activeAdaptiveCycle =
-    adaptiveDecision !== null && options.adaptive.effectiveMode !== "shadow";
+    adaptiveDecision !== null && adaptive !== null && adaptive.runtime.effectiveMode !== "shadow";
   if (!options.dryRun && adaptiveDecision && adaptiveCursor && adaptiveProbeCursor) {
     const decisionToReserve = adaptiveDecision;
     adaptiveCursorReservation = {
@@ -539,7 +547,7 @@ export async function runTargetFanout(argv: string[]): Promise<void> {
       cursor.revision,
     );
   }
-  if (adaptiveDecision && !options.dryRun && adaptiveCursorCycleDurable) {
+  if (adaptiveDecision && adaptive && !options.dryRun && adaptiveCursorCycleDurable) {
     adaptiveDecision = {
       ...adaptiveDecision,
       status: "dispatched",
@@ -547,7 +555,7 @@ export async function runTargetFanout(argv: string[]): Promise<void> {
     };
     await publishAdaptiveHotDecisionForMode(
       adaptiveDecision,
-      options.adaptive,
+      adaptive.runtime,
       options.cursorStoreUrl,
     );
   }
