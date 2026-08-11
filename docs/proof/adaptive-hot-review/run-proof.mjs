@@ -19,6 +19,7 @@ const proxyPort = workerPort + 1;
 const proxyOrigin = `https://127.0.0.1:${proxyPort}`;
 const persistence = await mkdtemp(path.join(os.tmpdir(), "adaptive-hot-review-proof-"));
 const wranglerVersion = "4.107.0";
+const proxyFaults = { adaptiveCommitFailures: 0 };
 
 assert.ok(expectedHead, "PROOF_SOURCE_SHA is required");
 assert.equal(actualHead, expectedHead, "proof must run from the recorded exact head");
@@ -186,6 +187,82 @@ try {
   assert.equal(recoveredSummary.adaptive_probe_cursor_persisted, true);
   const commandCursors = await readCursors(cursorUpdates);
   assert.equal(commandCursors.every((cursor) => cursor.revision === 2), true);
+
+  const shadowCommitFault = await runTargetFanoutCommand({
+    ghPath: ghProof.path,
+    runId: "900012",
+    dispatchMode: "shadow-commit-fault",
+    limit: 1,
+    commitFailures: 3,
+  });
+  assert.equal(shadowCommitFault.status, 0, shadowCommitFault.stderr);
+  assert.match(shadowCommitFault.stderr, /did not commit/);
+  const shadowCommitFaultSummary = JSON.parse(shadowCommitFault.stdout);
+  assert.deepEqual(shadowCommitFaultSummary.dispatched, ["example/alpha"]);
+  assert.equal(shadowCommitFaultSummary.cursor_persisted, true);
+  assert.equal(shadowCommitFaultSummary.adaptive_cursor_persisted, false);
+  assert.equal(proxyFaults.adaptiveCommitFailures, 0);
+  assert.deepEqual(await readCursors(cursorUpdates), [
+    { mode: "hot-intake", next_cursor: 1, revision: 3 },
+    { mode: "adaptive-hot-review", next_cursor: commandCursors[1].next_cursor, revision: 2 },
+    {
+      mode: "adaptive-hot-review-probe",
+      next_cursor: commandCursors[2].next_cursor,
+      revision: 2,
+    },
+  ]);
+
+  const shadowBlockedComparison = await runTargetFanoutCommand({
+    ghPath: ghProof.path,
+    runId: "900013",
+    dispatchMode: "shadow-comparison-blocked",
+    limit: 1,
+  });
+  assert.equal(shadowBlockedComparison.status, 0, shadowBlockedComparison.stderr);
+  assert.match(shadowBlockedComparison.stderr, /cursor batch did not reserve/);
+  const shadowBlockedSummary = JSON.parse(shadowBlockedComparison.stdout);
+  assert.deepEqual(shadowBlockedSummary.dispatched, ["example/beta"]);
+  assert.equal(shadowBlockedSummary.cursor_persisted, true);
+  const shadowRecoveryCursors = await readCursors(cursorUpdates);
+  assert.deepEqual(shadowRecoveryCursors, [
+    { mode: "hot-intake", next_cursor: 0, revision: 4 },
+    { mode: "adaptive-hot-review", next_cursor: commandCursors[1].next_cursor, revision: 2 },
+    {
+      mode: "adaptive-hot-review-probe",
+      next_cursor: commandCursors[2].next_cursor,
+      revision: 2,
+    },
+  ]);
+  await signedJson(
+    "/internal/state/cursors/adaptive-hot-reservation/abort",
+    "PUT",
+    { reservation_id: "900012:1:hot-intake" },
+    202,
+  );
+
+  const killSwitchRollback = await runTargetFanoutCommand({
+    ghPath: ghProof.path,
+    runId: "900014",
+    dispatchMode: "kill-switch-rollback",
+    limit: 1,
+    adaptiveArgs: [
+      "--adaptive-mode",
+      "not-a-mode",
+      "--adaptive-kill-switch",
+      "true",
+      "--adaptive-activation-approval",
+      "not-an-approval",
+      "--adaptive-rollout-percent",
+      "not-a-percentage",
+      "--adaptive-canary-repositories",
+      "not-a-repository",
+    ],
+  });
+  assert.equal(killSwitchRollback.status, 0, killSwitchRollback.stderr);
+  const killSwitchSummary = JSON.parse(killSwitchRollback.stdout);
+  assert.deepEqual(killSwitchSummary.dispatched, ["example/alpha"]);
+  assert.equal(killSwitchSummary.cursor_persisted, true);
+  assert.equal(killSwitchSummary.adaptive_hot_review, null);
   const dispatchLog = (await readFile(ghProof.logPath, "utf8"))
     .trim()
     .split("\n")
@@ -199,11 +276,14 @@ try {
       { mode: "fail", repo: "example/alpha" },
       { mode: "success", repo: "example/alpha" },
       { mode: "success", repo: "example/beta" },
+      { mode: "shadow-commit-fault", repo: "example/alpha" },
+      { mode: "shadow-comparison-blocked", repo: "example/beta" },
+      { mode: "kill-switch-rollback", repo: "example/alpha" },
     ],
   );
 
   const finalSnapshot = await publicSnapshot();
-  assertAdaptiveSnapshot(finalSnapshot, 1, 3);
+  assertAdaptiveSnapshot(finalSnapshot, 1, 5, "planned");
   const publicJson = JSON.stringify(finalSnapshot);
   assert.equal(publicJson.includes(secret), false);
   assert.equal(publicJson.includes(persistence), false);
@@ -253,6 +333,21 @@ try {
       recovery_exit_status: recoveredCommand.status,
       recovery_dispatched: recoveredSummary.dispatched,
       committed_cursors: commandCursors,
+      shadow_commit_failure: {
+        injected_commit_failures: 3,
+        dispatched: shadowCommitFaultSummary.dispatched,
+        authoritative_cursor_persisted: shadowCommitFaultSummary.cursor_persisted,
+        adaptive_cursor_persisted: shadowCommitFaultSummary.adaptive_cursor_persisted,
+        next_cycle_dispatched: shadowBlockedSummary.dispatched,
+        cursors_after_next_cycle: shadowRecoveryCursors,
+      },
+      kill_switch_rollback: {
+        inactive_controls: "malformed",
+        exit_status: killSwitchRollback.status,
+        dispatched: killSwitchSummary.dispatched,
+        cursor_persisted: killSwitchSummary.cursor_persisted,
+        adaptive_decision: killSwitchSummary.adaptive_hot_review,
+      },
       dispatch_trace: dispatchLog.filter((entry) => entry.kind === "dispatch"),
     },
     public_snapshot: {
@@ -282,6 +377,8 @@ try {
       `- One-shot identity: reusing the committed reservation ID returned HTTP ${reusedReservation.status}.`,
       "- Dispatch failure recovery: abort left all cursors unchanged and allowed an immediate replacement reservation.",
       "- Actual command boundary: target-fanout crossed loopback TLS into local Wrangler; an injected zero-dispatch failure aborted unchanged, then a new run dispatched two sanitized repositories and committed all cursor revisions.",
+      "- Shadow fail-open: three injected comparison-commit failures left adaptive cursors fenced, while the authoritative legacy cursor advanced and the next cycle selected the next repository.",
+      "- Kill-switch rollback: malformed inactive mode, approval, rollout, and canary controls did not prevent legacy dispatch or cursor persistence.",
       "- GitHub boundary: a deterministic local gh fixture recorded dispatch intent; no GitHub API or workflow was contacted.",
       "- Public snapshot: bounded output omitted the synthetic secret and disposable persistence path.",
       "",
@@ -299,6 +396,8 @@ try {
   console.log(`direct write during reservation: HTTP ${blockedDirectWrite.status}`);
   console.log("dispatch failure recovery: aborted unchanged; replacement reservation acquired");
   console.log("actual target-fanout: injected zero-dispatch failure aborted; recovery dispatched 2 and committed");
+  console.log("shadow commit failure: legacy cursor advanced; next cycle selected the next repository");
+  console.log("kill switch rollback: malformed inactive controls bypassed; legacy dispatch persisted");
   console.log("public snapshot: bounded and sanitized");
   console.log("RESULT: PASS");
 } finally {
@@ -450,11 +549,11 @@ async function publicSnapshot() {
   return response.json();
 }
 
-function assertAdaptiveSnapshot(snapshot, observationCount, decisionCount) {
+function assertAdaptiveSnapshot(snapshot, observationCount, decisionCount, latestStatus = "dispatched") {
   assert.equal(snapshot.adaptive_hot_review.observations.length, observationCount);
   assert.equal(snapshot.adaptive_hot_review.observations[0].targetRepo, "example/alpha");
   assert.equal(snapshot.adaptive_hot_review.recentDecisions.length, decisionCount);
-  assert.equal(snapshot.adaptive_hot_review.recentDecisions[0].status, "dispatched");
+  assert.equal(snapshot.adaptive_hot_review.recentDecisions[0].status, latestStatus);
 }
 
 async function assertCursors(updates, expectedCursor, expectedRevision) {
@@ -526,7 +625,15 @@ process.exit(2);
   return { path: ghPath, logPath };
 }
 
-function runTargetFanoutCommand({ ghPath, runId, dispatchMode }) {
+function runTargetFanoutCommand({
+  ghPath,
+  runId,
+  dispatchMode,
+  limit = 2,
+  commitFailures = 0,
+  adaptiveArgs = ["--adaptive-mode", "shadow", "--adaptive-kill-switch", "false"],
+}) {
+  proxyFaults.adaptiveCommitFailures = commitFailures;
   const child = spawn(
     process.execPath,
     [
@@ -534,17 +641,14 @@ function runTargetFanoutCommand({ ghPath, runId, dispatchMode }) {
       "--mode",
       "hot-intake",
       "--limit",
-      "2",
+      String(limit),
       "--owners",
       "example",
       "--cursor-store-url",
       proxyOrigin,
       "--repo",
       "example/control",
-      "--adaptive-mode",
-      "shadow",
-      "--adaptive-kill-switch",
-      "false",
+      ...adaptiveArgs,
       "--run-id",
       runId,
       "--run-attempt",
@@ -606,6 +710,16 @@ async function startTlsProxy() {
   const server = createHttpsServer(
     { key: await readFile(keyPath), cert: await readFile(certPath) },
     (request, response) => {
+      if (
+        request.url === "/internal/state/cursors/adaptive-hot-reservation/commit" &&
+        proxyFaults.adaptiveCommitFailures > 0
+      ) {
+        proxyFaults.adaptiveCommitFailures -= 1;
+        request.resume();
+        response.writeHead(503, { "content-type": "application/json" });
+        response.end(JSON.stringify({ error: "synthetic_shadow_commit_failure" }));
+        return;
+      }
       const upstream = httpRequest(
         {
           hostname: "127.0.0.1",

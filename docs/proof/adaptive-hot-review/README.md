@@ -19,6 +19,10 @@ The runtime scenario proves that:
 - the actual built `target-fanout` command crosses a loopback-only TLS proxy to
   the local Worker, aborts after a deterministic zero-dispatch fault, then
   recovers by recording two synthetic dispatches and committing its batch; and
+- three injected shadow comparison-commit failures cannot fence the
+  authoritative legacy cursor, and the next cycle selects the next repository;
+- malformed inactive adaptive controls cannot defeat kill-switch rollback to
+  legacy dispatch and cursor persistence; and
 - the bounded public snapshot contains neither the synthetic signing secret
   nor local persistence paths.
 

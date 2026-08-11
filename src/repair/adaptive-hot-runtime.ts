@@ -109,15 +109,30 @@ export function resolveAdaptiveHotRuntimeOptions(options: {
   rolloutPercent?: unknown;
   canaryRepositories?: unknown;
 }): AdaptiveHotRuntimeOptions {
-  const requestedMode =
-    options.mode == null || String(options.mode).trim() === ""
-      ? options.policy.defaultMode
-      : adaptiveHotMode(options.mode, "adaptive mode");
   const killSwitch = optionalBoolean(
     options.killSwitch,
     options.policy.killSwitchDefault,
     "adaptive kill switch",
   );
+  if (killSwitch) {
+    const requestedModeValue = String(options.mode ?? options.policy.defaultMode)
+      .trim()
+      .toLowerCase();
+    return {
+      requestedMode: isAdaptiveHotMode(requestedModeValue)
+        ? requestedModeValue
+        : options.policy.defaultMode,
+      effectiveMode: "legacy",
+      killSwitch: true,
+      activationApproval: "none",
+      rolloutPercent: 100,
+      canaryRepositories: [],
+    };
+  }
+  const requestedMode =
+    options.mode == null || String(options.mode).trim() === ""
+      ? options.policy.defaultMode
+      : adaptiveHotMode(options.mode, "adaptive mode");
   const approvalRaw =
     options.activationApproval == null || String(options.activationApproval).trim() === ""
       ? "none"
@@ -127,7 +142,7 @@ export function resolveAdaptiveHotRuntimeOptions(options: {
   }
   const rolloutPercent = rolloutPercentage(options.rolloutPercent);
   const canaryRepositories = repositoryList(options.canaryRepositories);
-  const effectiveMode = killSwitch ? "legacy" : requestedMode;
+  const effectiveMode = requestedMode;
   if (
     effectiveMode === "canary" &&
     (canaryRepositories.length < 3 || canaryRepositories.length > 5)

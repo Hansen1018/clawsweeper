@@ -462,15 +462,18 @@ export async function runTargetFanout(argv: string[]): Promise<void> {
   let adaptiveCursorReservationReserved = false;
   const activeAdaptiveCycle =
     adaptiveDecision !== null && adaptive !== null && adaptive.runtime.effectiveMode !== "shadow";
-  if (!options.dryRun && adaptiveDecision && adaptiveCursor && adaptiveProbeCursor) {
+  if (!options.dryRun && adaptiveDecision && adaptive && adaptiveCursor && adaptiveProbeCursor) {
     const decisionToReserve = adaptiveDecision;
     adaptiveCursorReservation = {
       baseUrl: options.cursorStoreUrl,
       webhookSecret: process.env.CLAWSWEEPER_WEBHOOK_SECRET ?? "",
       reservationId: decisionToReserve.decisionId,
-      legacy: persistLegacyCursor
-        ? { nextCursor: selection.cursor, expectedRevision: cursor.revision }
-        : null,
+      legacy: adaptiveHotReservationLegacyCursor({
+        effectiveMode: adaptive.runtime.effectiveMode,
+        persistLegacyCursor,
+        nextCursor: selection.cursor,
+        expectedRevision: cursor.revision,
+      }),
       adaptive: {
         nextCursor: decisionToReserve.adaptiveCursor.next,
         expectedRevision: adaptiveCursor.revision,
@@ -598,6 +601,18 @@ type AdaptiveHotCursorReservationOptions = {
   fetchImpl?: typeof fetch;
   sleep?: (milliseconds: number) => Promise<void>;
 };
+
+export function adaptiveHotReservationLegacyCursor(options: {
+  effectiveMode: AdaptiveHotRuntimeOptions["effectiveMode"];
+  persistLegacyCursor: boolean;
+  nextCursor: number;
+  expectedRevision: number;
+}): { nextCursor: number; expectedRevision: number } | null {
+  return options.persistLegacyCursor &&
+    (options.effectiveMode === "canary" || options.effectiveMode === "full")
+    ? { nextCursor: options.nextCursor, expectedRevision: options.expectedRevision }
+    : null;
+}
 
 export async function reserveAdaptiveHotCursors(
   options: AdaptiveHotCursorReservationOptions,

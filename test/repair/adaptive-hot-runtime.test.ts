@@ -31,6 +31,25 @@ test("adaptive hot-review defaults preserve legacy fanout behind the kill switch
   });
   assert.equal(rollback.requestedMode, "full");
   assert.equal(rollback.effectiveMode, "legacy");
+
+  assert.deepEqual(
+    resolveAdaptiveHotRuntimeOptions({
+      policy,
+      mode: "not-a-mode",
+      killSwitch: "true",
+      activationApproval: "not-an-approval",
+      rolloutPercent: "not-a-percentage",
+      canaryRepositories: "not-a-repository",
+    }),
+    {
+      requestedMode: "legacy",
+      effectiveMode: "legacy",
+      killSwitch: true,
+      activationApproval: "none",
+      rolloutPercent: 100,
+      canaryRepositories: [],
+    },
+  );
 });
 
 test("adaptive activation requires bounded canaries, explicit approval, and durable windows", () => {

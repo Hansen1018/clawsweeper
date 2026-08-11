@@ -8,6 +8,7 @@ import test from "node:test";
 
 import {
   SCHEDULED_REVIEW_PLAN_BATCH_SIZE,
+  adaptiveHotReservationLegacyCursor,
   adaptiveHotLegacyCursor,
   allocateReviewCandidateCapacity,
   commitAdaptiveHotCursors,
@@ -718,6 +719,34 @@ test("active adaptive fanout reserves every required cursor before dispatch", as
   await assert.rejects(reserveThenDispatch(true, false), /cursors did not commit after dispatch/);
   assert.deepEqual(events, ["reserve", "dispatch", "commit"]);
   assert.equal(dispatched, true);
+});
+
+test("shadow cursor settlement keeps the authoritative legacy cursor independent", () => {
+  const cursor = { nextCursor: 12, expectedRevision: 4 };
+  assert.equal(
+    adaptiveHotReservationLegacyCursor({
+      effectiveMode: "shadow",
+      persistLegacyCursor: true,
+      ...cursor,
+    }),
+    null,
+  );
+  assert.deepEqual(
+    adaptiveHotReservationLegacyCursor({
+      effectiveMode: "canary",
+      persistLegacyCursor: true,
+      ...cursor,
+    }),
+    cursor,
+  );
+  assert.equal(
+    adaptiveHotReservationLegacyCursor({
+      effectiveMode: "full",
+      persistLegacyCursor: false,
+      ...cursor,
+    }),
+    null,
+  );
 });
 
 test("adaptive fanout aborts its cursor reservation after a dispatch failure", async () => {
