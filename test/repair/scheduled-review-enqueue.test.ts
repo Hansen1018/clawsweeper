@@ -129,7 +129,16 @@ test("scheduled review enqueue reports the full selection-to-queue funnel and st
 test("scheduled review enqueue rejects numeric target branches before queue admission", async () => {
   await assert.rejects(
     enqueueScheduledReviewPlan({
-      plan: { candidates: [] },
+      plan: {
+        candidates: [
+          {
+            repo: "openclaw/openclaw",
+            number: 1,
+            kind: "issue",
+            updatedAt: "2026-08-10T12:00:00Z",
+          },
+        ],
+      },
       lane: "normal_backfill",
       targetRepo: "openclaw/openclaw",
       targetBranch: "0",
@@ -147,7 +156,16 @@ test("scheduled review enqueue rejects numeric target branches before queue admi
 test("scheduled review enqueue fails closed until the queue advertises pacing", async () => {
   await assert.rejects(
     enqueueScheduledReviewPlan({
-      plan: { candidates: [] },
+      plan: {
+        candidates: [
+          {
+            repo: "openclaw/openclaw",
+            number: 1,
+            kind: "issue",
+            updatedAt: "2026-08-10T12:00:00Z",
+          },
+        ],
+      },
       lane: "normal_backfill",
       targetRepo: "openclaw/openclaw",
       targetBranch: "main",
@@ -158,6 +176,38 @@ test("scheduled review enqueue fails closed until the queue advertises pacing", 
     }),
     /does not advertise scheduled feed admission/,
   );
+});
+
+test("zero-offer plans skip target-branch and queue-capability dependencies", async () => {
+  let fetches = 0;
+  const summary = await enqueueScheduledReviewPlan({
+    plan: { candidates: [] },
+    lane: "hot_intake",
+    targetRepo: "openclaw/clawsweeper",
+    queueUrl: "https://queue.example",
+    secret: "secret",
+    deliveryPrefix: "scheduled:empty:1",
+    fetchImpl: async () => {
+      fetches += 1;
+      throw new Error("fetch must not run");
+    },
+  });
+
+  assert.equal(fetches, 0);
+  assert.deepEqual(summary, {
+    lane: "hot_intake",
+    offered: 0,
+    attempted: 0,
+    queued: 0,
+    deduped: 0,
+    shed: 0,
+    rateLimited: 0,
+    backpressured: 0,
+    rejected: 0,
+    deferred: 0,
+    observationPublished: false,
+    ageHours: { p50: null, p90: null, max: null },
+  });
 });
 
 test("scheduled review enqueue rejects cross-repository plan candidates", async () => {
@@ -199,7 +249,6 @@ test("scheduled review enqueue preserves backlog-wide age in a zero-offer observ
     },
     lane: "hot_intake",
     targetRepo: "OpenClaw/ClawSweeper",
-    targetBranch: "main",
     queueUrl: "https://queue.example",
     secret,
     deliveryPrefix: "scheduled:200:2",
@@ -320,7 +369,6 @@ test("planner observation failure does not undo valid queue dispositions", async
       plan: { candidates: [] },
       lane: "hot_intake",
       targetRepo: "openclaw/clawsweeper",
-      targetBranch: "main",
       queueUrl: "https://queue.example",
       secret: "secret",
       deliveryPrefix: "scheduled:201:1",

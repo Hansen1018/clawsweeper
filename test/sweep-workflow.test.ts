@@ -5344,9 +5344,12 @@ test("scheduled reviews feed the durable queue instead of one-item matrix worker
   assert.match(modeBlock, /batch_size="\$requested_batch_size"[\s\S]*shard_count="1"/);
   assert.match(enqueueBlock, /repair:scheduled-review-enqueue/);
   assert.match(enqueueBlock, /if: \$\{\{ steps\.mode\.outputs\.queue_feed == 'true' \}\}/);
-  assert.doesNotMatch(enqueueBlock, /planned_count != '0'/);
-  assert.match(enqueueBlock, /gh api "repos\/\$target_repo" --jq '\.default_branch \/\/ empty'/);
-  assert.match(enqueueBlock, /--target-branch "\$target_branch"/);
+  assert.match(
+    enqueueBlock,
+    /target_branch_arg=\(\)[\s\S]*if \[ "\$\{\{ steps\.select\.outputs\.planned_count \}\}" != "0" \]; then[\s\S]*gh api "repos\/\$target_repo" --jq '\.default_branch \/\/ empty'/,
+  );
+  assert.match(enqueueBlock, /target_branch_arg=\(--target-branch "\$target_branch"\)/);
+  assert.match(enqueueBlock, /"\$\{target_branch_arg\[@\]\}"/);
   assert.match(enqueueBlock, /--run-id "\$\{\{ github\.run_id \}\}"/);
   assert.match(enqueueBlock, /--run-attempt "\$\{\{ github\.run_attempt \}\}"/);
   assert.doesNotMatch(

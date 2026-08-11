@@ -120,10 +120,11 @@ Modes are deliberately asymmetric:
 - `shadow`: computes and durably records the adaptive proposal, but dispatches
   the exact legacy repository list and 50-candidate capacities. A telemetry or
   adaptive-cursor batch failure warns without blocking legacy work or counting
-  the comparison toward readiness. The authoritative legacy cursor and the
-  main and probe cursors reserve and commit atomically when that batch is
-  available. If the adaptive batch cannot reserve or commit, shadow remains
-  fail-open and persists the legacy cursor through its independent fallback.
+  the comparison toward readiness. The main and probe cursors reserve and
+  commit together when the adaptive batch is available. The authoritative
+  legacy cursor stays outside that comparison reservation and persists
+  independently, so an adaptive reserve or commit failure remains fail-open
+  for legacy work.
 - `canary`: replaces only legacy slots belonging to the explicit three-to-five
   repository allowlist. Control-plane, decision, and cursor durability are
   required for a successful active cycle. The legacy cursor when used, the main

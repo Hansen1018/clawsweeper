@@ -46,7 +46,7 @@ type EnqueueOptions = {
   plan: ScheduledReviewPlan;
   lane: ScheduledReviewLane;
   targetRepo: string;
-  targetBranch: string;
+  targetBranch?: string;
   queueUrl: string;
   secret: string;
   deliveryPrefix: string;
@@ -63,27 +63,12 @@ export async function enqueueScheduledReviewPlan(
   options: EnqueueOptions,
 ): Promise<ScheduledReviewEnqueueSummary> {
   const fetchImpl = options.fetchImpl ?? fetch;
-  const targetBranch = options.targetBranch.trim();
-  if (!isPlausibleTargetBranch(targetBranch)) {
+  const targetBranch = options.targetBranch?.trim() ?? "";
+  if (options.plan.candidates.length > 0 && !isPlausibleTargetBranch(targetBranch)) {
     throw new Error("scheduled review target branch is invalid");
   }
   for (const candidate of options.plan.candidates) validateCandidate(candidate, options.targetRepo);
   const queueUrl = options.queueUrl.replace(/\/$/, "");
-  const capabilityResponse = await fetchImpl(`${queueUrl}/api/exact-review-queue`, {
-    signal: AbortSignal.timeout(20_000),
-  });
-  const capability = (await capabilityResponse.json().catch(() => null)) as Record<
-    string,
-    unknown
-  > | null;
-  const scheduledFeed = capability?.scheduled_feed as Record<string, unknown> | undefined;
-  if (
-    !capabilityResponse.ok ||
-    !scheduledFeed ||
-    !Number.isFinite(Number(scheduledFeed.target_rate_per_hour))
-  ) {
-    throw new Error("exact-review queue does not advertise scheduled feed admission");
-  }
   const ages = (options.plan.selection ?? [])
     .map((selection) => Number(selection.ageMs))
     .filter((age) => Number.isFinite(age) && age >= 0)
@@ -112,6 +97,24 @@ export async function enqueueScheduledReviewPlan(
     },
   };
   const servedCandidateIndices = new Set<number>();
+
+  if (options.plan.candidates.length > 0) {
+    const capabilityResponse = await fetchImpl(`${queueUrl}/api/exact-review-queue`, {
+      signal: AbortSignal.timeout(20_000),
+    });
+    const capability = (await capabilityResponse.json().catch(() => null)) as Record<
+      string,
+      unknown
+    > | null;
+    const scheduledFeed = capability?.scheduled_feed as Record<string, unknown> | undefined;
+    if (
+      !capabilityResponse.ok ||
+      !scheduledFeed ||
+      !Number.isFinite(Number(scheduledFeed.target_rate_per_hour))
+    ) {
+      throw new Error("exact-review queue does not advertise scheduled feed admission");
+    }
+  }
 
   for (const [index, candidate] of options.plan.candidates.entries()) {
     const payload = JSON.stringify({
@@ -320,11 +323,14 @@ function errorMessage(error: unknown): string {
 
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
+  const plan = readPlan(requiredString(args.plan, "--plan"));
   const result = await enqueueScheduledReviewPlan({
-    plan: readPlan(requiredString(args.plan, "--plan")),
+    plan,
     lane: scheduledReviewLane(args.lane),
     targetRepo: requiredString(args["target-repo"], "--target-repo"),
-    targetBranch: requiredString(args["target-branch"], "--target-branch"),
+    ...(plan.candidates.length > 0
+      ? { targetBranch: requiredString(args["target-branch"], "--target-branch") }
+      : {}),
     queueUrl: requiredString(args["queue-url"], "--queue-url"),
     secret: requiredString(process.env.CLAWSWEEPER_WEBHOOK_SECRET, "CLAWSWEEPER_WEBHOOK_SECRET"),
     deliveryPrefix: requiredString(args["delivery-prefix"], "--delivery-prefix"),

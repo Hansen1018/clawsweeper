@@ -4025,24 +4025,28 @@ jobs:
             lane="hot_intake"
           fi
           target_repo="${{ steps.target.outputs.target_repo }}"
-          target_branch="$(gh api "repos/$target_repo" --jq '.default_branch // empty')"
-          if [ -z "$target_branch" ] ||
-            ! printf '%s' "$target_branch" | grep -Eq '^[A-Za-z0-9_.\/-]+$' ||
-            printf '%s' "$target_branch" | grep -Eq '^[0-9]+$' ||
-            [[ "$target_branch" == *".."* ]]; then
-            echo "Invalid default branch for scheduled target $target_repo: $target_branch" >&2
-            exit 1
+          target_branch_arg=()
+          if [ "${{ steps.select.outputs.planned_count }}" != "0" ]; then
+            target_branch="$(gh api "repos/$target_repo" --jq '.default_branch // empty')"
+            if [ -z "$target_branch" ] ||
+              ! printf '%s' "$target_branch" | grep -Eq '^[A-Za-z0-9_.\/-]+$' ||
+              printf '%s' "$target_branch" | grep -Eq '^[0-9]+$' ||
+              [[ "$target_branch" == *".."* ]]; then
+              echo "Invalid default branch for scheduled target $target_repo: $target_branch" >&2
+              exit 1
+            fi
+            echo "::notice::Scheduled review payloads will use default branch '$target_branch' for $target_repo."
+            target_branch_arg=(--target-branch "$target_branch")
           fi
-          echo "::notice::Scheduled review payloads will use default branch '$target_branch' for $target_repo."
           result="$(pnpm run --silent repair:scheduled-review-enqueue -- \
             --plan plan.json \
             --lane "$lane" \
             --target-repo "$target_repo" \
-            --target-branch "$target_branch" \
             --queue-url "$QUEUE_URL" \
             --run-id "${{ github.run_id }}" \
             --run-attempt "${{ github.run_attempt }}" \
-            --delivery-prefix "scheduled:${{ github.run_id }}:${{ github.run_attempt }}")"
+            --delivery-prefix "scheduled:${{ github.run_id }}:${{ github.run_attempt }}" \
+            "${target_branch_arg[@]}")"
           jq -e '.offered >= .attempted and .attempted >= (.queued + .deduped + .shed + .rejected)' <<<"$result" >/dev/null
           {
             echo "offered=$(jq -r .offered <<<"$result")"
