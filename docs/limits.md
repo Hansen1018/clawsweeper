@@ -116,8 +116,8 @@ they do not reserve workers or bypass queue admission.
 | `scheduled_review.adaptive_hot.max_repositories`                       |         20 | Absolute repositories selected by one adaptive fleet cycle.                |
 | `scheduled_review.adaptive_hot.unknown_probe_limit`                    |          2 | Maximum stale, missing, or malformed repositories probed per cycle.         |
 | `scheduled_review.adaptive_hot.unavailable_observation_fallback_limit` |          5 | One-candidate repository probes when the observation service is unavailable. |
-| `scheduled_review.adaptive_hot.repository_share_numerator`            |          1 | Numerator of the per-repository service-capacity share.                    |
-| `scheduled_review.adaptive_hot.repository_share_denominator`          |          4 | Denominator of the per-repository service-capacity share.                  |
+| `scheduled_review.adaptive_hot.repository_share_numerator`            |          1 | Numerator of the per-repository over-offered candidate-budget share.       |
+| `scheduled_review.adaptive_hot.repository_share_denominator`          |          4 | Denominator of the per-repository over-offered candidate-budget share.     |
 | `scheduled_review.adaptive_hot.max_repository_candidates`             |         10 | Absolute candidate cap for one repository in one adaptive cycle.           |
 | `scheduled_review.adaptive_hot.shadow_min_duration_ms`                 |  604800000 | Minimum seven-day comparison window before canary can pass readiness.       |
 | `scheduled_review.adaptive_hot.shadow_min_cycles`                      |         21 | Minimum durable dispatched shadow decisions before canary readiness.       |

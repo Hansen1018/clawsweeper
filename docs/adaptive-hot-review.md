@@ -52,7 +52,7 @@ offer budget = min(ceil(service capacity * 1.5), 30)
 ```
 
 The allocator selects no more than 20 repositories. One repository receives no
-more than 25% of service capacity, with an integer minimum of one and an
+more than 25% of the over-offered candidate budget, with an integer minimum of one and an
 absolute cap of 10 candidates. Fresh observed demand is considered in this
 order:
 

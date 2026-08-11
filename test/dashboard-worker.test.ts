@@ -12050,6 +12050,41 @@ test("adaptive hot-review public observations retain the newest one hundred part
   );
 });
 
+test("adaptive hot-review public decisions use an allowlisted normalized projection", () => {
+  const now = Date.parse("2026-08-10T12:00:00Z");
+  const storage = new MemoryDurableStorage();
+  const store = new AdaptiveHotReviewStore(storage);
+  store.ensureSchemaSync();
+  const clean = adaptiveDecisionRecord({ status: "dispatched", observedAt: now });
+  const unsafe = {
+    ...clean,
+    unknownTopLevel: "synthetic-private-marker",
+    actual: clean.actual.map((allocation) => ({
+      ...allocation,
+      unknownActual: "synthetic-private-marker",
+    })),
+    proposed: {
+      ...clean.proposed,
+      unknownProposed: "synthetic-private-marker",
+      allocations: clean.proposed.allocations.map((allocation) => ({
+        ...allocation,
+        unknownAllocation: "synthetic-private-marker",
+      })),
+      allocationTrace: clean.proposed.allocationTrace.map((step) => ({
+        ...step,
+        unknownTrace: "synthetic-private-marker",
+      })),
+    },
+    control: { ...clean.control, unknownControl: "synthetic-private-marker" },
+    comparison: { ...clean.comparison, unknownComparison: "synthetic-private-marker" },
+  };
+
+  assert.equal(store.recordDecision(unsafe, now).accepted, true);
+  const publicDecision = store.snapshot(now).recentDecisions[0];
+  assert.deepEqual(publicDecision, clean);
+  assert.equal(JSON.stringify(publicDecision).includes("synthetic-private-marker"), false);
+});
+
 function adaptivePlannerObservation(overrides: {
   observationId: string;
   observedAt: string;

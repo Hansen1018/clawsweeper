@@ -1,4 +1,11 @@
 import {
+  ADAPTIVE_HOT_ALLOCATION_SCHEMA_VERSION,
+  type AdaptiveHotAllocationDecision,
+  type AdaptiveHotAllocationReason,
+  type AdaptiveHotAllocationStatus,
+  type AdaptiveHotObservationStatus,
+} from "../src/repair/adaptive-hot-allocation.ts";
+import {
   ADAPTIVE_HOT_CONTROL_SNAPSHOT_SCHEMA_VERSION,
   ADAPTIVE_HOT_DECISION_RECORD_SCHEMA_VERSION,
   ADAPTIVE_HOT_PLANNER_OBSERVATION_SCHEMA_VERSION,
@@ -6,8 +13,10 @@ import {
   isAdaptiveHotMode,
   isAdaptiveHotRepositorySlug,
   type AdaptiveHotControlSnapshot,
+  type AdaptiveHotControlFacts,
   type AdaptiveHotDecisionRecord,
   type AdaptiveHotExecutionObservation,
+  type AdaptiveHotActualAllocation,
   type AdaptiveHotPlannerObservation,
   type AdaptiveHotRepositoryObservationSnapshot,
 } from "../src/repair/adaptive-hot-review-contract.ts";
@@ -26,6 +35,29 @@ const ADAPTIVE_HOT_EXECUTION_RETENTION_MAX = 20_000;
 const ADAPTIVE_HOT_DECISION_RETENTION_MAX = 640;
 const ADAPTIVE_HOT_PUBLIC_OBSERVATION_LIMIT = 100;
 const ADAPTIVE_HOT_PUBLIC_DECISION_LIMIT = 100;
+const ADAPTIVE_HOT_ALLOCATION_STATUSES = new Set<AdaptiveHotAllocationStatus>([
+  "allocated",
+  "observation_fallback",
+  "scheduled_throttle",
+  "queue_unavailable",
+  "no_capacity",
+  "no_eligible_demand",
+]);
+const ADAPTIVE_HOT_ALLOCATION_REASONS = new Set<AdaptiveHotAllocationReason>([
+  "overdue_fairness",
+  "source_novelty",
+  "unknown_probe",
+  "ordinary_demand",
+  "residual_expansion",
+  "observation_fallback",
+]);
+const ADAPTIVE_HOT_OBSERVATION_STATUSES = new Set<AdaptiveHotObservationStatus>([
+  "fresh",
+  "missing",
+  "stale",
+  "malformed",
+  "unavailable",
+]);
 
 export class AdaptiveHotReviewStore {
   private readonly storage: DurableStorage;
@@ -543,10 +575,14 @@ function normalizeAdaptiveHotDecisionRecord(
   const canaryRepositories = Array.isArray(record.canaryRepositories)
     ? record.canaryRepositories.map((repository) => String(repository).trim().toLowerCase())
     : null;
-  const actual = Array.isArray(record.actual) ? record.actual : null;
-  const proposed = objectValue(record.proposed);
-  const control = objectValue(record.control);
-  const comparison = objectValue(record.comparison);
+  const reason = String(record.reason || "");
+  const legacyCursor = normalizeCursorPair(record.legacyCursor);
+  const adaptiveCursor = normalizeCursorPair(record.adaptiveCursor);
+  const adaptiveProbeCursor = normalizeCursorPair(record.adaptiveProbeCursor);
+  const actual = normalizeActualAllocations(record.actual);
+  const proposed = normalizeAdaptiveHotAllocationDecision(record.proposed);
+  const control = normalizeAdaptiveHotControlFacts(record.control, now);
+  const comparison = normalizeDecisionComparison(record.comparison);
   const serialized = JSON.stringify(value);
   if (
     record.schemaVersion !== ADAPTIVE_HOT_DECISION_RECORD_SCHEMA_VERSION ||
@@ -565,49 +601,92 @@ function normalizeAdaptiveHotDecisionRecord(
     !canaryRepositories ||
     canaryRepositories.length > 5 ||
     canaryRepositories.some((repository) => !isAdaptiveHotRepositorySlug(repository)) ||
-    !validId(String(record.reason || ""), 200) ||
-    !validCursorPair(record.legacyCursor) ||
-    !validCursorPair(record.adaptiveCursor) ||
-    !validCursorPair(record.adaptiveProbeCursor) ||
+    !validId(reason, 200) ||
+    !legacyCursor ||
+    !adaptiveCursor ||
+    !adaptiveProbeCursor ||
     !actual ||
-    actual.length > 20 ||
-    actual.some((allocation) => !validActualAllocation(allocation)) ||
-    !Array.isArray(proposed.allocations) ||
-    proposed.allocations.length > 20 ||
-    !Array.isArray(proposed.allocationTrace) ||
-    proposed.allocationTrace.length > 30 ||
-    !Array.isArray(control.activeCredentialCircuits) ||
-    control.activeCredentialCircuits.length > 100 ||
-    !validDecisionComparison(comparison) ||
+    !proposed ||
+    !control ||
+    !comparison ||
     serialized.length > 128 * 1024
   ) {
     return null;
   }
-  return value as AdaptiveHotDecisionRecord;
+  return {
+    schemaVersion: ADAPTIVE_HOT_DECISION_RECORD_SCHEMA_VERSION,
+    decisionId,
+    runId,
+    runAttempt,
+    observedAt,
+    requestedMode,
+    effectiveMode,
+    status,
+    policyVersion,
+    killSwitch: record.killSwitch,
+    activationApproval,
+    rolloutPercent: rolloutPercent as 10 | 50 | 100,
+    canaryRepositories,
+    reason,
+    legacyCursor,
+    adaptiveCursor,
+    adaptiveProbeCursor,
+    actual,
+    proposed,
+    control,
+    comparison,
+  };
 }
 
-function validDecisionComparison(value: Record<string, unknown>) {
-  const integers = [
-    value.legacyRepositoryCount,
-    value.legacyOfferBudget,
-    value.adaptiveRepositoryCount,
-    value.adaptiveOfferBudget,
-    value.predictedOfferReduction,
-    value.observedPlannerSamples,
-    value.observedAttempted,
-    value.observedDedupedOrShed,
-    value.overdueRepositoriesBefore,
-    value.overdueRepositoriesSelected,
-  ];
-  const nullableIntegers = [
-    value.estimatedAvoidedDedupeOrShed,
-    value.oldestUnservedAgeBeforeMs,
-    value.oldestUnservedAgeAfterProposalMs,
-  ];
-  return (
-    integers.every((entry) => integer(entry) !== null) &&
-    nullableIntegers.every((entry) => entry === null || integer(entry) !== null)
-  );
+function normalizeDecisionComparison(
+  value: unknown,
+): AdaptiveHotDecisionRecord["comparison"] | null {
+  const record = objectValue(value);
+  const legacyRepositoryCount = integer(record.legacyRepositoryCount);
+  const legacyOfferBudget = integer(record.legacyOfferBudget);
+  const adaptiveRepositoryCount = integer(record.adaptiveRepositoryCount);
+  const adaptiveOfferBudget = integer(record.adaptiveOfferBudget);
+  const predictedOfferReduction = integer(record.predictedOfferReduction);
+  const observedPlannerSamples = integer(record.observedPlannerSamples);
+  const observedAttempted = integer(record.observedAttempted);
+  const observedDedupedOrShed = integer(record.observedDedupedOrShed);
+  const estimatedAvoidedDedupeOrShed = nullableInteger(record.estimatedAvoidedDedupeOrShed);
+  const overdueRepositoriesBefore = integer(record.overdueRepositoriesBefore);
+  const overdueRepositoriesSelected = integer(record.overdueRepositoriesSelected);
+  const oldestUnservedAgeBeforeMs = nullableInteger(record.oldestUnservedAgeBeforeMs);
+  const oldestUnservedAgeAfterProposalMs = nullableInteger(record.oldestUnservedAgeAfterProposalMs);
+  if (
+    legacyRepositoryCount === null ||
+    legacyOfferBudget === null ||
+    adaptiveRepositoryCount === null ||
+    adaptiveOfferBudget === null ||
+    predictedOfferReduction === null ||
+    observedPlannerSamples === null ||
+    observedAttempted === null ||
+    observedDedupedOrShed === null ||
+    estimatedAvoidedDedupeOrShed === undefined ||
+    overdueRepositoriesBefore === null ||
+    overdueRepositoriesSelected === null ||
+    oldestUnservedAgeBeforeMs === undefined ||
+    oldestUnservedAgeAfterProposalMs === undefined
+  ) {
+    return null;
+  }
+  return {
+    legacyRepositoryCount,
+    legacyOfferBudget,
+    adaptiveRepositoryCount,
+    adaptiveOfferBudget,
+    predictedOfferReduction,
+    observedPlannerSamples,
+    observedAttempted,
+    observedDedupedOrShed,
+    estimatedAvoidedDedupeOrShed,
+    overdueRepositoriesBefore,
+    overdueRepositoriesSelected,
+    oldestUnservedAgeBeforeMs,
+    oldestUnservedAgeAfterProposalMs,
+  };
 }
 
 function normalizeAdaptiveHotPlannerObservationJson(value: string) {
@@ -626,19 +705,217 @@ function normalizeAdaptiveHotDecisionJson(value: string) {
   }
 }
 
-function validActualAllocation(value: unknown) {
-  const allocation = objectValue(value);
-  return (
-    isAdaptiveHotRepositorySlug(allocation.targetRepo) &&
-    integer(allocation.candidateCapacity) !== null &&
-    Number(allocation.candidateCapacity) >= 1 &&
-    (allocation.source === "legacy" || allocation.source === "adaptive")
-  );
+function normalizeActualAllocations(value: unknown): AdaptiveHotActualAllocation[] | null {
+  if (!Array.isArray(value) || value.length > 20) return null;
+  const allocations: AdaptiveHotActualAllocation[] = [];
+  for (const raw of value) {
+    const allocation = objectValue(raw);
+    const targetRepo = String(allocation.targetRepo || "")
+      .trim()
+      .toLowerCase();
+    const candidateCapacity = integer(allocation.candidateCapacity);
+    if (
+      !isAdaptiveHotRepositorySlug(targetRepo) ||
+      candidateCapacity === null ||
+      candidateCapacity < 1 ||
+      (allocation.source !== "legacy" && allocation.source !== "adaptive")
+    ) {
+      return null;
+    }
+    allocations.push({ targetRepo, candidateCapacity, source: allocation.source });
+  }
+  return allocations;
 }
 
-function validCursorPair(value: unknown) {
+function normalizeAdaptiveHotAllocationDecision(
+  value: unknown,
+): AdaptiveHotAllocationDecision | null {
+  const record = objectValue(value);
+  const policyVersion = String(record.policyVersion || "").trim();
+  const status = String(record.status || "") as AdaptiveHotAllocationStatus;
+  const serviceCapacity = integer(record.serviceCapacity);
+  const offerBudget = integer(record.offerBudget);
+  const perRepositoryLimit = integer(record.perRepositoryLimit);
+  const repositoryLimit = integer(record.repositoryLimit);
+  const repositoriesConsidered = integer(record.repositoriesConsidered);
+  const credentialBlockedRepositories = integer(record.credentialBlockedRepositories);
+  const unknownProbeCount = integer(record.unknownProbeCount);
+  const allocations = normalizeProposedAllocations(record.allocations);
+  const allocationTrace = normalizeAllocationTrace(record.allocationTrace);
+  const unusedOfferBudget = integer(record.unusedOfferBudget);
+  const inputCursor = integer(record.inputCursor);
+  const nextCursor = integer(record.nextCursor);
+  const inputProbeCursor = integer(record.inputProbeCursor);
+  const nextProbeCursor = integer(record.nextProbeCursor);
+  if (
+    record.schemaVersion !== ADAPTIVE_HOT_ALLOCATION_SCHEMA_VERSION ||
+    !validId(policyVersion, 100) ||
+    !ADAPTIVE_HOT_ALLOCATION_STATUSES.has(status) ||
+    serviceCapacity === null ||
+    offerBudget === null ||
+    perRepositoryLimit === null ||
+    repositoryLimit === null ||
+    repositoriesConsidered === null ||
+    credentialBlockedRepositories === null ||
+    unknownProbeCount === null ||
+    !allocations ||
+    !allocationTrace ||
+    unusedOfferBudget === null ||
+    inputCursor === null ||
+    nextCursor === null ||
+    typeof record.cursorAdvanced !== "boolean" ||
+    inputProbeCursor === null ||
+    nextProbeCursor === null ||
+    typeof record.probeCursorAdvanced !== "boolean"
+  ) {
+    return null;
+  }
+  return {
+    schemaVersion: ADAPTIVE_HOT_ALLOCATION_SCHEMA_VERSION,
+    policyVersion,
+    status,
+    serviceCapacity,
+    offerBudget,
+    perRepositoryLimit,
+    repositoryLimit,
+    repositoriesConsidered,
+    credentialBlockedRepositories,
+    unknownProbeCount,
+    allocations,
+    allocationTrace,
+    unusedOfferBudget,
+    inputCursor,
+    nextCursor,
+    cursorAdvanced: record.cursorAdvanced,
+    inputProbeCursor,
+    nextProbeCursor,
+    probeCursorAdvanced: record.probeCursorAdvanced,
+  };
+}
+
+function normalizeProposedAllocations(
+  value: unknown,
+): AdaptiveHotAllocationDecision["allocations"] | null {
+  if (!Array.isArray(value) || value.length > 20) return null;
+  const allocations: AdaptiveHotAllocationDecision["allocations"] = [];
+  for (const raw of value) {
+    const allocation = objectValue(raw);
+    const targetRepo = String(allocation.targetRepo || "")
+      .trim()
+      .toLowerCase();
+    const candidateCapacity = integer(allocation.candidateCapacity);
+    const initialReason = String(allocation.initialReason || "") as AdaptiveHotAllocationReason;
+    const observationStatus = String(
+      allocation.observationStatus || "",
+    ) as AdaptiveHotObservationStatus;
+    if (
+      !isAdaptiveHotRepositorySlug(targetRepo) ||
+      candidateCapacity === null ||
+      candidateCapacity < 1 ||
+      !ADAPTIVE_HOT_ALLOCATION_REASONS.has(initialReason) ||
+      !ADAPTIVE_HOT_OBSERVATION_STATUSES.has(observationStatus)
+    ) {
+      return null;
+    }
+    allocations.push({ targetRepo, candidateCapacity, initialReason, observationStatus });
+  }
+  return allocations;
+}
+
+function normalizeAllocationTrace(
+  value: unknown,
+): AdaptiveHotAllocationDecision["allocationTrace"] | null {
+  if (!Array.isArray(value) || value.length > 30) return null;
+  const trace: AdaptiveHotAllocationDecision["allocationTrace"] = [];
+  for (const raw of value) {
+    const step = objectValue(raw);
+    const sequence = integer(step.sequence);
+    const targetRepo = String(step.targetRepo || "")
+      .trim()
+      .toLowerCase();
+    const reason = String(step.reason || "") as AdaptiveHotAllocationReason;
+    const candidateNumber = integer(step.candidateNumber);
+    if (
+      sequence === null ||
+      sequence < 1 ||
+      !isAdaptiveHotRepositorySlug(targetRepo) ||
+      !ADAPTIVE_HOT_ALLOCATION_REASONS.has(reason) ||
+      candidateNumber === null ||
+      candidateNumber < 1
+    ) {
+      return null;
+    }
+    trace.push({ sequence, targetRepo, reason, candidateNumber });
+  }
+  return trace;
+}
+
+function normalizeAdaptiveHotControlFacts(
+  value: unknown,
+  now: number,
+): AdaptiveHotControlFacts | null {
+  const record = objectValue(value);
+  const availableCandidateCapacity = integer(record.availableCandidateCapacity);
+  const globalTokenBalance = integer(record.globalTokenBalance);
+  const hotTokenBalance = integer(record.hotTokenBalance);
+  const activeCredentialCircuits = normalizeCredentialCircuits(record.activeCredentialCircuits);
+  const githubRequestMetricsUpdatedAt = nullableTimestamp(
+    record.githubRequestMetricsUpdatedAt,
+    now,
+  );
+  if (
+    typeof record.queueCapabilityAvailable !== "boolean" ||
+    availableCandidateCapacity === null ||
+    globalTokenBalance === null ||
+    hotTokenBalance === null ||
+    typeof record.scheduledAdmissionThrottled !== "boolean" ||
+    typeof record.repositoryObservationsAvailable !== "boolean" ||
+    !activeCredentialCircuits ||
+    (record.githubRequestMetricsUpdatedAt != null && githubRequestMetricsUpdatedAt === null)
+  ) {
+    return null;
+  }
+  return {
+    queueCapabilityAvailable: record.queueCapabilityAvailable,
+    availableCandidateCapacity,
+    globalTokenBalance,
+    hotTokenBalance,
+    scheduledAdmissionThrottled: record.scheduledAdmissionThrottled,
+    repositoryObservationsAvailable: record.repositoryObservationsAvailable,
+    activeCredentialCircuits,
+    githubRequestMetricsUpdatedAt,
+  };
+}
+
+function normalizeCredentialCircuits(
+  value: unknown,
+): AdaptiveHotControlFacts["activeCredentialCircuits"] | null {
+  if (!Array.isArray(value) || value.length > 100) return null;
+  const circuits: AdaptiveHotControlFacts["activeCredentialCircuits"] = [];
+  for (const raw of value) {
+    const circuit = objectValue(raw);
+    const scope = String(circuit.scope || "");
+    const targetOwner =
+      circuit.targetOwner == null ? null : String(circuit.targetOwner).trim().toLowerCase();
+    const blockedUntil = timestamp(circuit.blockedUntil, Number.MAX_SAFE_INTEGER);
+    if (
+      (scope !== "repository_actions" && scope !== "target_app") ||
+      (targetOwner !== null && !/^[a-z0-9_.-]{1,100}$/.test(targetOwner)) ||
+      (scope === "target_app" && !targetOwner) ||
+      !blockedUntil
+    ) {
+      return null;
+    }
+    circuits.push({ scope, targetOwner, blockedUntil });
+  }
+  return circuits;
+}
+
+function normalizeCursorPair(value: unknown) {
   const cursor = objectValue(value);
-  return integer(cursor.input) !== null && integer(cursor.next) !== null;
+  const input = integer(cursor.input);
+  const next = integer(cursor.next);
+  return input === null || next === null ? null : { input, next };
 }
 
 function validExecutionObservation(value: AdaptiveHotExecutionObservation) {
@@ -690,6 +967,11 @@ function nullableTimestamp(value: unknown, now: number) {
 function integer(value: unknown): number | null {
   const parsed = Number(value);
   return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null;
+}
+
+function nullableInteger(value: unknown): number | null | undefined {
+  if (value === null) return null;
+  return integer(value) ?? undefined;
 }
 
 function validId(value: string, max: number) {

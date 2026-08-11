@@ -61,7 +61,7 @@ echo "CRABBOX_PHASE:focused-tests"
     test/repair/scheduled-review-enqueue.test.ts \
     test/repair/target-fanout.test.ts
   node --test \
-    --test-name-pattern='active adaptive cursor reservation|adaptive cursor receipts cover a full day|signed adaptive hot-review telemetry routes|adaptive hot-review public observations retain|only a fenced scheduled lease completion records adaptive execution outcomes' \
+    --test-name-pattern='active adaptive cursor reservation|adaptive cursor receipts cover a full day|signed adaptive hot-review telemetry routes|adaptive hot-review public observations retain|adaptive hot-review public decisions use|only a fenced scheduled lease completion records adaptive execution outcomes' \
     test/dashboard-worker.test.ts
   node --test \
     --test-name-pattern='adaptive|hot fleet fanout|target fanout' \
