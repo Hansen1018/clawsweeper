@@ -19,6 +19,11 @@ test("automerge E2E container is readable by the runtime and restores output own
   assert.match(wrapper, /"chown",\s*"-R",\s*hostOwner/);
 });
 
+test("automerge E2E install receives the repository pnpm build policy", () => {
+  assert.match(dockerfile, /COPY package\.json pnpm-lock\.yaml pnpm-workspace\.yaml \.\//);
+  assert.match(dockerfile, /RUN pnpm install --frozen-lockfile/);
+});
+
 test("automerge E2E builds the default base from repository-controlled source", () => {
   assert.match(dockerfile, /ARG AUTOMERGE_E2E_BASE_IMAGE=clawsweeper-automerge-e2e-base:local/);
   assert.match(
