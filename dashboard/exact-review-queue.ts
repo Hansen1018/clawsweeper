@@ -5,11 +5,7 @@ import {
   payloadHash,
   type StateWriterOperation,
 } from "../src/state-writer-telemetry.ts";
-import {
-  summarizeExactReviewPublicationHealth,
-  summarizeExactReviewHandoff,
-  summarizeExactReviewPressure,
-} from "./exact-review-health.ts";
+import { summarizeExactReviewPublicationHealth } from "./exact-review-health.ts";
 import {
   ExactReviewPublicationBatchStore,
   type PublicationBatchCompletion,
@@ -22,7 +18,6 @@ import {
 } from "./exact-review-publication-retry.ts";
 import {
   CanonicalRecordTupleConflictError,
-  DIRECT_PUBLICATION_LIFECYCLE_KINDS,
   EXACT_REVIEW_DIRECT_PUBLICATION_MAX_POST_BYTES,
   REVIEW_COVERAGE_INVENTORY_KEY,
   ExactReviewDirectPublicationStore,
@@ -34,7 +29,6 @@ import {
   validateRecordSection,
   validateRepoSlug,
   validateTupleRecordSection,
-  type DirectPublicationLifecyclePlan,
   type DirectPublicationPlan,
   type CanonicalRecordTupleMutation,
   type CanonicalCommitRecordInput,
@@ -82,71 +76,109 @@ import {
   type GitHubRequestValidationDetail,
 } from "./github-api.ts";
 
+import {
+  EXACT_REVIEW_ARTIFACT_PUBLISH_SOURCE_ACTION,
+  EXACT_REVIEW_ARTIFACT_RETENTION_RECOVERY_SOURCE_ACTION,
+  EXACT_REVIEW_BRANCH_AUTHORITY_RESERVATION_PREFIX,
+  EXACT_REVIEW_SOURCE_AUTHORITY_RESERVATION_PREFIX,
+  EXACT_REVIEW_SOURCE_AUTHORITY_RETRY_LIMIT,
+  EXACT_REVIEW_SOURCE_DRIFT_REQUEUE_SOURCE_ACTION,
+  FAILED_REVIEW_SHARD_RECOVERY_SOURCE_ACTION,
+  advanceExactReviewSourceAuthorityWatermark,
+  exactReviewBranchAuthorityDecisionFrom,
+  exactReviewBranchAuthorityReservationFrom,
+  exactReviewBranchAuthorityReservationKey,
+  exactReviewDecisionAtLiveHead,
+  exactReviewDecisionCanSupersedeReview,
+  exactReviewDecisionFrom,
+  exactReviewDecisionWithoutSourceAuthority,
+  exactReviewEditedSemanticInput,
+  exactReviewIngressCanPromoteFallback,
+  exactReviewIngressFrom,
+  exactReviewItemKey,
+  exactReviewPublicationLineage,
+  exactReviewPublicationLineageKey,
+  exactReviewPublicationProducerIsNewer,
+  exactReviewPublicationRevision,
+  exactReviewQueueHasCommandContext,
+  exactReviewQueueHasStaleLiveHead,
+  exactReviewQueueIsBatchablePublication,
+  exactReviewQueueIsPublication,
+  exactReviewSourceAuthorityReservationFrom,
+  exactReviewSourceAuthorityReservationKey,
+  exactReviewSourceAuthorityWatermark,
+  exactReviewTerminalFinalizationSharesCommandStatus,
+  isExactReviewQueueTargetEnabled,
+  isImmediateExactReviewDecision,
+  isLowPriorityExactReviewDecision,
+  mergePendingExactReviewDecision,
+  type ExactReviewBranchAuthorityReservation,
+  type ExactReviewDecision,
+  type ExactReviewEditedSemanticInput,
+  type ExactReviewIngress,
+  type ExactReviewPublication,
+  type ExactReviewPublicationLineage,
+  type ExactReviewSourceAuthorityReservation,
+  type ExactReviewTargetItemState,
+} from "./exact-review-decision.ts";
+import {
+  exactReviewScheduledLane,
+  numberFrom,
+  objectValue,
+  type ExactReviewScheduledLane,
+} from "./exact-review-queue-shared.ts";
+
+export type {
+  ExactReviewBaseDecision,
+  ExactReviewDecision,
+  ExactReviewIngress,
+  ExactReviewPublication,
+} from "./exact-review-decision.ts";
+
+import {
+  DEFAULT_EXACT_REVIEW_DISPATCH_LEASE_MS,
+  DEFAULT_EXACT_REVIEW_EXECUTION_LEASE_MS,
+  DEFAULT_EXACT_REVIEW_HEARTBEAT_GRACE_MS,
+  DEFAULT_EXACT_REVIEW_PUBLICATION_DISPATCH_LEASE_MS,
+  DEFAULT_EXACT_REVIEW_RETRY_MS,
+  exactReviewDispatchFailureDetailJson,
+  exactReviewEffectiveLeaseExpiresAt,
+  exactReviewGithubCredentialCircuits,
+  exactReviewGithubTargetAppCircuitRetryAt,
+  exactReviewParkedOperatorEligible,
+  exactReviewParkedRecoveryAt,
+  exactReviewParkedRecoveryAttempts,
+  exactReviewParkedRecoveryDelayMs,
+  exactReviewParkedTerminalCheckAt,
+  exactReviewParkedTerminalGlobalCheckAt,
+  exactReviewPrioritizePublicationItems,
+  exactReviewQueueActivePublicationCount,
+  exactReviewQueueActiveReviewCount,
+  exactReviewQueueAdmittedItems,
+  exactReviewQueueBackoffReason,
+  exactReviewQueueBayProjection,
+  exactReviewQueueBayPriorityKeys,
+  exactReviewQueueCapacity as exactReviewQueueCapacityFromReadModel,
+  exactReviewQueueLane,
+  exactReviewQueueNextWakeAt,
+  exactReviewQueueStats,
+  exactReviewShedSinceReset,
+  percentileFor,
+  sumFor,
+  type ExactReviewBayBatchOwner,
+} from "./exact-review-read-model.ts";
+
+export {
+  exactReviewEffectiveLeaseExpiresAt,
+  exactReviewQueueAdmittedItems,
+  exactReviewQueueNextWakeAt,
+} from "./exact-review-read-model.ts";
+
 const RECENT_DURABLE_PUBLICATION_EVENTS_CACHE_MS = 60_000;
 
 const GITHUB_TIMEOUT_MS = 4500;
 const CLAWSWEEPER_REVIEW_REPO = "openclaw/clawsweeper";
 
-const FAILED_REVIEW_SHARD_RECOVERY_SOURCE_ACTION = "failed_review_shard_recovery";
-const EXACT_REVIEW_ARTIFACT_PUBLISH_SOURCE_ACTION = "exact_review_artifact_publish";
-const EXACT_REVIEW_ARTIFACT_RETENTION_RECOVERY_SOURCE_ACTION = "artifact_retention_recovery";
-const EXACT_REVIEW_SOURCE_DRIFT_REQUEUE_SOURCE_ACTION = "source_drift_requeue";
-const EXACT_REVIEW_SCHEDULED_HOT_SOURCE_ACTION = "scheduled_hot_intake";
-const EXACT_REVIEW_SCHEDULED_NORMAL_SOURCE_ACTION = "scheduled_normal_backfill";
-const EXACT_REVIEW_LOW_PRIORITY_SOURCE_ACTIONS = new Set([
-  FAILED_REVIEW_SHARD_RECOVERY_SOURCE_ACTION,
-  EXACT_REVIEW_ARTIFACT_RETENTION_RECOVERY_SOURCE_ACTION,
-  EXACT_REVIEW_SOURCE_DRIFT_REQUEUE_SOURCE_ACTION,
-]);
-
-export type ExactReviewBaseDecision = {
-  targetRepo: string;
-  targetBranch: string;
-  itemNumber: number;
-  itemKind: "issue" | "pull_request";
-  sourceEvent: "issues" | "pull_request";
-  sourceAction: string;
-  supersedesInProgress: boolean;
-  sourceHeadSha?: string;
-  sourceBaseSha?: string;
-  sourceIsDraft?: boolean;
-  sourceContentRevision?: string;
-  sourceHeadVerified?: boolean;
-  sourceAuthoritySeq?: number;
-  sourceUpdatedAt?: string;
-  sourceDeliveryId?: string;
-  codexTimeoutMs?: number;
-  mediaProofTimeoutMs?: number;
-  commandStatusMarker?: string;
-  statusCommentId?: number;
-  additionalPrompt?: string;
-};
-export type ExactReviewPublication = {
-  artifactName: string;
-  producerRunId: string;
-  producerRunAttempt: number;
-  sourceSha: string;
-  itemKey: string;
-  protocolVersion: 1 | 2;
-  leaseRevision: number | null;
-  claimGeneration: number | null;
-  liveProceeded: boolean;
-  liveTerminalNoop: boolean;
-  liveTerminalMissing: boolean;
-  liveGuardedOpen: boolean;
-  producerDecision: ExactReviewBaseDecision;
-  directLifecycle?: {
-    plan: DirectPublicationLifecyclePlan;
-    receiptOutcome: "accepted" | "deduped" | "superseded";
-  };
-};
-export type ExactReviewDecision = ExactReviewBaseDecision & {
-  publication?: ExactReviewPublication;
-};
-export type ExactReviewIngress = {
-  route: "direct_webhook" | "target_dispatcher";
-  fingerprint: string;
-};
 type ExactReviewBackoffReason =
   | "dispatch_debounce"
   | "dispatcher_backoff"
@@ -281,7 +313,7 @@ type ExactReviewGithubRateLimitObservation = {
   provenance: ExactReviewGithubRateLimitProvenance;
   authoritative: boolean;
 };
-type ExactReviewGithubCredentialCircuit = ExactReviewGithubRateLimitObservation & {
+export type ExactReviewGithubCredentialCircuit = ExactReviewGithubRateLimitObservation & {
   poolKey: string;
 };
 type ExactReviewGithubRequestMetric = {
@@ -415,33 +447,6 @@ type ExactReviewQueueMetricTotals = {
     refreshed: number;
   };
 };
-type ExactReviewSourceAuthorityReservation = {
-  deliveryId: string;
-  decision: ExactReviewDecision;
-  ingress?: ExactReviewIngress;
-  installationId: number;
-  sourceAuthoritySeq: number;
-  attempts: number;
-  nextAttemptAt: number;
-};
-type ExactReviewBranchAuthorityDecision = Omit<ExactReviewDecision, "targetBranch" | "publication">;
-type ExactReviewBranchAuthorityReservation = {
-  deliveryId: string;
-  decision: ExactReviewBranchAuthorityDecision;
-  ingress?: ExactReviewIngress;
-  installationId?: number;
-  sourceAuthorityRequired: boolean;
-  attempts: number;
-  nextAttemptAt: number;
-};
-type ExactReviewEditedSemanticInput = {
-  // Queue state preserves the repository's display casing, while this durable
-  // semantic cursor canonicalizes it so equivalent GitHub repository spellings
-  // share one fingerprint.
-  queueKey: string;
-  storageKey: string;
-  fingerprint: string;
-};
 type ExactReviewQueueMetricDelta = {
   reviewEnqueued?: number;
   reviewCompleted?: number;
@@ -480,7 +485,6 @@ export type DurableObjectNamespace = {
   get: (id: unknown) => DurableObjectStub;
 };
 
-const DEFAULT_EXACT_REVIEW_QUEUE_MAX_CONCURRENT = 128;
 const DEFAULT_EXACT_REVIEW_TARGET_MAX_CONCURRENT = 120;
 const DEFAULT_EXACT_REVIEW_ACTIONS_BUDGET = 194;
 const DEFAULT_EXACT_REVIEW_PUBLICATION_MIN_CONCURRENT = 4;
@@ -499,13 +503,8 @@ const EXACT_REVIEW_PUBLICATION_DEMAND_SAMPLE_MS = 5 * 60 * 1000;
 const EXACT_REVIEW_PUBLICATION_SCALE_UP_MS = 10 * 60 * 1000;
 const EXACT_REVIEW_PUBLICATION_SCALE_DOWN_MS = 15 * 60 * 1000;
 const EXACT_REVIEW_PUBLICATION_ACTIONS_RESERVE = 16;
-const DEFAULT_EXACT_REVIEW_DISPATCH_LEASE_MS = 6 * 60 * 1000;
 // Exact publications have a dedicated bounded lane. Bound the unclaimed handoff so a run that
 // never reaches its claim step is re-dispatched; stale runs lose the lease tuple safely.
-const DEFAULT_EXACT_REVIEW_PUBLICATION_DISPATCH_LEASE_MS = 15 * 60 * 1000;
-const DEFAULT_EXACT_REVIEW_EXECUTION_LEASE_MS = 130 * 60 * 1000;
-const DEFAULT_EXACT_REVIEW_HEARTBEAT_GRACE_MS = 20 * 60 * 1000;
-const DEFAULT_EXACT_REVIEW_RETRY_MS = 30_000;
 const DEFAULT_EXACT_REVIEW_WORKFLOW_PAUSED_RETRY_MS = 60_000;
 const DEFAULT_EXACT_REVIEW_DISPATCH_DEBOUNCE_MS = 90_000;
 const DEFAULT_EXACT_REVIEW_DISPATCH_DEBOUNCE_MAX_MS = 3 * 60_000;
@@ -514,16 +513,11 @@ const DEFAULT_EXACT_REVIEW_TARGET_RATE_PER_HOUR = 200;
 const DEFAULT_EXACT_REVIEW_TARGET_BURST = 50;
 const EXACT_REVIEW_GITHUB_THROTTLE_ADMISSION_COOLDOWN_MS = 15 * 60 * 1000;
 const EXACT_REVIEW_SCHEDULED_FEED_KEY_PREFIX = "exact-review-scheduled-feed:v1";
-type ExactReviewScheduledLane = "hot_intake" | "normal_backfill";
 type ExactReviewScheduledBucket = ExactReviewScheduledLane | "global";
 const EXACT_REVIEW_COMPLETION_RETRY_MAX_MS = 2 * 60 * 60 * 1000;
 const EXACT_REVIEW_ARTIFACT_RETRY_MAX_MS = 80 * 24 * 60 * 60 * 1000;
 const EXACT_REVIEW_PUBLICATION_ARTIFACT_RETRY_LIMIT = 3;
 const EXACT_REVIEW_RETRY_LIMIT = 8;
-const EXACT_REVIEW_PARKED_RECOVERY_LIMIT = 3;
-const EXACT_REVIEW_PARKED_RECOVERY_BASE_MS = 5 * 60_000;
-const EXACT_REVIEW_PARKED_RECOVERY_MAX_MS = 30 * 60_000;
-const EXACT_REVIEW_PARKED_TERMINAL_CHECK_INTERVAL_MS = 5 * 60_000;
 const EXACT_REVIEW_RECONCILE_RUN_LIMIT = 128;
 const EXACT_REVIEW_RECONCILE_CLAIM_MATCH_LIMIT = EXACT_REVIEW_RECONCILE_RUN_LIMIT * 2;
 export const EXACT_REVIEW_RECONCILE_CONCURRENCY = 8;
@@ -562,11 +556,6 @@ type OperationalCursor = {
   revision: number;
   updatedAt: number;
 };
-const EXACT_REVIEW_SOURCE_AUTHORITY_RESERVATION_PREFIX =
-  "exact-review-source-authority-reservation:v1:";
-const EXACT_REVIEW_BRANCH_AUTHORITY_RESERVATION_PREFIX =
-  "exact-review-branch-authority-reservation:v1:";
-const EXACT_REVIEW_SOURCE_AUTHORITY_RETRY_LIMIT = 16;
 const EXACT_REVIEW_SOURCE_AUTHORITY_RETRY_BASE_MS = 15_000;
 const EXACT_REVIEW_SOURCE_AUTHORITY_RETRY_MAX_MS = 15 * 60_000;
 const EXACT_REVIEW_QUEUE_META_TABLE = "exact_review_queue_meta";
@@ -601,9 +590,6 @@ const EXACT_REVIEW_QUEUE_METRIC_BUCKET_TTL_MS = 48 * 60 * 60 * 1000;
 const EXACT_REVIEW_QUEUE_SUPERSESSION_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const EXACT_REVIEW_PUBLICATION_CONTROL_KEY = "exact-review-publication-control:v1";
 export const EXACT_REVIEW_QUEUE_NAME = "global";
-const EXACT_REVIEW_COMMAND_STATUS_MARKER_PATTERN =
-  /^<!-- clawsweeper-command-status:[^<>\r\n]{1,200} -->$/;
-const EXACT_REVIEW_ADDITIONAL_PROMPT_MAX_CHARS = 5000;
 const DEFAULT_EXACT_REVIEW_PUBLICATION_BATCH_SIZE = 8;
 const MAX_EXACT_REVIEW_PUBLICATION_BATCH_SIZE = 32;
 const MAX_EXACT_REVIEW_PUBLICATION_BATCH_SCAN_SIZE = 50;
@@ -619,7 +605,6 @@ const DEFAULT_STATE_WRITER_COORDINATOR_QUEUED_STALE_MS = 2 * 60_000;
 // hung runner into a permanent queue owner. The Git fence blocks any in-flight
 // push that outlives this absolute coordinator horizon.
 const DEFAULT_STATE_WRITER_COORDINATOR_MAX_LEASE_AGE_MS = 30 * 60_000;
-const EXACT_REVIEW_INGRESS_FINGERPRINT_PATTERN = /^[0-9a-f]{64}$/;
 const RECORD_EXPORT_DEFAULT_LIMIT = 100;
 const RECORD_EXPORT_MAX_LIMIT = 200;
 const RECORD_EXPORT_MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
@@ -633,6 +618,10 @@ const RECORD_EXPORT_SECTIONS: readonly RecordSection[] = [
   "decision-packets",
   "commits",
 ];
+
+export function exactReviewQueueCapacity(env) {
+  return exactReviewQueueCapacityFromReadModel(env, DEFAULT_EXACT_REVIEW_ACTIONS_BUDGET);
+}
 
 export class ExactReviewQueue {
   private state;
@@ -9747,608 +9736,6 @@ export class ExactReviewQueue {
   }
 }
 
-function exactReviewDecisionFrom(value): ExactReviewDecision | null {
-  const base = exactReviewBaseDecisionFrom(value);
-  if (!base) return null;
-  const decision = objectValue(value);
-  const hasPublication = Object.hasOwn(decision, "publication");
-  const publication = hasPublication ? exactReviewPublicationFrom(decision.publication) : undefined;
-  if (hasPublication && !publication) return null;
-  if (publication) {
-    if (base.sourceAction !== EXACT_REVIEW_ARTIFACT_PUBLISH_SOURCE_ACTION) return null;
-    if (
-      publication.producerDecision.sourceAction === EXACT_REVIEW_ARTIFACT_PUBLISH_SOURCE_ACTION ||
-      publication.producerDecision.targetRepo !== base.targetRepo ||
-      publication.producerDecision.targetBranch !== base.targetBranch ||
-      publication.producerDecision.itemNumber !== base.itemNumber ||
-      publication.producerDecision.itemKind !== base.itemKind ||
-      publication.producerDecision.sourceEvent !== base.sourceEvent ||
-      publication.itemKey !== `${base.targetRepo}#${base.itemNumber}`
-    ) {
-      return null;
-    }
-  } else if (base.sourceAction === EXACT_REVIEW_ARTIFACT_PUBLISH_SOURCE_ACTION) {
-    return null;
-  }
-  return { ...base, ...(publication ? { publication } : {}) };
-}
-
-function exactReviewDecisionWithoutSourceAuthority(decision: ExactReviewDecision) {
-  const {
-    sourceAuthoritySeq: _sourceAuthoritySeq,
-    sourceHeadVerified: _sourceHeadVerified,
-    // These semantic edit fields were added after source-authority reservations
-    // already existed. They affect queue admission, not the identity of an
-    // already-reserved delivery, so omit them while matching a redelivery.
-    sourceBaseSha: _sourceBaseSha,
-    sourceIsDraft: _sourceIsDraft,
-    sourceContentRevision: _sourceContentRevision,
-    ...rest
-  } = decision;
-  return rest;
-}
-
-function exactReviewBranchAuthorityDecisionFrom(value): ExactReviewBranchAuthorityDecision | null {
-  const raw = objectValue(value);
-  if (String(raw.targetBranch || "").trim() || Object.hasOwn(raw, "publication")) return null;
-  const parsed = exactReviewDecisionFrom({
-    ...raw,
-    targetBranch: "branch-authority-pending",
-  });
-  if (!parsed || parsed.publication) return null;
-  const { targetBranch: _targetBranch, ...decision } = parsed;
-  return decision;
-}
-
-function exactReviewBranchAuthorityReservationKey(deliveryId: string) {
-  return `${EXACT_REVIEW_BRANCH_AUTHORITY_RESERVATION_PREFIX}${encodeURIComponent(deliveryId)}`;
-}
-
-function exactReviewBranchAuthorityReservationFrom(
-  value,
-): ExactReviewBranchAuthorityReservation | null {
-  const reservation = objectValue(value);
-  const deliveryId = String(reservation.deliveryId || "").trim();
-  const decision = exactReviewBranchAuthorityDecisionFrom(reservation.decision);
-  const ingress =
-    reservation.ingress === undefined ? undefined : exactReviewIngressFrom(reservation.ingress);
-  const installationId =
-    reservation.installationId === undefined ? undefined : Number(reservation.installationId);
-  const sourceAuthorityRequired = reservation.sourceAuthorityRequired === true;
-  const attempts = Number(reservation.attempts);
-  const nextAttemptAt = Number(reservation.nextAttemptAt);
-  if (
-    !deliveryId ||
-    deliveryId.length > 200 ||
-    !decision ||
-    (reservation.ingress !== undefined && !ingress) ||
-    (installationId !== undefined && (!Number.isInteger(installationId) || installationId <= 0)) ||
-    (sourceAuthorityRequired &&
-      (decision.itemKind !== "pull_request" ||
-        installationId === undefined ||
-        ingress?.route === "target_dispatcher")) ||
-    typeof reservation.sourceAuthorityRequired !== "boolean" ||
-    !Number.isInteger(attempts) ||
-    attempts < 0 ||
-    attempts > EXACT_REVIEW_SOURCE_AUTHORITY_RETRY_LIMIT ||
-    !Number.isSafeInteger(nextAttemptAt) ||
-    nextAttemptAt < 0
-  ) {
-    return null;
-  }
-  return {
-    deliveryId,
-    decision,
-    ...(ingress ? { ingress } : {}),
-    ...(installationId === undefined ? {} : { installationId }),
-    sourceAuthorityRequired,
-    attempts,
-    nextAttemptAt,
-  };
-}
-
-function exactReviewSourceAuthorityReservationKey(deliveryId: string) {
-  return `${EXACT_REVIEW_SOURCE_AUTHORITY_RESERVATION_PREFIX}${encodeURIComponent(deliveryId)}`;
-}
-
-function exactReviewSourceAuthorityReservationFrom(
-  value,
-): ExactReviewSourceAuthorityReservation | null {
-  const reservation = objectValue(value);
-  const deliveryId = String(reservation.deliveryId || "").trim();
-  const decision = exactReviewDecisionFrom(reservation.decision);
-  const ingress =
-    reservation.ingress === undefined ? undefined : exactReviewIngressFrom(reservation.ingress);
-  const installationId = Number(reservation.installationId);
-  const sourceAuthoritySeq = Number(reservation.sourceAuthoritySeq);
-  const attempts = Number(reservation.attempts);
-  const nextAttemptAt = Number(reservation.nextAttemptAt);
-  if (
-    !deliveryId ||
-    deliveryId.length > 200 ||
-    !decision ||
-    decision.itemKind !== "pull_request" ||
-    decision.publication ||
-    (reservation.ingress !== undefined && (!ingress || ingress.route !== "direct_webhook")) ||
-    !Number.isInteger(installationId) ||
-    installationId <= 0 ||
-    !Number.isSafeInteger(sourceAuthoritySeq) ||
-    sourceAuthoritySeq <= 0 ||
-    decision.sourceAuthoritySeq !== sourceAuthoritySeq ||
-    !Number.isInteger(attempts) ||
-    attempts < 0 ||
-    attempts > EXACT_REVIEW_SOURCE_AUTHORITY_RETRY_LIMIT ||
-    !Number.isSafeInteger(nextAttemptAt) ||
-    nextAttemptAt < 0
-  ) {
-    return null;
-  }
-  return {
-    deliveryId,
-    decision,
-    ...(ingress ? { ingress } : {}),
-    installationId,
-    sourceAuthoritySeq,
-    attempts,
-    nextAttemptAt,
-  };
-}
-
-function exactReviewIngressFrom(value): ExactReviewIngress | null {
-  const ingress = objectValue(value);
-  const route = String(ingress.route || "");
-  const fingerprint = String(ingress.fingerprint || "")
-    .trim()
-    .toLowerCase();
-  if (route !== "direct_webhook" && route !== "target_dispatcher") return null;
-  if (!EXACT_REVIEW_INGRESS_FINGERPRINT_PATTERN.test(fingerprint)) return null;
-  return { route, fingerprint };
-}
-
-function exactReviewIngressCanPromoteFallback(
-  ingress: ExactReviewIngress | undefined,
-  decision: ExactReviewDecision,
-) {
-  const sourceAuthoritySeq = Number(decision.sourceAuthoritySeq || 0);
-  return (
-    ingress?.route === "direct_webhook" &&
-    decision.sourceHeadVerified === true &&
-    /^[0-9a-f]{40}$/.test(String(decision.sourceHeadSha || "").toLowerCase()) &&
-    Number.isSafeInteger(sourceAuthoritySeq) &&
-    sourceAuthoritySeq > 0
-  );
-}
-
-function exactReviewBaseDecisionFrom(value): ExactReviewBaseDecision | null {
-  const decision = objectValue(value);
-  const targetRepo = String(decision.targetRepo || "").trim();
-  const targetBranch = String(decision.targetBranch || "").trim();
-  const itemNumber = Number(decision.itemNumber);
-  const itemKind = String(decision.itemKind || "");
-  const sourceEvent = String(decision.sourceEvent || "");
-  const sourceAction = String(decision.sourceAction || "");
-  const hasSourceHeadSha = Object.hasOwn(decision, "sourceHeadSha");
-  const sourceHeadSha = hasSourceHeadSha
-    ? String(decision.sourceHeadSha || "")
-        .trim()
-        .toLowerCase()
-    : undefined;
-  const hasSourceBaseSha = Object.hasOwn(decision, "sourceBaseSha");
-  const sourceBaseSha = hasSourceBaseSha
-    ? String(decision.sourceBaseSha || "")
-        .trim()
-        .toLowerCase()
-    : undefined;
-  const hasSourceIsDraft = Object.hasOwn(decision, "sourceIsDraft");
-  const hasSourceContentRevision = Object.hasOwn(decision, "sourceContentRevision");
-  const sourceContentRevision = hasSourceContentRevision
-    ? String(decision.sourceContentRevision || "")
-        .trim()
-        .toLowerCase()
-    : undefined;
-  const hasSourceHeadVerified = Object.hasOwn(decision, "sourceHeadVerified");
-  const hasSourceAuthoritySeq = Object.hasOwn(decision, "sourceAuthoritySeq");
-  const sourceAuthoritySeq = hasSourceAuthoritySeq
-    ? Number(decision.sourceAuthoritySeq)
-    : undefined;
-  const hasSourceUpdatedAt = Object.hasOwn(decision, "sourceUpdatedAt");
-  const sourceUpdatedAt = hasSourceUpdatedAt
-    ? String(decision.sourceUpdatedAt || "").trim()
-    : undefined;
-  const hasSourceDeliveryId = Object.hasOwn(decision, "sourceDeliveryId");
-  const sourceDeliveryId = hasSourceDeliveryId ? decision.sourceDeliveryId : undefined;
-  const hasCommandStatusMarker = Object.hasOwn(decision, "commandStatusMarker");
-  const commandStatusMarker = hasCommandStatusMarker ? decision.commandStatusMarker : undefined;
-  const hasStatusCommentId = Object.hasOwn(decision, "statusCommentId");
-  const statusCommentId = hasStatusCommentId ? Number(decision.statusCommentId) : undefined;
-  const hasAdditionalPrompt = Object.hasOwn(decision, "additionalPrompt");
-  const additionalPrompt = hasAdditionalPrompt ? decision.additionalPrompt : undefined;
-  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(targetRepo)) return null;
-  if (!/^[A-Za-z0-9_./-]+$/.test(targetBranch)) return null;
-  if (!Number.isInteger(itemNumber) || itemNumber <= 0) return null;
-  if (itemKind !== "issue" && itemKind !== "pull_request") return null;
-  if (sourceEvent !== "issues" && sourceEvent !== "pull_request") return null;
-  if (!sourceAction) return null;
-  if (hasSourceHeadSha && !/^[0-9a-f]{40}$/.test(sourceHeadSha || "")) return null;
-  if (hasSourceBaseSha && !/^[0-9a-f]{40}$/.test(sourceBaseSha || "")) return null;
-  if (hasSourceIsDraft && typeof decision.sourceIsDraft !== "boolean") return null;
-  if (hasSourceContentRevision && !/^[0-9a-f]{64}$/.test(sourceContentRevision || "")) {
-    return null;
-  }
-  if (hasSourceHeadVerified && typeof decision.sourceHeadVerified !== "boolean") return null;
-  if (
-    hasSourceAuthoritySeq &&
-    (!Number.isSafeInteger(sourceAuthoritySeq) || Number(sourceAuthoritySeq) <= 0)
-  ) {
-    return null;
-  }
-  if (hasSourceUpdatedAt && !Number.isFinite(Date.parse(sourceUpdatedAt || ""))) return null;
-  if (
-    hasSourceDeliveryId &&
-    (typeof sourceDeliveryId !== "string" || !/^[A-Za-z0-9_.:-]{1,200}$/.test(sourceDeliveryId))
-  ) {
-    return null;
-  }
-  if (
-    hasCommandStatusMarker &&
-    (typeof commandStatusMarker !== "string" ||
-      !EXACT_REVIEW_COMMAND_STATUS_MARKER_PATTERN.test(commandStatusMarker))
-  ) {
-    return null;
-  }
-  if (
-    hasStatusCommentId &&
-    (!Number.isSafeInteger(statusCommentId) || Number(statusCommentId) <= 0)
-  ) {
-    return null;
-  }
-  if (
-    hasAdditionalPrompt &&
-    (typeof additionalPrompt !== "string" ||
-      additionalPrompt.length > EXACT_REVIEW_ADDITIONAL_PROMPT_MAX_CHARS ||
-      additionalPrompt.includes("\0"))
-  ) {
-    return null;
-  }
-  return {
-    targetRepo,
-    targetBranch,
-    itemNumber,
-    itemKind,
-    sourceEvent,
-    sourceAction,
-    supersedesInProgress: Boolean(decision.supersedesInProgress),
-    ...(hasSourceHeadSha ? { sourceHeadSha } : {}),
-    ...(hasSourceBaseSha ? { sourceBaseSha } : {}),
-    ...(hasSourceIsDraft ? { sourceIsDraft: decision.sourceIsDraft } : {}),
-    ...(hasSourceContentRevision ? { sourceContentRevision } : {}),
-    ...(hasSourceHeadVerified ? { sourceHeadVerified: decision.sourceHeadVerified } : {}),
-    ...(hasSourceAuthoritySeq ? { sourceAuthoritySeq } : {}),
-    ...(hasSourceUpdatedAt ? { sourceUpdatedAt } : {}),
-    ...(hasSourceDeliveryId ? { sourceDeliveryId } : {}),
-    ...(Number.isFinite(Number(decision.codexTimeoutMs))
-      ? { codexTimeoutMs: Number(decision.codexTimeoutMs) }
-      : {}),
-    ...(Number.isFinite(Number(decision.mediaProofTimeoutMs))
-      ? { mediaProofTimeoutMs: Number(decision.mediaProofTimeoutMs) }
-      : {}),
-    ...(hasCommandStatusMarker ? { commandStatusMarker } : {}),
-    ...(hasStatusCommentId ? { statusCommentId } : {}),
-    ...(hasAdditionalPrompt ? { additionalPrompt } : {}),
-  };
-}
-
-async function exactReviewEditedSemanticInput(
-  decision: ExactReviewDecision,
-): Promise<ExactReviewEditedSemanticInput | null> {
-  if (
-    decision.itemKind !== "pull_request" ||
-    decision.sourceEvent !== "pull_request" ||
-    decision.sourceAction !== "edited" ||
-    decision.publication
-  ) {
-    return null;
-  }
-  const headSha = String(decision.sourceHeadSha || "").toLowerCase();
-  const baseSha = String(decision.sourceBaseSha || "").toLowerCase();
-  const contentRevision = String(decision.sourceContentRevision || "").toLowerCase();
-  if (!/^[0-9a-f]{40}$/.test(headSha) || !/^[0-9a-f]{40}$/.test(baseSha)) return null;
-  if (typeof decision.sourceIsDraft !== "boolean") return null;
-  if (!/^[0-9a-f]{64}$/.test(contentRevision)) return null;
-
-  const tuple = stableJson({
-    version: 1,
-    target_repo: decision.targetRepo.toLowerCase(),
-    target_branch: decision.targetBranch,
-    item_number: decision.itemNumber,
-    head_sha: headSha,
-    base_sha: baseSha,
-    is_draft: decision.sourceIsDraft,
-    content_revision: contentRevision,
-    request: {
-      codex_timeout_ms: Number.isFinite(decision.codexTimeoutMs) ? decision.codexTimeoutMs : null,
-      media_proof_timeout_ms: Number.isFinite(decision.mediaProofTimeoutMs)
-        ? decision.mediaProofTimeoutMs
-        : null,
-      command_status_marker: decision.commandStatusMarker || null,
-      status_comment_id: Number.isSafeInteger(decision.statusCommentId)
-        ? decision.statusCommentId
-        : null,
-      additional_prompt: decision.additionalPrompt || null,
-    },
-  });
-  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(tuple));
-  const queueKey = exactReviewItemKey(decision);
-  return {
-    queueKey,
-    storageKey: queueKey.toLowerCase(),
-    fingerprint: Array.from(new Uint8Array(digest), (byte) =>
-      byte.toString(16).padStart(2, "0"),
-    ).join(""),
-  };
-}
-
-function exactReviewPublicationRevision(decision: ExactReviewDecision): {
-  targetKey: string;
-  sourceRevision: number;
-} | null {
-  const publication = decision.publication;
-  if (!publication || publication.protocolVersion !== 2 || publication.leaseRevision === null) {
-    return null;
-  }
-  return {
-    targetKey: publication.itemKey.toLowerCase(),
-    sourceRevision: publication.leaseRevision,
-  };
-}
-
-type ExactReviewPublicationLineage = {
-  targetKey: string;
-  sourceRevision: number;
-  claimGeneration: number;
-};
-
-function exactReviewPublicationLineage(
-  decision: ExactReviewDecision,
-): ExactReviewPublicationLineage | null {
-  const publication = decision.publication;
-  if (!publication || publication.protocolVersion !== 2 || publication.leaseRevision === null) {
-    return null;
-  }
-  if (publication.claimGeneration === null) return null;
-  return {
-    targetKey: publication.itemKey.toLowerCase(),
-    sourceRevision: publication.leaseRevision,
-    claimGeneration: publication.claimGeneration,
-  };
-}
-
-function exactReviewPublicationLineageKey(lineage: ExactReviewPublicationLineage) {
-  return `${lineage.targetKey}\u0000${lineage.sourceRevision}\u0000${lineage.claimGeneration}`;
-}
-
-function exactReviewPublicationProducerIsNewer(
-  incoming: ExactReviewPublication,
-  retained: ExactReviewPublication,
-) {
-  const runComparison = compareDecimalIdentifiers(incoming.producerRunId, retained.producerRunId);
-  return (
-    runComparison > 0 ||
-    (runComparison === 0 && incoming.producerRunAttempt > retained.producerRunAttempt)
-  );
-}
-
-function compareDecimalIdentifiers(left: string, right: string) {
-  const normalizedLeft = left.replace(/^0+/, "") || "0";
-  const normalizedRight = right.replace(/^0+/, "") || "0";
-  if (normalizedLeft.length !== normalizedRight.length) {
-    return normalizedLeft.length - normalizedRight.length;
-  }
-  return normalizedLeft.localeCompare(normalizedRight);
-}
-
-function exactReviewPublicationFrom(value): ExactReviewPublication | null {
-  const publication = objectValue(value);
-  const artifactName = String(publication.artifactName || "").trim();
-  const producerRunId = String(publication.producerRunId || "").trim();
-  const producerRunAttempt = Number(publication.producerRunAttempt);
-  const sourceSha = String(publication.sourceSha || "").trim();
-  const itemKey = String(publication.itemKey || "").trim();
-  const protocolVersion = Number(publication.protocolVersion);
-  const leaseRevision =
-    publication.leaseRevision === null ? null : Number(publication.leaseRevision);
-  const claimGeneration =
-    publication.claimGeneration === null ? null : Number(publication.claimGeneration);
-  const producerDecision = exactReviewBaseDecisionFrom(publication.producerDecision);
-  const liveProceeded = publication.liveProceeded;
-  const liveTerminalNoop = publication.liveTerminalNoop;
-  const liveTerminalMissing = publication.liveTerminalMissing;
-  const liveGuardedOpen = publication.liveGuardedOpen;
-  const hasDirectLifecycle = Object.hasOwn(publication, "directLifecycle");
-  const directLifecycle = hasDirectLifecycle
-    ? exactReviewDirectLifecycleReceiptFrom(publication.directLifecycle)
-    : undefined;
-  if (!/^exact-review-\d{1,30}-[1-9]\d*$/.test(artifactName)) return null;
-  if (!/^\d{1,30}$/.test(producerRunId)) return null;
-  if (!Number.isSafeInteger(producerRunAttempt) || producerRunAttempt < 1) return null;
-  if (artifactName !== `exact-review-${producerRunId}-${producerRunAttempt}`) return null;
-  if (!/^[0-9a-f]{40}$/.test(sourceSha)) return null;
-  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+#[1-9]\d*$/.test(itemKey)) return null;
-  if (protocolVersion !== 1 && protocolVersion !== 2) return null;
-  if (
-    (leaseRevision !== null && (!Number.isSafeInteger(leaseRevision) || leaseRevision < 1)) ||
-    (claimGeneration !== null && (!Number.isSafeInteger(claimGeneration) || claimGeneration < 1))
-  ) {
-    return null;
-  }
-  if (protocolVersion === 2 && (leaseRevision === null || claimGeneration === null)) return null;
-  if (!producerDecision) return null;
-  if (hasDirectLifecycle && !directLifecycle) return null;
-  const liveOutcomes = [liveProceeded, liveTerminalNoop, liveTerminalMissing, liveGuardedOpen];
-  if (liveOutcomes.some((outcome) => typeof outcome !== "boolean")) return null;
-  if (liveOutcomes.filter(Boolean).length !== 1) return null;
-  return {
-    artifactName,
-    producerRunId,
-    producerRunAttempt,
-    sourceSha,
-    itemKey,
-    protocolVersion,
-    leaseRevision,
-    claimGeneration,
-    liveProceeded,
-    liveTerminalNoop,
-    liveTerminalMissing,
-    liveGuardedOpen,
-    producerDecision,
-    ...(directLifecycle ? { directLifecycle } : {}),
-  };
-}
-
-function exactReviewDirectLifecycleReceiptFrom(value): ExactReviewPublication["directLifecycle"] {
-  const receipt = objectValue(value);
-  const plan = objectValue(receipt.plan);
-  if (Object.keys(plan).length !== 1 || typeof plan.kind !== "string") return undefined;
-  if (!(DIRECT_PUBLICATION_LIFECYCLE_KINDS as readonly string[]).includes(plan.kind)) {
-    return undefined;
-  }
-  const receiptOutcome = receipt.receiptOutcome;
-  if (
-    receiptOutcome !== "accepted" &&
-    receiptOutcome !== "deduped" &&
-    receiptOutcome !== "superseded"
-  ) {
-    return undefined;
-  }
-  return {
-    plan: { kind: plan.kind as DirectPublicationLifecyclePlan["kind"] },
-    receiptOutcome,
-  };
-}
-
-function mergePendingExactReviewDecision(
-  current: ExactReviewDecision,
-  next: ExactReviewDecision,
-): ExactReviewDecision {
-  const merged = { ...current, ...next };
-  const commandMarkerChanged =
-    Object.hasOwn(next, "commandStatusMarker") &&
-    next.commandStatusMarker !== current.commandStatusMarker;
-  if (commandMarkerChanged && !Object.hasOwn(next, "statusCommentId")) {
-    delete merged.statusCommentId;
-  }
-  if (
-    (Object.hasOwn(next, "commandStatusMarker") || Object.hasOwn(next, "statusCommentId")) &&
-    !Object.hasOwn(next, "sourceDeliveryId")
-  ) {
-    delete merged.sourceDeliveryId;
-  }
-  return merged;
-}
-
-function exactReviewDecisionAtLiveHead(decision: ExactReviewDecision, headSha: string) {
-  const refreshed = {
-    ...decision,
-    sourceHeadSha: headSha,
-    sourceHeadVerified: true,
-  };
-  // The live read is authoritative for the head, but it has no webhook
-  // sequence or event timestamp to truthfully carry forward.
-  delete refreshed.sourceAuthoritySeq;
-  delete refreshed.sourceUpdatedAt;
-  return refreshed;
-}
-
-function exactReviewQueueHasStaleLiveHead(
-  item: Pick<ExactReviewQueueItem, "decision">,
-  live: ExactReviewTargetItemState,
-): live is { state: "open"; headSha: string } {
-  if (item.decision.itemKind !== "pull_request" || live.state !== "open") return false;
-  const queuedHead = String(item.decision.sourceHeadSha || "").toLowerCase();
-  return /^[0-9a-f]{40}$/.test(queuedHead) && queuedHead !== live.headSha;
-}
-
-function exactReviewDecisionCanSupersedeReview(
-  current: ExactReviewQueueItem,
-  incoming: ExactReviewDecision,
-): boolean {
-  const active = current.leaseDecision || current.decision;
-  if (active.itemKind !== "pull_request" || incoming.itemKind !== "pull_request") return true;
-
-  const activeHead = String(active.sourceHeadSha || "").toLowerCase();
-  const incomingHead = String(incoming.sourceHeadSha || "").toLowerCase();
-  if (!/^[0-9a-f]{40}$/.test(incomingHead)) return false;
-  const incomingAuthoritySeq = Number(incoming.sourceAuthoritySeq || 0);
-  const watermark = current.sourceAuthorityWatermark;
-  const activeSourceAuthoritySeq = Number(watermark?.sequence || active.sourceAuthoritySeq || 0);
-  const activeHasAuthority =
-    Number.isSafeInteger(activeSourceAuthoritySeq) && activeSourceAuthoritySeq > 0;
-  if (!/^[0-9a-f]{40}$/.test(activeHead)) {
-    return (
-      incoming.sourceHeadVerified === true &&
-      Number.isSafeInteger(incomingAuthoritySeq) &&
-      incomingAuthoritySeq > 0
-    );
-  }
-  if (incomingHead !== activeHead && incoming.sourceHeadVerified !== true) {
-    return false;
-  }
-  if (!activeHasAuthority) {
-    if (incomingHead !== activeHead) {
-      return incoming.sourceHeadVerified === true;
-    }
-    return Number.isSafeInteger(incomingAuthoritySeq) && incomingAuthoritySeq > 0;
-  }
-  if (!Number.isSafeInteger(incomingAuthoritySeq) || incomingAuthoritySeq <= 0) return false;
-
-  const activeUpdatedAt = Date.parse(String(watermark?.updatedAt || active.sourceUpdatedAt || ""));
-  const incomingUpdatedAt = Date.parse(String(incoming.sourceUpdatedAt || ""));
-  if (
-    Number.isFinite(activeUpdatedAt) &&
-    Number.isFinite(incomingUpdatedAt) &&
-    incomingUpdatedAt !== activeUpdatedAt
-  ) {
-    return incomingUpdatedAt > activeUpdatedAt;
-  }
-
-  return incomingAuthoritySeq > activeSourceAuthoritySeq;
-}
-
-function exactReviewSourceAuthorityWatermark(
-  decision: ExactReviewDecision,
-): ExactReviewQueueItem["sourceAuthorityWatermark"] | null {
-  if (decision.itemKind !== "pull_request") return null;
-  const sequence = Number(decision.sourceAuthoritySeq || 0);
-  if (!Number.isSafeInteger(sequence) || sequence <= 0) return null;
-  const updatedAt = String(decision.sourceUpdatedAt || "");
-  return {
-    sequence,
-    ...(Number.isFinite(Date.parse(updatedAt)) ? { updatedAt } : {}),
-  };
-}
-
-function advanceExactReviewSourceAuthorityWatermark(
-  item: ExactReviewQueueItem,
-  decision: ExactReviewDecision,
-) {
-  const watermark = exactReviewSourceAuthorityWatermark(decision);
-  if (watermark) item.sourceAuthorityWatermark = watermark;
-}
-
-function exactReviewItemKey(decision: ExactReviewDecision) {
-  const base = `${decision.targetRepo}#${decision.itemNumber}`;
-  return decision.publication
-    ? `${base}@publish:${decision.publication.producerRunId}:${decision.publication.producerRunAttempt}`
-    : base;
-}
-
-function isExactReviewQueueTargetEnabled(decision: ExactReviewDecision, env) {
-  return (
-    decision.targetRepo !== "openclaw/clawhub" ||
-    String(env.CLAWSWEEPER_ENABLE_CLAWHUB || "") === "1"
-  );
-}
-
 function exactReviewItemForLease(state: ExactReviewQueueState, leaseId: string) {
   return Object.values(state.items).find((item) => item.leaseId === leaseId) || null;
 }
@@ -11320,41 +10707,6 @@ function clearExactReviewDispatchFailure(item: ExactReviewQueueItem) {
   item.dispatchFailureDetail = undefined;
 }
 
-function exactReviewDispatchFailureDetailJson(detail?: ExactReviewDispatchFailureDetail) {
-  if (!detail) return null;
-  return {
-    validation_fields: detail.validationFields,
-    validation_codes: detail.validationCodes,
-  };
-}
-
-export function exactReviewEffectiveLeaseExpiresAt(
-  item: ExactReviewQueueItem,
-  publicationDispatchLeaseMs: number,
-  heartbeatGraceMs = DEFAULT_EXACT_REVIEW_HEARTBEAT_GRACE_MS,
-) {
-  const leaseExpiresAt = Number(item.leaseExpiresAt || 0);
-  const leaseHeartbeatAt = Number(item.leaseHeartbeatAt || 0);
-  if (
-    leaseExpiresAt &&
-    item.state === "leased" &&
-    leaseHeartbeatAt &&
-    item.leasePhase !== "finalizing"
-  ) {
-    return Math.min(leaseExpiresAt, leaseHeartbeatAt + heartbeatGraceMs);
-  }
-  if (
-    !leaseExpiresAt ||
-    item.state !== "dispatching" ||
-    !exactReviewQueueIsPublication(item) ||
-    item.claimedRunId ||
-    !item.dispatchedAt
-  ) {
-    return leaseExpiresAt;
-  }
-  return Math.min(leaseExpiresAt, item.dispatchedAt + publicationDispatchLeaseMs);
-}
-
 function isLiveExactReviewLease(
   item: ExactReviewQueueItem,
   now: number,
@@ -11428,22 +10780,6 @@ function reclaimExpiredExactReviewLease(
   return true;
 }
 
-function exactReviewParkedRecoveryDelayMs(item: ExactReviewQueueItem) {
-  if (
-    item.state !== "parked" ||
-    exactReviewQueueIsPublication(item) ||
-    (item.parkedReason !== "dispatch_rejected" && item.parkedReason !== "review_retry_exhausted")
-  ) {
-    return null;
-  }
-  const recoveries = exactReviewParkedRecoveryAttempts(item.parkedRecoveryAttempts);
-  if (recoveries >= EXACT_REVIEW_PARKED_RECOVERY_LIMIT) return null;
-  return Math.min(
-    EXACT_REVIEW_PARKED_RECOVERY_MAX_MS,
-    EXACT_REVIEW_PARKED_RECOVERY_BASE_MS * 2 ** recoveries,
-  );
-}
-
 function parkRecoverableExactReviewItem(
   item: ExactReviewQueueItem,
   reason: Extract<ExactReviewParkedReason, "dispatch_rejected" | "review_retry_exhausted">,
@@ -11457,17 +10793,6 @@ function parkRecoverableExactReviewItem(
   const delay = exactReviewParkedRecoveryDelayMs(item);
   item.parkedRecoveryAt =
     delay === null ? undefined : now + exactReviewJitteredDelayMs(delay, random);
-}
-
-function exactReviewParkedRecoveryAt(item: ExactReviewQueueItem) {
-  const delay = exactReviewParkedRecoveryDelayMs(item);
-  if (delay === null) return null;
-  const scheduled = Number(item.parkedRecoveryAt);
-  // Pre-jitter records did not persist their recovery timestamp. Preserve their
-  // established ladder for one final cycle instead of resampling on every read.
-  return Number.isSafeInteger(scheduled) && scheduled >= item.updatedAt
-    ? scheduled
-    : item.updatedAt + delay;
 }
 
 function recoverParkedExactReviewItems(state: ExactReviewQueueState, now: number) {
@@ -11491,28 +10816,6 @@ function recoverParkedExactReviewItems(state: ExactReviewQueueState, now: number
   return recovered;
 }
 
-function exactReviewParkedRecoveryAttempts(value: unknown) {
-  const attempts = Number(value || 0);
-  return Number.isSafeInteger(attempts) && attempts > 0 ? attempts : 0;
-}
-
-function exactReviewParkedOperatorEligible(item: ExactReviewQueueItem) {
-  return (
-    item.state === "parked" &&
-    !exactReviewQueueIsPublication(item) &&
-    (item.parkedReason === "dispatch_rejected" || item.parkedReason === "review_retry_exhausted") &&
-    exactReviewParkedRecoveryAttempts(item.parkedRecoveryAttempts) >=
-      EXACT_REVIEW_PARKED_RECOVERY_LIMIT
-  );
-}
-
-function exactReviewParkedTerminalCheckAt(item: ExactReviewQueueItem) {
-  if (!exactReviewParkedOperatorEligible(item) || exactReviewQueueHasCommandContext(item)) {
-    return null;
-  }
-  return Number(item.parkedTerminalCheckedAt || 0) + EXACT_REVIEW_PARKED_TERMINAL_CHECK_INTERVAL_MS;
-}
-
 function exactReviewDueParkedTerminalItem(state: ExactReviewQueueState, now: number) {
   if (exactReviewParkedTerminalGlobalCheckAt(state) > now) return undefined;
   return Object.values(state.items)
@@ -11526,14 +10829,6 @@ function exactReviewDueParkedTerminalItem(state: ExactReviewQueueState, now: num
         left.createdAt - right.createdAt ||
         left.key.localeCompare(right.key),
     )[0];
-}
-
-function exactReviewParkedTerminalGlobalCheckAt(state: ExactReviewQueueState) {
-  const lastCheckedAt = Object.values(state.items).reduce(
-    (latest, item) => Math.max(latest, Number(item.parkedTerminalCheckedAt || 0)),
-    Number(state.dispatcher?.parkedTerminalCheckedAt || 0),
-  );
-  return lastCheckedAt + EXACT_REVIEW_PARKED_TERMINAL_CHECK_INTERVAL_MS;
 }
 
 export function exactReviewJitteredDelayMs(delayMs: number, random: () => number = Math.random) {
@@ -11663,30 +10958,10 @@ function exactReviewQueueDebouncedAttempt(
   };
 }
 
-function isImmediateExactReviewDecision(decision: ExactReviewDecision, isFirstEvent = false) {
-  return Boolean(
-    decision.commandStatusMarker ||
-    decision.publication ||
-    exactReviewScheduledLane(decision) ||
-    (isFirstEvent &&
-      decision.itemKind === "pull_request" &&
-      ["opened", "ready_for_review"].includes(decision.sourceAction)),
-  );
-}
-
-function isLowPriorityExactReviewDecision(decision: ExactReviewDecision) {
-  return EXACT_REVIEW_LOW_PRIORITY_SOURCE_ACTIONS.has(decision.sourceAction);
-}
-
 function exactReviewQueuePendingReviewCount(state: ExactReviewQueueState) {
   return Object.values(state.items).filter(
     (item) => item.state === "pending" && !exactReviewQueueIsPublication(item),
   ).length;
-}
-
-function exactReviewShedSinceReset(state: Pick<ExactReviewQueueState, "shedSinceReset">) {
-  const value = Number(state.shedSinceReset || 0);
-  return Number.isSafeInteger(value) && value > 0 ? value : 0;
 }
 
 function exactReviewMetricTotal(value: unknown) {
@@ -11697,55 +10972,6 @@ function exactReviewMetricTotal(value: unknown) {
 function exactReviewMetricDelta(value: unknown) {
   const delta = Number(value || 0);
   return Number.isSafeInteger(delta) && delta > 0 ? delta : 0;
-}
-
-function exactReviewQueueIsPublication(item: Pick<ExactReviewQueueItem, "decision">) {
-  return item.decision.sourceAction === EXACT_REVIEW_ARTIFACT_PUBLISH_SOURCE_ACTION;
-}
-
-function exactReviewQueueIsBatchablePublication(
-  item: Pick<ExactReviewQueueItem, "decision" | "terminalFinalization">,
-) {
-  // A direct receipt's router/terminal plan is immutable per fenced revision.
-  // Batch publication has no lifecycle-plan replay step, so only the normal
-  // publisher may recover a pending direct receipt.
-  return (
-    exactReviewQueueIsPublication(item) &&
-    !item.terminalFinalization &&
-    !item.decision.publication?.directLifecycle
-  );
-}
-
-function exactReviewQueueHasCommandContext(item: Pick<ExactReviewQueueItem, "decision">) {
-  const command = exactReviewQueueCommandStatusAddress(item.decision);
-  return Boolean(command.statusMarker || command.statusCommentId);
-}
-
-function exactReviewQueueCommandStatusAddress(decision: ExactReviewDecision) {
-  return {
-    statusMarker:
-      decision.publication?.producerDecision.commandStatusMarker ??
-      decision.commandStatusMarker ??
-      null,
-    statusCommentId:
-      decision.publication?.producerDecision.statusCommentId ?? decision.statusCommentId ?? null,
-  };
-}
-
-function exactReviewTerminalFinalizationSharesCommandStatus(
-  item: Pick<ExactReviewQueueItem, "decision">,
-  successor: ExactReviewDecision,
-) {
-  const current = exactReviewQueueCommandStatusAddress(item.decision);
-  const next = exactReviewQueueCommandStatusAddress(successor);
-  return (
-    (current.statusCommentId !== null &&
-      next.statusCommentId !== null &&
-      current.statusCommentId === next.statusCommentId) ||
-    (current.statusMarker !== null &&
-      next.statusMarker !== null &&
-      current.statusMarker === next.statusMarker)
-  );
 }
 
 type ExactReviewLegacyPublicationAuthority = {
@@ -11914,715 +11140,6 @@ function exactReviewLegacyStateBatchTerminalPublicationCandidate(
     !authority.hasActiveOwner &&
     !newerPublication &&
     revision.sourceRevision >= newestRevision,
-  );
-}
-
-function exactReviewQueueLane(item: ExactReviewQueueItem) {
-  return exactReviewQueueIsPublication(item) ? "publication" : "review";
-}
-
-// The Bay is a deliberately lightweight visual projection of durable queue
-// state. Keep this representation bounded and scrubbed: it is public dashboard
-// data, not a queue-inspection API. Live workers remain the authority for the
-// reviewing stage; these records only make the otherwise invisible admission,
-// setup, publication, and recovery phases visible. Publication is distinct
-// from the publisher workflow's deterministic follow-up, which the Bay shows
-// from the live worker as Applying.
-const EXACT_REVIEW_BAY_SAMPLE_LIMIT = 24;
-// The dashboard can retain both a terminal-buffer card and its washed card
-// while their live queue retry is pending. Accept all bounded Bay candidates
-// first, then apply the public sample limit only after resolving live rows.
-const EXACT_REVIEW_BAY_PRIORITY_INPUT_LIMIT = 40;
-const EXACT_REVIEW_BAY_STAGES = [
-  "arriving",
-  "setting-up",
-  "reviewing",
-  "publishing",
-  "applying",
-  "repairing",
-] as const;
-type ExactReviewBayStage = (typeof EXACT_REVIEW_BAY_STAGES)[number];
-type ExactReviewBayProjectionItem = {
-  item_key: string;
-  repository: string;
-  item_number: number;
-  stage: ExactReviewBayStage;
-  queue_state: ExactReviewQueueItem["state"];
-  created_at: string;
-  updated_at: string;
-  next_attempt_at: string;
-  batch_id?: string;
-  batch_created_at?: string;
-};
-
-type ExactReviewBayBatchOwner = {
-  batchId: string;
-};
-
-function exactReviewQueueBayStage(
-  item: ExactReviewQueueItem,
-  batchByItemKey: ReadonlyMap<string, ExactReviewBayBatchOwner> = new Map(),
-): ExactReviewBayStage {
-  // A parked item is deliberately no longer making normal queue progress. This
-  // includes bounded review-retry exhaustion, permanent dispatch rejection,
-  // and a publication that needs its dead-letter/recovery path. Keep it in the
-  // exception cove instead of making it look like an active setup or publisher.
-  if (item.state === "parked") return "repairing";
-  // The batch publisher's GitHub job is intentionally targetless. Its durable
-  // batch membership is the authoritative bounded source for the individual
-  // items it is currently applying, without another GitHub lookup.
-  if (batchByItemKey.has(item.key)) return "applying";
-  if (exactReviewQueueIsPublication(item)) return "publishing";
-  if (isLowPriorityExactReviewDecision(item.decision)) return "repairing";
-  return item.state === "pending" ? "arriving" : "setting-up";
-}
-
-function exactReviewQueueBayStagePriority(stage: ExactReviewBayStage) {
-  return EXACT_REVIEW_BAY_STAGES.indexOf(stage);
-}
-
-function exactReviewQueueBayPriorityKeys(values: string[]) {
-  const unique = new Set<string>();
-  for (const value of values) {
-    const itemKey = String(value || "").trim();
-    if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+#\d+$/.test(itemKey)) continue;
-    unique.add(itemKey);
-    if (unique.size === EXACT_REVIEW_BAY_PRIORITY_INPUT_LIMIT) break;
-  }
-  return [...unique];
-}
-
-function exactReviewQueueBayProjection(
-  items: ExactReviewQueueItem[],
-  priorityItemKeys: string[] = [],
-  batchByItemKey: ReadonlyMap<string, ExactReviewBayBatchOwner> = new Map(),
-) {
-  const projected = new Map<string, ExactReviewBayProjectionItem>();
-  for (const item of items) {
-    // Parked records are not terminal outcomes: they remain bounded durable
-    // queue work that needs recovery. Keep their already-scrubbed identity in
-    // the projection so Bay shows the exception rather than a false empty lane.
-    const repository = String(item.decision.targetRepo || "").trim();
-    const itemNumber = Number(item.decision.itemNumber);
-    if (!repository || !Number.isSafeInteger(itemNumber) || itemNumber <= 0) continue;
-    const batch = batchByItemKey.get(item.key);
-    const candidate: ExactReviewBayProjectionItem = {
-      item_key: `${repository}#${itemNumber}`,
-      repository,
-      item_number: itemNumber,
-      stage: exactReviewQueueBayStage(item, batchByItemKey),
-      queue_state: item.state,
-      created_at: new Date(item.createdAt).toISOString(),
-      updated_at: new Date(item.updatedAt).toISOString(),
-      next_attempt_at: new Date(item.nextAttemptAt).toISOString(),
-      ...(batch
-        ? {
-            batch_id: batch.batchId,
-          }
-        : {}),
-    };
-    const previous = projected.get(candidate.item_key);
-    const candidateUpdatedAt = Date.parse(candidate.updated_at);
-    const previousUpdatedAt = previous ? Date.parse(previous.updated_at) : Number.NEGATIVE_INFINITY;
-    if (
-      !previous ||
-      candidateUpdatedAt > previousUpdatedAt ||
-      (candidateUpdatedAt === previousUpdatedAt &&
-        exactReviewQueueBayStagePriority(candidate.stage) >
-          exactReviewQueueBayStagePriority(previous.stage))
-    ) {
-      projected.set(candidate.item_key, candidate);
-    }
-  }
-  const rows = [...projected.values()];
-  const stages = Object.fromEntries(
-    EXACT_REVIEW_BAY_STAGES.map((stage) => [
-      stage,
-      rows.filter((item) => item.stage === stage).length,
-    ]),
-  ) as Record<ExactReviewBayStage, number>;
-  const rowsByStage = Object.fromEntries(
-    EXACT_REVIEW_BAY_STAGES.map((stage) => [
-      stage,
-      rows
-        .filter((item) => item.stage === stage)
-        .sort(
-          (left, right) =>
-            Date.parse(left.created_at) - Date.parse(right.created_at) ||
-            left.item_key.localeCompare(right.item_key),
-        ),
-    ]),
-  ) as Record<ExactReviewBayStage, ExactReviewBayProjectionItem[]>;
-  const priorityRows = exactReviewQueueBayPriorityKeys(priorityItemKeys)
-    .map((itemKey) => projected.get(itemKey))
-    .filter((item): item is ExactReviewBayProjectionItem => Boolean(item))
-    .slice(0, EXACT_REVIEW_BAY_SAMPLE_LIMIT);
-  const priorityKeys = new Set(priorityRows.map((item) => item.item_key));
-  const sample = [...priorityRows];
-  const longestStage = Math.max(
-    ...EXACT_REVIEW_BAY_STAGES.map((stage) => rowsByStage[stage].length),
-  );
-  for (
-    let index = 0;
-    sample.length < EXACT_REVIEW_BAY_SAMPLE_LIMIT && index < longestStage;
-    index += 1
-  ) {
-    for (const stage of EXACT_REVIEW_BAY_STAGES) {
-      const item = rowsByStage[stage][index];
-      if (!item || priorityKeys.has(item.item_key)) continue;
-      sample.push(item);
-      if (sample.length === EXACT_REVIEW_BAY_SAMPLE_LIMIT) break;
-    }
-  }
-  return {
-    sample_limit: EXACT_REVIEW_BAY_SAMPLE_LIMIT,
-    total: rows.length,
-    stages,
-    items: sample,
-  };
-}
-
-function exactReviewQueueActiveReviewCount(state: ExactReviewQueueState) {
-  return Object.values(state.items).filter(
-    (item) =>
-      !exactReviewQueueIsPublication(item) &&
-      (item.state === "dispatching" || item.state === "leased"),
-  ).length;
-}
-
-function exactReviewQueueActivePublicationCount(state: ExactReviewQueueState) {
-  return Object.values(state.items).filter(
-    (item) =>
-      exactReviewQueueIsPublication(item) &&
-      (item.state === "dispatching" || item.state === "leased"),
-  ).length;
-}
-
-function exactReviewPrioritizePublicationItems(
-  items: ExactReviewQueueItem[],
-  freshItemKeys: ReadonlySet<string>,
-  freshReserve: number,
-) {
-  if (!freshReserve || !freshItemKeys.size) return items;
-  const fresh = items.filter((item) => freshItemKeys.has(item.key));
-  if (!fresh.length) return items;
-  const historical = items.filter((item) => !freshItemKeys.has(item.key));
-  if (!historical.length) return items;
-  const reservedFresh = fresh.slice(0, freshReserve);
-  return [...reservedFresh, ...historical, ...fresh.slice(reservedFresh.length)];
-}
-
-export function exactReviewQueueAdmittedItems(
-  state: ExactReviewQueueState,
-  now: number,
-  capacity: number,
-  targetCapacity: number,
-  publicationCapacity: number,
-  excludedItemKeys: ReadonlySet<string> = new Set(),
-  publicationAdmissionBlocked = false,
-  uniquePublicationItems = false,
-  freshPublicationItemKeys: ReadonlySet<string> = new Set(),
-  freshPublicationReserve = 0,
-) {
-  const dispatcherRetryAt = Number(state.dispatcher?.retryAt || 0);
-  if (
-    (state.dispatcher?.state === "paused" || state.dispatcher?.state === "blocked") &&
-    dispatcherRetryAt > now
-  ) {
-    return [];
-  }
-  const reviewSlots = Math.max(0, capacity - exactReviewQueueActiveReviewCount(state));
-  const activeTargets = new Map<string, number>();
-  let activePublishers = 0;
-  for (const item of Object.values(state.items)) {
-    if (item.state !== "dispatching" && item.state !== "leased") continue;
-    if (exactReviewQueueIsPublication(item)) {
-      activePublishers += 1;
-      continue;
-    }
-    const target = item.decision.targetRepo;
-    activeTargets.set(target, (activeTargets.get(target) || 0) + 1);
-  }
-  const pending = Object.values(state.items)
-    .filter(
-      (item) =>
-        item.state === "pending" && item.nextAttemptAt <= now && !excludedItemKeys.has(item.key),
-    )
-    .sort((left, right) => left.createdAt - right.createdAt || left.key.localeCompare(right.key));
-  const pendingReviews = pending.filter((item) => !exactReviewQueueIsPublication(item));
-  const pendingPublications = exactReviewPrioritizePublicationItems(
-    pending.filter(exactReviewQueueIsPublication),
-    freshPublicationItemKeys,
-    freshPublicationReserve,
-  );
-  const admittedReviews: ExactReviewQueueItem[] = [];
-  for (const item of pendingReviews) {
-    if (admittedReviews.length >= reviewSlots) break;
-    const target = item.decision.targetRepo;
-    if (exactReviewGithubTargetAppCircuitRetryAt(state, target, now) > now) continue;
-    const active = activeTargets.get(target) || 0;
-    if (active >= targetCapacity) continue;
-    activeTargets.set(target, active + 1);
-    admittedReviews.push(item);
-  }
-
-  const admittedPublications: ExactReviewQueueItem[] = [];
-  const admittedPublicationItems = new Set<string>();
-  for (const item of pendingPublications) {
-    // Batching owns publication work, but a committed terminal driver owns no
-    // publication. It must use the normal dispatcher to reach the dedicated
-    // fenced acknowledgement finalizer.
-    if (
-      publicationAdmissionBlocked &&
-      !item.terminalFinalization &&
-      exactReviewQueueIsBatchablePublication(item)
-    ) {
-      continue;
-    }
-    if (activePublishers >= publicationCapacity) break;
-    // Distinct publication events may target the same durable record path. A batch
-    // must serialize those events across commits or their prepared mutations can
-    // disagree even though their queue keys and fencing revisions are independent.
-    const publicationItem = uniquePublicationItems
-      ? `${item.decision.targetRepo.toLowerCase()}#${item.decision.itemNumber}`
-      : "";
-    if (uniquePublicationItems && admittedPublicationItems.has(publicationItem)) continue;
-    activePublishers += 1;
-    if (uniquePublicationItems) admittedPublicationItems.add(publicationItem);
-    admittedPublications.push(item);
-  }
-
-  // Review admission owns its capacity and is intentionally ordered first.
-  // A blocked or slow publication key cannot delay an available review slot.
-  return [...admittedReviews, ...admittedPublications];
-}
-
-function sumFor(rows: Array<Record<string, number | string | null>>, field: string) {
-  return rows.reduce(
-    (total, row) => total + (typeof row[field] === "number" ? Number(row[field]) : 0),
-    0,
-  );
-}
-
-function percentileFor(rows: Array<Record<string, number | string | null>>, field: string) {
-  const values = rows
-    .map((row) => row[field])
-    .filter((value): value is number => typeof value === "number")
-    .sort((left, right) => left - right);
-  const at = (ratio: number) =>
-    values.length
-      ? values[Math.min(values.length - 1, Math.ceil(values.length * ratio) - 1)]
-      : null;
-  return { p50: at(0.5), p95: at(0.95), samples: values.length };
-}
-
-function exactReviewQueueStats(
-  state: ExactReviewQueueState,
-  now = Date.now(),
-  capacity = Number.POSITIVE_INFINITY,
-  targetCapacity = Number.POSITIVE_INFINITY,
-  publicationCapacity = Number.POSITIVE_INFINITY,
-  dispatchLeaseMs = DEFAULT_EXACT_REVIEW_DISPATCH_LEASE_MS,
-  executionLeaseMs = DEFAULT_EXACT_REVIEW_EXECUTION_LEASE_MS,
-  publicationDispatchLeaseMs = DEFAULT_EXACT_REVIEW_PUBLICATION_DISPATCH_LEASE_MS,
-  heartbeatGraceMs = DEFAULT_EXACT_REVIEW_HEARTBEAT_GRACE_MS,
-  excludedItemKeys: ReadonlySet<string> = new Set(),
-  publicationBlockedUntil: number | null = null,
-) {
-  const items = Object.values(state.items);
-  const handoffItems = items.filter(
-    (item): item is ExactReviewQueueItem & { state: "pending" | "dispatching" | "leased" } =>
-      item.state !== "parked" && !exactReviewQueueIsPublication(item),
-  );
-  const handoffHealth = summarizeExactReviewHandoff({
-    // Parked poison items are reported by publication health and cannot take a
-    // handoff lease, so they must not be mislabeled as an unknown handoff phase.
-    items: handoffItems,
-    dispatcher: state.dispatcher,
-    shedSinceReset: exactReviewShedSinceReset(state),
-    now,
-    capacity,
-    dispatchLeaseMs,
-    executionLeaseMs,
-  });
-  const targets = new Map<
-    string,
-    {
-      target_repo: string;
-      pending: number;
-      dispatching: number;
-      leased: number;
-      parked: number;
-      oldest_pending_at: number | null;
-    }
-  >();
-  for (const item of items) {
-    const targetRepo = item.decision.targetRepo;
-    const current = targets.get(targetRepo) ?? {
-      target_repo: targetRepo,
-      pending: 0,
-      dispatching: 0,
-      leased: 0,
-      parked: 0,
-      oldest_pending_at: null,
-    };
-    if (item.state === "pending") {
-      current.pending += 1;
-      current.oldest_pending_at =
-        current.oldest_pending_at === null
-          ? item.createdAt
-          : Math.min(current.oldest_pending_at, item.createdAt);
-    } else if (item.state === "dispatching") {
-      current.dispatching += 1;
-    } else if (item.state === "leased") {
-      current.leased += 1;
-    } else {
-      current.parked += 1;
-    }
-    targets.set(targetRepo, current);
-  }
-  const targetStats = [...targets.values()]
-    .map((target) => ({
-      target_repo: target.target_repo,
-      pending: target.pending,
-      dispatching: target.dispatching,
-      leased: target.leased,
-      oldest_pending_at:
-        target.oldest_pending_at === null ? null : new Date(target.oldest_pending_at).toISOString(),
-    }))
-    .sort(
-      (left, right) =>
-        right.pending - left.pending ||
-        right.dispatching + right.leased - (left.dispatching + left.leased) ||
-        left.target_repo.localeCompare(right.target_repo),
-    );
-  const nextWakeAt = exactReviewQueueNextWakeAt(
-    state,
-    now,
-    capacity,
-    targetCapacity,
-    publicationCapacity,
-    publicationDispatchLeaseMs,
-    heartbeatGraceMs,
-    excludedItemKeys,
-    publicationBlockedUntil,
-    Number(state.dispatcher?.reviewAdmissionNextAt || 0) > now
-      ? Number(state.dispatcher?.reviewAdmissionNextAt)
-      : null,
-  );
-  const lanes = {
-    review: exactReviewQueueLaneStats(
-      items.filter((item) => !exactReviewQueueIsPublication(item)),
-      now,
-      capacity,
-      exactReviewShedSinceReset(state),
-      state,
-    ),
-    publication: exactReviewQueueLaneStats(
-      items.filter(exactReviewQueueIsPublication),
-      now,
-      publicationCapacity,
-      0,
-      state,
-    ),
-  };
-  const admissibleItems = exactReviewQueueAdmittedItems(
-    state,
-    now,
-    Number.MAX_SAFE_INTEGER,
-    targetCapacity,
-    publicationCapacity,
-    excludedItemKeys,
-    publicationBlockedUntil !== null && publicationBlockedUntil > now,
-  );
-  const reviewAdmissiblePending = admissibleItems.filter(
-    (item) => !exactReviewQueueIsPublication(item),
-  ).length;
-  const pressure = summarizeExactReviewPressure({
-    pending: lanes.review.pending,
-    readyPending: lanes.review.ready,
-    admissiblePending: reviewAdmissiblePending,
-    dispatching: lanes.review.dispatching,
-    leased: lanes.review.leased,
-    capacity: lanes.review.capacity,
-    dispatcherState: state.dispatcher?.state,
-    handoffStatus: handoffHealth.status,
-  });
-  return {
-    generated_at: handoffHealth.observed_at,
-    pending: lanes.review.pending,
-    ready_pending: lanes.review.ready,
-    admissible_pending: reviewAdmissiblePending,
-    shed_since_reset: exactReviewShedSinceReset(state),
-    dispatching: handoffHealth.phases.dispatching.count,
-    leased: handoffHealth.phases.leased.count,
-    oldest_pending_at: handoffHealth.phases.pending.oldest_at,
-    oldest_pending_age_seconds: handoffHealth.phases.pending.oldest_age_seconds,
-    oldest_pending_key: handoffHealth.phases.pending.oldest_key,
-    oldest_dispatching_at: handoffHealth.phases.dispatching.oldest_at,
-    oldest_dispatching_age_seconds: handoffHealth.phases.dispatching.oldest_age_seconds,
-    oldest_leased_at: handoffHealth.phases.leased.oldest_at,
-    oldest_leased_age_seconds: handoffHealth.phases.leased.oldest_age_seconds,
-    handoff_health: handoffHealth,
-    lanes,
-    pressure,
-    bay_projection: exactReviewQueueBayProjection(items),
-    next_wake_at: nextWakeAt === null ? null : new Date(nextWakeAt).toISOString(),
-    dispatcher: {
-      state: state.dispatcher?.state || "unknown",
-      reason: state.dispatcher?.reason || null,
-      workflow_state: state.dispatcher?.workflowState || null,
-      checked_at: state.dispatcher?.checkedAt
-        ? new Date(state.dispatcher.checkedAt).toISOString()
-        : null,
-      retry_at: state.dispatcher?.retryAt ? new Date(state.dispatcher.retryAt).toISOString() : null,
-      dispatch_failure_status: state.dispatcher?.dispatchFailureStatus ?? null,
-      dispatch_failure_class: state.dispatcher?.dispatchFailureClass || null,
-      dispatch_failure_at: state.dispatcher?.dispatchFailureAt
-        ? new Date(state.dispatcher.dispatchFailureAt).toISOString()
-        : null,
-      dispatch_failure_fingerprint: state.dispatcher?.dispatchFailureFingerprint || null,
-      dispatch_failure_detail: exactReviewDispatchFailureDetailJson(
-        state.dispatcher?.dispatchFailureDetail,
-      ),
-      dispatch_consecutive_failures: state.dispatcher?.dispatchConsecutiveFailures || 0,
-    },
-    target_stats: targetStats,
-  };
-}
-
-function exactReviewQueueLaneStats(
-  items: ExactReviewQueueItem[],
-  now: number,
-  capacity: number,
-  shedSinceReset = 0,
-  state: ExactReviewQueueState = { items: {} },
-) {
-  const pendingItems = items.filter((item) => item.state === "pending");
-  const readyItems = pendingItems.filter((item) => item.nextAttemptAt <= now);
-  const backoffItems = pendingItems.filter((item) => item.nextAttemptAt > now);
-  const dispatchingItems = items.filter((item) => item.state === "dispatching");
-  const leasedItems = items.filter((item) => item.state === "leased");
-  const parkedItems = items.filter((item) => item.state === "parked");
-  const active = dispatchingItems.length + leasedItems.length;
-  const oldestPendingAt = pendingItems.reduce<number | null>(
-    (oldest, item) => (oldest === null ? item.createdAt : Math.min(oldest, item.createdAt)),
-    null,
-  );
-  const oldestPendingKey = pendingItems
-    .slice()
-    .sort(
-      (left, right) => left.createdAt - right.createdAt || left.key.localeCompare(right.key),
-    )[0]?.key;
-  const oldestReadyAt = readyItems.reduce<number | null>(
-    (oldest, item) => (oldest === null ? item.createdAt : Math.min(oldest, item.createdAt)),
-    null,
-  );
-  const oldestBackoffAt = backoffItems.reduce<number | null>(
-    (oldest, item) => (oldest === null ? item.createdAt : Math.min(oldest, item.createdAt)),
-    null,
-  );
-  const nextAttemptAt = pendingItems.reduce<number | null>(
-    (next, item) => (next === null ? item.nextAttemptAt : Math.min(next, item.nextAttemptAt)),
-    null,
-  );
-  return {
-    pending: pendingItems.length,
-    pending_depth: pendingItems.length,
-    shed_since_reset: shedSinceReset,
-    ready: readyItems.length,
-    backoff: backoffItems.length,
-    backoff_reasons: exactReviewQueueReasonCounts(
-      backoffItems.map((item) => exactReviewQueueBackoffReason(item, state, now)),
-    ),
-    dispatching: dispatchingItems.length,
-    leased: leasedItems.length,
-    parked: parkedItems.length,
-    parked_reasons: exactReviewQueueReasonCounts(
-      parkedItems.map((item) => item.parkedReason || "unknown"),
-    ),
-    capacity,
-    active,
-    available_slots: Math.max(0, capacity - active),
-    oldest_pending_at: oldestPendingAt === null ? null : new Date(oldestPendingAt).toISOString(),
-    oldest_pending_age_seconds:
-      oldestPendingAt === null ? null : Math.max(0, Math.floor((now - oldestPendingAt) / 1_000)),
-    oldest_pending_key: oldestPendingKey ?? null,
-    oldest_ready_at: oldestReadyAt === null ? null : new Date(oldestReadyAt).toISOString(),
-    oldest_ready_age_seconds:
-      oldestReadyAt === null ? null : Math.max(0, Math.floor((now - oldestReadyAt) / 1_000)),
-    oldest_backoff_at: oldestBackoffAt === null ? null : new Date(oldestBackoffAt).toISOString(),
-    oldest_backoff_age_seconds:
-      oldestBackoffAt === null ? null : Math.max(0, Math.floor((now - oldestBackoffAt) / 1_000)),
-    next_attempt_at: nextAttemptAt === null ? null : new Date(nextAttemptAt).toISOString(),
-  };
-}
-
-function exactReviewQueueBackoffReason(
-  item: ExactReviewQueueItem,
-  state: ExactReviewQueueState,
-  now: number,
-) {
-  if (item.backoffReason) return item.backoffReason;
-  if (item.publicationFailureAttempts || (exactReviewQueueIsPublication(item) && item.attempts)) {
-    return "publication_retry";
-  }
-  if (item.reviewFailureAttempts || item.attempts) return "retry_backoff";
-  const retryAt = Number(state.dispatcher?.retryAt || 0);
-  if (
-    (state.dispatcher?.state === "paused" || state.dispatcher?.state === "blocked") &&
-    retryAt > now &&
-    item.nextAttemptAt >= retryAt
-  ) {
-    return "dispatcher_backoff";
-  }
-  return "dispatch_debounce";
-}
-
-function exactReviewQueueReasonCounts(reasons: string[]) {
-  return reasons.reduce<Record<string, number>>((counts, reason) => {
-    counts[reason] = (counts[reason] || 0) + 1;
-    return counts;
-  }, {});
-}
-
-export function exactReviewQueueNextWakeAt(
-  state: ExactReviewQueueState,
-  now: number,
-  capacity = Number.POSITIVE_INFINITY,
-  targetCapacity = Number.POSITIVE_INFINITY,
-  publicationCapacity = Number.POSITIVE_INFINITY,
-  publicationDispatchLeaseMs = DEFAULT_EXACT_REVIEW_PUBLICATION_DISPATCH_LEASE_MS,
-  heartbeatGraceMs = DEFAULT_EXACT_REVIEW_HEARTBEAT_GRACE_MS,
-  excludedItemKeys: ReadonlySet<string> = new Set(),
-  publicationBlockedUntil: number | null = null,
-  reviewAdmissionBlockedUntil: number | null = null,
-) {
-  const items = Object.values(state.items);
-  if (!items.length) return null;
-  const dispatcherRetryAt = Number(state.dispatcher?.retryAt || 0);
-  const dispatcherPaused =
-    (state.dispatcher?.state === "paused" || state.dispatcher?.state === "blocked") &&
-    dispatcherRetryAt > now;
-  const activeItems = items.filter(
-    (item) => item.state === "dispatching" || item.state === "leased",
-  );
-  if (
-    activeItems.some(
-      (item) =>
-        !item.leaseExpiresAt ||
-        exactReviewEffectiveLeaseExpiresAt(item, publicationDispatchLeaseMs, heartbeatGraceMs) <=
-          now,
-    )
-  ) {
-    return now + 1_000;
-  }
-  const activeReviews = activeItems.filter((item) => !exactReviewQueueIsPublication(item));
-  const activePublishers = activeItems.filter(exactReviewQueueIsPublication);
-  const activeReviewWakeAt = activeReviews
-    .map((item) =>
-      exactReviewEffectiveLeaseExpiresAt(item, publicationDispatchLeaseMs, heartbeatGraceMs),
-    )
-    .filter((value): value is number => Boolean(value && value > now));
-  const activePublisherWakeAt = activePublishers
-    .map((item) =>
-      exactReviewEffectiveLeaseExpiresAt(item, publicationDispatchLeaseMs, heartbeatGraceMs),
-    )
-    .filter((value): value is number => Boolean(value && value > now));
-  const activeTargetWakeAt = new Map<string, number>();
-  const activeTargetCounts = new Map<string, number>();
-  for (const item of activeReviews) {
-    const leaseExpiresAt = exactReviewEffectiveLeaseExpiresAt(
-      item,
-      publicationDispatchLeaseMs,
-      heartbeatGraceMs,
-    );
-    if (leaseExpiresAt > now) {
-      const target = item.decision.targetRepo;
-      activeTargetCounts.set(target, (activeTargetCounts.get(target) || 0) + 1);
-      const current = activeTargetWakeAt.get(item.decision.targetRepo);
-      activeTargetWakeAt.set(
-        target,
-        current === undefined ? leaseExpiresAt : Math.min(current, leaseExpiresAt),
-      );
-    }
-  }
-  const parkedTerminalGlobalCheckAt = exactReviewParkedTerminalGlobalCheckAt(state);
-  const times = items.flatMap((item) => {
-    if (item.state === "pending") {
-      if (excludedItemKeys.has(item.key)) return [];
-      if (dispatcherPaused) return [dispatcherRetryAt];
-      if (exactReviewQueueIsPublication(item)) {
-        if (publicationBlockedUntil !== null && publicationBlockedUntil > now) {
-          return [Math.max(item.nextAttemptAt, publicationBlockedUntil)];
-        }
-        let blockedUntil = item.nextAttemptAt;
-        if (activePublishers.length >= publicationCapacity) {
-          const capacityWakeAt = [...activePublisherWakeAt];
-          if (publicationCapacity <= 0) {
-            // A zero publication budget is normally caused by active reviews
-            // consuming the shared worker budget. Their leases, rather than a
-            // one-second alarm loop, determine when a slot can become available.
-            capacityWakeAt.push(...activeReviewWakeAt);
-          }
-          blockedUntil = capacityWakeAt.length
-            ? Math.min(...capacityWakeAt)
-            : now + DEFAULT_EXACT_REVIEW_RETRY_MS;
-        }
-        return [Math.max(item.nextAttemptAt, blockedUntil)];
-      }
-      const target = item.decision.targetRepo;
-      const credentialBlockedUntil = exactReviewGithubTargetAppCircuitRetryAt(state, target, now);
-      const capacityBlockedUntil = [
-        ...(activeReviews.length >= capacity && activeReviewWakeAt.length
-          ? [Math.min(...activeReviewWakeAt)]
-          : []),
-        ...((activeTargetCounts.get(target) || 0) >= targetCapacity &&
-        activeTargetWakeAt.has(target)
-          ? [activeTargetWakeAt.get(target) as number]
-          : []),
-      ];
-      return [
-        Math.max(
-          item.nextAttemptAt,
-          reviewAdmissionBlockedUntil ?? item.nextAttemptAt,
-          credentialBlockedUntil,
-          capacityBlockedUntil.length ? Math.min(...capacityBlockedUntil) : item.nextAttemptAt,
-        ),
-      ];
-    }
-    if (item.state === "parked") {
-      const recoveryAt = exactReviewParkedRecoveryAt(item);
-      const terminalCheckAt = exactReviewParkedTerminalCheckAt(item);
-      return [
-        recoveryAt,
-        terminalCheckAt === null
-          ? null
-          : Math.max(
-              terminalCheckAt,
-              parkedTerminalGlobalCheckAt,
-              dispatcherPaused ? dispatcherRetryAt : 0,
-            ),
-      ].filter((value): value is number => value !== null);
-    }
-    const leaseExpiresAt = exactReviewEffectiveLeaseExpiresAt(
-      item,
-      publicationDispatchLeaseMs,
-      heartbeatGraceMs,
-    );
-    return leaseExpiresAt ? [leaseExpiresAt] : [];
-  });
-  if (!times.length) return null;
-  return Math.max(now + 1_000, Math.min(...times));
-}
-
-export function exactReviewQueueCapacity(env) {
-  return Math.max(
-    1,
-    Math.min(
-      numberFrom(env.EXACT_REVIEW_ACTIONS_BUDGET, DEFAULT_EXACT_REVIEW_ACTIONS_BUDGET),
-      numberFrom(env.EXACT_REVIEW_QUEUE_MAX_CONCURRENT, DEFAULT_EXACT_REVIEW_QUEUE_MAX_CONCURRENT),
-    ),
   );
 }
 
@@ -13277,14 +11794,6 @@ function exactReviewPendingSoftLimit(env) {
   );
 }
 
-function exactReviewScheduledLane(decision: ExactReviewDecision): ExactReviewScheduledLane | null {
-  if (decision.sourceAction === EXACT_REVIEW_SCHEDULED_HOT_SOURCE_ACTION) return "hot_intake";
-  if (decision.sourceAction === EXACT_REVIEW_SCHEDULED_NORMAL_SOURCE_ACTION) {
-    return "normal_backfill";
-  }
-  return null;
-}
-
 function exactReviewScheduledFeedKey(lane: ExactReviewScheduledBucket) {
   return `${EXACT_REVIEW_SCHEDULED_FEED_KEY_PREFIX}:${lane}`;
 }
@@ -13484,11 +11993,6 @@ async function exactReviewTargetDefaultBranch(
   }
   return targetBranch;
 }
-
-type ExactReviewTargetItemState =
-  | { state: "open"; headSha?: string }
-  | { state: "terminal" }
-  | { state: "unavailable" };
 
 async function exactReviewTargetItemState(
   token: string,
@@ -13778,7 +12282,7 @@ type ExactReviewDispatchFailure = {
   detail?: ExactReviewDispatchFailureDetail;
 };
 
-type ExactReviewDispatchFailureDetail = GitHubRequestValidationDetail;
+export type ExactReviewDispatchFailureDetail = GitHubRequestValidationDetail;
 
 function exactReviewDispatchFailure(error: unknown): ExactReviewDispatchFailure {
   const requestError = error instanceof GitHubRequestError ? error : null;
@@ -14073,17 +12577,6 @@ function applyExactReviewGithubRequestMetrics(
   };
 }
 
-function exactReviewGithubCredentialCircuits(
-  state: ExactReviewQueueState,
-): ExactReviewGithubCredentialCircuit[] {
-  return Object.values(state.dispatcher?.githubCredentialCircuits || {}).filter(
-    (circuit) =>
-      circuit &&
-      (circuit.scope === "repository_actions" || circuit.scope === "target_app") &&
-      Number.isFinite(circuit.retryAt),
-  );
-}
-
 function exactReviewGithubCircuitBlocksItem(
   state: ExactReviewQueueState,
   item: ExactReviewQueueItem,
@@ -14094,21 +12587,6 @@ function exactReviewGithubCircuitBlocksItem(
     (circuit) =>
       circuit.retryAt > now &&
       (circuit.scope === "repository_actions" || circuit.targetOwner === owner),
-  );
-}
-
-function exactReviewGithubTargetAppCircuitRetryAt(
-  state: ExactReviewQueueState,
-  targetRepo: string,
-  now: number,
-) {
-  const owner = targetRepo.split("/", 1)[0]?.toLowerCase();
-  return exactReviewGithubCredentialCircuits(state).reduce(
-    (retryAt, circuit) =>
-      circuit.scope === "target_app" && circuit.targetOwner === owner && circuit.retryAt > now
-        ? Math.max(retryAt, circuit.retryAt)
-        : retryAt,
-    0,
   );
 }
 
@@ -14536,10 +13014,6 @@ function exactReviewPublicationBatchTimestamp(value) {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
-function objectValue(value) {
-  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
-}
-
 function operationalCursorModeFromPath(path: string): OperationalCursorMode | null {
   const match =
     /^\/cursors\/(hot-intake|normal-review|audit|review-placeholder-[a-f0-9]{16}-(?:open|closed))$/.exec(
@@ -14638,11 +13112,6 @@ function exactReviewGithubTargetAppObservation(
     provenance: hint.provenance,
     authoritative: hint.authoritative,
   };
-}
-
-function numberFrom(value, fallback) {
-  const number = Number(value);
-  return Number.isFinite(number) ? number : fallback;
 }
 
 function snapshotJson(snapshot: RecordSnapshot) {
