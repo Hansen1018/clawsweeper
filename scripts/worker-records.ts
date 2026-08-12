@@ -1,4 +1,4 @@
-import { createHash, createHmac } from "node:crypto";
+import { createHash } from "node:crypto";
 import {
   closeSync,
   cpSync,
@@ -17,6 +17,7 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 
 import { WORKER_RECORDS_MANIFEST_SCHEMA_VERSION } from "../src/review-coverage-manifest.ts";
+import { internalQueueRequestHeaders } from "./internal-queue-request.mjs";
 
 export const RECORD_SECTIONS = ["items", "closed", "plans", "decision-packets", "commits"] as const;
 export type RecordSection = (typeof RECORD_SECTIONS)[number];
@@ -927,7 +928,6 @@ export async function signedRequest(options: {
   if (!options.webhookSecret) throw new Error("Worker records HMAC secret is required");
   const method = options.method ?? "POST";
   const body = method === "GET" ? "" : JSON.stringify(options.body);
-  const signature = `sha256=${createHmac("sha256", options.webhookSecret).update(body).digest("hex")}`;
   const performFetch = options.fetch ?? globalThis.fetch;
   // Bounded retry for transient failures: 5xx responses and network errors
   // (GitHub/Cloudflare 502s regularly kill long reconcile/export runs). 4xx
@@ -937,10 +937,12 @@ export async function signedRequest(options: {
     try {
       response = await performFetch(`${baseUrl}${options.path}`, {
         method,
-        headers: {
-          ...(method === "POST" ? { "content-type": "application/json" } : {}),
-          "x-clawsweeper-exact-review-signature": signature,
-        },
+        headers: internalQueueRequestHeaders({
+          secret: options.webhookSecret,
+          method,
+          path: options.path,
+          body,
+        }),
         ...(method === "POST" ? { body } : {}),
       });
     } catch (error) {

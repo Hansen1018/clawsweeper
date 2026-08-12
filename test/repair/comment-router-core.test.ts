@@ -309,6 +309,12 @@ test("parseCommand recognizes maintainer slash commands", () => {
     command: "review again",
     intent: "re_review",
   });
+  assert.deepEqual(parseCommand("@clawsweeper\nre-review: focus on the current path"), {
+    trigger: "mention",
+    command: "re-review: focus on the current path",
+    intent: "re_review",
+    freeform_prompt: "focus on the current path",
+  });
   assert.deepEqual(parseCommand("/clawsweeper implement"), {
     trigger: "slash",
     command: "implement",

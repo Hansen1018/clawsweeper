@@ -1,5 +1,6 @@
 import { readFileSync, existsSync, readdirSync } from "node:fs";
-import { createHmac } from "node:crypto";
+
+import { signedInternalQueueRequest } from "./internal-queue-request.mjs";
 
 const healthFile = optional("--health-file");
 const healthPath = healthFile && existsSync(healthFile) ? healthFile : fallbackHealthPath();
@@ -93,14 +94,12 @@ const payload = JSON.stringify({
   },
 });
 const queueUrl = requiredEnv("QUEUE_URL").replace(/\/+$/, "");
-const response = await fetch(`${queueUrl}/internal/apply-observability`, {
-  method: "POST",
-  headers: {
-    "content-type": "application/json",
-    "x-clawsweeper-exact-review-signature": `sha256=${createHmac("sha256", requiredEnv("CLAWSWEEPER_WEBHOOK_SECRET")).update(payload).digest("hex")}`,
-  },
+const response = await signedInternalQueueRequest({
+  baseUrl: queueUrl,
+  path: "/internal/apply-observability",
+  secret:
+    process.env.CLAWSWEEPER_INTERNAL_QUEUE_SECRET || requiredEnv("CLAWSWEEPER_WEBHOOK_SECRET"),
   body: payload,
-  signal: AbortSignal.timeout(20_000),
 });
 if (!response.ok) throw new Error(`apply observability publish failed: ${response.status}`);
 

@@ -736,7 +736,7 @@ test("GitHub throttles abort apply lease checks and preserve durable lease owner
   const releaseEnd = applySource.indexOf("runtimeBudget.onFailure", releaseStart);
   assert.match(
     applySource.slice(releaseStart, releaseEnd),
-    /catch \(error\) \{\s*if \(error instanceof GitHubRateLimitError\) throw error;/,
+    /catch \(error\) \{[\s\S]*durablyPublishedReviewComments\.has\(active\.itemNumber\)[\s\S]*if \(error instanceof GitHubRateLimitError\) throw error;/,
   );
   assert.match(
     applySource,

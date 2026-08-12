@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
-import { createHash, createHmac } from "node:crypto";
+import { createHash } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 
 import worker from "../dashboard/worker.ts";
+import { internalQueueRequestHeaders } from "../dist/repair/exact-review-command-queue.js";
 import {
   WorkerBlobsUnavailableError,
   downloadStateBlob,
@@ -353,12 +354,15 @@ function viaWorker(env: Record<string, unknown>): typeof globalThis.fetch {
 
 function signedBlobRequest(operation: string, payload: unknown) {
   const body = JSON.stringify(payload);
+  const requestPath = `/internal/state/blobs/${operation}`;
   return new Request(`${baseUrl}/internal/state/blobs/${operation}`, {
     method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "x-clawsweeper-exact-review-signature": `sha256=${createHmac("sha256", secret).update(body).digest("hex")}`,
-    },
+    headers: internalQueueRequestHeaders({
+      secret,
+      method: "POST",
+      path: requestPath,
+      body,
+    }),
     body,
   });
 }

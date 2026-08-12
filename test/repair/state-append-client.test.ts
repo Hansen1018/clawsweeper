@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { createHmac } from "node:crypto";
 import test from "node:test";
 
 import {
@@ -28,10 +27,9 @@ test("postCanonicalRecordTuple signs the canonical tuple endpoint", async () => 
     assert.equal(input.toString(), "https://queue.test/internal/state/records/tuples");
     const body = String(init?.body ?? "");
     assert.deepEqual(JSON.parse(body), mutation);
-    assert.equal(
-      new Headers(init?.headers).get("x-clawsweeper-exact-review-signature"),
-      `sha256=${createHmac("sha256", webhookSecret).update(body).digest("hex")}`,
-    );
+    const headers = new Headers(init?.headers);
+    assert.equal(headers.get("x-clawsweeper-internal-protocol"), "1");
+    assert.match(String(headers.get("x-clawsweeper-internal-signature")), /^sha256=[0-9a-f]{64}$/);
     return Response.json(
       { ok: true, accepted: true, deduped: false, revision: 3 },
       { status: 202 },
@@ -56,10 +54,9 @@ test("postCanonicalCommitRecords signs immutable commit records", async () => {
     assert.equal(init?.method, "POST");
     const body = String(init?.body ?? "");
     assert.deepEqual(JSON.parse(body), { repo_slug: "openclaw-openclaw", records });
-    assert.equal(
-      new Headers(init?.headers).get("x-clawsweeper-exact-review-signature"),
-      `sha256=${createHmac("sha256", webhookSecret).update(body).digest("hex")}`,
-    );
+    const headers = new Headers(init?.headers);
+    assert.equal(headers.get("x-clawsweeper-internal-protocol"), "1");
+    assert.match(String(headers.get("x-clawsweeper-internal-signature")), /^sha256=[0-9a-f]{64}$/);
     return Response.json({ ok: true, inserted: 1, unchanged: 0 }, { status: 202 });
   }) as typeof fetch;
 

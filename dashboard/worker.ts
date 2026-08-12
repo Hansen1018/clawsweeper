@@ -1,7 +1,15 @@
 import {
+  clawSweeperCommandAckMarker,
   commandTextForClawSweeperFastAck,
+  directReReviewAdditionalPrompt,
   isClawSweeperReReviewCommandText,
+  renderClawSweeperQueuedAcknowledgement,
+  reReviewContextFromClawSweeperComment,
 } from "../src/repair/comment-command-text.ts";
+import {
+  directReReviewIntake,
+  reReviewCommandVersionIdentity,
+} from "../src/repair/direct-re-review-admission.ts";
 import { isExactReviewCloseGuardLabel } from "../src/repair/exact-review-guard-labels.ts";
 import { bayHtml } from "./bay-page.ts";
 import { liveActivityBaySnapshot } from "./live-activity.ts";
@@ -56,7 +64,10 @@ import {
 
 export {
   ExactReviewQueue,
+  EXACT_REVIEW_COMMAND_RECEIPT_RETENTION_MS,
+  convergeCommandAcknowledgement,
   exactReviewEffectiveLeaseExpiresAt,
+  exactReviewJitteredDelayMs,
   exactReviewPublicationCapacity,
   exactReviewPublicationCapacityForState,
   exactReviewQueueAdmittedItems,
@@ -101,6 +112,7 @@ const BAY_INITIAL_TERMINAL_LOOKBACK_MS = BAY_TIMING_WINDOW_MS;
 const BAY_TIMING_MAX_SAMPLE_MS = 24 * 60 * 60 * 1000;
 const BAY_JOURNEY_LIMIT = 100;
 const BAY_JOURNEY_TTL_SECONDS = 24 * 60 * 60;
+const BAY_JOURNEY_SCHEMA_VERSION = 2;
 const AVERAGE_LIMIT = 4;
 const RECENT_CLOSED_LIMIT = 8;
 const CLOSED_STATS_HOURS = 24;
@@ -134,7 +146,6 @@ const CLAWSWEEPER_PULL_ITEM_ACTIONS = new Set([
   "unlocked",
   "unlabeled",
 ]);
-const DEFAULT_FAST_ACK_SETTLE_DELAYS_MS = [250, 1500, 10_000];
 const inFlightFastAcks = new Map();
 const CLAWSWEEPER_WEBHOOK_DENY_REPOS = new Set(["openclaw/clawsweeper-state", "openclaw/.github"]);
 const OPTIONAL_SECTION_TIMEOUT_MS = 6000;
@@ -544,16 +555,24 @@ export default {
       return json({ ok: true, service: "clawsweeper-github-webhook" });
     if (url.pathname === "/github/webhook" && request.method === "POST")
       return githubWebhook(request, env, ctx);
+    if (url.pathname === "/internal/exact-review/command-intake" && request.method === "POST")
+      return authenticatedExactReviewQueueRequest(request, env, "/command-intake");
     if (url.pathname === "/internal/exact-review/enqueue" && request.method === "POST")
-      return authenticatedExactReviewEnqueue(request, env);
+      return authenticatedExactReviewQueueRequest(request, env, "/enqueue");
     if (url.pathname === "/internal/exact-review/source-authority" && request.method === "POST")
       return authenticatedExactReviewQueueRequest(request, env, "/source-authority");
+    if (
+      url.pathname === "/internal/exact-review/source-authority/complete" &&
+      request.method === "POST"
+    )
+      return authenticatedExactReviewQueueRequest(request, env, "/source-authority/complete");
     if (url.pathname === "/internal/review-coverage/inventory" && request.method === "POST")
       return authenticatedExactReviewQueueRequest(request, env, "/review-coverage/inventory");
-    const fanoutCursorPath = /^\/internal\/state\/cursors\/(hot-intake|normal-review|audit)$/.exec(
-      url.pathname,
-    );
-    if (fanoutCursorPath && (request.method === "GET" || request.method === "PUT"))
+    const operationalCursorPath =
+      /^\/internal\/state\/cursors\/(hot-intake|normal-review|audit|review-placeholder-[a-f0-9]{16}-(?:open|closed))$/.exec(
+        url.pathname,
+      );
+    if (operationalCursorPath && (request.method === "GET" || request.method === "PUT"))
       return authenticatedExactReviewQueueCursorRequest(
         request,
         env,
@@ -1273,25 +1292,48 @@ async function githubWebhook(request, env, ctx) {
     return json({ ok: true, ...queued }, 202);
   }
 
-  const trigger = bayJourneyTriggerFromGithubWebhook({
-    decision,
-    payload,
-    deliveryId: request.headers.get("x-github-delivery"),
-  });
+  const trigger = await bayJourneyTriggerFromGithubWebhook({ decision, payload });
   if (trigger) await recordBayJourneyTelemetry(env, ctx, [trigger], []);
+
+  const commentDecision = decision as any;
+  if (
+    commentDecision.itemState === "open" &&
+    reReviewContextFromClawSweeperComment(commentDecision.commentBody) !== null
+  ) {
+    const updatedAt = exactWebhookTimestamp(commentDecision.commentUpdatedAt);
+    if (!updatedAt) return json({ error: "invalid_command_version" }, 400);
+    const intake = directReReviewIntake({
+      targetRepo: commentDecision.targetRepo,
+      targetBranch: commentDecision.targetBranch,
+      itemNumber: commentDecision.itemNumber,
+      itemKind: commentDecision.itemKind,
+      installationId: commentDecision.installationId,
+      sourceCommentId: commentDecision.commentId,
+      sourceCommentUpdatedAt: updatedAt,
+      commandBodyDigest: await sha256Text(commentDecision.commentBody),
+      commandOrigin: "hosted_webhook",
+      additionalPrompt: directReReviewAdditionalPrompt({
+        body: commentDecision.commentBody,
+        maintainerAuthorized: commentDecision.maintainerAuthorized === true,
+        author: commentDecision.commentAuthor,
+        commentUrl: commentDecision.commentUrl,
+      }),
+    });
+    const queue = exactReviewQueueStub(env);
+    if (!queue) return json({ error: "exact_review_queue_not_configured" }, 503);
+    const admitted = await queue.fetch(
+      new Request("https://clawsweeper-exact-review-queue/command-intake", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(intake),
+      }),
+    );
+    return admitted;
+  }
 
   const credentials = githubAppCredentials(env);
   if (!credentials) return json({ error: "github_app_not_configured" }, 503);
   const appJwt = await signGithubAppJwt(credentials.issuer, credentials.privateKey);
-  const dispatchToken = await createGithubAppTokenFor({
-    appJwt,
-    installationId: await githubAppInstallationId(appJwt, CLAWSWEEPER_REVIEW_REPO),
-    label: CLAWSWEEPER_REVIEW_REPO,
-    repositories: [repoName(CLAWSWEEPER_REVIEW_REPO)],
-    permissions: { contents: "write" },
-  });
-
-  const commentDecision = decision as any;
   const targetToken = await createGithubAppTokenFor({
     appJwt,
     installationId: commentDecision.installationId,
@@ -1301,6 +1343,13 @@ async function githubWebhook(request, env, ctx) {
       issues: "write",
       pull_requests: "write",
     },
+  });
+  const dispatchToken = await createGithubAppTokenFor({
+    appJwt,
+    installationId: await githubAppInstallationId(appJwt, CLAWSWEEPER_REVIEW_REPO),
+    label: CLAWSWEEPER_REVIEW_REPO,
+    repositories: [repoName(CLAWSWEEPER_REVIEW_REPO)],
+    permissions: { contents: "write" },
   });
   const statusCommentId = await createFastAckCommentOnce({
     token: targetToken,
@@ -1320,14 +1369,6 @@ async function githubWebhook(request, env, ctx) {
     statusCommentId,
     sourceDeliveryId: trigger?.source_delivery_id,
   });
-  settleFastAckComments({
-    token: targetToken,
-    repo: commentDecision.targetRepo,
-    itemNumber: commentDecision.itemNumber,
-    sourceCommentId: commentDecision.commentId,
-    delaysMs: fastAckSettleDelaysMs(env.CLAWSWEEPER_FAST_ACK_SETTLE_DELAYS_MS),
-    waitUntil: ctx?.waitUntil?.bind(ctx),
-  });
   return json({ ok: true, status_comment_id: statusCommentId }, 202);
 }
 
@@ -1343,7 +1384,7 @@ async function recordBayJourneyTelemetry(env, ctx, triggers, completions) {
   await write;
 }
 
-function bayJourneyTriggerFromGithubWebhook({ decision, payload, deliveryId }) {
+async function bayJourneyTriggerFromGithubWebhook({ decision, payload }) {
   if (!decision?.accepted || decision?.type !== "issue_comment") return null;
   const comment = objectValue(payload?.comment);
   const commandText = commandTextForClawSweeperFastAck(String(comment.body || ""));
@@ -1353,8 +1394,13 @@ function bayJourneyTriggerFromGithubWebhook({ decision, payload, deliveryId }) {
       ? comment.updated_at || comment.created_at
       : comment.created_at || comment.updated_at,
   );
-  const sourceDeliveryId = nullableString(deliveryId);
-  if (!triggerAt || !sourceDeliveryId) return null;
+  const updatedAt = exactWebhookTimestamp(comment.updated_at);
+  if (!triggerAt || !updatedAt) return null;
+  const sourceDeliveryId = reReviewCommandVersionIdentity({
+    commentId: Number(decision.commentId),
+    updatedAt,
+    bodySha256: await sha256Text(String(comment.body || "")),
+  });
   return {
     repository: decision.targetRepo,
     number: decision.itemNumber,
@@ -1487,15 +1533,16 @@ function classifyGithubIssueCommentWebhook({ event, payload }) {
     targetRepo,
     targetBranch,
     itemNumber,
+    itemKind: issue.pull_request ? "pull_request" : "issue",
+    itemState: String(issue.state || "").toLowerCase(),
     commentId,
     installationId,
     sourceAction: action,
-    ...(commentUpdatedAt
-      ? {
-          commentUpdatedAt,
-          commentBody: String(comment.body || ""),
-        }
-      : {}),
+    commentBody: String(comment.body || ""),
+    commentAuthor: String(objectValue(comment.user).login || ""),
+    commentUrl: String(comment.html_url || ""),
+    maintainerAuthorized: CLAWSWEEPER_ALLOWED_ASSOCIATIONS.has(association),
+    ...(commentUpdatedAt ? { commentUpdatedAt } : {}),
   };
 }
 
@@ -1616,10 +1663,12 @@ async function bindLivePullRequestHeadAuthority({
   env,
   decision,
   sourceAuthoritySeq,
+  token: suppliedToken,
 }: {
   env: DashboardEnv;
   decision: ExactReviewDecision & { installationId?: number };
   sourceAuthoritySeq: number | null;
+  token?: string;
 }): Promise<ExactReviewDecision | null> {
   if (decision.itemKind !== "pull_request") return decision;
   if (!Number.isSafeInteger(sourceAuthoritySeq) || Number(sourceAuthoritySeq) <= 0) {
@@ -1628,7 +1677,7 @@ async function bindLivePullRequestHeadAuthority({
   const sourceHeadSha = String(decision.sourceHeadSha || "").toLowerCase();
   if (!/^[0-9a-f]{40}$/.test(sourceHeadSha)) return null;
 
-  let token = stringEnv(env.GITHUB_TOKEN);
+  let token = suppliedToken || stringEnv(env.GITHUB_TOKEN);
   if (!token) {
     const credentials = githubAppCredentials(env);
     if (
@@ -2063,36 +2112,17 @@ export async function exactReviewQueueStatusSnapshot(
   return body;
 }
 
-async function authenticatedExactReviewEnqueue(request, env) {
-  const secret = stringEnv(env.CLAWSWEEPER_WEBHOOK_SECRET);
-  if (!secret) return json({ error: "webhook_not_configured" }, 503);
-  const body = await request.text();
-  const signature = request.headers.get("x-clawsweeper-exact-review-signature") || "";
-  if (!(await verifyGithubWebhookSignature({ secret, signature, bodyText: body }))) {
-    return json({ error: "invalid_signature" }, 401);
-  }
-  return exactReviewQueueRequest(
-    env,
-    "/enqueue",
-    new Request("https://clawsweeper-exact-review-queue/enqueue", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body,
-    }),
-  );
-}
-
 async function authenticatedExactReviewQueueRequest(
   request,
   env,
   path: string,
   onAuthenticatedResponse?: (body: string, response: Response) => Promise<void>,
 ) {
-  const secret = stringEnv(env.CLAWSWEEPER_WEBHOOK_SECRET);
+  const secret =
+    stringEnv(env.CLAWSWEEPER_INTERNAL_QUEUE_SECRET) || stringEnv(env.CLAWSWEEPER_WEBHOOK_SECRET);
   if (!secret) return json({ error: "webhook_not_configured" }, 503);
   const body = await request.text();
-  const signature = request.headers.get("x-clawsweeper-exact-review-signature") || "";
-  if (!(await verifyGithubWebhookSignature({ secret, signature, bodyText: body }))) {
+  if (!(await verifyInternalQueueEnvelope({ request, secret, bodyText: body }))) {
     return json({ error: "invalid_signature" }, 401);
   }
   const response = await exactReviewQueueRequest(
@@ -2156,11 +2186,10 @@ async function authenticatedLifecycleCommandAcknowledgement(request, env, ctx) {
 }
 
 async function authenticatedExactReviewQueueRead(request, env, path: string) {
-  const secret = stringEnv(env.CLAWSWEEPER_WEBHOOK_SECRET);
+  const secret = internalQueueSecret(env);
   if (!secret) return json({ error: "webhook_not_configured" }, 503);
   const body = await request.text();
-  const signature = request.headers.get("x-clawsweeper-exact-review-signature") || "";
-  if (!(await verifyGithubWebhookSignature({ secret, signature, bodyText: body }))) {
+  if (!(await verifyInternalQueueEnvelope({ request, secret, bodyText: body }))) {
     return json({ error: "invalid_signature" }, 401);
   }
   return exactReviewQueueRequest(
@@ -2171,11 +2200,10 @@ async function authenticatedExactReviewQueueRead(request, env, path: string) {
 }
 
 async function authenticatedExactReviewQueueCursorRequest(request, env, path: string) {
-  const secret = stringEnv(env.CLAWSWEEPER_WEBHOOK_SECRET);
+  const secret = internalQueueSecret(env);
   if (!secret) return json({ error: "webhook_not_configured" }, 503);
   const body = await request.text();
-  const signature = request.headers.get("x-clawsweeper-exact-review-signature") || "";
-  if (!(await verifyGithubWebhookSignature({ secret, signature, bodyText: body }))) {
+  if (!(await verifyInternalQueueEnvelope({ request, secret, bodyText: body }))) {
     return json({ error: "invalid_signature" }, 401);
   }
   const init: RequestInit = {
@@ -2191,11 +2219,10 @@ async function authenticatedExactReviewQueueCursorRequest(request, env, path: st
 }
 
 async function authenticatedStateBlobRequest(request, env, operation: StateBlobOperation) {
-  const secret = stringEnv(env.CLAWSWEEPER_WEBHOOK_SECRET);
+  const secret = internalQueueSecret(env);
   if (!secret) return json({ error: "webhook_not_configured" }, 503);
   const bodyText = await request.text();
-  const signature = request.headers.get("x-clawsweeper-exact-review-signature") || "";
-  if (!(await verifyGithubWebhookSignature({ secret, signature, bodyText }))) {
+  if (!(await verifyInternalQueueEnvelope({ request, secret, bodyText }))) {
     return json({ error: "invalid_signature" }, 401);
   }
   const body = parseJsonObject(bodyText);
@@ -2207,8 +2234,7 @@ async function authenticatedExactReviewOperatorRequest(request, env, path: strin
   const secret = stringEnv(env.EXACT_REVIEW_OPERATOR_SECRET);
   if (!secret) return json({ error: "operator_not_configured" }, 503);
   const body = await request.text();
-  const signature = request.headers.get("x-clawsweeper-exact-review-signature") || "";
-  if (!(await verifyGithubWebhookSignature({ secret, signature, bodyText: body }))) {
+  if (!(await verifyInternalQueueEnvelope({ request, secret, bodyText: body }))) {
     return json({ error: "invalid_signature" }, 401);
   }
   return exactReviewQueueRequest(
@@ -2223,13 +2249,12 @@ async function authenticatedExactReviewOperatorRequest(request, env, path: strin
 }
 
 async function authenticatedApplyObservability(request, env) {
-  const secret = stringEnv(env.CLAWSWEEPER_WEBHOOK_SECRET);
+  const secret = internalQueueSecret(env);
   if (!secret) return json({ error: "webhook_not_configured" }, 503);
   if (!isDurableStatusStore(env.STATUS_STORE))
     return json({ error: "apply_observability_not_configured" }, 503);
   const body = await request.text();
-  const signature = request.headers.get("x-clawsweeper-exact-review-signature") || "";
-  if (!(await verifyGithubWebhookSignature({ secret, signature, bodyText: body }))) {
+  if (!(await verifyInternalQueueEnvelope({ request, secret, bodyText: body }))) {
     return json({ error: "invalid_signature" }, 401);
   }
   return durableStatusStoreStub(env.STATUS_STORE).fetch(
@@ -2277,11 +2302,10 @@ async function applyObservabilityJson(request: Request, env: DashboardEnv) {
 }
 
 async function authenticatedExactReviewReconcile(request, env) {
-  const secret = stringEnv(env.CLAWSWEEPER_WEBHOOK_SECRET);
+  const secret = internalQueueSecret(env);
   if (!secret) return json({ error: "webhook_not_configured" }, 503);
   const bodyText = await request.text();
-  const signature = request.headers.get("x-clawsweeper-exact-review-signature") || "";
-  if (!(await verifyGithubWebhookSignature({ secret, signature, bodyText }))) {
+  if (!(await verifyInternalQueueEnvelope({ request, secret, bodyText }))) {
     return json({ error: "invalid_signature" }, 401);
   }
   const body = parseJsonObject(bodyText);
@@ -2442,58 +2466,81 @@ async function enqueueExactReview({
   return body;
 }
 
-async function createFastAckComment({ token, repo, itemNumber, sourceCommentId }) {
-  const existingId = await pruneFastAckComments({ token, repo, itemNumber, sourceCommentId });
-  if (existingId) return existingId;
-  const payload = await githubTokenJson({
-    token,
-    path: `/repos/${repo}/issues/${itemNumber}/comments`,
-    method: "POST",
-    body: { body: renderFastAckComment(sourceCommentId) },
-    errorLabel: "ClawSweeper ack comment",
-  });
-  return (
-    (await pruneFastAckComments({ token, repo, itemNumber, sourceCommentId })) ||
-    Number(payload.id) ||
-    null
-  );
-}
-
-function settleFastAckComments({
+async function createFastAckCommentOnce({
   token,
   repo,
   itemNumber,
   sourceCommentId,
-  delaysMs = DEFAULT_FAST_ACK_SETTLE_DELAYS_MS,
-  waitUntil,
+  statusMarker = "",
 }) {
-  const cleanup = async () => {
-    for (const delayMs of delaysMs) {
-      await sleep(delayMs);
-      await pruneFastAckComments({ token, repo, itemNumber, sourceCommentId });
-    }
-  };
-  const promise = cleanup().catch((error) => {
-    console.error(`ClawSweeper fast ack cleanup failed: ${error?.message || error}`);
-  });
-  if (waitUntil) waitUntil(promise);
-}
-
-function fastAckSettleDelaysMs(value) {
-  const delays = String(value || "")
-    .split(",")
-    .map((entry) => Number.parseInt(entry.trim(), 10))
-    .filter((delay) => Number.isFinite(delay) && delay >= 0);
-  return delays.length > 0 ? delays : DEFAULT_FAST_ACK_SETTLE_DELAYS_MS;
-}
-
-async function createFastAckCommentOnce({ token, repo, itemNumber, sourceCommentId }) {
-  const key = fastAckKey({ repo, itemNumber, sourceCommentId });
+  const key = `${fastAckKey({ repo, itemNumber, sourceCommentId })}:${statusMarker || "router"}`;
   const pending = inFlightFastAcks.get(key);
   if (pending) return pending;
-  const next = createFastAckComment({ token, repo, itemNumber, sourceCommentId }).finally(() => {
-    inFlightFastAcks.delete(key);
-  });
+  const next = (async () => {
+    const comments = await listFastAckComments({ token, repo, itemNumber, sourceCommentId });
+    const bare = comments.find(
+      (comment) =>
+        !/clawsweeper-command-(?:status|progress)/.test(String(objectValue(comment).body || "")),
+    );
+    const matching = statusMarker
+      ? comments.find((comment) => String(objectValue(comment).body || "").includes(statusMarker))
+      : bare;
+    if (matching) {
+      const converged = planGenericAcknowledgementConvergence(comments);
+      for (const id of converged.prunableIds) {
+        await githubTokenJson({
+          token,
+          path: `/repos/${repo}/issues/comments/${id}`,
+          method: "DELETE",
+          body: undefined,
+          errorLabel: "ClawSweeper duplicate acknowledgement cleanup",
+        }).catch((error) => {
+          if (!String(error?.message || error).includes("404")) {
+            console.error(`ClawSweeper duplicate acknowledgement cleanup deferred: ${error}`);
+          }
+        });
+      }
+      return converged.keepId ?? Number(objectValue(matching).id);
+    }
+    const body = renderClawSweeperQueuedAcknowledgement(sourceCommentId, statusMarker || undefined);
+    const bareId = Number(objectValue(bare).id) || null;
+    const result = await githubTokenJson({
+      token,
+      path: bareId
+        ? `/repos/${repo}/issues/comments/${bareId}`
+        : `/repos/${repo}/issues/${itemNumber}/comments`,
+      method: bareId ? "PATCH" : "POST",
+      body: { body },
+      errorLabel: "ClawSweeper direct review ack",
+    });
+    const resultId = Number(result.id || bareId);
+    const converged = planGenericAcknowledgementConvergence([
+      ...(await listFastAckComments({ token, repo, itemNumber, sourceCommentId })),
+      {
+        ...objectValue(result),
+        id: resultId,
+        body,
+        created_at:
+          objectValue(result).created_at ||
+          objectValue(bare).created_at ||
+          new Date().toISOString(),
+      },
+    ]);
+    for (const id of converged.prunableIds) {
+      await githubTokenJson({
+        token,
+        path: `/repos/${repo}/issues/comments/${id}`,
+        method: "DELETE",
+        body: undefined,
+        errorLabel: "ClawSweeper duplicate acknowledgement cleanup",
+      }).catch((error) => {
+        if (!String(error?.message || error).includes("404")) {
+          console.error(`ClawSweeper duplicate acknowledgement cleanup deferred: ${error}`);
+        }
+      });
+    }
+    return converged.keepId ?? resultId;
+  })().finally(() => inFlightFastAcks.delete(key));
   inFlightFastAcks.set(key, next);
   return next;
 }
@@ -2502,74 +2549,29 @@ function fastAckKey({ repo, itemNumber, sourceCommentId }) {
   return `${String(repo).toLowerCase()}:${itemNumber}:${sourceCommentId}`;
 }
 
-function sleep(delayMs) {
-  return new Promise((resolve) => {
-    const timer = setTimeout(resolve, delayMs);
-    timer.unref?.();
-  });
-}
-
-async function pruneFastAckComments({ token, repo, itemNumber, sourceCommentId }) {
-  const comments = await listFastAckComments({ token, repo, itemNumber, sourceCommentId });
-  if (!comments.length) return null;
-  const hasStatusComment = comments.some(isStatusBearingFastAckComment);
-  comments.sort(compareFastAckKeepPriority);
-  const keepId = Number(objectValue(comments[0]).id) || null;
-  for (const comment of comments) {
-    const id = Number(objectValue(comment).id) || 0;
-    if (id <= 0 || id === keepId) continue;
-    if (hasStatusComment && isStatusBearingFastAckComment(comment)) continue;
-    await githubTokenJson({
-      token,
-      path: `/repos/${repo}/issues/comments/${id}`,
-      method: "DELETE",
-      body: undefined,
-      errorLabel: "ClawSweeper duplicate ack cleanup",
-    }).catch((error) => {
-      if (!String(error?.message || "").includes("404")) throw error;
-      return null;
-    });
-  }
-  return keepId;
-}
-
-function compareFastAckKeepPriority(left, right) {
-  const leftStatus = isStatusBearingFastAckComment(left) ? 1 : 0;
-  const rightStatus = isStatusBearingFastAckComment(right) ? 1 : 0;
-  if (leftStatus !== rightStatus) return rightStatus - leftStatus;
-  if (leftStatus > 0) return compareCommentsByUpdatedAtDesc(left, right);
-  return compareCommentsByCreatedAt(left, right);
-}
-
-function isStatusBearingFastAckComment(comment) {
-  const body = String(objectValue(comment).body || "");
-  return (
-    body.includes("clawsweeper-command-status:") ||
-    body.includes("<!-- clawsweeper-command-progress:start -->")
-  );
-}
-
-function compareCommentsByUpdatedAtDesc(left, right) {
-  const leftUpdated = String(objectValue(left).updated_at || objectValue(left).created_at || "");
-  const rightUpdated = String(objectValue(right).updated_at || objectValue(right).created_at || "");
-  return (
-    rightUpdated.localeCompare(leftUpdated) ||
-    (Number(objectValue(right).id) || 0) - (Number(objectValue(left).id) || 0)
-  );
-}
-
-function compareCommentsByCreatedAt(left, right) {
-  const leftCreated = String(objectValue(left).created_at || "");
-  const rightCreated = String(objectValue(right).created_at || "");
-  return (
-    leftCreated.localeCompare(rightCreated) ||
-    (Number(objectValue(left).id) || 0) - (Number(objectValue(right).id) || 0)
-  );
+function planGenericAcknowledgementConvergence(comments) {
+  const candidates = comments
+    .filter(
+      (comment) => !String(objectValue(comment).body || "").includes("clawsweeper-command-status:"),
+    )
+    .sort(
+      (left, right) =>
+        String(objectValue(left).created_at || "").localeCompare(
+          String(objectValue(right).created_at || ""),
+        ) || Number(objectValue(left).id) - Number(objectValue(right).id),
+    );
+  const keepId = Number(objectValue(candidates[0]).id) || null;
+  return {
+    keepId,
+    prunableIds: candidates
+      .map((comment) => Number(objectValue(comment).id))
+      .filter((id) => Number.isSafeInteger(id) && id > 0 && id !== keepId),
+  };
 }
 
 async function listFastAckComments({ token, repo, itemNumber, sourceCommentId }) {
   const comments = [];
-  const marker = fastAckMarker(sourceCommentId);
+  const marker = clawSweeperCommandAckMarker(sourceCommentId);
   const since = encodeURIComponent(new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString());
   for (let page = 1; page <= 5; page += 1) {
     const payload = await githubTokenJson({
@@ -2591,20 +2593,6 @@ async function listFastAckComments({ token, repo, itemNumber, sourceCommentId })
     if (payload.length < 100) return comments;
   }
   return comments;
-}
-
-function renderFastAckComment(sourceCommentId) {
-  return [
-    fastAckMarker(sourceCommentId),
-    "🦞👀",
-    "ClawSweeper picked this up.",
-    "",
-    "Command router queued. I will update this comment with the next step.",
-  ].join("\n");
-}
-
-function fastAckMarker(sourceCommentId) {
-  return `<!-- clawsweeper-command-ack:${sourceCommentId} -->`;
 }
 
 async function addIssueCommentReaction({ token, repo, commentId, content }) {
@@ -2642,7 +2630,7 @@ async function dispatchClawsweeperComment({ token, decision, statusCommentId, so
         target_branch: decision.targetBranch,
         item_number: decision.itemNumber,
         comment_id: decision.commentId,
-        status_comment_id: statusCommentId,
+        ...(statusCommentId ? { status_comment_id: statusCommentId } : {}),
         ...(sourceDeliveryId ? {} : { source_event: "issue_comment" }),
         source_action: decision.sourceAction,
         ...(sourceDeliveryId ? { source_delivery_id: sourceDeliveryId } : {}),
@@ -2698,6 +2686,26 @@ async function verifyGithubWebhookSignature({ secret, signature, bodyText }) {
   const digest = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(bodyText));
   const expected = `sha256=${hexEncode(new Uint8Array(digest))}`;
   return constantTimeEqual(expected, actual);
+}
+
+async function verifyInternalQueueEnvelope({ request, secret, bodyText }) {
+  if (!secret) return false;
+  const protocol = request.headers.get("x-clawsweeper-internal-protocol") || "";
+  const timestamp = request.headers.get("x-clawsweeper-internal-timestamp") || "";
+  const signature = request.headers.get("x-clawsweeper-internal-signature") || "";
+  const timestampSeconds = Number(timestamp);
+  if (
+    protocol !== "1" ||
+    !Number.isSafeInteger(timestampSeconds) ||
+    Math.abs(Math.floor(Date.now() / 1000) - timestampSeconds) > 300 ||
+    !signature.startsWith("sha256=")
+  ) {
+    return false;
+  }
+  const digest = await sha256Text(bodyText);
+  const path = new URL(request.url).pathname;
+  const canonical = [protocol, timestamp, request.method, path, digest].join("\n");
+  return verifyGithubWebhookSignature({ secret, signature, bodyText: canonical });
 }
 
 function parseJsonObject(text) {
@@ -4241,13 +4249,17 @@ export function mergeBayJourneyState(previous, triggers, completions, generatedA
   const now = Number.isFinite(parsedNow) ? parsedNow : Date.now();
   const cutoff = now - BAY_JOURNEY_TTL_SECONDS * 1000;
   const records = new Map();
+  const legacyBridgeRecordIds = new Set();
   for (const value of Array.isArray(previous?.journeys) ? previous.journeys : []) {
     const record = normalizeBayJourneyRecord(value);
     const activityAt = Math.max(
       Date.parse(String(record?.completed_at || "")) || 0,
       Date.parse(String(record?.triggered_at || "")) || 0,
     );
-    if (record && activityAt >= cutoff) records.set(record.id, record);
+    if (record && activityAt >= cutoff) {
+      records.set(record.id, record);
+      if (Number(previous?.schema_version) === 1) legacyBridgeRecordIds.add(record.id);
+    }
   }
   for (const value of Array.isArray(triggers) ? triggers : []) {
     const trigger = normalizeBayJourneyTrigger(value);
@@ -4351,6 +4363,23 @@ export function mergeBayJourneyState(previous, triggers, completions, generatedA
       }
       exactCompletion = undefined;
     }
+    const legacyTransportTriggers =
+      legacyBridgeRecordIds.size && completion.source_delivery_id?.startsWith("command-")
+        ? [...records.values()].filter(
+            (record) =>
+              legacyBridgeRecordIds.has(record.id) &&
+              record.repository === completion.repository &&
+              record.number === completion.number &&
+              record.source_comment_id === completion.source_comment_id &&
+              record.source_delivery_id &&
+              !String(record.source_delivery_id).startsWith("command-") &&
+              record.triggered_at &&
+              !record.completed_at &&
+              Date.parse(record.triggered_at) <= Date.parse(completion.completed_at),
+          )
+        : [];
+    const legacyTransportTrigger =
+      legacyTransportTriggers.length === 1 ? legacyTransportTriggers[0] : undefined;
     const current =
       exactCompletion ||
       (completion.source_delivery_id
@@ -4365,6 +4394,7 @@ export function mergeBayJourneyState(previous, triggers, completions, generatedA
                 Date.parse(record.triggered_at) <= Date.parse(completion.completed_at)),
           )
         : undefined) ||
+      legacyTransportTrigger ||
       [...records.values()]
         .filter(
           (record) =>
@@ -4389,7 +4419,16 @@ export function mergeBayJourneyState(previous, triggers, completions, generatedA
         )[0] ||
       records.get(completion.id) ||
       {};
-    const recordId = current.id || completion.id;
+    const recordId =
+      current === legacyTransportTrigger && current.triggered_at
+        ? bayJourneyId(
+            completion.repository,
+            completion.number,
+            completion.source_comment_id,
+            completion.source_delivery_id,
+            current.triggered_at,
+          )
+        : current.id || completion.id;
     const currentCompletedAt = Date.parse(String(current.completed_at || ""));
     const completionAt = Date.parse(completion.completed_at);
     if (
@@ -4468,7 +4507,7 @@ export function mergeBayJourneyState(previous, triggers, completions, generatedA
     )
     .slice(0, BAY_JOURNEY_LIMIT);
   return {
-    schema_version: 1,
+    schema_version: BAY_JOURNEY_SCHEMA_VERSION,
     journeys,
     updated_at: new Date(now).toISOString(),
   };
@@ -6908,6 +6947,12 @@ function base64UrlEncode(value) {
 function stringEnv(value) {
   const text = String(value || "").trim();
   return text ? text : "";
+}
+
+function internalQueueSecret(env) {
+  return (
+    stringEnv(env.CLAWSWEEPER_INTERNAL_QUEUE_SECRET) || stringEnv(env.CLAWSWEEPER_WEBHOOK_SECRET)
+  );
 }
 
 async function withTimeout(promise, timeoutMs, label) {

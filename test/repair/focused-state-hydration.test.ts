@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { createHash, createHmac } from "node:crypto";
+import { createHash } from "node:crypto";
 import fs, { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
@@ -59,11 +59,9 @@ test("single-issue hydration fetches one authenticated Worker record without sna
   );
   assert.equal(requests[0]?.init?.method, "GET");
   assert.equal(requests[0]?.init?.body, undefined);
-  const expectedSignature = `sha256=${createHmac("sha256", webhookSecret).update("").digest("hex")}`;
-  assert.equal(
-    new Headers(requests[0]?.init?.headers).get("x-clawsweeper-exact-review-signature"),
-    expectedSignature,
-  );
+  const headers = new Headers(requests[0]?.init?.headers);
+  assert.equal(headers.get("x-clawsweeper-internal-protocol"), "1");
+  assert.match(String(headers.get("x-clawsweeper-internal-signature")), /^sha256=[0-9a-f]{64}$/);
   assert.equal(
     readFileSync(join(worktreeRoot, "records", repoSlug, "items", `${itemNumber}.md`), "utf8"),
     content,

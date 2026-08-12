@@ -1,10 +1,12 @@
-import { createHmac, timingSafeEqual } from "node:crypto";
-
 import type {
   ExactReviewBatchCompletion,
   ExactReviewBatchMember,
 } from "./exact-review-batch-publisher.js";
 import type { StateWriterOperation, StateWriterProgress } from "../state-writer-telemetry.js";
+import {
+  INTERNAL_QUEUE_REQUEST_TIMEOUT_MS,
+  internalQueueRequestHeaders,
+} from "./exact-review-command-queue.js";
 
 export type ExactReviewBatchQueueItem = ExactReviewBatchMember & { decision: unknown };
 
@@ -313,15 +315,16 @@ export class ExactReviewBatchQueueClient implements ExactReviewBatchQueue {
     payload: Record<string, unknown>,
   ): Promise<Record<string, unknown>> {
     const body = JSON.stringify(payload);
-    const signature = `sha256=${createHmac("sha256", this.webhookSecret).update(body).digest("hex")}`;
     const response = await this.request(`${this.baseUrl}${path}`, {
       method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-clawsweeper-exact-review-signature": signature,
-      },
+      headers: internalQueueRequestHeaders({
+        secret: this.webhookSecret,
+        method: "POST",
+        path,
+        body,
+      }),
       body,
-      signal: AbortSignal.timeout(20_000),
+      signal: AbortSignal.timeout(INTERNAL_QUEUE_REQUEST_TIMEOUT_MS),
     });
     const text = await response.text();
     let parsed: unknown;
@@ -338,17 +341,6 @@ export class ExactReviewBatchQueueClient implements ExactReviewBatchQueue {
     }
     return objectValue(parsed);
   }
-}
-
-export function verifyExactReviewBatchSignature(
-  body: string,
-  signature: string,
-  webhookSecret: string,
-): boolean {
-  const expected = `sha256=${createHmac("sha256", webhookSecret).update(body).digest("hex")}`;
-  const left = Buffer.from(signature);
-  const right = Buffer.from(expected);
-  return left.length === right.length && timingSafeEqual(left, right);
 }
 
 function parseQueueItem(value: unknown): ExactReviewBatchQueueItem {

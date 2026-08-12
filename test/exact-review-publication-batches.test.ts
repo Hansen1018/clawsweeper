@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { createHmac, generateKeyPairSync } from "node:crypto";
+import { generateKeyPairSync } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 
@@ -15,6 +15,7 @@ import {
 import { EXACT_REVIEW_LIFECYCLE_PROJECTION_TABLE } from "../dashboard/exact-review-lifecycle.ts";
 import { ExactReviewQueue } from "../dashboard/exact-review-queue.ts";
 import worker from "../dashboard/worker.ts";
+import { internalQueueRequestHeaders } from "../dist/repair/exact-review-command-queue.js";
 
 class SqlCursor<T extends Record<string, unknown>> implements Iterable<T> {
   private readonly rows: T[];
@@ -1348,7 +1349,7 @@ test("stale publication ingress is acknowledged without replacing a newer revisi
     const removedNewer = await (
       await queue.fetch(
         batchRequest("/publications/supersede", {
-          items: [{ item_key: "openclaw/openclaw#108701@publish:2202:1", revision: 1 }],
+          items: [{ item_key: "openclaw/openclaw#108701@publish:2202:1", revision: 3 }],
         }),
       )
     ).json();
@@ -1401,7 +1402,7 @@ test("publication reconcile preserves active batches and removes older revisions
     const removedNewer = await (
       await queue.fetch(
         batchRequest("/publications/supersede", {
-          items: [{ item_key: "openclaw/openclaw#108702@publish:2302:1", revision: 1 }],
+          items: [{ item_key: "openclaw/openclaw#108702@publish:2302:1", revision: 3 }],
         }),
       )
     ).json();
@@ -2030,11 +2031,15 @@ test("batch protocol routes require the shared internal signature", async () => 
   const unauthorized = await worker.fetch(new Request(url, { method: "POST", body }), env);
   assert.equal(unauthorized.status, 401);
 
-  const signature = `sha256=${createHmac("sha256", secret).update(body).digest("hex")}`;
   const authorized = await worker.fetch(
     new Request(url, {
       method: "POST",
-      headers: { "x-clawsweeper-exact-review-signature": signature },
+      headers: internalQueueRequestHeaders({
+        secret,
+        method: "POST",
+        path: "/internal/exact-review/publication-batches/claim",
+        body,
+      }),
       body,
     }),
     env,
@@ -2360,11 +2365,15 @@ test("authenticated publication reconciliation dry-run reports without mutation"
     const unauthorized = await worker.fetch(new Request(url, { method: "POST", body }), env);
     assert.equal(unauthorized.status, 401);
 
-    const signature = `sha256=${createHmac("sha256", secret).update(body).digest("hex")}`;
     const authorized = await worker.fetch(
       new Request(url, {
         method: "POST",
-        headers: { "x-clawsweeper-exact-review-signature": signature },
+        headers: internalQueueRequestHeaders({
+          secret,
+          method: "POST",
+          path: "/internal/exact-review/publications/reconcile",
+          body,
+        }),
         body,
       }),
       env,
@@ -2434,7 +2443,7 @@ test("queue fetch terminalizes a stale batch revision before dispatch", async ()
       )
     ).json();
     assert.equal(claim.claimed, true, JSON.stringify(claim));
-    assert.equal(claim.batch.items[0].revision, 1);
+    assert.equal(claim.batch.items[0].revision, 2);
 
     const retriedClaim = await (
       await queue.fetch(
@@ -2485,7 +2494,7 @@ test("queue fetch terminalizes a stale batch revision before dispatch", async ()
           WHERE canonical_target_key = ? AND fence_key = ? AND revision = ?`,
         "openclaw/openclaw#102",
         claim.batch.items[0].item_key,
-        1,
+        claim.batch.items[0].revision,
       ),
     )[0] as { projection_json: string };
     const lifecycle = JSON.parse(lifecycleRow.projection_json) as {
@@ -2515,7 +2524,7 @@ test("queue fetch terminalizes a stale batch revision before dispatch", async ()
         }),
       )
     ).json();
-    assert.equal(next.batch.items[0].revision, 2);
+    assert.equal(next.batch.items[0].revision, 3);
     assert.equal(next.batch.items[0].claim_generation, 2);
   } finally {
     Date.now = originalNow;
@@ -2909,7 +2918,7 @@ test("batch fetch supersedes a claimed publication when the source head advances
         }),
       )
     ).json();
-    assert.equal(next.batch.items[0].revision, 1);
+    assert.equal(next.batch.items[0].revision, 3);
     assert.equal(next.batch.items[0].item_key, "openclaw/openclaw#200@publish:7302:1");
   } finally {
     Date.now = originalNow;
@@ -3318,7 +3327,7 @@ test("batch failure completion requeues a newer revision owned by the same lease
       )
     ).json();
     assert.equal(replacement.claimed, true, JSON.stringify(replacement));
-    assert.equal(replacement.batch.items[0].revision, 2);
+    assert.equal(replacement.batch.items[0].revision, 3);
     assert.notEqual(replacement.batch.items[0].claim_generation, member.claim_generation);
   } finally {
     Date.now = originalNow;
@@ -3382,7 +3391,7 @@ test("batch published completion preserves a newer revision owned by the same le
       )
     ).json();
     assert.equal(replacement.claimed, true, JSON.stringify(replacement));
-    assert.equal(replacement.batch.items[0].revision, 2);
+    assert.equal(replacement.batch.items[0].revision, 3);
     assert.notEqual(replacement.batch.items[0].claim_generation, member.claim_generation);
   } finally {
     Date.now = originalNow;

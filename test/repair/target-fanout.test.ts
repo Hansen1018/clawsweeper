@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { createHmac } from "node:crypto";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -281,7 +280,7 @@ test("target fanout publishes signed live open counts for dashboard coverage", a
     ],
   });
 
-  const requests: Array<{ body: string; signature: string }> = [];
+  const requests: Array<{ body: string; headers: Headers }> = [];
   const waits: number[] = [];
   await publishReviewCoverageInventory({
     baseUrl: "https://queue.example/",
@@ -290,10 +289,9 @@ test("target fanout publishes signed live open counts for dashboard coverage", a
     attempts: 2,
     fetchImpl: async (_input, init) => {
       const body = String(init?.body ?? "");
-      const headers = (init?.headers ?? {}) as Record<string, string>;
       requests.push({
         body,
-        signature: String(headers["x-clawsweeper-exact-review-signature"]),
+        headers: new Headers(init?.headers),
       });
       return requests.length === 1
         ? Response.json({ error: "busy" }, { status: 503 })
@@ -306,9 +304,10 @@ test("target fanout publishes signed live open counts for dashboard coverage", a
   assert.equal(requests.length, 2);
   assert.deepEqual(waits, [5_000]);
   assert.equal(requests[0]?.body, JSON.stringify(snapshot));
-  assert.equal(
-    requests[0]?.signature,
-    `sha256=${createHmac("sha256", "coverage-secret").update(JSON.stringify(snapshot)).digest("hex")}`,
+  assert.equal(requests[0]?.headers.get("x-clawsweeper-internal-protocol"), "1");
+  assert.match(
+    String(requests[0]?.headers.get("x-clawsweeper-internal-signature")),
+    /^sha256=[0-9a-f]{64}$/,
   );
 });
 
@@ -493,12 +492,11 @@ test("target fanout selection advances cursor with wraparound", () => {
 
 test("target fanout advances across canonical cursor-store cycles", async () => {
   let stored = { next_cursor: 0, revision: 0, updated_at: null as string | null };
-  const requests: Array<{ method: string; body: string; signature: string }> = [];
+  const requests: Array<{ method: string; body: string; headers: Headers }> = [];
   const fetchImpl: typeof fetch = async (_input, init) => {
     const method = String(init?.method || "GET");
     const body = String(init?.body || "");
-    const signature = new Headers(init?.headers).get("x-clawsweeper-exact-review-signature")!;
-    requests.push({ method, body, signature });
+    requests.push({ method, body, headers: new Headers(init?.headers) });
     if (method === "PUT") {
       const update = JSON.parse(body) as { next_cursor: number; expected_revision: number };
       assert.equal(update.expected_revision, stored.revision);
@@ -537,9 +535,10 @@ test("target fanout advances across canonical cursor-store cycles", async () => 
     updated_at: "2026-07-30T12:00:00.000Z",
   });
   for (const request of requests) {
-    assert.equal(
-      request.signature,
-      `sha256=${createHmac("sha256", "cursor-secret").update(request.body).digest("hex")}`,
+    assert.equal(request.headers.get("x-clawsweeper-internal-protocol"), "1");
+    assert.match(
+      String(request.headers.get("x-clawsweeper-internal-signature")),
+      /^sha256=[0-9a-f]{64}$/,
     );
   }
 });

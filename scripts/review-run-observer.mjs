@@ -7,10 +7,11 @@
  * 决策：无法证明是 review 的 sweep 运行直接跳过，避免把 apply/audit/router 支持任务计入成功率。
  */
 
-import { createHmac } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import process from "node:process";
 import { pathToFileURL } from "node:url";
+
+import { signedInternalQueueRequest } from "./internal-queue-request.mjs";
 
 export function usage() {
   return `Usage:
@@ -211,20 +212,16 @@ export async function fetchJobs(run, options = {}) {
 }
 
 async function publish(record) {
-  const secret = process.env.CLAWSWEEPER_WEBHOOK_SECRET || "";
+  const secret =
+    process.env.CLAWSWEEPER_INTERNAL_QUEUE_SECRET || process.env.CLAWSWEEPER_WEBHOOK_SECRET || "";
   const queueUrl = String(process.env.QUEUE_URL || "").replace(/\/$/, "");
-  if (!secret || !queueUrl)
-    throw new Error("CLAWSWEEPER_WEBHOOK_SECRET and QUEUE_URL are required");
+  if (!secret || !queueUrl) throw new Error("internal queue secret and QUEUE_URL are required");
   const body = JSON.stringify(record);
-  const signature = `sha256=${createHmac("sha256", secret).update(body).digest("hex")}`;
-  const response = await fetch(`${queueUrl}/internal/exact-review/review-run-telemetry`, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "x-clawsweeper-exact-review-signature": signature,
-    },
+  const response = await signedInternalQueueRequest({
+    baseUrl: queueUrl,
+    path: "/internal/exact-review/review-run-telemetry",
+    secret,
     body,
-    signal: AbortSignal.timeout(20_000),
   });
   if (!response.ok)
     throw new Error(`review telemetry write returned ${response.status}: ${await response.text()}`);

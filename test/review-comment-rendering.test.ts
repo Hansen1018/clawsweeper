@@ -1481,24 +1481,33 @@ test("publishing the durable review comment sweeps superseded placeholders", () 
 
   const applyStart = source.indexOf('syncReasons.push("updated durable Codex review comment")');
   assert.ok(applyStart >= 0);
-  const applyWindow = source.slice(applyStart, applyStart + 1200);
+  const applyWindow = source.slice(applyStart, applyStart + 3400);
   assert.match(applyWindow, /cleanupSupersededReviewPlaceholderComments\(\{/);
+  assert.match(applyWindow, /deferred superseded review placeholder cleanup/);
 });
 
 test("completed durable publication clears a recovery escalation only after the review exists", () => {
   const source = readFileSync("src/clawsweeper-apply-decision-workflow.ts", "utf8");
+  const cleanupObligation = source.indexOf("const needsReviewRecoveryLabelCleanup =");
+  const cleanupHelper = source.indexOf("const clearReviewRecoveryLabel =", cleanupObligation);
   const publication = source.indexOf("syncedComment = upsertReviewComment(");
-  const recoveryCleanup = source.indexOf("clearResolvedReviewRecoveryLabel({", publication);
-  const nextCatch = source.indexOf("} catch (error)", recoveryCleanup);
+  const cleanupCall = source.indexOf("clearReviewRecoveryLabel();", publication);
 
-  assert.ok(publication >= 0);
-  assert.ok(recoveryCleanup > publication);
+  assert.ok(cleanupObligation >= 0);
   assert.match(
-    source.slice(publication, recoveryCleanup),
-    /if \(complete && item\.labels\.includes\(REVIEW_RECOVERY_STUCK_LABEL\)\)/,
+    source.slice(cleanupObligation, cleanupHelper),
+    /complete && item\.labels\.includes\(REVIEW_RECOVERY_STUCK_LABEL\)/,
   );
-  assert.match(source.slice(recoveryCleanup, nextCatch), /removeLabel:\s*removeIssueLabel/);
-  assert.match(source.slice(recoveryCleanup, nextCatch), /"labels_synced_at"/);
+  assert.ok(publication >= 0);
+  assert.ok(cleanupHelper > cleanupObligation && cleanupHelper < publication);
+  assert.match(source.slice(cleanupHelper, publication), /clearResolvedReviewRecoveryLabel\(\{/);
+  assert.match(source.slice(cleanupHelper, publication), /removeLabel:\s*removeIssueLabel/);
+  assert.match(source.slice(cleanupHelper, publication), /"labels_synced_at"/);
+  assert.match(
+    source.slice(cleanupHelper, publication),
+    /retained review recovery label for cleanup retry/,
+  );
+  assert.ok(cleanupCall > publication);
 });
 
 test("placeholder sweep retries on every apply pass independent of comment body sync", () => {

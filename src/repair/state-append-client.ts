@@ -1,4 +1,4 @@
-import { createHmac } from "node:crypto";
+import { internalQueueRequestHeaders } from "./exact-review-command-queue.js";
 
 export type CanonicalRecordTupleOperation = {
   path: string;
@@ -59,20 +59,17 @@ export async function postCanonicalRecordTuple(options: {
     if (!queueUrl) throw new Error("canonical record queue URL is required");
     if (!options.webhookSecret) throw new Error("canonical record webhook secret is required");
     const body = JSON.stringify(options.mutation);
-    const signature = `sha256=${createHmac("sha256", options.webhookSecret)
-      .update(body)
-      .digest("hex")}`;
-    const response = await (options.fetchImpl ?? fetch)(
-      `${queueUrl}/internal/state/records/tuples`,
-      {
+    const path = "/internal/state/records/tuples";
+    const response = await (options.fetchImpl ?? fetch)(`${queueUrl}${path}`, {
+      method: "POST",
+      headers: internalQueueRequestHeaders({
+        secret: options.webhookSecret,
         method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "x-clawsweeper-exact-review-signature": signature,
-        },
+        path,
         body,
-      },
-    );
+      }),
+      body,
+    });
     const value = (await response.json().catch(() => null)) as unknown;
     const responseRecord = isRecord(value) ? value : null;
     if (!response.ok || !responseRecord || responseRecord.ok !== true) {
@@ -114,20 +111,17 @@ export async function postCanonicalCommitRecords(options: {
     if (!options.webhookSecret) throw new Error("canonical record webhook secret is required");
     if (!options.records.length) throw new Error("canonical commit records are required");
     const body = JSON.stringify({ repo_slug: options.repoSlug, records: options.records });
-    const signature = `sha256=${createHmac("sha256", options.webhookSecret)
-      .update(body)
-      .digest("hex")}`;
-    const response = await (options.fetchImpl ?? fetch)(
-      `${queueUrl}/internal/state/records/commits`,
-      {
+    const path = "/internal/state/records/commits";
+    const response = await (options.fetchImpl ?? fetch)(`${queueUrl}${path}`, {
+      method: "POST",
+      headers: internalQueueRequestHeaders({
+        secret: options.webhookSecret,
         method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "x-clawsweeper-exact-review-signature": signature,
-        },
+        path,
         body,
-      },
-    );
+      }),
+      body,
+    });
     const value = (await response.json().catch(() => null)) as unknown;
     if (!response.ok || !isRecord(value) || value.ok !== true) {
       const code = isRecord(value) ? String(value.error || "unknown_error") : "invalid_response";

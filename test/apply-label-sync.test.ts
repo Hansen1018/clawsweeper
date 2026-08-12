@@ -2578,15 +2578,20 @@ Full review comments:
   }
 });
 
-test("apply-decisions clears a recovery escalation only after publishing a completed PR review", () => {
+test("rate pressure after durable review publication retains cleanup and stops before item two", () => {
   const root = mkdtempSync(tmpPrefix);
+  const previousRetryAttempts = process.env.CLAWSWEEPER_GH_RETRY_ATTEMPTS;
+  process.env.CLAWSWEEPER_GH_RETRY_ATTEMPTS = "1";
   try {
     const itemsDir = join(root, "items");
     const closedDir = join(root, "closed");
     const plansDir = join(root, "plans");
     const reportPath = join(root, "apply-report.json");
     const logPath = join(root, "gh.log");
+    const commentBodyPath = join(root, "comment-body.md");
+    const labelsPath = join(root, "labels.json");
     const itemPath = join(itemsDir, "74479.md");
+    const secondItemPath = join(itemsDir, "74480.md");
     mkdirSync(itemsDir, { recursive: true });
     mkdirSync(plansDir, { recursive: true });
     writeFileSync(
@@ -2632,13 +2637,23 @@ Full review comments:
 `,
       "utf8",
     );
+    writeFileSync(
+      secondItemPath,
+      readFileSync(itemPath, "utf8")
+        .replaceAll("74479", "74480")
+        .replace("snapshot-a", "snapshot-b"),
+      "utf8",
+    );
 
     const staleCommentBody =
       "Codex review: needs maintainer review before merge.\n\n<!-- clawsweeper-review item=74479 -->";
+    writeFileSync(commentBodyPath, staleCommentBody);
+    writeFileSync(labelsPath, JSON.stringify(["clawsweeper-recovery-stuck"]));
     const ghMock = `
-const { appendFileSync, readFileSync } = require("fs");
+const { appendFileSync, readFileSync, writeFileSync } = require("fs");
 const logPath = ${JSON.stringify(logPath)};
-const staleCommentBody = ${JSON.stringify(staleCommentBody)};
+const commentBodyPath = ${JSON.stringify(commentBodyPath)};
+const labelsPath = ${JSON.stringify(labelsPath)};
 const rawArgs = process.argv.slice(2);
 const args = rawArgs[0] === "--repo" ? rawArgs.slice(2) : rawArgs;
 appendFileSync(logPath, JSON.stringify(args) + "\\n");
@@ -2656,7 +2671,7 @@ if (args[0] === "api" && /\\/issues\\/74479$/.test(path)) {
     active_lock_reason: null,
     author_association: "CONTRIBUTOR",
     user: { login: "contributor" },
-    labels: ["clawsweeper-recovery-stuck"],
+    labels: JSON.parse(readFileSync(labelsPath, "utf8")),
     pull_request: {}
   }));
 } else if (args[0] === "api" && args[1] === "-i" && /\\/issues\\/74479\\/timeline(?:\\?|$)/.test(args[2] || "")) {
@@ -2682,7 +2697,7 @@ if (args[0] === "api" && /\\/issues\\/74479$/.test(path)) {
     {
       id: 987479,
       html_url: "https://github.com/openclaw/clawsweeper/pull/74479#issuecomment-987479",
-      body: staleCommentBody,
+      body: readFileSync(commentBodyPath, "utf8"),
       user: { login: "clawsweeper[bot]" },
       created_at: "2026-05-19T23:59:00Z",
       updated_at: "2026-05-19T23:59:00Z"
@@ -2690,7 +2705,9 @@ if (args[0] === "api" && /\\/issues\\/74479$/.test(path)) {
   ]]));
 } else if (args[0] === "api" && /\\/issues\\/comments\\/987479$/.test(path)) {
   const input = args[args.indexOf("--input") + 1];
-  appendFileSync(logPath, JSON.stringify(["patched-review-body", JSON.parse(readFileSync(input, "utf8")).body]) + "\\n");
+  const body = JSON.parse(readFileSync(input, "utf8")).body;
+  writeFileSync(commentBodyPath, body);
+  appendFileSync(logPath, JSON.stringify(["patched-review-body", body]) + "\\n");
   console.log(JSON.stringify({
     id: 987479,
     html_url: "https://github.com/openclaw/clawsweeper/pull/74479#issuecomment-987479"
@@ -2698,6 +2715,20 @@ if (args[0] === "api" && /\\/issues\\/74479$/.test(path)) {
 } else if (args[0] === "label" && args[1] === "create") {
   console.log(JSON.stringify({ name: args[2] }));
 } else if (args[0] === "issue" && args[1] === "edit") {
+  if (args.includes("--remove-label") && args.includes("clawsweeper-recovery-stuck")) {
+    console.error("HTTP 429: rate limit exceeded");
+    process.exit(1);
+  }
+  const labels = new Set(JSON.parse(readFileSync(labelsPath, "utf8")));
+  for (let index = 0; index < args.length; index += 1) {
+    if (args[index] === "--add-label" && args[index + 1]) {
+      for (const label of args[index + 1].split(",")) labels.add(label);
+    }
+    if (args[index] === "--remove-label" && args[index + 1]) {
+      for (const label of args[index + 1].split(",")) labels.delete(label);
+    }
+  }
+  writeFileSync(labelsPath, JSON.stringify([...labels]));
   console.log("");
 } else {
   console.error("unexpected gh args", JSON.stringify(args));
@@ -2705,27 +2736,33 @@ if (args[0] === "api" && /\\/issues\\/74479$/.test(path)) {
 }
 `;
     withMockGh(root, ghMock, () => {
-      runApplyDecisionsForTest({
-        itemsDir,
-        closedDir,
-        plansDir,
-        reportPath,
-        extraArgs: [
-          "--sync-comments-only",
-          "--comment-sync-min-age-days",
-          "7",
-          "--item-numbers",
-          "74479",
-        ],
-      });
+      for (let attempt = 0; attempt < 1; attempt += 1) {
+        runApplyDecisionsForTest({
+          itemsDir,
+          closedDir,
+          plansDir,
+          reportPath,
+          extraArgs: [
+            "--sync-comments-only",
+            "--comment-sync-min-age-days",
+            "7",
+            "--item-numbers",
+            "74479,74480",
+          ],
+        });
+      }
     });
+
+    const firstReport = JSON.parse(readFileSync(reportPath, "utf8"));
+    assert.match(firstReport[0]?.reason ?? "", /retained review recovery label for cleanup retry/);
 
     const calls = readFileSync(logPath, "utf8")
       .trim()
       .split("\n")
       .filter(Boolean)
       .map((line) => JSON.parse(line) as string[]);
-    const patchedBody = calls.find((args) => args[0] === "patched-review-body")?.[1] ?? "";
+    const patchedBodies = calls.filter((args) => args[0] === "patched-review-body");
+    const patchedBody = patchedBodies[0]?.[1] ?? "";
     assert.match(patchedBody, /Label justifications:/);
     assert.match(patchedBody, /`proof: sufficient`/);
     assert.match(patchedBody, /`proof: 📸 screenshot`/);
@@ -2740,17 +2777,16 @@ if (args[0] === "api" && /\\/issues\\/74479$/.test(path)) {
     );
     assert.ok(publicationIndex >= 0);
     assert.ok(recoveryCleanupIndex > publicationIndex);
+    assert.equal(patchedBodies.length, 1);
+    assert.equal(
+      calls.some((args) => args.some((arg) => arg.includes("74480"))),
+      false,
+    );
     const updatedReport = readFileSync(itemPath, "utf8");
-    assert.match(updatedReport, /^labels_synced_at: /m);
-    assert.doesNotMatch(updatedReport, /clawsweeper-recovery-stuck/);
-    assert.deepEqual(JSON.parse(readFileSync(reportPath, "utf8")), [
-      {
-        number: 74479,
-        action: "review_comment_synced",
-        reason: "updated durable Codex review comment; cleared resolved review recovery label",
-      },
-    ]);
+    assert.match(updatedReport, /clawsweeper-recovery-stuck/);
   } finally {
+    if (previousRetryAttempts === undefined) delete process.env.CLAWSWEEPER_GH_RETRY_ATTEMPTS;
+    else process.env.CLAWSWEEPER_GH_RETRY_ATTEMPTS = previousRetryAttempts;
     rmSync(root, { recursive: true, force: true });
   }
 });

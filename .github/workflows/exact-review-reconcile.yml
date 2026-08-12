@@ -47,9 +47,17 @@ jobs:
       actions: read
       contents: read
     steps:
+      - uses: actions/checkout@v7
+        if: ${{ always() }}
+        # workflow_run may expose secrets, so execute only code from the trusted default branch.
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
       - name: Reconcile terminal run
         if: ${{ github.event.workflow_run.event == 'repository_dispatch' && startsWith(github.event.workflow_run.display_title, 'Review event item ') }}
         env:
+          CLAWSWEEPER_INTERNAL_QUEUE_SECRET: ${{ secrets.CLAWSWEEPER_INTERNAL_QUEUE_SECRET || secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
           SOURCE_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
@@ -69,14 +77,9 @@ jobs:
               include_all_claimed: true,
             }));
           ')"
-          signature="$(PAYLOAD="$payload" node -e 'const crypto=require("node:crypto"); process.stdout.write(`sha256=${crypto.createHmac("sha256", process.env.CLAWSWEEPER_WEBHOOK_SECRET).update(process.env.PAYLOAD).digest("hex")}`)')"
           for attempt in 1 2 3; do
-            if curl --fail --silent --show-error --connect-timeout 5 --max-time 120 \
-              --request POST \
-              --header "content-type: application/json" \
-              --header "x-clawsweeper-exact-review-signature: $signature" \
-              --data-binary "$payload" \
-              "$queue_url/internal/exact-review/reconcile" >/dev/null; then
+            if printf '%s' "$payload" | node scripts/internal-queue-request.mjs \
+              --url "$queue_url" --path "/internal/exact-review/reconcile" >/dev/null; then
               exit 0
             fi
             if [ "$attempt" -lt 3 ]; then
@@ -85,16 +88,10 @@ jobs:
           done
           exit 1
 
-      - uses: actions/checkout@v7
-        if: ${{ always() }}
-        # workflow_run may expose secrets, so execute observer code only from the trusted default branch.
-        with:
-          ref: ${{ github.event.repository.default_branch }}
-          persist-credentials: false
-
       - name: Record terminal review wave
         if: ${{ always() }}
         env:
+          CLAWSWEEPER_INTERNAL_QUEUE_SECRET: ${{ secrets.CLAWSWEEPER_INTERNAL_QUEUE_SECRET || secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           GH_TOKEN: ${{ github.token }}
           QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
@@ -111,16 +108,21 @@ jobs:
       issues: read
       pull-requests: read
     steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
       - name: Reconcile claimed terminal runs
         env:
+          CLAWSWEEPER_INTERNAL_QUEUE_SECRET: ${{ secrets.CLAWSWEEPER_INTERNAL_QUEUE_SECRET || secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           GH_TOKEN: ${{ github.token }}
           QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
         run: |
           node --input-type=module <<'NODE'
-          import { createHmac } from "node:crypto";
+          import { signedInternalQueueRequest } from "./scripts/internal-queue-request.mjs";
 
-          const secret = process.env.CLAWSWEEPER_WEBHOOK_SECRET || "";
+          const secret = process.env.CLAWSWEEPER_INTERNAL_QUEUE_SECRET || process.env.CLAWSWEEPER_WEBHOOK_SECRET || "";
           const token = process.env.GH_TOKEN || "";
           const repository = process.env.GITHUB_REPOSITORY || "";
           const queueUrl = (process.env.QUEUE_URL || "").replace(/\/$/, "");
@@ -128,13 +130,10 @@ jobs:
 
           async function signedPost(path, value) {
             const body = JSON.stringify(value);
-            const signature = `sha256=${createHmac("sha256", secret).update(body).digest("hex")}`;
-            const response = await fetch(`${queueUrl}${path}`, {
-              method: "POST",
-              headers: {
-                "content-type": "application/json",
-                "x-clawsweeper-exact-review-signature": signature,
-              },
+            const response = await signedInternalQueueRequest({
+              baseUrl: queueUrl,
+              path,
+              secret,
               body,
             });
             if (!response.ok) throw new Error(`${path} returned ${response.status}: ${await response.text()}`);
@@ -196,8 +195,6 @@ jobs:
           if (runs.length && unavailable.length === runs.length) throw new Error("all claimed run lookups failed");
           NODE
 
-      - uses: actions/checkout@v7
-
       - name: Create state token
         id: state-token
         continue-on-error: true
@@ -233,6 +230,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TARGET_WRITE_TOKEN: ${{ steps.target-write-token.outputs.token }}
           QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
+          REVIEW_PLACEHOLDER_CURSOR_STORE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
           REVIEW_PLACEHOLDER_LOOKBACK_HOURS: ${{ vars.REVIEW_PLACEHOLDER_LOOKBACK_HOURS || '48' }}
           REVIEW_PLACEHOLDER_MAX_CHECKS: ${{ vars.REVIEW_PLACEHOLDER_MAX_CHECKS || '20' }}
           REVIEW_PLACEHOLDER_MAX_RECOVERIES: ${{ vars.REVIEW_PLACEHOLDER_MAX_RECOVERIES || '5' }}

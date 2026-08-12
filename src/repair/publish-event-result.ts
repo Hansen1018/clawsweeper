@@ -598,7 +598,8 @@ async function publishSnapshot({
     );
     const publication = await postDirectPublicationResult({
       baseUrl: envValue("EXACT_REVIEW_QUEUE_URL"),
-      webhookSecret: envValue("CLAWSWEEPER_WEBHOOK_SECRET"),
+      webhookSecret:
+        process.env.CLAWSWEEPER_INTERNAL_QUEUE_SECRET || envValue("CLAWSWEEPER_WEBHOOK_SECRET"),
       path: "/internal/exact-review/publication-batch-results",
       payload: prepareDirectPublicationPayload({
         revision,

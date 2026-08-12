@@ -66,7 +66,8 @@ export async function publishMainWithStateAppend(
   const publishGit = runtime.publishGit ?? publishMainCommit;
   const root = runtime.root ?? process.cwd();
   const queueUrl = env.QUEUE_URL ?? "";
-  const webhookSecret = env.CLAWSWEEPER_WEBHOOK_SECRET ?? "";
+  const webhookSecret =
+    env.CLAWSWEEPER_INTERNAL_QUEUE_SECRET ?? env.CLAWSWEEPER_WEBHOOK_SECRET ?? "";
   const canonicalBaselineRoot =
     env.CLAWSWEEPER_CANONICAL_RECORD_BASELINE_DIR?.trim() || env.CLAWSWEEPER_STATE_DIR;
   const canonicalPlan = planCanonicalRecordTuples(options.paths, root, canonicalBaselineRoot, env);

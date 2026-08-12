@@ -22,6 +22,27 @@ test("comment router records receipts after durable command boundaries", () => {
   assert.match(source, /await flushCommandActionEvents\(\);/);
 });
 
+test("re-review compatibility routing uses the signed durable queue without workflow fallback", () => {
+  const source = readText("src/repair/comment-router.ts");
+  const start = source.indexOf("function enqueueClawSweeperReReview(");
+  const end = source.indexOf("function dispatchCompletedReviewVerdict(", start);
+  assert.ok(start >= 0 && end > start);
+  const block = source.slice(start, end);
+  assert.match(block, /postExactReviewCommandIntakeSync/);
+  assert.match(block, /directReReviewIntake/);
+  assert.match(block, /sourceCommentUpdatedAt/);
+  assert.match(block, /commandBodyDigest/);
+  assert.match(block, /commandOrigin: "comment_router"/);
+  assert.match(block, /command\.target\?\.head_sha/);
+  assert.match(block, /\^\[0-9a-f\]\{40\}\$/);
+  assert.match(
+    block,
+    /itemKind === "pull_request" \? \{ candidateHeadSha: sourceHeadSha \} : \{\}/,
+  );
+  assert.doesNotMatch(block, /sourceAuthoritySeq|sourceHeadVerified|direct_webhook/);
+  assert.doesNotMatch(block, /workflow_dispatch|repository_dispatch|gh workflow run/);
+});
+
 test("comment router wraps every GitHub mutation at the request boundary", () => {
   const source = readText("src/repair/comment-router.ts");
 

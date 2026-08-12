@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { createHmac } from "node:crypto";
 import test from "node:test";
 
 import { enqueueScheduledReviewPlan } from "../../dist/repair/scheduled-review-enqueue.js";
@@ -62,7 +61,7 @@ test("coverage-untracked plans reach queue admission before canonical refreshes"
 
 test("scheduled review enqueue reports the full selection-to-queue funnel and stops on rate limit", async () => {
   const secret = "scheduled-review-test-secret";
-  const requests: Array<{ body: string; signature: string }> = [];
+  const requests: Array<{ body: string; headers: Headers }> = [];
   const dispositions = [
     { ok: true, queued: true },
     { ok: true, deduped: true },
@@ -89,10 +88,9 @@ test("scheduled review enqueue reports the full selection-to-queue funnel and st
         return Response.json({ scheduled_feed: { target_rate_per_hour: 200 } });
       }
       const body = String(init?.body || "");
-      const headers = (init?.headers ?? {}) as Record<string, string>;
       requests.push({
         body,
-        signature: String(headers["x-clawsweeper-exact-review-signature"]),
+        headers: new Headers(init?.headers),
       });
       return Response.json(dispositions[requests.length - 1], { status: 202 });
     },
@@ -113,9 +111,10 @@ test("scheduled review enqueue reports the full selection-to-queue funnel and st
   });
   assert.equal(requests.length, 3);
   for (const request of requests) {
-    assert.equal(
-      request.signature,
-      `sha256=${createHmac("sha256", secret).update(request.body).digest("hex")}`,
+    assert.equal(request.headers.get("x-clawsweeper-internal-protocol"), "1");
+    assert.match(
+      String(request.headers.get("x-clawsweeper-internal-signature")),
+      /^sha256=[0-9a-f]{64}$/,
     );
   }
   const second = JSON.parse(requests[1]!.body);

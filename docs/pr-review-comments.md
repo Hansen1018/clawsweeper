@@ -46,6 +46,26 @@ just because the SHAs differ. Same-revision contenders still use the
 server-assigned comment-id election, and expired leftovers retain the existing
 conservative cleanup path.
 
+Every accepted re-review command is also an acknowledgement obligation owned by
+the exact-review queue. A newer command may coalesce the item-level review, but
+it does not erase the older obligation: the displaced queue revision is recorded
+as superseded and the normal terminal acknowledgement finalizer updates its
+status comment. Duplicate delivery of the same command enriches the existing
+revision instead of terminalizing it.
+Direct webhook and Actions compatibility delivery derive that identity from the
+same source comment id, update time, and body digest. Editing the command creates
+a distinct revision; transport delivery ids do not. A per-comment durable
+watermark rejects older edits even if their transport or head-authority sequence
+arrives later. Semantic command receipts outlive the generic seven-day transport
+receipt, so an already completed command cannot restart after transport expiry.
+
+OpenClaw Bay remains observer-only. During the bounded semantic-identity
+migration it may join one transport journey already stored under journey schema
+v1 to its semantic command completion. The first merge upgrades the store to v2;
+the bridge never accepts a newly observed transport journey, and the existing
+24-hour journey retention removes any untouched v1 state. It never exposes
+queue, recovery, deploy, or GitHub mutation actions.
+
 For a PR that needs work, the visible comment starts with:
 
 ```text

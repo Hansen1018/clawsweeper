@@ -1,5 +1,18 @@
 import { stableJson } from "../src/stable-json.ts";
 import {
+  coordinateDirectReReview,
+  planClawSweeperAcknowledgementConvergence,
+  validateDirectReReviewIntake,
+  type AuthorityCompletionResult,
+  type AuthorityReservationResult,
+  type DirectReReviewIntake,
+  type ExactReviewEnqueueResult,
+} from "../src/repair/direct-re-review-admission.ts";
+import {
+  clawSweeperCommandAckMarker,
+  renderClawSweeperQueuedAcknowledgement,
+} from "../src/repair/comment-command-text.ts";
+import {
   normalizeStateWriterOperation,
   normalizeStateWriterProgress,
   payloadHash,
@@ -111,6 +124,11 @@ export type ExactReviewBaseDecision = {
   sourceAuthoritySeq?: number;
   sourceUpdatedAt?: string;
   sourceDeliveryId?: string;
+  sourceCommentId?: number;
+  sourceCommentUpdatedAt?: string;
+  commandBodyDigest?: string;
+  commandOrigin?: "hosted_webhook" | "comment_router";
+  sourceCommentVerified?: boolean;
   codexTimeoutMs?: number;
   mediaProofTimeoutMs?: number;
   commandStatusMarker?: string;
@@ -198,6 +216,7 @@ export type ExactReviewQueueItem = {
   claimedAt?: number;
   parkedReason?: ExactReviewParkedReason;
   parkedRecoveryAttempts?: number;
+  parkedRecoveryAt?: number;
   dispatchFailureStatus?: number;
   dispatchFailureClass?: ExactReviewDispatchFailureClass;
   dispatchFailureAt?: number;
@@ -376,6 +395,20 @@ type ExactReviewSourceAuthorityReservation = {
   attempts: number;
   nextAttemptAt: number;
 };
+
+type ExactReviewCommandRevisionTransitionOptions = {
+  newItem?: boolean;
+  minimumRevision?: number;
+  admissionDeliveryId?: string;
+  retainPriorLifecycle?: boolean;
+};
+
+type ExactReviewCommandRevisionTransition = (
+  item: ExactReviewQueueItem,
+  decision: ExactReviewDecision,
+  now: number,
+  options?: ExactReviewCommandRevisionTransitionOptions,
+) => ExactReviewQueueItem;
 type ExactReviewEditedSemanticInput = {
   // Queue state preserves the repository's display casing, while this durable
   // semantic cursor canonicalizes it so equivalent GitHub repository spellings
@@ -488,10 +521,16 @@ const EXACT_REVIEW_QUEUE_ROLLBACK_CLOCK_SKEW_MS = 5 * 60 * 1000;
 const EXACT_REVIEW_QUEUE_LEGACY_GENERATION_PREFIX = "__clawsweeper_sql_generation:";
 const EXACT_REVIEW_QUEUE_STATE_KEY = "exact-review-queue";
 const EXACT_REVIEW_SOURCE_AUTHORITY_SEQUENCE_KEY = "exact-review-source-authority-sequence:v1";
-const TARGET_FANOUT_CURSOR_KEY_PREFIX = "target-fanout-cursor:v1:";
-type TargetFanoutMode = "hot-intake" | "normal-review" | "audit";
-type TargetFanoutCursor = {
-  mode: TargetFanoutMode;
+// Preserve the original key prefix so existing fanout cursors survive the
+// broader operational-cursor contract introduced for bounded recovery lanes.
+const OPERATIONAL_CURSOR_KEY_PREFIX = "target-fanout-cursor:v1:";
+type OperationalCursorMode =
+  | "hot-intake"
+  | "normal-review"
+  | "audit"
+  | `review-placeholder-${string}-${"open" | "closed"}`;
+type OperationalCursor = {
+  mode: OperationalCursorMode;
   nextCursor: number;
   revision: number;
   updatedAt: number;
@@ -504,6 +543,10 @@ const EXACT_REVIEW_SOURCE_AUTHORITY_RETRY_MAX_MS = 15 * 60_000;
 const EXACT_REVIEW_QUEUE_META_TABLE = "exact_review_queue_meta";
 const EXACT_REVIEW_QUEUE_ITEM_TABLE = "exact_review_queue_items";
 const EXACT_REVIEW_QUEUE_DELIVERY_TABLE = "exact_review_queue_deliveries";
+const EXACT_REVIEW_COMMAND_INTAKE_TABLE = "exact_review_command_intakes";
+const EXACT_REVIEW_COMMAND_WATERMARK_TABLE = "exact_review_command_watermarks";
+const EXACT_REVIEW_COMMAND_RECEIPT_TABLE = "exact_review_command_receipts";
+const EXACT_REVIEW_ITEM_REVISION_TABLE = "exact_review_item_revisions";
 const EXACT_REVIEW_QUEUE_INGRESS_TABLE = "exact_review_queue_ingress";
 const EXACT_REVIEW_QUEUE_EDIT_SEMANTIC_TABLE = "exact_review_queue_edit_semantic";
 const EXACT_REVIEW_QUEUE_METRICS_TABLE = "exact_review_queue_metrics";
@@ -517,10 +560,26 @@ const EXACT_REVIEW_STATE_WRITER_OPERATION_TABLE = "exact_review_state_writer_ope
 const EXACT_REVIEW_STATE_WRITER_LIVE_TABLE = "exact_review_state_writer_live";
 const EXACT_REVIEW_STATE_WRITER_DIAGNOSTICS_TABLE = "exact_review_state_writer_diagnostics";
 const EXACT_REVIEW_STATE_WRITER_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+const EXACT_REVIEW_COMMAND_INTAKE_LIMIT = 16;
+const EXACT_REVIEW_COMMAND_RETRY_BASE_MS = 15_000;
+const EXACT_REVIEW_COMMAND_RETRY_MAX_MS = 15 * 60_000;
+
+type ExactReviewCommandIntakeRecord = {
+  intake: DirectReReviewIntake;
+  state: "pending" | "effects_pending";
+  attempts: number;
+  nextAttemptAt: number;
+  admittedAt: number;
+};
 const EXACT_REVIEW_STATE_WRITER_LIVE_MS = 90 * 1000;
 const REVIEW_OBSERVABILITY_SCAN_LIMIT = 10_000;
 const EXACT_REVIEW_QUEUE_DEAD_LETTER_LIMIT = 5_000;
 const EXACT_REVIEW_QUEUE_DEAD_LETTER_RESOLVED_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+// Semantic command receipts use the same terminal-record horizon as resolved
+// dead letters. The per-comment watermark remains after compaction, so an old
+// command version still cannot restart when its detailed receipt is pruned.
+export const EXACT_REVIEW_COMMAND_RECEIPT_RETENTION_MS =
+  EXACT_REVIEW_QUEUE_DEAD_LETTER_RESOLVED_TTL_MS;
 const EXACT_REVIEW_QUEUE_METRIC_BUCKET_MS = 5 * 60 * 1000;
 const EXACT_REVIEW_QUEUE_METRIC_BUCKET_TTL_MS = 48 * 60 * 60 * 1000;
 const EXACT_REVIEW_QUEUE_SUPERSESSION_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
@@ -573,6 +632,7 @@ export class ExactReviewQueue {
   private stateWriterCoordinator;
   private lifecycleProjectionStore;
   private lifecycleTelemetryStore;
+  private readonly random: () => number;
   private readonly baselines = new WeakMap<ExactReviewQueueState, ExactReviewQueueBaseline>();
   private reviewCoverageCache: { at: number; summary: ReviewCoverageSummary } | null = null;
   private recentDurablePublicationEventsCache = new Map<
@@ -580,10 +640,11 @@ export class ExactReviewQueue {
     { expiresAt: number; value: NonNullable<ReturnType<typeof recentDurablePublicationEvents>> }
   >();
 
-  constructor(state, env) {
+  constructor(state, env, random: () => number = Math.random) {
     this.state = state;
     this.storage = state.storage;
     this.env = env;
+    this.random = random;
     this.batchStore = new ExactReviewPublicationBatchStore(this.storage);
     this.directPublicationStore = new ExactReviewDirectPublicationStore(this.storage);
     this.recordSnapshotStore = new ExactReviewRecordSnapshotStore(
@@ -629,12 +690,15 @@ export class ExactReviewQueue {
       this.reviewCoverageCache = null;
       return json({ ok: true, accepted: true }, 202);
     }
-    const targetFanoutMode = targetFanoutModeFromPath(url.pathname);
-    if (targetFanoutMode && request.method === "GET") {
-      return this.readTargetFanoutCursor(targetFanoutMode);
+    const operationalCursorMode = operationalCursorModeFromPath(url.pathname);
+    if (operationalCursorMode && request.method === "GET") {
+      return this.readOperationalCursor(operationalCursorMode);
     }
-    if (targetFanoutMode && request.method === "PUT") {
-      return this.writeTargetFanoutCursor(targetFanoutMode, await request.json().catch(() => null));
+    if (operationalCursorMode && request.method === "PUT") {
+      return this.writeOperationalCursor(
+        operationalCursorMode,
+        await request.json().catch(() => null),
+      );
     }
     if (request.method === "GET" && url.pathname === "/recent-durable-publication-events") {
       const events = this.recentDurablePublicationEvents(
@@ -643,6 +707,9 @@ export class ExactReviewQueue {
       return events
         ? json({ recent_durable_publication_events: events })
         : json({ error: "invalid_window" }, 400);
+    }
+    if (request.method === "POST" && url.pathname === "/command-intake") {
+      return this.admitCommandIntake(await request.json().catch(() => null));
     }
     if (request.method === "POST" && url.pathname === "/source-authority") {
       const body = objectValue(await request.json().catch(() => null));
@@ -738,14 +805,8 @@ export class ExactReviewQueue {
         );
         if (!reservation) return "missing" as const;
         if (reservation.sourceAuthoritySeq !== sourceAuthoritySeq) return "conflict" as const;
-        if (disposition === "mismatch") {
-          this.storage.sql.exec(
-            `INSERT OR IGNORE INTO ${EXACT_REVIEW_QUEUE_DELIVERY_TABLE}
-             (delivery_id, received_at) VALUES (?, ?)`,
-            deliveryId,
-            Date.now(),
-          );
-        }
+        const delivered = this.commandDecisionDeliveryExists(deliveryId);
+        if ((disposition === "enqueued") !== delivered) return "conflict" as const;
         this.storage.kv.delete(reservationKey);
         return "completed" as const;
       });
@@ -849,6 +910,29 @@ export class ExactReviewQueue {
           deliveryId,
           now - EXACT_REVIEW_QUEUE_DELIVERY_TTL_MS,
         );
+        const existingReceipt = Array.from(
+          this.storage.sql.exec(
+            `SELECT delivery_id FROM ${EXACT_REVIEW_QUEUE_DELIVERY_TABLE}
+              WHERE delivery_id = ?`,
+            deliveryId,
+          ),
+        ).length;
+        if (existingReceipt) {
+          this.syncLegacyCompatibilitySync(this.readStateSync());
+          return { deduped: true as const };
+        }
+        if (Object.hasOwn(decision, "sourceAuthoritySeq")) {
+          const reservation = exactReviewSourceAuthorityReservationFrom(
+            this.storage.kv.get(exactReviewSourceAuthorityReservationKey(deliveryId)),
+          );
+          if (!reservation || reservation.sourceAuthoritySeq !== decision.sourceAuthoritySeq) {
+            this.syncLegacyCompatibilitySync(this.readStateSync());
+            return {
+              accepted: false as const,
+              reason: "source authority reservation is no longer current" as const,
+            };
+          }
+        }
         const insertedReceipts = Array.from(
           this.storage.sql.exec(
             `INSERT OR IGNORE INTO ${EXACT_REVIEW_QUEUE_DELIVERY_TABLE}
@@ -1141,8 +1225,24 @@ export class ExactReviewQueue {
             }
             const nextRevision = Math.max(
               current.revision + 1,
-              this.nextExactReviewItemRevisionSync(key),
+              this.publicationHeadRevisionSync(key.toLowerCase()) + 1,
+              this.lifecycleProjectionStore.maxRevision(key, key) + 1,
             );
+            if (
+              exactReviewCommandVersionIsOlder(current.leaseDecision || current.decision, decision)
+            ) {
+              this.storage.sql.exec(
+                `DELETE FROM ${EXACT_REVIEW_QUEUE_DELIVERY_TABLE} WHERE delivery_id = ?`,
+                deliveryId,
+              );
+              this.writeStateSync(state);
+              return {
+                accepted: false as const,
+                reason: "older command version" as const,
+                key,
+                state,
+              };
+            }
             // Explicit commands arrive through repository_dispatch without a webhook authority
             // tuple. Bind them to the current verified decision via the merge below. An active
             // review keeps its lease and exposes the command as a follow-up revision on completion.
@@ -1150,8 +1250,12 @@ export class ExactReviewQueue {
               decision.itemKind === "pull_request" &&
               (current.leaseDecision || current.decision).itemKind === "pull_request" &&
               Boolean(decision.commandStatusMarker) &&
-              !Object.hasOwn(decision, "sourceHeadSha") &&
-              !Object.hasOwn(decision, "sourceAuthoritySeq");
+              !Object.hasOwn(decision, "sourceAuthoritySeq") &&
+              (!Object.hasOwn(decision, "sourceHeadSha") ||
+                decision.sourceHeadSha ===
+                  String(
+                    (current.leaseDecision || current.decision).sourceHeadSha || "",
+                  ).toLowerCase());
             const queuesCommandFollowUp =
               bindsCommandToCurrentAuthority &&
               (current.state === "dispatching" || current.state === "leased");
@@ -1165,22 +1269,41 @@ export class ExactReviewQueue {
               !attemptsReviewSupersession ||
               exactReviewDecisionCanSupersedeReview(current, decision);
             if (attemptsReviewSupersession && !sourceAuthorityIsNewer) {
+              this.storage.sql.exec(
+                `DELETE FROM ${EXACT_REVIEW_QUEUE_DELIVERY_TABLE} WHERE delivery_id = ?`,
+                deliveryId,
+              );
               this.writeStateSync(state);
               return {
-                deduped: true as const,
+                accepted: false as const,
                 staleSource: true as const,
                 ...(counterpartIngress ? { crossRoute: true as const } : {}),
                 key,
                 state,
               };
             }
-            const supersedesActiveReview =
+            const supersedesReview =
+              attemptsReviewSupersession &&
               !bindsCommandToCurrentAuthority &&
               sourceAuthorityIsNewer &&
-              decision.supersedesInProgress &&
-              (current.state === "dispatching" || current.state === "leased");
+              decision.supersedesInProgress;
+            const supersedesActiveReview =
+              supersedesReview && (current.state === "dispatching" || current.state === "leased");
             if (supersedesActiveReview) {
               const priorRevision = current.revision;
+              if (
+                (current.leaseRevision !== current.revision ||
+                  !exactReviewDecisionHasCommandContext(current.decision)) &&
+                exactReviewDecisionHasCommandContext(current.leaseDecision ?? current.decision)
+              ) {
+                this.terminalizeDisplacedCommandRevision(
+                  state,
+                  current,
+                  current.leaseDecision ?? current.decision,
+                  current.leaseRevision ?? current.revision,
+                  now,
+                );
+              }
               supersededRunId = current.claimedRunId || null;
               supersessionAudit = {
                 auditId: crypto.randomUUID(),
@@ -1211,14 +1334,27 @@ export class ExactReviewQueue {
               exactReviewQueueIsPublication(current)
                 ? (current.decision.publication?.producerDecision ?? current.decision)
                 : current.decision;
-            current.decision = supersedesActiveReview
+            const nextDecision = supersedesReview
               ? decision
               : mergeable || queuesCommandFollowUp
                 ? mergePendingExactReviewDecision(followUpMergeBase, decision)
                 : decision;
-            current.revision = nextRevision;
-            current.admissionDeliveryId = deliveryId;
-            current.updatedAt = now;
+            if (
+              exactReviewDecisionHasCommandContext(current.decision) ||
+              exactReviewDecisionHasCommandContext(nextDecision)
+            ) {
+              this.transitionCommandRevision(state, current, nextDecision, now, {
+                admissionDeliveryId: deliveryId,
+                retainPriorLifecycle:
+                  queuesCommandFollowUp && current.revision === current.leaseRevision,
+                persist: false,
+              });
+            } else {
+              current.decision = nextDecision;
+              current.revision = nextRevision;
+              current.admissionDeliveryId = deliveryId;
+              current.updatedAt = now;
+            }
             // Immediacy must come from the merged decision: a pending explicit command
             // keeps its command marker through the merge, and a later plain webhook
             // event must not re-debounce it.
@@ -1227,7 +1363,7 @@ export class ExactReviewQueue {
               mergeable
                 ? exactReviewQueueDebouncedAttempt(
                     state,
-                    current.decision,
+                    nextDecision,
                     now,
                     current.createdAt,
                     this.env,
@@ -1269,6 +1405,10 @@ export class ExactReviewQueue {
             exactReviewQueuePendingReviewCount(state) >= exactReviewPendingSoftLimit(this.env)
           ) {
             state.shedSinceReset = exactReviewShedSinceReset(state) + 1;
+            this.storage.sql.exec(
+              `DELETE FROM ${EXACT_REVIEW_QUEUE_DELIVERY_TABLE} WHERE delivery_id = ?`,
+              deliveryId,
+            );
             this.writeStateSync(state);
             this.incrementQueueMetricsSync({ reviewShed: 1, reviewShedBackpressure: 1 });
             console.warn(
@@ -1281,6 +1421,10 @@ export class ExactReviewQueue {
             !this.takeScheduledReviewTokenSync(decision, now)
           ) {
             state.shedSinceReset = exactReviewShedSinceReset(state) + 1;
+            this.storage.sql.exec(
+              `DELETE FROM ${EXACT_REVIEW_QUEUE_DELIVERY_TABLE} WHERE delivery_id = ?`,
+              deliveryId,
+            );
             this.writeStateSync(state);
             this.incrementQueueMetricsSync({ reviewShed: 1, reviewShedScheduledRate: 1 });
             console.warn(
@@ -1291,13 +1435,14 @@ export class ExactReviewQueue {
           if (!decision.publication && !exactReviewScheduledLane(decision)) {
             this.consumeScheduledReviewCapacitySync(now);
           }
+          const allocatedRevision = this.nextExactReviewItemRevisionSync(key);
           state.items[key] = {
             key,
             decision,
             admissionDeliveryId: deliveryId,
             ...(ingress ? { ingressFingerprint: ingress.fingerprint } : {}),
             state: "pending",
-            revision: this.nextExactReviewItemRevisionSync(key),
+            revision: allocatedRevision,
             createdAt: now,
             updatedAt: now,
             ...exactReviewQueueDebouncedAttempt(state, decision, now, now, this.env),
@@ -1306,6 +1451,7 @@ export class ExactReviewQueue {
               ? { sourceAuthorityWatermark: exactReviewSourceAuthorityWatermark(decision)! }
               : {}),
           };
+          this.recordCommandAdmission(state.items[key], decision, now, allocatedRevision);
           ingressAdmitted = true;
         }
         if (
@@ -1343,6 +1489,21 @@ export class ExactReviewQueue {
           supersededRunId,
         };
       });
+      if ("accepted" in accepted && accepted.accepted === false) {
+        return json(
+          {
+            ok: true,
+            accepted: false,
+            reason:
+              "staleSource" in accepted && accepted.staleSource
+                ? "stale pull request head"
+                : accepted.reason,
+            ...("staleSource" in accepted && accepted.staleSource ? { stale_source: true } : {}),
+            ...("key" in accepted ? { item_key: accepted.key } : {}),
+          },
+          202,
+        );
+      }
       if (accepted.deduped) {
         if ("state" in accepted) await this.scheduleNext(accepted.state, now);
         return json(
@@ -1847,6 +2008,7 @@ export class ExactReviewQueue {
                 exactReviewDeadLetterId(item),
               ),
               env: this.env,
+              advanceCommandRevision: this.commandRevisionTransition(state, false),
             })
           : this.requeueDirectLifecyclePublicationSync(state, item, now)
         : publicationCompletionOwnedByLease && publicationCompletion
@@ -1862,6 +2024,7 @@ export class ExactReviewQueue {
                 exactReviewDeadLetterId(item),
               ),
               env: this.env,
+              advanceCommandRevision: this.commandRevisionTransition(state, false),
             })
           : {
               ...finishExactReviewQueueItem(
@@ -1872,6 +2035,7 @@ export class ExactReviewQueue {
                 requestedRetryAt ?? undefined,
                 requeueLatest,
                 retryKind,
+                this.random,
               ),
               retried: outcome !== "success",
               refreshed: false,
@@ -2819,6 +2983,10 @@ export class ExactReviewQueue {
           item,
           now,
           run.outcome,
+          0,
+          false,
+          undefined,
+          this.random,
         );
         reconciled += 1;
         if (parked) continue;
@@ -3092,13 +3260,13 @@ export class ExactReviewQueue {
     return value;
   }
 
-  private readTargetFanoutCursor(mode: TargetFanoutMode) {
-    const stored = readTargetFanoutCursor(this.storage.kv.get(targetFanoutCursorKey(mode)), mode);
+  private readOperationalCursor(mode: OperationalCursorMode) {
+    const stored = readOperationalCursor(this.storage.kv.get(operationalCursorKey(mode)), mode);
     if (stored === "invalid") return json({ error: "fanout_cursor_store_invalid" }, 500);
-    return json(targetFanoutCursorJson(stored ?? emptyTargetFanoutCursor(mode)));
+    return json(operationalCursorJson(stored ?? emptyOperationalCursor(mode)));
   }
 
-  private writeTargetFanoutCursor(mode: TargetFanoutMode, value: unknown) {
+  private writeOperationalCursor(mode: OperationalCursorMode, value: unknown) {
     const body = objectValue(value);
     const nextCursor = Number(body.next_cursor);
     const expectedRevision = Number(body.expected_revision);
@@ -3112,25 +3280,22 @@ export class ExactReviewQueue {
     }
     try {
       const result = this.storage.transactionSync(() => {
-        const stored = readTargetFanoutCursor(
-          this.storage.kv.get(targetFanoutCursorKey(mode)),
-          mode,
-        );
+        const stored = readOperationalCursor(this.storage.kv.get(operationalCursorKey(mode)), mode);
         if (stored === "invalid") return { kind: "invalid" as const };
-        const current = stored ?? emptyTargetFanoutCursor(mode);
+        const current = stored ?? emptyOperationalCursor(mode);
         if (current.revision !== expectedRevision) {
           return { kind: "conflict" as const, current };
         }
         if (current.revision >= Number.MAX_SAFE_INTEGER) {
           return { kind: "invalid" as const };
         }
-        const next: TargetFanoutCursor = {
+        const next: OperationalCursor = {
           mode,
           nextCursor,
           revision: current.revision + 1,
           updatedAt: Date.now(),
         };
-        this.storage.kv.put(targetFanoutCursorKey(mode), next);
+        this.storage.kv.put(operationalCursorKey(mode), next);
         return { kind: "written" as const, cursor: next };
       });
       if (result.kind === "invalid") return json({ error: "fanout_cursor_store_invalid" }, 500);
@@ -3138,12 +3303,12 @@ export class ExactReviewQueue {
         return json(
           {
             error: "fanout_cursor_revision_conflict",
-            current: targetFanoutCursorJson(result.current),
+            current: operationalCursorJson(result.current),
           },
           409,
         );
       }
-      return json(targetFanoutCursorJson(result.cursor), 202);
+      return json(operationalCursorJson(result.cursor), 202);
     } catch (error) {
       console.error(`fanout cursor write failed: ${sanitizedServerError(error)}`);
       return json({ error: "fanout_cursor_store_unavailable" }, 503);
@@ -3155,9 +3320,11 @@ export class ExactReviewQueue {
     this.cleanupLegacyCompatibilitySync();
     const startedAt = Date.now();
     await this.storage.deleteAlarm();
+    await this.processCommandIntakes(startedAt);
     await this.processSourceAuthorityReservations(startedAt);
     this.storage.transactionSync(() => {
       this.pruneDeliveryReceiptsSync(startedAt);
+      this.pruneQueueTelemetrySync(startedAt);
       this.directPublicationStore.pruneTerminalSync(startedAt);
       this.reconcileStoredReviewRunsSync(startedAt);
       this.syncLegacyCompatibilitySync(this.readStateSync());
@@ -3171,7 +3338,12 @@ export class ExactReviewQueue {
       exactReviewHeartbeatGraceMs(this.env),
     );
     const recoveredParkedSnapshot = recoverParkedExactReviewItems(snapshot, startedAt);
-    const expiredSnapshot = expireExactReviewPublicationItems(snapshot, startedAt, this.env);
+    const expiredSnapshot = expireExactReviewPublicationItems(
+      snapshot,
+      startedAt,
+      this.env,
+      this.commandRevisionTransition(snapshot, true),
+    );
     let snapshotChanged = reclaimedSnapshot || recoveredParkedSnapshot > 0 || expiredSnapshot;
     if (
       snapshot.dispatcher?.publicationBatchTerminalProbe &&
@@ -3353,7 +3525,12 @@ export class ExactReviewQueue {
           exactReviewPublicationDispatchLeaseMs(this.env),
           exactReviewHeartbeatGraceMs(this.env),
         );
-        expireExactReviewPublicationItems(current, Date.now(), this.env);
+        expireExactReviewPublicationItems(
+          current,
+          Date.now(),
+          this.env,
+          this.commandRevisionTransition(current, true),
+        );
         await this.writeState(current);
       }
     }
@@ -3410,7 +3587,12 @@ export class ExactReviewQueue {
       exactReviewPublicationDispatchLeaseMs(this.env),
       exactReviewHeartbeatGraceMs(this.env),
     );
-    const expired = expireExactReviewPublicationItems(state, now, this.env);
+    const expired = expireExactReviewPublicationItems(
+      state,
+      now,
+      this.env,
+      this.commandRevisionTransition(state, true),
+    );
     // The preflight fetch releases the input gate, so publication demand may
     // have crossed a scale boundary while the workflow state was checked.
     const publicationControl = this.refreshPublicationControlSync(state, now);
@@ -3600,9 +3782,13 @@ export class ExactReviewQueue {
           // A command/status receipt is independently meaningful. Advance it to
           // the authoritative current head rather than dispatching its stale
           // source tuple or dropping the acknowledgement lifecycle.
-          item.decision = exactReviewDecisionAtLiveHead(item.decision, candidate.state.headSha);
-          item.revision += 1;
-          item.updatedAt = checkedAt;
+          this.transitionCommandRevision(
+            checkedState,
+            item,
+            exactReviewDecisionAtLiveHead(item.decision, candidate.state.headSha),
+            checkedAt,
+            { persist: true },
+          );
           Object.assign(item, exactReviewQueueEnqueueAttempt(checkedState, checkedAt));
           item.parkedReason = undefined;
           item.parkedRecoveryAttempts = 0;
@@ -3628,10 +3814,7 @@ export class ExactReviewQueue {
         const failureAttempts = Number(item.reviewFailureAttempts || 0) + 1;
         item.reviewFailureAttempts = failureAttempts;
         if (failureAttempts >= EXACT_REVIEW_RETRY_LIMIT) {
-          item.state = "parked";
-          item.parkedReason = "review_retry_exhausted";
-          item.backoffReason = undefined;
-          item.updatedAt = checkedAt;
+          parkRecoverableExactReviewItem(item, "review_retry_exhausted", checkedAt, this.random);
           continue;
         }
         item.nextAttemptAt = Math.max(
@@ -3852,9 +4035,7 @@ export class ExactReviewQueue {
         item.backoffReason = "publication_retry";
         item.attempts = Number(item.attempts || 0) + 1;
       } else if (failure.attempted && failure.failure.scope === "item") {
-        item.state = "parked";
-        item.parkedReason = "dispatch_rejected";
-        item.backoffReason = undefined;
+        parkRecoverableExactReviewItem(item, "dispatch_rejected", completedAt, this.random);
       } else {
         item.state = "pending";
         item.nextAttemptAt = completedAt;
@@ -5689,6 +5870,7 @@ export class ExactReviewQueue {
             ownedRevision: completion.revision,
             deadLetterCapacityAvailable: true,
             env: this.env,
+            advanceCommandRevision: this.commandRevisionTransition(current, false),
           });
           if (!result.requeued && !result.parked) superseded += 1;
         }
@@ -5921,6 +6103,7 @@ export class ExactReviewQueue {
                 exactReviewDeadLetterId(item, completion.revision),
               ),
               env: this.env,
+              advanceCommandRevision: this.commandRevisionTransition(state, false),
             });
             const terminalDisposition =
               exactReviewLifecycleCompletionDisposition({
@@ -6008,6 +6191,7 @@ export class ExactReviewQueue {
             ownedRevision: completion.revision,
             deadLetterCapacityAvailable: true,
             env: this.env,
+            advanceCommandRevision: this.commandRevisionTransition(state, false),
           });
           const terminalDisposition =
             exactReviewLifecycleCompletionDisposition({
@@ -6112,13 +6296,16 @@ export class ExactReviewQueue {
     if (existing && existing.fenceKey !== identity.fenceKey) {
       throw new Error("conflicting lifecycle projection identity");
     }
-    if (!existing) {
+    {
       const commandOriginated = Boolean(
         sourceDecision.commandStatusMarker || sourceDecision.statusCommentId,
       );
       this.lifecycleProjectionStore.recordAdmission({
         ...identity,
-        deliveryId: item.admissionDeliveryId ?? `claim:${item.leaseId}:${revision}`,
+        deliveryId:
+          sourceDecision.sourceDeliveryId ??
+          item.admissionDeliveryId ??
+          `claim:${item.leaseId}:${revision}`,
         sourceAction: sourceDecision.sourceAction,
         commandOriginated,
         statusMarker: sourceDecision.commandStatusMarker ?? null,
@@ -6126,6 +6313,16 @@ export class ExactReviewQueue {
         ...(sourceDecision.sourceDeliveryId
           ? { sourceDeliveryId: sourceDecision.sourceDeliveryId }
           : {}),
+        ...(sourceDecision.sourceCommentId
+          ? { sourceCommentId: sourceDecision.sourceCommentId }
+          : {}),
+        ...(sourceDecision.sourceCommentUpdatedAt
+          ? { sourceCommentUpdatedAt: sourceDecision.sourceCommentUpdatedAt }
+          : {}),
+        ...(sourceDecision.commandBodyDigest
+          ? { commandBodyDigest: sourceDecision.commandBodyDigest }
+          : {}),
+        ...(sourceDecision.commandOrigin ? { commandOrigin: sourceDecision.commandOrigin } : {}),
         observedAt: now,
       });
     }
@@ -6135,6 +6332,143 @@ export class ExactReviewQueue {
       runId: item.claimedRunId,
       runAttempt: exactReviewRunAttempt(item.claimedRunAttempt),
       observedAt: now,
+    });
+  }
+
+  private recordCommandAdmission(
+    item: ExactReviewQueueItem,
+    decision: ExactReviewDecision,
+    now: number,
+    revision = item.revision,
+  ) {
+    const commandDecision = decision.publication?.producerDecision ?? decision;
+    if (!exactReviewDecisionHasCommandContext(commandDecision)) return null;
+    const canonicalTargetKey = `${commandDecision.targetRepo}#${commandDecision.itemNumber}`;
+    return this.lifecycleProjectionStore.recordAdmissionSync({
+      canonicalTargetKey,
+      fenceKey: item.key,
+      revision,
+      deliveryId:
+        commandDecision.sourceDeliveryId ||
+        item.admissionDeliveryId ||
+        `publication:${item.key}:${revision}`,
+      sourceAction: commandDecision.sourceAction,
+      commandOriginated: true,
+      statusMarker: commandDecision.commandStatusMarker ?? null,
+      statusCommentId: commandDecision.statusCommentId ?? null,
+      ...(commandDecision.sourceDeliveryId
+        ? { sourceDeliveryId: commandDecision.sourceDeliveryId }
+        : {}),
+      ...(commandDecision.sourceCommentId
+        ? { sourceCommentId: commandDecision.sourceCommentId }
+        : {}),
+      ...(commandDecision.sourceCommentUpdatedAt
+        ? { sourceCommentUpdatedAt: commandDecision.sourceCommentUpdatedAt }
+        : {}),
+      ...(commandDecision.commandBodyDigest
+        ? { commandBodyDigest: commandDecision.commandBodyDigest }
+        : {}),
+      ...(commandDecision.commandOrigin ? { commandOrigin: commandDecision.commandOrigin } : {}),
+      observedAt: now,
+    });
+  }
+
+  private commandRevisionTransition(
+    state: ExactReviewQueueState,
+    persist: boolean,
+  ): ExactReviewCommandRevisionTransition {
+    return (item, decision, now, options) =>
+      this.transitionCommandRevision(state, item, decision, now, {
+        ...options,
+        persist,
+      });
+  }
+
+  private transitionCommandRevision(
+    state: ExactReviewQueueState,
+    item: ExactReviewQueueItem,
+    decision: ExactReviewDecision,
+    now: number,
+    options: {
+      newItem?: boolean;
+      minimumRevision?: number;
+      admissionDeliveryId?: string;
+      retainPriorLifecycle?: boolean;
+      persist: boolean;
+    },
+  ) {
+    const transition = () => {
+      if (!options.newItem) {
+        const prior = this.recordCommandAdmission(item, item.decision, now);
+        if (prior && !options.retainPriorLifecycle) {
+          const requestedDisposition = exactReviewCommandObligationSurvives(item.decision, decision)
+            ? "requeue"
+            : "superseded";
+          const committedDisposition = prior.terminalDisposition?.kind;
+          const terminal =
+            committedDisposition && committedDisposition !== "requeue"
+              ? prior
+              : this.lifecycleProjectionStore.recordTerminalDispositionSync({
+                  canonicalTargetKey: prior.canonicalTargetKey,
+                  fenceKey: prior.fenceKey,
+                  revision: prior.revision,
+                  kind: requestedDisposition,
+                  observedAt: now,
+                });
+          const terminalDisposition = terminal.terminalDisposition?.kind;
+          if (terminalDisposition && terminalDisposition !== "requeue") {
+            this.ensureLifecycleTerminalFinalizationDriver({
+              state,
+              projection: terminal,
+              terminalDisposition,
+              now,
+            });
+          }
+        }
+        item.revision = this.nextExactReviewItemRevisionSync(item.key, item.revision + 1);
+      } else {
+        item.revision = this.nextExactReviewItemRevisionSync(
+          item.key,
+          Math.max(1, Number(options.minimumRevision || 1)),
+        );
+      }
+      if (options.admissionDeliveryId) item.admissionDeliveryId = options.admissionDeliveryId;
+      item.decision = decision;
+      item.updatedAt = now;
+      state.items[item.key] = item;
+      this.recordCommandAdmission(item, decision, now);
+    };
+    if (!options.persist) transition();
+    else
+      this.storage.transactionSync(() => {
+        transition();
+        this.writeStateSync(state);
+      });
+    return item;
+  }
+
+  private terminalizeDisplacedCommandRevision(
+    state: ExactReviewQueueState,
+    item: ExactReviewQueueItem,
+    decision: ExactReviewDecision,
+    revision: number,
+    now: number,
+  ) {
+    if (!exactReviewDecisionHasCommandContext(decision)) return;
+    const projection = this.recordCommandAdmission(item, decision, now, revision);
+    if (!projection) return;
+    const terminal = this.lifecycleProjectionStore.recordTerminalDispositionSync({
+      canonicalTargetKey: projection.canonicalTargetKey,
+      fenceKey: projection.fenceKey,
+      revision: projection.revision,
+      kind: "superseded",
+      observedAt: now,
+    });
+    this.ensureLifecycleTerminalFinalizationDriver({
+      state,
+      projection: terminal,
+      terminalDisposition: "superseded",
+      now,
     });
   }
 
@@ -6159,16 +6493,13 @@ export class ExactReviewQueue {
         fenceKey: item.key,
         revision: membership.revision,
       };
-      const existing = this.lifecycleProjectionStore.read(
-        identity.canonicalTargetKey,
-        identity.fenceKey,
-        identity.revision,
-      );
-      if (!existing) {
+      {
         this.lifecycleProjectionStore.recordAdmission({
           ...identity,
           deliveryId:
-            item.admissionDeliveryId ?? `publication:${membership.itemKey}:${membership.revision}`,
+            sourceDecision.sourceDeliveryId ??
+            item.admissionDeliveryId ??
+            `publication:${membership.itemKey}:${membership.revision}`,
           sourceAction: sourceDecision.sourceAction,
           commandOriginated: Boolean(
             sourceDecision.commandStatusMarker || sourceDecision.statusCommentId,
@@ -6178,6 +6509,16 @@ export class ExactReviewQueue {
           ...(sourceDecision.sourceDeliveryId
             ? { sourceDeliveryId: sourceDecision.sourceDeliveryId }
             : {}),
+          ...(sourceDecision.sourceCommentId
+            ? { sourceCommentId: sourceDecision.sourceCommentId }
+            : {}),
+          ...(sourceDecision.sourceCommentUpdatedAt
+            ? { sourceCommentUpdatedAt: sourceDecision.sourceCommentUpdatedAt }
+            : {}),
+          ...(sourceDecision.commandBodyDigest
+            ? { commandBodyDigest: sourceDecision.commandBodyDigest }
+            : {}),
+          ...(sourceDecision.commandOrigin ? { commandOrigin: sourceDecision.commandOrigin } : {}),
           observedAt: now,
         });
       }
@@ -6249,11 +6590,13 @@ export class ExactReviewQueue {
     }
     const statusMarker = sourceDecision?.commandStatusMarker ?? null;
     const statusCommentId = sourceDecision?.statusCommentId ?? null;
-    if (!existingProjection) {
+    {
       this.lifecycleProjectionStore.recordAdmission({
         ...identity,
         deliveryId:
-          owned?.admissionDeliveryId ?? `publication:${validated.fenceKey}:${validated.revision}`,
+          sourceDecision?.sourceDeliveryId ??
+          owned?.admissionDeliveryId ??
+          `publication:${validated.fenceKey}:${validated.revision}`,
         sourceAction: sourceDecision?.sourceAction ?? "exact_review_publication",
         commandOriginated,
         statusMarker,
@@ -6261,6 +6604,16 @@ export class ExactReviewQueue {
         ...(sourceDecision?.sourceDeliveryId
           ? { sourceDeliveryId: sourceDecision.sourceDeliveryId }
           : {}),
+        ...(sourceDecision?.sourceCommentId
+          ? { sourceCommentId: sourceDecision.sourceCommentId }
+          : {}),
+        ...(sourceDecision?.sourceCommentUpdatedAt
+          ? { sourceCommentUpdatedAt: sourceDecision.sourceCommentUpdatedAt }
+          : {}),
+        ...(sourceDecision?.commandBodyDigest
+          ? { commandBodyDigest: sourceDecision.commandBodyDigest }
+          : {}),
+        ...(sourceDecision?.commandOrigin ? { commandOrigin: sourceDecision.commandOrigin } : {}),
         observedAt: now,
       });
     }
@@ -7051,14 +7404,11 @@ export class ExactReviewQueue {
     // This is a new review revision, not a replay of the direct receipt. The
     // old fenced projection retains its requeue terminal fact while the new
     // item receives fresh admission and claim facts when it is dispatched.
+    const admissionDeliveryId = `direct-lifecycle-requeue:${item.key}:${completedRevision}`;
     clearExactReviewLease(item);
-    item.decision = decision;
-    item.admissionDeliveryId = `direct-lifecycle-requeue:${item.key}:${completedRevision}`;
     item.ingressFingerprint = undefined;
     item.state = "pending";
-    item.revision = Math.max(item.revision + 1, this.nextExactReviewItemRevisionSync(item.key));
     item.createdAt = now;
-    item.updatedAt = now;
     item.parkedReason = undefined;
     item.parkedRecoveryAttempts = 0;
     item.terminalFinalization = undefined;
@@ -7068,6 +7418,10 @@ export class ExactReviewQueue {
     item.firstFailureAt = undefined;
     item.lastFailureReason = undefined;
     clearExactReviewDispatchFailure(item);
+    this.transitionCommandRevision(state, item, decision, now, {
+      admissionDeliveryId,
+      persist: false,
+    });
     Object.assign(item, exactReviewQueueDebouncedAttempt(state, decision, now, now, this.env));
     advanceExactReviewSourceAuthorityWatermark(item, decision);
     return {
@@ -7089,8 +7443,35 @@ export class ExactReviewQueue {
     return Number(row?.source_revision || 0);
   }
 
-  private nextExactReviewItemRevisionSync(itemKey: string): number {
-    return this.publicationHeadRevisionSync(itemKey.toLowerCase()) + 1;
+  private nextExactReviewItemRevisionSync(itemKey: string, minimumRevision = 1): number {
+    const canonicalKey = itemKey.split("@publish:")[0]!.toLowerCase();
+    const lifecycleRevision = this.lifecycleProjectionStore.maxRevision(canonicalKey, canonicalKey);
+    const floor = Math.max(
+      0,
+      minimumRevision - 1,
+      lifecycleRevision,
+      this.publicationHeadRevisionSync(canonicalKey),
+    );
+    this.storage.sql.exec(
+      `INSERT INTO ${EXACT_REVIEW_ITEM_REVISION_TABLE} (item_key, last_revision)
+       VALUES (?, ?)
+       ON CONFLICT(item_key) DO UPDATE SET last_revision = MAX(last_revision, excluded.last_revision)`,
+      canonicalKey,
+      floor,
+    );
+    const row = Array.from(
+      this.storage.sql.exec(
+        `UPDATE ${EXACT_REVIEW_ITEM_REVISION_TABLE}
+            SET last_revision = last_revision + 1 WHERE item_key = ?
+          RETURNING last_revision`,
+        canonicalKey,
+      ),
+    )[0] as { last_revision?: number } | undefined;
+    const revision = Number(row?.last_revision || 0);
+    if (!Number.isSafeInteger(revision) || revision < minimumRevision) {
+      throw new Error("exact-review item revision allocation failed");
+    }
+    return revision;
   }
 
   private freshPublicationItemKeysSync(state: ExactReviewQueueState, now: number) {
@@ -7262,6 +7643,46 @@ export class ExactReviewQueue {
       `CREATE TABLE IF NOT EXISTS ${EXACT_REVIEW_QUEUE_DELIVERY_TABLE} (
          delivery_id TEXT PRIMARY KEY,
          received_at INTEGER NOT NULL
+       ) STRICT`,
+    );
+    this.storage.sql.exec(
+      `CREATE TABLE IF NOT EXISTS ${EXACT_REVIEW_COMMAND_INTAKE_TABLE} (
+         command_version_id TEXT PRIMARY KEY,
+         source_comment_key TEXT NOT NULL,
+         source_updated_at INTEGER NOT NULL,
+         record_json TEXT NOT NULL,
+         next_attempt_at INTEGER NOT NULL
+       ) STRICT`,
+    );
+    this.storage.sql.exec(
+      `CREATE INDEX IF NOT EXISTS exact_review_command_intakes_due
+         ON ${EXACT_REVIEW_COMMAND_INTAKE_TABLE} (next_attempt_at, command_version_id)`,
+    );
+    this.storage.sql.exec(
+      `CREATE TABLE IF NOT EXISTS ${EXACT_REVIEW_COMMAND_WATERMARK_TABLE} (
+         source_comment_key TEXT PRIMARY KEY,
+         source_updated_at INTEGER NOT NULL,
+         command_version_id TEXT NOT NULL,
+         body_digest TEXT NOT NULL
+       ) STRICT`,
+    );
+    this.storage.sql.exec(
+      `CREATE TABLE IF NOT EXISTS ${EXACT_REVIEW_COMMAND_RECEIPT_TABLE} (
+         command_version_id TEXT PRIMARY KEY,
+         source_comment_key TEXT NOT NULL,
+         outcome TEXT NOT NULL CHECK (outcome IN ('pending', 'completed', 'rejected', 'superseded')),
+         observed_at INTEGER NOT NULL,
+         detail TEXT
+       ) STRICT`,
+    );
+    this.storage.sql.exec(
+      `CREATE INDEX IF NOT EXISTS exact_review_command_receipts_terminal_observed
+         ON ${EXACT_REVIEW_COMMAND_RECEIPT_TABLE} (outcome, observed_at, command_version_id)`,
+    );
+    this.storage.sql.exec(
+      `CREATE TABLE IF NOT EXISTS ${EXACT_REVIEW_ITEM_REVISION_TABLE} (
+         item_key TEXT PRIMARY KEY,
+         last_revision INTEGER NOT NULL CHECK (last_revision >= 0)
        ) STRICT`,
     );
     // Store only the current SHA-256 tuple for a PR. That lets a later genuine
@@ -8542,6 +8963,11 @@ export class ExactReviewQueue {
       now - EXACT_REVIEW_QUEUE_DEAD_LETTER_RESOLVED_TTL_MS,
     );
     this.storage.sql.exec(
+      `DELETE FROM ${EXACT_REVIEW_COMMAND_RECEIPT_TABLE}
+        WHERE outcome != 'pending' AND observed_at <= ?`,
+      now - EXACT_REVIEW_COMMAND_RECEIPT_RETENTION_MS,
+    );
+    this.storage.sql.exec(
       `DELETE FROM ${EXACT_REVIEW_QUEUE_SUPERSESSION_TABLE} WHERE superseded_at < ?`,
       now - EXACT_REVIEW_QUEUE_SUPERSESSION_RETENTION_MS,
     );
@@ -9212,7 +9638,7 @@ export class ExactReviewQueue {
         const liveHeadSha = await exactReviewSourceAuthorityLiveHead(this.env, reservation);
         const reservedHeadSha = String(reservation.decision.sourceHeadSha || "").toLowerCase();
         if (liveHeadSha !== reservedHeadSha) {
-          this.completeSourceAuthorityReservationSync(reservation, "mismatch");
+          this.completeSourceAuthorityReservationSync(reservation);
           continue;
         }
         const response = await this.fetch(
@@ -9230,7 +9656,7 @@ export class ExactReviewQueue {
           }),
         );
         if (!response.ok) throw new Error(`source authority enqueue failed: ${response.status}`);
-        this.completeSourceAuthorityReservationSync(reservation, "enqueued");
+        this.completeSourceAuthorityReservationSync(reservation);
       } catch (error) {
         console.warn(
           "exact-review source authority verification deferred",
@@ -9241,22 +9667,11 @@ export class ExactReviewQueue {
     }
   }
 
-  private completeSourceAuthorityReservationSync(
-    expected: ExactReviewSourceAuthorityReservation,
-    disposition: "enqueued" | "mismatch",
-  ) {
+  private completeSourceAuthorityReservationSync(expected: ExactReviewSourceAuthorityReservation) {
     this.storage.transactionSync(() => {
       const key = exactReviewSourceAuthorityReservationKey(expected.deliveryId);
       const current = exactReviewSourceAuthorityReservationFrom(this.storage.kv.get(key));
       if (current?.sourceAuthoritySeq === expected.sourceAuthoritySeq) {
-        if (disposition === "mismatch") {
-          this.storage.sql.exec(
-            `INSERT OR IGNORE INTO ${EXACT_REVIEW_QUEUE_DELIVERY_TABLE}
-             (delivery_id, received_at) VALUES (?, ?)`,
-            expected.deliveryId,
-            Date.now(),
-          );
-        }
         this.storage.kv.delete(key);
       }
     });
@@ -9292,6 +9707,459 @@ export class ExactReviewQueue {
       .filter(
         (reservation): reservation is ExactReviewSourceAuthorityReservation => reservation !== null,
       );
+  }
+
+  private async admitCommandIntake(value: unknown) {
+    const intake = validateDirectReReviewIntake(value);
+    if (!intake || !exactReviewBaseDecisionFrom(intake.decision)) {
+      return json({ error: "invalid_command_intake" }, 400);
+    }
+    const now = Date.now();
+    const sourceUpdatedAt = Date.parse(intake.sourceCommentUpdatedAt);
+    const sourceCommentKey = `${intake.decision.targetRepo.toLowerCase()}:${intake.sourceCommentId}`;
+    const admitted = this.storage.transactionSync(() => {
+      const receipt = Array.from(
+        this.storage.sql.exec(
+          `SELECT outcome, detail FROM ${EXACT_REVIEW_COMMAND_RECEIPT_TABLE}
+            WHERE command_version_id = ?`,
+          intake.commandVersionId,
+        ),
+      )[0] as { outcome?: string; detail?: string | null } | undefined;
+      if (receipt) {
+        return receipt.outcome === "rejected" || receipt.outcome === "superseded"
+          ? {
+              accepted: false as const,
+              reason: String(receipt.detail || receipt.outcome),
+            }
+          : { accepted: true as const, deduped: true as const };
+      }
+      const watermark = Array.from(
+        this.storage.sql.exec(
+          `SELECT source_updated_at, command_version_id, body_digest FROM ${EXACT_REVIEW_COMMAND_WATERMARK_TABLE}
+            WHERE source_comment_key = ?`,
+          sourceCommentKey,
+        ),
+      )[0] as
+        | { source_updated_at?: number; command_version_id?: string; body_digest?: string }
+        | undefined;
+      if (watermark?.command_version_id === intake.commandVersionId) {
+        return { accepted: false as const, reason: "semantic command version already observed" };
+      }
+      if (watermark && Number(watermark.source_updated_at) > sourceUpdatedAt) {
+        this.storage.sql.exec(
+          `INSERT OR IGNORE INTO ${EXACT_REVIEW_COMMAND_RECEIPT_TABLE}
+             (command_version_id, source_comment_key, outcome, observed_at, detail)
+           VALUES (?, ?, 'rejected', ?, 'older_comment_version')`,
+          intake.commandVersionId,
+          sourceCommentKey,
+          now,
+        );
+        return { accepted: false as const, reason: "older comment version" };
+      }
+      if (
+        watermark &&
+        Number(watermark.source_updated_at) < sourceUpdatedAt &&
+        watermark.command_version_id !== intake.commandVersionId
+      ) {
+        this.storage.sql.exec(
+          `UPDATE ${EXACT_REVIEW_COMMAND_RECEIPT_TABLE}
+              SET outcome = 'superseded', observed_at = ?, detail = 'newer_comment_version'
+            WHERE command_version_id = ? AND outcome = 'pending'`,
+          now,
+          watermark.command_version_id,
+        );
+        this.storage.sql.exec(
+          `DELETE FROM ${EXACT_REVIEW_COMMAND_INTAKE_TABLE} WHERE command_version_id = ?`,
+          watermark.command_version_id,
+        );
+      }
+      const record: ExactReviewCommandIntakeRecord = {
+        intake,
+        state: "pending",
+        attempts: 0,
+        nextAttemptAt: now,
+        admittedAt: now,
+      };
+      this.storage.sql.exec(
+        `INSERT INTO ${EXACT_REVIEW_COMMAND_WATERMARK_TABLE}
+           (source_comment_key, source_updated_at, command_version_id, body_digest)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(source_comment_key) DO UPDATE SET
+           source_updated_at = MAX(source_updated_at, excluded.source_updated_at),
+           command_version_id = CASE
+             WHEN excluded.source_updated_at > source_updated_at OR
+                  (excluded.source_updated_at = source_updated_at AND
+                   excluded.command_version_id > command_version_id)
+             THEN excluded.command_version_id ELSE command_version_id END,
+           body_digest = CASE
+             WHEN excluded.source_updated_at > source_updated_at OR
+                  (excluded.source_updated_at = source_updated_at AND
+                   excluded.command_version_id > command_version_id)
+             THEN excluded.body_digest ELSE body_digest END`,
+        sourceCommentKey,
+        sourceUpdatedAt,
+        intake.commandVersionId,
+        intake.commandBodyDigest,
+      );
+      this.storage.sql.exec(
+        `INSERT INTO ${EXACT_REVIEW_COMMAND_RECEIPT_TABLE}
+           (command_version_id, source_comment_key, outcome, observed_at)
+         VALUES (?, ?, 'pending', ?)`,
+        intake.commandVersionId,
+        sourceCommentKey,
+        now,
+      );
+      this.storage.sql.exec(
+        `INSERT INTO ${EXACT_REVIEW_COMMAND_INTAKE_TABLE}
+           (command_version_id, source_comment_key, source_updated_at, record_json, next_attempt_at)
+         VALUES (?, ?, ?, ?, ?)`,
+        intake.commandVersionId,
+        sourceCommentKey,
+        sourceUpdatedAt,
+        JSON.stringify(record),
+        now,
+      );
+      return { accepted: true as const, deduped: false as const };
+    });
+    if (admitted.accepted) await this.scheduleSourceAuthorityVerification(now);
+    return json(
+      {
+        ok: true,
+        ...admitted,
+        command_version_id: intake.commandVersionId,
+      },
+      202,
+    );
+  }
+
+  private dueCommandIntakes(now: number) {
+    return Array.from(
+      this.storage.sql.exec(
+        `SELECT record_json FROM ${EXACT_REVIEW_COMMAND_INTAKE_TABLE}
+          WHERE next_attempt_at <= ? ORDER BY next_attempt_at, command_version_id
+          LIMIT ${EXACT_REVIEW_COMMAND_INTAKE_LIMIT}`,
+        now,
+      ),
+    )
+      .map((row) => {
+        try {
+          return JSON.parse(
+            String((row as { record_json?: unknown }).record_json || ""),
+          ) as ExactReviewCommandIntakeRecord;
+        } catch {
+          return null;
+        }
+      })
+      .filter((record): record is ExactReviewCommandIntakeRecord => Boolean(record));
+  }
+
+  private async processCommandIntakes(now: number) {
+    for (const record of this.dueCommandIntakes(now)) {
+      const intake = record.intake;
+      const current = Array.from(
+        this.storage.sql.exec(
+          `SELECT source_updated_at, command_version_id FROM ${EXACT_REVIEW_COMMAND_WATERMARK_TABLE}
+            WHERE source_comment_key = ?`,
+          `${intake.decision.targetRepo.toLowerCase()}:${intake.sourceCommentId}`,
+        ),
+      )[0] as { source_updated_at?: number; command_version_id?: string } | undefined;
+      if (
+        current?.command_version_id !== intake.commandVersionId &&
+        Number(current?.source_updated_at) > Date.parse(intake.sourceCommentUpdatedAt)
+      ) {
+        this.finishCommandIntake(
+          intake.commandVersionId,
+          "superseded",
+          now,
+          "newer_comment_version",
+        );
+        continue;
+      }
+      let tokenPromise: Promise<string> | null = null;
+      const token = () =>
+        (tokenPromise ??= exactReviewCommandTargetToken(this.env, intake, {
+          issues: "write",
+          pull_requests: "write",
+        }));
+      try {
+        let sourceComment: Record<string, unknown>;
+        try {
+          sourceComment = objectValue(
+            await githubTokenJson({
+              token: await token(),
+              path: `/repos/${intake.decision.targetRepo}/issues/comments/${intake.sourceCommentId}`,
+              method: "GET",
+              body: undefined,
+              errorLabel: "direct re-review source comment",
+            }),
+          );
+        } catch (error) {
+          if (/\b(?:404|410)\b/.test(String(error))) {
+            this.finishCommandIntake(
+              intake.commandVersionId,
+              "rejected",
+              Date.now(),
+              "source_comment_missing",
+            );
+            continue;
+          }
+          throw error;
+        }
+        const liveCommentUpdatedAt = Date.parse(String(sourceComment.updated_at || ""));
+        const admittedCommentUpdatedAt = Date.parse(intake.sourceCommentUpdatedAt);
+        const liveCommentDigest = await sha256Hex(
+          new TextEncoder().encode(String(sourceComment.body || "")),
+        );
+        if (
+          !Number.isFinite(liveCommentUpdatedAt) ||
+          liveCommentUpdatedAt < admittedCommentUpdatedAt
+        ) {
+          throw new Error("live source comment version is not yet authoritative");
+        }
+        if (
+          liveCommentUpdatedAt > admittedCommentUpdatedAt ||
+          liveCommentDigest !== intake.commandBodyDigest
+        ) {
+          this.finishCommandIntake(
+            intake.commandVersionId,
+            "rejected",
+            Date.now(),
+            "source_comment_changed",
+          );
+          continue;
+        }
+        this.storage.sql.exec(
+          `UPDATE ${EXACT_REVIEW_COMMAND_WATERMARK_TABLE}
+              SET command_version_id = ?, body_digest = ?
+            WHERE source_comment_key = ? AND source_updated_at = ?`,
+          intake.commandVersionId,
+          intake.commandBodyDigest,
+          `${intake.decision.targetRepo.toLowerCase()}:${intake.sourceCommentId}`,
+          admittedCommentUpdatedAt,
+        );
+        const result = await coordinateDirectReReview(
+          {
+            ...intake,
+            decision: { ...intake.decision, sourceCommentVerified: true },
+          },
+          {
+            readPullRequest: async () => {
+              const pull = await githubTokenJson({
+                token: await token(),
+                path: `/repos/${intake.decision.targetRepo}/pulls/${intake.decision.itemNumber}`,
+                method: "GET",
+                body: undefined,
+                errorLabel: "direct re-review pull request",
+              });
+              return {
+                headSha: String(objectValue(objectValue(pull).head).sha || ""),
+                ...(typeof objectValue(pull).updated_at === "string"
+                  ? { updatedAt: String(objectValue(pull).updated_at) }
+                  : {}),
+              };
+            },
+            reserveAuthority: async (decision) =>
+              this.reserveCommandSourceAuthority(intake, decision, now),
+            completeAuthority: async (sequence, disposition) =>
+              this.completeCommandSourceAuthority(intake.commandVersionId, sequence, disposition),
+            enqueue: (decision) => this.enqueueCommandDecision(intake.commandVersionId, decision),
+            convergeAcknowledgement: (decision) =>
+              convergeCommandAcknowledgement({
+                token: token(),
+                decision,
+                sourceCommentId: intake.sourceCommentId,
+              }),
+            addReaction: () =>
+              addCommandReaction({
+                token: token(),
+                repo: intake.decision.targetRepo,
+                commentId: intake.sourceCommentId,
+              }),
+          },
+        );
+        if (result.kind === "completed") {
+          if (record.state === "pending") {
+            const next: ExactReviewCommandIntakeRecord = {
+              ...record,
+              state: "effects_pending",
+              nextAttemptAt: Date.now() + 10_000,
+            };
+            this.storage.sql.exec(
+              `UPDATE ${EXACT_REVIEW_COMMAND_INTAKE_TABLE}
+                  SET record_json = ?, next_attempt_at = ? WHERE command_version_id = ?`,
+              JSON.stringify(next),
+              next.nextAttemptAt,
+              intake.commandVersionId,
+            );
+          } else {
+            this.finishCommandIntake(intake.commandVersionId, "completed", Date.now(), null);
+          }
+        } else if (result.kind === "rejected") {
+          this.finishCommandIntake(intake.commandVersionId, "rejected", Date.now(), result.reason);
+        } else {
+          this.deferCommandIntake(record, Date.now(), result.reason);
+        }
+      } catch (error) {
+        this.deferCommandIntake(record, Date.now(), sanitizedServerError(error));
+      }
+    }
+  }
+
+  private reserveCommandSourceAuthority(
+    intake: DirectReReviewIntake,
+    decision: ExactReviewDecision,
+    now: number,
+  ): AuthorityReservationResult {
+    const key = exactReviewSourceAuthorityReservationKey(intake.commandVersionId);
+    return this.storage.transactionSync(() => {
+      const existing = exactReviewSourceAuthorityReservationFrom(this.storage.kv.get(key));
+      if (existing) {
+        return existing.sourceAuthoritySeq > 0
+          ? { kind: "reserved", sourceAuthoritySeq: existing.sourceAuthoritySeq }
+          : { kind: "rejected", reason: "invalid source authority reservation" };
+      }
+      const completed = this.commandDecisionDeliveryExists(intake.commandVersionId);
+      if (completed) return { kind: "already_completed" };
+      const stored = Number(this.storage.kv.get(EXACT_REVIEW_SOURCE_AUTHORITY_SEQUENCE_KEY) || 0);
+      const sequence = stored + 1;
+      if (!Number.isSafeInteger(sequence) || sequence < 1) {
+        return { kind: "rejected", reason: "source authority exhausted" };
+      }
+      this.storage.kv.put(EXACT_REVIEW_SOURCE_AUTHORITY_SEQUENCE_KEY, sequence);
+      this.storage.kv.put(key, {
+        deliveryId: intake.commandVersionId,
+        decision: { ...decision, sourceAuthoritySeq: sequence },
+        installationId: intake.installationId,
+        sourceAuthoritySeq: sequence,
+        attempts: 0,
+        nextAttemptAt: now,
+      } satisfies ExactReviewSourceAuthorityReservation);
+      return { kind: "reserved", sourceAuthoritySeq: sequence };
+    });
+  }
+
+  private completeCommandSourceAuthority(
+    deliveryId: string,
+    sequence: number,
+    disposition: "enqueued" | "mismatch",
+  ): AuthorityCompletionResult {
+    return this.storage.transactionSync(() => {
+      const key = exactReviewSourceAuthorityReservationKey(deliveryId);
+      const reservation = exactReviewSourceAuthorityReservationFrom(this.storage.kv.get(key));
+      if (!reservation) return { kind: "missing" };
+      if (reservation.sourceAuthoritySeq !== sequence) {
+        return { kind: "conflict", reason: "source authority sequence changed" };
+      }
+      const delivered = this.commandDecisionDeliveryExists(deliveryId);
+      if ((disposition === "enqueued") !== delivered) {
+        return { kind: "conflict", reason: "source authority disposition conflicts with receipt" };
+      }
+      this.storage.kv.delete(key);
+      return { kind: "completed" };
+    });
+  }
+
+  private commandDecisionDeliveryExists(deliveryId: string) {
+    return Boolean(
+      Array.from(
+        this.storage.sql.exec(
+          `SELECT 1 FROM ${EXACT_REVIEW_QUEUE_DELIVERY_TABLE} WHERE delivery_id = ? LIMIT 1`,
+          deliveryId,
+        ),
+      )[0],
+    );
+  }
+
+  private async enqueueCommandDecision(
+    deliveryId: string,
+    decision: ExactReviewDecision,
+  ): Promise<ExactReviewEnqueueResult> {
+    const response = await this.fetch(
+      new Request("https://clawsweeper-exact-review-queue/enqueue", {
+        method: "POST",
+        body: JSON.stringify({ delivery_id: deliveryId, decision }),
+      }),
+    );
+    const result = objectValue(await response.json().catch(() => null));
+    if (result.queued === true || result.deduped === true) {
+      return {
+        kind: "queued",
+        itemKey: String(result.item_key || `${decision.targetRepo}#${decision.itemNumber}`),
+        deduped: result.deduped === true,
+      };
+    }
+    return { kind: "rejected", reason: String(result.reason || result.error || "queue rejected") };
+  }
+
+  private finishCommandIntake(
+    commandVersionId: string,
+    outcome: "completed" | "rejected" | "superseded",
+    now: number,
+    detail: string | null,
+  ) {
+    this.storage.transactionSync(() => {
+      this.storage.sql.exec(
+        `UPDATE ${EXACT_REVIEW_COMMAND_RECEIPT_TABLE}
+            SET outcome = ?, observed_at = ?, detail = ? WHERE command_version_id = ?`,
+        outcome,
+        now,
+        detail,
+        commandVersionId,
+      );
+      this.storage.sql.exec(
+        `DELETE FROM ${EXACT_REVIEW_COMMAND_INTAKE_TABLE} WHERE command_version_id = ?`,
+        commandVersionId,
+      );
+    });
+  }
+
+  private deferCommandIntake(record: ExactReviewCommandIntakeRecord, now: number, detail: string) {
+    const persistedRow = Array.from(
+      this.storage.sql.exec(
+        `SELECT record_json FROM ${EXACT_REVIEW_COMMAND_INTAKE_TABLE}
+          WHERE command_version_id = ?`,
+        record.intake.commandVersionId,
+      ),
+    )[0] as { record_json?: string } | undefined;
+    let persisted: ExactReviewCommandIntakeRecord | null = null;
+    try {
+      persisted = persistedRow?.record_json ? JSON.parse(persistedRow.record_json) : null;
+    } catch {
+      persisted = null;
+    }
+    // A stale alarm snapshot must never move a command back across the durable
+    // post-effect fence after another attempt has advanced it.
+    const current = persisted?.state === "effects_pending" ? persisted : record;
+    const attempts = current.attempts + 1;
+    const delay = Math.min(
+      EXACT_REVIEW_COMMAND_RETRY_MAX_MS,
+      EXACT_REVIEW_COMMAND_RETRY_BASE_MS * 2 ** Math.min(attempts - 1, 8),
+    );
+    const next = { ...current, attempts, nextAttemptAt: now + delay };
+    this.storage.sql.exec(
+      `UPDATE ${EXACT_REVIEW_COMMAND_INTAKE_TABLE}
+          SET record_json = ?, next_attempt_at = ? WHERE command_version_id = ?`,
+      JSON.stringify(next),
+      next.nextAttemptAt,
+      record.intake.commandVersionId,
+    );
+    this.storage.sql.exec(
+      `UPDATE ${EXACT_REVIEW_COMMAND_RECEIPT_TABLE}
+          SET observed_at = ?, detail = ? WHERE command_version_id = ? AND outcome = 'pending'`,
+      now,
+      detail.slice(0, 500),
+      record.intake.commandVersionId,
+    );
+  }
+
+  private nextCommandIntakeAtSync() {
+    const row = Array.from(
+      this.storage.sql.exec(
+        `SELECT MIN(next_attempt_at) AS next_attempt_at FROM ${EXACT_REVIEW_COMMAND_INTAKE_TABLE}`,
+      ),
+    )[0] as { next_attempt_at?: number | null } | undefined;
+    const next = Number(row?.next_attempt_at || 0);
+    return next > 0 ? next : null;
   }
 
   private async nextSourceAuthorityVerificationAt() {
@@ -9357,12 +10225,14 @@ export class ExactReviewQueue {
       this.freshPublicationItemKeysSync(state, now),
     );
     const sourceAuthorityNext = await this.nextSourceAuthorityVerificationAt();
+    const commandIntakeNext = this.nextCommandIntakeAtSync();
     const next = [
       queueNext,
       reviewNext,
       batchOwnership.nextLeaseExpiresAt,
       batchDeparture?.dueAt ?? null,
       sourceAuthorityNext,
+      commandIntakeNext,
     ]
       .filter((candidate): candidate is number => candidate !== null)
       .reduce<number | null>(
@@ -9531,6 +10401,19 @@ function exactReviewBaseDecisionFrom(value): ExactReviewBaseDecision | null {
     : undefined;
   const hasSourceDeliveryId = Object.hasOwn(decision, "sourceDeliveryId");
   const sourceDeliveryId = hasSourceDeliveryId ? decision.sourceDeliveryId : undefined;
+  const hasSourceCommentId = Object.hasOwn(decision, "sourceCommentId");
+  const sourceCommentId = hasSourceCommentId ? Number(decision.sourceCommentId) : undefined;
+  const hasSourceCommentUpdatedAt = Object.hasOwn(decision, "sourceCommentUpdatedAt");
+  const sourceCommentUpdatedAt = hasSourceCommentUpdatedAt
+    ? String(decision.sourceCommentUpdatedAt || "")
+    : undefined;
+  const hasCommandBodyDigest = Object.hasOwn(decision, "commandBodyDigest");
+  const commandBodyDigest = hasCommandBodyDigest
+    ? String(decision.commandBodyDigest || "").toLowerCase()
+    : undefined;
+  const hasCommandOrigin = Object.hasOwn(decision, "commandOrigin");
+  const commandOrigin = hasCommandOrigin ? String(decision.commandOrigin || "") : undefined;
+  const hasSourceCommentVerified = Object.hasOwn(decision, "sourceCommentVerified");
   const hasCommandStatusMarker = Object.hasOwn(decision, "commandStatusMarker");
   const commandStatusMarker = hasCommandStatusMarker ? decision.commandStatusMarker : undefined;
   const hasStatusCommentId = Object.hasOwn(decision, "statusCommentId");
@@ -9563,6 +10446,27 @@ function exactReviewBaseDecisionFrom(value): ExactReviewBaseDecision | null {
   ) {
     return null;
   }
+  if (
+    hasSourceCommentId &&
+    (!Number.isSafeInteger(sourceCommentId) || Number(sourceCommentId) < 1)
+  ) {
+    return null;
+  }
+  if (
+    hasSourceCommentUpdatedAt &&
+    !Number.isFinite(Date.parse(String(sourceCommentUpdatedAt || "")))
+  ) {
+    return null;
+  }
+  if (hasCommandBodyDigest && !/^[0-9a-f]{64}$/.test(String(commandBodyDigest || ""))) return null;
+  if (
+    hasCommandOrigin &&
+    commandOrigin !== "hosted_webhook" &&
+    commandOrigin !== "comment_router"
+  ) {
+    return null;
+  }
+  if (hasSourceCommentVerified && decision.sourceCommentVerified !== true) return null;
   if (
     hasCommandStatusMarker &&
     (typeof commandStatusMarker !== "string" ||
@@ -9600,6 +10504,13 @@ function exactReviewBaseDecisionFrom(value): ExactReviewBaseDecision | null {
     ...(hasSourceAuthoritySeq ? { sourceAuthoritySeq } : {}),
     ...(hasSourceUpdatedAt ? { sourceUpdatedAt } : {}),
     ...(hasSourceDeliveryId ? { sourceDeliveryId } : {}),
+    ...(hasSourceCommentId ? { sourceCommentId } : {}),
+    ...(hasSourceCommentUpdatedAt ? { sourceCommentUpdatedAt } : {}),
+    ...(hasCommandBodyDigest ? { commandBodyDigest } : {}),
+    ...(hasCommandOrigin
+      ? { commandOrigin: commandOrigin as "hosted_webhook" | "comment_router" }
+      : {}),
+    ...(hasSourceCommentVerified ? { sourceCommentVerified: true } : {}),
     ...(Number.isFinite(Number(decision.codexTimeoutMs))
       ? { codexTimeoutMs: Number(decision.codexTimeoutMs) }
       : {}),
@@ -9820,6 +10731,22 @@ function mergePendingExactReviewDecision(
   return merged;
 }
 
+function exactReviewDecisionHasCommandContext(decision: ExactReviewDecision) {
+  return Boolean(decision.commandStatusMarker || decision.statusCommentId);
+}
+
+function exactReviewCommandObligationSurvives(
+  current: ExactReviewDecision,
+  incoming: ExactReviewDecision,
+) {
+  if (!exactReviewDecisionHasCommandContext(current)) return true;
+  if (!exactReviewDecisionHasCommandContext(incoming)) return false;
+  return (
+    (current.commandStatusMarker ?? null) === (incoming.commandStatusMarker ?? null) &&
+    (current.statusCommentId ?? null) === (incoming.statusCommentId ?? null)
+  );
+}
+
 function exactReviewDecisionAtLiveHead(decision: ExactReviewDecision, headSha: string) {
   const refreshed = {
     ...decision,
@@ -9847,6 +10774,25 @@ function exactReviewDecisionCanSupersedeReview(
   incoming: ExactReviewDecision,
 ): boolean {
   const active = current.leaseDecision || current.decision;
+  if (
+    active.sourceCommentId &&
+    incoming.sourceCommentId &&
+    active.sourceCommentId === incoming.sourceCommentId
+  ) {
+    const activeCommentAt = Date.parse(String(active.sourceCommentUpdatedAt || ""));
+    const incomingCommentAt = Date.parse(String(incoming.sourceCommentUpdatedAt || ""));
+    if (Number.isFinite(activeCommentAt) && Number.isFinite(incomingCommentAt)) {
+      if (incomingCommentAt < activeCommentAt) return false;
+      if (
+        incomingCommentAt === activeCommentAt &&
+        active.commandBodyDigest &&
+        incoming.commandBodyDigest &&
+        active.commandBodyDigest !== incoming.commandBodyDigest
+      ) {
+        return incoming.sourceCommentVerified === true;
+      }
+    }
+  }
   if (active.itemKind !== "pull_request" || incoming.itemKind !== "pull_request") return true;
 
   const activeHead = String(active.sourceHeadSha || "").toLowerCase();
@@ -9886,6 +10832,29 @@ function exactReviewDecisionCanSupersedeReview(
   }
 
   return incomingAuthoritySeq > activeSourceAuthoritySeq;
+}
+
+function exactReviewCommandVersionIsOlder(
+  active: ExactReviewDecision,
+  incoming: ExactReviewDecision,
+) {
+  if (
+    !active.sourceCommentId ||
+    !incoming.sourceCommentId ||
+    active.sourceCommentId !== incoming.sourceCommentId
+  ) {
+    return false;
+  }
+  const activeAt = Date.parse(String(active.sourceCommentUpdatedAt || ""));
+  const incomingAt = Date.parse(String(incoming.sourceCommentUpdatedAt || ""));
+  if (!Number.isFinite(activeAt) || !Number.isFinite(incomingAt)) return false;
+  if (incomingAt !== activeAt) return incomingAt < activeAt;
+  return Boolean(
+    active.commandBodyDigest &&
+    incoming.commandBodyDigest &&
+    incoming.commandBodyDigest !== active.commandBodyDigest &&
+    incoming.sourceCommentVerified !== true,
+  );
 }
 
 function exactReviewSourceAuthorityWatermark(
@@ -10566,6 +11535,7 @@ function finishExactReviewPublicationQueueItem({
   requeueLatest = false,
   deadLetterCapacityAvailable,
   env,
+  advanceCommandRevision,
 }: {
   state: ExactReviewQueueState;
   item: ExactReviewQueueItem;
@@ -10576,6 +11546,7 @@ function finishExactReviewPublicationQueueItem({
   requeueLatest?: boolean;
   deadLetterCapacityAvailable: boolean;
   env: unknown;
+  advanceCommandRevision: ExactReviewCommandRevisionTransition;
 }): {
   requeued: boolean;
   retried: boolean;
@@ -10637,7 +11608,7 @@ function finishExactReviewPublicationQueueItem({
     (completion.reasonCode === "artifact_unavailable" &&
       attempt >= EXACT_REVIEW_PUBLICATION_ARTIFACT_RETRY_LIMIT);
   if (artifactRefresh) {
-    refreshExactReviewPublicationItem(state, item, now, env);
+    refreshExactReviewPublicationItem(state, item, now, env, advanceCommandRevision);
     return { requeued: false, retried: false, refreshed: true, parked: false };
   }
 
@@ -10736,6 +11707,7 @@ function finishExactReviewQueueItem(
   requestedRetryAt = 0,
   requeueLatest = false,
   retryKind?: ExactReviewRetryKind,
+  random: () => number = Math.random,
 ) {
   const retryingFailure = outcome !== "success";
   const hasNewerRevision = item.revision > Number(item.leaseRevision || 0);
@@ -10755,7 +11727,11 @@ function finishExactReviewQueueItem(
   item.state = "pending";
   if (typedDeferral) {
     const dispatcherAttemptAt = exactReviewQueueEnqueueAttemptAt(state, now);
-    item.nextAttemptAt = Math.max(dispatcherAttemptAt, requestedRetryAt);
+    const deferredAttemptAt =
+      retryKind === "throttle"
+        ? now + exactReviewJitteredDelayMs(Math.max(0, requestedRetryAt - now), random)
+        : requestedRetryAt;
+    item.nextAttemptAt = Math.max(dispatcherAttemptAt, deferredAttemptAt);
     item.backoffReason =
       dispatcherAttemptAt >= item.nextAttemptAt
         ? "dispatcher_backoff"
@@ -10769,10 +11745,7 @@ function finishExactReviewQueueItem(
       const failureAttempts = Number(item.reviewFailureAttempts || 0) + 1;
       item.reviewFailureAttempts = failureAttempts;
       if (failureAttempts >= EXACT_REVIEW_RETRY_LIMIT) {
-        item.state = "parked";
-        item.parkedReason = "review_retry_exhausted";
-        item.backoffReason = undefined;
-        item.updatedAt = now;
+        parkRecoverableExactReviewItem(item, "review_retry_exhausted", now, random);
         return { requeued: false, parked: true };
       }
     }
@@ -10940,7 +11913,7 @@ function reclaimExpiredExactReviewLease(
   return true;
 }
 
-function exactReviewParkedRecoveryAt(item: ExactReviewQueueItem) {
+function exactReviewParkedRecoveryDelayMs(item: ExactReviewQueueItem) {
   if (
     item.state !== "parked" ||
     exactReviewQueueIsPublication(item) ||
@@ -10950,11 +11923,36 @@ function exactReviewParkedRecoveryAt(item: ExactReviewQueueItem) {
   }
   const recoveries = exactReviewParkedRecoveryAttempts(item.parkedRecoveryAttempts);
   if (recoveries >= EXACT_REVIEW_PARKED_RECOVERY_LIMIT) return null;
-  const delay = Math.min(
+  return Math.min(
     EXACT_REVIEW_PARKED_RECOVERY_MAX_MS,
     EXACT_REVIEW_PARKED_RECOVERY_BASE_MS * 2 ** recoveries,
   );
-  return item.updatedAt + delay;
+}
+
+function parkRecoverableExactReviewItem(
+  item: ExactReviewQueueItem,
+  reason: Extract<ExactReviewParkedReason, "dispatch_rejected" | "review_retry_exhausted">,
+  now: number,
+  random: () => number,
+) {
+  item.state = "parked";
+  item.parkedReason = reason;
+  item.backoffReason = undefined;
+  item.updatedAt = now;
+  const delay = exactReviewParkedRecoveryDelayMs(item);
+  item.parkedRecoveryAt =
+    delay === null ? undefined : now + exactReviewJitteredDelayMs(delay, random);
+}
+
+function exactReviewParkedRecoveryAt(item: ExactReviewQueueItem) {
+  const delay = exactReviewParkedRecoveryDelayMs(item);
+  if (delay === null) return null;
+  const scheduled = Number(item.parkedRecoveryAt);
+  // Pre-jitter records did not persist their recovery timestamp. Preserve their
+  // established ladder for one final cycle instead of resampling on every read.
+  return Number.isSafeInteger(scheduled) && scheduled >= item.updatedAt
+    ? scheduled
+    : item.updatedAt + delay;
 }
 
 function recoverParkedExactReviewItems(state: ExactReviewQueueState, now: number) {
@@ -10964,6 +11962,7 @@ function recoverParkedExactReviewItems(state: ExactReviewQueueState, now: number
     if (retryAt === null || retryAt > now) continue;
     item.state = "pending";
     item.parkedReason = undefined;
+    item.parkedRecoveryAt = undefined;
     item.parkedRecoveryAttempts =
       exactReviewParkedRecoveryAttempts(item.parkedRecoveryAttempts) + 1;
     item.nextAttemptAt = now;
@@ -10982,7 +11981,21 @@ function exactReviewParkedRecoveryAttempts(value: unknown) {
   return Number.isSafeInteger(attempts) && attempts > 0 ? attempts : 0;
 }
 
-function expireExactReviewPublicationItems(state: ExactReviewQueueState, now: number, env) {
+export function exactReviewJitteredDelayMs(delayMs: number, random: () => number = Math.random) {
+  const delay = Math.max(0, delayMs);
+  const sample = random();
+  const unit = Number.isFinite(sample) ? Math.max(0, Math.min(1, sample)) : 0.5;
+  const minimum = Math.ceil(delay * 0.75);
+  const maximum = Math.floor(delay * 1.5);
+  return Math.max(minimum, Math.min(maximum, Math.round(delay * (0.75 + 0.75 * unit))));
+}
+
+function expireExactReviewPublicationItems(
+  state: ExactReviewQueueState,
+  now: number,
+  env,
+  advanceCommandRevision: ExactReviewCommandRevisionTransition,
+) {
   let changed = false;
   for (const item of Object.values(state.items)) {
     const publication = item.decision.publication;
@@ -10994,7 +12007,7 @@ function expireExactReviewPublicationItems(state: ExactReviewQueueState, now: nu
     ) {
       continue;
     }
-    refreshExactReviewPublicationItem(state, item, now, env);
+    refreshExactReviewPublicationItem(state, item, now, env, advanceCommandRevision);
     changed = true;
   }
   return changed;
@@ -11005,6 +12018,7 @@ function refreshExactReviewPublicationItem(
   item: ExactReviewQueueItem,
   now: number,
   env,
+  advanceCommandRevision: ExactReviewCommandRevisionTransition,
 ) {
   const publication = item.decision.publication;
   if (!publication) throw new Error(`publication metadata missing for ${item.key}`);
@@ -11020,20 +12034,41 @@ function refreshExactReviewPublicationItem(
   const recoveryKey = exactReviewItemKey(decision);
   const current = state.items[recoveryKey];
   if (current) {
+    if (
+      (current.state === "dispatching" || current.state === "leased") &&
+      !exactReviewDecisionHasCommandContext(decision)
+    ) {
+      return;
+    }
+    if (
+      current.state === "pending" ||
+      current.state === "parked" ||
+      current.state === "dispatching" ||
+      current.state === "leased"
+    ) {
+      const mergeBase = exactReviewQueueIsPublication(current)
+        ? (current.decision.publication?.producerDecision ?? current.decision)
+        : current.decision;
+      const mergedDecision = mergePendingExactReviewDecision(mergeBase, decision);
+      if (exactReviewDecisionHasCommandContext(mergedDecision)) {
+        advanceCommandRevision(current, mergedDecision, now);
+      } else {
+        current.decision = mergedDecision;
+        current.revision += 1;
+        current.updatedAt = now;
+      }
+    }
     if (current.state === "pending" || current.state === "parked") {
-      current.decision = mergePendingExactReviewDecision(current.decision, decision);
       current.state = "pending";
       current.parkedReason = undefined;
       current.parkedRecoveryAttempts = 0;
-    } else {
-      return;
     }
-    current.revision += 1;
-    current.updatedAt = now;
-    Object.assign(
-      current,
-      exactReviewQueueDebouncedAttempt(state, current.decision, now, current.createdAt, env),
-    );
+    if (current.state === "pending") {
+      Object.assign(
+        current,
+        exactReviewQueueDebouncedAttempt(state, current.decision, now, current.createdAt, env),
+      );
+    }
     current.attempts = 0;
     current.publicationFailureAttempts = 0;
     current.reviewFailureAttempts = 0;
@@ -11043,16 +12078,21 @@ function refreshExactReviewPublicationItem(
   }
   // Refresh is the terminal recovery for an unusable artifact. It must not be
   // shed after deleting the only durable publication reference.
-  state.items[recoveryKey] = {
+  const recovery: ExactReviewQueueItem = {
     key: recoveryKey,
     decision,
+    admissionDeliveryId: `artifact-recovery:${item.key}:${item.revision}`,
     state: "pending",
-    revision: 1,
+    revision: 0,
     createdAt: now,
     updatedAt: now,
     ...exactReviewQueueDebouncedAttempt(state, decision, now, now, env),
     attempts: 0,
   };
+  advanceCommandRevision(recovery, decision, now, {
+    newItem: true,
+    minimumRevision: Math.max(item.revision + 1, Number(publication.leaseRevision || 0) + 1),
+  });
 }
 
 function exactReviewQueueEnqueueAttempt(state: ExactReviewQueueState, now: number) {
@@ -12827,6 +13867,127 @@ async function exactReviewSourceAuthorityLiveHead(
     .toLowerCase();
 }
 
+async function exactReviewCommandTargetToken(
+  env,
+  intake: DirectReReviewIntake,
+  permissions: { issues: "write"; pull_requests: "write" },
+) {
+  const credentials = githubAppCredentials(env);
+  if (!credentials) throw new Error("github app is not configured");
+  const appJwt = await signGithubAppJwt(credentials.issuer, credentials.privateKey);
+  return createGithubAppTokenFor({
+    appJwt,
+    installationId: intake.installationId,
+    label: intake.decision.targetRepo,
+    repositories: [repoName(intake.decision.targetRepo)],
+    permissions,
+  });
+}
+
+export async function convergeCommandAcknowledgement(options: {
+  token: Promise<string>;
+  decision: ExactReviewDecision;
+  sourceCommentId: number;
+}) {
+  const token = await options.token;
+  const marker = clawSweeperCommandAckMarker(options.sourceCommentId);
+  const statusMarker = String(options.decision.commandStatusMarker || "");
+  if (!statusMarker) throw new Error("direct command status marker is missing");
+  const list = async () => {
+    const comments = await githubTokenJson({
+      token,
+      path: `/repos/${options.decision.targetRepo}/issues/${options.decision.itemNumber}/comments?per_page=100`,
+      method: "GET",
+      body: undefined,
+      errorLabel: "direct command acknowledgement list",
+    });
+    return Array.isArray(comments)
+      ? comments.filter((comment) => String(objectValue(comment).body || "").includes(marker))
+      : [];
+  };
+  let comments = await list();
+  let exact = comments.find((comment) =>
+    String(objectValue(comment).body || "").includes(statusMarker),
+  );
+  const suppliedStatusCommentId = Number(options.decision.statusCommentId) || null;
+  if (
+    !exact &&
+    suppliedStatusCommentId &&
+    !comments.some((comment) => Number(objectValue(comment).id) === suppliedStatusCommentId)
+  ) {
+    const supplied = await githubTokenJson({
+      token,
+      path: `/repos/${options.decision.targetRepo}/issues/comments/${suppliedStatusCommentId}`,
+      method: "GET",
+      body: undefined,
+      errorLabel: "direct command supplied acknowledgement",
+    }).catch((error) => {
+      if (/404/.test(String(error))) return null;
+      throw error;
+    });
+    const suppliedRecord = objectValue(supplied);
+    const suppliedIssueUrl = String(suppliedRecord.issue_url || "");
+    if (
+      Number(suppliedRecord.id) === suppliedStatusCommentId &&
+      String(suppliedRecord.body || "").includes(marker) &&
+      suppliedIssueUrl.endsWith(
+        `/repos/${options.decision.targetRepo}/issues/${options.decision.itemNumber}`,
+      )
+    ) {
+      comments.push(suppliedRecord);
+    }
+  }
+  if (!exact) {
+    const bare = comments.find(
+      (comment) => !String(objectValue(comment).body || "").includes("clawsweeper-command-status:"),
+    );
+    const bareId = Number(objectValue(bare).id) || null;
+    const body = renderClawSweeperQueuedAcknowledgement(options.sourceCommentId, statusMarker);
+    exact = await githubTokenJson({
+      token,
+      path: bareId
+        ? `/repos/${options.decision.targetRepo}/issues/comments/${bareId}`
+        : `/repos/${options.decision.targetRepo}/issues/${options.decision.itemNumber}/comments`,
+      method: bareId ? "PATCH" : "POST",
+      body: { body },
+      errorLabel: "direct command acknowledgement",
+    });
+    comments = [
+      ...(await list()),
+      { ...objectValue(exact), body, id: Number(objectValue(exact).id || bareId) },
+    ];
+  }
+  const convergence = planClawSweeperAcknowledgementConvergence(comments, statusMarker);
+  for (const id of convergence.prunableIds.slice(0, 20)) {
+    await githubTokenJson({
+      token,
+      path: `/repos/${options.decision.targetRepo}/issues/comments/${id}`,
+      method: "DELETE",
+      body: undefined,
+      errorLabel: "duplicate command acknowledgement cleanup",
+    }).catch((error) => {
+      if (!/404/.test(String(error))) throw error;
+    });
+  }
+  return convergence.keepId ?? (Number(objectValue(exact).id) || null);
+}
+
+async function addCommandReaction(options: {
+  token: Promise<string>;
+  repo: string;
+  commentId: number;
+}) {
+  await githubTokenJson({
+    token: await options.token,
+    path: `/repos/${options.repo}/issues/comments/${options.commentId}/reactions`,
+    method: "POST",
+    body: { content: "eyes" },
+    errorLabel: "direct command reaction",
+  }).catch((error) => {
+    if (!/422|already exists/i.test(String(error))) throw error;
+  });
+}
+
 async function exactReviewTargetReadToken(env, targetRepo: string) {
   const credentials = githubAppCredentials(env);
   if (!credentials) throw new Error("github app is not configured");
@@ -13659,23 +14820,26 @@ function objectValue(value) {
   return value && typeof value === "object" && !Array.isArray(value) ? value : {};
 }
 
-function targetFanoutModeFromPath(path: string): TargetFanoutMode | null {
-  const match = /^\/cursors\/(hot-intake|normal-review|audit)$/.exec(path);
-  return (match?.[1] as TargetFanoutMode | undefined) ?? null;
+function operationalCursorModeFromPath(path: string): OperationalCursorMode | null {
+  const match =
+    /^\/cursors\/(hot-intake|normal-review|audit|review-placeholder-[a-f0-9]{16}-(?:open|closed))$/.exec(
+      path,
+    );
+  return (match?.[1] as OperationalCursorMode | undefined) ?? null;
 }
 
-function targetFanoutCursorKey(mode: TargetFanoutMode): string {
-  return `${TARGET_FANOUT_CURSOR_KEY_PREFIX}${mode}`;
+function operationalCursorKey(mode: OperationalCursorMode): string {
+  return `${OPERATIONAL_CURSOR_KEY_PREFIX}${mode}`;
 }
 
-function emptyTargetFanoutCursor(mode: TargetFanoutMode): TargetFanoutCursor {
+function emptyOperationalCursor(mode: OperationalCursorMode): OperationalCursor {
   return { mode, nextCursor: 0, revision: 0, updatedAt: 0 };
 }
 
-function readTargetFanoutCursor(
+function readOperationalCursor(
   value: unknown,
-  mode: TargetFanoutMode,
-): TargetFanoutCursor | "invalid" | null {
+  mode: OperationalCursorMode,
+): OperationalCursor | "invalid" | null {
   if (value === undefined) return null;
   const cursor = objectValue(value);
   const nextCursor = Number(cursor.nextCursor);
@@ -13695,7 +14859,7 @@ function readTargetFanoutCursor(
   return { mode, nextCursor, revision, updatedAt };
 }
 
-function targetFanoutCursorJson(cursor: TargetFanoutCursor) {
+function operationalCursorJson(cursor: OperationalCursor) {
   return {
     ok: true,
     mode: cursor.mode,

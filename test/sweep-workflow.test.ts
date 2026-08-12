@@ -1141,7 +1141,7 @@ test("exact event review publishes directly with a queue-bounded canonical fallb
   const drift = step(publisher, "Queue fresh review after source drift");
   assert.match(drift.if ?? "", /requeue_latest == 'true'/);
   assert.match(drift.if ?? "", /legacy-exact-artifact\.outputs\.legacy_tupleless == 'true'/);
-  assert.match(drift.run ?? "", /x-clawsweeper-exact-review-signature/);
+  assert.match(drift.run ?? "", /node scripts\/internal-queue-request\.mjs/);
   assert.match(drift.run ?? "", /internal\/exact-review\/enqueue/);
   assert.match(drift.run ?? "", /decision\.sourceAction === "failed_review_shard_recovery"/);
   assert.match(drift.run ?? "", /\.queued == true or \.deduped == true or \.shed == true/);
@@ -1726,9 +1726,8 @@ test("terminal exact-review runs reconcile through a signed isolated backstop", 
   assert.match(eventJob, /run_attempt: runAttempt/);
   assert.match(eventJob, /include_all_claimed: true/);
   assert.match(eventJob, /CLAWSWEEPER_WEBHOOK_SECRET/);
-  assert.match(eventJob, /x-clawsweeper-exact-review-signature: \$signature/);
-  assert.match(eventJob, /--max-time 120/);
-  assert.match(eventJob, /--data-binary "\$payload"/);
+  assert.match(eventJob, /node scripts\/internal-queue-request\.mjs/);
+  assert.match(eventJob, /printf '%s' "\$payload"/);
   assert.match(eventJob, /\/internal\/exact-review\/reconcile/);
   assert.match(eventJob, /actions\/checkout@v7/);
   assert.match(eventJob, /ref: \$\{\{ github\.event\.repository\.default_branch \}\}/);
@@ -1748,7 +1747,7 @@ test("terminal exact-review runs reconcile through a signed isolated backstop", 
   assert.match(sweepJob, /actions\/runs\/\$\{runId\}\$\{suffix\}/);
   assert.match(sweepJob, /terminal_runs: terminalRuns/);
   assert.match(sweepJob, /\/internal\/exact-review\/reconcile/);
-  assert.match(sweepJob, /x-clawsweeper-exact-review-signature/);
+  assert.match(sweepJob, /signedInternalQueueRequest/);
   assert.match(sweepJob, /actions\/checkout@v7/);
   assert.match(sweepJob, /build-script: build/);
   assert.match(sweepJob, /name: Create target write token/);
@@ -1768,6 +1767,10 @@ test("terminal exact-review runs reconcile through a signed isolated backstop", 
   assert.match(
     sweepJob,
     /REVIEW_PLACEHOLDER_MAX_CHECKS: \$\{\{ vars\.REVIEW_PLACEHOLDER_MAX_CHECKS \|\| '20' \}\}/,
+  );
+  assert.match(
+    sweepJob,
+    /REVIEW_PLACEHOLDER_CURSOR_STORE_URL: \$\{\{ vars\.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL \|\| 'https:\/\/clawsweeper\.openclaw\.ai' \}\}/,
   );
   assert.doesNotMatch(sweepJob, /REVIEW_PLACEHOLDER_BACKLOG_ALERT/);
   assert.match(
@@ -1909,6 +1912,89 @@ test("broad record publishers isolate tuple reconciliation from status and auxil
       false,
       `${stepName} auxiliary publish must not replay records`,
     );
+  }
+});
+
+test("exact-item record publication reconciles only selected artifacts through dual-token reads", () => {
+  type Workflow = {
+    jobs: Record<
+      string,
+      { steps: Array<{ name?: string; env?: Record<string, string>; run?: string }> }
+    >;
+  };
+  const workflow = YAML.parse(readText(".github/workflows/sweep.yml")) as Workflow;
+  const publish = workflow.jobs.publish.steps.find(
+    (candidate) => candidate.name === "Commit review records",
+  );
+  assert.ok(publish);
+  assert.equal(publish.env?.GH_TOKEN, "${{ steps.target-write-token.outputs.token }}");
+  assert.equal(
+    publish.env?.CLAWSWEEPER_PUBLIC_GH_TOKEN,
+    "${{ needs.plan.outputs.target_repo == 'openclaw/openclaw' && github.token || '' }}",
+  );
+  const run = publish.run ?? "";
+  assert.match(run, /artifact-item-numbers --artifact-dir artifacts/);
+  assert.match(
+    run,
+    /if \[ -n "\$EXACT_ITEM" \]; then[\s\S]*reconcile_args\+=\(--item-numbers "\$item_numbers" --only-item-numbers\)/,
+  );
+  assert.match(run, /pnpm run reconcile -- "\$\{reconcile_args\[@\]\}"/);
+  assert.doesNotMatch(
+    run.slice(
+      run.indexOf('if [ -n "$EXACT_ITEM" ]'),
+      run.indexOf("fi\n", run.indexOf('if [ -n "$EXACT_ITEM" ]')),
+    ),
+    /--max-pages|issues\?state=open|pulls\?state=open/,
+  );
+});
+
+test("Actions compatibility intake acknowledges only non-review commands before routing", () => {
+  const workflow = YAML.parse(readText(".github/workflows/clawsweeper-dispatch.yml")) as {
+    jobs: Record<string, { steps: Array<{ name?: string; run?: string }> }>;
+  };
+  const step = workflow.jobs.dispatch.steps.find(
+    (candidate) => candidate.name === "Acknowledge and dispatch ClawSweeper comment",
+  );
+  assert.ok(step);
+  const block = step.run ?? "";
+  assert.match(block, /is_read_only_review=false/);
+  assert.match(block, /review\|re-\?review\|rereview\|re-\?run\|rerun/);
+  assert.doesNotMatch(block, /review_scan_file|awk '/);
+  assert.match(
+    block,
+    /if \[ "\$is_read_only_review" != "true" \] && \[ -n "\$TARGET_TOKEN" \]; then/,
+  );
+  assert.match(block, /Command router queued/);
+  assert.match(block, /status_comment_id:\(\$status_comment_id\|tonumber\)/);
+  assert.match(block, /event_type:"clawsweeper_comment"/);
+
+  const predicateStart = block.indexOf('body_file="$RUNNER_TEMP/clawsweeper-comment-body.txt"');
+  const predicateEnd = block.indexOf('status_comment_id=""', predicateStart);
+  assert.ok(predicateStart >= 0 && predicateEnd > predicateStart);
+  const predicate = [
+    "set -euo pipefail",
+    block.slice(predicateStart, predicateEnd),
+    "printf '%s\\n' \"$is_read_only_review\"",
+  ].join("\n");
+  const root = mkdtempSync(tmpPrefix);
+  try {
+    for (const [body, expected] of [
+      ["@clawsweeper\nre-review this path", "true"],
+      ["@openclaw-clawsweeper[bot]\nre-run review: check retries", "true"],
+      ["/review focus on retries", "true"],
+      ["/clawsweeper review focus on retries", "true"],
+      ["@openclaw-clawsweeper review focus on retries", "true"],
+      ["@clawsweeper automerge", "false"],
+      ["@clawsweeper autofix: rerun the review tests", "false"],
+    ] as const) {
+      const output = execFileSync("bash", ["-c", predicate], {
+        encoding: "utf8",
+        env: { ...process.env, COMMENT_BODY: body, RUNNER_TEMP: root, TARGET_TOKEN: "" },
+      });
+      assert.equal(output.trim(), expected, body);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
   }
 });
 

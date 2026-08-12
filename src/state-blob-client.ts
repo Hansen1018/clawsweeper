@@ -1,4 +1,6 @@
-import { createHash, createHmac } from "node:crypto";
+import { createHash } from "node:crypto";
+
+import { internalQueueRequestHeaders } from "./repair/exact-review-command-queue.js";
 
 const SINGLE_PUT_MAX_BYTES = 24 * 1024 * 1024;
 
@@ -85,23 +87,20 @@ async function signedBlobPost<T>(
   if (!baseUrl) throw new Error("state blob Worker URL is required");
   if (!options.webhookSecret) throw new Error("state blob Worker secret is required");
   const body = JSON.stringify(payload);
-  const signature = `sha256=${createHmac("sha256", options.webhookSecret)
-    .update(body)
-    .digest("hex")}`;
+  const path = `/internal/state/blobs/${operation}`;
   let lastError = "request failed";
   for (let attempt = 1; attempt <= 4; attempt += 1) {
     try {
-      const response = await (options.fetchImpl ?? fetch)(
-        `${baseUrl}/internal/state/blobs/${operation}`,
-        {
+      const response = await (options.fetchImpl ?? fetch)(`${baseUrl}${path}`, {
+        method: "POST",
+        headers: internalQueueRequestHeaders({
+          secret: options.webhookSecret,
           method: "POST",
-          headers: {
-            "content-type": "application/json",
-            "x-clawsweeper-exact-review-signature": signature,
-          },
+          path,
           body,
-        },
-      );
+        }),
+        body,
+      });
       const value = (await response.json().catch(() => null)) as unknown;
       if (response.ok && value && typeof value === "object") return value as T;
       const code =

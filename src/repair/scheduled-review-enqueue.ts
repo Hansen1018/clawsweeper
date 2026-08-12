@@ -1,8 +1,11 @@
 #!/usr/bin/env node
-import { createHmac } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { parseArgs } from "./lib.js";
+import {
+  INTERNAL_QUEUE_REQUEST_TIMEOUT_MS,
+  internalQueueRequestHeaders,
+} from "./exact-review-command-queue.js";
 
 type ScheduledReviewLane = "hot_intake" | "normal_backfill";
 
@@ -110,16 +113,18 @@ export async function enqueueScheduledReviewPlan(
         sourceUpdatedAt: candidate.updatedAt,
       },
     });
-    const signature = `sha256=${createHmac("sha256", options.secret).update(payload).digest("hex")}`;
+    const path = "/internal/exact-review/enqueue";
     summary.attempted += 1;
-    const response = await fetchImpl(`${queueUrl}/internal/exact-review/enqueue`, {
+    const response = await fetchImpl(`${queueUrl}${path}`, {
       method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-clawsweeper-exact-review-signature": signature,
-      },
+      headers: internalQueueRequestHeaders({
+        secret: options.secret,
+        method: "POST",
+        path,
+        body: payload,
+      }),
       body: payload,
-      signal: AbortSignal.timeout(20_000),
+      signal: AbortSignal.timeout(INTERNAL_QUEUE_REQUEST_TIMEOUT_MS),
     });
     const body = (await response.json().catch(() => null)) as Record<string, unknown> | null;
     if (!response.ok || !body || body.ok !== true) {
@@ -193,7 +198,10 @@ async function main(): Promise<void> {
     targetRepo: requiredString(args["target-repo"], "--target-repo"),
     targetBranch: requiredString(args["target-branch"], "--target-branch"),
     queueUrl: requiredString(args["queue-url"], "--queue-url"),
-    secret: requiredString(process.env.CLAWSWEEPER_WEBHOOK_SECRET, "CLAWSWEEPER_WEBHOOK_SECRET"),
+    secret: requiredString(
+      process.env.CLAWSWEEPER_INTERNAL_QUEUE_SECRET || process.env.CLAWSWEEPER_WEBHOOK_SECRET,
+      "internal queue secret",
+    ),
     deliveryPrefix: requiredString(args["delivery-prefix"], "--delivery-prefix"),
   });
   process.stdout.write(`${JSON.stringify(result)}\n`);

@@ -13,6 +13,14 @@ import {
 import { adaptiveReviewBudgetForPullRequest } from "./adaptive-review-budget.js";
 import { isExactReviewCloseGuardLabel } from "./exact-review-guard-labels.js";
 import { commentBodySha256 } from "./comment-router-utils.js";
+import {
+  clawSweeperCommandAckMarker,
+  directReReviewAdditionalPrompt,
+  renderClawSweeperQueuedAcknowledgement,
+  reReviewContextFromClawSweeperComment,
+} from "./comment-command-text.js";
+import { directReReviewIntake } from "./direct-re-review-admission.js";
+import { postSignedExactReviewQueue } from "./exact-review-command-queue.js";
 
 const DEFAULT_PORT = 8787;
 const REVIEW_REPO = "openclaw/clawsweeper";
@@ -30,7 +38,6 @@ const PULL_ITEM_ACTIONS = new Set([
   "unlocked",
   "unlabeled",
 ]);
-const DEFAULT_FAST_ACK_SETTLE_DELAYS_MS = [250, 1500, 10_000];
 const inFlightFastAcks = new Map<string, Promise<number>>();
 
 type AcceptedIssueCommentWebhook = {
@@ -39,9 +46,15 @@ type AcceptedIssueCommentWebhook = {
   targetRepo: string;
   targetBranch: string;
   itemNumber: number;
+  itemKind: "issue" | "pull_request";
+  itemState: string;
   commentId: number;
   installationId: number;
   sourceAction: string;
+  commentBody: string;
+  commentAuthor: string;
+  commentUrl: string;
+  maintainerAuthorized: boolean;
   commentUpdatedAt?: string;
   commentBodySha256?: string;
 };
@@ -72,17 +85,19 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   startServer();
 }
 
-export function startServer() {
-  const port = Number.parseInt(process.env.PORT ?? String(DEFAULT_PORT), 10) || DEFAULT_PORT;
+export function startServer(portOverride?: number) {
+  const port =
+    portOverride ?? (Number.parseInt(process.env.PORT ?? String(DEFAULT_PORT), 10) || DEFAULT_PORT);
   const server = http.createServer((request, response) => {
     void handleRequest(request, response);
   });
   server.listen(port, () => {
     console.log(`[clawsweeper webhook] listening on :${port}`);
   });
+  return server;
 }
 
-async function handleRequest(request: http.IncomingMessage, response: http.ServerResponse) {
+export async function handleRequest(request: http.IncomingMessage, response: http.ServerResponse) {
   if (request.method !== "POST" || request.url !== "/github/webhook") {
     response.writeHead(404).end("not found\n");
     return;
@@ -101,10 +116,33 @@ async function handleRequest(request: http.IncomingMessage, response: http.Serve
     response.end(`${JSON.stringify(result.body)}\n`);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    console.error(`[clawsweeper webhook] ${message}`);
-    response.writeHead(400, { "content-type": "application/json" });
-    response.end(`${JSON.stringify({ ok: false, error: message })}\n`);
+    const retryableIntakeFailure = isRetryableIntakeFailure(error);
+    console.error(
+      `[clawsweeper webhook] ${retryableIntakeFailure ? "durable intake unavailable" : "request rejected"}: ${message}`,
+    );
+    response.writeHead(retryableIntakeFailure ? 503 : 400, {
+      "content-type": "application/json",
+    });
+    response.end(
+      `${JSON.stringify(
+        retryableIntakeFailure
+          ? { ok: false, retryable: true, error: "durable_intake_unavailable" }
+          : { ok: false, error: message },
+      )}\n`,
+    );
   }
+}
+
+function isRetryableIntakeFailure(error: unknown) {
+  const name = error instanceof Error ? error.name : "";
+  const message = error instanceof Error ? error.message : String(error);
+  return (
+    name === "TimeoutError" ||
+    name === "AbortError" ||
+    /exact-review queue \/internal\/exact-review\/command-intake failed \(HTTP (?:429|5\d\d)\)/.test(
+      message,
+    )
+  );
 }
 
 export async function handleGitHubWebhook({
@@ -118,10 +156,47 @@ export async function handleGitHubWebhook({
   if (!decision.accepted) return { statusCode: 202, body: decision };
   const accepted = decision as AcceptedWebhook;
 
+  if (
+    accepted.type === "issue_comment" &&
+    accepted.itemState === "open" &&
+    reReviewContextFromClawSweeperComment(accepted.commentBody) !== null
+  ) {
+    const intake = directReReviewIntake({
+      targetRepo: accepted.targetRepo,
+      targetBranch: accepted.targetBranch,
+      itemNumber: accepted.itemNumber,
+      itemKind: accepted.itemKind,
+      installationId: accepted.installationId,
+      sourceCommentId: accepted.commentId,
+      sourceCommentUpdatedAt: accepted.commentUpdatedAt ?? "",
+      commandBodyDigest: accepted.commentBodySha256 ?? "",
+      commandOrigin: "hosted_webhook",
+      additionalPrompt: directReReviewAdditionalPrompt({
+        body: accepted.commentBody,
+        maintainerAuthorized: accepted.maintainerAuthorized,
+        author: accepted.commentAuthor,
+        commentUrl: accepted.commentUrl,
+      }),
+    });
+    const result = await postSignedExactReviewQueue({
+      queueUrl:
+        process.env.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL ||
+        process.env.QUEUE_URL ||
+        "https://clawsweeper.openclaw.ai",
+      secret:
+        process.env.CLAWSWEEPER_INTERNAL_QUEUE_SECRET ||
+        process.env.CLAWSWEEPER_WEBHOOK_SECRET ||
+        "",
+      path: "/internal/exact-review/command-intake",
+      body: intake,
+    });
+    return { statusCode: 202, body: result };
+  }
+
   const appJwt = createAppJwt();
-  const dispatchToken = await createReviewRepoDispatchToken({ appJwt });
 
   if (accepted.type === "item") {
+    const dispatchToken = await createReviewRepoDispatchToken({ appJwt });
     await dispatchItemReview({ token: dispatchToken, accepted });
     return { statusCode: 202, body: { ok: true, dispatched: "clawsweeper_item" } };
   }
@@ -136,6 +211,7 @@ export async function handleGitHubWebhook({
       pull_requests: "write",
     },
   });
+  const dispatchToken = await createReviewRepoDispatchToken({ appJwt });
   const statusCommentId = await createFastAckCommentOnce({
     token: targetToken,
     repo: accepted.targetRepo,
@@ -158,13 +234,6 @@ export async function handleGitHubWebhook({
     sourceAction: accepted.sourceAction,
     ...(accepted.commentUpdatedAt ? { commentUpdatedAt: accepted.commentUpdatedAt } : {}),
     ...(accepted.commentBodySha256 ? { commentBodyDigest: accepted.commentBodySha256 } : {}),
-  });
-  settleFastAckComments({
-    token: targetToken,
-    repo: accepted.targetRepo,
-    itemNumber: accepted.itemNumber,
-    sourceCommentId: accepted.commentId,
-    delaysMs: fastAckSettleDelaysMs(process.env.CLAWSWEEPER_FAST_ACK_SETTLE_DELAYS_MS),
   });
   return { statusCode: 202, body: { ok: true, status_comment_id: statusCommentId } };
 }
@@ -244,9 +313,15 @@ export function classifyIssueCommentWebhook({
     targetRepo,
     targetBranch,
     itemNumber,
+    itemKind: issue.pull_request ? "pull_request" : "issue",
+    itemState: String(issue.state ?? "").toLowerCase(),
     commentId,
     installationId,
     sourceAction: String(payload.action ?? "created"),
+    commentBody: String(comment.body ?? ""),
+    commentAuthor: String(asRecord(comment.user).login ?? ""),
+    commentUrl: String(comment.html_url ?? ""),
+    maintainerAuthorized: ALLOWED_ASSOCIATIONS.has(association),
     ...(commentUpdatedAt
       ? {
           commentUpdatedAt,
@@ -414,20 +489,6 @@ function normalizedLogin(value: JsonValue) {
     .toLowerCase();
 }
 
-export function renderFastAckComment(sourceCommentId: number) {
-  return [
-    fastAckMarker(sourceCommentId),
-    "🦞👀",
-    "ClawSweeper picked this up.",
-    "",
-    "Command router queued. I will update this comment with the next step.",
-  ].join("\n");
-}
-
-function fastAckMarker(sourceCommentId: number) {
-  return `<!-- clawsweeper-command-ack:${sourceCommentId} -->`;
-}
-
 export function verifyGitHubSignature({
   secret,
   signature,
@@ -515,80 +576,81 @@ function signAppJwt({ issuer, privateKey }: { issuer: string; privateKey: string
   return `${input}.${base64Url(signature)}`;
 }
 
-async function createFastAckComment({
-  token,
-  repo,
-  itemNumber,
-  sourceCommentId,
-}: {
-  token: string;
-  repo: string;
-  itemNumber: number;
-  sourceCommentId: number;
-}) {
-  const existingId = await pruneFastAckComments({ token, repo, itemNumber, sourceCommentId });
-  if (existingId) return existingId;
-  const response = await githubFetch({
-    token,
-    path: `/repos/${repo}/issues/${itemNumber}/comments`,
-    method: "POST",
-    body: { body: renderFastAckComment(sourceCommentId) },
-  });
-  const id = Number(response.id);
-  if (!Number.isInteger(id) || id <= 0) throw new Error("fast ack comment response missing id");
-  return (await pruneFastAckComments({ token, repo, itemNumber, sourceCommentId })) ?? id;
-}
-
-function settleFastAckComments({
-  token,
-  repo,
-  itemNumber,
-  sourceCommentId,
-  delaysMs = DEFAULT_FAST_ACK_SETTLE_DELAYS_MS,
-}: {
-  token: string;
-  repo: string;
-  itemNumber: number;
-  sourceCommentId: number;
-  delaysMs?: number[];
-}) {
-  const cleanup = async () => {
-    for (const delayMs of delaysMs) {
-      await sleep(delayMs);
-      await pruneFastAckComments({ token, repo, itemNumber, sourceCommentId });
-    }
-  };
-  void cleanup().catch((error) => {
-    const message = error instanceof Error ? error.message : String(error);
-    console.error(`[clawsweeper webhook] fast ack cleanup failed: ${message}`);
-  });
-}
-
-function fastAckSettleDelaysMs(value: string | undefined) {
-  const delays = String(value ?? "")
-    .split(",")
-    .map((entry) => Number.parseInt(entry.trim(), 10))
-    .filter((delay) => Number.isFinite(delay) && delay >= 0);
-  return delays.length > 0 ? delays : DEFAULT_FAST_ACK_SETTLE_DELAYS_MS;
-}
-
 async function createFastAckCommentOnce({
   token,
   repo,
   itemNumber,
   sourceCommentId,
+  statusMarker,
 }: {
   token: string;
   repo: string;
   itemNumber: number;
   sourceCommentId: number;
+  statusMarker?: string;
 }) {
-  const key = fastAckKey({ repo, itemNumber, sourceCommentId });
+  const key = `${fastAckKey({ repo, itemNumber, sourceCommentId })}:${statusMarker ?? "router"}`;
   const pending = inFlightFastAcks.get(key);
   if (pending) return pending;
-  const next = createFastAckComment({ token, repo, itemNumber, sourceCommentId }).finally(() => {
-    inFlightFastAcks.delete(key);
-  });
+  const next = (async () => {
+    const comments = await listFastAckComments({ token, repo, itemNumber, sourceCommentId });
+    const bare = comments.find(
+      (comment) => !/clawsweeper-command-(?:status|progress)/.test(String(comment.body ?? "")),
+    );
+    const matching = statusMarker
+      ? comments.find((comment) => String(comment.body ?? "").includes(statusMarker))
+      : bare;
+    if (matching?.id) {
+      const converged = planGenericAcknowledgementConvergence(comments);
+      for (const id of converged.prunableIds) {
+        await githubFetch({
+          token,
+          path: `/repos/${repo}/issues/comments/${id}`,
+          method: "DELETE",
+        }).catch((error) => {
+          if (!String(error).includes("404")) {
+            console.error(
+              `[clawsweeper webhook] deferred duplicate acknowledgement cleanup: ${error}`,
+            );
+          }
+        });
+      }
+      return converged.keepId ?? Number(matching.id);
+    }
+    const body = renderClawSweeperQueuedAcknowledgement(sourceCommentId, statusMarker);
+    const result = await githubFetch({
+      token,
+      path: bare?.id
+        ? `/repos/${repo}/issues/comments/${bare.id}`
+        : `/repos/${repo}/issues/${itemNumber}/comments`,
+      method: bare?.id ? "PATCH" : "POST",
+      body: { body },
+    });
+    const resultId = Number(result.id || bare?.id);
+    const converged = planGenericAcknowledgementConvergence([
+      ...(await listFastAckComments({ token, repo, itemNumber, sourceCommentId })),
+      {
+        ...result,
+        id: resultId,
+        body,
+        created_at: result.created_at ?? bare?.created_at ?? new Date().toISOString(),
+      },
+    ]);
+    for (const id of converged.prunableIds) {
+      await githubFetch({
+        token,
+        path: `/repos/${repo}/issues/comments/${id}`,
+        method: "DELETE",
+      }).catch((error) => {
+        if (!String(error).includes("404")) {
+          console.error(
+            `[clawsweeper webhook] deferred duplicate acknowledgement cleanup: ${error}`,
+          );
+        }
+      });
+    }
+    return converged.keepId ?? resultId;
+  })().finally(() => inFlightFastAcks.delete(key));
   inFlightFastAcks.set(key, next);
   return next;
 }
@@ -605,75 +667,23 @@ function fastAckKey({
   return `${repo.toLowerCase()}:${itemNumber}:${sourceCommentId}`;
 }
 
-function sleep(delayMs: number) {
-  return new Promise((resolve) => {
-    const timer = setTimeout(resolve, delayMs);
-    timer.unref?.();
-  });
-}
-
-async function pruneFastAckComments({
-  token,
-  repo,
-  itemNumber,
-  sourceCommentId,
-}: {
-  token: string;
-  repo: string;
-  itemNumber: number;
-  sourceCommentId: number;
-}) {
-  const comments = await listFastAckComments({ token, repo, itemNumber, sourceCommentId });
-  if (comments.length === 0) return null;
-  const hasStatusComment = comments.some(isStatusBearingFastAckComment);
-  comments.sort(compareFastAckKeepPriority);
-  const keepId = Number(comments[0]?.id) || null;
-  for (const comment of comments) {
-    const id = Number(comment.id) || 0;
-    if (id <= 0 || id === keepId) continue;
-    if (hasStatusComment && isStatusBearingFastAckComment(comment)) continue;
-    await githubFetch({
-      token,
-      path: `/repos/${repo}/issues/comments/${id}`,
-      method: "DELETE",
-    }).catch((error) => {
-      const message = error instanceof Error ? error.message : String(error);
-      if (!message.includes("404")) throw error;
-    });
-  }
-  return keepId;
-}
-
-function compareFastAckKeepPriority(left: LooseRecord, right: LooseRecord) {
-  const leftStatus = isStatusBearingFastAckComment(left) ? 1 : 0;
-  const rightStatus = isStatusBearingFastAckComment(right) ? 1 : 0;
-  if (leftStatus !== rightStatus) return rightStatus - leftStatus;
-  if (leftStatus > 0) return compareCommentsByUpdatedAtDesc(left, right);
-  return compareCommentsByCreatedAt(left, right);
-}
-
-function isStatusBearingFastAckComment(comment: LooseRecord) {
-  const body = String(comment.body ?? "");
-  return (
-    body.includes("clawsweeper-command-status:") ||
-    body.includes("<!-- clawsweeper-command-progress:start -->")
-  );
-}
-
-function compareCommentsByUpdatedAtDesc(left: LooseRecord, right: LooseRecord) {
-  const leftUpdated = String(left.updated_at ?? left.created_at ?? "");
-  const rightUpdated = String(right.updated_at ?? right.created_at ?? "");
-  return (
-    rightUpdated.localeCompare(leftUpdated) || (Number(right.id) || 0) - (Number(left.id) || 0)
-  );
-}
-
-function compareCommentsByCreatedAt(left: LooseRecord, right: LooseRecord) {
-  const leftCreated = String(left.created_at ?? "");
-  const rightCreated = String(right.created_at ?? "");
-  return (
-    leftCreated.localeCompare(rightCreated) || (Number(left.id) || 0) - (Number(right.id) || 0)
-  );
+function planGenericAcknowledgementConvergence(
+  comments: Array<{ id?: unknown; body?: unknown; created_at?: unknown }>,
+) {
+  const candidates = comments
+    .filter((comment) => !String(comment.body || "").includes("clawsweeper-command-status:"))
+    .sort(
+      (left, right) =>
+        String(left.created_at || "").localeCompare(String(right.created_at || "")) ||
+        Number(left.id) - Number(right.id),
+    );
+  const keepId = Number(candidates[0]?.id) || null;
+  return {
+    keepId,
+    prunableIds: candidates
+      .map((comment) => Number(comment.id))
+      .filter((id) => Number.isSafeInteger(id) && id > 0 && id !== keepId),
+  };
 }
 
 async function listFastAckComments({
@@ -688,7 +698,7 @@ async function listFastAckComments({
   sourceCommentId: number;
 }) {
   const comments: LooseRecord[] = [];
-  const marker = fastAckMarker(sourceCommentId);
+  const marker = clawSweeperCommandAckMarker(sourceCommentId);
   const since = encodeURIComponent(new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString());
   for (let page = 1; page <= 5; page += 1) {
     const response = await githubFetch({
@@ -794,7 +804,7 @@ async function dispatchCommentRouter({
   targetBranch: string;
   itemNumber: number;
   commentId: number;
-  statusCommentId: number;
+  statusCommentId?: number;
   sourceAction: string;
   commentUpdatedAt?: string;
   commentBodyDigest?: string;
@@ -810,7 +820,7 @@ async function dispatchCommentRouter({
         target_branch: targetBranch,
         item_number: itemNumber,
         comment_id: commentId,
-        status_comment_id: statusCommentId,
+        ...(statusCommentId ? { status_comment_id: statusCommentId } : {}),
         source_event: "issue_comment",
         source_action: sourceAction,
         comment_event_auth: "github_webhook_v1",

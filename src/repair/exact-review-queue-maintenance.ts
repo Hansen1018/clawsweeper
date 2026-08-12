@@ -6,7 +6,7 @@ const maxItems = integerArg("--max-items", 100, 1, 100);
 const requestedPasses = integerArg("--passes", 1, 1, 100);
 const client = new ExactReviewBatchQueueClient({
   baseUrl: env("EXACT_REVIEW_QUEUE_URL"),
-  webhookSecret: env("CLAWSWEEPER_WEBHOOK_SECRET"),
+  webhookSecret: process.env.CLAWSWEEPER_INTERNAL_QUEUE_SECRET || env("CLAWSWEEPER_WEBHOOK_SECRET"),
 });
 
 if (requestedPasses > 1) {

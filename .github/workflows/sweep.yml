@@ -264,6 +264,7 @@ jobs:
           CLIENT_PAYLOAD: ${{ toJson(github.event.client_payload) }}
           GH_TOKEN: ${{ github.token }}
           QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
+          CLAWSWEEPER_INTERNAL_QUEUE_SECRET: ${{ secrets.CLAWSWEEPER_INTERNAL_QUEUE_SECRET || secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
         run: |
           set -euo pipefail
@@ -424,13 +425,8 @@ jobs:
           );
           NODE
           )"
-          signature="$(PAYLOAD="$payload" node -e 'const crypto=require("node:crypto"); process.stdout.write(`sha256=${crypto.createHmac("sha256", process.env.CLAWSWEEPER_WEBHOOK_SECRET).update(process.env.PAYLOAD).digest("hex")}`)')"
-          curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
-            --request POST \
-            --header "content-type: application/json" \
-            --header "x-clawsweeper-exact-review-signature: $signature" \
-            --data "$payload" \
-            "$queue_url$queue_path" >/dev/null
+          printf '%s' "$payload" | node scripts/internal-queue-request.mjs \
+            --url "$queue_url" --path "$queue_path" >/dev/null
 
   event-review-apply:
     name: Review exact event item
@@ -1350,6 +1346,7 @@ jobs:
         id: prepare-direct-exact-review-publication
         continue-on-error: true
         env:
+          CLAWSWEEPER_INTERNAL_QUEUE_SECRET: ${{ secrets.CLAWSWEEPER_INTERNAL_QUEUE_SECRET || secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           GH_TOKEN: ${{ steps.target-write-token.outputs.token }}
           CLAWSWEEPER_PUBLIC_GH_TOKEN: ${{ steps.target.outputs.target_repo == 'openclaw/openclaw' && github.token || '' }}
@@ -1376,6 +1373,7 @@ jobs:
           EXACT_REVIEW_DIRECT_REVISION: ${{ steps.claim-exact-review-queue.outputs.lease_revision }}
           EXACT_REVIEW_DIRECT_SOURCE_ACTION: ${{ fromJSON(steps.claim-exact-review-queue.outputs.decision).sourceAction }}
           EXACT_REVIEW_QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
+          CLAWSWEEPER_INTERNAL_QUEUE_SECRET: ${{ secrets.CLAWSWEEPER_INTERNAL_QUEUE_SECRET || secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
         run: pnpm run --silent repair:exact-review-direct-publication
 
@@ -1393,6 +1391,7 @@ jobs:
           DIRECT_PUBLICATION_SUPERSEDED: ${{ steps.direct-exact-review-publication.outputs.superseded }}
           DIRECT_OUTCOME: .artifacts/direct-publication-outcome.json
           QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
+          CLAWSWEEPER_INTERNAL_QUEUE_SECRET: ${{ secrets.CLAWSWEEPER_INTERNAL_QUEUE_SECRET || secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           CLAWSWEEPER_COMMENT_LOOKBACK_MINUTES: ${{ vars.CLAWSWEEPER_COMMENT_LOOKBACK_MINUTES || '180' }}
           CLAWSWEEPER_COMMENT_MAX_COMMENTS: ${{ vars.CLAWSWEEPER_COMMENT_MAX_COMMENTS || '1000' }}
@@ -1460,13 +1459,9 @@ jobs:
                 receipt_id: `${prefix}:${process.env.GITHUB_RUN_ID}:${process.env.GITHUB_RUN_ATTEMPT}`,
               }));
             ')"
-            lifecycle_signature="$(PAYLOAD="$lifecycle_payload" node -e 'const crypto=require("node:crypto"); process.stdout.write(`sha256=${crypto.createHmac("sha256", process.env.CLAWSWEEPER_WEBHOOK_SECRET).update(process.env.PAYLOAD).digest("hex")}`)')"
-            lifecycle_response="$(curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
-              --request POST \
-              --header "content-type: application/json" \
-              --header "x-clawsweeper-exact-review-signature: $lifecycle_signature" \
-              --data "$lifecycle_payload" \
-              "$queue_url/internal/exact-review/lifecycle/router-receipt")"
+            lifecycle_response="$(printf '%s' "$lifecycle_payload" | node scripts/internal-queue-request.mjs \
+              --url "$queue_url" \
+              --path "/internal/exact-review/lifecycle/router-receipt")"
             jq -e '.ok == true' <<<"$lifecycle_response" >/dev/null
           elif [ -n "$lifecycle_terminal" ]; then
             export LIFECYCLE_TERMINAL="$lifecycle_terminal"
@@ -1480,13 +1475,9 @@ jobs:
                 kind: process.env.LIFECYCLE_TERMINAL,
               }));
             ')"
-            lifecycle_signature="$(PAYLOAD="$lifecycle_payload" node -e 'const crypto=require("node:crypto"); process.stdout.write(`sha256=${crypto.createHmac("sha256", process.env.CLAWSWEEPER_WEBHOOK_SECRET).update(process.env.PAYLOAD).digest("hex")}`)')"
-            lifecycle_response="$(curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
-              --request POST \
-              --header "content-type: application/json" \
-              --header "x-clawsweeper-exact-review-signature: $lifecycle_signature" \
-              --data "$lifecycle_payload" \
-              "$queue_url/internal/exact-review/lifecycle/terminal-disposition")"
+            lifecycle_response="$(printf '%s' "$lifecycle_payload" | node scripts/internal-queue-request.mjs \
+              --url "$queue_url" \
+              --path "/internal/exact-review/lifecycle/terminal-disposition")"
             jq -e '.ok == true' <<<"$lifecycle_response" >/dev/null
           fi
           echo "direct_lifecycle_requeue=$direct_lifecycle_requeue" >> "$GITHUB_OUTPUT"
@@ -1536,6 +1527,7 @@ jobs:
           LIVE_TERMINAL_NOOP: ${{ steps.review-exact-event-item.outputs.terminal_during_review == 'true' && 'true' || steps.live-item.outputs.terminal_noop }}
           PROTOCOL_VERSION: ${{ steps.claim-exact-review-queue.outputs.protocol_version }}
           QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
+          CLAWSWEEPER_INTERNAL_QUEUE_SECRET: ${{ secrets.CLAWSWEEPER_INTERNAL_QUEUE_SECRET || secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
         run: |
           set -euo pipefail
@@ -1579,15 +1571,10 @@ jobs:
           }));
           NODE
           )"
-          signature="$(PAYLOAD="$payload" node -e 'const crypto=require("node:crypto"); process.stdout.write(`sha256=${crypto.createHmac("sha256", process.env.CLAWSWEEPER_WEBHOOK_SECRET).update(process.env.PAYLOAD).digest("hex")}`)')"
           for attempt in 1 2 3; do
             response="$(
-              curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
-                --request POST \
-                --header "content-type: application/json" \
-                --header "x-clawsweeper-exact-review-signature: $signature" \
-                --data "$payload" \
-                "$queue_url/internal/exact-review/enqueue" || true
+              printf '%s' "$payload" | node scripts/internal-queue-request.mjs \
+                --url "$queue_url" --path "/internal/exact-review/enqueue" || true
             )"
             if jq -e '.superseded == true' <<< "$response" >/dev/null 2>&1; then
               echo "::notice::Exact-review publication revision $(jq -r '.publication_revision // "unknown"' <<< "$response") was superseded by revision $(jq -r '.superseded_by_revision // "unknown"' <<< "$response"); the newer publisher owns final delivery."
@@ -2088,6 +2075,7 @@ jobs:
           DIRECT_LIFECYCLE_PLAN: ${{ steps.publication-context.outputs.direct_lifecycle_plan }}
           DIRECT_LIFECYCLE_RECEIPT_OUTCOME: ${{ steps.publication-context.outputs.direct_lifecycle_receipt_outcome }}
           QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
+          CLAWSWEEPER_INTERNAL_QUEUE_SECRET: ${{ secrets.CLAWSWEEPER_INTERNAL_QUEUE_SECRET || secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           CLAWSWEEPER_COMMENT_LOOKBACK_MINUTES: ${{ vars.CLAWSWEEPER_COMMENT_LOOKBACK_MINUTES || '180' }}
           CLAWSWEEPER_COMMENT_MAX_COMMENTS: ${{ vars.CLAWSWEEPER_COMMENT_MAX_COMMENTS || '1000' }}
@@ -2128,13 +2116,9 @@ jobs:
                 receipt_id: `${prefix}:${process.env.GITHUB_RUN_ID}:${process.env.GITHUB_RUN_ATTEMPT}`,
               }));
             ')"
-            lifecycle_signature="$(PAYLOAD="$lifecycle_payload" node -e 'const crypto=require("node:crypto"); process.stdout.write(`sha256=${crypto.createHmac("sha256", process.env.CLAWSWEEPER_WEBHOOK_SECRET).update(process.env.PAYLOAD).digest("hex")}`)')"
-            lifecycle_response="$(curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
-              --request POST \
-              --header "content-type: application/json" \
-              --header "x-clawsweeper-exact-review-signature: $lifecycle_signature" \
-              --data "$lifecycle_payload" \
-              "$queue_url/internal/exact-review/lifecycle/router-receipt")"
+            lifecycle_response="$(printf '%s' "$lifecycle_payload" | node scripts/internal-queue-request.mjs \
+              --url "$queue_url" \
+              --path "/internal/exact-review/lifecycle/router-receipt")"
             jq -e '.ok == true' <<<"$lifecycle_response" >/dev/null
           }
           post_terminal_disposition() {
@@ -2149,13 +2133,9 @@ jobs:
                 kind: process.env.LIFECYCLE_TERMINAL,
               }));
             ')"
-            lifecycle_signature="$(PAYLOAD="$lifecycle_payload" node -e 'const crypto=require("node:crypto"); process.stdout.write(`sha256=${crypto.createHmac("sha256", process.env.CLAWSWEEPER_WEBHOOK_SECRET).update(process.env.PAYLOAD).digest("hex")}`)')"
-            lifecycle_response="$(curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
-              --request POST \
-              --header "content-type: application/json" \
-              --header "x-clawsweeper-exact-review-signature: $lifecycle_signature" \
-              --data "$lifecycle_payload" \
-              "$queue_url/internal/exact-review/lifecycle/terminal-disposition")"
+            lifecycle_response="$(printf '%s' "$lifecycle_payload" | node scripts/internal-queue-request.mjs \
+              --url "$queue_url" \
+              --path "/internal/exact-review/lifecycle/terminal-disposition")"
             jq -e '.ok == true' <<<"$lifecycle_response" >/dev/null
           }
           completion_kind=published
@@ -2335,6 +2315,7 @@ jobs:
         if: ${{ steps.publication-context.outputs.claimed == 'true' && steps.publication-context.outputs.direct_lifecycle_recovery != 'true' && steps.validate-exact-review-bundle.outcome == 'success' && steps.legacy-exact-artifact.outputs.legacy_tupleless != 'true' }}
         id: publish-event-result
         env:
+          CLAWSWEEPER_INTERNAL_QUEUE_SECRET: ${{ secrets.CLAWSWEEPER_INTERNAL_QUEUE_SECRET || secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           GH_TOKEN: ${{ steps.target-write-token.outputs.token }}
           CLAWSWEEPER_PUBLIC_GH_TOKEN: ${{ steps.publication-context.outputs.target_repo == 'openclaw/openclaw' && github.token || '' }}
@@ -2485,6 +2466,7 @@ jobs:
           FENCE_KEY: ${{ steps.publication-context.outputs.publisher_item_key }}
           REVISION: ${{ steps.publication-context.outputs.publisher_lease_revision }}
           QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
+          CLAWSWEEPER_INTERNAL_QUEUE_SECRET: ${{ secrets.CLAWSWEEPER_INTERNAL_QUEUE_SECRET || secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
         run: |
           set -euo pipefail
@@ -2499,14 +2481,10 @@ jobs:
               receipt_id: `fallback:${process.env.GITHUB_RUN_ID}:${process.env.GITHUB_RUN_ATTEMPT}`,
             }));
           ')"
-          signature="$(PAYLOAD="$payload" node -e 'const crypto=require("node:crypto"); process.stdout.write(`sha256=${crypto.createHmac("sha256", process.env.CLAWSWEEPER_WEBHOOK_SECRET).update(process.env.PAYLOAD).digest("hex")}`)')"
           queue_url="${QUEUE_URL%/}"
-          curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
-            --request POST \
-            --header "content-type: application/json" \
-            --header "x-clawsweeper-exact-review-signature: $signature" \
-            --data "$payload" \
-            "$queue_url/internal/exact-review/lifecycle/canonical-receipt" >/dev/null
+          printf '%s' "$payload" | node scripts/internal-queue-request.mjs \
+            --url "$queue_url" \
+            --path "/internal/exact-review/lifecycle/canonical-receipt" >/dev/null
 
       - name: Queue deferred exact verdict router
         id: queue-deferred-verdict-router
@@ -2519,6 +2497,7 @@ jobs:
           FENCE_KEY: ${{ steps.publication-context.outputs.publisher_item_key }}
           REVISION: ${{ steps.publication-context.outputs.publisher_lease_revision }}
           QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
+          CLAWSWEEPER_INTERNAL_QUEUE_SECRET: ${{ secrets.CLAWSWEEPER_INTERNAL_QUEUE_SECRET || secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           CLAWSWEEPER_COMMENT_LOOKBACK_MINUTES: ${{ vars.CLAWSWEEPER_COMMENT_LOOKBACK_MINUTES || '180' }}
           CLAWSWEEPER_COMMENT_MAX_COMMENTS: ${{ vars.CLAWSWEEPER_COMMENT_MAX_COMMENTS || '1000' }}
@@ -2543,14 +2522,10 @@ jobs:
               receipt_id: `router:${process.env.GITHUB_RUN_ID}:${process.env.GITHUB_RUN_ATTEMPT}`,
             }));
           ')"
-          signature="$(PAYLOAD="$payload" node -e 'const crypto=require("node:crypto"); process.stdout.write(`sha256=${crypto.createHmac("sha256", process.env.CLAWSWEEPER_WEBHOOK_SECRET).update(process.env.PAYLOAD).digest("hex")}`)')"
           queue_url="${QUEUE_URL%/}"
-          curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
-            --request POST \
-            --header "content-type: application/json" \
-            --header "x-clawsweeper-exact-review-signature: $signature" \
-            --data "$payload" \
-            "$queue_url/internal/exact-review/lifecycle/router-receipt" >/dev/null
+          printf '%s' "$payload" | node scripts/internal-queue-request.mjs \
+            --url "$queue_url" \
+            --path "/internal/exact-review/lifecycle/router-receipt" >/dev/null
 
       - name: Record deferred close-proof exact review lifecycle receipt
         id: record-deferred-close-proof-lifecycle-receipt
@@ -2561,6 +2536,7 @@ jobs:
           FENCE_KEY: ${{ steps.publication-context.outputs.publisher_item_key }}
           REVISION: ${{ steps.publication-context.outputs.publisher_lease_revision }}
           QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
+          CLAWSWEEPER_INTERNAL_QUEUE_SECRET: ${{ secrets.CLAWSWEEPER_INTERNAL_QUEUE_SECRET || secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
         run: |
           set -euo pipefail
@@ -2575,14 +2551,10 @@ jobs:
               receipt_id: "router-proof:" + process.env.GITHUB_RUN_ID + ":" + process.env.GITHUB_RUN_ATTEMPT,
             }));
           ')"
-          signature="$(PAYLOAD="$payload" node -e 'const crypto=require("node:crypto"); process.stdout.write("sha256="+crypto.createHmac("sha256", process.env.CLAWSWEEPER_WEBHOOK_SECRET).update(process.env.PAYLOAD).digest("hex"))')"
           queue_url="${QUEUE_URL%/}"
-          curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
-            --request POST \
-            --header "content-type: application/json" \
-            --header "x-clawsweeper-exact-review-signature: $signature" \
-            --data "$payload" \
-            "$queue_url/internal/exact-review/lifecycle/router-receipt" >/dev/null
+          printf '%s' "$payload" | node scripts/internal-queue-request.mjs \
+            --url "$queue_url" \
+            --path "/internal/exact-review/lifecycle/router-receipt" >/dev/null
 
       - name: Record no-router exact review lifecycle receipt
         id: record-no-router-lifecycle-receipt
@@ -2593,6 +2565,7 @@ jobs:
           FENCE_KEY: ${{ steps.publication-context.outputs.publisher_item_key }}
           REVISION: ${{ steps.publication-context.outputs.publisher_lease_revision }}
           QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
+          CLAWSWEEPER_INTERNAL_QUEUE_SECRET: ${{ secrets.CLAWSWEEPER_INTERNAL_QUEUE_SECRET || secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
         run: |
           set -euo pipefail
@@ -2607,14 +2580,10 @@ jobs:
               receipt_id: `router-not-required:${process.env.GITHUB_RUN_ID}:${process.env.GITHUB_RUN_ATTEMPT}`,
             }));
           ')"
-          signature="$(PAYLOAD="$payload" node -e 'const crypto=require("node:crypto"); process.stdout.write(`sha256=${crypto.createHmac("sha256", process.env.CLAWSWEEPER_WEBHOOK_SECRET).update(process.env.PAYLOAD).digest("hex")}`)')"
           queue_url="${QUEUE_URL%/}"
-          curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
-            --request POST \
-            --header "content-type: application/json" \
-            --header "x-clawsweeper-exact-review-signature: $signature" \
-            --data "$payload" \
-            "$queue_url/internal/exact-review/lifecycle/router-receipt" >/dev/null
+          printf '%s' "$payload" | node scripts/internal-queue-request.mjs \
+            --url "$queue_url" \
+            --path "/internal/exact-review/lifecycle/router-receipt" >/dev/null
 
       - name: Dispatch deferred high-confidence bug implementation
         if: ${{ steps.publication-context.outputs.claimed == 'true' && steps.publication-context.outputs.direct_lifecycle_recovery != 'true' && steps.publish-event-result.outcome == 'success' && steps.publish-event-result.outputs.remote_tuple_verified == 'true' && steps.record-fallback-canonical-lifecycle-receipt.outcome == 'success' && vars.CLAWSWEEPER_AUTO_IMPLEMENT_ISSUES == '1' && steps.publication-context.outputs.target_repo == 'openclaw/openclaw' && fromJSON(steps.publication-context.outputs.decision).itemKind == 'issue' && ((fromJSON(steps.publication-context.outputs.decision).sourceAction == 'failed_review_shard_recovery' && steps.record-no-router-lifecycle-receipt.outcome == 'success') || (fromJSON(steps.publication-context.outputs.decision).sourceAction != 'failed_review_shard_recovery' && (steps.publish-event-result.outputs.routing_deferred != 'true' || steps.queue-deferred-verdict-router.outcome == 'success'))) }}
@@ -2638,6 +2607,7 @@ jobs:
           PRODUCER_RUN_ATTEMPT: ${{ steps.publication-context.outputs.generation_attempt }}
           PRODUCER_RUN_ID: ${{ steps.publication-context.outputs.producer_run_id }}
           QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
+          CLAWSWEEPER_INTERNAL_QUEUE_SECRET: ${{ secrets.CLAWSWEEPER_INTERNAL_QUEUE_SECRET || secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
         run: |
           set -euo pipefail
@@ -2658,13 +2628,8 @@ jobs:
           }));
           NODE
           )"
-          signature="$(PAYLOAD="$payload" node -e 'const crypto=require("node:crypto"); process.stdout.write(`sha256=${crypto.createHmac("sha256", process.env.CLAWSWEEPER_WEBHOOK_SECRET).update(process.env.PAYLOAD).digest("hex")}`)')"
-          response="$(curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
-            --request POST \
-            --header "content-type: application/json" \
-            --header "x-clawsweeper-exact-review-signature: $signature" \
-            --data "$payload" \
-            "$queue_url/internal/exact-review/enqueue")"
+          response="$(printf '%s' "$payload" | node scripts/internal-queue-request.mjs \
+            --url "$queue_url" --path "/internal/exact-review/enqueue")"
           jq -e '.ok == true and (.queued == true or .deduped == true or .shed == true)' <<< "$response" >/dev/null
           if jq -e '.shed == true' <<< "$response" >/dev/null; then
             echo "Source-drift recovery shed by exact-review queue backpressure."
@@ -3235,6 +3200,7 @@ jobs:
           REVISION: ${{ steps.finalization-context.outputs.lifecycle_revision }}
           ATTEMPT_ID: ${{ steps.terminal-acknowledgement.outputs.attempt_id }}
           QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
+          CLAWSWEEPER_INTERNAL_QUEUE_SECRET: ${{ secrets.CLAWSWEEPER_INTERNAL_QUEUE_SECRET || secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
         run: |
           set -euo pipefail
@@ -3263,12 +3229,9 @@ jobs:
                   ...(process.env.STATUS_COMMENT_ID ? { status_comment_id: Number(process.env.STATUS_COMMENT_ID) } : {}),
                 }));
               ')"
-              signature="$(PAYLOAD="$failure_payload" node -e 'const crypto=require("node:crypto"); process.stdout.write(`sha256=${crypto.createHmac("sha256", process.env.CLAWSWEEPER_WEBHOOK_SECRET).update(process.env.PAYLOAD).digest("hex")}`)')"
-              curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
-                --request POST --header "content-type: application/json" \
-                --header "x-clawsweeper-exact-review-signature: $signature" \
-                --data "$failure_payload" \
-                "${QUEUE_URL%/}/internal/exact-review/lifecycle/command-ack/failed" >/dev/null
+              printf '%s' "$failure_payload" | node scripts/internal-queue-request.mjs \
+                --url "${QUEUE_URL%/}" \
+                --path "/internal/exact-review/lifecycle/command-ack/failed" >/dev/null
               exit "$update_status"
             }
 
@@ -3286,6 +3249,7 @@ jobs:
           COMPLETION_COMMENT_ID: ${{ steps.update-final-command-status.outputs.completion_comment_id }}
           COMPLETION_COMPLETED_AT: ${{ steps.update-final-command-status.outputs.completion_completed_at }}
           QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
+          CLAWSWEEPER_INTERNAL_QUEUE_SECRET: ${{ secrets.CLAWSWEEPER_INTERNAL_QUEUE_SECRET || secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
         run: |
           set -euo pipefail
@@ -3317,12 +3281,9 @@ jobs:
               observed_at: Date.now(),
             }));
           ')"
-          signature="$(PAYLOAD="$payload" node -e 'const crypto=require("node:crypto"); process.stdout.write(`sha256=${crypto.createHmac("sha256", process.env.CLAWSWEEPER_WEBHOOK_SECRET).update(process.env.PAYLOAD).digest("hex")}`)')"
-          response="$(curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
-            --request POST --header "content-type: application/json" \
-            --header "x-clawsweeper-exact-review-signature: $signature" \
-            --data "$payload" \
-            "${QUEUE_URL%/}/internal/exact-review/lifecycle/command-ack/observed")"
+          response="$(printf '%s' "$payload" | node scripts/internal-queue-request.mjs \
+            --url "${QUEUE_URL%/}" \
+            --path "/internal/exact-review/lifecycle/command-ack/observed")"
           jq -e '.ok == true and .accepted == true and .acknowledgement_state == "observed"' <<< "$response" >/dev/null
 
       - name: Complete locked terminal acknowledgement skip
@@ -3463,6 +3424,7 @@ jobs:
           CLAWSWEEPER_DISPATCH_TOKEN: ${{ github.token }}
           CLAWSWEEPER_INVENTORY_TOKEN_OPENCLAW: ${{ steps.openclaw-token.outputs.token }}
           CLAWSWEEPER_INVENTORY_TOKEN_STEIPETE: ${{ steps.steipete-token.outputs.token || '__public__' }}
+          CLAWSWEEPER_INTERNAL_QUEUE_SECRET: ${{ secrets.CLAWSWEEPER_INTERNAL_QUEUE_SECRET || secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           FANOUT_MODE: ${{ github.event.schedule == '41/10 * * * *' && 'normal-review' || (github.event.schedule == '37 */6 * * *' && 'audit' || 'hot-intake') }}
           FANOUT_LIMIT: ${{ github.event.schedule == '41/10 * * * *' && '12' || (github.event.schedule == '37 */6 * * *' && '12' || '20') }}
@@ -3490,6 +3452,7 @@ jobs:
           CLAWSWEEPER_DISPATCH_TOKEN: ${{ github.token }}
           CLAWSWEEPER_INVENTORY_TOKEN_OPENCLAW: ${{ steps.openclaw-token.outputs.token }}
           CLAWSWEEPER_INVENTORY_TOKEN_STEIPETE: ${{ steps.steipete-token.outputs.token || '__public__' }}
+          CLAWSWEEPER_INTERNAL_QUEUE_SECRET: ${{ secrets.CLAWSWEEPER_INTERNAL_QUEUE_SECRET || secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           REVIEW_COVERAGE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
         run: pnpm run target-fanout -- coverage --window-days 7 --publish-url "$REVIEW_COVERAGE_URL" >> "$GITHUB_STEP_SUMMARY"
@@ -3615,6 +3578,7 @@ jobs:
         continue-on-error: true
         working-directory: clawsweeper
         env:
+          CLAWSWEEPER_INTERNAL_QUEUE_SECRET: ${{ secrets.CLAWSWEEPER_INTERNAL_QUEUE_SECRET || secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
         run: |
@@ -3937,6 +3901,7 @@ jobs:
         if: ${{ steps.mode.outputs.queue_feed == 'true' && steps.select.outputs.planned_count != '0' }}
         working-directory: clawsweeper
         env:
+          CLAWSWEEPER_INTERNAL_QUEUE_SECRET: ${{ secrets.CLAWSWEEPER_INTERNAL_QUEUE_SECRET || secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           GH_TOKEN: ${{ steps.target-read-token.outputs.token || github.token }}
           QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
@@ -4010,6 +3975,7 @@ jobs:
         continue-on-error: true
         working-directory: clawsweeper
         env:
+          CLAWSWEEPER_INTERNAL_QUEUE_SECRET: ${{ secrets.CLAWSWEEPER_INTERNAL_QUEUE_SECRET || secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           GH_TOKEN: ${{ github.token }}
           QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
@@ -4487,6 +4453,7 @@ jobs:
         if: ${{ always() && steps.import-review-action-ledger.outcome == 'success' }}
         continue-on-error: true
         env:
+          CLAWSWEEPER_INTERNAL_QUEUE_SECRET: ${{ secrets.CLAWSWEEPER_INTERNAL_QUEUE_SECRET || secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
         run: |
@@ -4564,6 +4531,7 @@ jobs:
       - name: Publish review artifact action ledger
         if: ${{ always() && steps.apply-review-artifacts.outputs.artifacts_applied == 'true' }}
         env:
+          CLAWSWEEPER_INTERNAL_QUEUE_SECRET: ${{ secrets.CLAWSWEEPER_INTERNAL_QUEUE_SECRET || secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
         run: |
@@ -4593,22 +4561,34 @@ jobs:
         if: ${{ always() && !cancelled() && steps.apply-review-artifacts.outputs.artifacts_applied == 'true' }}
         env:
           CLAWSWEEPER_CANONICAL_RECORD_BASELINE_DIR: .artifacts/review-canonical-baseline
+          CLAWSWEEPER_INTERNAL_QUEUE_SECRET: ${{ secrets.CLAWSWEEPER_INTERNAL_QUEUE_SECRET || secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           EXACT_ITEM: ${{ github.event.client_payload.item_number || github.event.inputs.item_number || github.event.inputs.item_numbers || '' }}
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.target-write-token.outputs.token }}
+          CLAWSWEEPER_PUBLIC_GH_TOKEN: ${{ needs.plan.outputs.target_repo == 'openclaw/openclaw' && github.token || '' }}
           HOT_INTAKE: ${{ needs.plan.outputs.hot_intake }}
           QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
           TARGET_REPO: ${{ needs.plan.outputs.target_repo }}
         run: |
           target_slug="$TARGET_REPO"
           target_slug="${target_slug//\//-}"
+          item_numbers="$(pnpm run --silent workflow -- artifact-item-numbers --artifact-dir artifacts)"
           if [ "$HOT_INTAKE" = "true" ] && [ -z "$EXACT_ITEM" ]; then
             echo "Skipping full reconcile for broad hot-intake publish."
           else
-            pnpm run reconcile -- \
+            reconcile_args=(
               --target-repo "$TARGET_REPO" \
               --skip-closed-at \
               --canonical-record-baseline-dir "$CLAWSWEEPER_CANONICAL_RECORD_BASELINE_DIR"
+            )
+            if [ -n "$EXACT_ITEM" ]; then
+              if [ -z "$item_numbers" ]; then
+                echo "Exact-item publication has no selected artifact records to reconcile." >&2
+                exit 1
+              fi
+              reconcile_args+=(--item-numbers "$item_numbers" --only-item-numbers)
+            fi
+            pnpm run reconcile -- "${reconcile_args[@]}"
           fi
           pnpm run repair:publish-main -- \
             --message "chore: update sweep records" \
@@ -4772,6 +4752,7 @@ jobs:
         if: ${{ always() && !cancelled() && steps.commit-review-records.outputs.records_published == 'true' && steps.target-write-token.outputs.token != '' && ((github.event_name == 'repository_dispatch' && github.event.action != 'clawsweeper_target_sweep') || github.event.inputs.item_number != '' || github.event.inputs.item_numbers != '') }}
         timeout-minutes: 15
         env:
+          CLAWSWEEPER_INTERNAL_QUEUE_SECRET: ${{ secrets.CLAWSWEEPER_INTERNAL_QUEUE_SECRET || secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           GH_TOKEN: ${{ steps.target-write-token.outputs.token }}
           CLAWSWEEPER_PUBLIC_GH_TOKEN: ${{ needs.plan.outputs.target_repo == 'openclaw/openclaw' && github.token || '' }}
@@ -4854,6 +4835,7 @@ jobs:
       - name: Publish selected review comment action ledger
         if: ${{ always() && steps.sync-selected-review-comments.outcome != 'skipped' && steps.finalize-selected-review-comment-action-ledger.outcome == 'success' }}
         env:
+          CLAWSWEEPER_INTERNAL_QUEUE_SECRET: ${{ secrets.CLAWSWEEPER_INTERNAL_QUEUE_SECRET || secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
         run: |
@@ -4958,6 +4940,7 @@ jobs:
           ADDITIONAL_PROMPT: ${{ github.event.inputs.additional_prompt || '' }}
           MATRIX_JSON: ${{ needs.plan.outputs.matrix }}
           QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
+          CLAWSWEEPER_INTERNAL_QUEUE_SECRET: ${{ secrets.CLAWSWEEPER_INTERNAL_QUEUE_SECRET || secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
         run: |
           set -euo pipefail
@@ -5048,14 +5031,8 @@ jobs:
               }')"
             queued=false
             for attempt in 1 2 3; do
-              # shellcheck disable=SC2016 # The Node source must retain its literal template expression.
-              signature="$(PAYLOAD="$payload" node -e 'const crypto=require("node:crypto"); process.stdout.write(`sha256=${crypto.createHmac("sha256", process.env.CLAWSWEEPER_WEBHOOK_SECRET).update(process.env.PAYLOAD).digest("hex")}`)')"
-              response="$(curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
-                --request POST \
-                --header "content-type: application/json" \
-                --header "x-clawsweeper-exact-review-signature: $signature" \
-                --data "$payload" \
-                "$queue_url/internal/exact-review/enqueue")" || response=""
+              response="$(printf '%s' "$payload" | node scripts/internal-queue-request.mjs \
+                --url "$queue_url" --path "/internal/exact-review/enqueue")" || response=""
               if jq -e '.ok == true and (.queued == true or .deduped == true or .shed == true or .accepted == false)' <<<"$response" >/dev/null; then
                 if jq -e '.accepted == false' <<<"$response" >/dev/null; then
                   echo "Recovery skipped because the target is disabled."
@@ -5177,6 +5154,7 @@ jobs:
         if: ${{ always() && vars.CLAWSWEEPER_FAILED_REVIEW_RETRY_ENABLED == '1' && hashFiles('results/failed-review-retries/openclaw-openclaw/*.json') != '' }}
         continue-on-error: true
         env:
+          CLAWSWEEPER_INTERNAL_QUEUE_SECRET: ${{ secrets.CLAWSWEEPER_INTERNAL_QUEUE_SECRET || secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
         run: |
           pnpm run repair:publish-main -- \
@@ -5187,6 +5165,7 @@ jobs:
       - name: Publish failed-review retry action ledger
         if: ${{ always() }}
         env:
+          CLAWSWEEPER_INTERNAL_QUEUE_SECRET: ${{ secrets.CLAWSWEEPER_INTERNAL_QUEUE_SECRET || secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
         run: |
@@ -5349,6 +5328,7 @@ jobs:
       - name: Commit Audit Health
         env:
           CLAWSWEEPER_CANONICAL_RECORD_BASELINE_DIR: .artifacts/audit-canonical-baseline
+          CLAWSWEEPER_INTERNAL_QUEUE_SECRET: ${{ secrets.CLAWSWEEPER_INTERNAL_QUEUE_SECRET || secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
           TARGET_REPO: ${{ steps.target.outputs.target_repo }}
@@ -5678,6 +5658,7 @@ jobs:
       - name: Publish apply proof action events
         if: ${{ needs.apply-proof.outputs.action_ledger_artifact_name != '' }}
         env:
+          CLAWSWEEPER_INTERNAL_QUEUE_SECRET: ${{ secrets.CLAWSWEEPER_INTERNAL_QUEUE_SECRET || secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
         run: |
@@ -5770,6 +5751,7 @@ jobs:
         continue-on-error: true
         env:
           APPLY_OUTCOME: in_progress
+          CLAWSWEEPER_INTERNAL_QUEUE_SECRET: ${{ secrets.CLAWSWEEPER_INTERNAL_QUEUE_SECRET || secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
           TARGET_REPO: ${{ steps.target.outputs.target_repo }}
@@ -5830,6 +5812,7 @@ jobs:
       - name: Reconcile before apply preselect
         if: ${{ !(github.event_name == 'schedule' && github.event.schedule == '6,21,36,51 * * * *') && !(github.event_name == 'workflow_dispatch' && (github.event.inputs.apply_sync_comments_only == 'true' || github.event.inputs.apply_item_numbers == '__cursor__')) }}
         env:
+          CLAWSWEEPER_INTERNAL_QUEUE_SECRET: ${{ secrets.CLAWSWEEPER_INTERNAL_QUEUE_SECRET || secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           GH_TOKEN: ${{ steps.target.outputs.target_repo == 'openclaw/openclaw' && github.token || steps.target-write-token.outputs.token }}
           QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
@@ -5845,6 +5828,7 @@ jobs:
         id: apply-existing-run
         timeout-minutes: 70
         env:
+          CLAWSWEEPER_INTERNAL_QUEUE_SECRET: ${{ secrets.CLAWSWEEPER_INTERNAL_QUEUE_SECRET || secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           GH_TOKEN: ${{ steps.target-write-token.outputs.token }}
           CLAWSWEEPER_PUBLIC_GH_TOKEN: ${{ steps.target.outputs.target_repo == 'openclaw/openclaw' && github.token || '' }}
@@ -6241,6 +6225,7 @@ jobs:
         if: ${{ always() && !cancelled() && steps.primary-apply-result.outputs.succeeded == 'true' }}
         continue-on-error: true
         env:
+          CLAWSWEEPER_INTERNAL_QUEUE_SECRET: ${{ secrets.CLAWSWEEPER_INTERNAL_QUEUE_SECRET || secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
         run: |

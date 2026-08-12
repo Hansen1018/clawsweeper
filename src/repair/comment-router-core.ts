@@ -1,8 +1,8 @@
 import type { JsonValue, LooseRecord } from "./json-types.js";
 import { clawsweeperCoAuthorKey, coAuthorKey } from "./co-author-credit.js";
 import {
-  extractClawSweeperCommandLine,
   isClawSweeperReReviewCommandText,
+  normalizeClawSweeperCommandLine,
   reviewPromptFromClawSweeperCommandText,
 } from "./comment-command-text.js";
 import { renderJobIntentFrontmatter } from "./job-intent.js";
@@ -1770,7 +1770,7 @@ function isAfterAutoRepairResumeBoundary(entry: AutoRepairDispatchEntry, resumeB
 
 export function parseCommand(body: string) {
   if (isProofNudgeCommentBody(body)) return null;
-  const commandLine = extractClawSweeperCommandLine(body);
+  const commandLine = normalizeClawSweeperCommandLine(body);
   if (!commandLine) return null;
   const command = commandFromText(commandLine.trigger, commandLine.commandText);
   if (!commandLine.supportsContinuation) return command;
@@ -1785,9 +1785,6 @@ export function parseCommand(body: string) {
     if (command.intent === "automerge" && rest) {
       command.automerge_instructions = rest;
       return command;
-    }
-    if (commandLine.trigger === "mention" && command.command === "status" && rest) {
-      return commandFromText(commandLine.trigger, rest);
     }
     return command;
   }
@@ -2927,7 +2924,7 @@ function normalizeIntent(command: LooseRecord) {
 }
 
 export function commandStatusMarker(command: LooseRecord) {
-  return `<!-- clawsweeper-command-status:${command.issue_number ?? "unknown"}:${command.intent}:${command.target?.head_sha ?? "na"} -->`;
+  return `<!-- clawsweeper-command-status:${command.issue_number ?? "unknown"}:${command.intent}:${command.command_status_revision ?? command.target?.head_sha ?? "na"} -->`;
 }
 
 export function commandStatusMarkerPrefix(command: LooseRecord) {

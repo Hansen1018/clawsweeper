@@ -1,9 +1,11 @@
 #!/usr/bin/env node
 
-import { createHash, createHmac } from "node:crypto";
+import { createHash } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import process from "node:process";
+
+import { signedInternalQueueRequest } from "./internal-queue-request.mjs";
 
 const DEFAULT_OUTPUT = ".artifacts/exact-review-dlq/inventory.json";
 const MAX_SELECTED_IDS = 2;
@@ -900,15 +902,11 @@ function countBy(rows, keyFor) {
 
 async function signedPost({ queueUrl, secret, path, payload }) {
   const body = JSON.stringify(payload);
-  const signature = `sha256=${createHmac("sha256", secret).update(body).digest("hex")}`;
-  const response = await fetch(`${queueUrl}${path}`, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "x-clawsweeper-exact-review-signature": signature,
-    },
+  const response = await signedInternalQueueRequest({
+    baseUrl: queueUrl,
+    path,
+    secret,
     body,
-    signal: AbortSignal.timeout(20_000),
   });
   const text = await response.text();
   if (!response.ok) throw new Error(`${path} returned ${response.status}`);

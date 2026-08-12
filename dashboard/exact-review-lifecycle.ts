@@ -210,6 +210,10 @@ export type ExactReviewLifecycleProjection = {
     commandOriginated: boolean;
     statusMarker: string | null;
     statusCommentId: number | null;
+    sourceCommentId?: number;
+    sourceCommentUpdatedAt?: string;
+    commandBodyDigest?: string;
+    commandOrigin?: "hosted_webhook" | "comment_router";
     admittedAt: number;
   };
   claims: LifecycleClaimFact[];
@@ -296,6 +300,12 @@ export class ExactReviewLifecycleProjectionStore {
   }
 
   recordAdmission(
+    input: Parameters<ExactReviewLifecycleProjectionStore["recordAdmissionSync"]>[0],
+  ) {
+    return this.storage.transactionSync(() => this.recordAdmissionSync(input));
+  }
+
+  recordAdmissionSync(
     input: ProjectionIdentity & {
       deliveryId: string;
       sourceDeliveryId?: string;
@@ -303,6 +313,10 @@ export class ExactReviewLifecycleProjectionStore {
       commandOriginated: boolean;
       statusMarker: string | null;
       statusCommentId: number | null;
+      sourceCommentId?: number;
+      sourceCommentUpdatedAt?: string;
+      commandBodyDigest?: string;
+      commandOrigin?: "hosted_webhook" | "comment_router";
       observedAt: number;
     },
   ) {
@@ -319,8 +333,27 @@ export class ExactReviewLifecycleProjectionStore {
     if (input.statusCommentId !== null && !positiveInteger(input.statusCommentId)) {
       throw new Error("invalid lifecycle status comment id");
     }
+    if (input.sourceCommentId !== undefined && !positiveInteger(input.sourceCommentId)) {
+      throw new Error("invalid lifecycle source comment id");
+    }
+    if (
+      input.sourceCommentUpdatedAt !== undefined &&
+      !Number.isFinite(Date.parse(input.sourceCommentUpdatedAt))
+    ) {
+      throw new Error("invalid lifecycle source comment update time");
+    }
+    if (input.commandBodyDigest !== undefined && !/^[0-9a-f]{64}$/.test(input.commandBodyDigest)) {
+      throw new Error("invalid lifecycle command body digest");
+    }
+    if (
+      input.commandOrigin !== undefined &&
+      input.commandOrigin !== "hosted_webhook" &&
+      input.commandOrigin !== "comment_router"
+    ) {
+      throw new Error("invalid lifecycle command origin");
+    }
     this.ensureSchemaSync();
-    return this.storage.transactionSync(() => {
+    const record = () => {
       const existing = this.readSync(input.canonicalTargetKey, input.fenceKey, input.revision);
       if (existing) {
         this.assertIdentity(existing, input);
@@ -331,9 +364,29 @@ export class ExactReviewLifecycleProjectionStore {
           admission.sourceAction !== input.sourceAction ||
           admission.commandOriginated !== input.commandOriginated ||
           admission.statusMarker !== input.statusMarker ||
-          admission.statusCommentId !== input.statusCommentId
+          admission.statusCommentId !== input.statusCommentId ||
+          admission.sourceCommentId !== input.sourceCommentId ||
+          admission.sourceCommentUpdatedAt !== input.sourceCommentUpdatedAt ||
+          admission.commandBodyDigest !== input.commandBodyDigest ||
+          admission.commandOrigin !== input.commandOrigin
         ) {
-          throw new Error("conflicting lifecycle admission fact");
+          throw new Error(
+            `conflicting lifecycle admission fact: ${[
+              ["delivery", admission.deliveryId, input.deliveryId],
+              ["source_delivery", admission.sourceDeliveryId, input.sourceDeliveryId],
+              ["source_action", admission.sourceAction, input.sourceAction],
+              ["command", admission.commandOriginated, input.commandOriginated],
+              ["marker", admission.statusMarker, input.statusMarker],
+              ["comment", admission.statusCommentId, input.statusCommentId],
+              ["source_comment", admission.sourceCommentId, input.sourceCommentId],
+              ["source_updated", admission.sourceCommentUpdatedAt, input.sourceCommentUpdatedAt],
+              ["digest", admission.commandBodyDigest, input.commandBodyDigest],
+              ["origin", admission.commandOrigin, input.commandOrigin],
+            ]
+              .filter(([, left, right]) => left !== right)
+              .map(([field]) => field)
+              .join(",")}`,
+          );
         }
         return existing;
       }
@@ -349,6 +402,12 @@ export class ExactReviewLifecycleProjectionStore {
           commandOriginated: input.commandOriginated,
           statusMarker: input.statusMarker,
           statusCommentId: input.statusCommentId,
+          ...(input.sourceCommentId ? { sourceCommentId: input.sourceCommentId } : {}),
+          ...(input.sourceCommentUpdatedAt
+            ? { sourceCommentUpdatedAt: input.sourceCommentUpdatedAt }
+            : {}),
+          ...(input.commandBodyDigest ? { commandBodyDigest: input.commandBodyDigest } : {}),
+          ...(input.commandOrigin ? { commandOrigin: input.commandOrigin } : {}),
           admittedAt: input.observedAt,
         },
         claims: [],
@@ -364,7 +423,8 @@ export class ExactReviewLifecycleProjectionStore {
       };
       this.writeSync(projection);
       return projection;
-    });
+    };
+    return record();
   }
 
   recordClaim(
@@ -511,31 +571,49 @@ export class ExactReviewLifecycleProjectionStore {
   }
 
   recordTerminalDisposition(
+    input: Parameters<ExactReviewLifecycleProjectionStore["recordTerminalDispositionSync"]>[0],
+  ) {
+    return this.storage.transactionSync(() => this.recordTerminalDispositionSync(input));
+  }
+
+  recordTerminalDispositionSync(
     input: ProjectionIdentity & {
       kind: LifecycleTerminalDisposition;
       observedAt: number;
     },
   ) {
     this.validateIdentity(input);
-    return this.mutate(input, (projection) => {
-      const next = { kind: input.kind, observedAt: input.observedAt };
-      const current = projection.terminalDisposition;
-      if (!current) {
-        projection.terminalDispositions.push(next);
-        projection.terminalDisposition = next;
-        return projection;
-      }
-      if (current.kind === next.kind) return projection;
-      // A newer source can requeue a just-routed revision before its final
-      // queue completion lands. Requeue remains an immutable history fact and
-      // a later durable handoff may still complete the same admitted revision.
-      if (next.kind !== "requeue" && current.kind !== "requeue") {
-        throw new Error("conflicting lifecycle terminal disposition");
-      }
+    const record = this.readSync(input.canonicalTargetKey, input.fenceKey, input.revision);
+    if (!record) throw new Error("missing lifecycle admission fact");
+    this.assertIdentity(record, input);
+    this.applyTerminalDisposition(record, input.kind, input.observedAt);
+    record.updatedAt = input.observedAt;
+    this.writeSync(record);
+    return record;
+  }
+
+  private applyTerminalDisposition(
+    projection: ExactReviewLifecycleProjection,
+    kind: LifecycleTerminalDisposition,
+    observedAt: number,
+  ) {
+    const next = { kind, observedAt };
+    const current = projection.terminalDisposition;
+    if (!current) {
       projection.terminalDispositions.push(next);
       projection.terminalDisposition = next;
       return projection;
-    });
+    }
+    if (current.kind === next.kind) return projection;
+    // A newer source can requeue a just-routed revision before its final
+    // queue completion lands. Requeue remains an immutable history fact and
+    // a later durable handoff may still complete the same admitted revision.
+    if (next.kind !== "requeue" && current.kind !== "requeue") {
+      throw new Error("conflicting lifecycle terminal disposition");
+    }
+    projection.terminalDispositions.push(next);
+    projection.terminalDisposition = next;
+    return projection;
   }
 
   authorizeCommandAcknowledgement(
@@ -800,6 +878,20 @@ export class ExactReviewLifecycleProjectionStore {
       return null;
     }
     return this.readSync(canonicalTargetKey, fenceKey, revision);
+  }
+
+  maxRevision(canonicalTargetKey: string, fenceKey: string) {
+    if (!validCanonicalTargetKey(canonicalTargetKey) || !validFenceKey(fenceKey)) return 0;
+    this.ensureSchemaSync();
+    const row = Array.from(
+      this.storage.sql.exec(
+        `SELECT MAX(revision) AS revision FROM ${EXACT_REVIEW_LIFECYCLE_PROJECTION_TABLE}
+          WHERE canonical_target_key = ? AND fence_key = ?`,
+        canonicalTargetKey,
+        fenceKey,
+      ),
+    )[0];
+    return Number(row?.revision || 0);
   }
 
   /**
@@ -1713,6 +1805,15 @@ function validDurableLifecycleBayProjection(value: ExactReviewLifecycleProjectio
     (value.admission.statusMarker !== null && !validText(value.admission.statusMarker, 1, 300)) ||
     (value.admission.statusCommentId !== null &&
       !positiveInteger(value.admission.statusCommentId)) ||
+    (value.admission.sourceCommentId !== undefined &&
+      !positiveInteger(value.admission.sourceCommentId)) ||
+    (value.admission.sourceCommentUpdatedAt !== undefined &&
+      !Number.isFinite(Date.parse(value.admission.sourceCommentUpdatedAt))) ||
+    (value.admission.commandBodyDigest !== undefined &&
+      !/^[0-9a-f]{64}$/.test(value.admission.commandBodyDigest)) ||
+    (value.admission.commandOrigin !== undefined &&
+      value.admission.commandOrigin !== "hosted_webhook" &&
+      value.admission.commandOrigin !== "comment_router") ||
     typeof value.admission.commandOriginated !== "boolean" ||
     !finiteTimestamp(value.admission.admittedAt) ||
     !Array.isArray(value.claims) ||

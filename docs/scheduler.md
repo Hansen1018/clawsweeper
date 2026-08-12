@@ -66,14 +66,19 @@ Manual exact-item `workflow_dispatch` reviews use an exact-item concurrency
 group with the same single-pending policy, so newer revisions replace stale
 pending work instead of building a duplicate queue. Durable exact-review leases
 use lease-scoped workflow groups and remain owned by the Worker admission lane.
+Recoverable parked reviews use the nominal 5/10/20-minute retry ladder, but
+each item persists a schedule-time uniform jitter of 0.75-1.5x for every rung.
+GitHub throttle deferrals use the same per-item jitter band when the queue turns
+the reported cooldown into its next-attempt timestamp, preventing a parked
+cohort from becoming eligible in lockstep; coordination and ordinary failure
+retries keep their existing timing.
 Review publication and apply/comment sync use separate non-dropping queues.
 Exact-review publication starts at 24 concurrent publishers in the Durable
 Object and scales admission by ready backlog: every 250 ready publications adds
 8 slots, up to 48. Backoff work does not trigger expansion, and scaling down
 does not cancel publishers that already started. A GitHub 403/429 or explicit
 rate-limit failure halves the admission ceiling for 15 minutes; GitHub 5xx
-failures lower it by 8 for 5 minutes. Repeated pressure can reduce admission to
-4. After cooldown, every 50 successful
+failures lower it by 8 for 5 minutes. Repeated pressure can reduce admission to 4. After cooldown, every 50 successful
 publications restores 8 slots. Apply/comment sync remains per-target serialized.
 Tuple-aware state reconciliation prevents stale review snapshots from reviving
 closed records.
@@ -636,6 +641,13 @@ canonical cleanup.
 Review publishing applies newly generated artifacts first, then runs the same
 fast reconciler once before committing records. It does not run the slower
 artifact-apply reconciler and the explicit publish reconciler back to back.
+Manual or exact-item publication passes the artifact item numbers to that
+reconciler, so exact-item reconciliation does not enumerate GitHub's
+repository-wide open issue or pull-request sets. The local publisher may still
+walk its already hydrated record tree while preparing the commit.
+Broad normal review retains full reconciliation, while broad hot intake keeps
+its existing skip. The targeted publisher uses the target App token as the
+privileged fallback and the Actions token for eligible public reads.
 
 After publishing Git-backed audit results and reconciling canonical records,
 audit dispatches the `openclaw/clawsweeper-state` dashboard renderer; that

@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
-import { createHmac } from "node:crypto";
 import { spawn } from "node:child_process";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+
+import { internalQueueRequestHeaders } from "../scripts/internal-queue-request.mjs";
 import YAML from "yaml";
 import { readFileSync } from "node:fs";
 
@@ -96,8 +97,16 @@ test("automatic reconciliation resolves terminal rows and recovers one fresh rev
       return;
     }
     const body = Buffer.concat(chunks).toString("utf8");
-    const expected = `sha256=${createHmac("sha256", secret).update(body).digest("hex")}`;
-    assert.equal(request.headers["x-clawsweeper-exact-review-signature"], expected);
+    const expected = internalQueueRequestHeaders({
+      secret,
+      method: "POST",
+      path: String(request.url),
+      body,
+    });
+    assert.equal(
+      request.headers["x-clawsweeper-internal-signature"],
+      expected["x-clawsweeper-internal-signature"],
+    );
     const payload = JSON.parse(body);
     if (request.url?.endsWith("/list")) {
       response.writeHead(200, { "content-type": "application/json" });
@@ -2265,8 +2274,16 @@ test("operator inventories every page, signs requests, and reports unique target
     const chunks = [];
     for await (const chunk of request) chunks.push(chunk);
     const body = Buffer.concat(chunks).toString("utf8");
-    const expected = `sha256=${createHmac("sha256", secret).update(body).digest("hex")}`;
-    assert.equal(request.headers["x-clawsweeper-exact-review-signature"], expected);
+    const expected = internalQueueRequestHeaders({
+      secret,
+      method: "POST",
+      path: String(request.url),
+      body,
+    });
+    assert.equal(
+      request.headers["x-clawsweeper-internal-signature"],
+      expected["x-clawsweeper-internal-signature"],
+    );
     const payload = JSON.parse(body);
     requests.push({ url: request.url, payload });
     const secondPage = payload.cursor === "dlq-2";

@@ -54,8 +54,9 @@ if (
   );
 }
 
-const queueSecret = process.env.CLAWSWEEPER_WEBHOOK_SECRET;
-if (!queueSecret) throw new Error("CLAWSWEEPER_WEBHOOK_SECRET is required");
+const queueSecret =
+  process.env.CLAWSWEEPER_INTERNAL_QUEUE_SECRET || process.env.CLAWSWEEPER_WEBHOOK_SECRET || "";
+if (!queueSecret) throw new Error("internal queue secret is required");
 
 const client = new ExactReviewBatchQueueClient({
   baseUrl: env("EXACT_REVIEW_QUEUE_URL"),
@@ -219,7 +220,7 @@ async function commit() {
   let stateWriter: StateWriterOperation | undefined;
   const progressObserver = exactReviewBatchStateWriterProgressReporter({
     queueUrl: env("EXACT_REVIEW_QUEUE_URL"),
-    webhookSecret: env("CLAWSWEEPER_WEBHOOK_SECRET"),
+    webhookSecret: queueSecret,
     batchId: manifest.batchId,
     leaseOwner: manifest.leaseOwner,
     items: manifest.items,
@@ -289,7 +290,7 @@ async function publishCanonicalBatch(
     try {
       const result = await postDirectPublicationResult({
         baseUrl: env("EXACT_REVIEW_QUEUE_URL"),
-        webhookSecret: env("CLAWSWEEPER_WEBHOOK_SECRET"),
+        webhookSecret: queueSecret,
         path: "/internal/exact-review/publication-batch-results",
         payload: {
           canonicalTargetKey: publication.canonicalTargetKey,

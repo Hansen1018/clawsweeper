@@ -203,6 +203,22 @@ jobs:
             echo "Ignoring ClawSweeper proof-nudge comment."
             exit 0
           fi
+          is_read_only_review=false
+          review_scan_file="$RUNNER_TEMP/clawsweeper-review-command.txt"
+          awk '
+            BEGIN { pending = 0; joined = "" }
+            pending { joined = joined " " $0; next }
+            tolower($0) ~ /^[[:space:]]*@(clawsweeper|openclaw-clawsweeper)(\[bot\])?[[:space:]]*$/ {
+              pending = 1
+              joined = $0
+              next
+            }
+            { print }
+            END { if (pending) print joined }
+          ' "$body_file" > "$review_scan_file"
+          if grep -Eiq -m 1 '^[[:space:]]*(/review|/clawsweeper[[:space:]]+(review|re-?review|rereview|re-?run|rerun|run[[:space:]]+(review|again))|@(clawsweeper|openclaw-clawsweeper)(\[bot\])?[[:space:]:,]+(review|re-?review|rereview|re-?run|rerun|run[[:space:]]+(review|again)))([[:space:]:.!-].*)?$' "$review_scan_file"; then
+            is_read_only_review=true
+          fi
           if [ -n "$TARGET_TOKEN" ]; then
             GH_TOKEN="$TARGET_TOKEN" gh api -X POST \
               -H "Accept: application/vnd.github+json" \
@@ -210,7 +226,7 @@ jobs:
               -f content="eyes" >/dev/null || true
           fi
           status_comment_id=""
-          if [ -n "$TARGET_TOKEN" ]; then
+          if [ "$is_read_only_review" != "true" ] && [ -n "$TARGET_TOKEN" ]; then
             case "$AUTHOR_ASSOCIATION" in
               OWNER|MEMBER|COLLABORATOR)
                 status_body="$(printf '%s\n' \
@@ -249,13 +265,11 @@ jobs:
 
 Comments are a lightweight trigger only when the body contains a ClawSweeper
 command, and generated proof-nudge comments are explicitly ignored before command
-matching. The target workflow reacts with `eyes` and creates one visible queued
-status comment for maintainer-authored commands when target write permission is
-available, but both acknowledgement writes are best-effort. It must still dispatch
-`clawsweeper_comment` to the comment router when acknowledgement or queued-comment
-creation gets a target-repository 403. The dispatch carries the exact source
-comment id and, when available, the queued status comment id. The router edits
-that queued comment in place instead of posting a second reply.
+matching. For read-only review syntax the target workflow performs no GitHub
+effect; it only dispatches the source comment to the router, which writes the
+same durable semantic intake as the hosted webhook. Other commands retain the
+best-effort reaction and generic router status. The dispatch carries the exact source comment id, and the router creates or
+updates the command status after classification.
 Exact comment dispatches scan only that comment and use a per-comment receiver
 concurrency group, so one maintainer command does not wait behind an unrelated
 command on the same repository. The scheduled sweep remains a five-minute
@@ -272,12 +286,38 @@ endpoint is `/github/webhook`; the local equivalent is
 `CLAWSWEEPER_WEBHOOK_SECRET`, accepts eligible public `openclaw/*` and
 `steipete/*` `issue_comment`, `issues`, and `pull_request` events, mints a
 target installation token for acknowledgement/comment reactions, mints the
-`openclaw/clawsweeper` installation token for repository dispatch, and queues
-exact `clawsweeper_comment` or `clawsweeper_item` work. The durable Worker
+`openclaw/clawsweeper` installation token only when repository dispatch is
+needed, and queues exact command or item work. The durable Worker
 queue dispatches at most 128 leased exact-review executors, with up to 120 active
 reviews per target repository. Keep the Actions
 dispatcher installed as a compatibility fallback; its legacy dispatch is
 bridged into the same queue before Codex starts.
+
+Authorized read-only `review` and `re-review` commands take a shorter path.
+The webhook receiver writes one durable command intake and returns `202`; it
+does not mint an App token, read the PR, react, or post a status comment on the
+request deadline. The queue alarm resolves and verifies the current PR head,
+reserves source authority, enqueues the command, then owns reaction and bounded
+status convergence. The queue decision carries the deterministic
+command-version identity derived from comment id, update time, and body digest;
+the same identity is used for its status marker and queue receipt. Maintainer focus or evidence
+text, including continuation lines, is forwarded as bounded read-only review
+context; an issue or PR author may request the review but cannot add model
+steering text. Other commands continue through `clawsweeper_comment`. If that
+router path is selected, the receiver first posts the generic `Command router
+queued` status and passes its comment id so the router edits it in place. If the
+compatibility router sees a re-review, it uses the same signed command-intake
+contract rather than repository or workflow dispatch. The target Actions
+fallback follows the same split: it withholds the generic pre-router status for
+syntactic read-only review commands, while retaining it for other maintainer
+commands.
+
+Internal command intake uses a canonical HMAC envelope over protocol version,
+timestamp, HTTP method, path, and body digest. The Worker rejects stale or
+cross-endpoint replay before the Durable Object is called. Deployments may set
+`CLAWSWEEPER_INTERNAL_QUEUE_SECRET`; until that secret exists, the established
+`CLAWSWEEPER_WEBHOOK_SECRET` is the compatibility secret for this internal
+contract.
 
 The receiver keeps the review lane proposal-only, then runs exact apply for the
 selected item with only immediate-safe close reasons enabled:

@@ -1,7 +1,7 @@
-import { createHmac } from "node:crypto";
 import { spawn } from "node:child_process";
 
 import type { ExactReviewBatchMember } from "./exact-review-batch-publisher.js";
+import { internalQueueRequestHeaders } from "./exact-review-command-queue.js";
 import type { StateWriterTelemetryObserver } from "./state-writer-telemetry-recorder.js";
 
 export function exactReviewBatchStateWriterProgressReporter(input: {
@@ -27,19 +27,25 @@ export function exactReviewBatchStateWriterProgressReporter(input: {
           })),
           state_writer_progress: progress,
         });
-        const signature = `sha256=${createHmac("sha256", input.webhookSecret).update(body).digest("hex")}`;
+        const path = "/internal/exact-review/publication-batches/heartbeat";
+        const headers = internalQueueRequestHeaders({
+          secret: input.webhookSecret,
+          method: "POST",
+          path,
+          body,
+        });
         const child = spawn(
           process.execPath,
           [
             "--input-type=module",
             "-e",
-            `const [url, signature, body] = process.argv.slice(1);
+            `const [url, headers, body] = process.argv.slice(1);
              const controller = new AbortController();
              setTimeout(() => controller.abort(), 4000).unref();
-             fetch(url, { method: "POST", headers: {"content-type": "application/json", "x-clawsweeper-exact-review-signature": signature},
+             fetch(url, { method: "POST", headers: JSON.parse(headers),
                body, signal: controller.signal }).catch(() => {});`,
-            `${input.queueUrl.replace(/\/$/, "")}/internal/exact-review/publication-batches/heartbeat`,
-            signature,
+            `${input.queueUrl.replace(/\/$/, "")}${path}`,
+            JSON.stringify(headers),
             body,
           ],
           { detached: true, stdio: "ignore", windowsHide: true },

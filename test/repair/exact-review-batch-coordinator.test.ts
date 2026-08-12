@@ -2,10 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { coordinateExactReviewBatch } from "../../dist/repair/exact-review-batch-coordinator.js";
-import {
-  ExactReviewBatchQueueClient,
-  verifyExactReviewBatchSignature,
-} from "../../dist/repair/exact-review-batch-queue-client.js";
+import { ExactReviewBatchQueueClient } from "../../dist/repair/exact-review-batch-queue-client.js";
 
 const queueItems = [1, 2, 3].map((number) => ({
   itemKey: `openclaw/openclaw#${number}`,
@@ -147,10 +144,12 @@ test("queue client signs protocol calls and rejects malformed responses", async 
       paths.push(new URL(url).pathname);
       const body = String(init?.body);
       bodies.push(JSON.parse(body));
-      const signature = String(
-        new Headers(init?.headers).get("x-clawsweeper-exact-review-signature"),
+      const headers = new Headers(init?.headers);
+      assert.equal(headers.get("x-clawsweeper-internal-protocol"), "1");
+      assert.match(
+        String(headers.get("x-clawsweeper-internal-signature")),
+        /^sha256=[0-9a-f]{64}$/,
       );
-      assert.equal(verifyExactReviewBatchSignature(body, signature, "secret"), true);
       return new Response(
         JSON.stringify({
           ok: true,

@@ -2193,7 +2193,7 @@ test("sweep workflow executes only durable queue leases without runner-side admi
   assert.match(eventReviewBlock, /github\.event\.client_payload\.queue_lease_id != ''/);
   assert.match(legacyIntakeBlock, /Queue legacy exact-review event/);
   assert.match(legacyIntakeBlock, /\/internal\/exact-review\/enqueue/);
-  assert.match(legacyIntakeBlock, /x-clawsweeper-exact-review-signature/);
+  assert.match(legacyIntakeBlock, /node scripts\/internal-queue-request\.mjs/);
   assert.match(legacyIntakeBlock, /CLAWSWEEPER_WEBHOOK_SECRET/);
   assert.match(legacyIntakeBlock, /gh api "repos\/\$target_repo" --jq \.default_branch/);
   assert.match(legacyIntakeBlock, /targetBranch: process\.env\.TARGET_BRANCH/);
@@ -2652,7 +2652,7 @@ test("sweep review recovery uses explicit failed shard artifacts", () => {
   assert.match(recoveryJob, /delivery_id: \("router:" \+ \$dispatch_key\)/);
   assert.match(recoveryJob, /sourceAction: "failed_review_shard_recovery"/);
   assert.match(recoveryJob, /--arg dispatch_key/);
-  assert.match(recoveryJob, /x-clawsweeper-exact-review-signature/);
+  assert.match(recoveryJob, /node scripts\/internal-queue-request\.mjs/);
   assert.match(recoveryJob, /\/internal\/exact-review\/enqueue/);
   assert.match(
     recoveryJob,

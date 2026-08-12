@@ -1,7 +1,8 @@
 import { spawn, spawnSync } from "node:child_process";
-import { createHmac, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 
 import { finishDetachedCleanupProcess } from "./detached-cleanup.js";
+import { internalQueueRequestHeaders } from "./exact-review-command-queue.js";
 
 const COORDINATOR_POLL_MS = 1_000;
 const COORDINATOR_HEARTBEAT_MS = 30_000;
@@ -205,7 +206,10 @@ function coordinatorConfig(env: NodeJS.ProcessEnv) {
     .trim()
     .replace(/\/+$/, "");
   const rawCredential =
-    env.CLAWSWEEPER_STATE_COORDINATOR_SECRET || env.CLAWSWEEPER_WEBHOOK_SECRET || "";
+    env.CLAWSWEEPER_STATE_COORDINATOR_SECRET ||
+    env.CLAWSWEEPER_INTERNAL_QUEUE_SECRET ||
+    env.CLAWSWEEPER_WEBHOOK_SECRET ||
+    "";
   const secret = String(rawCredential);
   if (!/^https?:\/\//.test(queueUrl)) {
     throw new Error("state writer coordinator URL is required when coordinator mode is enabled");
@@ -219,18 +223,20 @@ function coordinatorConfig(env: NodeJS.ProcessEnv) {
 function signedCoordinatorRequest(config: { queueUrl: string; secret: string }) {
   return (path: string, payload: unknown): CoordinatorResponse => {
     const body = JSON.stringify(payload);
-    const signature = `sha256=${createHmac("sha256", config.secret).update(body).digest("hex")}`;
+    const headers = internalQueueRequestHeaders({
+      secret: config.secret,
+      method: "POST",
+      path,
+      body,
+    });
     const script = String.raw`
-      const [url, body, signature, timeoutText] = process.argv.slice(1);
+      const [url, body, headersText, timeoutText] = process.argv.slice(1);
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), Number(timeoutText));
       try {
         const response = await fetch(url, {
           method: "POST",
-          headers: {
-            "content-type": "application/json",
-            "x-clawsweeper-exact-review-signature": signature,
-          },
+          headers: JSON.parse(headersText),
           body,
           signal: controller.signal,
         });
@@ -248,7 +254,7 @@ function signedCoordinatorRequest(config: { queueUrl: string; secret: string }) 
         script,
         `${config.queueUrl}${path}`,
         body,
-        signature,
+        JSON.stringify(headers),
         String(COORDINATOR_REQUEST_TIMEOUT_MS),
       ],
       { encoding: "utf8", timeout: COORDINATOR_REQUEST_TIMEOUT_MS + 2_000, windowsHide: true },
@@ -273,23 +279,21 @@ function startCoordinatorWatchdog(
   ticket: StateWriterCoordinatorTicket,
 ): { close: (ownershipReleased: boolean) => void } {
   const payload = JSON.stringify(ticketPayload(ticket));
-  const heartbeatSignature = `sha256=${createHmac("sha256", config.secret)
-    .update(payload)
-    .digest("hex")}`;
-  const releaseSignature = heartbeatSignature;
+  const signingModuleUrl = new URL("../../scripts/internal-queue-request.mjs", import.meta.url)
+    .href;
   const script = String.raw`
-    const [baseUrl, payload, heartbeatSignature, releaseSignature, intervalText] =
+    const [baseUrl, payload, signingModuleUrl, intervalText] =
       process.argv.slice(1);
-    const post = async (path, signature) => {
+    const { internalQueueRequestHeaders } = await import(signingModuleUrl);
+    const secret = process.env.CLAWSWEEPER_COORDINATOR_CHILD_SECRET || "";
+    delete process.env.CLAWSWEEPER_COORDINATOR_CHILD_SECRET;
+    const post = async (path) => {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 10000);
       try {
         await fetch(baseUrl + path, {
           method: "POST",
-          headers: {
-            "content-type": "application/json",
-            "x-clawsweeper-exact-review-signature": signature,
-          },
+          headers: internalQueueRequestHeaders({ secret, method: "POST", path, body: payload }),
           body: payload,
           signal: controller.signal,
         });
@@ -297,13 +301,13 @@ function startCoordinatorWatchdog(
       finally { clearTimeout(timer); }
     };
     const interval = setInterval(
-      () => void post("/internal/state-writer/heartbeat", heartbeatSignature),
+      () => void post("/internal/state-writer/heartbeat"),
       Number(intervalText),
     );
     process.stdin.resume();
     process.stdin.on("end", async () => {
       clearInterval(interval);
-      await post("/internal/state-writer/release", releaseSignature);
+      await post("/internal/state-writer/release");
       process.exit(0);
     });
   `;
@@ -315,11 +319,15 @@ function startCoordinatorWatchdog(
       script,
       config.queueUrl,
       payload,
-      heartbeatSignature,
-      releaseSignature,
+      signingModuleUrl,
       String(COORDINATOR_HEARTBEAT_MS),
     ],
-    { detached: true, stdio: ["pipe", "ignore", "ignore"], windowsHide: true },
+    {
+      detached: true,
+      stdio: ["pipe", "ignore", "ignore"],
+      windowsHide: true,
+      env: { ...process.env, CLAWSWEEPER_COORDINATOR_CHILD_SECRET: config.secret },
+    },
   );
   child.on("error", () => {});
   child.stdin.on("error", () => {});

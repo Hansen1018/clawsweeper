@@ -1,5 +1,8 @@
-import { createHmac } from "node:crypto";
 import fs from "node:fs";
+import {
+  INTERNAL_QUEUE_REQUEST_TIMEOUT_MS,
+  internalQueueRequestHeaders,
+} from "./exact-review-command-queue.js";
 
 import type {
   BatchPublicationIdentity,
@@ -91,7 +94,7 @@ export async function postDirectPublicationResult(options: {
     );
     return { kind: "fallback", attempts: 0, reason: "payload_too_large", status: 413 };
   }
-  const signature = `sha256=${createHmac("sha256", options.webhookSecret).update(body).digest("hex")}`;
+  const path = options.path ?? "/internal/exact-review/publication-results";
   const attempts = boundedAttempts(options.attempts ?? DEFAULT_ATTEMPTS);
   const request = options.fetch ?? globalThis.fetch;
   const sleep =
@@ -101,18 +104,17 @@ export async function postDirectPublicationResult(options: {
   let lastStatus: number | undefined;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     try {
-      const response = await request(
-        `${baseUrl}${options.path ?? "/internal/exact-review/publication-results"}`,
-        {
+      const response = await request(`${baseUrl}${path}`, {
+        method: "POST",
+        headers: internalQueueRequestHeaders({
+          secret: options.webhookSecret,
           method: "POST",
-          headers: {
-            "content-type": "application/json",
-            "x-clawsweeper-exact-review-signature": signature,
-          },
+          path,
           body,
-          signal: AbortSignal.timeout(20_000),
-        },
-      );
+        }),
+        body,
+        signal: AbortSignal.timeout(INTERNAL_QUEUE_REQUEST_TIMEOUT_MS),
+      });
       lastStatus = response.status;
       const payload = (await response.json().catch(() => ({}))) as Record<string, unknown>;
       if (
@@ -183,7 +185,8 @@ export async function runExactReviewDirectPublicationFromEnv() {
   });
   const result = await postDirectPublicationResult({
     baseUrl: requiredEnv("EXACT_REVIEW_QUEUE_URL"),
-    webhookSecret: requiredEnv("CLAWSWEEPER_WEBHOOK_SECRET"),
+    webhookSecret:
+      process.env.CLAWSWEEPER_INTERNAL_QUEUE_SECRET || requiredEnv("CLAWSWEEPER_WEBHOOK_SECRET"),
     payload,
   });
   writeGithubOutput("accepted", result.kind === "accepted" ? "true" : "false");

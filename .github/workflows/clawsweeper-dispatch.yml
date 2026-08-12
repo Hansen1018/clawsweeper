@@ -158,14 +158,18 @@ jobs:
             echo "Ignoring ClawSweeper proof-nudge comment."
             exit 0
           fi
-          if [ -n "$TARGET_TOKEN" ]; then
+          is_read_only_review=false
+          if grep -Eiq -m 1 '^[[:space:]]*((/clawsweeper|@clawsweeper|@openclaw-clawsweeper(\[bot\])?)[[:space:]]+)?/?(review|re-?review|rereview|re-?run|rerun)([[:space:]:.!-]|$)' "$body_file"; then
+            is_read_only_review=true
+          fi
+          if [ "$is_read_only_review" != "true" ] && [ -n "$TARGET_TOKEN" ]; then
             GH_TOKEN="$TARGET_TOKEN" gh api -X POST \
               -H "Accept: application/vnd.github+json" \
               "repos/$TARGET_REPO/issues/comments/$COMMENT_ID/reactions" \
               -f content="eyes" >/dev/null || true
           fi
           status_comment_id=""
-          if [ -n "$TARGET_TOKEN" ]; then
+          if [ "$is_read_only_review" != "true" ] && [ -n "$TARGET_TOKEN" ]; then
             case "$AUTHOR_ASSOCIATION" in
               OWNER|MEMBER|COLLABORATOR)
                 status_body="$(printf '%s\n' \

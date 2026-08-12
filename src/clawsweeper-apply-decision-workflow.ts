@@ -111,7 +111,6 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
     frontMatterStringArray,
     frontMatterValue,
     ghJson,
-    GitHubRuntimeBudgetError,
     guardedOpenApplyProofFields,
     hasVerifiedLocalCheckoutAccess,
     isApplyCloseCandidateReport,
@@ -391,6 +390,7 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
       itemNumber: number;
       lease: AcquiredReviewStartLease;
     } | null = null;
+    const durablyPublishedReviewComments = new Set<number>();
     const releaseActiveApplyMutationLease = (): void => {
       const active = activeApplyMutationLease;
       activeApplyMutationLease = null;
@@ -400,6 +400,12 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
           throwOnError: true,
         });
       } catch (error) {
+        if (durablyPublishedReviewComments.has(active.itemNumber)) {
+          console.error(
+            `[apply] deferred review lease cleanup for #${active.itemNumber} after durable comment publication: ${mutationErrorMessage(error)}`,
+          );
+          return;
+        }
         if (error instanceof GitHubRateLimitError) throw error;
         console.error(
           `[apply] could not delete owned review lease comment ${active.lease.commentId}: ${mutationErrorMessage(error)}`,
@@ -1784,6 +1790,15 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
           });
         }
       }
+      const needsReviewRecoveryLabelCleanup =
+        complete && item.labels.includes(REVIEW_RECOVERY_STUCK_LABEL);
+      const pendingApplyCleanup = frontMatterValue(markdown, "apply_cleanup_pending");
+      if (
+        needsReviewRecoveryLabelCleanup ||
+        (pendingApplyCleanup !== undefined && pendingApplyCleanup !== "[]")
+      ) {
+        needsReviewCommentSync = true;
+      }
       if (needsReviewCommentSync) {
         const staleSyncReason = needsReviewCommentBodySync ? staleReviewCommentReason : null;
         if (staleSyncReason) {
@@ -1812,6 +1827,61 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
         }
         let syncedComment = existingReviewComment;
         const syncReasons: string[] = [];
+        const cleanupObligations = new Set<string>(
+          (() => {
+            try {
+              const parsed = JSON.parse(pendingApplyCleanup || "[]");
+              return Array.isArray(parsed)
+                ? parsed.filter((value): value is string => typeof value === "string")
+                : [];
+            } catch {
+              return [];
+            }
+          })(),
+        );
+        let postPublicationThrottle: string | null = null;
+        const deferPostPublicationCleanup = (kind: string, error: unknown): void => {
+          cleanupObligations.add(kind);
+          if (error instanceof GitHubRateLimitError) {
+            postPublicationThrottle = runtimeBudget.yieldReason ?? mutationErrorMessage(error);
+          }
+        };
+        const clearReviewRecoveryLabel = (): void => {
+          if (!needsReviewRecoveryLabelCleanup) return;
+          if (postPublicationThrottle) {
+            cleanupObligations.add("recovery_label");
+            return;
+          }
+          if (dryRun) {
+            syncReasons.push("would clear resolved review recovery label");
+            return;
+          }
+          try {
+            clearResolvedReviewRecoveryLabel({
+              number,
+              labels: item.labels,
+              complete,
+              removeLabel: removeIssueLabel,
+              onMutation: recordMutation,
+            });
+            markdown = replaceFrontMatterValue(markdown, "labels", JSON.stringify(item.labels));
+            markdown = replaceFrontMatterValue(
+              markdown,
+              "labels_synced_at",
+              new Date().toISOString(),
+            );
+            rememberSelfMutationUpdatedAt();
+            syncReasons.push("cleared resolved review recovery label");
+          } catch (error) {
+            deferPostPublicationCleanup("recovery_label", error);
+            syncReasons.push("retained review recovery label for cleanup retry");
+            console.error(
+              `[apply] could not clear resolved review recovery label for #${number}: ${
+                error instanceof Error ? error.message : String(error)
+              }`,
+            );
+          }
+        };
         if (needsReviewCommentBodySync) {
           if (dryRun) {
             syncReasons.push(
@@ -1887,53 +1957,47 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
                 markedReviewComment,
                 existingReviewComment,
               );
-              rememberSelfMutationUpdatedAt();
+              durablyPublishedReviewComments.add(number);
               syncReasons.push("updated durable Codex review comment");
-              // The durable review comment is now published, so stale "review
-              // started" placeholders from failed earlier attempts are clutter.
-              const placeholderKeepCommentIds = new Set<number>();
-              const syncedCommentId = commentId(syncedComment);
-              if (syncedCommentId !== null) placeholderKeepCommentIds.add(syncedCommentId);
-              // Closures assign the active lease, so read it through a cast to
-              // defeat TypeScript's stale null narrowing at this use site.
-              const heldMutationLease = activeApplyMutationLease as {
-                itemNumber: number;
-                lease: AcquiredReviewStartLease;
-              } | null;
-              if (heldMutationLease?.itemNumber === number) {
-                placeholderKeepCommentIds.add(heldMutationLease.lease.commentId);
+              try {
+                rememberSelfMutationUpdatedAt();
+              } catch (error) {
+                deferPostPublicationCleanup("freshness_receipt", error);
+                syncReasons.push("deferred post-publication freshness receipt cleanup");
+                console.error(
+                  `[apply] deferred post-publication freshness receipt for #${number}: ${mutationErrorMessage(error)}`,
+                );
               }
-              cleanupSupersededReviewPlaceholderComments({
-                number,
-                comments: latestLeaseState.comments,
-                keepCommentIds: placeholderKeepCommentIds,
-              });
-              if (complete && item.labels.includes(REVIEW_RECOVERY_STUCK_LABEL)) {
+              if (!postPublicationThrottle) {
+                // The durable review comment is now published, so stale "review
+                // started" placeholders from failed earlier attempts are clutter.
+                const placeholderKeepCommentIds = new Set<number>();
+                const syncedCommentId = commentId(syncedComment);
+                if (syncedCommentId !== null) placeholderKeepCommentIds.add(syncedCommentId);
+                // Closures assign the active lease, so read it through a cast to
+                // defeat TypeScript's stale null narrowing at this use site.
+                const heldMutationLease = activeApplyMutationLease as {
+                  itemNumber: number;
+                  lease: AcquiredReviewStartLease;
+                } | null;
+                if (heldMutationLease?.itemNumber === number) {
+                  placeholderKeepCommentIds.add(heldMutationLease.lease.commentId);
+                }
                 try {
-                  clearResolvedReviewRecoveryLabel({
+                  cleanupSupersededReviewPlaceholderComments({
                     number,
-                    labels: item.labels,
-                    complete,
-                    removeLabel: removeIssueLabel,
-                    onMutation: recordMutation,
+                    comments: latestLeaseState.comments,
+                    keepCommentIds: placeholderKeepCommentIds,
                   });
-                  markdown = replaceFrontMatterValue(markdown, "labels", JSON.stringify(item.labels));
-                  markdown = replaceFrontMatterValue(
-                    markdown,
-                    "labels_synced_at",
-                    new Date().toISOString(),
-                  );
-                  rememberSelfMutationUpdatedAt();
-                  syncReasons.push("cleared resolved review recovery label");
                 } catch (error) {
-                  if (error instanceof GitHubRuntimeBudgetError || error instanceof GitHubRateLimitError)
-                    throw error;
+                  deferPostPublicationCleanup("review_placeholders", error);
+                  syncReasons.push("deferred superseded review placeholder cleanup");
                   console.error(
-                    `[apply] could not clear resolved review recovery label for #${number}: ${
-                      error instanceof Error ? error.message : String(error)
-                    }`,
+                    `[apply] deferred superseded review placeholder cleanup for #${number}: ${mutationErrorMessage(error)}`,
                   );
                 }
+              } else {
+                cleanupObligations.add("review_placeholders");
               }
             } catch (error) {
               const commentAuthError = isGitHubRequiresAuthenticationError(error);
@@ -1960,6 +2024,36 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
         } else {
           syncReasons.push("recorded existing durable comment metadata");
         }
+        if (!postPublicationThrottle && cleanupObligations.has("freshness_receipt")) {
+          try {
+            rememberSelfMutationUpdatedAt();
+            cleanupObligations.delete("freshness_receipt");
+          } catch (error) {
+            deferPostPublicationCleanup("freshness_receipt", error);
+          }
+        }
+        if (!postPublicationThrottle && cleanupObligations.has("review_placeholders")) {
+          try {
+            const retryLeaseState = refreshReviewStartLeaseState();
+            const keepCommentIds = new Set<number>();
+            const durableCommentId = commentId(syncedComment);
+            if (durableCommentId !== null) keepCommentIds.add(durableCommentId);
+            cleanupSupersededReviewPlaceholderComments({
+              number,
+              comments: retryLeaseState.comments,
+              keepCommentIds,
+            });
+            cleanupObligations.delete("review_placeholders");
+          } catch (error) {
+            deferPostPublicationCleanup("review_placeholders", error);
+          }
+        }
+        clearReviewRecoveryLabel();
+        markdown = replaceFrontMatterValue(
+          markdown,
+          "apply_cleanup_pending",
+          JSON.stringify([...cleanupObligations].sort()),
+        );
         markdown = replaceFrontMatterValue(markdown, "apply_checked_at", new Date().toISOString());
         markdown = updateReviewCommentMetadata(markdown, syncedComment, markedReviewComment);
         if (staleCanonicalCommentSyncPending) {
@@ -1977,6 +2071,15 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
         });
         processedCount += 1;
         maybeLogProgress(`synced review comment #${number}`);
+        if (postPublicationThrottle) {
+          runtimeBudget.onYield?.(postPublicationThrottle, false);
+          return;
+        }
+        const postPublicationBudgetYield = runtimeBudget.yieldReason;
+        if (postPublicationBudgetYield) {
+          runtimeBudget.onYield?.(postPublicationBudgetYield, false);
+          return;
+        }
         if (processedCount >= processedLimit) break;
       }
       if (closeBlockedForCommentSync) {

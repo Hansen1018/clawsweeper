@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
+import http from "node:http";
 import test from "node:test";
 
 import {
@@ -8,9 +9,15 @@ import {
   classifyIssueCommentWebhook,
   classifyWebhook,
   handleGitHubWebhook,
-  renderFastAckComment,
+  startServer,
   verifyGitHubSignature,
 } from "../../dist/repair/comment-webhook.js";
+import {
+  coordinateDirectReReview,
+  directReReviewIntake,
+  planClawSweeperAcknowledgementConvergence,
+  validateDirectReReviewIntake,
+} from "../../dist/repair/direct-re-review-admission.js";
 
 test("comment webhook accepts maintainer ClawSweeper commands", () => {
   const result = classifyIssueCommentWebhook({
@@ -34,9 +41,15 @@ test("comment webhook accepts maintainer ClawSweeper commands", () => {
     targetRepo: "openclaw/openclaw",
     targetBranch: "trunk",
     itemNumber: 71898,
+    itemKind: "issue",
+    itemState: "",
     commentId: 456,
     installationId: 123,
     sourceAction: "created",
+    commentBody: "@clawsweeper automerge",
+    commentAuthor: "",
+    commentUrl: "",
+    maintainerAuthorized: true,
   });
 });
 
@@ -187,9 +200,15 @@ test("comment webhook accepts author read-only re-review commands", () => {
     targetRepo: "openclaw/openclaw",
     targetBranch: "main",
     itemNumber: 76991,
+    itemKind: "issue",
+    itemState: "",
     commentId: 456,
     installationId: 123,
     sourceAction: "created",
+    commentBody: "@clawsweeper Re-run",
+    commentAuthor: "NickMOpen",
+    commentUrl: "",
+    maintainerAuthorized: false,
   });
 });
 
@@ -253,9 +272,15 @@ test("comment webhook still accepts post-close re-review commands for router res
     targetRepo: "openclaw/openclaw",
     targetBranch: "main",
     itemNumber: 76991,
+    itemKind: "pull_request",
+    itemState: "closed",
     commentId: 456,
     installationId: 123,
     sourceAction: "created",
+    commentBody: "@clawsweeper re-review",
+    commentAuthor: "user",
+    commentUrl: "",
+    maintainerAuthorized: true,
     commentUpdatedAt: "2026-05-19T05:03:00Z",
     commentBodySha256: crypto.createHash("sha256").update("@clawsweeper re-review").digest("hex"),
   });
@@ -728,14 +753,467 @@ test("webhook rejects label additions and unrelated removals from exact-review i
   }
 });
 
-test("fast ack comment carries source comment marker", () => {
-  const body = renderFastAckComment(456);
+test("direct re-review performs one signed durable intake without GitHub work", async () => {
+  const previousFetch = globalThis.fetch;
+  const previousAppId = process.env.CLAWSWEEPER_APP_ID;
+  const previousPrivateKey = process.env.CLAWSWEEPER_APP_PRIVATE_KEY;
+  const previousSecret = process.env.CLAWSWEEPER_WEBHOOK_SECRET;
+  const { privateKey } = crypto.generateKeyPairSync("rsa", { modulusLength: 2048 });
+  process.env.CLAWSWEEPER_APP_ID = "12345";
+  process.env.CLAWSWEEPER_APP_PRIVATE_KEY = privateKey
+    .export({ type: "pkcs1", format: "pem" })
+    .toString();
+  process.env.CLAWSWEEPER_WEBHOOK_SECRET = "queue-secret";
+  const requests: string[] = [];
+  const intakes: Array<Record<string, any>> = [];
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = new URL(String(input));
+    const method = String(init?.method ?? "GET").toUpperCase();
+    requests.push(`${method} ${url.pathname}`);
+    if (url.pathname === "/internal/exact-review/command-intake") {
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      intakes.push(body);
+      assert.match(
+        String(new Headers(init?.headers).get("x-clawsweeper-internal-signature")),
+        /^sha256=[0-9a-f]{64}$/,
+      );
+      return jsonResponse({
+        ok: true,
+        accepted: true,
+        deduped: false,
+        command_version_id: body.commandVersionId,
+      });
+    }
+    throw new Error(`unexpected fetch ${method} ${url.pathname}`);
+  }) as typeof fetch;
 
-  assert.match(body, /clawsweeper-command-ack:456/);
-  assert.match(body, /ClawSweeper picked this up/);
+  try {
+    for (const scenario of [
+      {
+        number: 8101,
+        association: "MEMBER",
+        author: "maintainer",
+        issueAuthor: "reporter",
+        body: "@clawsweeper\nre-review: focus on the retry\nEvidence: injected 429 after PATCH",
+      },
+      {
+        number: 8102,
+        association: "CONTRIBUTOR",
+        author: "reporter",
+        issueAuthor: "reporter",
+        body: "@clawsweeper\nre-review this path",
+      },
+    ]) {
+      const result = await handleGitHubWebhook({
+        event: "issue_comment",
+        payload: {
+          action: "created",
+          repository: { full_name: "openclaw/openclaw" },
+          issue: {
+            number: scenario.number,
+            state: "open",
+            user: { login: scenario.issueAuthor },
+          },
+          installation: { id: 123 },
+          comment: {
+            id: scenario.number + 100,
+            body: scenario.body,
+            updated_at: `2026-08-08T20:00:${scenario.number === 8101 ? "01" : "02"}Z`,
+            html_url: `https://github.com/openclaw/openclaw/issues/${scenario.number}#comment`,
+            author_association: scenario.association,
+            user: { login: scenario.author },
+          },
+        },
+      });
+      assert.equal(result.statusCode, 202);
+      const decision = intakes.at(-1)!.decision;
+      assert.match(
+        String(decision.sourceDeliveryId),
+        new RegExp(`^command-${scenario.number + 100}-`),
+      );
+      assert.match(String(decision.commandStatusMarker), /:re_review:command-/);
+      assert.equal(
+        String(decision.additionalPrompt).includes("Evidence: injected 429 after PATCH"),
+        scenario.association === "MEMBER",
+      );
+    }
+    assert.deepEqual(requests, [
+      "POST /internal/exact-review/command-intake",
+      "POST /internal/exact-review/command-intake",
+    ]);
+  } finally {
+    globalThis.fetch = previousFetch;
+    restoreEnv("CLAWSWEEPER_APP_ID", previousAppId);
+    restoreEnv("CLAWSWEEPER_APP_PRIVATE_KEY", previousPrivateKey);
+    restoreEnv("CLAWSWEEPER_WEBHOOK_SECRET", previousSecret);
+  }
 });
 
-test("concurrent duplicate command webhooks converge on one fast ack comment", async () => {
+test("acknowledgement convergence prunes only duplicate copies of the same command revision", () => {
+  const marker = "<!-- clawsweeper-command-status:8101:re_review:command-8201 -->";
+  const otherMarker = "<!-- clawsweeper-command-status:8101:re_review:command-8201-edit -->";
+  const comments = [
+    {
+      id: 10,
+      body: `<!-- clawsweeper-command-ack:8201 -->\n${marker}`,
+      created_at: "2026-08-08T20:00:00Z",
+    },
+    {
+      id: 11,
+      body: `<!-- clawsweeper-command-ack:8201 -->\n${marker}`,
+      created_at: "2026-08-08T20:00:01Z",
+    },
+    {
+      id: 12,
+      body: `<!-- clawsweeper-command-ack:8201 -->\n${otherMarker}`,
+      created_at: "2026-08-08T20:00:02Z",
+    },
+    {
+      id: 13,
+      body: "<!-- clawsweeper-command-ack:8201 -->\nCommand router queued.",
+      created_at: "2026-08-08T20:00:03Z",
+    },
+  ];
+
+  assert.deepEqual(planClawSweeperAcknowledgementConvergence(comments, marker), {
+    keepId: 10,
+    prunableIds: [11, 13],
+  });
+});
+
+test("direct PR coordinator retries rejection only after observing a changed head", async () => {
+  const intake = directReReviewIntake({
+    targetRepo: "openclaw/openclaw",
+    targetBranch: "main",
+    itemNumber: 8203,
+    itemKind: "pull_request",
+    installationId: 123,
+    sourceCommentId: 8303,
+    sourceCommentUpdatedAt: "2026-08-08T20:00:00Z",
+    commandBodyDigest: "c".repeat(64),
+    commandOrigin: "hosted_webhook",
+    additionalPrompt: "",
+  });
+  const heads = ["a".repeat(40), "b".repeat(40)];
+  const completions: Array<[number, "enqueued" | "mismatch"]> = [];
+  const result = await coordinateDirectReReview(intake, {
+    readPullRequest: async () => ({ headSha: heads.shift()! }),
+    reserveAuthority: async () => ({ kind: "reserved", sourceAuthoritySeq: 1 }),
+    completeAuthority: async (sequence, disposition) => {
+      completions.push([sequence, disposition]);
+      return { kind: "completed" };
+    },
+    enqueue: async () => ({ kind: "rejected", reason: "stale head" }),
+    convergeAcknowledgement: async () => 1,
+    addReaction: async () => undefined,
+  });
+
+  assert.deepEqual(result, { kind: "retry", reason: "head_changed" });
+  assert.deepEqual(completions, [[1, "mismatch"]]);
+});
+
+test("direct PR coordinator terminalizes rejection when head and command version are unchanged", async () => {
+  const intake = directReReviewIntake({
+    targetRepo: "openclaw/openclaw",
+    targetBranch: "main",
+    itemNumber: 8204,
+    itemKind: "pull_request",
+    installationId: 123,
+    sourceCommentId: 8304,
+    sourceCommentUpdatedAt: "2026-08-08T20:00:00Z",
+    commandBodyDigest: "d".repeat(64),
+    commandOrigin: "hosted_webhook",
+    additionalPrompt: "",
+  });
+  const head = "a".repeat(40);
+  const result = await coordinateDirectReReview(intake, {
+    readPullRequest: async () => ({ headSha: head }),
+    reserveAuthority: async () => ({ kind: "reserved", sourceAuthoritySeq: 1 }),
+    completeAuthority: async () => ({ kind: "completed" }),
+    enqueue: async () => ({ kind: "rejected", reason: "stale head" }),
+    convergeAcknowledgement: async () => assert.fail("acknowledgement must not run"),
+    addReaction: async () => assert.fail("reaction must not run"),
+  });
+  assert.deepEqual(result, { kind: "rejected", reason: "stale head" });
+});
+
+test("direct PR coordinator retries when rejection freshness cannot be verified", async () => {
+  const intake = directReReviewIntake({
+    targetRepo: "openclaw/openclaw",
+    targetBranch: "main",
+    itemNumber: 8_205,
+    itemKind: "pull_request",
+    installationId: 123,
+    sourceCommentId: 8_305,
+    sourceCommentUpdatedAt: "2026-08-08T20:00:00Z",
+    commandBodyDigest: "d".repeat(64),
+    commandOrigin: "hosted_webhook",
+    additionalPrompt: "",
+  });
+  let reads = 0;
+  const completions: string[] = [];
+  const result = await coordinateDirectReReview(intake, {
+    readPullRequest: async () => {
+      reads += 1;
+      if (reads === 1) return { headSha: "a".repeat(40) };
+      throw new Error("GitHub unavailable");
+    },
+    reserveAuthority: async () => ({ kind: "reserved", sourceAuthoritySeq: 1 }),
+    completeAuthority: async (_sequence, disposition) => {
+      completions.push(disposition);
+      return { kind: "completed" };
+    },
+    enqueue: async () => ({ kind: "rejected", reason: "stale head" }),
+    convergeAcknowledgement: async () => assert.fail("acknowledgement must not run"),
+    addReaction: async () => assert.fail("reaction must not run"),
+  });
+  assert.deepEqual(result, { kind: "retry", reason: "dependency_unavailable" });
+  assert.deepEqual(completions, []);
+});
+
+test("direct intake validation rejects a mismatched acknowledgement marker", () => {
+  const intake = directReReviewIntake({
+    targetRepo: "openclaw/openclaw",
+    targetBranch: "main",
+    itemNumber: 8_206,
+    itemKind: "issue",
+    installationId: 123,
+    sourceCommentId: 8_306,
+    sourceCommentUpdatedAt: "2026-08-08T20:00:00Z",
+    commandBodyDigest: "e".repeat(64),
+    commandOrigin: "hosted_webhook",
+    additionalPrompt: "",
+  });
+  assert.equal(
+    validateDirectReReviewIntake({
+      ...intake,
+      decision: { ...intake.decision, commandStatusMarker: "<!-- wrong-command -->" },
+    }),
+    null,
+  );
+});
+
+test("direct intake construction caps maintainer context to its validated bound", () => {
+  const intake = directReReviewIntake({
+    targetRepo: "openclaw/openclaw",
+    targetBranch: "main",
+    itemNumber: 8_207,
+    itemKind: "issue",
+    installationId: 123,
+    sourceCommentId: 8_307,
+    sourceCommentUpdatedAt: "2026-08-08T20:00:00Z",
+    commandBodyDigest: "f".repeat(64),
+    commandOrigin: "hosted_webhook",
+    additionalPrompt: "x".repeat(6_000),
+  });
+  assert.equal(intake.decision.additionalPrompt.length, 5_000);
+  assert.ok(validateDirectReReviewIntake(intake));
+});
+
+test("local direct PR webhook returns after intake without waiting for slow GitHub", async () => {
+  const previousFetch = globalThis.fetch;
+  const previousSecret = process.env.CLAWSWEEPER_WEBHOOK_SECRET;
+  process.env.CLAWSWEEPER_WEBHOOK_SECRET = "queue-secret";
+  let githubCalls = 0;
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/internal/exact-review/command-intake") {
+      const intake = JSON.parse(String(init?.body || "{}"));
+      return jsonResponse({
+        ok: true,
+        accepted: true,
+        deduped: false,
+        command_version_id: intake.commandVersionId,
+      });
+    }
+    githubCalls += 1;
+    await new Promise((resolve) => setTimeout(resolve, 11_000));
+    throw new Error(`unexpected slow GitHub call ${url}`);
+  }) as typeof fetch;
+  try {
+    const startedAt = Date.now();
+    const result = await handleGitHubWebhook({
+      event: "issue_comment",
+      payload: {
+        action: "created",
+        repository: { full_name: "openclaw/openclaw" },
+        issue: {
+          number: 8201,
+          state: "open",
+          pull_request: {},
+          user: { login: "maintainer" },
+        },
+        installation: { id: 123 },
+        comment: {
+          id: 8301,
+          body: "@clawsweeper re-review",
+          updated_at: "2026-08-08T20:00:00Z",
+          author_association: "MEMBER",
+          user: { login: "maintainer" },
+        },
+      },
+    });
+    assert.equal(result.statusCode, 202);
+    assert.ok(Date.now() - startedAt < 1_000);
+    assert.equal(githubCalls, 0);
+  } finally {
+    globalThis.fetch = previousFetch;
+    restoreEnv("CLAWSWEEPER_WEBHOOK_SECRET", previousSecret);
+  }
+});
+
+test("local webhook fails closed before ten seconds when durable remote intake hangs", async () => {
+  const previousSecret = process.env.CLAWSWEEPER_WEBHOOK_SECRET;
+  const previousInternalSecret = process.env.CLAWSWEEPER_INTERNAL_QUEUE_SECRET;
+  const previousQueueUrl = process.env.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL;
+  const secret = "hung-intake-secret";
+  let intakeCalls = 0;
+  const hungIntake = http.createServer((_request, _response) => {
+    intakeCalls += 1;
+  });
+  await new Promise<void>((resolve) => hungIntake.listen(0, "127.0.0.1", resolve));
+  const intakeAddress = hungIntake.address();
+  assert.ok(intakeAddress && typeof intakeAddress === "object");
+  process.env.CLAWSWEEPER_WEBHOOK_SECRET = secret;
+  process.env.CLAWSWEEPER_INTERNAL_QUEUE_SECRET = secret;
+  process.env.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL = `http://127.0.0.1:${intakeAddress.port}`;
+
+  const webhook = startServer(0);
+  await new Promise<void>((resolve) => webhook.once("listening", resolve));
+  const webhookAddress = webhook.address();
+  assert.ok(webhookAddress && typeof webhookAddress === "object");
+  const payload = JSON.stringify({
+    action: "created",
+    repository: { full_name: "openclaw/openclaw" },
+    issue: { number: 8_205, state: "open", pull_request: {}, user: { login: "maintainer" } },
+    installation: { id: 123 },
+    comment: {
+      id: 8_305,
+      body: "@clawsweeper re-review",
+      updated_at: "2026-08-08T20:00:00Z",
+      author_association: "MEMBER",
+      user: { login: "maintainer" },
+    },
+  });
+  const signature = `sha256=${crypto.createHmac("sha256", secret).update(payload).digest("hex")}`;
+  try {
+    const startedAt = Date.now();
+    const response = await fetch(`http://127.0.0.1:${webhookAddress.port}/github/webhook`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-github-event": "issue_comment",
+        "x-hub-signature-256": signature,
+      },
+      body: payload,
+    });
+    const elapsed = Date.now() - startedAt;
+    assert.equal(response.status, 503);
+    assert.ok(elapsed < 10_000, `webhook response took ${elapsed}ms`);
+    assert.deepEqual(await response.json(), {
+      ok: false,
+      retryable: true,
+      error: "durable_intake_unavailable",
+    });
+    assert.equal(intakeCalls, 1);
+  } finally {
+    webhook.closeAllConnections();
+    hungIntake.closeAllConnections();
+    await Promise.all([
+      new Promise<void>((resolve) => webhook.close(() => resolve())),
+      new Promise<void>((resolve) => hungIntake.close(() => resolve())),
+    ]);
+    restoreEnv("CLAWSWEEPER_WEBHOOK_SECRET", previousSecret);
+    restoreEnv("CLAWSWEEPER_INTERNAL_QUEUE_SECRET", previousInternalSecret);
+    restoreEnv("CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL", previousQueueUrl);
+  }
+});
+
+test("local closed post-close re-review stays on the visible comment-router path", async () => {
+  const previousFetch = globalThis.fetch;
+  const previousAppId = process.env.CLAWSWEEPER_APP_ID;
+  const previousPrivateKey = process.env.CLAWSWEEPER_APP_PRIVATE_KEY;
+  const { privateKey } = crypto.generateKeyPairSync("rsa", { modulusLength: 2048 });
+  process.env.CLAWSWEEPER_APP_ID = "12345";
+  process.env.CLAWSWEEPER_APP_PRIVATE_KEY = privateKey
+    .export({ type: "pkcs1", format: "pem" })
+    .toString();
+  let exactQueueCalls = 0;
+  let dispatchPayload: Record<string, unknown> | undefined;
+  let statusBody = "";
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/app/installations/123/access_tokens") {
+      return jsonResponse({ token: "target-token" });
+    }
+    if (url.pathname === "/repos/openclaw/clawsweeper/installation") {
+      return jsonResponse({ id: 999 });
+    }
+    if (url.pathname === "/app/installations/999/access_tokens") {
+      return jsonResponse({ token: "dispatch-token" });
+    }
+    if (url.pathname === "/repos/openclaw/openclaw/issues/8202/comments") {
+      if (init?.method === "GET") return jsonResponse([]);
+      statusBody = String(JSON.parse(String(init?.body ?? "{}")).body || "");
+      return jsonResponse({ id: 18_202, body: statusBody });
+    }
+    if (url.pathname === "/repos/openclaw/openclaw/issues/comments/8302/reactions") {
+      return jsonResponse({ id: 1 });
+    }
+    if (url.pathname === "/repos/openclaw/clawsweeper/dispatches") {
+      dispatchPayload = JSON.parse(String(init?.body ?? "{}"));
+      return jsonResponse({});
+    }
+    if (url.pathname.startsWith("/internal/exact-review/")) {
+      exactQueueCalls += 1;
+      return jsonResponse({ ok: true, queued: true });
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  }) as typeof fetch;
+
+  try {
+    const result = await handleGitHubWebhook({
+      event: "issue_comment",
+      payload: {
+        action: "created",
+        repository: { full_name: "openclaw/openclaw" },
+        issue: {
+          number: 8202,
+          state: "closed",
+          closed_at: "2026-08-08T20:00:00Z",
+          pull_request: {},
+          user: { login: "maintainer" },
+        },
+        installation: { id: 123 },
+        comment: {
+          id: 8302,
+          body: "@clawsweeper re-review",
+          created_at: "2026-08-08T20:01:00Z",
+          updated_at: "2026-08-08T20:01:00Z",
+          author_association: "MEMBER",
+          user: { login: "maintainer" },
+        },
+      },
+    });
+    assert.deepEqual(result, {
+      statusCode: 202,
+      body: { ok: true, status_comment_id: 18_202 },
+    });
+    assert.equal(exactQueueCalls, 0);
+    assert.match(statusBody, /Command router queued/);
+    assert.equal(
+      (dispatchPayload as { client_payload?: { status_comment_id?: number } })?.client_payload
+        ?.status_comment_id,
+      18_202,
+    );
+  } finally {
+    globalThis.fetch = previousFetch;
+    restoreEnv("CLAWSWEEPER_APP_ID", previousAppId);
+    restoreEnv("CLAWSWEEPER_APP_PRIVATE_KEY", previousPrivateKey);
+  }
+});
+
+test("concurrent non-review commands share an immediate status comment with the router", async () => {
   const previousFetch = globalThis.fetch;
   const previousAppId = process.env.CLAWSWEEPER_APP_ID;
   const previousClientId = process.env.CLAWSWEEPER_APP_CLIENT_ID;
@@ -810,7 +1288,7 @@ test("concurrent duplicate command webhooks converge on one fast ack comment", a
       installation: { id: 123 },
       comment: {
         id: 456,
-        body: "@clawsweeper re-review",
+        body: "@clawsweeper automerge",
         updated_at: "2026-07-12T20:00:00Z",
         author_association: "MEMBER",
         user: { login: "user" },
@@ -821,8 +1299,14 @@ test("concurrent duplicate command webhooks converge on one fast ack comment", a
       handleGitHubWebhook({ event: "issue_comment", payload }),
     ]);
 
-    assert.deepEqual(left, { statusCode: 202, body: { ok: true, status_comment_id: 9001 } });
-    assert.deepEqual(right, { statusCode: 202, body: { ok: true, status_comment_id: 9001 } });
+    assert.deepEqual(left, {
+      statusCode: 202,
+      body: { ok: true, status_comment_id: 9001 },
+    });
+    assert.deepEqual(right, {
+      statusCode: 202,
+      body: { ok: true, status_comment_id: 9001 },
+    });
     assert.equal(fastAckPosts, 1);
     assert.equal(reactions, 2);
     assert.equal(dispatches, 2);
@@ -840,7 +1324,7 @@ test("concurrent duplicate command webhooks converge on one fast ack comment", a
         comment_updated_at: "2026-07-12T20:00:00Z",
         comment_body_sha256: crypto
           .createHash("sha256")
-          .update("@clawsweeper re-review")
+          .update("@clawsweeper automerge")
           .digest("hex"),
       })),
     );
@@ -850,123 +1334,14 @@ test("concurrent duplicate command webhooks converge on one fast ack comment", a
       ),
     );
     assert.equal(comments.length, 1);
-    assert.match(comments[0]?.body ?? "", /clawsweeper-command-ack:456/);
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.match(comments[0]!.body, /Command router queued/);
+    assert.doesNotMatch(comments[0]!.body, /clawsweeper-command-status/);
   } finally {
     globalThis.fetch = previousFetch;
     restoreEnv("CLAWSWEEPER_APP_ID", previousAppId);
     restoreEnv("CLAWSWEEPER_APP_CLIENT_ID", previousClientId);
     restoreEnv("CLAWSWEEPER_APP_PRIVATE_KEY", previousPrivateKey);
     restoreEnv("CLAWSWEEPER_FAST_ACK_SETTLE_DELAYS_MS", previousSettleDelays);
-  }
-});
-
-test("comment webhook settles duplicate fast ack comments after dispatch", async () => {
-  const previousFetch = globalThis.fetch;
-  const previousAppId = process.env.CLAWSWEEPER_APP_ID;
-  const previousClientId = process.env.CLAWSWEEPER_APP_CLIENT_ID;
-  const previousPrivateKey = process.env.CLAWSWEEPER_APP_PRIVATE_KEY;
-  const { privateKey } = crypto.generateKeyPairSync("rsa", { modulusLength: 2048 });
-  let commentLookups = 0;
-  let deletedAck = 0;
-  let resolveDeleted: (() => void) | undefined;
-  const deleted = new Promise<void>((resolve) => {
-    resolveDeleted = resolve;
-  });
-  process.env.CLAWSWEEPER_APP_ID = "12345";
-  delete process.env.CLAWSWEEPER_APP_CLIENT_ID;
-  process.env.CLAWSWEEPER_APP_PRIVATE_KEY = privateKey
-    .export({ type: "pkcs1", format: "pem" })
-    .toString();
-
-  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
-    const url = new URL(String(input));
-    const method = String(init?.method ?? "GET").toUpperCase();
-    const path = `${url.pathname}${url.search}`;
-    if (path === "/repos/openclaw/clawsweeper/installation" && method === "GET") {
-      return jsonResponse({ id: 999 });
-    }
-    if (path === "/app/installations/999/access_tokens" && method === "POST") {
-      return jsonResponse({ token: "dispatch-token" });
-    }
-    if (path === "/app/installations/123/access_tokens" && method === "POST") {
-      return jsonResponse({ token: "target-token" });
-    }
-    if (path.startsWith("/repos/openclaw/openclaw/issues/71898/comments?") && method === "GET") {
-      commentLookups += 1;
-      if (commentLookups <= 2) {
-        return jsonResponse([
-          {
-            id: 9001,
-            body: "<!-- clawsweeper-command-ack:456 -->\nClawSweeper picked this up.",
-            created_at: "2026-05-28T13:00:00Z",
-            user: { login: "clawsweeper[bot]" },
-          },
-        ]);
-      }
-      return jsonResponse([
-        {
-          id: 9001,
-          body: "<!-- clawsweeper-command-ack:456 -->\nClawSweeper picked this up.",
-          created_at: "2026-05-28T13:00:00Z",
-          user: { login: "clawsweeper[bot]" },
-        },
-        {
-          id: 9002,
-          body: [
-            "<!-- clawsweeper-command-status:71898:re_review:abc123 -->",
-            "<!-- clawsweeper-command-ack:456 -->",
-            "ClawSweeper re-review requested.",
-            "<!-- clawsweeper-command-progress:start -->",
-            "Re-review progress:",
-            "- State: In progress",
-            "<!-- clawsweeper-command-progress:end -->",
-          ].join("\n"),
-          created_at: "2026-05-28T13:00:01Z",
-          updated_at: "2026-05-28T13:00:02Z",
-          user: { login: "clawsweeper[bot]" },
-        },
-      ]);
-    }
-    if (path === "/repos/openclaw/openclaw/issues/comments/456/reactions" && method === "POST") {
-      return jsonResponse({ id: 1 });
-    }
-    if (path === "/repos/openclaw/clawsweeper/dispatches" && method === "POST") {
-      return jsonResponse({});
-    }
-    if (path === "/repos/openclaw/openclaw/issues/comments/9001" && method === "DELETE") {
-      deletedAck = 9001;
-      resolveDeleted?.();
-      return jsonResponse({});
-    }
-    throw new Error(`unexpected fetch ${method} ${path}`);
-  }) as typeof fetch;
-
-  try {
-    const result = await handleGitHubWebhook({
-      event: "issue_comment",
-      payload: {
-        action: "created",
-        repository: { full_name: "openclaw/openclaw" },
-        issue: { number: 71898 },
-        installation: { id: 123 },
-        comment: {
-          id: 456,
-          body: "@clawsweeper re-review",
-          author_association: "MEMBER",
-          user: { login: "user" },
-        },
-      },
-    });
-
-    assert.deepEqual(result, { statusCode: 202, body: { ok: true, status_comment_id: 9001 } });
-    await deleted;
-    assert.equal(deletedAck, 9001);
-  } finally {
-    globalThis.fetch = previousFetch;
-    restoreEnv("CLAWSWEEPER_APP_ID", previousAppId);
-    restoreEnv("CLAWSWEEPER_APP_CLIENT_ID", previousClientId);
-    restoreEnv("CLAWSWEEPER_APP_PRIVATE_KEY", previousPrivateKey);
   }
 });
 

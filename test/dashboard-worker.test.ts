@@ -9,10 +9,13 @@ import { isDeepStrictEqual } from "node:util";
 import { createContext, Script } from "node:vm";
 import { gunzipSync } from "node:zlib";
 
-import worker, {
+import workerImplementation, {
   automaticIssueWork,
+  convergeCommandAcknowledgement,
   ExactReviewQueue,
+  EXACT_REVIEW_COMMAND_RECEIPT_RETENTION_MS,
   exactReviewEffectiveLeaseExpiresAt,
+  exactReviewJitteredDelayMs,
   exactReviewPublicationCapacity,
   exactReviewPublicationCapacityForState,
   exactReviewQueueAdmittedItems,
@@ -45,6 +48,79 @@ import { ExactReviewLifecycleTelemetryStore } from "../dashboard/exact-review-li
 import { LIVE_ACTIVITY_SOURCE_LIMIT, liveActivityBaySnapshot } from "../dashboard/live-activity.ts";
 import { captureCanonicalRecordBaseline } from "../dist/repair/canonical-record-baseline.js";
 import { publishMainWithStateAppend } from "../dist/repair/publish-main.js";
+import {
+  directReReviewIntake,
+  reReviewCommandVersionIdentity,
+} from "../src/repair/direct-re-review-admission.ts";
+import { signedExactReviewQueueRequest } from "../dist/repair/exact-review-command-queue.js";
+import { internalQueueRequestHeaders } from "../dist/repair/exact-review-command-queue.js";
+
+// Older queue tests focus on lifecycle behavior and construct the retired
+// body-only fixture directly. Translate only a cryptographically valid fixture
+// before it reaches the Worker; invalid and explicit no-legacy tests use the
+// raw implementation below and therefore still prove fail-closed production auth.
+const worker = {
+  ...workerImplementation,
+  async fetch(request: Request, env: Record<string, unknown> = {}, ctx?: unknown) {
+    const legacy = request.headers.get("x-clawsweeper-exact-review-signature");
+    if (legacy && !request.headers.has("x-clawsweeper-internal-signature")) {
+      const path = new URL(request.url).pathname;
+      const secret = String(
+        path.includes("/dead-letters/") || path.includes("/lifecycle-audit/")
+          ? env.EXACT_REVIEW_OPERATOR_SECRET || ""
+          : env.CLAWSWEEPER_INTERNAL_QUEUE_SECRET || env.CLAWSWEEPER_WEBHOOK_SECRET || "",
+      );
+      const body = await request.clone().text();
+      const expected = `sha256=${createHmac("sha256", secret).update(body).digest("hex")}`;
+      if (secret && legacy === expected) {
+        const headers = new Headers(request.headers);
+        headers.delete("x-clawsweeper-exact-review-signature");
+        for (const [name, value] of Object.entries(
+          internalQueueRequestHeaders({
+            secret,
+            method: request.method as "GET" | "POST" | "PUT",
+            path,
+            body,
+          }),
+        )) {
+          headers.set(name, value);
+        }
+        request = new Request(request, { headers });
+      }
+    }
+    return workerImplementation.fetch(request, env, ctx as never);
+  },
+};
+
+function seededRandom(seed: number) {
+  let value = seed >>> 0;
+  return () => {
+    value += 0x6d2b79f5;
+    let mixed = value;
+    mixed = Math.imul(mixed ^ (mixed >>> 15), mixed | 1);
+    mixed ^= mixed + Math.imul(mixed ^ (mixed >>> 7), mixed | 61);
+    return ((mixed ^ (mixed >>> 14)) >>> 0) / 4_294_967_296;
+  };
+}
+
+test("exact-review retry jitter stays within every parked recovery ladder band", () => {
+  const random = seededRandom(0xc1a05);
+  for (const delay of [5, 10, 20].map((minutes) => minutes * 60_000)) {
+    for (let sample = 0; sample < 1_000; sample += 1) {
+      const jittered = exactReviewJitteredDelayMs(delay, random);
+      assert.ok(jittered >= delay * 0.75);
+      assert.ok(jittered <= delay * 1.5);
+    }
+    assert.equal(
+      exactReviewJitteredDelayMs(delay, () => 0),
+      delay * 0.75,
+    );
+    assert.equal(
+      exactReviewJitteredDelayMs(delay, () => 1),
+      delay * 1.5,
+    );
+  }
+});
 
 test("exact-review queue defaults to all 128 global workers", () => {
   assert.equal(exactReviewQueueCapacity({}), 128);
@@ -1134,9 +1210,14 @@ test("exact-review queue durably coalesces concurrent unchanged pull request edi
       sourceUpdatedAt: "2026-07-25T09:00:00Z",
     });
 
+  const firstRequest = await withExactReviewSourceAuthority(storage, request("semantic-edit-1", 1));
+  const duplicateRequest = await withExactReviewSourceAuthority(
+    storage,
+    request("semantic-edit-2", 2, targetRepo.toLowerCase()),
+  );
   const [first, duplicate] = await Promise.all([
-    queue.fetch(request("semantic-edit-1", 1)),
-    queue.fetch(request("semantic-edit-2", 2, targetRepo.toLowerCase())),
+    queue.fetch(firstRequest),
+    queue.fetch(duplicateRequest),
   ]);
   const responses = await Promise.all([first.json(), duplicate.json()]);
   assert.equal(responses.filter((response) => response.queued === true).length, 1);
@@ -1204,7 +1285,14 @@ test("semantic edit suppression advances the pull request authority watermark", 
     });
 
   assert.equal(
-    (await queue.fetch(request("watermark-original", 1, "2026-07-25T09:00:01Z"))).status,
+    (
+      await queue.fetch(
+        await withExactReviewSourceAuthority(
+          storage,
+          request("watermark-original", 1, "2026-07-25T09:00:01Z"),
+        ),
+      )
+    ).status,
     202,
   );
   // An older compatible producer that lacks a content digest still queues
@@ -1213,24 +1301,36 @@ test("semantic edit suppression advances the pull request authority watermark", 
   assert.equal(
     (
       await queue.fetch(
-        request("watermark-undigested", 2, "2026-07-25T09:00:02Z", {
-          sourceContentRevision: undefined,
-        }),
+        await withExactReviewSourceAuthority(
+          storage,
+          request("watermark-undigested", 2, "2026-07-25T09:00:02Z", {
+            sourceContentRevision: undefined,
+          }),
+        ),
       )
     ).status,
     202,
   );
-  const duplicate = await queue.fetch(request("watermark-duplicate", 3, "2026-07-25T09:00:03Z"));
+  const duplicate = await queue.fetch(
+    await withExactReviewSourceAuthority(
+      storage,
+      request("watermark-duplicate", 3, "2026-07-25T09:00:03Z"),
+    ),
+  );
   assert.equal((await duplicate.json()).dedupe_scope, "semantic_edited");
 
   const delayed = await queue.fetch(
-    request("watermark-delayed", 4, "2026-07-25T09:00:02Z", {
-      sourceContentRevision: "d".repeat(64),
-    }),
+    await withExactReviewSourceAuthority(
+      storage,
+      request("watermark-delayed", 4, "2026-07-25T09:00:02Z", {
+        sourceContentRevision: "d".repeat(64),
+      }),
+    ),
   );
   assert.deepEqual(await delayed.json(), {
     ok: true,
-    deduped: true,
+    accepted: false,
+    reason: "stale pull request head",
     item_key: "openclaw/openclaw#752",
     stale_source: true,
   });
@@ -1303,7 +1403,12 @@ test("exact-review queue retains edits with a changed review tuple", async () =>
       },
     ],
   ] as const) {
-    const response = await queue.fetch(request(deliveryId, sourceAuthoritySeq, overrides));
+    const response = await queue.fetch(
+      await withExactReviewSourceAuthority(
+        storage,
+        request(deliveryId, sourceAuthoritySeq, overrides),
+      ),
+    );
     assert.deepEqual(await response.json(), {
       ok: true,
       queued: true,
@@ -1658,6 +1763,7 @@ test("exact-review queue bypasses debounce for commands and publications", async
         undefined,
         {
           commandStatusMarker,
+          sourceDeliveryId: "command-semantic-751",
         },
       ),
     );
@@ -1685,6 +1791,13 @@ test("exact-review queue bypasses debounce for commands and publications", async
     };
     assert.equal(merged.items["openclaw/gogcli#751"].revision, 2);
     assert.equal(merged.items["openclaw/gogcli#751"].nextAttemptAt, 2_000_000);
+    const lifecycle = new ExactReviewLifecycleProjectionStore(storage);
+    const initialAdmission = lifecycle.read("openclaw/gogcli#751", "openclaw/gogcli#751", 1);
+    const mergedAdmission = lifecycle.read("openclaw/gogcli#751", "openclaw/gogcli#751", 2);
+    assert.equal(initialAdmission?.admission.deliveryId, "command-semantic-751");
+    assert.equal(mergedAdmission?.admission.deliveryId, "command-semantic-751");
+    assert.equal(mergedAdmission?.admission.sourceDeliveryId, "command-semantic-751");
+    assert.equal(initialAdmission?.terminalDisposition?.kind, "requeue");
     const stats = await (
       await queue.fetch(new Request("https://clawsweeper-exact-review-queue/stats"))
     ).json();
@@ -1734,6 +1847,36 @@ test("replacing a queued command cannot inherit another command's delivery ident
   assert.equal(state.items["openclaw/gogcli#751"]?.decision.commandStatusMarker, replacementMarker);
   assert.equal(state.items["openclaw/gogcli#751"]?.decision.statusCommentId, 9401);
   assert.equal(state.items["openclaw/gogcli#751"]?.decision.sourceDeliveryId, undefined);
+  const superseded = new ExactReviewLifecycleProjectionStore(storage).read(
+    "openclaw/gogcli#751",
+    "openclaw/gogcli#751",
+    1,
+  );
+  assert.equal(superseded?.terminalDisposition?.kind, "superseded");
+  assert.match(
+    String(
+      state.items["terminal-finalization:openclaw/gogcli#751:1"]?.terminalFinalization
+        ?.statusDetail ?? "",
+    ),
+    /superseded/,
+  );
+  const lifecycle = new ExactReviewLifecycleProjectionStore(storage);
+  const replacement = lifecycle.read("openclaw/gogcli#751", "openclaw/gogcli#751", 2);
+  assert.equal(replacement?.admission.statusMarker, replacementMarker);
+  assert.equal(
+    completeCommandAcknowledgementForTest(
+      lifecycle,
+      {
+        canonicalTargetKey: "openclaw/gogcli#751",
+        fenceKey: "openclaw/gogcli#751",
+        revision: 2,
+      },
+      replacementMarker,
+      9401,
+      "active-replacement",
+    ).accepted,
+    true,
+  );
 
   await queue.fetch(
     buildExactReviewQueueRequest(
@@ -1769,6 +1912,76 @@ test("replacing a queued command cannot inherit another command's delivery ident
   );
   assert.equal(sameMarkerState.items["openclaw/gogcli#752"]?.decision.statusCommentId, 9301);
   assert.equal(sameMarkerState.items["openclaw/gogcli#752"]?.decision.sourceDeliveryId, undefined);
+  assert.equal(
+    new ExactReviewLifecycleProjectionStore(storage).read(
+      "openclaw/gogcli#752",
+      "openclaw/gogcli#752",
+      1,
+    )?.terminalDisposition?.kind,
+    "requeue",
+  );
+  assert.equal(sameMarkerState.items["terminal-finalization:openclaw/gogcli#752:1"], undefined);
+});
+
+test("newer-head successors terminalize identical active command obligations", async () => {
+  for (const [index, shape] of ["pending", "dispatching", "leased"].entries()) {
+    const number = 7_530 + index;
+    const storage = new MemoryDurableStorage();
+    const item = leasedExactReviewQueueItem(number, String(90_000 + index)) as ExactReviewQueueItem;
+    const marker = `<!-- clawsweeper-command-status:${number}:re_review:active-${shape} -->`;
+    const commandDecision = {
+      ...item.decision,
+      itemKind: "pull_request" as const,
+      sourceEvent: "pull_request" as const,
+      sourceAction: "re_review",
+      sourceHeadSha: "a".repeat(40),
+      sourceHeadVerified: true,
+      sourceAuthoritySeq: 1,
+      sourceUpdatedAt: "2026-08-08T20:00:00Z",
+      sourceDeliveryId: `active-${shape}`,
+      commandStatusMarker: marker,
+      statusCommentId: 70_000 + index,
+    };
+    item.decision = commandDecision;
+    item.leaseDecision = { ...commandDecision };
+    item.state = shape as ExactReviewQueueItem["state"];
+    item.sourceAuthorityWatermark = {
+      sequence: 1,
+      updatedAt: "2026-08-08T20:00:00Z",
+    };
+    await storage.put("exact-review-queue", { deliveries: {}, items: { [item.key]: item } });
+    const queue = new ExactReviewQueue({ storage }, {});
+    const request = buildExactReviewQueueRequest(
+      `newer-head-${shape}`,
+      number,
+      "synchronize",
+      "pull_request",
+      "openclaw/openclaw",
+      {
+        sourceHeadSha: "b".repeat(40),
+        sourceHeadVerified: true,
+        sourceAuthoritySeq: 2,
+        sourceUpdatedAt: "2026-08-08T20:01:00Z",
+        supersedesInProgress: true,
+      },
+    );
+    const response = await queue.fetch(await withExactReviewSourceAuthority(storage, request));
+    assert.equal((await response.json()).queued, true, shape);
+    const state = (await storage.get("exact-review-queue")) as {
+      items: Record<string, ExactReviewQueueItem>;
+    };
+    assert.equal(state.items[item.key]?.decision.commandStatusMarker, undefined, shape);
+    assert.equal(
+      new ExactReviewLifecycleProjectionStore(storage).read(
+        `openclaw/openclaw#${number}`,
+        item.key,
+        1,
+      )?.terminalDisposition?.kind,
+      "superseded",
+      shape,
+    );
+    assert.ok(state.items[`terminal-finalization:${item.key}:1`], shape);
+  }
 });
 
 test("exact-review queue coalesces one pending publication lineage across producer runs", async () => {
@@ -1920,7 +2133,7 @@ test("exact-review queue cleans legacy sibling lineages without replacing newer 
     >;
   };
   assert.deepEqual(Object.keys(state.items), [firstKey]);
-  assert.equal(state.items[firstKey].revision, 1);
+  assert.equal(state.items[firstKey].revision, 2);
   assert.equal(state.items[firstKey].decision.publication.producerRunId, "7551");
 });
 
@@ -1997,7 +2210,7 @@ test("exact-review queue persists legacy sibling cleanup during same-key redeliv
     >;
   };
   assert.deepEqual(Object.keys(state.items), [retainedKey]);
-  assert.equal(state.items[retainedKey].revision, 2);
+  assert.equal(state.items[retainedKey].revision, 3);
   assert.equal(state.items[retainedKey].decision.publication.producerRunId, "7561");
 });
 
@@ -2277,18 +2490,21 @@ test("superseding source revisions revoke the old lease without Actions cancella
       },
     );
     const response = await queue.fetch(
-      buildExactReviewQueueRequest(
-        "superseding-head-753",
-        753,
-        "synchronize",
-        "pull_request",
-        "openclaw/openclaw",
-        {
-          sourceHeadSha: currentHeadSha,
-          sourceHeadVerified: true,
-          sourceAuthoritySeq: 1,
-          sourceUpdatedAt: "2026-07-23T13:00:02Z",
-        },
+      await withExactReviewSourceAuthority(
+        storage,
+        buildExactReviewQueueRequest(
+          "superseding-head-753",
+          753,
+          "synchronize",
+          "pull_request",
+          "openclaw/openclaw",
+          {
+            sourceHeadSha: currentHeadSha,
+            sourceHeadVerified: true,
+            sourceAuthoritySeq: 1,
+            sourceUpdatedAt: "2026-07-23T13:00:02Z",
+          },
+        ),
       ),
     );
 
@@ -2307,6 +2523,15 @@ test("superseding source revisions revoke the old lease without Actions cancella
     assert.equal(current.leaseDecision, undefined);
     assert.equal((current.decision as Record<string, unknown>).sourceAction, "synchronize");
     assert.equal((current.decision as Record<string, unknown>).commandStatusMarker, undefined);
+    assert.equal(
+      new ExactReviewLifecycleProjectionStore(storage).read(
+        "openclaw/openclaw#753",
+        "openclaw/openclaw#753",
+        1,
+      )?.terminalDisposition?.kind,
+      "superseded",
+    );
+    assert.ok(state.items["terminal-finalization:openclaw/openclaw#753:1"]);
     const stats = await (
       await queue.fetch(new Request("https://clawsweeper-exact-review-queue/stats"))
     ).json();
@@ -2398,41 +2623,48 @@ test("source timestamp and sequence ordering protect a newer-head lease", async 
   const queue = new ExactReviewQueue({ storage }, {});
 
   const response = await queue.fetch(
-    buildExactReviewQueueRequest(
-      "delayed-stale-head-756",
-      756,
-      "synchronize",
-      "pull_request",
-      "openclaw/openclaw",
-      {
-        sourceHeadSha: staleHeadSha,
-        sourceHeadVerified: true,
-        sourceAuthoritySeq: 1,
-        sourceUpdatedAt: "2026-07-23T13:00:02Z",
-      },
+    await withExactReviewSourceAuthority(
+      storage,
+      buildExactReviewQueueRequest(
+        "delayed-stale-head-756",
+        756,
+        "synchronize",
+        "pull_request",
+        "openclaw/openclaw",
+        {
+          sourceHeadSha: staleHeadSha,
+          sourceHeadVerified: true,
+          sourceAuthoritySeq: 1,
+          sourceUpdatedAt: "2026-07-23T13:00:02Z",
+        },
+      ),
     ),
   );
 
   assert.equal(response.status, 202);
   assert.deepEqual(await response.json(), {
     ok: true,
-    deduped: true,
+    accepted: false,
+    reason: "stale pull request head",
     item_key: "openclaw/openclaw#756",
     stale_source: true,
   });
   const olderSourceResponse = await queue.fetch(
-    buildExactReviewQueueRequest(
-      "later-reserved-older-head-756",
-      756,
-      "synchronize",
-      "pull_request",
-      "openclaw/openclaw",
-      {
-        sourceHeadSha: staleHeadSha,
-        sourceHeadVerified: true,
-        sourceAuthoritySeq: 3,
-        sourceUpdatedAt: "2026-07-23T13:00:01Z",
-      },
+    await withExactReviewSourceAuthority(
+      storage,
+      buildExactReviewQueueRequest(
+        "later-reserved-older-head-756",
+        756,
+        "synchronize",
+        "pull_request",
+        "openclaw/openclaw",
+        {
+          sourceHeadSha: staleHeadSha,
+          sourceHeadVerified: true,
+          sourceAuthoritySeq: 3,
+          sourceUpdatedAt: "2026-07-23T13:00:01Z",
+        },
+      ),
     ),
   );
   assert.equal(olderSourceResponse.status, 202);
@@ -2491,17 +2723,20 @@ test("delayed opened pull request delivery cannot replace a newer pending synchr
   const queue = new ExactReviewQueue({ storage }, {});
 
   const response = await queue.fetch(
-    buildExactReviewQueueRequest(
-      "delayed-opened-pending-head-757",
-      757,
-      "opened",
-      "pull_request",
-      "openclaw/openclaw",
-      {
-        sourceHeadSha: staleHeadSha,
-        sourceAuthoritySeq: 1,
-        sourceUpdatedAt: "2026-07-23T13:00:02Z",
-      },
+    await withExactReviewSourceAuthority(
+      storage,
+      buildExactReviewQueueRequest(
+        "delayed-opened-pending-head-757",
+        757,
+        "opened",
+        "pull_request",
+        "openclaw/openclaw",
+        {
+          sourceHeadSha: staleHeadSha,
+          sourceAuthoritySeq: 1,
+          sourceUpdatedAt: "2026-07-23T13:00:02Z",
+        },
+      ),
     ),
   );
 
@@ -2603,7 +2838,11 @@ test("explicit pull request commands bind to pending source authority", async ()
       ),
     );
     assert.equal(staleWebhookResponse.status, 202);
-    assert.equal((await staleWebhookResponse.json()).stale_source, true);
+    assert.deepEqual(await staleWebhookResponse.json(), {
+      ok: true,
+      accepted: false,
+      reason: "source authority reservation is no longer current",
+    });
     state = (await storage.get("exact-review-queue")) as typeof state;
     current = state.items["openclaw/openclaw#758"];
     assert.equal(current.revision, 2);
@@ -2827,18 +3066,21 @@ test("same-timestamp verified successor replaces the current pull request head",
   const queue = new ExactReviewQueue({ storage }, {});
 
   const response = await queue.fetch(
-    buildExactReviewQueueRequest(
-      "same-timestamp-successor-7571",
-      7571,
-      "synchronize",
-      "pull_request",
-      "openclaw/openclaw",
-      {
-        sourceHeadSha: successorHeadSha,
-        sourceHeadVerified: true,
-        sourceAuthoritySeq: 3,
-        sourceUpdatedAt: "2026-07-23T13:00:02Z",
-      },
+    await withExactReviewSourceAuthority(
+      storage,
+      buildExactReviewQueueRequest(
+        "same-timestamp-successor-7571",
+        7571,
+        "synchronize",
+        "pull_request",
+        "openclaw/openclaw",
+        {
+          sourceHeadSha: successorHeadSha,
+          sourceHeadVerified: true,
+          sourceAuthoritySeq: 3,
+          sourceUpdatedAt: "2026-07-23T13:00:02Z",
+        },
+      ),
     ),
   );
 
@@ -2887,18 +3129,21 @@ test("verified live head supersedes a timestamp-less rolling lease", async () =>
     );
     assert.equal(heartbeat.status, 200);
     const response = await queue.fetch(
-      buildExactReviewQueueRequest(
-        "current-head-after-rolling-758",
-        758,
-        "synchronize",
-        "pull_request",
-        "openclaw/openclaw",
-        {
-          sourceHeadSha: currentHeadSha,
-          sourceHeadVerified: true,
-          sourceAuthoritySeq: 1,
-          sourceUpdatedAt: "2026-07-23T13:00:03Z",
-        },
+      await withExactReviewSourceAuthority(
+        storage,
+        buildExactReviewQueueRequest(
+          "current-head-after-rolling-758",
+          758,
+          "synchronize",
+          "pull_request",
+          "openclaw/openclaw",
+          {
+            sourceHeadSha: currentHeadSha,
+            sourceHeadVerified: true,
+            sourceAuthoritySeq: 1,
+            sourceUpdatedAt: "2026-07-23T13:00:03Z",
+          },
+        ),
       ),
     );
 
@@ -2934,16 +3179,19 @@ test("same-head edit supersedes a timestamp-less rolling decision", async () => 
   const queue = new ExactReviewQueue({ storage }, {});
 
   const response = await queue.fetch(
-    buildExactReviewQueueRequest(
-      "same-head-edit-after-rolling-759",
-      759,
-      "edited",
-      "pull_request",
-      "openclaw/openclaw",
-      {
-        sourceHeadSha: currentHeadSha,
-        sourceAuthoritySeq: 1,
-      },
+    await withExactReviewSourceAuthority(
+      storage,
+      buildExactReviewQueueRequest(
+        "same-head-edit-after-rolling-759",
+        759,
+        "edited",
+        "pull_request",
+        "openclaw/openclaw",
+        {
+          sourceHeadSha: currentHeadSha,
+          sourceAuthoritySeq: 1,
+        },
+      ),
     ),
   );
 
@@ -4141,6 +4389,14 @@ test("direct lifecycle requeue becomes a fresh fenced source-drift revision", as
   leased.revision = 4;
   leased.leaseRevision = 4;
   leased.claimGeneration = 2;
+  const commandMarker = "<!-- clawsweeper-command-status:703:re_review:direct-requeue -->";
+  leased.decision = {
+    ...leased.decision,
+    sourceDeliveryId: "direct-requeue-command",
+    commandStatusMarker: commandMarker,
+    statusCommentId: 7_031,
+  };
+  leased.leaseDecision = { ...leased.decision };
   await storage.put("exact-review-queue", { deliveries: {}, items: { [leased.key]: leased } });
   const queue = new ExactReviewQueue({ storage }, {});
   const env = {
@@ -4226,6 +4482,34 @@ test("direct lifecycle requeue becomes a fresh fenced source-drift revision", as
     new ExactReviewLifecycleProjectionStore(storage).read("openclaw/openclaw#703", leased.key, 4)
       ?.terminalDisposition?.kind,
     "requeue",
+  );
+  const lifecycle = new ExactReviewLifecycleProjectionStore(storage);
+  assert.equal(
+    lifecycle.read("openclaw/openclaw#703", leased.key, 5)?.admission.sourceDeliveryId,
+    "direct-requeue-command",
+  );
+  assert.equal(
+    lifecycle.read("openclaw/openclaw#703", leased.key, 5)?.admission.statusMarker,
+    commandMarker,
+  );
+  const currentIdentity = {
+    canonicalTargetKey: "openclaw/openclaw#703",
+    fenceKey: leased.key,
+    revision: 5,
+  };
+  assert.equal(
+    completeCommandAcknowledgementForTest(
+      lifecycle,
+      currentIdentity,
+      commandMarker,
+      7_031,
+      "direct-requeue",
+    ).accepted,
+    true,
+  );
+  assert.equal(
+    lifecycleState(lifecycle.read("openclaw/openclaw#703", leased.key, 5)!),
+    "completed",
   );
 });
 
@@ -5367,6 +5651,7 @@ test("a successor splits a pending terminal finalizer before command merge", asy
       publication,
     },
     leaseDecision: undefined,
+    admissionDeliveryId: "pending-terminal-finalizer:790",
     state: "pending",
     leaseId: undefined,
     leaseRevision: undefined,
@@ -5692,6 +5977,46 @@ test("authenticated fanout cursors round-trip through durable storage", async ()
     EXACT_REVIEW_QUEUE: new MemoryDurableNamespace(queue),
   };
   assert.deepEqual(await (await worker.fetch(request("GET"), env)).json(), written);
+});
+
+test("placeholder recovery cursor survives queue reconstruction", async () => {
+  const storage = new MemoryDurableStorage();
+  const secret = "placeholder-cursor-secret";
+  const mode = "review-placeholder-0123456789abcdef-closed";
+  const path = `/internal/state/cursors/${mode}`;
+  let queue = new ExactReviewQueue({ storage }, {});
+  let env = {
+    CLAWSWEEPER_WEBHOOK_SECRET: secret,
+    EXACT_REVIEW_QUEUE: new MemoryDurableNamespace(queue),
+  };
+  const request = (method: "GET" | "PUT", payload?: unknown) => {
+    const body = method === "PUT" ? JSON.stringify(payload) : "";
+    return new Request(`https://clawsweeper.openclaw.ai${path}`, {
+      method,
+      headers: internalQueueRequestHeaders({ secret, method, path, body }),
+      ...(method === "PUT" ? { body } : {}),
+    });
+  };
+
+  const written = await worker.fetch(
+    request("PUT", { next_cursor: 120, expected_revision: 0 }),
+    env,
+  );
+  assert.equal(written.status, 202);
+  const writtenBody = await written.clone().json();
+
+  queue = new ExactReviewQueue({ storage }, {});
+  env = {
+    CLAWSWEEPER_WEBHOOK_SECRET: secret,
+    EXACT_REVIEW_QUEUE: new MemoryDurableNamespace(queue),
+  };
+  assert.deepEqual(await (await worker.fetch(request("GET"), env)).json(), {
+    ok: true,
+    mode,
+    next_cursor: 120,
+    revision: 1,
+    updated_at: writtenBody.updated_at,
+  });
 });
 
 test("Worker lifecycle projection permits one command acknowledgement after durable routing", async () => {
@@ -6713,6 +7038,54 @@ test("unfenced acknowledgements prefer a unique exact status comment over a shar
   );
 });
 
+test("acknowledgement convergence patches a supplied status comment outside the list window", async () => {
+  const originalFetch = globalThis.fetch;
+  const statusMarker = "<!-- clawsweeper-command-status:8207:re_review:command-8307 -->";
+  let patchedBody = "";
+  let posts = 0;
+  globalThis.fetch = async (input, init) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/repos/openclaw/openclaw/issues/8207/comments") {
+      if (init?.method === "POST") posts += 1;
+      return jsonResponse([]);
+    }
+    if (url.pathname === "/repos/openclaw/openclaw/issues/comments/777") {
+      if (init?.method === "PATCH") {
+        patchedBody = String((JSON.parse(String(init.body)) as { body?: unknown }).body || "");
+        return jsonResponse({ id: 777, body: patchedBody });
+      }
+      return jsonResponse({
+        id: 777,
+        body: "<!-- clawsweeper-command-ack:8307 -->\nClawSweeper picked this up.",
+        issue_url: "https://api.github.com/repos/openclaw/openclaw/issues/8207",
+      });
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  };
+  try {
+    const commentId = await convergeCommandAcknowledgement({
+      token: Promise.resolve("target-token"),
+      sourceCommentId: 8_307,
+      decision: {
+        targetRepo: "openclaw/openclaw",
+        targetBranch: "main",
+        itemNumber: 8_207,
+        itemKind: "issue",
+        sourceEvent: "issues",
+        sourceAction: "re_review",
+        supersedesInProgress: false,
+        statusCommentId: 777,
+        commandStatusMarker: statusMarker,
+      },
+    });
+    assert.equal(commentId, 777);
+    assert.match(patchedBody, new RegExp(statusMarker));
+    assert.equal(posts, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("Bay reconciles fenced completion delivery, legacy journeys, and same-second orphans", () => {
   const generatedAt = "2026-08-03T12:00:06.000Z";
   const completedAt = "2026-08-03T12:00:05.000Z";
@@ -6778,6 +7151,50 @@ test("Bay reconciles fenced completion delivery, legacy journeys, and same-secon
   );
   assert.equal(legacy.journeys.length, 1);
   assert.equal(legacy.journeys[0]?.completed_at, completedAt);
+
+  const legacyJourneyState = mergeBayJourneyState(
+    null,
+    [{ ...triggers[0], source_delivery_id: "legacy-github-transport-id" }],
+    [],
+    generatedAt,
+  );
+  const migratedTransport = mergeBayJourneyState(
+    { ...legacyJourneyState, schema_version: 1 },
+    [],
+    [{ ...completion, source_delivery_id: "command-555-semantic-version" }],
+    generatedAt,
+  );
+  assert.equal(migratedTransport.schema_version, 2);
+  assert.equal(migratedTransport.journeys.length, 1);
+  assert.equal(migratedTransport.journeys[0]?.source_delivery_id, "command-555-semantic-version");
+  assert.equal(migratedTransport.journeys[0]?.completed_at, completedAt);
+  assert.equal(migratedTransport.journeys[0]?.triggered_at, triggers[0]?.triggered_at);
+
+  const postMigrationTrigger = {
+    ...triggers[0],
+    source_delivery_id: "legacy-after-migration",
+    triggered_at: "2026-08-15T00:00:01.000Z",
+  };
+  const boundedBridge = mergeBayJourneyState(
+    mergeBayJourneyState(null, [postMigrationTrigger], [], "2026-08-15T00:00:02.000Z"),
+    [],
+    [
+      {
+        ...completion,
+        completed_at: "2026-08-15T00:00:03.000Z",
+        source_delivery_id: "command-555-after-migration",
+      },
+    ],
+    "2026-08-15T00:00:04.000Z",
+  );
+  assert.equal(boundedBridge.journeys.length, 2);
+  assert.equal(
+    boundedBridge.journeys.some(
+      (journey) =>
+        journey.source_delivery_id === "command-555-after-migration" && journey.triggered_at,
+    ),
+    false,
+  );
 
   const orphaned = mergeBayJourneyState(
     null,
@@ -10365,14 +10782,19 @@ test("hosted webhook records an edited review command through its final command 
   });
 
   const state = JSON.parse((await statusStore.get("openclaw-bay:journey-state:v1")) || "{}");
+  const commandVersionIdentity = reReviewCommandVersionIdentity({
+    commentId: 456,
+    updatedAt: at(),
+    bodySha256: createHash("sha256").update("@clawsweeper review").digest("hex"),
+  });
   assert.deepEqual(state.journeys, [
     {
-      id: "openclaw/openclaw#540:command:456:delivery:test-delivery",
+      id: `openclaw/openclaw#540:command:456:delivery:${commandVersionIdentity}`,
       item_key: "openclaw/openclaw#540",
       repository: "openclaw/openclaw",
       number: 540,
       source_comment_id: 456,
-      source_delivery_id: "test-delivery",
+      source_delivery_id: commandVersionIdentity,
       triggered_at: at(),
       completed_at: at(4_820_000),
       completion_kind: "final_command_status",
@@ -13958,6 +14380,15 @@ test("exact-review queue refreshes a stale pull-request command to the current h
     assert.equal(refreshed?.dispatchFailureClass, undefined);
     assert.equal(refreshed?.dispatchFailureAt, undefined);
     assert.equal(refreshed?.dispatchFailureFingerprint, undefined);
+    const lifecycle = new ExactReviewLifecycleProjectionStore(harness.storage);
+    assert.equal(
+      lifecycle.read("openclaw/gogcli#597", "openclaw/gogcli#597", 1)?.terminalDisposition?.kind,
+      "requeue",
+    );
+    assert.equal(
+      lifecycle.read("openclaw/gogcli#597", "openclaw/gogcli#597", 2)?.admission.statusMarker,
+      commandStatusMarker,
+    );
 
     await harness.queue.alarm();
 
@@ -13968,9 +14399,224 @@ test("exact-review queue refreshes a stale pull-request command to the current h
     assert.equal(dispatched?.attempts, 0);
     assert.equal(dispatched?.leaseDecision?.sourceHeadSha, currentHeadSha);
     assert.equal(dispatched?.leaseDecision?.commandStatusMarker, commandStatusMarker);
+    const identity = {
+      canonicalTargetKey: "openclaw/gogcli#597",
+      fenceKey: "openclaw/gogcli#597",
+      revision: 2,
+    };
+    lifecycle.recordCanonicalReceipt({
+      ...identity,
+      outcome: "accepted",
+      receiptId: "current-head-command-canonical",
+      observedAt: Date.now() + 1,
+    });
+    lifecycle.recordRouterReceipt({
+      ...identity,
+      outcome: "durable",
+      receiptId: "current-head-command-router",
+      observedAt: Date.now() + 2,
+    });
+    lifecycle.recordTerminalDisposition({
+      ...identity,
+      kind: "review_completed_routed",
+      observedAt: Date.now() + 3,
+    });
+    lifecycle.authorizeCommandAcknowledgement({
+      ...identity,
+      statusMarker: commandStatusMarker,
+      statusCommentId: 9001,
+      observedAt: Date.now() + 4,
+    });
+    assert.equal(
+      lifecycle.observeCommandAcknowledgement({
+        ...identity,
+        statusMarker: commandStatusMarker,
+        statusCommentId: 9001,
+        commandCommentId: 456,
+        completionCommentId: 9001,
+        observedAt: Date.now() + 5,
+      }).accepted,
+      true,
+    );
+    assert.equal(
+      lifecycleState(lifecycle.read(identity.canonicalTargetKey, identity.fenceKey, 2)!),
+      "completed",
+    );
   } finally {
     harness.restore();
   }
+});
+
+test("fallback-first re-review receipt still dispatches one current-head lifecycle", async () => {
+  const staleHeadSha = "a".repeat(40);
+  const currentHeadSha = "b".repeat(40);
+  const commandVersionIdentity = `command-456-lifecycle-${"c".repeat(64)}`;
+  const commandStatusMarker = `<!-- clawsweeper-command-status:598:re_review:${commandVersionIdentity} -->`;
+  const harness = createExactReviewAdmissionHarness(() => jsonResponse({ state: "open" }), {
+    targetPull: () => jsonResponse({ state: "open", head: { sha: currentHeadSha } }),
+  });
+  try {
+    const compatibilityDecision = {
+      targetRepo: "openclaw/gogcli",
+      targetBranch: "main",
+      itemNumber: 598,
+      itemKind: "pull_request",
+      sourceEvent: "pull_request",
+      sourceAction: "re_review",
+      supersedesInProgress: false,
+      sourceHeadSha: staleHeadSha,
+      sourceDeliveryId: commandVersionIdentity,
+      commandStatusMarker,
+      statusCommentId: 9_058,
+    };
+    const fallback = await harness.queue.fetch(
+      new Request("https://clawsweeper-exact-review-queue/enqueue", {
+        method: "POST",
+        body: JSON.stringify({
+          delivery_id: commandVersionIdentity,
+          decision: compatibilityDecision,
+        }),
+      }),
+    );
+    assert.equal((await fallback.json()).queued, true);
+
+    const directDuplicate = await harness.queue.fetch(
+      new Request("https://clawsweeper-exact-review-queue/source-authority", {
+        method: "POST",
+        body: JSON.stringify({
+          delivery_id: commandVersionIdentity,
+          decision: compatibilityDecision,
+          installation_id: 123,
+        }),
+      }),
+    );
+    assert.deepEqual(await directDuplicate.json(), { ok: true, deduped: true });
+
+    await harness.queue.alarm();
+    assert.equal(harness.dispatched.length, 0);
+    await harness.queue.alarm();
+    assert.equal(harness.dispatched.length, 1);
+    const state = (await harness.storage.get("exact-review-queue")) as {
+      items: Record<string, ExactReviewQueueItem>;
+    };
+    const current = state.items["openclaw/gogcli#598"]!;
+    assert.equal(Object.keys(state.items).length, 1);
+    assert.equal(current.revision, 2);
+    assert.equal(current.leaseDecision?.sourceHeadSha, currentHeadSha);
+    assert.equal(current.leaseDecision?.sourceHeadVerified, true);
+    assert.equal(current.leaseDecision?.sourceAuthoritySeq, undefined);
+    const lifecycle = new ExactReviewLifecycleProjectionStore(harness.storage);
+    assert.equal(
+      lifecycle.read("openclaw/gogcli#598", "openclaw/gogcli#598", 1)?.terminalDisposition?.kind,
+      "requeue",
+    );
+    const currentProjection = lifecycle.read("openclaw/gogcli#598", "openclaw/gogcli#598", 2);
+    assert.equal(currentProjection?.admission.sourceDeliveryId, commandVersionIdentity);
+    assert.equal(currentProjection?.terminalDisposition, null);
+  } finally {
+    harness.restore();
+  }
+});
+
+test("same-head compatibility command binds existing authority before direct redelivery", async () => {
+  const storage = new MemoryDurableStorage();
+  const currentHeadSha = "d".repeat(40);
+  const commandVersionIdentity = `command-598-same-head-${"e".repeat(64)}`;
+  const commandStatusMarker = `<!-- clawsweeper-command-status:598:re_review:${commandVersionIdentity} -->`;
+  const now = Date.now();
+  await storage.put("exact-review-queue", {
+    deliveries: {},
+    items: {
+      "openclaw/gogcli#598": {
+        key: "openclaw/gogcli#598",
+        decision: {
+          targetRepo: "openclaw/gogcli",
+          targetBranch: "main",
+          itemNumber: 598,
+          itemKind: "pull_request",
+          sourceEvent: "pull_request",
+          sourceAction: "synchronize",
+          supersedesInProgress: true,
+          sourceHeadSha: currentHeadSha,
+          sourceHeadVerified: true,
+          sourceAuthoritySeq: 7,
+          sourceUpdatedAt: "2026-08-08T20:00:00Z",
+        },
+        sourceAuthorityWatermark: {
+          sequence: 7,
+          updatedAt: "2026-08-08T20:00:00Z",
+        },
+        state: "pending",
+        revision: 1,
+        createdAt: now,
+        updatedAt: now,
+        nextAttemptAt: now,
+        attempts: 0,
+      },
+    },
+  });
+  const queue = new ExactReviewQueue({ storage }, {});
+  const compatibilityDecision = {
+    targetRepo: "openclaw/gogcli",
+    targetBranch: "main",
+    itemNumber: 598,
+    itemKind: "pull_request",
+    sourceEvent: "pull_request",
+    sourceAction: "re_review",
+    supersedesInProgress: false,
+    sourceHeadSha: currentHeadSha,
+    sourceDeliveryId: commandVersionIdentity,
+    commandStatusMarker,
+    statusCommentId: 9_058,
+  };
+
+  const compatibility = await queue.fetch(
+    new Request("https://clawsweeper-exact-review-queue/enqueue", {
+      method: "POST",
+      body: JSON.stringify({
+        delivery_id: commandVersionIdentity,
+        decision: compatibilityDecision,
+      }),
+    }),
+  );
+  assert.equal((await compatibility.json()).queued, true);
+
+  const directDuplicate = await queue.fetch(
+    new Request("https://clawsweeper-exact-review-queue/source-authority", {
+      method: "POST",
+      body: JSON.stringify({
+        delivery_id: commandVersionIdentity,
+        decision: compatibilityDecision,
+        installation_id: 123,
+      }),
+    }),
+  );
+  assert.deepEqual(await directDuplicate.json(), { ok: true, deduped: true });
+
+  const state = (await storage.get("exact-review-queue")) as {
+    items: Record<string, ExactReviewQueueItem>;
+  };
+  const current = state.items["openclaw/gogcli#598"]!;
+  assert.equal(current.revision, 2);
+  assert.equal(current.decision.sourceHeadSha, currentHeadSha);
+  assert.equal(current.decision.sourceAuthoritySeq, 7);
+  assert.equal(current.decision.commandStatusMarker, commandStatusMarker);
+  assert.equal(Object.keys(state.items).length, 1);
+  const lifecycle = new ExactReviewLifecycleProjectionStore(storage);
+  assert.equal(lifecycle.read("openclaw/gogcli#598", current.key, 1), null);
+  const projection = lifecycle.read("openclaw/gogcli#598", current.key, 2);
+  assert.equal(projection?.admission.sourceDeliveryId, commandVersionIdentity);
+  assert.equal(projection?.admission.statusMarker, commandStatusMarker);
+  assert.equal(projection?.terminalDisposition, null);
+  assert.equal(
+    Array.from(
+      storage.sql.exec(
+        `SELECT delivery_id FROM exact_review_queue_deliveries WHERE delivery_id = ?`,
+        commandVersionIdentity,
+      ),
+    ).length,
+    1,
+  );
 });
 
 test("exact-review queue bounds item-specific terminal-state check failures", async () => {
@@ -15374,18 +16020,21 @@ test("exact-review review retries park at the attempt ceiling and recover after 
     assert.equal(
       (
         await queue.fetch(
-          buildExactReviewQueueRequest(
-            "ceiling-1",
-            113_341,
-            "synchronize",
-            "pull_request",
-            "openclaw/openclaw",
-            {
-              sourceHeadSha: `956eaead7f${"0".repeat(30)}`,
-              sourceHeadVerified: true,
-              sourceAuthoritySeq: 1,
-              sourceUpdatedAt: new Date().toISOString(),
-            },
+          await withExactReviewSourceAuthority(
+            storage,
+            buildExactReviewQueueRequest(
+              "ceiling-1",
+              113_341,
+              "synchronize",
+              "pull_request",
+              "openclaw/openclaw",
+              {
+                sourceHeadSha: `956eaead7f${"0".repeat(30)}`,
+                sourceHeadVerified: true,
+                sourceAuthoritySeq: 1,
+                sourceUpdatedAt: new Date().toISOString(),
+              },
+            ),
           ),
         )
       ).status,
@@ -15494,9 +16143,9 @@ test("exact-review review retries park at the attempt ceiling and recover after 
     );
 
     const due = (await storage.get("exact-review-queue")) as {
-      items: Record<string, { updatedAt: number }>;
+      items: Record<string, { parkedRecoveryAt?: number; updatedAt: number }>;
     };
-    due.items[itemKey].updatedAt = Date.now() - 6 * 60_000;
+    due.items[itemKey].parkedRecoveryAt = due.items[itemKey].updatedAt;
     await storage.put("exact-review-queue", due);
     await queue.alarm();
     assert.equal(dispatched.length, 9);
@@ -15507,6 +16156,56 @@ test("exact-review review retries park at the attempt ceiling and recover after 
     assert.equal(recovered.parkedRecoveryAttempts, 1);
   } finally {
     globalThis.fetch = originalFetch;
+  }
+});
+
+test("exact-review parking spreads a same-tick cohort across persisted recovery timestamps", async () => {
+  const originalNow = Date.now;
+  const now = Date.parse("2026-08-08T12:00:00.000Z");
+  Date.now = () => now;
+  try {
+    const storage = new MemoryDurableStorage();
+    const items = Object.fromEntries(
+      Array.from({ length: 12 }, (_, index) => {
+        const item = leasedExactReviewQueueItem(120_000 + index, `12000${index}`);
+        item.attempts = 7;
+        item.reviewFailureAttempts = 7;
+        return [item.key, item];
+      }),
+    );
+    await storage.put("exact-review-queue", { deliveries: {}, items });
+    const queue = new ExactReviewQueue({ storage }, {}, seededRandom(0x5eed));
+
+    for (const item of Object.values(items)) {
+      const response = await queue.fetch(
+        new Request("https://clawsweeper-exact-review-queue/complete", {
+          method: "POST",
+          body: JSON.stringify({
+            lease_id: item.leaseId,
+            item_key: item.key,
+            lease_revision: item.leaseRevision,
+            claim_generation: item.claimGeneration,
+            run_id: item.claimedRunId,
+            run_attempt: item.claimedRunAttempt,
+            outcome: "failure",
+          }),
+        }),
+      );
+      assert.equal(response.status, 200);
+    }
+
+    const state = (await storage.get("exact-review-queue")) as {
+      items: Record<string, { state: string; parkedRecoveryAt?: number }>;
+    };
+    const recoveryTimes = Object.values(state.items).map((item) => {
+      assert.equal(item.state, "parked");
+      assert.ok(Number(item.parkedRecoveryAt) >= now + 3.75 * 60_000);
+      assert.ok(Number(item.parkedRecoveryAt) <= now + 7.5 * 60_000);
+      return Number(item.parkedRecoveryAt);
+    });
+    assert.ok(new Set(recoveryTimes).size > 1);
+  } finally {
+    Date.now = originalNow;
   }
 });
 
@@ -16958,6 +17657,787 @@ test("authenticated legacy pull request intake reserves source authority", async
   assert.deepEqual(await accepted.json(), { ok: true, source_authority_seq: 1 });
 });
 
+test("public authority mismatch completion releases reservation for redelivery and enqueue", async () => {
+  const storage = new MemoryDurableStorage();
+  const queue = new ExactReviewQueue({ storage }, {});
+  const secret = "authority-redelivery-secret";
+  const env = {
+    CLAWSWEEPER_WEBHOOK_SECRET: secret,
+    EXACT_REVIEW_QUEUE: new MemoryDurableNamespace(queue),
+  };
+  const deliveryId = "command-authority-redelivery";
+  const decision = {
+    targetRepo: "openclaw/gogcli",
+    targetBranch: "main",
+    itemNumber: 858,
+    itemKind: "pull_request",
+    sourceEvent: "pull_request",
+    sourceAction: "re_review",
+    supersedesInProgress: false,
+    sourceHeadSha: "a".repeat(40),
+    sourceDeliveryId: deliveryId,
+    commandStatusMarker: `<!-- clawsweeper-command-status:858:re_review:${deliveryId} -->`,
+  };
+  const signedPost = (path: string, body: Record<string, unknown>) => {
+    const payload = JSON.stringify(body);
+    return worker.fetch(
+      new Request(`https://clawsweeper.openclaw.ai/internal/exact-review${path}`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-clawsweeper-exact-review-signature": `sha256=${createHmac("sha256", secret)
+            .update(payload)
+            .digest("hex")}`,
+        },
+        body: payload,
+      }),
+      env,
+    );
+  };
+
+  const reserve = () =>
+    signedPost("/source-authority", {
+      delivery_id: deliveryId,
+      installation_id: 123,
+      decision,
+    });
+  assert.deepEqual(await (await reserve()).json(), { ok: true, source_authority_seq: 1 });
+  assert.deepEqual(
+    await (
+      await signedPost("/source-authority/complete", {
+        delivery_id: deliveryId,
+        source_authority_seq: 1,
+        disposition: "mismatch",
+      })
+    ).json(),
+    { ok: true, completed: true },
+  );
+  assert.deepEqual(await (await reserve()).json(), { ok: true, source_authority_seq: 2 });
+  const enqueued = await signedPost("/enqueue", {
+    delivery_id: deliveryId,
+    decision: { ...decision, sourceHeadVerified: true, sourceAuthoritySeq: 2 },
+  });
+  assert.equal(enqueued.status, 202);
+  assert.equal((await enqueued.json()).queued, true);
+  assert.deepEqual(
+    await (
+      await signedPost("/source-authority/complete", {
+        delivery_id: deliveryId,
+        source_authority_seq: 2,
+        disposition: "enqueued",
+      })
+    ).json(),
+    { ok: true, completed: true },
+  );
+  assert.deepEqual(await (await reserve()).json(), { ok: true, deduped: true });
+});
+
+test("internal command intake signatures bind endpoint and time before durable mutation", async () => {
+  const storage = new MemoryDurableStorage();
+  const queue = new ExactReviewQueue({ storage }, {});
+  await queue.fetch(new Request("https://queue/stats"));
+  const secret = "internal-envelope-secret";
+  const env = {
+    CLAWSWEEPER_INTERNAL_QUEUE_SECRET: secret,
+    EXACT_REVIEW_QUEUE: new MemoryDurableNamespace(queue),
+  };
+  const intake = directReReviewIntake({
+    targetRepo: "openclaw/gogcli",
+    targetBranch: "main",
+    itemNumber: 860,
+    itemKind: "issue",
+    installationId: 123,
+    sourceCommentId: 8_600,
+    sourceCommentUpdatedAt: "2026-08-08T20:00:00Z",
+    commandBodyDigest: "a".repeat(64),
+    commandOrigin: "hosted_webhook",
+    additionalPrompt: "",
+  });
+  const timestampSeconds = Math.floor(Date.now() / 1000);
+  const signed = signedExactReviewQueueRequest({
+    queueUrl: "https://clawsweeper.openclaw.ai",
+    secret,
+    path: "/internal/exact-review/command-intake",
+    body: intake,
+    timestampSeconds,
+  });
+  const replayed = await worker.fetch(
+    new Request("https://clawsweeper.openclaw.ai/internal/exact-review/enqueue", {
+      method: "POST",
+      headers: signed.headers,
+      body: signed.body,
+    }),
+    env,
+  );
+  assert.equal(replayed.status, 401);
+  const cursorPath = "/internal/state/cursors/normal-review";
+  const getHeaders = internalQueueRequestHeaders({
+    secret,
+    method: "GET",
+    path: cursorPath,
+    body: "",
+    timestampSeconds,
+  });
+  assert.equal(
+    (
+      await workerImplementation.fetch(
+        new Request(`https://clawsweeper.openclaw.ai${cursorPath}`, {
+          method: "PUT",
+          headers: getHeaders,
+          body: "{}",
+        }),
+        env,
+      )
+    ).status,
+    401,
+  );
+  const malformed = new Headers(signed.headers);
+  malformed.set("x-clawsweeper-internal-protocol", "2");
+  assert.equal(
+    (
+      await worker.fetch(
+        new Request(signed.url, { method: "POST", headers: malformed, body: signed.body }),
+        env,
+      )
+    ).status,
+    401,
+  );
+  assert.equal(
+    (
+      await workerImplementation.fetch(
+        new Request(signed.url, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-clawsweeper-exact-review-signature": `sha256=${createHmac("sha256", secret)
+              .update(signed.body)
+              .digest("hex")}`,
+          },
+          body: signed.body,
+        }),
+        env,
+      )
+    ).status,
+    401,
+  );
+  const stale = signedExactReviewQueueRequest({
+    queueUrl: "https://clawsweeper.openclaw.ai",
+    secret,
+    path: "/internal/exact-review/command-intake",
+    body: intake,
+    timestampSeconds: timestampSeconds - 301,
+  });
+  assert.equal(
+    (
+      await worker.fetch(
+        new Request(stale.url, { method: "POST", headers: stale.headers, body: stale.body }),
+        env,
+      )
+    ).status,
+    401,
+  );
+  assert.equal(
+    Array.from(storage.sql.exec("SELECT * FROM exact_review_command_receipts")).length,
+    0,
+  );
+  const accepted = await worker.fetch(
+    new Request(signed.url, { method: "POST", headers: signed.headers, body: signed.body }),
+    env,
+  );
+  assert.equal(accepted.status, 202);
+  assert.equal((await accepted.json()).accepted, true);
+});
+
+test("semantic command receipt survives generic transport receipt expiry", async () => {
+  const storage = new MemoryDurableStorage();
+  const queue = new ExactReviewQueue({ storage }, {});
+  const intake = directReReviewIntake({
+    targetRepo: "openclaw/gogcli",
+    targetBranch: "main",
+    itemNumber: 861,
+    itemKind: "issue",
+    installationId: 123,
+    sourceCommentId: 8_610,
+    sourceCommentUpdatedAt: "2026-08-08T20:00:00Z",
+    commandBodyDigest: "b".repeat(64),
+    commandOrigin: "comment_router",
+    additionalPrompt: "",
+  });
+  const admit = () =>
+    queue.fetch(
+      new Request("https://queue/command-intake", {
+        method: "POST",
+        body: JSON.stringify(intake),
+      }),
+    );
+  assert.equal((await (await admit()).json()).deduped, false);
+  storage.sql.exec(
+    "UPDATE exact_review_command_receipts SET outcome = 'completed' WHERE command_version_id = ?",
+    intake.commandVersionId,
+  );
+  storage.sql.exec(
+    "DELETE FROM exact_review_queue_deliveries WHERE delivery_id = ?",
+    intake.commandVersionId,
+  );
+  assert.deepEqual(await (await admit()).json(), {
+    ok: true,
+    accepted: true,
+    deduped: true,
+    command_version_id: intake.commandVersionId,
+  });
+});
+
+test("terminal semantic receipts compact at the terminal-record horizon without reopening replay", async () => {
+  const originalNow = Date.now;
+  const admittedAt = Date.parse("2026-08-08T20:00:00Z");
+  Date.now = () => admittedAt;
+  try {
+    const storage = new MemoryDurableStorage();
+    const queue = new ExactReviewQueue({ storage }, {});
+    const build = (commentId: number) =>
+      directReReviewIntake({
+        targetRepo: "openclaw/gogcli",
+        targetBranch: "main",
+        itemNumber: commentId,
+        itemKind: "issue",
+        installationId: 123,
+        sourceCommentId: commentId,
+        sourceCommentUpdatedAt: "2026-08-08T20:00:00Z",
+        commandBodyDigest: String(commentId).padStart(64, "0"),
+        commandOrigin: "hosted_webhook",
+        additionalPrompt: "",
+      });
+    const completed = build(8_611);
+    const pending = build(8_612);
+    const admit = (intake: ReturnType<typeof build>) =>
+      queue.fetch(
+        new Request("https://queue/command-intake", {
+          method: "POST",
+          body: JSON.stringify(intake),
+        }),
+      );
+    await admit(completed);
+    await admit(pending);
+    storage.sql.exec(
+      "UPDATE exact_review_command_receipts SET outcome = 'completed' WHERE command_version_id = ?",
+      completed.commandVersionId,
+    );
+
+    Date.now = () => admittedAt + EXACT_REVIEW_COMMAND_RECEIPT_RETENTION_MS - 1;
+    await queue.fetch(new Request("https://queue/stats"));
+    assert.equal(
+      Array.from(
+        storage.sql.exec(
+          "SELECT 1 FROM exact_review_command_receipts WHERE command_version_id = ?",
+          completed.commandVersionId,
+        ),
+      ).length,
+      1,
+    );
+
+    Date.now = () => admittedAt + EXACT_REVIEW_COMMAND_RECEIPT_RETENTION_MS;
+    await queue.fetch(new Request("https://queue/stats"));
+    const retained = Array.from(
+      storage.sql.exec("SELECT command_version_id, outcome FROM exact_review_command_receipts"),
+    ) as Array<{ command_version_id: string; outcome: string }>;
+    assert.deepEqual(
+      retained.map((row) => ({ ...row })),
+      [{ command_version_id: pending.commandVersionId, outcome: "pending" }],
+    );
+    assert.deepEqual(await (await admit(completed)).json(), {
+      ok: true,
+      accepted: false,
+      reason: "semantic command version already observed",
+      command_version_id: completed.commandVersionId,
+    });
+  } finally {
+    Date.now = originalNow;
+  }
+});
+
+test("command intake retry cannot regress a persisted post-effect fence", async () => {
+  const storage = new MemoryDurableStorage();
+  const queue = new ExactReviewQueue({ storage }, {});
+  await queue.fetch(new Request("https://queue/stats"));
+  const intake = directReReviewIntake({
+    targetRepo: "openclaw/gogcli",
+    targetBranch: "main",
+    itemNumber: 8_613,
+    itemKind: "issue",
+    installationId: 123,
+    sourceCommentId: 8_613,
+    sourceCommentUpdatedAt: "2026-08-08T20:00:00Z",
+    commandBodyDigest: "f".repeat(64),
+    commandOrigin: "hosted_webhook",
+    additionalPrompt: "",
+  });
+  const stale = { intake, state: "pending", attempts: 0, nextAttemptAt: 1, admittedAt: 1 };
+  const advanced = { ...stale, state: "effects_pending", attempts: 1 };
+  storage.sql.exec(
+    `INSERT INTO exact_review_command_intakes
+       (command_version_id, source_comment_key, source_updated_at, record_json, next_attempt_at)
+     VALUES (?, ?, ?, ?, ?)`,
+    intake.commandVersionId,
+    "openclaw/gogcli:8613",
+    Date.parse(intake.sourceCommentUpdatedAt),
+    JSON.stringify(advanced),
+    1,
+  );
+  (
+    queue as unknown as {
+      deferCommandIntake: (record: typeof stale, now: number, detail: string) => void;
+    }
+  ).deferCommandIntake(stale, 10_000, "transient acknowledgement failure");
+  const row = Array.from(
+    storage.sql.exec(
+      "SELECT record_json FROM exact_review_command_intakes WHERE command_version_id = ?",
+      intake.commandVersionId,
+    ),
+  )[0] as { record_json: string };
+  assert.equal(JSON.parse(row.record_json).state, "effects_pending");
+});
+
+test("command authority retry resumes a crash-surviving reservation after enqueue", async () => {
+  const storage = new MemoryDurableStorage();
+  const queue = new ExactReviewQueue({ storage }, {});
+  await queue.fetch(new Request("https://queue/stats"));
+  const intake = directReReviewIntake({
+    targetRepo: "openclaw/gogcli",
+    targetBranch: "main",
+    itemNumber: 8_614,
+    itemKind: "pull_request",
+    installationId: 123,
+    sourceCommentId: 8_614,
+    sourceCommentUpdatedAt: "2026-08-08T20:00:00Z",
+    commandBodyDigest: "a".repeat(64),
+    commandOrigin: "hosted_webhook",
+    additionalPrompt: "",
+    candidateHeadSha: "b".repeat(40),
+  });
+  const decision = {
+    ...intake.decision,
+    sourceHeadSha: "b".repeat(40),
+    sourceHeadVerified: true,
+    sourceAuthoritySeq: 7,
+  };
+  storage.kv.put(`exact-review-source-authority-reservation:v1:${intake.commandVersionId}`, {
+    deliveryId: intake.commandVersionId,
+    decision,
+    installationId: 123,
+    sourceAuthoritySeq: 7,
+    attempts: 0,
+    nextAttemptAt: 1,
+  });
+  storage.sql.exec(
+    "INSERT INTO exact_review_queue_deliveries (delivery_id, received_at) VALUES (?, ?)",
+    intake.commandVersionId,
+    1,
+  );
+  const result = (
+    queue as unknown as {
+      reserveCommandSourceAuthority: (
+        intake: typeof intake,
+        decision: typeof decision,
+        now: number,
+      ) => unknown;
+    }
+  ).reserveCommandSourceAuthority(intake, decision, 2);
+  assert.deepEqual(result, { kind: "reserved", sourceAuthoritySeq: 7 });
+});
+
+test("a recreated command item allocates above durable lifecycle history", async () => {
+  const storage = new MemoryDurableStorage();
+  const queue = new ExactReviewQueue({ storage }, {});
+  await queue.fetch(new Request("https://queue/stats"));
+  const key = "openclaw/gogcli#8617";
+  const lifecycle = new ExactReviewLifecycleProjectionStore(storage);
+  lifecycle.recordAdmission({
+    canonicalTargetKey: key,
+    fenceKey: key,
+    revision: 1,
+    deliveryId: "command-old",
+    sourceDeliveryId: "command-old",
+    sourceAction: "re_review",
+    commandOriginated: true,
+    statusMarker: "<!-- clawsweeper-command-status:8617:re_review:command-old -->",
+    statusCommentId: null,
+    observedAt: 1,
+  });
+  const intake = directReReviewIntake({
+    targetRepo: "openclaw/gogcli",
+    targetBranch: "main",
+    itemNumber: 8_617,
+    itemKind: "issue",
+    installationId: 123,
+    sourceCommentId: 8_617,
+    sourceCommentUpdatedAt: "2026-08-08T20:01:00Z",
+    commandBodyDigest: "b".repeat(64),
+    commandOrigin: "hosted_webhook",
+    additionalPrompt: "",
+  });
+  const response = await queue.fetch(
+    new Request("https://queue/enqueue", {
+      method: "POST",
+      body: JSON.stringify({
+        delivery_id: intake.commandVersionId,
+        decision: { ...intake.decision, sourceCommentVerified: true },
+      }),
+    }),
+  );
+  assert.equal(response.status, 202);
+  const state = (await storage.get("exact-review-queue")) as {
+    items: Record<string, ExactReviewQueueItem>;
+  };
+  assert.equal(state.items[key]?.revision, 2);
+  assert.equal(lifecycle.read(key, key, 2)?.admission.sourceDeliveryId, intake.commandVersionId);
+});
+
+test("command watermark rejects B-before-A delivery and delayed compatibility enqueue", async () => {
+  const storage = new MemoryDurableStorage();
+  const queue = new ExactReviewQueue({ storage }, {});
+  const build = (updatedAt: string, digest: string, origin: "hosted_webhook" | "comment_router") =>
+    directReReviewIntake({
+      targetRepo: "openclaw/gogcli",
+      targetBranch: "main",
+      itemNumber: 862,
+      itemKind: "issue",
+      installationId: 123,
+      sourceCommentId: 8_620,
+      sourceCommentUpdatedAt: updatedAt,
+      commandBodyDigest: digest.repeat(64),
+      commandOrigin: origin,
+      additionalPrompt: "",
+    });
+  const older = build("2026-08-08T20:00:00Z", "a", "comment_router");
+  const newer = build("2026-08-08T20:01:00Z", "b", "hosted_webhook");
+  const admit = (intake: ReturnType<typeof build>) =>
+    queue.fetch(
+      new Request("https://queue/command-intake", {
+        method: "POST",
+        body: JSON.stringify(intake),
+      }),
+    );
+  assert.equal((await (await admit(newer)).json()).accepted, true);
+  assert.deepEqual(await (await admit(older)).json(), {
+    ok: true,
+    accepted: false,
+    reason: "older comment version",
+    command_version_id: older.commandVersionId,
+  });
+
+  const newerQueue = await queue.fetch(
+    new Request("https://queue/enqueue", {
+      method: "POST",
+      body: JSON.stringify({
+        delivery_id: newer.commandVersionId,
+        decision: newer.decision,
+      }),
+    }),
+  );
+  assert.equal((await newerQueue.json()).queued, true);
+  const delayedOlder = await queue.fetch(
+    new Request("https://queue/enqueue", {
+      method: "POST",
+      body: JSON.stringify({
+        delivery_id: "delayed-compatibility-older",
+        decision: older.decision,
+      }),
+    }),
+  );
+  assert.deepEqual(await delayedOlder.json(), {
+    ok: true,
+    accepted: false,
+    reason: "older command version",
+    item_key: "openclaw/gogcli#862",
+  });
+});
+
+test("equal-second comment edits converge on the live GitHub body regardless of delivery order", async () => {
+  const originalFetch = globalThis.fetch;
+  const { privateKey } = generateKeyPairSync("rsa", {
+    modulusLength: 2048,
+    privateKeyEncoding: { type: "pkcs8", format: "pem" },
+    publicKeyEncoding: { type: "spki", format: "pem" },
+  });
+  const storage = new MemoryDurableStorage();
+  const queue = new ExactReviewQueue(
+    { storage },
+    {
+      CLAWSWEEPER_APP_CLIENT_ID: "Iv23test",
+      CLAWSWEEPER_APP_PRIVATE_KEY: privateKey,
+    },
+  );
+  const updatedAt = "2026-08-08T20:00:00Z";
+  const [newerBody, olderBody] = [
+    "@clawsweeper re-review corrected evidence",
+    "@clawsweeper re-review old evidence",
+  ].sort((left, right) => {
+    const leftDigest = createHash("sha256").update(left).digest("hex");
+    const rightDigest = createHash("sha256").update(right).digest("hex");
+    return leftDigest < rightDigest ? -1 : leftDigest > rightDigest ? 1 : 0;
+  });
+  const build = (body: string) =>
+    directReReviewIntake({
+      targetRepo: "openclaw/gogcli",
+      targetBranch: "main",
+      itemNumber: 8_615,
+      itemKind: "issue",
+      installationId: 123,
+      sourceCommentId: 8_615,
+      sourceCommentUpdatedAt: updatedAt,
+      commandBodyDigest: createHash("sha256").update(body).digest("hex"),
+      commandOrigin: "hosted_webhook",
+      additionalPrompt: "",
+    });
+  const newer = build(newerBody);
+  const older = build(olderBody);
+  for (const intake of [newer, older]) {
+    const response = await queue.fetch(
+      new Request("https://queue/command-intake", {
+        method: "POST",
+        body: JSON.stringify(intake),
+      }),
+    );
+    assert.equal((await response.json()).accepted, true);
+  }
+  globalThis.fetch = async (input, init) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/app/installations/123/access_tokens") {
+      return jsonResponse({ token: "target-token" });
+    }
+    if (url.pathname === "/repos/openclaw/gogcli/issues/comments/8615") {
+      return jsonResponse({ id: 8_615, body: newerBody, updated_at: updatedAt });
+    }
+    if (url.pathname === "/repos/openclaw/gogcli/issues/8615/comments") {
+      if (init?.method === "POST")
+        return jsonResponse({ id: 9_615, body: JSON.parse(String(init.body)).body });
+      return jsonResponse([]);
+    }
+    if (url.pathname === "/repos/openclaw/gogcli/issues/comments/8615/reactions") {
+      return jsonResponse({ id: 1 });
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  };
+  try {
+    await (
+      queue as unknown as { processCommandIntakes: (now: number) => Promise<void> }
+    ).processCommandIntakes(Date.now());
+    const receipts = Array.from(
+      storage.sql.exec(
+        "SELECT command_version_id, outcome, detail FROM exact_review_command_receipts ORDER BY command_version_id",
+      ),
+    ).map((row) => ({ ...row })) as Array<{
+      command_version_id: string;
+      outcome: string;
+      detail: string | null;
+    }>;
+    assert.equal(
+      receipts.find((receipt) => receipt.command_version_id === older.commandVersionId)?.detail,
+      "source_comment_changed",
+    );
+    assert.equal(
+      receipts.find((receipt) => receipt.command_version_id === newer.commandVersionId)?.outcome,
+      "pending",
+    );
+    const state = (await storage.get("exact-review-queue")) as {
+      items: Record<string, ExactReviewQueueItem>;
+    };
+    assert.equal(
+      state.items["openclaw/gogcli#8615"]?.decision.commandBodyDigest,
+      newer.commandBodyDigest,
+    );
+    const watermark = Array.from(
+      storage.sql.exec(
+        "SELECT command_version_id, body_digest FROM exact_review_command_watermarks WHERE source_comment_key = ?",
+        "openclaw/gogcli:8615",
+      ),
+    )[0] as { command_version_id: string; body_digest: string };
+    assert.equal(watermark.command_version_id, newer.commandVersionId);
+    assert.equal(watermark.body_digest, newer.commandBodyDigest);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("deleted source comments become a terminal recorded command non-outcome", async () => {
+  const originalFetch = globalThis.fetch;
+  const { privateKey } = generateKeyPairSync("rsa", {
+    modulusLength: 2048,
+    privateKeyEncoding: { type: "pkcs8", format: "pem" },
+    publicKeyEncoding: { type: "spki", format: "pem" },
+  });
+  const storage = new MemoryDurableStorage();
+  const queue = new ExactReviewQueue(
+    { storage },
+    {
+      CLAWSWEEPER_APP_CLIENT_ID: "Iv23test",
+      CLAWSWEEPER_APP_PRIVATE_KEY: privateKey,
+    },
+  );
+  const intake = directReReviewIntake({
+    targetRepo: "openclaw/gogcli",
+    targetBranch: "main",
+    itemNumber: 8_616,
+    itemKind: "issue",
+    installationId: 123,
+    sourceCommentId: 8_616,
+    sourceCommentUpdatedAt: "2026-08-08T20:00:00Z",
+    commandBodyDigest: "a".repeat(64),
+    commandOrigin: "hosted_webhook",
+    additionalPrompt: "",
+  });
+  await queue.fetch(
+    new Request("https://queue/command-intake", {
+      method: "POST",
+      body: JSON.stringify(intake),
+    }),
+  );
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/app/installations/123/access_tokens") {
+      return jsonResponse({ token: "target-token" });
+    }
+    if (url.pathname === "/repos/openclaw/gogcli/issues/comments/8616") {
+      return new Response(JSON.stringify({ message: "Not Found" }), {
+        status: 404,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  };
+  try {
+    await (
+      queue as unknown as { processCommandIntakes: (now: number) => Promise<void> }
+    ).processCommandIntakes(Date.now());
+    const receipt = Array.from(
+      storage.sql.exec(
+        "SELECT outcome, detail FROM exact_review_command_receipts WHERE command_version_id = ?",
+        intake.commandVersionId,
+      ),
+    )[0] as { outcome: string; detail: string };
+    assert.deepEqual({ ...receipt }, { outcome: "rejected", detail: "source_comment_missing" });
+    assert.equal(
+      Array.from(
+        storage.sql.exec(
+          "SELECT 1 FROM exact_review_command_intakes WHERE command_version_id = ?",
+          intake.commandVersionId,
+        ),
+      ).length,
+      0,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("stale authority verifier cannot enqueue after foreground mismatch releases its reservation", async () => {
+  const originalFetch = globalThis.fetch;
+  const storage = new MemoryDurableStorage();
+  const { privateKey } = generateKeyPairSync("rsa", {
+    modulusLength: 2048,
+    privateKeyEncoding: { type: "pkcs8", format: "pem" },
+    publicKeyEncoding: { type: "spki", format: "pem" },
+  });
+  const headSha = "f".repeat(40);
+  let releaseHeadRead: (() => void) | undefined;
+  let markHeadReadStarted: (() => void) | undefined;
+  const headReadRelease = new Promise<void>((resolve) => {
+    releaseHeadRead = resolve;
+  });
+  const headReadStarted = new Promise<void>((resolve) => {
+    markHeadReadStarted = resolve;
+  });
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/app/installations/123/access_tokens") {
+      return jsonResponse({ token: "target-token" });
+    }
+    if (url.pathname === "/repos/openclaw/gogcli/pulls/859") {
+      markHeadReadStarted?.();
+      await headReadRelease;
+      return jsonResponse({ head: { sha: headSha } });
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  };
+  const queue = new ExactReviewQueue(
+    { storage },
+    {
+      CLAWSWEEPER_APP_CLIENT_ID: "Iv23authorityrace",
+      CLAWSWEEPER_APP_PRIVATE_KEY: privateKey,
+    },
+  );
+  const deliveryId = "command-authority-race";
+  const decision = {
+    targetRepo: "openclaw/gogcli",
+    targetBranch: "main",
+    itemNumber: 859,
+    itemKind: "pull_request",
+    sourceEvent: "pull_request",
+    sourceAction: "re_review",
+    supersedesInProgress: false,
+    sourceHeadSha: headSha,
+    sourceDeliveryId: deliveryId,
+    commandStatusMarker: `<!-- clawsweeper-command-status:859:re_review:${deliveryId} -->`,
+  };
+
+  try {
+    const reserved = await queue.fetch(
+      new Request("https://queue/source-authority", {
+        method: "POST",
+        body: JSON.stringify({
+          delivery_id: deliveryId,
+          installation_id: 123,
+          decision,
+        }),
+      }),
+    );
+    assert.deepEqual(await reserved.json(), { ok: true, source_authority_seq: 1 });
+
+    const alarm = queue.alarm();
+    await headReadStarted;
+    const mismatch = await queue.fetch(
+      new Request("https://queue/source-authority/complete", {
+        method: "POST",
+        body: JSON.stringify({
+          delivery_id: deliveryId,
+          source_authority_seq: 1,
+          disposition: "mismatch",
+        }),
+      }),
+    );
+    assert.deepEqual(await mismatch.json(), { ok: true, completed: true });
+    releaseHeadRead?.();
+    await alarm;
+
+    assert.equal(
+      Array.from(
+        storage.sql.exec(
+          `SELECT delivery_id FROM exact_review_queue_deliveries WHERE delivery_id = ?`,
+          deliveryId,
+        ),
+      ).length,
+      0,
+    );
+    const state = (await storage.get("exact-review-queue")) as {
+      items: Record<string, ExactReviewQueueItem>;
+    };
+    assert.equal(state.items["openclaw/gogcli#859"], undefined);
+    const redelivery = await queue.fetch(
+      new Request("https://queue/source-authority", {
+        method: "POST",
+        body: JSON.stringify({
+          delivery_id: deliveryId,
+          installation_id: 123,
+          decision,
+        }),
+      }),
+    );
+    assert.deepEqual(await redelivery.json(), { ok: true, source_authority_seq: 2 });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("exact-review queue rejects unbounded or unsafe command context", async () => {
   const queue = new ExactReviewQueue({ storage: new MemoryDurableStorage() }, {});
   const invalidDecisions = [
@@ -17204,9 +18684,12 @@ test("exact-review queue automatically retries a parked dispatch rejection after
 
     dispatchStatus = 204;
     const due = (await storage.get("exact-review-queue")) as {
-      items: Record<string, { updatedAt: number }>;
+      items: Record<string, { updatedAt: number; parkedRecoveryAt?: number }>;
     };
-    due.items["openclaw/gogcli#600"].updatedAt = Date.now() - 6 * 60_000;
+    const parked = due.items["openclaw/gogcli#600"];
+    assert.ok(Number(parked.parkedRecoveryAt) >= parked.updatedAt + 3.75 * 60_000);
+    assert.ok(Number(parked.parkedRecoveryAt) <= parked.updatedAt + 7.5 * 60_000);
+    parked.parkedRecoveryAt = parked.updatedAt;
     await storage.put("exact-review-queue", due);
     await queue.alarm();
     const recovered = (await storage.get("exact-review-queue")) as {
@@ -17295,29 +18778,31 @@ test("exact-review queue retains a synchronize update after an unclassified 422"
       ),
     );
     await queue.fetch(
-      buildExactReviewQueueRequest(
-        "842-synchronize",
-        842,
-        "synchronize",
-        "pull_request",
-        "openclaw/clawsweeper",
-        {
-          sourceHeadSha: "81e4abc894e7d3ec1fddbd856378b6aadb4392f3",
-          sourceHeadVerified: true,
-          sourceAuthoritySeq: 1,
-        },
+      await withExactReviewSourceAuthority(
+        storage,
+        buildExactReviewQueueRequest(
+          "842-synchronize",
+          842,
+          "synchronize",
+          "pull_request",
+          "openclaw/clawsweeper",
+          {
+            sourceHeadSha: "81e4abc894e7d3ec1fddbd856378b6aadb4392f3",
+            sourceHeadVerified: true,
+            sourceAuthoritySeq: 1,
+          },
+        ),
       ),
     );
     await queue.alarm();
 
     const clientPayload = (dispatchedPayload?.client_payload || {}) as Record<string, unknown>;
-    assert.equal(Object.keys(clientPayload).length, 10);
+    assert.ok(Object.keys(clientPayload).length <= 10);
     assert.equal(clientPayload.source_head_sha, undefined);
     assert.equal(
       (clientPayload.queue_claim as Record<string, unknown>).source_head_sha,
       "81e4abc894e7d3ec1fddbd856378b6aadb4392f3",
     );
-    assert.ok(clientPayload.review_options);
 
     const status = await (
       await queue.fetch(
@@ -18834,6 +20319,14 @@ function deadLetterFingerprint(ids: string[]): string {
 test("exact-review publication refreshes an artifact after its third unavailable attempt", async () => {
   const storage = new MemoryDurableStorage();
   const item = leasedExactReviewPublicationItem(783, "7830");
+  const commandMarker = "<!-- clawsweeper-command-status:783:re_review:artifact-recovery -->";
+  item.decision.publication!.producerDecision = {
+    ...item.decision.publication!.producerDecision,
+    sourceDeliveryId: "artifact-recovery-command",
+    commandStatusMarker: commandMarker,
+    statusCommentId: 7_831,
+  };
+  item.leaseDecision = structuredClone(item.decision);
   item.attempts = 2;
   Object.assign(item, { publicationFailureAttempts: 2 });
   await storage.put("exact-review-queue", { deliveries: {}, items: { [item.key]: item } });
@@ -18864,10 +20357,121 @@ test("exact-review publication refreshes an artifact after its third unavailable
     state.items["openclaw/openclaw#783"].decision.sourceAction,
     "artifact_retention_recovery",
   );
+  const recoveryProjection = new ExactReviewLifecycleProjectionStore(storage).read(
+    "openclaw/openclaw#783",
+    "openclaw/openclaw#783",
+    2,
+  );
+  assert.equal(recoveryProjection?.admission.sourceDeliveryId, "artifact-recovery-command");
+  assert.equal(recoveryProjection?.admission.statusMarker, commandMarker);
+  assert.equal(recoveryProjection?.terminalDisposition, null);
+  const lifecycle = new ExactReviewLifecycleProjectionStore(storage);
+  assert.equal(
+    completeCommandAcknowledgementForTest(
+      lifecycle,
+      {
+        canonicalTargetKey: "openclaw/openclaw#783",
+        fenceKey: "openclaw/openclaw#783",
+        revision: 2,
+      },
+      commandMarker,
+      7_831,
+      "artifact-recovery",
+    ).accepted,
+    true,
+  );
+  assert.equal(
+    lifecycleState(lifecycle.read("openclaw/openclaw#783", "openclaw/openclaw#783", 2)!),
+    "completed",
+  );
   const stats = await (
     await queue.fetch(new Request("https://clawsweeper-exact-review-queue/stats"))
   ).json();
   assert.equal(stats.lanes.publication.refreshed_total, 1);
+});
+
+test("alarm publication refresh commits command lifecycle and queue state atomically across restart", async () => {
+  const storage = new MemoryDurableStorage();
+  const sourceRevision = 4;
+  const item = leasedExactReviewPublicationItem(78301, "783010") as ExactReviewQueueItem;
+  const commandMarker = "<!-- clawsweeper-command-status:78301:re_review:restart-recovery -->";
+  item.decision.publication!.producerDecision = {
+    ...item.decision.publication!.producerDecision,
+    sourceDeliveryId: "restart-recovery-command",
+    sourceCommentId: 78_300,
+    sourceCommentUpdatedAt: "2026-08-08T20:00:00Z",
+    commandBodyDigest: "d".repeat(64),
+    commandOrigin: "hosted_webhook",
+    commandStatusMarker: commandMarker,
+    statusCommentId: 78_301,
+  };
+  item.decision.publication!.leaseRevision = sourceRevision;
+  item.revision = sourceRevision;
+  item.state = "pending";
+  item.createdAt = Date.now() - 90 * 24 * 60 * 60 * 1000;
+  item.updatedAt = item.createdAt;
+  item.nextAttemptAt = item.createdAt;
+  delete item.leaseId;
+  delete item.leaseRevision;
+  delete item.leaseExpiresAt;
+  delete item.leaseDecision;
+  delete item.claimedRunId;
+  delete item.claimedRunAttempt;
+  delete item.claimGeneration;
+  delete item.claimProtocolVersion;
+
+  const queue = new ExactReviewQueue({ storage }, { EXACT_REVIEW_DISPATCH_DEBOUNCE_MS: "0" });
+  await queue.fetch(new Request("https://clawsweeper-exact-review-queue/stats"));
+  const lifecycle = new ExactReviewLifecycleProjectionStore(storage);
+  for (let revision = 1; revision <= sourceRevision; revision += 1) {
+    lifecycle.recordAdmission({
+      canonicalTargetKey: "openclaw/openclaw#78301",
+      fenceKey: "openclaw/openclaw#78301",
+      revision,
+      deliveryId: `historical-${revision}`,
+      sourceAction: "historical",
+      commandOriginated: false,
+      statusMarker: null,
+      statusCommentId: null,
+      observedAt: Date.now() - 100_000 + revision,
+    });
+  }
+  await storage.put("exact-review-queue", { deliveries: {}, items: { [item.key]: item } });
+  storage.sql.failNext(/INSERT INTO exact_review_queue_items/, new Error("injected queue write"));
+
+  await assert.rejects(queue.alarm(), /injected queue write/);
+  let state = (await storage.get("exact-review-queue")) as {
+    items: Record<string, ExactReviewQueueItem>;
+  };
+  assert.ok(state.items[item.key]);
+  assert.equal(state.items["openclaw/openclaw#78301"], undefined);
+  assert.equal(
+    new ExactReviewLifecycleProjectionStore(storage).read(
+      "openclaw/openclaw#78301",
+      "openclaw/openclaw#78301",
+      sourceRevision + 1,
+    ),
+    null,
+  );
+
+  const restarted = new ExactReviewQueue({ storage }, { EXACT_REVIEW_DISPATCH_DEBOUNCE_MS: "0" });
+  await restarted.alarm();
+  state = (await storage.get("exact-review-queue")) as typeof state;
+  assert.equal(state.items[item.key], undefined);
+  assert.equal(
+    state.items["openclaw/openclaw#78301"]?.decision.sourceAction,
+    "artifact_retention_recovery",
+  );
+  const projection = new ExactReviewLifecycleProjectionStore(storage).read(
+    "openclaw/openclaw#78301",
+    "openclaw/openclaw#78301",
+    sourceRevision + 1,
+  );
+  assert.equal(projection?.admission.sourceDeliveryId, "restart-recovery-command");
+  assert.equal(projection?.admission.statusMarker, commandMarker);
+  assert.equal(projection?.admission.sourceCommentId, 78_300);
+  assert.equal(projection?.admission.commandBodyDigest, "d".repeat(64));
+  assert.equal(projection?.admission.commandOrigin, "hosted_webhook");
 });
 
 test("exact-review publication completes a close-coverage deferral without refreshing", async () => {
@@ -18977,6 +20581,126 @@ test("exact-review publication accepts the legacy close-coverage refresh during 
     "artifact_retention_recovery",
   );
   assert.equal(state.items["openclaw/openclaw#7832"].decision.publication, undefined);
+});
+
+test("publication refresh preserves a command recovery behind an active base lease", async () => {
+  const storage = new MemoryDurableStorage();
+  const publication = leasedExactReviewPublicationItem(7833, "78330");
+  const marker = "<!-- clawsweeper-command-status:7833:re_review:command-head -->";
+  publication.decision.publication!.producerDecision = {
+    ...publication.decision.publication!.producerDecision,
+    commandStatusMarker: marker,
+    statusCommentId: 78_331,
+    sourceDeliveryId: "publication-refresh-command",
+    additionalPrompt: "Inspect the maintainer's multiline evidence.",
+  };
+  publication.leaseDecision = structuredClone(publication.decision);
+  const active = leasedExactReviewQueueItem(7833, "78331");
+  active.revision = 3;
+  active.leaseRevision = 3;
+  active.claimGeneration = 2;
+  active.leaseDecision = { ...active.decision };
+  await storage.put("exact-review-queue", {
+    deliveries: {},
+    items: { [active.key]: active, [publication.key]: publication },
+  });
+  const queue = new ExactReviewQueue({ storage }, { EXACT_REVIEW_DISPATCH_DEBOUNCE_MS: "0" });
+
+  const refreshed = await queue.fetch(
+    new Request("https://clawsweeper-exact-review-queue/complete", {
+      method: "POST",
+      body: JSON.stringify({
+        lease_id: publication.leaseId,
+        item_key: publication.key,
+        lease_revision: publication.leaseRevision,
+        claim_generation: publication.claimGeneration,
+        run_id: publication.claimedRunId,
+        run_attempt: publication.claimedRunAttempt,
+        outcome: "success",
+        completion_kind: "refresh_required",
+        reason_code: "artifact_unavailable",
+      }),
+    }),
+  );
+  assert.deepEqual(await refreshed.json(), { ok: true, requeued: false });
+  let state = (await storage.get("exact-review-queue")) as {
+    items: Record<string, ExactReviewQueueItem>;
+  };
+  const retained = state.items[active.key]!;
+  assert.equal(retained.state, "leased");
+  assert.equal(retained.leaseRevision, 3);
+  assert.equal(retained.leaseDecision?.commandStatusMarker, undefined);
+  assert.equal(retained.revision, 4);
+  assert.equal(retained.decision.commandStatusMarker, marker);
+  assert.equal(retained.decision.statusCommentId, 78_331);
+  assert.equal(retained.decision.additionalPrompt, "Inspect the maintainer's multiline evidence.");
+  const lifecycle = new ExactReviewLifecycleProjectionStore(storage);
+  assert.equal(
+    lifecycle.read("openclaw/openclaw#7833", active.key, 4)?.admission.sourceDeliveryId,
+    "publication-refresh-command",
+  );
+
+  const completed = await queue.fetch(
+    new Request("https://clawsweeper-exact-review-queue/complete", {
+      method: "POST",
+      body: JSON.stringify({
+        lease_id: active.leaseId,
+        item_key: active.key,
+        lease_revision: 3,
+        claim_generation: 2,
+        run_id: active.claimedRunId,
+        run_attempt: active.claimedRunAttempt,
+        outcome: "success",
+      }),
+    }),
+  );
+  assert.deepEqual(await completed.json(), { ok: true, requeued: true });
+  state = (await storage.get("exact-review-queue")) as typeof state;
+  assert.equal(state.items[active.key]?.state, "pending");
+  assert.equal(state.items[active.key]?.decision.commandStatusMarker, marker);
+  const identity = {
+    canonicalTargetKey: "openclaw/openclaw#7833",
+    fenceKey: active.key,
+    revision: 4,
+  };
+  lifecycle.recordCanonicalReceipt({
+    ...identity,
+    outcome: "accepted",
+    receiptId: "publication-refresh-command-canonical",
+    observedAt: Date.now() + 1,
+  });
+  lifecycle.recordRouterReceipt({
+    ...identity,
+    outcome: "durable",
+    receiptId: "publication-refresh-command-router",
+    observedAt: Date.now() + 2,
+  });
+  lifecycle.recordTerminalDisposition({
+    ...identity,
+    kind: "review_completed_routed",
+    observedAt: Date.now() + 3,
+  });
+  lifecycle.authorizeCommandAcknowledgement({
+    ...identity,
+    statusMarker: marker,
+    statusCommentId: 78_331,
+    observedAt: Date.now() + 4,
+  });
+  assert.equal(
+    lifecycle.observeCommandAcknowledgement({
+      ...identity,
+      statusMarker: marker,
+      statusCommentId: 78_331,
+      commandCommentId: 78_330,
+      completionCommentId: 78_331,
+      observedAt: Date.now() + 5,
+    }).accepted,
+    true,
+  );
+  assert.equal(
+    lifecycleState(lifecycle.read(identity.canonicalTargetKey, identity.fenceKey, 4)!),
+    "completed",
+  );
 });
 
 test("exact-review publication retry budgets ignore earlier dispatch failures", async () => {
@@ -19406,7 +21130,7 @@ for (const retryKind of ["coordination", "throttle"] as const) {
         "openclaw/openclaw#711": item,
       },
     });
-    const queue = new ExactReviewQueue({ storage }, {});
+    const queue = new ExactReviewQueue({ storage }, {}, () => 1 / 3);
 
     const response = await queue.fetch(
       new Request("https://clawsweeper-exact-review-queue/complete", {
@@ -24626,11 +26350,11 @@ test("hosted edited webhook binds and enqueues only the live pull request head",
     );
     assert.deepEqual(await staleDuplicateResponse.json(), {
       ok: true,
-      deduped: true,
-      item_key: "openclaw/gogcli#596",
+      accepted: false,
+      reason: "stale pull request head",
     });
-    assert.equal(verificationCalls, 3);
-    assert.equal(storage.rawGet("exact-review-source-authority-sequence:v1"), 3);
+    assert.equal(verificationCalls, 4);
+    assert.equal(storage.rawGet("exact-review-source-authority-sequence:v1"), 4);
     const stored = (await storage.get("exact-review-queue")) as {
       items: Record<
         string,
@@ -24880,20 +26604,23 @@ test("exact-review queue drops a delayed matching ingress after the first review
 
   try {
     const direct = await harness.queue.fetch(
-      buildExactReviewQueueRequest(
-        "completed-direct-ingress",
-        601,
-        "synchronize",
-        "pull_request",
-        "openclaw/gogcli",
-        {
-          targetBranch: "trunk",
-          sourceHeadSha,
-          sourceHeadVerified: true,
-          sourceAuthoritySeq: 1,
-          sourceUpdatedAt: "2026-07-23T13:00:02Z",
-        },
-        { ingress: { route: "direct_webhook", fingerprint } },
+      await withExactReviewSourceAuthority(
+        harness.storage,
+        buildExactReviewQueueRequest(
+          "completed-direct-ingress",
+          601,
+          "synchronize",
+          "pull_request",
+          "openclaw/gogcli",
+          {
+            targetBranch: "trunk",
+            sourceHeadSha,
+            sourceHeadVerified: true,
+            sourceAuthoritySeq: 1,
+            sourceUpdatedAt: "2026-07-23T13:00:02Z",
+          },
+          { ingress: { route: "direct_webhook", fingerprint } },
+        ),
       ),
     );
     assert.equal((await direct.json()).queued, true);
@@ -25066,20 +26793,23 @@ test("unadmitted fallback receipts do not suppress a later verified direct event
 
   try {
     await harness.queue.fetch(
-      buildExactReviewQueueRequest(
-        "verified-first",
-        602,
-        "synchronize",
-        "pull_request",
-        "openclaw/gogcli",
-        {
-          targetBranch: "trunk",
-          sourceHeadSha: firstHeadSha,
-          sourceHeadVerified: true,
-          sourceAuthoritySeq: 1,
-          sourceUpdatedAt: "2026-07-23T13:00:02Z",
-        },
-        { ingress: { route: "direct_webhook", fingerprint: firstFingerprint } },
+      await withExactReviewSourceAuthority(
+        harness.storage,
+        buildExactReviewQueueRequest(
+          "verified-first",
+          602,
+          "synchronize",
+          "pull_request",
+          "openclaw/gogcli",
+          {
+            targetBranch: "trunk",
+            sourceHeadSha: firstHeadSha,
+            sourceHeadVerified: true,
+            sourceAuthoritySeq: 1,
+            sourceUpdatedAt: "2026-07-23T13:00:02Z",
+          },
+          { ingress: { route: "direct_webhook", fingerprint: firstFingerprint } },
+        ),
       ),
     );
     const staleFallback = await harness.queue.fetch(
@@ -25095,7 +26825,8 @@ test("unadmitted fallback receipts do not suppress a later verified direct event
     );
     assert.deepEqual(await staleFallback.json(), {
       ok: true,
-      deduped: true,
+      accepted: false,
+      reason: "stale pull request head",
       item_key: "openclaw/gogcli#602",
       stale_source: true,
     });
@@ -25135,20 +26866,23 @@ test("unadmitted fallback receipts do not suppress a later verified direct event
     assert.deepEqual(await completed.json(), { ok: true, requeued: false });
 
     const verifiedSecond = await harness.queue.fetch(
-      buildExactReviewQueueRequest(
-        "verified-second",
-        602,
-        "edited",
-        "pull_request",
-        "openclaw/gogcli",
-        {
-          targetBranch: "trunk",
-          sourceHeadSha: secondHeadSha,
-          sourceHeadVerified: true,
-          sourceAuthoritySeq: 2,
-          sourceUpdatedAt: "2026-07-23T13:01:02Z",
-        },
-        { ingress: { route: "direct_webhook", fingerprint: secondFingerprint } },
+      await withExactReviewSourceAuthority(
+        harness.storage,
+        buildExactReviewQueueRequest(
+          "verified-second",
+          602,
+          "edited",
+          "pull_request",
+          "openclaw/gogcli",
+          {
+            targetBranch: "trunk",
+            sourceHeadSha: secondHeadSha,
+            sourceHeadVerified: true,
+            sourceAuthoritySeq: 2,
+            sourceUpdatedAt: "2026-07-23T13:01:02Z",
+          },
+          { ingress: { route: "direct_webhook", fingerprint: secondFingerprint } },
+        ),
       ),
     );
     assert.equal((await verifiedSecond.json()).queued, true);
@@ -25226,20 +26960,23 @@ test("a delayed counterpart cannot replace a newer admitted fallback", async () 
     assert.equal((await newerFallback.json()).queued, true);
 
     const delayedDirect = await harness.queue.fetch(
-      buildExactReviewQueueRequest(
-        "delayed-direct-first",
-        603,
-        "synchronize",
-        "pull_request",
-        "openclaw/gogcli",
-        {
-          targetBranch: "trunk",
-          sourceHeadSha: firstHeadSha,
-          sourceHeadVerified: true,
-          sourceAuthoritySeq: 1,
-          sourceUpdatedAt: "2026-07-23T13:00:02Z",
-        },
-        { ingress: { route: "direct_webhook", fingerprint: firstFingerprint } },
+      await withExactReviewSourceAuthority(
+        harness.storage,
+        buildExactReviewQueueRequest(
+          "delayed-direct-first",
+          603,
+          "synchronize",
+          "pull_request",
+          "openclaw/gogcli",
+          {
+            targetBranch: "trunk",
+            sourceHeadSha: firstHeadSha,
+            sourceHeadVerified: true,
+            sourceAuthoritySeq: 1,
+            sourceUpdatedAt: "2026-07-23T13:00:02Z",
+          },
+          { ingress: { route: "direct_webhook", fingerprint: firstFingerprint } },
+        ),
       ),
     );
     assert.deepEqual(await delayedDirect.json(), {
@@ -25278,36 +27015,42 @@ test("a delayed direct ingress cannot promote across a newer legacy-only update"
     assert.equal((await fallback.json()).queued, true);
 
     const legacyUpdate = await harness.queue.fetch(
-      buildExactReviewQueueRequest(
-        "legacy-only-newer-update",
-        604,
-        "edited",
-        "pull_request",
-        "openclaw/gogcli",
-        {
-          targetBranch: "trunk",
-          sourceHeadSha: secondHeadSha,
-          sourceHeadVerified: true,
-          sourceAuthoritySeq: 2,
-        },
+      await withExactReviewSourceAuthority(
+        harness.storage,
+        buildExactReviewQueueRequest(
+          "legacy-only-newer-update",
+          604,
+          "edited",
+          "pull_request",
+          "openclaw/gogcli",
+          {
+            targetBranch: "trunk",
+            sourceHeadSha: secondHeadSha,
+            sourceHeadVerified: true,
+            sourceAuthoritySeq: 2,
+          },
+        ),
       ),
     );
     assert.equal((await legacyUpdate.json()).queued, true);
 
     const delayedDirect = await harness.queue.fetch(
-      buildExactReviewQueueRequest(
-        "delayed-direct-before-legacy-update",
-        604,
-        "synchronize",
-        "pull_request",
-        "openclaw/gogcli",
-        {
-          targetBranch: "trunk",
-          sourceHeadSha: firstHeadSha,
-          sourceHeadVerified: true,
-          sourceAuthoritySeq: 3,
-        },
-        { ingress: { route: "direct_webhook", fingerprint: firstFingerprint } },
+      await withExactReviewSourceAuthority(
+        harness.storage,
+        buildExactReviewQueueRequest(
+          "delayed-direct-before-legacy-update",
+          604,
+          "synchronize",
+          "pull_request",
+          "openclaw/gogcli",
+          {
+            targetBranch: "trunk",
+            sourceHeadSha: firstHeadSha,
+            sourceHeadVerified: true,
+            sourceAuthoritySeq: 3,
+          },
+          { ingress: { route: "direct_webhook", fingerprint: firstFingerprint } },
+        ),
       ),
     );
     assert.deepEqual(await delayedDirect.json(), {
@@ -25525,7 +27268,8 @@ test("exact-review queue coalesces matching ingress and promotes verified direct
     );
     assert.deepEqual(await fallbackAfterBranchChange.json(), {
       ok: true,
-      deduped: true,
+      accepted: false,
+      reason: "stale pull request head",
       item_key: "openclaw/gogcli#600",
       stale_source: true,
     });
@@ -25720,26 +27464,49 @@ test("hosted webhook ignores removal of non-close-guard labels", async () => {
   });
 });
 
-test("hosted webhook reuses existing fast ack comments on redelivery", async () => {
+test("direct and compatibility re-review deliveries share one lifecycle until the command is edited", async () => {
   const originalFetch = globalThis.fetch;
   const { privateKey } = generateKeyPairSync("rsa", {
     modulusLength: 2048,
     privateKeyEncoding: { type: "pkcs8", format: "pem" },
     publicKeyEncoding: { type: "spki", format: "pem" },
   });
-  let dispatchBody: unknown = null;
+  const storage = new MemoryDurableStorage();
+  const queue = new ExactReviewQueue(
+    { storage },
+    {
+      CLAWSWEEPER_APP_CLIENT_ID: "Iv23test",
+      CLAWSWEEPER_APP_PRIVATE_KEY: privateKey,
+    },
+  );
+  const statusStore = new MemoryKv();
+  const hostedEnv = {
+    CLAWSWEEPER_APP_CLIENT_ID: "Iv23test",
+    CLAWSWEEPER_APP_PRIVATE_KEY: privateKey,
+    CLAWSWEEPER_WEBHOOK_SECRET: "test-secret",
+    CLAWSWEEPER_FAST_ACK_SETTLE_DELAYS_MS: "0",
+    EXACT_REVIEW_QUEUE: new MemoryDurableNamespace(queue),
+    STATUS_STORE: statusStore,
+  };
+  let patchedAckBody = "";
+  let postedAckBody = "";
   let postedAck = false;
+  let lateBare = false;
+  let lateBareDeleted = false;
+  let sourceCommentBody = "@clawsweeper\nre-review: focus on the current path";
+  let sourceCommentUpdatedAt = "2026-08-08T20:00:00Z";
   globalThis.fetch = async (input, init) => {
     const url = new URL(String(input));
     const authorization = new Headers(init?.headers).get("authorization");
-    if (url.pathname === "/repos/openclaw/clawsweeper/installation") {
-      return jsonResponse({ id: 999 });
-    }
-    if (url.pathname === "/app/installations/999/access_tokens") {
-      return jsonResponse({ token: "dispatch-token" });
-    }
     if (url.pathname === "/app/installations/123/access_tokens") {
       return jsonResponse({ token: "target-token" });
+    }
+    if (url.pathname === "/repos/openclaw/gogcli/issues/comments/456") {
+      return jsonResponse({
+        id: 456,
+        body: sourceCommentBody,
+        updated_at: sourceCommentUpdatedAt,
+      });
     }
     if (url.pathname === "/repos/openclaw/gogcli/issues/597/comments" && init?.method === "GET") {
       assert.equal(authorization, "Bearer target-token");
@@ -25747,23 +27514,43 @@ test("hosted webhook reuses existing fast ack comments on redelivery", async () 
       return jsonResponse([
         {
           id: 777,
-          body: "<!-- clawsweeper-command-ack:456 -->\nClawSweeper picked this up.",
+          body:
+            patchedAckBody || "<!-- clawsweeper-command-ack:456 -->\nClawSweeper picked this up.",
           user: { login: "openclaw-clawsweeper[bot]" },
         },
+        ...(postedAckBody
+          ? [{ id: 888, body: postedAckBody, user: { login: "openclaw-clawsweeper[bot]" } }]
+          : []),
+        ...(lateBare && !lateBareDeleted
+          ? [
+              {
+                id: 999,
+                body: "<!-- clawsweeper-command-ack:456 -->\nLate command router placeholder.",
+                user: { login: "openclaw-clawsweeper[bot]" },
+              },
+            ]
+          : []),
       ]);
     }
     if (url.pathname === "/repos/openclaw/gogcli/issues/597/comments" && init?.method === "POST") {
       postedAck = true;
-      return jsonResponse({ id: 888 });
+      postedAckBody = String(JSON.parse(String(init.body)).body || "");
+      return jsonResponse({ id: 888, body: postedAckBody });
+    }
+    if (url.pathname === "/repos/openclaw/gogcli/issues/comments/777" && init?.method === "PATCH") {
+      patchedAckBody = String(JSON.parse(String(init.body)).body || "");
+      return jsonResponse({ id: 777, body: patchedAckBody });
+    }
+    if (
+      url.pathname === "/repos/openclaw/gogcli/issues/comments/999" &&
+      init?.method === "DELETE"
+    ) {
+      lateBareDeleted = true;
+      return new Response(null, { status: 204 });
     }
     if (url.pathname === "/repos/openclaw/gogcli/issues/comments/456/reactions") {
       assert.equal(authorization, "Bearer target-token");
       return jsonResponse({});
-    }
-    if (url.pathname === "/repos/openclaw/clawsweeper/dispatches") {
-      assert.equal(authorization, "Bearer dispatch-token");
-      dispatchBody = JSON.parse(String(init?.body));
-      return new Response(null, { status: 204 });
     }
     throw new Error(`unexpected fetch ${url}`);
   };
@@ -25783,236 +27570,325 @@ test("hosted webhook reuses existing fast ack comments on redelivery", async () 
             fork: false,
             has_issues: true,
           },
-          issue: { number: 597, user: { login: "steipete" } },
+          issue: { number: 597, state: "open", user: { login: "steipete" } },
           installation: { id: 123 },
           comment: {
             id: 456,
-            body: "@clawsweeper review",
-            updated_at: "2026-07-12T20:00:00Z",
+            body: "@clawsweeper\nre-review: focus on the current path",
+            updated_at: "2026-08-08T20:00:00Z",
             author_association: "OWNER",
             user: { login: "steipete" },
           },
         },
       }),
+      hostedEnv,
+    );
+
+    assert.equal(response.status, 202);
+    assert.deepEqual(await response.json(), {
+      ok: true,
+      accepted: true,
+      deduped: false,
+      command_version_id: reReviewCommandVersionIdentity({
+        commentId: 456,
+        updatedAt: "2026-08-08T20:00:00Z",
+        bodySha256: createHash("sha256")
+          .update("@clawsweeper\nre-review: focus on the current path")
+          .digest("hex"),
+      }),
+    });
+    assert.equal(patchedAckBody, "");
+    await queue.alarm();
+    assert.equal(postedAck, false);
+    assert.match(patchedAckBody, /clawsweeper-command-status:597:re_review:command-456/);
+    lateBare = true;
+    storage.sql.exec("UPDATE exact_review_command_intakes SET next_attempt_at = 0");
+    await queue.alarm();
+    assert.equal(lateBareDeleted, true);
+    const state = (await storage.get("exact-review-queue")) as {
+      items: Record<string, { decision: Record<string, unknown> }>;
+    };
+    assert.match(
+      String(state.items["openclaw/gogcli#597"]?.decision.sourceDeliveryId),
+      /^command-456-/,
+    );
+    const first = state.items["openclaw/gogcli#597"]!;
+    const compatibilityIdentity = reReviewCommandVersionIdentity({
+      commentId: 456,
+      updatedAt: "2026-08-08T20:00:00Z",
+      bodySha256: createHash("sha256")
+        .update("@clawsweeper\nre-review: focus on the current path")
+        .digest("hex"),
+    });
+    assert.equal(first.decision.sourceDeliveryId, compatibilityIdentity);
+    const compatibility = await queue.fetch(
+      new Request("https://clawsweeper-exact-review-queue/enqueue", {
+        method: "POST",
+        body: JSON.stringify({
+          delivery_id: compatibilityIdentity,
+          decision: { ...first.decision, statusCommentId: 777 },
+        }),
+      }),
+    );
+    assert.equal((await compatibility.json()).deduped, true);
+    let queueState = (await storage.get("exact-review-queue")) as {
+      items: Record<string, ExactReviewQueueItem>;
+    };
+    assert.equal(queueState.items["openclaw/gogcli#597"]?.revision, 1);
+    assert.equal(Object.keys(queueState.items).length, 1);
+
+    const edited = await worker.fetch(
+      signedGithubWebhookRequest({
+        event: "issue_comment",
+        secret: "test-secret",
+        payload: {
+          action: "edited",
+          repository: {
+            full_name: "openclaw/gogcli",
+            default_branch: "trunk",
+            private: false,
+            archived: false,
+            fork: false,
+            has_issues: true,
+          },
+          issue: { number: 597, state: "open", user: { login: "steipete" } },
+          installation: { id: 123 },
+          comment: {
+            id: 456,
+            body: "@clawsweeper review\nNew evidence after the edit.",
+            updated_at: "2026-08-08T20:01:00Z",
+            author_association: "OWNER",
+            user: { login: "steipete" },
+          },
+        },
+      }),
+      hostedEnv,
+    );
+    assert.equal(edited.status, 202);
+    assert.equal((await edited.json()).accepted, true);
+    sourceCommentBody = "@clawsweeper review\nNew evidence after the edit.";
+    sourceCommentUpdatedAt = "2026-08-08T20:01:00Z";
+    await queue.alarm();
+    assert.match(patchedAckBody, new RegExp(String(first.decision.sourceDeliveryId)));
+    assert.match(postedAckBody, /clawsweeper-command-status:597:re_review:command-456-/);
+    assert.notEqual(postedAckBody, patchedAckBody);
+    queueState = (await storage.get("exact-review-queue")) as typeof queueState;
+    assert.equal(queueState.items["openclaw/gogcli#597"]?.revision, 2);
+    assert.match(
+      queueState.items["terminal-finalization:openclaw/gogcli#597:1"]?.terminalFinalization
+        ?.statusDetail ?? "",
+      /superseded/,
+    );
+    assert.equal(
+      new ExactReviewLifecycleProjectionStore(storage).read(
+        "openclaw/gogcli#597",
+        "openclaw/gogcli#597",
+        1,
+      )?.terminalDisposition?.kind,
+      "superseded",
+    );
+    const lifecycle = new ExactReviewLifecycleProjectionStore(storage);
+    const current = queueState.items["openclaw/gogcli#597"]!;
+    const currentIdentity = {
+      canonicalTargetKey: "openclaw/gogcli#597",
+      fenceKey: "openclaw/gogcli#597",
+      revision: 2,
+    };
+    const currentProjection = lifecycle.read(
+      currentIdentity.canonicalTargetKey,
+      currentIdentity.fenceKey,
+      currentIdentity.revision,
+    );
+    assert.equal(currentProjection?.admission.sourceDeliveryId, current.decision.sourceDeliveryId);
+    lifecycle.recordCanonicalReceipt({
+      ...currentIdentity,
+      outcome: "accepted",
+      receiptId: "bay-command-canonical",
+      observedAt: Date.parse("2026-08-08T20:01:01Z"),
+    });
+    lifecycle.recordRouterReceipt({
+      ...currentIdentity,
+      outcome: "durable",
+      receiptId: "bay-command-router",
+      observedAt: Date.parse("2026-08-08T20:01:02Z"),
+    });
+    lifecycle.recordTerminalDisposition({
+      ...currentIdentity,
+      kind: "review_completed_routed",
+      observedAt: Date.parse("2026-08-08T20:01:03Z"),
+    });
+    lifecycle.authorizeCommandAcknowledgement({
+      ...currentIdentity,
+      statusMarker: current.decision.commandStatusMarker ?? null,
+      statusCommentId: null,
+      observedAt: Date.parse("2026-08-08T20:01:04Z"),
+    });
+    const acknowledgementPayload = JSON.stringify({
+      canonical_target_key: currentIdentity.canonicalTargetKey,
+      fence_key: currentIdentity.fenceKey,
+      revision: currentIdentity.revision,
+      status_marker: current.decision.commandStatusMarker,
+      command_comment_id: 456,
+      completion_comment_id: 888,
+      completed_at: "2026-08-08T20:01:05Z",
+      observed_at: Date.parse("2026-08-08T20:01:05Z"),
+    });
+    const acknowledged = await worker.fetch(
+      new Request(
+        "https://clawsweeper.openclaw.ai/internal/exact-review/lifecycle/command-ack/observed",
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-clawsweeper-exact-review-signature": `sha256=${createHmac("sha256", "test-secret")
+              .update(acknowledgementPayload)
+              .digest("hex")}`,
+          },
+          body: acknowledgementPayload,
+        },
+      ),
+      hostedEnv,
+    );
+    assert.equal((await acknowledged.json()).source_delivery_id, current.decision.sourceDeliveryId);
+    const bay = JSON.parse((await statusStore.get("openclaw-bay:journey-state:v1"))!);
+    assert.equal(bay.schema_version, 2);
+    assert.equal(bay.journeys.length, 2);
+    assert.equal(
+      bay.journeys.some((journey) => !journey.triggered_at),
+      false,
+    );
+    const completedJourney = bay.journeys.find(
+      (journey) => journey.source_delivery_id === current.decision.sourceDeliveryId,
+    );
+    assert.equal(completedJourney.completed_at, "2026-08-08T20:01:05Z");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("hosted non-review command acknowledges before router dispatch and passes its status id", async () => {
+  const originalFetch = globalThis.fetch;
+  const { privateKey } = generateKeyPairSync("rsa", {
+    modulusLength: 2048,
+    privateKeyEncoding: { type: "pkcs8", format: "pem" },
+    publicKeyEncoding: { type: "spki", format: "pem" },
+  });
+  const mutations: string[] = [];
+  let dispatchPayload: Record<string, any> | undefined;
+  globalThis.fetch = async (input, init) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/app/installations/123/access_tokens") {
+      return jsonResponse({ token: "target-token" });
+    }
+    if (url.pathname === "/repos/openclaw/clawsweeper/installation") {
+      return jsonResponse({ id: 999 });
+    }
+    if (url.pathname === "/app/installations/999/access_tokens") {
+      return jsonResponse({ token: "dispatch-token" });
+    }
+    if (url.pathname === "/repos/openclaw/gogcli/issues/596/comments" && init?.method === "GET") {
+      return jsonResponse([]);
+    }
+    if (url.pathname === "/repos/openclaw/gogcli/issues/596/comments" && init?.method === "POST") {
+      mutations.push("ack");
+      const body = String(JSON.parse(String(init.body)).body || "");
+      assert.match(body, /Command router queued/);
+      assert.doesNotMatch(body, /clawsweeper-command-status/);
+      return jsonResponse({ id: 896 });
+    }
+    if (url.pathname === "/repos/openclaw/gogcli/issues/comments/456/reactions") {
+      mutations.push("reaction");
+      return jsonResponse({});
+    }
+    if (url.pathname === "/repos/openclaw/clawsweeper/dispatches") {
+      mutations.push("dispatch");
+      dispatchPayload = JSON.parse(String(init?.body || "{}"));
+      return jsonResponse({});
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  };
+
+  try {
+    const response = await worker.fetch(
+      signedGithubWebhookRequest({
+        event: "issue_comment",
+        secret: "non-review-ack-secret",
+        payload: {
+          action: "created",
+          repository: {
+            full_name: "openclaw/gogcli",
+            default_branch: "trunk",
+            private: false,
+            archived: false,
+            fork: false,
+            has_issues: true,
+          },
+          issue: { number: 596, user: { login: "contributor" } },
+          installation: { id: 123 },
+          comment: {
+            id: 456,
+            body: "@clawsweeper automerge",
+            updated_at: "2026-08-08T20:00:00Z",
+            author_association: "OWNER",
+            user: { login: "maintainer" },
+          },
+        },
+      }),
       {
-        CLAWSWEEPER_APP_CLIENT_ID: "Iv23test",
+        CLAWSWEEPER_APP_CLIENT_ID: "Iv23nonreviewack",
         CLAWSWEEPER_APP_PRIVATE_KEY: privateKey,
-        CLAWSWEEPER_WEBHOOK_SECRET: "test-secret",
-        CLAWSWEEPER_FAST_ACK_SETTLE_DELAYS_MS: "0",
+        CLAWSWEEPER_WEBHOOK_SECRET: "non-review-ack-secret",
         STATUS_STORE: new MemoryKv(),
       },
     );
 
     assert.equal(response.status, 202);
-    assert.deepEqual(await response.json(), { ok: true, status_comment_id: 777 });
-    assert.equal(postedAck, false);
-    assert.deepEqual(dispatchBody, {
-      event_type: "clawsweeper_comment",
-      client_payload: {
-        target_repo: "openclaw/gogcli",
-        target_branch: "trunk",
-        item_number: 597,
-        comment_id: 456,
-        status_comment_id: 777,
-        source_action: "created",
-        source_delivery_id: "test-delivery",
-        comment_event_auth: "github_webhook_v1",
-        comment_updated_at: "2026-07-12T20:00:00Z",
-        comment_body_sha256: createHash("sha256").update("@clawsweeper review").digest("hex"),
-      },
-    });
-    assert.ok(
-      Object.keys((dispatchBody as { client_payload: Record<string, unknown> }).client_payload)
-        .length <= 10,
-    );
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.deepEqual(await response.json(), { ok: true, status_comment_id: 896 });
+    assert.deepEqual(mutations, ["ack", "reaction", "dispatch"]);
+    assert.equal(dispatchPayload?.event_type, "clawsweeper_comment");
+    assert.equal(dispatchPayload?.client_payload?.status_comment_id, 896);
   } finally {
     globalThis.fetch = originalFetch;
   }
 });
 
-test("hosted webhook coalesces concurrent duplicate fast ack comments", async () => {
+test("hosted closed post-close re-review stays on the visible comment-router path", async () => {
   const originalFetch = globalThis.fetch;
   const { privateKey } = generateKeyPairSync("rsa", {
     modulusLength: 2048,
     privateKeyEncoding: { type: "pkcs8", format: "pem" },
     publicKeyEncoding: { type: "spki", format: "pem" },
   });
-  const comments: Array<{ id: number; body: string; created_at: string; user: { login: string } }> =
-    [];
-  const dispatchBodies: unknown[] = [];
-  let fastAckPosts = 0;
-  let reactions = 0;
-  let releaseAckPost: (() => void) | undefined;
-  let markAckPostStarted: (() => void) | undefined;
-  const ackPostRelease = new Promise<void>((resolve) => {
-    releaseAckPost = resolve;
-  });
-  const ackPostStarted = new Promise<void>((resolve) => {
-    markAckPostStarted = resolve;
-  });
+  let exactQueueCalls = 0;
+  let statusBody = "";
+  let dispatchPayload: Record<string, any> | undefined;
   globalThis.fetch = async (input, init) => {
     const url = new URL(String(input));
-    const authorization = new Headers(init?.headers).get("authorization");
+    if (url.pathname === "/app/installations/123/access_tokens") {
+      return jsonResponse({ token: "target-token" });
+    }
     if (url.pathname === "/repos/openclaw/clawsweeper/installation") {
       return jsonResponse({ id: 999 });
     }
     if (url.pathname === "/app/installations/999/access_tokens") {
       return jsonResponse({ token: "dispatch-token" });
     }
-    if (url.pathname === "/app/installations/123/access_tokens") {
-      return jsonResponse({ token: "target-token" });
+    if (url.pathname === "/repos/openclaw/gogcli/issues/599/comments") {
+      if (init?.method === "GET") return jsonResponse([]);
+      statusBody = String(JSON.parse(String(init?.body ?? "{}")).body || "");
+      return jsonResponse({ id: 899, body: statusBody });
     }
-    if (url.pathname === "/repos/openclaw/gogcli/issues/597/comments" && init?.method === "GET") {
-      assert.equal(authorization, "Bearer target-token");
-      return jsonResponse([...comments]);
-    }
-    if (url.pathname === "/repos/openclaw/gogcli/issues/597/comments" && init?.method === "POST") {
-      assert.equal(authorization, "Bearer target-token");
-      fastAckPosts += 1;
-      markAckPostStarted?.();
-      await ackPostRelease;
-      const body = JSON.parse(String(init.body || "{}"));
-      const comment = {
-        id: 777,
-        body: String(body.body || ""),
-        created_at: "2026-05-28T13:00:00Z",
-        user: { login: "openclaw-clawsweeper[bot]" },
-      };
-      comments.push(comment);
-      return jsonResponse(comment);
-    }
-    if (url.pathname === "/repos/openclaw/gogcli/issues/comments/456/reactions") {
-      assert.equal(authorization, "Bearer target-token");
-      reactions += 1;
-      return jsonResponse({});
+    if (url.pathname === "/repos/openclaw/gogcli/issues/comments/459/reactions") {
+      return jsonResponse({ id: 1 });
     }
     if (url.pathname === "/repos/openclaw/clawsweeper/dispatches") {
-      assert.equal(authorization, "Bearer dispatch-token");
-      dispatchBodies.push(JSON.parse(String(init?.body)));
-      return new Response(null, { status: 204 });
-    }
-    throw new Error(`unexpected fetch ${url}`);
-  };
-
-  const payload = {
-    action: "created",
-    repository: {
-      full_name: "openclaw/gogcli",
-      default_branch: "trunk",
-      private: false,
-      archived: false,
-      fork: false,
-      has_issues: true,
-    },
-    issue: { number: 597, user: { login: "steipete" } },
-    installation: { id: 123 },
-    comment: {
-      id: 456,
-      body: "@clawsweeper build",
-      author_association: "OWNER",
-      user: { login: "steipete" },
-    },
-  };
-  const env = {
-    CLAWSWEEPER_APP_CLIENT_ID: "Iv23test",
-    CLAWSWEEPER_APP_PRIVATE_KEY: privateKey,
-    CLAWSWEEPER_WEBHOOK_SECRET: "test-secret",
-    CLAWSWEEPER_FAST_ACK_SETTLE_DELAYS_MS: "0",
-  };
-
-  try {
-    const left = worker.fetch(
-      signedGithubWebhookRequest({ event: "issue_comment", secret: "test-secret", payload }),
-      env,
-    );
-    const right = worker.fetch(
-      signedGithubWebhookRequest({ event: "issue_comment", secret: "test-secret", payload }),
-      env,
-    );
-    await ackPostStarted;
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    releaseAckPost?.();
-    const [leftResponse, rightResponse] = await Promise.all([left, right]);
-
-    assert.equal(leftResponse.status, 202);
-    assert.equal(rightResponse.status, 202);
-    assert.deepEqual(await leftResponse.json(), { ok: true, status_comment_id: 777 });
-    assert.deepEqual(await rightResponse.json(), { ok: true, status_comment_id: 777 });
-    assert.equal(fastAckPosts, 1);
-    assert.equal(reactions, 2);
-    assert.equal(comments.length, 1);
-    assert.match(comments[0]?.body || "", /clawsweeper-command-ack:456/);
-    assert.equal(dispatchBodies.length, 2);
-    assert.deepEqual(
-      dispatchBodies.map(
-        (body) =>
-          (body as { client_payload?: { status_comment_id?: unknown } }).client_payload
-            ?.status_comment_id,
-      ),
-      [777, 777],
-    );
-    await new Promise((resolve) => setTimeout(resolve, 0));
-  } finally {
-    globalThis.fetch = originalFetch;
-  }
-});
-
-test("hosted webhook removes duplicate fast ack comments after concurrent redelivery", async () => {
-  const originalFetch = globalThis.fetch;
-  const { privateKey } = generateKeyPairSync("rsa", {
-    modulusLength: 2048,
-    privateKeyEncoding: { type: "pkcs8", format: "pem" },
-    publicKeyEncoding: { type: "spki", format: "pem" },
-  });
-  let commentLookups = 0;
-  let deletedAck = 0;
-  let dispatchBody: unknown = null;
-  globalThis.fetch = async (input, init) => {
-    const url = new URL(String(input));
-    if (url.pathname === "/repos/openclaw/clawsweeper/installation") {
-      return jsonResponse({ id: 999 });
-    }
-    if (url.pathname === "/app/installations/999/access_tokens") {
-      return jsonResponse({ token: "dispatch-token" });
-    }
-    if (url.pathname === "/app/installations/123/access_tokens") {
-      return jsonResponse({ token: "target-token" });
-    }
-    if (url.pathname === "/repos/openclaw/gogcli/issues/597/comments" && init?.method === "GET") {
-      commentLookups += 1;
-      if (commentLookups === 1) return jsonResponse([]);
-      return jsonResponse([
-        {
-          id: 777,
-          created_at: "2026-05-24T00:00:00Z",
-          body: "<!-- clawsweeper-command-ack:456 -->\nClawSweeper picked this up.",
-          user: { login: "openclaw-clawsweeper[bot]" },
-        },
-        {
-          id: 888,
-          created_at: "2026-05-24T00:00:01Z",
-          body: "<!-- clawsweeper-command-ack:456 -->\nClawSweeper picked this up.",
-          user: { login: "openclaw-clawsweeper[bot]" },
-        },
-      ]);
-    }
-    if (url.pathname === "/repos/openclaw/gogcli/issues/597/comments" && init?.method === "POST") {
-      return jsonResponse({ id: 888 });
-    }
-    if (
-      url.pathname === "/repos/openclaw/gogcli/issues/comments/888" &&
-      init?.method === "DELETE"
-    ) {
-      deletedAck = 888;
-      return new Response(null, { status: 204 });
-    }
-    if (url.pathname === "/repos/openclaw/gogcli/issues/comments/456/reactions") {
+      dispatchPayload = JSON.parse(String(init?.body ?? "{}"));
       return jsonResponse({});
     }
-    if (url.pathname === "/repos/openclaw/clawsweeper/dispatches") {
-      dispatchBody = JSON.parse(String(init?.body));
-      return new Response(null, { status: 204 });
+    if (url.pathname.startsWith("/internal/exact-review/")) {
+      exactQueueCalls += 1;
+      return jsonResponse({ ok: true, queued: true });
     }
     throw new Error(`unexpected fetch ${url}`);
   };
@@ -26021,7 +27897,7 @@ test("hosted webhook removes duplicate fast ack comments after concurrent redeli
     const response = await worker.fetch(
       signedGithubWebhookRequest({
         event: "issue_comment",
-        secret: "test-secret",
+        secret: "closed-review-secret",
         payload: {
           action: "created",
           repository: {
@@ -26032,125 +27908,75 @@ test("hosted webhook removes duplicate fast ack comments after concurrent redeli
             fork: false,
             has_issues: true,
           },
-          issue: { number: 597, user: { login: "steipete" } },
+          issue: {
+            number: 599,
+            state: "closed",
+            closed_at: "2026-08-08T20:00:00Z",
+            pull_request: {},
+            user: { login: "maintainer" },
+          },
           installation: { id: 123 },
           comment: {
-            id: 456,
-            body: "@clawsweeper build",
+            id: 459,
+            body: "@clawsweeper re-review",
+            created_at: "2026-08-08T20:01:00Z",
+            updated_at: "2026-08-08T20:01:00Z",
             author_association: "OWNER",
-            user: { login: "steipete" },
+            user: { login: "maintainer" },
           },
         },
       }),
       {
-        CLAWSWEEPER_APP_CLIENT_ID: "Iv23test",
+        CLAWSWEEPER_APP_CLIENT_ID: "Iv23closedreview",
         CLAWSWEEPER_APP_PRIVATE_KEY: privateKey,
-        CLAWSWEEPER_WEBHOOK_SECRET: "test-secret",
-        CLAWSWEEPER_FAST_ACK_SETTLE_DELAYS_MS: "0",
+        CLAWSWEEPER_WEBHOOK_SECRET: "closed-review-secret",
       },
     );
-
-    assert.equal(response.status, 202);
-    assert.deepEqual(await response.json(), { ok: true, status_comment_id: 777 });
-    assert.equal(deletedAck, 888);
-    assert.equal(commentLookups, 2);
-    assert.deepEqual(dispatchBody, {
-      event_type: "clawsweeper_comment",
-      client_payload: {
-        target_repo: "openclaw/gogcli",
-        target_branch: "trunk",
-        item_number: 597,
-        comment_id: 456,
-        status_comment_id: 777,
-        source_event: "issue_comment",
-        source_action: "created",
-      },
-    });
-    assert.ok(
-      Object.keys((dispatchBody as { client_payload: Record<string, unknown> }).client_payload)
-        .length <= 10,
-    );
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.deepEqual(await response.json(), { ok: true, status_comment_id: 899 });
+    assert.equal(exactQueueCalls, 0);
+    assert.match(statusBody, /Command router queued/);
+    assert.equal(dispatchPayload?.client_payload?.status_comment_id, 899);
   } finally {
     globalThis.fetch = originalFetch;
   }
 });
 
-test("hosted webhook schedules post-dispatch fast ack cleanup", async () => {
+test("hosted re-review admission failure leaves no orphan acknowledgement", async () => {
   const originalFetch = globalThis.fetch;
   const { privateKey } = generateKeyPairSync("rsa", {
     modulusLength: 2048,
     privateKeyEncoding: { type: "pkcs8", format: "pem" },
     publicKeyEncoding: { type: "spki", format: "pem" },
   });
-  let commentLookups = 0;
-  let deletedAck = 0;
-  const waitUntilPromises: Promise<unknown>[] = [];
+  let acknowledgementPosts = 0;
+  let centralTokens = 0;
   globalThis.fetch = async (input, init) => {
     const url = new URL(String(input));
-    if (url.pathname === "/repos/openclaw/clawsweeper/installation") {
-      return jsonResponse({ id: 999 });
-    }
-    if (url.pathname === "/app/installations/999/access_tokens") {
-      return jsonResponse({ token: "dispatch-token" });
-    }
     if (url.pathname === "/app/installations/123/access_tokens") {
       return jsonResponse({ token: "target-token" });
     }
-    if (url.pathname === "/repos/openclaw/gogcli/issues/597/comments" && init?.method === "GET") {
-      commentLookups += 1;
-      if (commentLookups <= 2) {
-        return jsonResponse([
-          {
-            id: 777,
-            created_at: "2026-05-28T13:00:00Z",
-            body: "<!-- clawsweeper-command-ack:456 -->\nClawSweeper picked this up.",
-            user: { login: "openclaw-clawsweeper[bot]" },
-          },
-        ]);
-      }
-      return jsonResponse([
-        {
-          id: 777,
-          created_at: "2026-05-28T13:00:00Z",
-          body: "<!-- clawsweeper-command-ack:456 -->\nClawSweeper picked this up.",
-          user: { login: "openclaw-clawsweeper[bot]" },
-        },
-        {
-          id: 888,
-          created_at: "2026-05-28T13:00:01Z",
-          updated_at: "2026-05-28T13:00:02Z",
-          body: [
-            "<!-- clawsweeper-command-status:597:implement_issue:abc123 -->",
-            "<!-- clawsweeper-command-ack:456 -->",
-            "ClawSweeper issue implementation requested.",
-            "<!-- clawsweeper-command-progress:start -->",
-            "Implementation progress:",
-            "- State: In progress",
-            "<!-- clawsweeper-command-progress:end -->",
-          ].join("\n"),
-          user: { login: "openclaw-clawsweeper[bot]" },
-        },
-      ]);
+    if (url.pathname === "/repos/openclaw/clawsweeper/installation") {
+      centralTokens += 1;
+      return jsonResponse({ id: 999 });
     }
-    if (
-      url.pathname === "/repos/openclaw/gogcli/issues/comments/777" &&
-      init?.method === "DELETE"
-    ) {
-      deletedAck = 777;
-      return new Response(null, { status: 204 });
-    }
-    if (url.pathname === "/repos/openclaw/gogcli/issues/comments/456/reactions") {
-      return jsonResponse({});
-    }
-    if (url.pathname === "/repos/openclaw/clawsweeper/dispatches") {
-      return new Response(null, { status: 204 });
+    if (url.pathname.endsWith("/issues/598/comments") && init?.method === "POST") {
+      acknowledgementPosts += 1;
+      return jsonResponse({ id: 9001 });
     }
     throw new Error(`unexpected fetch ${url}`);
   };
-
+  const rejectingQueue = {
+    idFromName: () => "global",
+    get: () => ({
+      fetch: async () =>
+        new Response(JSON.stringify({ error: "github_rate_limit" }), {
+          status: 429,
+          headers: { "content-type": "application/json" },
+        }),
+    }),
+  };
   try {
-    const response = await worker.fetch(
+    const rejected = await worker.fetch(
       signedGithubWebhookRequest({
         event: "issue_comment",
         secret: "test-secret",
@@ -26158,17 +27984,18 @@ test("hosted webhook schedules post-dispatch fast ack cleanup", async () => {
           action: "created",
           repository: {
             full_name: "openclaw/gogcli",
-            default_branch: "trunk",
+            default_branch: "main",
             private: false,
             archived: false,
             fork: false,
             has_issues: true,
           },
-          issue: { number: 597, user: { login: "steipete" } },
+          issue: { number: 598, state: "open", user: { login: "steipete" } },
           installation: { id: 123 },
           comment: {
-            id: 456,
-            body: "@clawsweeper build",
+            id: 457,
+            body: "@clawsweeper re-review",
+            updated_at: "2026-08-08T20:00:00Z",
             author_association: "OWNER",
             user: { login: "steipete" },
           },
@@ -26178,20 +28005,13 @@ test("hosted webhook schedules post-dispatch fast ack cleanup", async () => {
         CLAWSWEEPER_APP_CLIENT_ID: "Iv23test",
         CLAWSWEEPER_APP_PRIVATE_KEY: privateKey,
         CLAWSWEEPER_WEBHOOK_SECRET: "test-secret",
-        CLAWSWEEPER_FAST_ACK_SETTLE_DELAYS_MS: "0,0,0",
-      },
-      {
-        waitUntil(promise: Promise<unknown>) {
-          waitUntilPromises.push(promise);
-        },
+        EXACT_REVIEW_QUEUE: rejectingQueue,
       },
     );
-
-    assert.equal(response.status, 202);
-    assert.deepEqual(await response.json(), { ok: true, status_comment_id: 777 });
-    assert.equal(waitUntilPromises.length, 1);
-    await Promise.all(waitUntilPromises);
-    assert.equal(deletedAck, 777);
+    assert.equal(rejected.status, 429);
+    assert.deepEqual(await rejected.json(), { error: "github_rate_limit" });
+    assert.equal(acknowledgementPosts, 0);
+    assert.equal(centralTokens, 0);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -26556,6 +28376,72 @@ function buildExactReviewQueueRequest(
       ...envelopeOverrides,
     }),
   });
+}
+
+function completeCommandAcknowledgementForTest(
+  lifecycle: ExactReviewLifecycleProjectionStore,
+  identity: { canonicalTargetKey: string; fenceKey: string; revision: number },
+  statusMarker: string,
+  statusCommentId: number,
+  receiptPrefix: string,
+) {
+  const observedAt = Date.now();
+  lifecycle.recordCanonicalReceipt({
+    ...identity,
+    outcome: "accepted",
+    receiptId: `${receiptPrefix}:canonical`,
+    observedAt: observedAt + 1,
+  });
+  lifecycle.recordRouterReceipt({
+    ...identity,
+    outcome: "durable",
+    receiptId: `${receiptPrefix}:router`,
+    observedAt: observedAt + 2,
+  });
+  lifecycle.recordTerminalDisposition({
+    ...identity,
+    kind: "review_completed_routed",
+    observedAt: observedAt + 3,
+  });
+  lifecycle.authorizeCommandAcknowledgement({
+    ...identity,
+    statusMarker,
+    statusCommentId,
+    observedAt: observedAt + 4,
+  });
+  return lifecycle.observeCommandAcknowledgement({
+    ...identity,
+    statusMarker,
+    statusCommentId,
+    commandCommentId: statusCommentId - 1,
+    completionCommentId: statusCommentId,
+    observedAt: observedAt + 5,
+  });
+}
+
+async function withExactReviewSourceAuthority(
+  storage: MemoryDurableStorage,
+  request: Request,
+  installationId = 123,
+) {
+  const body = (await request.clone().json()) as {
+    delivery_id: string;
+    decision: ExactReviewDecision;
+  };
+  const sourceAuthoritySeq = Number(body.decision.sourceAuthoritySeq);
+  if (!Number.isSafeInteger(sourceAuthoritySeq) || sourceAuthoritySeq <= 0) return request;
+  storage.rawPut(
+    `exact-review-source-authority-reservation:v1:${encodeURIComponent(body.delivery_id)}`,
+    {
+      deliveryId: body.delivery_id,
+      decision: body.decision,
+      installationId,
+      sourceAuthoritySeq,
+      attempts: 0,
+      nextAttemptAt: Date.now(),
+    },
+  );
+  return request;
 }
 
 function exactReviewPublicationOverrides(

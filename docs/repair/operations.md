@@ -313,10 +313,9 @@ Exact-review producers normally deliver GitHub effects and submit prepared state
 `pnpm run repair:comment-router` scans recent issue and PR comments in the target repo.
 Target repositories can also forward matching `issue_comment` events as
 `clawsweeper_comment` repository dispatches with the exact comment id. Those
-comments get an immediate `eyes` reaction from the ClawSweeper app. Maintainer
-commands also get one queued status comment that the router edits in place after
-it classifies the command, so the visible reply is available as soon as the
-target dispatcher starts. Exact comment dispatches scan only the source comment
+comments get an immediate `eyes` reaction from the ClawSweeper app. The router
+creates its status comment only after classification and durable ownership.
+Exact comment dispatches scan only the source comment
 and use per-comment receiver concurrency; the scheduled sweep remains a
 five-minute fallback.
 The status comment itself uses one compact badge: `🦞👀` for acknowledgement,
@@ -330,13 +329,27 @@ For lower latency than GitHub Actions startup can provide, the GitHub App
 webhook receiver runs at `/github/webhook` on the dashboard Worker, with
 `pnpm run repair:comment-webhook` as the local equivalent. It verifies
 `CLAWSWEEPER_WEBHOOK_SECRET`, accepts eligible public `openclaw/*` and
-`steipete/*` `issue_comment`, `issues`, and `pull_request` events, posts the
-same queued status comment for maintainer commands, reacts with `eyes`, and
-queues exact `clawsweeper_comment` or `clawsweeper_item` work. The durable
+`steipete/*` `issue_comment`, `issues`, and `pull_request` events, and queues
+exact command or item work. A direct review webhook performs one durable
+command-intake write and returns; the queue alarm later verifies the live head,
+enqueues the review, reacts with `eyes`, and converges the marker-bearing status
+comment. Other maintainer
+commands receive the immediate generic queued status before router dispatch,
+and the router receives that comment id so it can update the status in place. The durable
 Worker queue coalesces item revisions and leases the executor before checkout.
 The target workflow remains a compatibility fallback when the webhook service
 is down or not installed for a repository; its direct event is bridged into the
 same queue.
+
+Read-only review and re-review commands are admitted to a semantic intake owned
+by that queue. Durable intake precedes every GitHub effect, and the acknowledgement
+contains the same command-status marker stored with the queue revision. When a
+newer command displaces an older pending revision, the queue retains a terminal
+superseded finalizer for the older acknowledgement. The router compatibility
+path signs the same versioned method/path/body-digest envelope and does not use
+a second dispatch retry protocol. The intake stores a per-comment update
+watermark and a non-expiring semantic command receipt; the ordinary seven-day
+transport receipt is not the command's idempotency boundary.
 
 Supported triggers:
 

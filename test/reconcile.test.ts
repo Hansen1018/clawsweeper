@@ -7,7 +7,7 @@ import test from "node:test";
 import { capturedCanonicalRecordBaselineKeys } from "../dist/repair/canonical-record-baseline.js";
 import { reportFrontMatter, tmpPrefix, withMockGh } from "./helpers.ts";
 
-test("scoped reconciliation never changes records outside its selected batch", () => {
+test("exact-item reconciler CLI scans no pages and changes only selected records", () => {
   const root = mkdtempSync(tmpPrefix);
   const recordsDir = join(root, "records", "openclaw-openclaw");
   const itemsDir = join(recordsDir, "items");
@@ -63,6 +63,7 @@ if (args[0] === "api" && args[1]?.endsWith("/issues/2")) {
 
     const result = JSON.parse(stdout);
     assert.equal(result.pagesScanned, 0);
+    assert.equal(result.openItemsSeen, 0);
     assert.deepEqual(result.changedItemNumbers, [2]);
     assert.deepEqual(result.changedRecordFiles, ["2.md"]);
     assert.equal(existsSync(join(itemsDir, "1.md")), true);
