@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { createHmac } from "node:crypto";
+import { createHmac, generateKeyPairSync } from "node:crypto";
 import { spawn } from "node:child_process";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
@@ -45,6 +45,12 @@ test("dead-letter workflow is manual, serialized, and bounded to safe actions", 
     operatorStep.env.CLAWSWEEPER_WEBHOOK_SECRET,
     "${{ secrets.EXACT_REVIEW_OPERATOR_SECRET }}",
   );
+  assert.equal(
+    operatorStep.env.CLAWSWEEPER_APP_PRIVATE_KEY,
+    "${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}",
+  );
+  assert.equal(operatorStep.env.EXACT_REVIEW_TARGET_TOKEN_MODE, "github-app");
+  assert.equal(operatorStep.env.GH_TOKEN, undefined);
   assert.equal(operatorStep.env.GITHUB_TOKEN, "${{ github.token }}");
   assert.match(operatorStep.run, /operator:\$\{GITHUB_RUN_ID\}/);
   assert.doesNotMatch(operatorStep.run, /GITHUB_RUN_ATTEMPT/);
@@ -83,6 +89,10 @@ test("automatic dead-letter reconciliation is scheduled, bounded, and least priv
   assert.equal(scheduled.jobs.reconcile.env.CLAWSWEEPER_WEBHOOK_SECRET, undefined);
   assert.match(step.run, /--max-targets "\$MAX_TARGETS"/);
   assert.match(step.run, /--max-recoveries "\$MAX_RECOVERIES"/);
+  assert.equal(step.env.CLAWSWEEPER_APP_PRIVATE_KEY, "${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}");
+  assert.equal(step.env.EXACT_REVIEW_TARGET_TOKEN_MODE, "github-app");
+  assert.equal(step.env.GH_TOKEN, undefined);
+  assert.equal(step.env.GITHUB_TOKEN, "${{ github.token }}");
   const guard = scheduled.jobs.reconcile.steps.find(
     (candidate) => candidate.name === "Verify live recovery guards",
   );
@@ -99,6 +109,12 @@ test("automatic dead-letter reconciliation is scheduled, bounded, and least priv
     parked.env.CLAWSWEEPER_WEBHOOK_SECRET,
     "${{ secrets.EXACT_REVIEW_OPERATOR_SECRET }}",
   );
+  assert.equal(
+    parked.env.CLAWSWEEPER_APP_PRIVATE_KEY,
+    "${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}",
+  );
+  assert.equal(parked.env.EXACT_REVIEW_TARGET_TOKEN_MODE, "github-app");
+  assert.equal(parked.env.GH_TOKEN, undefined);
   assert.equal(parked.env.GITHUB_TOKEN, "${{ github.token }}");
   assert.match(parked.run, /--action reconcile-parked/);
   assert.match(parked.run, /--max-targets "\$MAX_TARGETS"/);
@@ -110,6 +126,98 @@ test("automatic dead-letter reconciliation is scheduled, bounded, and least priv
   assert.match(upload.with.path, /inventory\.json/);
   assert.match(upload.with.path, /parked-reviews\.json/);
   assert.doesNotMatch(source, /dead-letters\/replay/);
+});
+
+test("target-read App mode fails at startup for every incomplete credential pair", async () => {
+  const secret = "test-target-read-credential-validation";
+  const { privateKey } = generateKeyPairSync("rsa", {
+    modulusLength: 2048,
+    privateKeyEncoding: { type: "pkcs8", format: "pem" },
+    publicKeyEncoding: { type: "spki", format: "pem" },
+  });
+  let inventoryRequests = 0;
+  const server = createServer(async (request, response) => {
+    for await (const _chunk of request) {
+      // Drain the signed request body before replying.
+    }
+    inventoryRequests += 1;
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ ok: true, dead_letters: [], next_cursor: null }));
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  const queueUrl = `http://127.0.0.1:${address.port}`;
+  const directory = await mkdtemp(join(tmpdir(), "clawsweeper-target-read-credentials-"));
+  const commonEnv = {
+    EXACT_REVIEW_TARGET_TOKEN_MODE: "github-app",
+    CLAWSWEEPER_APP_ID: "",
+    CLAWSWEEPER_APP_CLIENT_ID: "",
+    CLAWSWEEPER_APP_PRIVATE_KEY: "",
+  };
+  try {
+    const matrix = [
+      {
+        name: "private key only",
+        env: { ...commonEnv, CLAWSWEEPER_APP_PRIVATE_KEY: privateKey },
+        missing: /missing CLAWSWEEPER_APP_CLIENT_ID or CLAWSWEEPER_APP_ID\n/,
+      },
+      {
+        name: "App id only",
+        env: { ...commonEnv, CLAWSWEEPER_APP_CLIENT_ID: "Iv23partial" },
+        missing: /missing CLAWSWEEPER_APP_PRIVATE_KEY\n/,
+      },
+      {
+        name: "neither credential",
+        env: commonEnv,
+        missing:
+          /missing CLAWSWEEPER_APP_CLIENT_ID or CLAWSWEEPER_APP_ID and CLAWSWEEPER_APP_PRIVATE_KEY\n/,
+      },
+    ];
+    const incompleteResults = [];
+    for (const scenario of matrix) {
+      incompleteResults.push({
+        scenario,
+        result: await runOperator(
+          ["--action", "inventory", "--output", join(directory, `${scenario.name}.json`)],
+          queueUrl,
+          secret,
+          scenario.env,
+        ),
+      });
+    }
+    assert.deepEqual(
+      incompleteResults.map(({ scenario, result }) => ({ name: scenario.name, code: result.code })),
+      matrix.map(({ name }) => ({ name, code: 1 })),
+    );
+    for (const { scenario, result } of incompleteResults) {
+      assert.match(result.stderr, scenario.missing, scenario.name);
+    }
+
+    const complete = await runOperator(
+      ["--action", "inventory", "--output", join(directory, "complete.json")],
+      queueUrl,
+      secret,
+      {
+        ...commonEnv,
+        CLAWSWEEPER_APP_CLIENT_ID: "Iv23complete",
+        CLAWSWEEPER_APP_PRIVATE_KEY: privateKey,
+      },
+    );
+    assert.equal(complete.code, 0, complete.stderr);
+
+    const actionsOptIn = await runOperator(
+      ["--action", "inventory", "--output", join(directory, "actions.json")],
+      queueUrl,
+      secret,
+      { ...commonEnv, EXACT_REVIEW_TARGET_TOKEN_MODE: "actions" },
+    );
+    assert.equal(actionsOptIn.code, 0, actionsOptIn.stderr);
+    assert.equal(inventoryRequests, 2);
+  } finally {
+    server.close();
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test("parked review reconciliation plans by default and executes terminal resolve plus open recovery", async () => {
@@ -369,7 +477,8 @@ test("parked review reconciliation reports bounded HTTP and timeout skip diagnos
     assert.deepEqual(summary.skip_samples, [
       {
         target: "openclaw/repo#1",
-        reason: "parked review target check failed for openclaw/repo#1 with 403",
+        reason:
+          "parked review target check failed for openclaw/repo#1 with 403: Resource not accessible by integration",
       },
       {
         target: "openclaw/repo#2",
@@ -2035,6 +2144,67 @@ test("100-target reconciliation batches canonical lookups within the GitHub toke
     scenario.recoveries.reduce((count, recovery) => count + recovery.ids.length, 0),
     10,
   );
+  assert.deepEqual(
+    new Set(scenario.targetReadAuthorizations),
+    new Set(["Bearer test-target-app-token"]),
+  );
+});
+
+test("batched canonical discovery skips a throttled batch and inspects later targets", async () => {
+  const scenario = await automaticReconcileScenario({
+    rows: Array.from({ length: 50 }, (_, index) =>
+      row(
+        `batch-${index + 1}`,
+        `publication:batch-${index + 1}`,
+        index + 1,
+        "retry_exhausted",
+        true,
+        "eligible",
+        `openclaw/repo#${index + 1}`,
+      ),
+    ),
+    maxTargets: 100,
+    maxRecoveries: 10,
+    failGraphqlRequests: 1,
+    failedStatus: 403,
+    throttleFailures: true,
+  });
+
+  assert.equal(scenario.first.code, 0, scenario.first.stderr);
+  const summary = JSON.parse(scenario.first.stdout);
+  assert.deepEqual(summary.skip_reasons, { github_throttled: 40 });
+  assert.equal(summary.skipped_targets, 40);
+  assert.equal(summary.recovered_targets, 10);
+  assert.equal(scenario.graphqlRequests, 2);
+  assert.equal(scenario.restRequests, 10);
+});
+
+test("batched canonical discovery aborts on an authorization 403", async () => {
+  const scenario = await automaticReconcileScenario({
+    rows: Array.from({ length: 50 }, (_, index) =>
+      row(
+        `authorization-${index + 1}`,
+        `publication:authorization-${index + 1}`,
+        index + 1,
+        "retry_exhausted",
+        true,
+        "eligible",
+        `openclaw/repo#${index + 1}`,
+      ),
+    ),
+    maxTargets: 100,
+    maxRecoveries: 10,
+    failGraphqlRequests: 1,
+    failedStatus: 403,
+  });
+
+  assert.equal(scenario.first.code, 0, scenario.first.stderr);
+  const summary = JSON.parse(scenario.first.stdout);
+  assert.deepEqual(summary.skip_reasons, { http_403: 40, not_inspected_abort: 10 });
+  assert.equal(summary.skipped_targets, 50);
+  assert.equal(summary.recovered_targets, 0);
+  assert.equal(scenario.graphqlRequests, 1);
+  assert.equal(scenario.restRequests, 0);
 });
 
 test("terminal target rechecks stay bounded for closed issues and pull requests", async () => {
@@ -2359,7 +2529,621 @@ test("inaccessible canonical targets cannot starve independently invalid dead le
   assert.equal(JSON.parse(scenario.first.stdout).invalid_rows, 1);
 });
 
-test("serial canonical discovery attributes a failure only to the target that threw", async () => {
+test("serial canonical discovery skips one throttle and recovers later targets", async () => {
+  const scenario = await automaticReconcileScenario({
+    rows: [
+      row("first", "publication:first", 1, "retry_exhausted", true, "eligible", "openclaw/first#1"),
+      row(
+        "second",
+        "publication:second",
+        2,
+        "retry_exhausted",
+        true,
+        "eligible",
+        "openclaw/second#2",
+      ),
+      row("third", "publication:third", 3, "retry_exhausted", true, "eligible", "openclaw/third#3"),
+    ],
+    failedRepository: "first",
+    failedStatus: 403,
+    throttleFailures: true,
+  });
+
+  assert.equal(scenario.first.code, 0, scenario.first.stderr);
+  const summary = JSON.parse(scenario.first.stdout);
+  assert.deepEqual(summary.skip_reasons, { github_throttled: 1 });
+  assert.deepEqual(summary.skip_samples, [
+    {
+      target: "openclaw/first#1",
+      reason:
+        "live target check failed for openclaw/first#1 (403): API rate limit exceeded for installation",
+    },
+  ]);
+  assert.equal(summary.skipped_targets, 1);
+  assert.equal(summary.recovered_targets, 2);
+  assert.equal(scenario.restRequests, 5);
+  assert.deepEqual(
+    scenario.recoveries.map((recovery) => recovery.ids),
+    [["second", "third"]],
+  );
+  assert.equal(scenario.resolutions.length, 0);
+});
+
+test("multi-owner reconciliation recovers installed targets and reports missing installations", async () => {
+  const { privateKey } = generateKeyPairSync("rsa", {
+    modulusLength: 2048,
+    privateKeyEncoding: { type: "pkcs8", format: "pem" },
+    publicKeyEncoding: { type: "spki", format: "pem" },
+  });
+  const scenario = await automaticReconcileScenario({
+    rows: [
+      row(
+        "installed",
+        "publication:installed",
+        1,
+        "retry_exhausted",
+        true,
+        "eligible",
+        "installed-owner/repo#1",
+      ),
+      row(
+        "missing",
+        "publication:missing",
+        2,
+        "retry_exhausted",
+        true,
+        "eligible",
+        "missing-owner/repo#2",
+      ),
+    ],
+    targetInstallations: new Map([
+      ["installed-owner", { id: 123, token: "installed-owner-token" }],
+      ["missing-owner", null],
+    ]),
+    operatorEnv: {
+      GH_TOKEN: "",
+      EXACT_REVIEW_TARGET_TOKEN_MODE: "github-app",
+      CLAWSWEEPER_APP_CLIENT_ID: "Iv23multiowner",
+      CLAWSWEEPER_APP_PRIVATE_KEY: privateKey,
+    },
+  });
+
+  assert.equal(scenario.first.code, 0, scenario.first.stderr);
+  const summary = JSON.parse(scenario.first.stdout);
+  assert.equal(summary.recovered_targets, 1);
+  assert.equal(summary.skipped_targets, 1);
+  assert.deepEqual(summary.skip_reasons, { installation_missing: 1 });
+  assert.deepEqual(summary.skip_samples, [
+    {
+      target: "missing-owner/repo#2",
+      reason: "GitHub App installation is missing or revoked for missing-owner/repo",
+    },
+  ]);
+  assert.deepEqual(
+    scenario.recoveries.map((recovery) => recovery.ids),
+    [["installed"]],
+  );
+  assert.deepEqual(scenario.installationRequests, ["installed-owner/repo", "missing-owner/repo"]);
+  assert.deepEqual(scenario.tokenMintRequests, [123]);
+  assert.deepEqual(
+    new Set(scenario.targetReadAuthorizations),
+    new Set(["Bearer installed-owner-token"]),
+  );
+});
+
+test("a missing selected repository does not hide an accessible repository under the same owner", async () => {
+  const { privateKey } = generateKeyPairSync("rsa", {
+    modulusLength: 2048,
+    privateKeyEncoding: { type: "pkcs8", format: "pem" },
+    publicKeyEncoding: { type: "spki", format: "pem" },
+  });
+  const scenario = await automaticReconcileScenario({
+    rows: [
+      row(
+        "missing",
+        "publication:missing",
+        1,
+        "retry_exhausted",
+        true,
+        "eligible",
+        "selected-owner/missing#1",
+      ),
+      row(
+        "accessible",
+        "publication:accessible",
+        2,
+        "retry_exhausted",
+        true,
+        "eligible",
+        "selected-owner/accessible#2",
+      ),
+    ],
+    targetInstallations: new Map([
+      ["selected-owner/missing", null],
+      ["selected-owner/accessible", { id: 124, token: "selected-owner-token" }],
+    ]),
+    operatorEnv: {
+      GH_TOKEN: "",
+      EXACT_REVIEW_TARGET_TOKEN_MODE: "github-app",
+      CLAWSWEEPER_APP_CLIENT_ID: "Iv23selectedrepos",
+      CLAWSWEEPER_APP_PRIVATE_KEY: privateKey,
+    },
+  });
+
+  assert.equal(scenario.first.code, 0, scenario.first.stderr);
+  const summary = JSON.parse(scenario.first.stdout);
+  assert.equal(summary.recovered_targets, 1);
+  assert.equal(summary.skipped_targets, 1);
+  assert.deepEqual(summary.skip_reasons, { installation_missing: 1 });
+  assert.deepEqual(
+    scenario.recoveries.map((recovery) => recovery.ids),
+    [["accessible"]],
+  );
+  assert.deepEqual(scenario.installationRequests, [
+    "selected-owner/missing",
+    "selected-owner/accessible",
+  ]);
+  assert.deepEqual(scenario.tokenMintRequests, [124]);
+  assert.deepEqual(
+    new Set(scenario.targetReadAuthorizations),
+    new Set(["Bearer selected-owner-token"]),
+  );
+});
+
+for (const failedStatus of [429, 403]) {
+  test(`throttled owner token mint ${failedStatus} skips that owner's targets and recovers another owner`, async () => {
+    const { privateKey } = generateKeyPairSync("rsa", {
+      modulusLength: 2048,
+      privateKeyEncoding: { type: "pkcs8", format: "pem" },
+      publicKeyEncoding: { type: "spki", format: "pem" },
+    });
+    const scenario = await automaticReconcileScenario({
+      rows: [
+        row(
+          "owner-a-first",
+          "publication:owner-a-first",
+          1,
+          "retry_exhausted",
+          true,
+          "eligible",
+          "owner-a/first#1",
+        ),
+        row(
+          "owner-a-second",
+          "publication:owner-a-second",
+          2,
+          "retry_exhausted",
+          true,
+          "eligible",
+          "owner-a/second#2",
+        ),
+        row(
+          "owner-a-third",
+          "publication:owner-a-third",
+          3,
+          "retry_exhausted",
+          true,
+          "eligible",
+          "owner-a/third#3",
+        ),
+        row(
+          "owner-b",
+          "publication:owner-b",
+          4,
+          "retry_exhausted",
+          true,
+          "eligible",
+          "owner-b/repo#4",
+        ),
+      ],
+      targetInstallations: new Map([
+        ["owner-a", { id: 201, token: "owner-a-token" }],
+        ["owner-b", { id: 202, token: "owner-b-token" }],
+      ]),
+      tokenMintFailures: new Map([[201, { status: failedStatus, throttle: true }]]),
+      operatorEnv: {
+        GH_TOKEN: "",
+        EXACT_REVIEW_TARGET_TOKEN_MODE: "github-app",
+        CLAWSWEEPER_APP_CLIENT_ID: "Iv23mintthrottle",
+        CLAWSWEEPER_APP_PRIVATE_KEY: privateKey,
+      },
+    });
+
+    assert.equal(scenario.first.code, 0, scenario.first.stderr);
+    const summary = JSON.parse(scenario.first.stdout);
+    assert.equal(summary.recovered_targets, 1);
+    assert.equal(summary.skipped_targets, 3);
+    assert.deepEqual(summary.skip_reasons, { github_throttled: 3 });
+    assert.deepEqual(summary.skip_samples, [
+      {
+        target: "owner-a/first#1",
+        reason: `github_throttled scope=app_setup stage=token_mint owner=owner-a status=${failedStatus}`,
+      },
+      {
+        target: "owner-a/second#2",
+        reason: `github_throttled scope=app_setup stage=token_mint owner=owner-a status=${failedStatus}`,
+      },
+      {
+        target: "owner-a/third#3",
+        reason: `github_throttled scope=app_setup stage=token_mint owner=owner-a status=${failedStatus}`,
+      },
+    ]);
+    assert.deepEqual(
+      scenario.recoveries.map((recovery) => recovery.ids),
+      [["owner-b"]],
+    );
+    assert.deepEqual(scenario.installationRequests, ["owner-a/first", "owner-b/repo"]);
+    assert.deepEqual(scenario.tokenMintRequests, [201, 202]);
+    assert.deepEqual(new Set(scenario.targetReadAuthorizations), new Set(["Bearer owner-b-token"]));
+  });
+}
+
+test("throttled installation lookup skips that owner's targets and recovers another owner", async () => {
+  const { privateKey } = generateKeyPairSync("rsa", {
+    modulusLength: 2048,
+    privateKeyEncoding: { type: "pkcs8", format: "pem" },
+    publicKeyEncoding: { type: "spki", format: "pem" },
+  });
+  const scenario = await automaticReconcileScenario({
+    rows: [
+      row(
+        "owner-a",
+        "publication:owner-a",
+        1,
+        "retry_exhausted",
+        true,
+        "eligible",
+        "owner-a/repo#1",
+      ),
+      row(
+        "owner-b",
+        "publication:owner-b",
+        2,
+        "retry_exhausted",
+        true,
+        "eligible",
+        "owner-b/repo#2",
+      ),
+    ],
+    targetInstallations: new Map([
+      ["owner-a", { id: 301, token: "owner-a-token" }],
+      ["owner-b", { id: 302, token: "owner-b-token" }],
+    ]),
+    installationFailures: new Map([["owner-a", { status: 403, throttle: true }]]),
+    operatorEnv: {
+      GH_TOKEN: "",
+      EXACT_REVIEW_TARGET_TOKEN_MODE: "github-app",
+      CLAWSWEEPER_APP_CLIENT_ID: "Iv23lookupthrottle",
+      CLAWSWEEPER_APP_PRIVATE_KEY: privateKey,
+    },
+  });
+
+  assert.equal(scenario.first.code, 0, scenario.first.stderr);
+  const summary = JSON.parse(scenario.first.stdout);
+  assert.equal(summary.recovered_targets, 1);
+  assert.equal(summary.skipped_targets, 1);
+  assert.deepEqual(summary.skip_reasons, { github_throttled: 1 });
+  assert.deepEqual(summary.skip_samples, [
+    {
+      target: "owner-a/repo#1",
+      reason: "github_throttled scope=app_setup stage=installation_lookup owner=owner-a status=403",
+    },
+  ]);
+  assert.deepEqual(scenario.installationRequests, ["owner-a/repo", "owner-b/repo"]);
+  assert.deepEqual(scenario.tokenMintRequests, [302]);
+  assert.deepEqual(
+    scenario.recoveries.map((recovery) => recovery.ids),
+    [["owner-b"]],
+  );
+});
+
+test("an installation removed before token mint remains a bounded missing-installation skip", async () => {
+  const { privateKey } = generateKeyPairSync("rsa", {
+    modulusLength: 2048,
+    privateKeyEncoding: { type: "pkcs8", format: "pem" },
+    publicKeyEncoding: { type: "spki", format: "pem" },
+  });
+  const scenario = await automaticReconcileScenario({
+    rows: [
+      row(
+        "owner-a",
+        "publication:owner-a",
+        1,
+        "retry_exhausted",
+        true,
+        "eligible",
+        "owner-a/repo#1",
+      ),
+      row(
+        "owner-b",
+        "publication:owner-b",
+        2,
+        "retry_exhausted",
+        true,
+        "eligible",
+        "owner-b/repo#2",
+      ),
+    ],
+    targetInstallations: new Map([
+      ["owner-a", { id: 351, token: "owner-a-token" }],
+      ["owner-b", { id: 352, token: "owner-b-token" }],
+    ]),
+    tokenMintFailures: new Map([[351, { status: 404, throttle: false }]]),
+    operatorEnv: {
+      GH_TOKEN: "",
+      EXACT_REVIEW_TARGET_TOKEN_MODE: "github-app",
+      CLAWSWEEPER_APP_CLIENT_ID: "Iv23mintmissing",
+      CLAWSWEEPER_APP_PRIVATE_KEY: privateKey,
+    },
+  });
+
+  assert.equal(scenario.first.code, 0, scenario.first.stderr);
+  const summary = JSON.parse(scenario.first.stdout);
+  assert.equal(summary.recovered_targets, 1);
+  assert.equal(summary.skipped_targets, 1);
+  assert.deepEqual(summary.skip_reasons, { installation_missing: 1 });
+  assert.deepEqual(scenario.installationRequests, ["owner-a/repo", "owner-b/repo"]);
+  assert.deepEqual(scenario.tokenMintRequests, [351, 352]);
+  assert.deepEqual(
+    scenario.recoveries.map((recovery) => recovery.ids),
+    [["owner-b"]],
+  );
+});
+
+test("batched discovery skips a throttled owner setup and continues with another owner", async () => {
+  const { privateKey } = generateKeyPairSync("rsa", {
+    modulusLength: 2048,
+    privateKeyEncoding: { type: "pkcs8", format: "pem" },
+    publicKeyEncoding: { type: "spki", format: "pem" },
+  });
+  const scenario = await automaticReconcileScenario({
+    rows: [
+      row(
+        "owner-a",
+        "publication:owner-a",
+        1,
+        "retry_exhausted",
+        true,
+        "eligible",
+        "owner-a/repo#1",
+      ),
+      ...Array.from({ length: 10 }, (_, index) =>
+        row(
+          `owner-b-${index + 1}`,
+          `publication:owner-b-${index + 1}`,
+          index + 2,
+          "retry_exhausted",
+          true,
+          "eligible",
+          `owner-b/repo-${index + 1}#${index + 2}`,
+        ),
+      ),
+    ],
+    maxTargets: 100,
+    maxRecoveries: 10,
+    targetInstallations: new Map([
+      ["owner-a", { id: 601, token: "owner-a-token" }],
+      ["owner-b", { id: 602, token: "owner-b-token" }],
+    ]),
+    tokenMintFailures: new Map([[601, { status: 403, throttle: true }]]),
+    operatorEnv: {
+      GH_TOKEN: "",
+      EXACT_REVIEW_TARGET_TOKEN_MODE: "github-app",
+      CLAWSWEEPER_APP_CLIENT_ID: "Iv23batchsetupthrottle",
+      CLAWSWEEPER_APP_PRIVATE_KEY: privateKey,
+    },
+  });
+
+  assert.equal(scenario.first.code, 0, scenario.first.stderr);
+  const summary = JSON.parse(scenario.first.stdout);
+  assert.equal(summary.recovered_targets, 10);
+  assert.equal(summary.skipped_targets, 1);
+  assert.deepEqual(summary.skip_reasons, { github_throttled: 1 });
+  assert.deepEqual(scenario.installationRequests, ["owner-a/repo", "owner-b/repo-1"]);
+  assert.deepEqual(scenario.tokenMintRequests, [601, 602]);
+  assert.equal(scenario.graphqlRequests, 1);
+  assert.deepEqual(new Set(scenario.targetReadAuthorizations), new Set(["Bearer owner-b-token"]));
+});
+
+test("a cached setup throttle spanning three batches counts once and later owners continue", async () => {
+  const { privateKey } = generateKeyPairSync("rsa", {
+    modulusLength: 2048,
+    privateKeyEncoding: { type: "pkcs8", format: "pem" },
+    publicKeyEncoding: { type: "spki", format: "pem" },
+  });
+  const scenario = await automaticReconcileScenario({
+    rows: [
+      ...Array.from({ length: 81 }, (_, index) =>
+        row(
+          `owner-a-${index + 1}`,
+          `publication:owner-a-${index + 1}`,
+          index + 1,
+          "retry_exhausted",
+          true,
+          "eligible",
+          `owner-a/repo-${index + 1}#${index + 1}`,
+        ),
+      ),
+      row(
+        "owner-b",
+        "publication:owner-b",
+        82,
+        "retry_exhausted",
+        true,
+        "eligible",
+        "owner-b/repo#82",
+      ),
+    ],
+    maxTargets: 100,
+    maxRecoveries: 10,
+    targetInstallations: new Map([
+      ["owner-a", { id: 701, token: "owner-a-token" }],
+      ["owner-b", { id: 702, token: "owner-b-token" }],
+    ]),
+    tokenMintFailures: new Map([[701, { status: 429, throttle: true }]]),
+    operatorEnv: {
+      GH_TOKEN: "",
+      EXACT_REVIEW_TARGET_TOKEN_MODE: "github-app",
+      CLAWSWEEPER_APP_CLIENT_ID: "Iv23cachedsetupthrottle",
+      CLAWSWEEPER_APP_PRIVATE_KEY: privateKey,
+    },
+  });
+
+  assert.equal(scenario.first.code, 0, scenario.first.stderr);
+  const summary = JSON.parse(scenario.first.stdout);
+  assert.equal(summary.recovered_targets, 1);
+  assert.equal(summary.skipped_targets, 81);
+  assert.deepEqual(summary.skip_reasons, { github_throttled: 81 });
+  assert.deepEqual(scenario.installationRequests, ["owner-a/repo-1", "owner-b/repo"]);
+  assert.deepEqual(scenario.tokenMintRequests, [701, 702]);
+  assert.equal(scenario.graphqlRequests, 1);
+  assert.deepEqual(
+    scenario.recoveries.map((recovery) => recovery.ids),
+    [["owner-b"]],
+  );
+});
+
+for (const stage of ["installation_lookup", "token_mint"]) {
+  for (const failedStatus of [401, 403]) {
+    test(`ordinary ${stage} ${failedStatus} remains fail-closed`, async () => {
+      const { privateKey } = generateKeyPairSync("rsa", {
+        modulusLength: 2048,
+        privateKeyEncoding: { type: "pkcs8", format: "pem" },
+        publicKeyEncoding: { type: "spki", format: "pem" },
+      });
+      const scenario = await automaticReconcileScenario({
+        rows: [
+          row(
+            "owner-a",
+            "publication:owner-a",
+            1,
+            "retry_exhausted",
+            true,
+            "eligible",
+            "owner-a/repo#1",
+          ),
+          row(
+            "owner-b",
+            "publication:owner-b",
+            2,
+            "retry_exhausted",
+            true,
+            "eligible",
+            "owner-b/repo#2",
+          ),
+        ],
+        targetInstallations: new Map([
+          ["owner-a", { id: 401, token: "owner-a-token" }],
+          ["owner-b", { id: 402, token: "owner-b-token" }],
+        ]),
+        ...(stage === "installation_lookup"
+          ? {
+              installationFailures: new Map([
+                ["owner-a", { status: failedStatus, throttle: false }],
+              ]),
+            }
+          : {
+              tokenMintFailures: new Map([[401, { status: failedStatus, throttle: false }]]),
+            }),
+        operatorEnv: {
+          GH_TOKEN: "",
+          EXACT_REVIEW_TARGET_TOKEN_MODE: "github-app",
+          CLAWSWEEPER_APP_CLIENT_ID: "Iv23setupauth",
+          CLAWSWEEPER_APP_PRIVATE_KEY: privateKey,
+        },
+      });
+
+      assert.equal(scenario.first.code, 0, scenario.first.stderr);
+      const summary = JSON.parse(scenario.first.stdout);
+      assert.equal(summary.recovered_targets, 0);
+      assert.deepEqual(summary.skip_reasons, {
+        [failedStatus === 403 ? "http_403" : "http_4xx"]: 1,
+        not_inspected_abort: 1,
+      });
+      assert.deepEqual(scenario.installationRequests, ["owner-a/repo"]);
+      assert.deepEqual(scenario.tokenMintRequests, stage === "token_mint" ? [401] : []);
+    });
+  }
+}
+
+test("persistent setup throttling trips the shared fuse before another owner is attempted", async () => {
+  const { privateKey } = generateKeyPairSync("rsa", {
+    modulusLength: 2048,
+    privateKeyEncoding: { type: "pkcs8", format: "pem" },
+    publicKeyEncoding: { type: "spki", format: "pem" },
+  });
+  const installations = new Map(
+    ["owner-a", "owner-b", "owner-c", "owner-d"].map((owner, index) => [
+      owner,
+      { id: 501 + index, token: `${owner}-token` },
+    ]),
+  );
+  const scenario = await automaticReconcileScenario({
+    rows: [...installations.keys()].map((owner, index) =>
+      row(
+        owner,
+        `publication:${owner}`,
+        index + 1,
+        "retry_exhausted",
+        true,
+        "eligible",
+        `${owner}/repo#${index + 1}`,
+      ),
+    ),
+    targetInstallations: installations,
+    tokenMintFailures: new Map(
+      [...installations.values()].map(({ id }) => [id, { status: 429, throttle: true }]),
+    ),
+    operatorEnv: {
+      GH_TOKEN: "",
+      EXACT_REVIEW_TARGET_TOKEN_MODE: "github-app",
+      CLAWSWEEPER_APP_CLIENT_ID: "Iv23setupfuse",
+      CLAWSWEEPER_APP_PRIVATE_KEY: privateKey,
+    },
+  });
+
+  assert.equal(scenario.first.code, 0, scenario.first.stderr);
+  const summary = JSON.parse(scenario.first.stdout);
+  assert.equal(summary.recovered_targets, 0);
+  assert.deepEqual(summary.skip_reasons, { github_throttled: 3, not_inspected_abort: 1 });
+  assert.deepEqual(scenario.installationRequests, ["owner-a/repo", "owner-b/repo", "owner-c/repo"]);
+  assert.deepEqual(scenario.tokenMintRequests, [501, 502, 503]);
+  assert.equal(scenario.restRequests, 0);
+});
+
+test("authorization 403 with a valid owner installation remains fail-closed", async () => {
+  const { privateKey } = generateKeyPairSync("rsa", {
+    modulusLength: 2048,
+    privateKeyEncoding: { type: "pkcs8", format: "pem" },
+    publicKeyEncoding: { type: "spki", format: "pem" },
+  });
+  const scenario = await automaticReconcileScenario({
+    rows: [
+      row("first", "publication:first", 1, "retry_exhausted", true, "eligible", "owner/first#1"),
+      row("second", "publication:second", 2, "retry_exhausted", true, "eligible", "owner/second#2"),
+      row("third", "publication:third", 3, "retry_exhausted", true, "eligible", "owner/third#3"),
+    ],
+    targetInstallations: new Map([["owner", { id: 456, token: "owner-token" }]]),
+    operatorEnv: {
+      GH_TOKEN: "",
+      EXACT_REVIEW_TARGET_TOKEN_MODE: "github-app",
+      CLAWSWEEPER_APP_CLIENT_ID: "Iv23authorization",
+      CLAWSWEEPER_APP_PRIVATE_KEY: privateKey,
+    },
+    failedRepository: "first",
+    failedStatus: 403,
+  });
+
+  assert.equal(scenario.first.code, 0, scenario.first.stderr);
+  const summary = JSON.parse(scenario.first.stdout);
+  assert.deepEqual(summary.skip_reasons, { http_403: 1, not_inspected_abort: 2 });
+  assert.equal(summary.recovered_targets, 0);
+  assert.deepEqual(scenario.installationRequests, ["owner/first"]);
+  assert.deepEqual(scenario.tokenMintRequests, [456]);
+  assert.deepEqual(new Set(scenario.targetReadAuthorizations), new Set(["Bearer owner-token"]));
+});
+
+test("serial canonical discovery aborts on an authorization 403", async () => {
   const scenario = await automaticReconcileScenario({
     rows: [
       row("first", "publication:first", 1, "retry_exhausted", true, "eligible", "openclaw/first#1"),
@@ -2381,29 +3165,79 @@ test("serial canonical discovery attributes a failure only to the target that th
   assert.equal(scenario.first.code, 0, scenario.first.stderr);
   const summary = JSON.parse(scenario.first.stdout);
   assert.deepEqual(summary.skip_reasons, { http_403: 1, not_inspected_abort: 2 });
-  assert.deepEqual(summary.skip_samples, [
-    {
-      target: "openclaw/first#1",
-      reason: "live target check failed for openclaw/first#1 (403)",
-    },
-    {
-      target: "openclaw/second#2",
-      reason:
-        "canonical target was not inspected because canonical discovery aborted after another target inspection failed",
-    },
-    {
-      target: "openclaw/third#3",
-      reason:
-        "canonical target was not inspected because canonical discovery aborted after another target inspection failed",
-    },
-  ]);
   assert.equal(summary.skipped_targets, 3);
+  assert.equal(summary.recovered_targets, 0);
   assert.equal(scenario.restRequests, 1);
   assert.equal(scenario.recoveries.length, 0);
+});
+
+test("serial canonical discovery aborts after three consecutive throttles", async () => {
+  const scenario = await automaticReconcileScenario({
+    rows: Array.from({ length: 5 }, (_, index) =>
+      row(
+        `target-${index + 1}`,
+        `publication:target-${index + 1}`,
+        index + 1,
+        "retry_exhausted",
+        true,
+        "eligible",
+        `openclaw/repo-${index + 1}#${index + 1}`,
+      ),
+    ),
+    failedRepositories: ["repo-1", "repo-2", "repo-3"],
+    failedStatus: 403,
+    throttleFailures: true,
+  });
+
+  assert.equal(scenario.first.code, 0, scenario.first.stderr);
+  const summary = JSON.parse(scenario.first.stdout);
+  assert.deepEqual(summary.skip_reasons, { github_throttled: 3, not_inspected_abort: 2 });
+  assert.equal(summary.skipped_targets, 5);
+  assert.equal(scenario.restRequests, 3);
+  assert.equal(scenario.recoveries.length, 0);
+});
+
+test("serial recovery revalidation skips one throttle and recovers later targets", async () => {
+  const scenario = await automaticReconcileScenario({
+    rows: [
+      row("first", "publication:first", 1, "retry_exhausted", true, "eligible", "openclaw/repo#1"),
+      row(
+        "second",
+        "publication:second",
+        2,
+        "retry_exhausted",
+        true,
+        "eligible",
+        "openclaw/repo#2",
+      ),
+      row("third", "publication:third", 3, "retry_exhausted", true, "eligible", "openclaw/repo#3"),
+    ],
+    failTargetOnInspection: 1,
+    failedStatus: 403,
+    throttleFailures: true,
+  });
+
+  assert.equal(scenario.first.code, 0, scenario.first.stderr);
+  const summary = JSON.parse(scenario.first.stdout);
+  assert.deepEqual(summary.skip_reasons, { github_throttled: 1 });
+  assert.deepEqual(summary.skip_samples, [
+    {
+      target: "openclaw/repo#1",
+      reason:
+        "live target check failed for openclaw/repo#1 (403): API rate limit exceeded for installation",
+    },
+  ]);
+  assert.equal(summary.skipped_targets, 1);
+  assert.equal(summary.recovered_targets, 2);
+  assert.equal(scenario.restRequests, 6);
+  assert.deepEqual(
+    scenario.recoveries.map((recovery) => recovery.ids),
+    [["second", "third"]],
+  );
   assert.equal(scenario.resolutions.length, 0);
 });
 
-test("serial recovery revalidation attributes a failure only to the target that threw", async () => {
+test("serial recovery revalidation aborts on an authorization 403", async () => {
   const scenario = await automaticReconcileScenario({
     rows: [
       row("first", "publication:first", 1, "retry_exhausted", true, "eligible", "openclaw/repo#1"),
@@ -2425,26 +3259,36 @@ test("serial recovery revalidation attributes a failure only to the target that 
   assert.equal(scenario.first.code, 0, scenario.first.stderr);
   const summary = JSON.parse(scenario.first.stdout);
   assert.deepEqual(summary.skip_reasons, { http_403: 1, not_inspected_abort: 2 });
-  assert.deepEqual(summary.skip_samples, [
-    {
-      target: "openclaw/repo#1",
-      reason: "live target check failed for openclaw/repo#1 (403)",
-    },
-    {
-      target: "openclaw/repo#2",
-      reason:
-        "canonical target was not inspected because canonical discovery aborted after another target inspection failed",
-    },
-    {
-      target: "openclaw/repo#3",
-      reason:
-        "canonical target was not inspected because canonical discovery aborted after another target inspection failed",
-    },
-  ]);
   assert.equal(summary.skipped_targets, 3);
+  assert.equal(summary.recovered_targets, 0);
   assert.equal(scenario.restRequests, 4);
   assert.equal(scenario.recoveries.length, 0);
-  assert.equal(scenario.resolutions.length, 0);
+});
+
+test("serial recovery revalidation aborts after three consecutive throttles", async () => {
+  const scenario = await automaticReconcileScenario({
+    rows: Array.from({ length: 5 }, (_, index) =>
+      row(
+        `target-${index + 1}`,
+        `publication:target-${index + 1}`,
+        index + 1,
+        "retry_exhausted",
+        true,
+        "eligible",
+        `openclaw/repo#${index + 1}`,
+      ),
+    ),
+    failTargetsOnInspection: [1, 2, 3],
+    failedStatus: 403,
+    throttleFailures: true,
+  });
+
+  assert.equal(scenario.first.code, 0, scenario.first.stderr);
+  const summary = JSON.parse(scenario.first.stdout);
+  assert.deepEqual(summary.skip_reasons, { github_throttled: 3, not_inspected_abort: 2 });
+  assert.equal(summary.skipped_targets, 5);
+  assert.equal(scenario.restRequests, 8);
+  assert.equal(scenario.recoveries.length, 0);
 });
 
 test("automatic recovery refuses a pull request whose current head has advanced", async () => {
@@ -2505,6 +3349,9 @@ async function automaticReconcileScenario(options) {
   let inventoryRequests = 0;
   let graphqlRequests = 0;
   let restRequests = 0;
+  const targetReadAuthorizations = [];
+  const installationRequests = [];
+  const tokenMintRequests = [];
   const restRequestsByNumber = new Map();
   let duplicateFailurePending = options.failFirstDuplicateCleanup === true;
   let duplicateSkipsRemaining =
@@ -2529,15 +3376,90 @@ async function automaticReconcileScenario(options) {
       );
       return;
     }
+    const installationMatch = /^\/repos\/([^/]+)\/([^/]+)\/installation$/.exec(request.url ?? "");
+    if (installationMatch && options.targetInstallations) {
+      const [, owner, repo] = installationMatch;
+      installationRequests.push(`${owner}/${repo}`);
+      const failure = options.installationFailures?.get(owner.toLowerCase());
+      if (failure) {
+        response.writeHead(failure.status, {
+          "content-type": "application/json",
+          ...(failure.throttle ? { "x-ratelimit-remaining": "0" } : {}),
+        });
+        response.end(
+          JSON.stringify({
+            message: failure.throttle
+              ? "API rate limit exceeded for installation"
+              : "Resource not accessible by integration",
+          }),
+        );
+        return;
+      }
+      const repositoryKey = `${owner}/${repo}`.toLowerCase();
+      const installationKey = options.targetInstallations.has(repositoryKey)
+        ? repositoryKey
+        : owner.toLowerCase();
+      const installation = options.targetInstallations.get(installationKey);
+      if (!installation) {
+        response.writeHead(404, { "content-type": "application/json" });
+        response.end(JSON.stringify({ message: "Not Found" }));
+        return;
+      }
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({ id: installation.id }));
+      return;
+    }
+    const tokenMatch = /^\/app\/installations\/(\d+)\/access_tokens$/.exec(request.url ?? "");
+    if (tokenMatch && options.targetInstallations) {
+      const installationId = Number(tokenMatch[1]);
+      tokenMintRequests.push(installationId);
+      const failure = options.tokenMintFailures?.get(installationId);
+      if (failure) {
+        response.writeHead(failure.status, {
+          "content-type": "application/json",
+          ...(failure.throttle ? { "x-ratelimit-remaining": "0" } : {}),
+        });
+        response.end(
+          JSON.stringify({
+            message: failure.throttle
+              ? "API rate limit exceeded for installation"
+              : "Resource not accessible by integration",
+          }),
+        );
+        return;
+      }
+      const installation = [...options.targetInstallations.values()].find(
+        (candidate) => candidate?.id === installationId,
+      );
+      assert.ok(installation);
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({ token: installation.token }));
+      return;
+    }
     if (request.url === "/graphql") {
       graphqlRequests += 1;
+      targetReadAuthorizations.push(request.headers.authorization);
+      if (graphqlRequests <= (options.failGraphqlRequests ?? 0)) {
+        response.writeHead(options.failedStatus ?? 403, { "content-type": "application/json" });
+        response.end(
+          JSON.stringify({
+            message: options.throttleFailures
+              ? "API rate limit exceeded for installation"
+              : "Resource not accessible by integration",
+          }),
+        );
+        return;
+      }
       const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
       const data = {};
       for (const match of body.query.matchAll(
         /target(\d+):repository\(owner:"([^"]+)",name:"([^"]+)"\)\{item:issueOrPullRequest\(number:(\d+)\)/g,
       )) {
         const [, index, , repository, value] = match;
-        if (options.failedRepository === repository) {
+        if (
+          options.failedRepository === repository ||
+          options.failedRepositories?.includes(repository)
+        ) {
           response.writeHead(200, { "content-type": "application/json" });
           response.end(JSON.stringify({ data, errors: [{ message: "temporary" }] }));
           return;
@@ -2572,6 +3494,7 @@ async function automaticReconcileScenario(options) {
     }
     if (request.url?.startsWith("/repos/")) {
       restRequests += 1;
+      targetReadAuthorizations.push(request.headers.authorization);
       const number = Number(request.url.split("/").at(-1));
       restRequestsByNumber.set(number, (restRequestsByNumber.get(number) || 0) + 1);
       if (request.url.includes("/pulls/")) {
@@ -2590,13 +3513,25 @@ async function automaticReconcileScenario(options) {
         return;
       }
       if (
-        (options.failedRepository &&
-          request.url.includes(`/${options.failedRepository}/issues/`)) ||
-        (options.failTargetOnInspection === number && restRequestsByNumber.get(number) >= 2) ||
+        ((options.failedRepository || options.failedRepositories) &&
+          [options.failedRepository, ...(options.failedRepositories ?? [])].some(
+            (repository) => repository && request.url.includes(`/${repository}/issues/`),
+          )) ||
+        ((options.failTargetOnInspection === number ||
+          options.failTargetsOnInspection?.includes(number)) &&
+          restRequestsByNumber.get(number) >= 2) ||
         (options.failTargetAfterCleanup === number && resolutions.length >= 2)
       ) {
         response.writeHead(options.failedStatus ?? 503, { "content-type": "application/json" });
-        response.end(JSON.stringify({ error: "temporary" }));
+        response.end(
+          JSON.stringify({
+            message: options.throttleFailures
+              ? "API rate limit exceeded for installation"
+              : options.failedStatus === 403
+                ? "Resource not accessible by integration"
+                : "temporary",
+          }),
+        );
         return;
       }
       response.writeHead(200, { "content-type": "application/json" });
@@ -2724,12 +3659,14 @@ async function automaticReconcileScenario(options) {
       [...args, "--output", join(directory, "first.json")],
       `http://127.0.0.1:${address.port}`,
       secret,
+      options.operatorEnv,
     );
     const second = options.repeat
       ? await runOperator(
           [...args, "--output", join(directory, "second.json")],
           `http://127.0.0.1:${address.port}`,
           secret,
+          options.operatorEnv,
         )
       : null;
     return {
@@ -2740,6 +3677,9 @@ async function automaticReconcileScenario(options) {
       inventoryRequests,
       graphqlRequests,
       restRequests,
+      targetReadAuthorizations,
+      installationRequests,
+      tokenMintRequests,
     };
   } finally {
     server.close();
@@ -2841,7 +3781,7 @@ test("operator previews by default and caps mutations at two audited ids", async
     for await (const chunk of request) chunks.push(chunk);
     if (request.url?.toLowerCase().startsWith("/repos/openclaw/repo/issues/")) {
       const number = Number(request.url.split("/").at(-1));
-      assert.equal(request.headers.authorization, "Bearer test-github-token");
+      assert.equal(request.headers.authorization, "Bearer test-target-app-token");
       response.writeHead(200, { "content-type": "application/json" });
       response.end(
         JSON.stringify({
@@ -3105,6 +4045,8 @@ function runOperator(args, queueUrl, secret, extraEnv = {}) {
           EXACT_REVIEW_QUEUE_URL: queueUrl,
           CLAWSWEEPER_WEBHOOK_SECRET: secret,
           GITHUB_API_URL: queueUrl,
+          EXACT_REVIEW_TARGET_TOKEN_MODE: "actions",
+          GH_TOKEN: "test-target-app-token",
           GITHUB_TOKEN: "test-github-token",
           ...extraEnv,
         },

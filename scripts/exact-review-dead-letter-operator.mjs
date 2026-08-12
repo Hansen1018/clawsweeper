@@ -5,7 +5,14 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import process from "node:process";
 import { parseArgs as parseNodeArgs } from "node:util";
-import { classifyOperatorSkipReason } from "./operator-skip-reasons.mjs";
+import {
+  GitHubRequestError,
+  createGithubAppTokenFor,
+  githubAppCredentials,
+  githubAppInstallationId,
+  signGithubAppJwt,
+} from "../dashboard/github-api.ts";
+import { classifyOperatorSkipReason, isGitHubThrottleFailure } from "./operator-skip-reasons.mjs";
 
 const DEFAULT_OUTPUT = ".artifacts/exact-review-dlq/inventory.json";
 const MAX_SELECTED_IDS = 2;
@@ -19,12 +26,14 @@ const MAX_INVENTORY_ROWS = 10_000;
 const MAX_RECONCILE_INVENTORY_PAGES = 250;
 const MAX_RECONCILE_INVENTORY_REFRESHES = 2;
 const GRAPHQL_IDENTITY_BATCH_SIZE = 40;
+const MAX_CONSECUTIVE_GITHUB_THROTTLES = 3;
 const ACTIVE_RECOVERY_REASONS = new Set(["fresh_review_already_active", "publication_item_active"]);
 const IDEMPOTENCY_KEY = /^[A-Za-z0-9:._-]{1,200}$/;
 const OPERATOR_REQUEST_TIMEOUT_MS = 20_000;
 const OPERATOR_DEADLINE_SETTLE_MS = 25;
 const MAX_SKIP_SAMPLES = 3;
 const MAX_SKIP_REASON_LENGTH = 240;
+const TARGET_READ_TOKEN_MODE_ENV = "EXACT_REVIEW_TARGET_TOKEN_MODE";
 
 class DeadLetterInventoryChangedError extends Error {
   constructor(summary, rowIds, targetKeys, blockedGroups) {
@@ -47,6 +56,148 @@ class CanonicalTargetInspectionError extends Error {
   }
 }
 
+class GitHubInspectionHttpError extends Error {
+  constructor(message, response) {
+    super(message);
+    this.name = "GitHubInspectionHttpError";
+    this.status = response.status;
+    this.retryAfter = response.headers.get("retry-after");
+    this.rateLimitRemaining = response.headers.get("x-ratelimit-remaining");
+  }
+}
+
+class TargetInstallationMissingError extends Error {
+  constructor(targetRepo, options) {
+    super(`GitHub App installation is missing or revoked for ${targetRepo}`, options);
+    this.name = "TargetInstallationMissingError";
+  }
+}
+
+class TargetAppSetupThrottleError extends Error {
+  constructor(error, { owner, stage }) {
+    const status = Number.isInteger(error?.status) ? error.status : "unknown";
+    super(
+      `github_throttled scope=app_setup stage=${stage} owner=${owner.toLowerCase()} status=${status}`,
+      { cause: error },
+    );
+    this.name = "TargetAppSetupThrottleError";
+    this.status = error?.status;
+    this.rateLimited = true;
+  }
+}
+
+class TargetReadTokenCache {
+  constructor(env) {
+    this.env = env;
+    this.mode = String(env[TARGET_READ_TOKEN_MODE_ENV] || "github-app").trim();
+    if (this.mode !== "github-app" && this.mode !== "actions") {
+      throw new Error(`${TARGET_READ_TOKEN_MODE_ENV} must be github-app or actions`);
+    }
+    this.fallbackToken = String(env.GH_TOKEN || "").trim() || String(env.GITHUB_TOKEN || "").trim();
+    this.tokensByOwner = new Map();
+    this.mintsByRepository = new Map();
+    if (this.mode === "actions") {
+      if (!this.fallbackToken) {
+        throw new Error(
+          `GH_TOKEN or GITHUB_TOKEN is required when ${TARGET_READ_TOKEN_MODE_ENV}=actions`,
+        );
+      }
+      this.credentials = null;
+      this.appJwt = null;
+      return;
+    }
+
+    const missing = [];
+    if (
+      !String(env.CLAWSWEEPER_APP_ID || "").trim() &&
+      !String(env.CLAWSWEEPER_APP_CLIENT_ID || "").trim()
+    ) {
+      missing.push("CLAWSWEEPER_APP_CLIENT_ID or CLAWSWEEPER_APP_ID");
+    }
+    if (!String(env.CLAWSWEEPER_APP_PRIVATE_KEY || "").trim()) {
+      missing.push("CLAWSWEEPER_APP_PRIVATE_KEY");
+    }
+    if (missing.length) {
+      throw new Error(
+        `${TARGET_READ_TOKEN_MODE_ENV}=github-app requires complete GitHub App credentials; missing ${missing.join(" and ")}`,
+      );
+    }
+    this.credentials = githubAppCredentials(env);
+    if (!this.credentials) {
+      throw new Error(
+        `${TARGET_READ_TOKEN_MODE_ENV}=github-app requires complete GitHub App credentials`,
+      );
+    }
+    this.appJwt = signGithubAppJwt(this.credentials.issuer, this.credentials.privateKey);
+  }
+
+  async tokenFor(target) {
+    const { owner, repo } = parseTargetRepository(target);
+    if (this.mode === "actions") {
+      return this.fallbackToken;
+    }
+    const ownerKey = owner.toLowerCase();
+    const repositoryKey = `${owner}/${repo}`.toLowerCase();
+    // Successful tokens and setup throttles are installation-scoped, so they remain owner-cached.
+    // Selected-repository installations still authorize each repo on its own REST/GraphQL read,
+    // whose 403/404 handling fails closed. An installation-missing 404 is repository-specific,
+    // so keep the in-flight/rejected mint under the repository key until its outcome is known.
+    let token = this.tokensByOwner.get(ownerKey);
+    if (token) return token;
+
+    token = this.mintsByRepository.get(repositoryKey);
+    if (!token) {
+      token = this.mintForOwner(`${owner}/${repo}`);
+      this.mintsByRepository.set(repositoryKey, token);
+    }
+    try {
+      const mintedToken = await token;
+      this.tokensByOwner.set(ownerKey, Promise.resolve(mintedToken));
+      return mintedToken;
+    } catch (error) {
+      if (error instanceof TargetAppSetupThrottleError) {
+        this.tokensByOwner.set(ownerKey, token);
+      }
+      throw error;
+    }
+  }
+
+  async mintForOwner(targetRepo) {
+    const [owner] = targetRepo.split("/");
+    let installationId;
+    try {
+      const appJwt = await this.appJwt;
+      installationId = await githubAppInstallationId(appJwt, targetRepo, this.env);
+    } catch (error) {
+      if (error instanceof GitHubRequestError && error.status === 404) {
+        throw new TargetInstallationMissingError(targetRepo, { cause: error });
+      }
+      if (error instanceof GitHubRequestError && error.rateLimited) {
+        throw new TargetAppSetupThrottleError(error, { owner, stage: "installation_lookup" });
+      }
+      throw error;
+    }
+    try {
+      const appJwt = await this.appJwt;
+      return await createGithubAppTokenFor({
+        env: this.env,
+        appJwt,
+        installationId,
+        label: targetRepo,
+        permissions: { contents: "read", issues: "read", pull_requests: "read" },
+      });
+    } catch (error) {
+      if (error instanceof GitHubRequestError && error.status === 404) {
+        throw new TargetInstallationMissingError(targetRepo, { cause: error });
+      }
+      if (error instanceof GitHubRequestError && error.rateLimited) {
+        throw new TargetAppSetupThrottleError(error, { owner, stage: "token_mint" });
+      }
+      throw error;
+    }
+  }
+}
+
 const HELP = `Usage:
   node scripts/exact-review-dead-letter-operator.mjs --action <inventory|recover-fresh|resolve|reconcile|reconcile-parked> [options]
 
@@ -62,6 +213,8 @@ Options:
   -h, --help                    Show this help
 
 The operator always inventories open dead letters first. It never exposes raw replay.
+Target reads use GitHub App credentials by default. Set EXACT_REVIEW_TARGET_TOKEN_MODE=actions
+only to opt explicitly into GH_TOKEN or GITHUB_TOKEN for target reads.
 `;
 
 async function main(argv) {
@@ -73,6 +226,7 @@ async function main(argv) {
 
   const queueUrl = String(process.env.EXACT_REVIEW_QUEUE_URL || "").replace(/\/$/, "");
   const secret = String(process.env.CLAWSWEEPER_WEBHOOK_SECRET || "");
+  const targetReadTokens = new TargetReadTokenCache(process.env);
   if (!queueUrl || !secret) {
     throw new Error("EXACT_REVIEW_QUEUE_URL and CLAWSWEEPER_WEBHOOK_SECRET are required");
   }
@@ -87,7 +241,14 @@ async function main(argv) {
     });
     await mkdir(dirname(resolve(args.output)), { recursive: true });
     await writeFile(args.output, `${JSON.stringify(inventory, null, 2)}\n`, "utf8");
-    await reconcileParkedReviews({ inventory, queueUrl, secret, args, deadlineAt });
+    await reconcileParkedReviews({
+      inventory,
+      queueUrl,
+      secret,
+      args,
+      deadlineAt,
+      targetReadTokens,
+    });
     return;
   }
 
@@ -116,7 +277,14 @@ async function main(argv) {
     };
     for (let refreshes = 0; refreshes <= MAX_RECONCILE_INVENTORY_REFRESHES; refreshes += 1) {
       try {
-        await reconcileDeadLetters({ inventory, queueUrl, secret, args, progress });
+        await reconcileDeadLetters({
+          inventory,
+          queueUrl,
+          secret,
+          args,
+          progress,
+          targetReadTokens,
+        });
         return;
       } catch (error) {
         if (!(error instanceof DeadLetterInventoryChangedError)) throw error;
@@ -195,7 +363,7 @@ async function main(argv) {
     if (new Set(recoveryTargets).size !== recoveryTargets.length) {
       throw new Error("selected dead letters must map to distinct fresh recovery targets");
     }
-    const canonicalTargetIds = await assertOpenRecoveryTargets(recoveryTargets);
+    const canonicalTargetIds = await assertOpenRecoveryTargets(recoveryTargets, targetReadTokens);
     if (new Set(canonicalTargetIds).size !== canonicalTargetIds.length) {
       throw new Error("selected dead letters must resolve to distinct GitHub items");
     }
@@ -335,7 +503,14 @@ function boundedInteger(value, flag, minimum, maximum) {
   return parsed;
 }
 
-async function reconcileDeadLetters({ inventory, queueUrl, secret, args, progress }) {
+async function reconcileDeadLetters({
+  inventory,
+  queueUrl,
+  secret,
+  args,
+  progress,
+  targetReadTokens,
+}) {
   const initialPressure = await readQueuePressure(queueUrl);
   const openIds = new Set(inventory.dead_letters.map((row) => row.dead_letter_id));
   const summary = (progress.summary ??= {
@@ -441,7 +616,26 @@ async function reconcileDeadLetters({ inventory, queueUrl, secret, args, progres
   const selectedGroups = [...groups.values()];
   let identities;
   try {
-    identities = await inspectCanonicalTargets(selectedGroups, args.maxTargets);
+    const inspection = await inspectCanonicalTargets(
+      selectedGroups,
+      args.maxTargets,
+      targetReadTokens,
+    );
+    identities = inspection.identities;
+    for (const failure of inspection.failedTargets) {
+      recordInspectionSkips(summary, [failure.target], failure.error);
+    }
+    if (inspection.notInspectedTargets.length) {
+      recordInspectionSkips(
+        summary,
+        inspection.notInspectedTargets,
+        new Error(
+          "canonical target was not inspected because canonical discovery aborted after another target inspection failed",
+        ),
+      );
+    }
+    summary.skipped_targets +=
+      inspection.failedTargets.length + inspection.notInspectedTargets.length;
   } catch (error) {
     if (error instanceof CanonicalTargetInspectionError) {
       recordAbortedInspectionSkips(summary, {
@@ -477,7 +671,8 @@ async function reconcileDeadLetters({ inventory, queueUrl, secret, args, progres
   const canonicalGroups = new Map();
   for (const group of groups.values()) {
     const live = identities.get(normalizeRecoveryTargetKey(group.target));
-    if (!live || !["open", "closed"].includes(live.state)) {
+    if (!live) continue;
+    if (!["open", "closed"].includes(live.state)) {
       summary.skipped_targets += groups.size;
       printResult(summary);
       return;
@@ -531,7 +726,7 @@ async function reconcileDeadLetters({ inventory, queueUrl, secret, args, progres
       progress.terminalTargetRechecks += 1;
       let current;
       try {
-        current = await inspectRecoveryTarget(canonicalTarget);
+        current = await inspectRecoveryTarget(canonicalTarget, targetReadTokens);
       } catch (error) {
         recordInspectionSkips(summary, [canonicalTarget], error);
         accountSkippedTarget(live.node_id);
@@ -649,27 +844,57 @@ async function reconcileDeadLetters({ inventory, queueUrl, secret, args, progres
 
   refreshBlockedInventory();
   if (recoveries.length) {
+    const revalidatedRecoveries = [];
+    let consecutiveThrottles = 0;
+    let individuallySkipped = 0;
     for (const [index, recovery] of recoveries.entries()) {
       let current;
       try {
-        current = await inspectRecoveryTarget(recovery.canonicalTarget);
+        current = await inspectRecoveryTarget(recovery.canonicalTarget, targetReadTokens);
       } catch (error) {
+        if (error instanceof TargetInstallationMissingError) {
+          recordInspectionSkips(summary, [recovery.canonicalTarget], error);
+          summary.skipped_targets += 1;
+          individuallySkipped += 1;
+          continue;
+        }
+        if (isThrottleInspectionError(error)) {
+          recordInspectionSkips(summary, [recovery.canonicalTarget], error);
+          summary.skipped_targets += 1;
+          individuallySkipped += 1;
+          consecutiveThrottles += 1;
+          if (consecutiveThrottles >= MAX_CONSECUTIVE_GITHUB_THROTTLES) {
+            const notInspectedTargets = recoveries
+              .slice(index + 1)
+              .map((candidate) => candidate.canonicalTarget);
+            recordInspectionSkips(
+              summary,
+              notInspectedTargets,
+              new Error(
+                "canonical target was not inspected because canonical discovery aborted after another target inspection failed",
+              ),
+            );
+            summary.skipped_targets += notInspectedTargets.length;
+            individuallySkipped += notInspectedTargets.length;
+            break;
+          }
+          continue;
+        }
         recordAbortedInspectionSkips(summary, {
-          inspectedTargets: recoveries
-            .slice(0, index)
-            .map((candidate) => candidate.canonicalTarget),
+          inspectedTargets: revalidatedRecoveries.map((candidate) => candidate.canonicalTarget),
           failedTargets: [recovery.canonicalTarget],
           notInspectedTargets: recoveries
             .slice(index + 1)
             .map((candidate) => candidate.canonicalTarget),
           error,
         });
-        summary.skipped_targets += recoveries.length;
+        summary.skipped_targets += recoveries.length - individuallySkipped;
         printResult(summary);
         return;
       }
+      consecutiveThrottles = 0;
       if (current.state !== "open" || current.node_id !== recovery.live.node_id) {
-        summary.skipped_targets += recoveries.length;
+        summary.skipped_targets += recoveries.length - individuallySkipped;
         printResult(summary);
         return;
       }
@@ -677,7 +902,7 @@ async function reconcileDeadLetters({ inventory, queueUrl, secret, args, progres
         recovery.primary.fresh_recovery.source_head_sha &&
         recovery.primary.fresh_recovery.source_head_sha !== current.head_sha
       ) {
-        summary.skipped_targets += recoveries.length;
+        summary.skipped_targets += recoveries.length - individuallySkipped;
         printResult(summary);
         return;
       }
@@ -688,19 +913,24 @@ async function reconcileDeadLetters({ inventory, queueUrl, secret, args, progres
         ];
       }
       recovery.currentHeadSha = current.head_sha || null;
+      revalidatedRecoveries.push(recovery);
+    }
+    if (!revalidatedRecoveries.length) {
+      printResult(summary);
+      return;
     }
     const finalPressure = await readQueuePressure(queueUrl);
     summary.queue_pressure = finalPressure.status;
     if (finalPressure.status !== "idle" || finalPressure.availableSlots < 1) {
-      summary.skipped_targets += recoveries.length;
+      summary.skipped_targets += revalidatedRecoveries.length;
       if (finalPressure.status !== "idle") {
-        recordSkipReasonCount(summary, "recovery_deferred_pressure", recoveries.length);
+        recordSkipReasonCount(summary, "recovery_deferred_pressure", revalidatedRecoveries.length);
       }
       printResult(summary);
       return;
     }
-    const admitted = recoveries.slice(0, finalPressure.availableSlots);
-    summary.skipped_targets += recoveries.length - admitted.length;
+    const admitted = revalidatedRecoveries.slice(0, finalPressure.availableSlots);
+    summary.skipped_targets += revalidatedRecoveries.length - admitted.length;
     const ids = admitted.map(({ primary }) => primary.dead_letter_id);
     if (args.execute) {
       const identity = admitted
@@ -739,7 +969,14 @@ async function reconcileDeadLetters({ inventory, queueUrl, secret, args, progres
   printResult(summary);
 }
 
-async function reconcileParkedReviews({ inventory, queueUrl, secret, args, deadlineAt }) {
+async function reconcileParkedReviews({
+  inventory,
+  queueUrl,
+  secret,
+  args,
+  deadlineAt,
+  targetReadTokens,
+}) {
   const pressure = parkedReconcileDeadlineReached(deadlineAt)
     ? { status: "unknown", availableSlots: 0 }
     : await readQueuePressure(queueUrl, deadlineAt);
@@ -782,7 +1019,11 @@ async function reconcileParkedReviews({ inventory, queueUrl, secret, args, deadl
     summary.inspected_targets += 1;
     let target;
     try {
-      target = await inspectParkedReviewTarget(`${row.target_repo}#${row.item_number}`, deadlineAt);
+      target = await inspectParkedReviewTarget(
+        `${row.target_repo}#${row.item_number}`,
+        targetReadTokens,
+        deadlineAt,
+      );
     } catch (error) {
       if (parkedReconcileDeadlineReached(deadlineAt)) {
         stopForDeadline(selectedRows.length - index + terminal.length + recoverable.length);
@@ -819,7 +1060,11 @@ async function reconcileParkedReviews({ inventory, queueUrl, secret, args, deadl
     }
     let current;
     try {
-      current = await inspectParkedReviewTarget(candidate.target.requested_target, deadlineAt);
+      current = await inspectParkedReviewTarget(
+        candidate.target.requested_target,
+        targetReadTokens,
+        deadlineAt,
+      );
     } catch (error) {
       if (parkedReconcileDeadlineReached(deadlineAt)) {
         stopForDeadline(terminal.length - index + recoverable.length);
@@ -871,7 +1116,11 @@ async function reconcileParkedReviews({ inventory, queueUrl, secret, args, deadl
       }
       let current;
       try {
-        current = await inspectParkedReviewTarget(candidate.target.requested_target, deadlineAt);
+        current = await inspectParkedReviewTarget(
+          candidate.target.requested_target,
+          targetReadTokens,
+          deadlineAt,
+        );
       } catch (error) {
         if (parkedReconcileDeadlineReached(deadlineAt)) {
           stopForDeadline(admitted.length + selectedRecoveries.length - index);
@@ -1043,9 +1292,13 @@ function operatorRequestSignal(deadlineAt = Number.POSITIVE_INFINITY) {
   return AbortSignal.timeout(Math.min(OPERATOR_REQUEST_TIMEOUT_MS, remaining));
 }
 
-async function inspectParkedReviewTarget(target, deadlineAt = Number.POSITIVE_INFINITY) {
+async function inspectParkedReviewTarget(
+  target,
+  targetReadTokens,
+  deadlineAt = Number.POSITIVE_INFINITY,
+) {
   const apiUrl = String(process.env.GITHUB_API_URL || "https://api.github.com").replace(/\/$/, "");
-  const token = String(process.env.GITHUB_TOKEN || "");
+  const token = await targetReadTokens.tokenFor(target);
   const match = /^([^/]+)\/([^#]+)#([1-9]\d*)$/.exec(target);
   if (!match) throw new Error(`invalid parked review target: ${target}`);
   const [, owner, repo, number] = match;
@@ -1074,7 +1327,10 @@ async function inspectParkedReviewTarget(target, deadlineAt = Number.POSITIVE_IN
     throw new Error(`parked review target is missing from an existing repository: ${target}`);
   }
   if (!response.ok) {
-    throw new Error(`parked review target check failed for ${target} with ${response.status}`);
+    throw await githubInspectionHttpError(
+      response,
+      `parked review target check failed for ${target} with ${response.status}`,
+    );
   }
   const item = await response.json();
   if (
@@ -1239,18 +1495,45 @@ async function loadInventory(options) {
   };
 }
 
-async function inspectCanonicalTargets(groups, maxTargets) {
+async function inspectCanonicalTargets(groups, maxTargets, targetReadTokens) {
   const identities = new Map();
+  const failedTargets = [];
+  let consecutiveThrottles = 0;
+  const countedSetupThrottles = new WeakSet();
+  const throttleFuseReached = (error) => {
+    if (error instanceof TargetAppSetupThrottleError) {
+      if (countedSetupThrottles.has(error)) return false;
+      countedSetupThrottles.add(error);
+    }
+    consecutiveThrottles += 1;
+    return consecutiveThrottles >= MAX_CONSECUTIVE_GITHUB_THROTTLES;
+  };
   if (groups.length <= Math.min(maxTargets, MAX_RECONCILE_RECOVERIES)) {
     const inspectedTargets = [];
     for (const [index, group] of groups.entries()) {
       try {
         identities.set(
           normalizeRecoveryTargetKey(group.target),
-          await inspectRecoveryTarget(group.target),
+          await inspectRecoveryTarget(group.target, targetReadTokens),
         );
         inspectedTargets.push(group.target);
+        consecutiveThrottles = 0;
       } catch (error) {
+        if (error instanceof TargetInstallationMissingError) {
+          failedTargets.push({ target: group.target, error });
+          continue;
+        }
+        if (isThrottleInspectionError(error)) {
+          failedTargets.push({ target: group.target, error });
+          if (throttleFuseReached(error)) {
+            return {
+              identities,
+              failedTargets,
+              notInspectedTargets: groups.slice(index + 1).map((candidate) => candidate.target),
+            };
+          }
+          continue;
+        }
         throw new CanonicalTargetInspectionError(error, {
           inspectedTargets,
           failedTargets: [group.target],
@@ -1258,14 +1541,55 @@ async function inspectCanonicalTargets(groups, maxTargets) {
         });
       }
     }
-    return identities;
+    return { identities, failedTargets, notInspectedTargets: [] };
   }
 
   const apiUrl = String(process.env.GITHUB_API_URL || "https://api.github.com").replace(/\/$/, "");
-  const token = String(process.env.GITHUB_TOKEN || "");
-  if (!token) throw new Error("GITHUB_TOKEN is required for canonical target discovery");
-  for (let offset = 0; offset < groups.length; offset += GRAPHQL_IDENTITY_BATCH_SIZE) {
-    const selected = groups.slice(offset, offset + GRAPHQL_IDENTITY_BATCH_SIZE);
+  const inspectedTargets = [];
+  const groupsByOwner = new Map();
+  for (const group of groups) {
+    const { owner } = parseTargetRepository(group.target);
+    const ownerGroups = groupsByOwner.get(owner.toLowerCase()) ?? [];
+    ownerGroups.push(group);
+    groupsByOwner.set(owner.toLowerCase(), ownerGroups);
+  }
+  const batches = [...groupsByOwner.values()].flatMap((ownerGroups) => {
+    const ownerBatches = [];
+    for (let offset = 0; offset < ownerGroups.length; offset += GRAPHQL_IDENTITY_BATCH_SIZE) {
+      ownerBatches.push(ownerGroups.slice(offset, offset + GRAPHQL_IDENTITY_BATCH_SIZE));
+    }
+    return ownerBatches;
+  });
+  for (const [batchIndex, selected] of batches.entries()) {
+    const remainingTargets = batches
+      .slice(batchIndex + 1)
+      .flat()
+      .map((candidate) => candidate.target);
+    let token;
+    try {
+      token = await targetReadTokens.tokenFor(selected[0].target);
+    } catch (error) {
+      if (error instanceof TargetInstallationMissingError) {
+        for (const group of selected) failedTargets.push({ target: group.target, error });
+        continue;
+      }
+      if (isThrottleInspectionError(error)) {
+        for (const group of selected) failedTargets.push({ target: group.target, error });
+        if (throttleFuseReached(error)) {
+          return {
+            identities,
+            failedTargets,
+            notInspectedTargets: remainingTargets,
+          };
+        }
+        continue;
+      }
+      throw new CanonicalTargetInspectionError(error, {
+        inspectedTargets,
+        failedTargets: selected.map((group) => group.target),
+        notInspectedTargets: remainingTargets,
+      });
+    }
     const fields = selected.map(({ target }, index) => {
       const match = /^([^/]+)\/([^#]+)#([1-9]\d*)$/.exec(target);
       if (!match) throw new Error(`invalid fresh recovery target: ${target}`);
@@ -1283,10 +1607,39 @@ async function inspectCanonicalTargets(groups, maxTargets) {
       body: JSON.stringify({ query: `query{${fields.join(" ")}}` }),
       signal: AbortSignal.timeout(20_000),
     });
-    if (!response.ok) throw new Error(`canonical target discovery failed (${response.status})`);
+    if (!response.ok) {
+      const error = await githubInspectionHttpError(
+        response,
+        `canonical target discovery failed (${response.status})`,
+      );
+      if (isThrottleInspectionError(error)) {
+        for (const group of selected) failedTargets.push({ target: group.target, error });
+        if (throttleFuseReached(error)) {
+          return {
+            identities,
+            failedTargets,
+            notInspectedTargets: remainingTargets,
+          };
+        }
+        continue;
+      }
+      throw new CanonicalTargetInspectionError(error, {
+        inspectedTargets,
+        failedTargets: selected.map((group) => group.target),
+        notInspectedTargets: remainingTargets,
+      });
+    }
+    consecutiveThrottles = 0;
     const result = await response.json();
     if (!result || !result.data || (Array.isArray(result.errors) && result.errors.length)) {
-      throw new Error("canonical target discovery returned incomplete GitHub identities");
+      throw new CanonicalTargetInspectionError(
+        new Error("canonical target discovery returned incomplete GitHub identities"),
+        {
+          inspectedTargets,
+          failedTargets: selected.map((group) => group.target),
+          notInspectedTargets: remainingTargets,
+        },
+      );
     }
     for (const [index, group] of selected.entries()) {
       const item = result.data[`target${index}`]?.item;
@@ -1305,15 +1658,22 @@ async function inspectCanonicalTargets(groups, maxTargets) {
           ? { head_sha: item.headRefOid.toLowerCase() }
           : {}),
       });
+      inspectedTargets.push(group.target);
     }
   }
-  return identities;
+  return { identities, failedTargets, notInspectedTargets: [] };
 }
 
 function normalizeRecoveryTargetKey(target) {
   const match = /^([^/]+)\/([^#]+)#([1-9]\d*)$/.exec(target);
   if (!match) return target;
   return `${match[1].toLowerCase()}/${match[2].toLowerCase()}#${match[3]}`;
+}
+
+function parseTargetRepository(target) {
+  const match = /^([^/]+)\/([^#]+)(?:#[1-9]\d*)?$/.exec(String(target));
+  if (!match) throw new Error(`invalid GitHub target repository: ${target}`);
+  return { owner: match[1], repo: match[2] };
 }
 
 function sanitizeRow(row) {
@@ -1369,7 +1729,7 @@ function countBy(rows, keyFor) {
 function recordInspectionSkips(summary, targets, error) {
   if (targets.length === 0) return;
   const reason = sanitizeSkipReason(error);
-  const reasonClass = classifyOperatorSkipReason(reason);
+  const reasonClass = classifyOperatorSkipReason(error);
   recordSkipReasonCount(summary, reasonClass, targets.length);
   for (const target of targets) {
     if (summary.skip_samples.length >= MAX_SKIP_SAMPLES) break;
@@ -1380,6 +1740,26 @@ function recordInspectionSkips(summary, targets, error) {
 function recordSkipReasonCount(summary, reasonClass, count) {
   if (count < 1) return;
   summary.skip_reasons[reasonClass] = (summary.skip_reasons[reasonClass] || 0) + count;
+}
+
+function isThrottleInspectionError(error) {
+  if (isGitHubThrottleFailure(error)) return true;
+  return (
+    error instanceof GitHubInspectionHttpError &&
+    error.status === 403 &&
+    (Boolean(error.retryAfter) || error.rateLimitRemaining === "0")
+  );
+}
+
+async function githubInspectionHttpError(response, context) {
+  let detail = "";
+  try {
+    const body = await response.json();
+    detail = String(body?.message || body?.error || "").trim();
+  } catch {
+    // The HTTP status and headers still preserve the fail-closed classification.
+  }
+  return new GitHubInspectionHttpError(`${context}${detail ? `: ${detail}` : ""}`, response);
 }
 
 function recordAbortedInspectionSkips(
@@ -1450,10 +1830,10 @@ async function signedPost({
   return result;
 }
 
-async function assertOpenRecoveryTargets(targets) {
+async function assertOpenRecoveryTargets(targets, targetReadTokens) {
   const canonicalTargetIds = [];
   for (const target of targets) {
-    const item = await inspectRecoveryTarget(target);
+    const item = await inspectRecoveryTarget(target, targetReadTokens);
     if (item?.state !== "open") {
       throw new Error(`fresh recovery target is not open: ${target}`);
     }
@@ -1465,9 +1845,9 @@ async function assertOpenRecoveryTargets(targets) {
   return canonicalTargetIds;
 }
 
-async function inspectRecoveryTarget(target) {
+async function inspectRecoveryTarget(target, targetReadTokens) {
   const apiUrl = String(process.env.GITHUB_API_URL || "https://api.github.com").replace(/\/$/, "");
-  const token = String(process.env.GITHUB_TOKEN || "");
+  const token = await targetReadTokens.tokenFor(target);
   const match = /^([^/]+)\/([^#]+)#([1-9]\d*)$/.exec(target);
   if (!match) throw new Error(`invalid fresh recovery target: ${target}`);
   const [, owner, repo, number] = match;
@@ -1482,7 +1862,12 @@ async function inspectRecoveryTarget(target) {
       signal: AbortSignal.timeout(20_000),
     },
   );
-  if (!response.ok) throw new Error(`live target check failed for ${target} (${response.status})`);
+  if (!response.ok) {
+    throw await githubInspectionHttpError(
+      response,
+      `live target check failed for ${target} (${response.status})`,
+    );
+  }
   let item;
   try {
     item = await response.json();
@@ -1509,7 +1894,12 @@ async function inspectRecoveryTarget(target) {
       signal: AbortSignal.timeout(20_000),
     },
   );
-  if (!pullResponse.ok) throw new Error(`live pull-request check failed for ${target}`);
+  if (!pullResponse.ok) {
+    throw await githubInspectionHttpError(
+      pullResponse,
+      `live pull-request check failed for ${target} (${pullResponse.status})`,
+    );
+  }
   const pull = await pullResponse.json();
   const headSha = String(pull?.head?.sha || "").toLowerCase();
   if (pull?.node_id !== item.node_id || !/^[0-9a-f]{40}$/.test(headSha)) {

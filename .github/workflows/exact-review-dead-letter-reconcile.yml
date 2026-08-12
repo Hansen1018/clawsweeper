@@ -38,6 +38,7 @@ jobs:
     environment: exact-review-operator
     env:
       EXACT_REVIEW_QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
+      CLAWSWEEPER_APP_CLIENT_ID: Iv23liOECG0slfuhz093
     steps:
       - name: Establish reconciliation deadline
         run: |
@@ -119,6 +120,8 @@ jobs:
       - name: Reconcile closed, duplicate, and recoverable dead letters
         env:
           CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.EXACT_REVIEW_OPERATOR_SECRET }}
+          CLAWSWEEPER_APP_PRIVATE_KEY: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
+          EXACT_REVIEW_TARGET_TOKEN_MODE: github-app
           GITHUB_TOKEN: ${{ github.token }}
           MAX_TARGETS: ${{ github.event.inputs.max_targets || '100' }}
           MAX_RECOVERIES: ${{ github.event.inputs.max_recoveries || '10' }}
@@ -139,6 +142,8 @@ jobs:
       - name: Reconcile terminal and open parked reviews
         env:
           CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.EXACT_REVIEW_OPERATOR_SECRET }}
+          CLAWSWEEPER_APP_PRIVATE_KEY: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
+          EXACT_REVIEW_TARGET_TOKEN_MODE: github-app
           GITHUB_TOKEN: ${{ github.token }}
           MAX_TARGETS: ${{ github.event.inputs.max_targets || '100' }}
           EXECUTE: ${{ github.event_name == 'schedule' && 'true' || github.event.inputs.execute }}
