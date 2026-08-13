@@ -6,7 +6,7 @@
   `src/github-egress-telemetry-contract.ts`,
   `dashboard/github-egress-telemetry.ts`,
   `dashboard/github-egress-pool-coordinator.ts`, and the publication workflows
-- Last verified: `openclaw/clawsweeper@559da850fddd4d56e9f3f710014d22e205440cfb`
+- Last verified: `openclaw/clawsweeper@8a85a4491920e76a1b019c2682dc7703bc23580c`
 - Update when: a publication request path, credential selection rule, telemetry
   dimension, retention limit, or public response changes
 - Checked by: focused telemetry tests plus `pnpm run check:docs`
@@ -250,6 +250,17 @@ logical telemetry class for a public target read, but when credential selection
 places that read on the repository Actions token it joins the same coordinated
 pool. Calls that actually use a target-owner App installation bypass this
 coordinator and retain their independent owner-correct circuits.
+
+The coordinator complements the durable queue circuit fed by signed Phase 0
+telemetry; it does not replace or reinterpret that circuit. The queue continues
+to defer matching publication admission until an authoritative repository-token
+reset plus deterministic per-item jitter. The coordinator closes the remaining
+race inside already-claimed publication work by stopping siblings synchronously
+on the first throttle. After reset, the queue's jitter determines when an
+eligible caller reaches the pool, and the coordinator still admits exactly one
+half-open probe. Owner-scoped `target_app` reset propagation and review recovery
+reasons remain owned by the durable queue and are not copied into the
+repository-actions coordinator.
 
 The Worker derives the Durable Object shard from its configured ClawSweeper
 repository identity. Callers cannot choose a pool name, item shard, owner shard,
