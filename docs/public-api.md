@@ -3,7 +3,7 @@
 - Status: active operator reference
 - Owner: ClawSweeper dashboard maintainers
 - Source of truth: `dashboard/worker.ts` request routing and its focused tests
-- Last verified: `openclaw/clawsweeper@559da850fddd4d56e9f3f710014d22e205440cfb`
+- Last verified: `openclaw/clawsweeper@75a873f1b9df9a2efd245db017422ebf6148617f`
 - Update when: a public observer route, method, query parameter, response source, or authentication boundary changes
 - Checked by: `pnpm run check:docs`
 
@@ -24,8 +24,8 @@ branch, not a promise that every method will remain supported.
 | `/api/exact-review-queue/item`           | `GET`  | One queue item's status; forwards query parameters.                                         |
 | `/api/exact-review-queue/reviews`        | `GET`  | Per-item review lookup used by observer surfaces.                                           |
 | `/api/review-observability`              | `GET`  | Review observability from the queue Durable Object; forwards query parameters.              |
-| `/api/github-egress-observability`        | `GET`  | Sanitized publication GitHub egress rollups for `hours=0.25`, `1`, `6`, or `24`.              |
-| `/api/github-egress-pool-coordinator`     | `GET`  | Sanitized repository Actions pool epoch, circuit, permit, probe, and recovery state.         |
+| `/api/github-egress-observability`       | `GET`  | Sanitized publication GitHub egress rollups for `hours=0.25`, `1`, `6`, or `24`.            |
+| `/api/github-egress-pool-coordinator`    | `GET`  | Sanitized repository Actions pool epoch, circuit, permit, probe, and recovery state.        |
 | `/api/review-coverage`                   | `GET`  | Review coverage from the queue Durable Object.                                              |
 | `/api/apply-observability`               | `GET`  | Apply-lane observability from `applyObservabilityJson`.                                     |
 | `/api/health-history`                    | `GET`  | Historical health from `healthHistoryJson`.                                                 |
