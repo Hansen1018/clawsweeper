@@ -1390,12 +1390,26 @@ test("exact event review publishes directly with a queue-bounded canonical fallb
     false,
   );
   const releaseTerminal = step(publisher, "Release terminal review leases");
+  const confirmTerminal = step(publisher, "Confirm terminal item remains closed");
   const releaseUnsuccessful = step(
     publisher,
     "Release superseded or unsuccessful publisher-owned review lease",
   );
   assert.doesNotMatch(releaseTerminal.if ?? "", /publication-context.*live_terminal_noop/);
   assert.match(releaseTerminal.if ?? "", /publish-event-result.*terminal_noop/);
+  assert.equal(confirmTerminal["continue-on-error"], true);
+  assert.equal(
+    confirmTerminal.env?.CLAWSWEEPER_GITHUB_POOL_CLASS,
+    "${{ steps.publication-context.outputs.target_repo == 'openclaw/openclaw' && 'repository_actions' || 'target_app' }}",
+  );
+  assert.equal(confirmTerminal.env?.CLAWSWEEPER_GITHUB_STAGE, "publication_apply");
+  assert.match(confirmTerminal.run ?? "", /repository_pool_gh api/);
+  assert.match(confirmTerminal.run ?? "", /github-egress-pool-runner\.js -- gh/);
+  assert.match(confirmTerminal.run ?? "", /confirm_status" -eq 75/);
+  assert.match(confirmTerminal.run ?? "", /coordinator_deferred=true/);
+  assert.match(confirmTerminal.run ?? "", /attempted=false/);
+  assert.match(confirmTerminal.run ?? "", /\.rateLimited == true/);
+  assert.match(confirmTerminal.run ?? "", /rate_limited=true/);
   assert.match(releaseUnsuccessful.run ?? "", /\.user\.login == \\"clawsweeper\[bot\]\\"/);
   assert.match(releaseUnsuccessful.run ?? "", /content == "eyes"/);
   assert.match(releaseUnsuccessful.if ?? "", /completion_kind == 'superseded'/);
@@ -1429,6 +1443,10 @@ test("exact event review publishes directly with a queue-bounded canonical fallb
     publishResult.env?.DEFERRED_ROUTE_COORDINATOR_DEFERRED ?? "",
     /queue-deferred-verdict-router/,
   );
+  assert.match(publishResult.env?.CONFIRM_COORDINATOR_DEFERRED ?? "", /confirm-terminal-item/);
+  assert.match(publishResult.env?.CONFIRM_RATE_LIMITED ?? "", /confirm-terminal-item/);
+  assert.match(publishResult.env?.CONFIRM_RETRY_AT ?? "", /confirm-terminal-item/);
+  assert.match(publishResult.env?.CONFIRM_OUTCOME ?? "", /confirm-terminal-item\.outcome/);
   assert.match(publishResult.env?.DIRECT_RECOVERY_RATE_LIMITED ?? "", /replay-direct-lifecycle/);
   assert.match(
     publishResult.env?.DEFERRED_ROUTE_RATE_LIMITED ?? "",
@@ -1440,9 +1458,13 @@ test("exact event review publishes directly with a queue-bounded canonical fallb
   assert.match(publishResult.run ?? "", /attempted=false/);
   assert.match(
     publishResult.run ?? "",
-    /DOWNLOAD_RATE_LIMITED.*DIRECT_RECOVERY_RATE_LIMITED.*DEFERRED_ROUTE_RATE_LIMITED/,
+    /DOWNLOAD_RATE_LIMITED.*DIRECT_RECOVERY_RATE_LIMITED.*DEFERRED_ROUTE_RATE_LIMITED.*CONFIRM_RATE_LIMITED/,
   );
   assert.match(publishResult.run ?? "", /failure_kind=github_rate_limit[\s\S]*attempted=true/);
+  assert.match(
+    publishResult.run ?? "",
+    /CONFIRM_OUTCOME.*failure[\s\S]*Preserve a non-throttle confirmation failure as permanent_failure/,
+  );
   assert.match(publishResult.run ?? "", /REQUEUE_LATEST.*SOURCE_DRIFT_OUTCOME/);
   assert.match(publishResult.run ?? "", /LEGACY_TUPLELESS.*SOURCE_DRIFT_OUTCOME/);
   assert.match(publishResult.run ?? "", /completion_kind=superseded/);

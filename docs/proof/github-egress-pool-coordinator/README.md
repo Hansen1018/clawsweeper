@@ -33,6 +33,9 @@ independent.
 - A real `gh run download` artifact request whose first loopback 403 opens the
   repository pool and whose next sibling is rejected before any artifact API
   request
+- The terminal item-state confirmation on the repository credential, including
+  header-only throttle classification and a sibling rejected before its issue
+  read
 - A real wrapper and child-process boundary where `SIGTERM` reaches the active
   GitHub CLI child before the wrapper exits
 - Sanitized public observability and privacy sentinels
@@ -79,6 +82,9 @@ deployments, or credentials.
 - A real artifact download can be the first throttled repository operation; its
   next sibling exits through the coordinator deferral without reaching the
   loopback artifact endpoint.
+- A real terminal item-state read with generic forbidden stderr is classified
+  from bounded response headers, opens the pool, and prevents the next terminal
+  confirmation from reaching the loopback issue endpoint.
 - Target-App and disabled rollback calls still reach their independent loopback
   path while repository Actions is open.
 - Terminating the production runner forwards termination to its active `gh`

@@ -3078,12 +3078,85 @@ jobs:
       - name: Confirm terminal item remains closed
         id: confirm-terminal-item
         if: ${{ always() && steps.publication-context.outputs.claimed == 'true' && steps.publication-context.outputs.direct_lifecycle_recovery != 'true' && steps.release-terminal-review-leases.outcome == 'success' }}
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ steps.publication-context.outputs.target_repo == 'openclaw/openclaw' && github.token || steps.target-write-token.outputs.token }}
+          CLAWSWEEPER_GITHUB_POOL_CLASS: ${{ steps.publication-context.outputs.target_repo == 'openclaw/openclaw' && 'repository_actions' || 'target_app' }}
+          CLAWSWEEPER_GITHUB_STAGE: publication_apply
+          CLAWSWEEPER_GITHUB_RATE_LIMIT_OBSERVATION_PATH: .artifacts/artifact-publication/confirm-github-rate-limits.jsonl
+          CLAWSWEEPER_REPOSITORY_POOL_COORDINATOR_ENABLED: ${{ vars.CLAWSWEEPER_REPOSITORY_POOL_COORDINATOR_ENABLED || 'false' }}
+          EXACT_REVIEW_QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
+          CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           TARGET_REPO: ${{ steps.publication-context.outputs.target_repo }}
           ITEM_NUMBER: ${{ steps.publication-context.outputs.item_number }}
         run: |
-          test "$(gh api "repos/$TARGET_REPO/issues/$ITEM_NUMBER" --jq .state)" = "closed"
+          set -euo pipefail
+          repository_pool_coordinator_enabled() {
+            [ "$TARGET_REPO" = "openclaw/openclaw" ] && {
+              [ "${CLAWSWEEPER_REPOSITORY_POOL_COORDINATOR_ENABLED,,}" = "true" ] || \
+                [ "$CLAWSWEEPER_REPOSITORY_POOL_COORDINATOR_ENABLED" = "1" ]
+            }
+          }
+          repository_pool_gh() {
+            if repository_pool_coordinator_enabled; then
+              node dist/repair/github-egress-pool-runner.js -- gh "$@"
+            else
+              gh "$@"
+            fi
+          }
+          coordinator_observation_count() {
+            if test -s "$CLAWSWEEPER_GITHUB_RATE_LIMIT_OBSERVATION_PATH"; then
+              wc -l < "$CLAWSWEEPER_GITHUB_RATE_LIMIT_OBSERVATION_PATH"
+            else
+              echo 0
+            fi
+          }
+          coordinator_retry_at_since() {
+            local observation_count="$1"
+            local deferred="$2"
+            test -s "$CLAWSWEEPER_GITHUB_RATE_LIMIT_OBSERVATION_PATH"
+            tail -n "+$((observation_count + 1))" "$CLAWSWEEPER_GITHUB_RATE_LIMIT_OBSERVATION_PATH" | \
+              jq -sr --argjson deferred "$deferred" \
+                '[.[] | select(.scope == "repository_actions" and .coordinator_deferred == $deferred and (.retry_at | type == "string"))] | last | .retry_at // empty'
+          }
+          fallback_retry_at() {
+            node -e 'process.stdout.write(new Date(Date.now() + 5 * 60_000).toISOString())'
+          }
+          coordinator_outcome_dir="$(mktemp -d)"
+          trap 'rm -rf "$coordinator_outcome_dir"' EXIT
+          export CLAWSWEEPER_GITHUB_COORDINATOR_OUTCOME_PATH="$coordinator_outcome_dir/outcome.json"
+          echo "coordinator_deferred=false" >> "$GITHUB_OUTPUT"
+          echo "rate_limited=false" >> "$GITHUB_OUTPUT"
+          echo "attempted=true" >> "$GITHUB_OUTPUT"
+          observation_count="$(coordinator_observation_count)"
+          set +e
+          terminal_state="$(repository_pool_gh api "repos/$TARGET_REPO/issues/$ITEM_NUMBER" --jq .state)"
+          confirm_status=$?
+          set -e
+          if [ "$confirm_status" -eq 75 ] && repository_pool_coordinator_enabled; then
+            retry_at="$(coordinator_retry_at_since "$observation_count" true || true)"
+            retry_at="${retry_at:-$(fallback_retry_at)}"
+            {
+              echo "coordinator_deferred=true"
+              echo "attempted=false"
+              echo "retry_at=$retry_at"
+            } >> "$GITHUB_OUTPUT"
+            exit 75
+          elif [ "$confirm_status" -ne 0 ]; then
+            retry_at=""
+            if repository_pool_coordinator_enabled && \
+              jq -e '.attempted == true and .rateLimited == true' \
+                "$CLAWSWEEPER_GITHUB_COORDINATOR_OUTCOME_PATH" >/dev/null 2>&1; then
+              retry_at="$(coordinator_retry_at_since "$observation_count" false || true)"
+              retry_at="${retry_at:-$(fallback_retry_at)}"
+              {
+                echo "rate_limited=true"
+                echo "retry_at=$retry_at"
+              } >> "$GITHUB_OUTPUT"
+            fi
+            exit "$confirm_status"
+          fi
+          test "$terminal_state" = "closed"
           echo "confirmed=true" >> "$GITHUB_OUTPUT"
 
       - name: React to target item completion
@@ -3170,6 +3243,10 @@ jobs:
           DEFERRED_ROUTE_COORDINATOR_DEFERRED: ${{ steps.queue-deferred-verdict-router.outputs.coordinator_deferred || 'false' }}
           DEFERRED_ROUTE_RATE_LIMITED: ${{ steps.queue-deferred-verdict-router.outputs.rate_limited || 'false' }}
           DEFERRED_ROUTE_COORDINATOR_RETRY_AT: ${{ steps.queue-deferred-verdict-router.outputs.retry_at }}
+          CONFIRM_COORDINATOR_DEFERRED: ${{ steps.confirm-terminal-item.outputs.coordinator_deferred || 'false' }}
+          CONFIRM_RATE_LIMITED: ${{ steps.confirm-terminal-item.outputs.rate_limited || 'false' }}
+          CONFIRM_RETRY_AT: ${{ steps.confirm-terminal-item.outputs.retry_at }}
+          CONFIRM_OUTCOME: ${{ steps.confirm-terminal-item.outcome }}
           REVIEW_ONLY: ${{ fromJSON(steps.publication-context.outputs.decision).sourceAction == 'failed_review_shard_recovery' && 'true' || 'false' }}
         run: |
           set -euo pipefail
@@ -3181,13 +3258,15 @@ jobs:
           direct_requeue=false
           attempted=true
           failure_kind="$FAILURE_KIND"
-          if [ "$DOWNLOAD_COORDINATOR_DEFERRED" = "true" ] || [ "$DIRECT_RECOVERY_COORDINATOR_DEFERRED" = "true" ] || [ "$DEFERRED_ROUTE_COORDINATOR_DEFERRED" = "true" ]; then
+          if [ "$DOWNLOAD_COORDINATOR_DEFERRED" = "true" ] || [ "$DIRECT_RECOVERY_COORDINATOR_DEFERRED" = "true" ] || [ "$DEFERRED_ROUTE_COORDINATOR_DEFERRED" = "true" ] || [ "$CONFIRM_COORDINATOR_DEFERRED" = "true" ]; then
             if [ "$DOWNLOAD_COORDINATOR_DEFERRED" = "true" ]; then
               retry_at="$DOWNLOAD_RETRY_AT"
             elif [ "$DIRECT_RECOVERY_COORDINATOR_DEFERRED" = "true" ]; then
               retry_at="$DIRECT_RECOVERY_COORDINATOR_RETRY_AT"
-            else
+            elif [ "$DEFERRED_ROUTE_COORDINATOR_DEFERRED" = "true" ]; then
               retry_at="$DEFERRED_ROUTE_COORDINATOR_RETRY_AT"
+            else
+              retry_at="$CONFIRM_RETRY_AT"
             fi
             test -n "$retry_at"
             outcome=failure
@@ -3195,13 +3274,15 @@ jobs:
             reason_code=github_rate_limit
             failure_kind=github_rate_limit
             attempted=false
-          elif [ "$DOWNLOAD_RATE_LIMITED" = "true" ] || [ "$DIRECT_RECOVERY_RATE_LIMITED" = "true" ] || [ "$DEFERRED_ROUTE_RATE_LIMITED" = "true" ]; then
+          elif [ "$DOWNLOAD_RATE_LIMITED" = "true" ] || [ "$DIRECT_RECOVERY_RATE_LIMITED" = "true" ] || [ "$DEFERRED_ROUTE_RATE_LIMITED" = "true" ] || [ "$CONFIRM_RATE_LIMITED" = "true" ]; then
             if [ "$DOWNLOAD_RATE_LIMITED" = "true" ]; then
               retry_at="$DOWNLOAD_RETRY_AT"
             elif [ "$DIRECT_RECOVERY_RATE_LIMITED" = "true" ]; then
               retry_at="$DIRECT_RECOVERY_COORDINATOR_RETRY_AT"
-            else
+            elif [ "$DEFERRED_ROUTE_RATE_LIMITED" = "true" ]; then
               retry_at="$DEFERRED_ROUTE_COORDINATOR_RETRY_AT"
+            else
+              retry_at="$CONFIRM_RETRY_AT"
             fi
             test -n "$retry_at"
             outcome=failure
@@ -3209,6 +3290,8 @@ jobs:
             reason_code=github_rate_limit
             failure_kind=github_rate_limit
             attempted=true
+          elif [ "$CONFIRM_OUTCOME" = "failure" ]; then
+            : # Preserve a non-throttle confirmation failure as permanent_failure.
           elif [ "$DIRECT_RECOVERY_OUTCOME" = "success" ]; then
             case "$DIRECT_RECOVERY_COMPLETION_KIND:$DIRECT_RECOVERY_REASON_CODE" in
               published:publication_applied|superseded:remote_newer_tuple) ;;

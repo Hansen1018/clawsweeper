@@ -418,6 +418,69 @@ try {
   await stopWorker(artifactWorker);
   workers.splice(workers.indexOf(artifactWorker), 1);
 
+  const confirmationWorkerPort = await availablePort();
+  const confirmationWorker = await startWorker(
+    confirmationWorkerPort,
+    path.join(scratch, "wrangler-terminal-confirmation-state"),
+    path.join(scratch, "wrangler-terminal-confirmation.log"),
+  );
+  workers.push(confirmationWorker);
+  await waitForWorker(confirmationWorker.origin);
+  const confirmationRoot = path.join(scratch, "terminal-confirmation");
+  const confirmationOutcomePath = path.join(confirmationRoot, "coordinator-outcome.json");
+  await mkdir(confirmationRoot, { recursive: true });
+  const confirmationEnv = {
+    ...commonGhEnv,
+    CLAWSWEEPER_REPOSITORY_POOL_COORDINATOR_ENABLED: "true",
+    CLAWSWEEPER_GITHUB_POOL_CLASS: "repository_actions",
+    CLAWSWEEPER_GITHUB_STAGE: "publication_apply",
+    CLAWSWEEPER_GITHUB_SOURCE_ACTION: "exact_review_artifact_publish",
+    CLAWSWEEPER_GITHUB_COORDINATOR_OUTCOME_PATH: confirmationOutcomePath,
+    CLAWSWEEPER_GITHUB_OBSERVER_ROOT: repoRoot,
+    CLAWSWEEPER_REAL_GH_BIN: realGh,
+    CLAWSWEEPER_GITHUB_EGRESS_METRICS_PATH: path.join(confirmationRoot, "github-egress.jsonl"),
+    CLAWSWEEPER_GITHUB_RATE_LIMIT_DETAILS_PATH: path.join(
+      confirmationRoot,
+      "github-rate-details.jsonl",
+    ),
+    CLAWSWEEPER_GITHUB_RATE_LIMIT_OBSERVATION_PATH: path.join(
+      confirmationRoot,
+      "github-rate-observations.jsonl",
+    ),
+    EXACT_REVIEW_QUEUE_URL: confirmationWorker.origin,
+    CLAWSWEEPER_WEBHOOK_SECRET: proofSecret,
+    GITHUB_REPOSITORY: "pool-owner/pool-repo",
+    TARGET_REPO: "openclaw/openclaw",
+    GITHUB_RUN_ID: "terminal-confirmation-first",
+    GITHUB_RUN_ATTEMPT: "1",
+  };
+  const confirmationBefore = totalRequests();
+  const confirmationThrottle = await runGithubEgressPoolCommand(
+    proofGh,
+    ["api", "repos/openclaw/openclaw/issues/97", "--jq", ".state"],
+    { env: confirmationEnv },
+  );
+  assert.notEqual(confirmationThrottle.code, 0);
+  assert.equal(confirmationThrottle.deferred, false);
+  assert.match(confirmationThrottle.stderr.toString("utf8"), /synthetic forbidden/i);
+  assert.doesNotMatch(confirmationThrottle.stderr.toString("utf8"), /rate limit/i);
+  assert.deepEqual(JSON.parse(await readFile(confirmationOutcomePath, "utf8")), {
+    attempted: true,
+    rateLimited: true,
+  });
+  assert.equal(totalRequests(), confirmationBefore + 1);
+  assert.equal((await coordinatorState(confirmationWorker.origin)).state, "open");
+  const confirmationSibling = await runGithubEgressPoolCommand(
+    proofGh,
+    ["api", "repos/openclaw/openclaw/issues/96", "--jq", ".state"],
+    { env: { ...confirmationEnv, GITHUB_RUN_ID: "terminal-confirmation-sibling" } },
+  );
+  assert.equal(confirmationSibling.code, GITHUB_EGRESS_POOL_DEFERRED_EXIT);
+  assert.equal(confirmationSibling.deferred, true);
+  assert.equal(totalRequests(), confirmationBefore + 1);
+  await stopWorker(confirmationWorker);
+  workers.splice(workers.indexOf(confirmationWorker), 1);
+
   const attemptedOutcomePath = path.join(scratch, "attempted-outcome.json");
   const deferredOutcomePath = path.join(scratch, "deferred-outcome.json");
   const acknowledgementLossOutcomePath = path.join(scratch, "acknowledgement-loss-outcome.json");
@@ -619,6 +682,9 @@ try {
       full_artifact_to_apply_sibling_requests_avoided: 1,
       real_artifact_download_first_throttle_opened_pool: true,
       real_artifact_download_sibling_requests_avoided: 1,
+      terminal_confirmation_first_throttle_opened_pool: true,
+      terminal_confirmation_header_only_classification: true,
+      terminal_confirmation_sibling_requests_avoided: 1,
       target_app_mutations_remain_outside_repository_pool: true,
       runner_termination: runnerTermination,
       runner_acknowledgement_loss_fallback: true,
@@ -640,6 +706,7 @@ try {
       "Synthetic loopback GitHub responses, not live GitHub quota consumption.",
       "The real gh run download proof classifies its loopback 403 from bounded stderr because binary archive transport intentionally suppresses GH_DEBUG; its opaque internal request count remains Phase 0 telemetry scope.",
       "The full-path fixture reaches publish-event-result -> apply-decisions and proves the first repository-token public read opens the pool; mutation credential separation is asserted structurally and by the independent target_app runner boundary.",
+      "The terminal-state confirmation proof uses the real gh issue-state read with generic forbidden stderr; bounded headers open the pool and the next confirmation is rejected before wire.",
       "Fake-time unit tests cover headerless jitter, throttled probes and ramps, completed non-throttled failures, unexecuted failures, expiry, and other-pool state isolation.",
       "Durable attempted=false and retry/DLQ conservation are covered by focused publication CLI tests.",
     ],
@@ -677,9 +744,11 @@ function githubRequest(request, response) {
     url.pathname.endsWith("/issues/1/comments") ||
     url.pathname.endsWith("/issues/98/comments") ||
     url.pathname.endsWith("/issues/99/comments") ||
+    url.pathname.endsWith("/issues/97") ||
     url.pathname.endsWith("/actions/runs/777/artifacts") ||
     fullPathRepositoryRead;
-  const overHorizon = url.pathname.endsWith("/issues/99/comments");
+  const overHorizon =
+    url.pathname.endsWith("/issues/99/comments") || url.pathname.endsWith("/issues/97");
   const commonHeaders = {
     "content-type": "application/json",
     etag: '"synthetic-etag-secret"',
