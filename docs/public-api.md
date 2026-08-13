@@ -3,7 +3,7 @@
 - Status: active operator reference
 - Owner: ClawSweeper dashboard maintainers
 - Source of truth: `dashboard/worker.ts` request routing and its focused tests
-- Last verified: `openclaw/clawsweeper@ac340908bf694c902f5a673374be1639ef9f220f`
+- Last verified: `openclaw/clawsweeper@559da850fddd4d56e9f3f710014d22e205440cfb`
 - Update when: a public observer route, method, query parameter, response source, or authentication boundary changes
 - Checked by: `pnpm run check:docs`
 

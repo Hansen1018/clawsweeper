@@ -6,7 +6,7 @@
   `src/github-egress-telemetry-contract.ts`,
   `dashboard/github-egress-telemetry.ts`,
   `dashboard/github-egress-pool-coordinator.ts`, and the publication workflows
-- Last verified: `openclaw/clawsweeper@ac340908bf694c902f5a673374be1639ef9f220f`
+- Last verified: `openclaw/clawsweeper@559da850fddd4d56e9f3f710014d22e205440cfb`
 - Update when: a publication request path, credential selection rule, telemetry
   dimension, retention limit, or public response changes
 - Checked by: focused telemetry tests plus `pnpm run check:docs`
