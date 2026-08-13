@@ -40,6 +40,7 @@ type RunnerRuntime = {
     args: readonly string[],
     env: NodeJS.ProcessEnv,
   ) => Promise<CommandResult>;
+  isolateRateLimitDetails?: typeof isolatedRateLimitDetails;
 };
 
 type RunnerResult = CommandResult & { deferred: boolean };
@@ -131,9 +132,40 @@ export async function runGithubEgressPoolCommand(
   }
   if ("granted" in started) return deferredResult(env, now(), started);
 
+  const rateDetails = (runtime.isolateRateLimitDetails ?? isolatedRateLimitDetails)(env);
+  if (!rateDetails) {
+    const observedAt = now();
+    const receiptId = digest(
+      [
+        "finish:v1",
+        permit.permitId,
+        permit.epoch,
+        OPERATION_INDEX,
+        "rate_detail_isolation_unavailable",
+        observedAt,
+      ].join(":"),
+      64,
+    );
+    try {
+      await retryCoordinatorCall(() =>
+        client.finish({
+          permit,
+          operationIndex: OPERATION_INDEX,
+          receiptId,
+          outcome: "unexecuted_failure",
+        }),
+      );
+    } catch {
+      // The started-permit TTL remains the final bound if the conservative
+      // release acknowledgement is unavailable.
+    }
+    return deferredResult(env, observedAt, unavailableDeferral(observedAt, permit.epoch));
+  }
+
   try {
     markPostEffectAttempted(env);
   } catch {
+    rateDetails.cleanup();
     const observedAt = now();
     const receiptId = digest(
       [
@@ -162,7 +194,6 @@ export async function runGithubEgressPoolCommand(
     return deferredResult(env, observedAt, unavailableDeferral(observedAt, permit.epoch));
   }
 
-  const rateDetails = isolatedRateLimitDetails(env);
   let result!: CommandResult;
   let executionError: unknown;
   let throttle: SanitizedThrottle | null = null;
@@ -428,7 +459,7 @@ function isolatedRateLimitDetails(env: NodeJS.ProcessEnv): {
   path: string | undefined;
   persist: () => void;
   cleanup: () => void;
-} {
+} | null {
   const sharedPath = env.CLAWSWEEPER_GITHUB_RATE_LIMIT_DETAILS_PATH?.trim();
   try {
     const root = mkdtempSync(join(tmpdir(), "clawsweeper-github-egress-pool-"));
@@ -451,14 +482,7 @@ function isolatedRateLimitDetails(env: NodeJS.ProcessEnv): {
       cleanup: () => rmSync(root, { recursive: true, force: true }),
     };
   } catch {
-    const commandEnv = { ...env };
-    delete commandEnv.CLAWSWEEPER_GITHUB_RATE_LIMIT_DETAILS_PATH;
-    return {
-      env: commandEnv,
-      path: undefined,
-      persist: () => {},
-      cleanup: () => {},
-    };
+    return null;
   }
 }
 

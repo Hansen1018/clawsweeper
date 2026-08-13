@@ -101,6 +101,67 @@ test("disabled repository execution fails closed before wire when its attempt re
   assert.equal(executions, 0);
 });
 
+test("enabled repository execution defers before wire when throttle-detail isolation is unavailable", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "clawsweeper-pool-detail-unavailable-"));
+  const attemptedOutcomePath = join(root, "attempted-outcome.json");
+  const observationPath = join(root, "rate-observations.jsonl");
+  writeFileSync(attemptedOutcomePath, `${JSON.stringify({ kind: "eligible" })}\n`);
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const secret = "detail-unavailable-secret";
+  const now = Date.parse("2026-08-13T03:15:00Z");
+  const operations: string[] = [];
+  const coordinator = new GithubEgressPoolCoordinator(
+    { storage: new MemoryDurableStorage() },
+    {},
+    { now: () => now, random: () => 0, permitId: () => "detail-unavailable-permit" },
+  );
+  let wireCalls = 0;
+  const result = await runGithubEgressPoolCommand("gh", ["api", "rate_limit"], {
+    env: {
+      CLAWSWEEPER_REPOSITORY_POOL_COORDINATOR_ENABLED: "true",
+      CLAWSWEEPER_GITHUB_POOL_CLASS: "repository_actions",
+      CLAWSWEEPER_GITHUB_POST_EFFECT_OUTCOME_PATH: attemptedOutcomePath,
+      CLAWSWEEPER_GITHUB_RATE_LIMIT_OBSERVATION_PATH: observationPath,
+      EXACT_REVIEW_QUEUE_URL: "https://clawsweeper.test",
+      CLAWSWEEPER_WEBHOOK_SECRET: secret,
+    },
+    fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = input instanceof Request ? input : new Request(input, init);
+      const body = await request.text();
+      const operation = new URL(request.url).pathname.split("/").at(-1) ?? "";
+      operations.push(operation);
+      return coordinator.fetch(
+        new Request(`https://pool.test/${operation}`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body,
+        }),
+      );
+    },
+    now: () => now,
+    isolateRateLimitDetails: () => null,
+    execute: async () => {
+      wireCalls += 1;
+      throw new Error("detail-sink failure reached GitHub");
+    },
+  });
+  assert.equal(result.code, GITHUB_EGRESS_POOL_DEFERRED_EXIT);
+  assert.equal(result.deferred, true);
+  assert.equal(wireCalls, 0);
+  assert.deepEqual(operations, ["acquire", "start", "finish"]);
+  assert.equal(
+    JSON.parse(readFileSync(attemptedOutcomePath, "utf8")).postEffectsGithubAttempted,
+    undefined,
+  );
+  const observation = JSON.parse(readFileSync(observationPath, "utf8").trim());
+  assert.equal(observation.coordinator_deferred, true);
+  assert.equal(observation.retry_at, new Date(now + 5 * 60_000).toISOString());
+  const state = await (
+    await coordinator.fetch(new Request("https://pool.test/observability"))
+  ).json();
+  assert.equal(state.permits_in_flight, 0);
+});
+
 test(
   "wrapper termination reaches the on-wire GitHub CLI child",
   { skip: process.platform === "win32" ? "POSIX workflow signal boundary" : false },

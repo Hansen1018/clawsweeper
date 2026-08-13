@@ -630,6 +630,43 @@ try {
   assert.equal(targetApp.code, 0);
   assert.equal(targetApp.deferred, false);
 
+  const detailIsolationOutcomePath = path.join(scratch, "detail-isolation-outcome.json");
+  await writeFile(detailIsolationOutcomePath, `${JSON.stringify({ kind: "eligible" })}\n`);
+  const detailWorkerPort = await availablePort();
+  const detailWorker = await startWorker(
+    detailWorkerPort,
+    path.join(scratch, "wrangler-detail-isolation-state"),
+    path.join(scratch, "wrangler-detail-isolation.log"),
+  );
+  workers.push(detailWorker);
+  await waitForWorker(detailWorker.origin);
+  const beforeDetailIsolationFailure = totalRequests();
+  const detailIsolationFailure = await runGithubEgressPoolCommand(
+    proofGh,
+    ["api", "repos/proof-owner/proof-repo/issues/203/comments"],
+    {
+      env: {
+        ...runnerEnv,
+        CLAWSWEEPER_GITHUB_POST_EFFECT_OUTCOME_PATH: detailIsolationOutcomePath,
+        EXACT_REVIEW_QUEUE_URL: detailWorker.origin,
+        GITHUB_RUN_ID: "9005",
+      },
+      isolateRateLimitDetails: () => null,
+    },
+  );
+  assert.equal(detailIsolationFailure.code, GITHUB_EGRESS_POOL_DEFERRED_EXIT);
+  assert.equal(detailIsolationFailure.deferred, true);
+  assert.equal(totalRequests(), beforeDetailIsolationFailure);
+  assert.equal(
+    JSON.parse(await readFile(detailIsolationOutcomePath, "utf8")).postEffectsGithubAttempted,
+    undefined,
+  );
+  const detailIsolationState = await coordinatorState(detailWorker.origin);
+  assert.equal(detailIsolationState.permits_in_flight, 0);
+  assert.equal(detailIsolationState.state, "closed");
+  await stopWorker(detailWorker);
+  workers.splice(workers.indexOf(detailWorker), 1);
+
   const rollback = await runGithubEgressPoolCommand(
     proofGh,
     ["api", "repos/proof-owner/proof-repo/issues/202/comments"],
@@ -703,6 +740,7 @@ try {
       target_app_independent: true,
       disabled_rollback_reaches_egress: true,
       disabled_rollback_preserves_attempt_accounting: true,
+      detail_isolation_failure_requests_avoided: 1,
       public_privacy_scan_passed: true,
     },
     request_summary: requestSummary,

@@ -88,6 +88,8 @@ deployments, or credentials.
 - Target-App and disabled rollback calls still reach their independent loopback
   path while repository Actions is open; disabled rollback records the durable
   attempt before the wire call.
+- Failure to create an invocation-private throttle-header sink releases the
+  started permit as unexecuted and defers without reaching GitHub.
 - Terminating the production runner forwards termination to its active `gh`
   child; the focused real-process regression observes the child receipt and a
   nonzero wrapper exit.
