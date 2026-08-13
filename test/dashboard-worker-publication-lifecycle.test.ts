@@ -24,6 +24,84 @@ import {
   type ExactReviewQueueItem,
 } from "./dashboard-worker-harness.ts";
 
+test("canonical record operator auth is scoped to items", async () => {
+  const webhookSecret = "record-read-webhook-secret";
+  const operatorSecret = "record-read-operator-secret";
+  const collections = ["items", "closed", "plans", "decision-packets"];
+  const record = {
+    content: "canonical record",
+    digest: createHash("sha256").update("canonical record").digest("hex"),
+    revision: 1,
+    updatedAt: "2026-08-12T23:38:00.000Z",
+  };
+  const queue = {
+    async fetch(request: Request) {
+      assert.match(
+        new URL(request.url).pathname,
+        /^\/records\/openclaw-openclaw\/(?:items|closed|plans|decision-packets)\/1148$/,
+      );
+      assert.equal(request.method, "GET");
+      return jsonResponse(record);
+    },
+  };
+  const env = {
+    CLAWSWEEPER_WEBHOOK_SECRET: webhookSecret,
+    EXACT_REVIEW_OPERATOR_SECRET: operatorSecret,
+    EXACT_REVIEW_QUEUE: new MemoryDurableNamespace(queue),
+  };
+  const signedRequest = (secret: string, collection: string) =>
+    new Request(
+      `https://clawsweeper.openclaw.ai/internal/state/records/openclaw-openclaw/${collection}/1148`,
+      {
+        headers: {
+          "x-clawsweeper-exact-review-signature": `sha256=${createHmac("sha256", secret).update("").digest("hex")}`,
+        },
+      },
+    );
+
+  for (const collection of collections) {
+    const operatorRead = await worker.fetch(signedRequest(operatorSecret, collection), env);
+    assert.equal(operatorRead.status, collection === "items" ? 200 : 401, collection);
+    assert.deepEqual(
+      await operatorRead.json(),
+      collection === "items" ? record : { error: "invalid_signature" },
+    );
+
+    const webhookRead = await worker.fetch(signedRequest(webhookSecret, collection), env);
+    assert.equal(webhookRead.status, 200, collection);
+    assert.deepEqual(await webhookRead.json(), record);
+
+    const garbageRead = await worker.fetch(
+      signedRequest("garbage-record-read-secret", collection),
+      env,
+    );
+    assert.equal(garbageRead.status, 401, collection);
+    assert.deepEqual(await garbageRead.json(), { error: "invalid_signature" });
+  }
+
+  const operatorOnlyEnv = {
+    EXACT_REVIEW_OPERATOR_SECRET: operatorSecret,
+    EXACT_REVIEW_QUEUE: env.EXACT_REVIEW_QUEUE,
+  };
+  const operatorOnlyItem = await worker.fetch(
+    signedRequest(operatorSecret, "items"),
+    operatorOnlyEnv,
+  );
+  assert.equal(operatorOnlyItem.status, 200);
+  const operatorOnlyClosed = await worker.fetch(
+    signedRequest(operatorSecret, "closed"),
+    operatorOnlyEnv,
+  );
+  assert.equal(operatorOnlyClosed.status, 503);
+  assert.deepEqual(await operatorOnlyClosed.json(), { error: "webhook_not_configured" });
+
+  const unconfiguredRead = await worker.fetch(signedRequest(operatorSecret, "items"), {
+    EXACT_REVIEW_QUEUE: env.EXACT_REVIEW_QUEUE,
+  });
+  assert.equal(unconfiguredRead.status, 503);
+  assert.deepEqual(await unconfiguredRead.json(), { error: "webhook_not_configured" });
+});
+
 test("direct publication endpoint authenticates, dedupes, and returns a structured 413", async () => {
   const storage = new MemoryDurableStorage();
   const leased = leasedExactReviewQueueItem(701, "7010");

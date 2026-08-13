@@ -771,7 +771,7 @@ export default {
       );
     const canonicalRecordPath =
       request.method === "GET"
-        ? /^\/internal\/state\/records\/[^/]+\/(?:items|closed|plans|decision-packets)\/[1-9]\d*$/.exec(
+        ? /^\/internal\/state\/records\/[^/]+\/(items|closed|plans|decision-packets)\/[1-9]\d*$/.exec(
             url.pathname,
           )
         : null;
@@ -780,6 +780,7 @@ export default {
         request,
         env,
         url.pathname.slice("/internal/state".length),
+        canonicalRecordPath[1] === "items",
       );
     if (url.pathname === "/internal/state/records/slugs" && request.method === "POST")
       return authenticatedExactReviewQueueRequest(request, env, "/records/slugs");
@@ -2581,12 +2582,29 @@ async function authenticatedLifecycleCommandAcknowledgement(request, env, ctx) {
   );
 }
 
-async function authenticatedExactReviewQueueRead(request, env, path: string) {
-  const secret = stringEnv(env.CLAWSWEEPER_WEBHOOK_SECRET);
-  if (!secret) return json({ error: "webhook_not_configured" }, 503);
+async function authenticatedExactReviewQueueRead(
+  request,
+  env,
+  path: string,
+  allowOperatorSecret: boolean,
+) {
+  const webhookSecret = stringEnv(env.CLAWSWEEPER_WEBHOOK_SECRET);
+  const operatorSecret = allowOperatorSecret ? stringEnv(env.EXACT_REVIEW_OPERATOR_SECRET) : "";
+  if (!webhookSecret && !operatorSecret) return json({ error: "webhook_not_configured" }, 503);
   const body = await request.text();
   const signature = request.headers.get("x-clawsweeper-exact-review-signature") || "";
-  if (!(await verifyGithubWebhookSignature({ secret, signature, bodyText: body }))) {
+  let authenticated = webhookSecret
+    ? await verifyGithubWebhookSignature({ secret: webhookSecret, signature, bodyText: body })
+    : false;
+  // Reconciliation reads active items only; closed records, plans, and decision packets stay webhook-only.
+  if (!authenticated && operatorSecret) {
+    authenticated = await verifyGithubWebhookSignature({
+      secret: operatorSecret,
+      signature,
+      bodyText: body,
+    });
+  }
+  if (!authenticated) {
     return json({ error: "invalid_signature" }, 401);
   }
   return exactReviewQueueRequest(
