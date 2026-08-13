@@ -187,14 +187,9 @@ jobs:
           test ! -f "$heartbeat_failed"
           receipt_path="$(dirname "$EXACT_REVIEW_BATCH_MANIFEST")/state-receipt.json"
           repository_pool_gh() {
-            if [ "${CLAWSWEEPER_REPOSITORY_POOL_COORDINATOR_ENABLED,,}" = "true" ] || \
-              [ "$CLAWSWEEPER_REPOSITORY_POOL_COORDINATOR_ENABLED" = "1" ]; then
-              CLAWSWEEPER_GITHUB_POOL_CLASS=repository_actions \
-                CLAWSWEEPER_GITHUB_STAGE=publication_router \
-                node dist/repair/github-egress-pool-runner.js -- gh "$@"
-            else
-              gh "$@"
-            fi
+            CLAWSWEEPER_GITHUB_POOL_CLASS=repository_actions \
+              CLAWSWEEPER_GITHUB_STAGE=publication_router \
+              node dist/repair/github-egress-pool-runner.js -- gh "$@"
           }
           remaining_implementations="$MAX_DISPATCH"
           if [ -z "$remaining_implementations" ]; then

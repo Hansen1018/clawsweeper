@@ -86,7 +86,8 @@ deployments, or credentials.
   from bounded response headers, opens the pool, and prevents the next terminal
   confirmation from reaching the loopback issue endpoint.
 - Target-App and disabled rollback calls still reach their independent loopback
-  path while repository Actions is open.
+  path while repository Actions is open; disabled rollback records the durable
+  attempt before the wire call.
 - Terminating the production runner forwards termination to its active `gh`
   child; the focused real-process regression observes the child receipt and a
   nonzero wrapper exit.

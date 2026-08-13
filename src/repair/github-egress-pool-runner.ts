@@ -56,6 +56,8 @@ type SanitizedThrottle = {
 };
 
 const DEFERRED_MESSAGE = "ClawSweeper repository Actions pool deferred before GitHub egress\n";
+const ATTEMPT_RECEIPT_UNAVAILABLE_MESSAGE =
+  "ClawSweeper GitHub attempt receipt unavailable before egress\n";
 const OPERATION_INDEX = 1;
 const CHILD_TERMINATION_GRACE_MS = 2_000;
 const FORWARDED_SIGNALS: readonly NodeJS.Signals[] =
@@ -69,7 +71,15 @@ export async function runGithubEgressPoolCommand(
   const env = runtime.env ?? process.env;
   const execute = runtime.execute ?? executeCommand;
   const now = runtime.now ?? Date.now;
-  if (!coordinatorEnabled(env) || coordinatorPoolClass(env) !== "repository_actions") {
+  if (coordinatorPoolClass(env) !== "repository_actions") {
+    return { ...(await execute(command, args, env)), deferred: false };
+  }
+  if (!coordinatorEnabled(env)) {
+    try {
+      markPostEffectAttempted(env);
+    } catch {
+      return attemptReceiptUnavailableResult();
+    }
     return { ...(await execute(command, args, env)), deferred: false };
   }
   if (!/^gh(?:\.exe)?$/i.test(basename(command))) {
@@ -460,6 +470,16 @@ function unavailableDeferral(now: number, epoch = 1): GithubEgressPoolDeferred {
     blockedUntil: new Date(now + 5 * 60_000).toISOString(),
     resetProvenance: "fallback",
     resetAuthoritative: false,
+  };
+}
+
+function attemptReceiptUnavailableResult(): RunnerResult {
+  return {
+    code: 1,
+    signal: null,
+    stdout: Buffer.alloc(0),
+    stderr: Buffer.from(ATTEMPT_RECEIPT_UNAVAILABLE_MESSAGE),
+    deferred: false,
   };
 }
 

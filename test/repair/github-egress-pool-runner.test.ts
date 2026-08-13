@@ -22,7 +22,13 @@ import {
 } from "../../dist/repair/github-egress-pool-runner.js";
 import { MemoryDurableStorage } from "../dashboard-worker-harness.ts";
 
-test("disabled and non-repository pool paths preserve command bytes without coordinator traffic", async () => {
+test("disabled and non-repository pool paths preserve command bytes without coordinator traffic", async (t) => {
+  const disabledOutcomePath = join(
+    tmpdir(),
+    `clawsweeper-disabled-pool-attempt-${process.pid}-${Date.now()}.json`,
+  );
+  writeFileSync(disabledOutcomePath, `${JSON.stringify({ kind: "eligible" })}\n`);
+  t.after(() => rmSync(disabledOutcomePath, { force: true }));
   const expected = {
     code: 17,
     signal: null,
@@ -35,7 +41,10 @@ test("disabled and non-repository pool paths preserve command bytes without coor
     return expected;
   };
   const disabled = await runGithubEgressPoolCommand("gh", ["api", "rate_limit"], {
-    env: { CLAWSWEEPER_GITHUB_POOL_CLASS: "repository_actions" },
+    env: {
+      CLAWSWEEPER_GITHUB_POOL_CLASS: "repository_actions",
+      CLAWSWEEPER_GITHUB_POST_EFFECT_OUTCOME_PATH: disabledOutcomePath,
+    },
     fetch: async () => {
       throw new Error("coordinator must not be called");
     },
@@ -45,6 +54,10 @@ test("disabled and non-repository pool paths preserve command bytes without coor
   assert.equal(disabled.code, expected.code);
   assert.deepEqual(disabled.stdout, expected.stdout);
   assert.deepEqual(disabled.stderr, expected.stderr);
+  assert.equal(
+    JSON.parse(readFileSync(disabledOutcomePath, "utf8")).postEffectsGithubAttempted,
+    true,
+  );
 
   const targetApp = await runGithubEgressPoolCommand("gh", ["api", "user"], {
     env: {
@@ -58,6 +71,34 @@ test("disabled and non-repository pool paths preserve command bytes without coor
   });
   assert.equal(targetApp.deferred, false);
   assert.equal(executions, 2);
+});
+
+test("disabled repository execution fails closed before wire when its attempt receipt is unavailable", async () => {
+  const unavailablePath = join(
+    tmpdir(),
+    `clawsweeper-missing-attempt-parent-${process.pid}-${Date.now()}`,
+    "outcome.json",
+  );
+  let executions = 0;
+  const result = await runGithubEgressPoolCommand("gh", ["api", "rate_limit"], {
+    env: {
+      CLAWSWEEPER_GITHUB_POOL_CLASS: "repository_actions",
+      CLAWSWEEPER_GITHUB_POST_EFFECT_OUTCOME_PATH: unavailablePath,
+    },
+    execute: async () => {
+      executions += 1;
+      throw new Error("unreceipted command reached the wire");
+    },
+  });
+  assert.equal(result.deferred, false);
+  assert.equal(result.code, 1);
+  assert.equal(result.stdout.length, 0);
+  assert.equal(
+    result.stderr.toString(),
+    "ClawSweeper GitHub attempt receipt unavailable before egress\n",
+  );
+  assert.doesNotMatch(result.stderr.toString(), /clawsweeper-missing-attempt-parent|outcome\.json/);
+  assert.equal(executions, 0);
 });
 
 test(
@@ -297,9 +338,11 @@ test("over-horizon wire throttle falls back and prevents the next command", asyn
   const legacyPath = join(root, "rate-observations.jsonl");
   const attemptedOutcomePath = join(root, "attempted-outcome.json");
   const deferredOutcomePath = join(root, "deferred-outcome.json");
+  const rollbackOutcomePath = join(root, "rollback-outcome.json");
   const coordinatorOutcomePath = join(root, "coordinator-outcome.json");
   writeFileSync(attemptedOutcomePath, `${JSON.stringify({ kind: "eligible" })}\n`);
   writeFileSync(deferredOutcomePath, `${JSON.stringify({ kind: "eligible" })}\n`);
+  writeFileSync(rollbackOutcomePath, `${JSON.stringify({ kind: "eligible" })}\n`);
   const secret = "coordinator-test-secret";
   let now = Date.parse("2026-08-12T15:00:00Z");
   let permitSequence = 0;
@@ -438,7 +481,11 @@ test("over-horizon wire throttle falls back and prevents the next command", asyn
     assert.equal(readFileSync(detailPath, "utf8").trim().split(/\r?\n/).length, 1);
 
     const rollbackBypass = await runGithubEgressPoolCommand("gh", ["api", "rate_limit"], {
-      env: { ...env, CLAWSWEEPER_REPOSITORY_POOL_COORDINATOR_ENABLED: "false" },
+      env: {
+        ...env,
+        CLAWSWEEPER_REPOSITORY_POOL_COORDINATOR_ENABLED: "false",
+        CLAWSWEEPER_GITHUB_POST_EFFECT_OUTCOME_PATH: rollbackOutcomePath,
+      },
       fetch: async () => {
         throw new Error("disabled rollback must bypass coordinator state");
       },
@@ -455,6 +502,10 @@ test("over-horizon wire throttle falls back and prevents the next command", asyn
     });
     assert.equal(rollbackBypass.deferred, false);
     assert.equal(rollbackBypass.stdout.toString(), "rollback bypass\n");
+    assert.equal(
+      JSON.parse(readFileSync(rollbackOutcomePath, "utf8")).postEffectsGithubAttempted,
+      true,
+    );
     assert.equal(wireCalls, 2);
   } finally {
     rmSync(root, { recursive: true, force: true });

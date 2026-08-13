@@ -483,10 +483,12 @@ try {
 
   const attemptedOutcomePath = path.join(scratch, "attempted-outcome.json");
   const deferredOutcomePath = path.join(scratch, "deferred-outcome.json");
+  const rollbackOutcomePath = path.join(scratch, "rollback-outcome.json");
   const acknowledgementLossOutcomePath = path.join(scratch, "acknowledgement-loss-outcome.json");
   const coordinatorOutcomePath = path.join(scratch, "coordinator-outcome.json");
   await writeFile(attemptedOutcomePath, `${JSON.stringify({ kind: "eligible" })}\n`);
   await writeFile(deferredOutcomePath, `${JSON.stringify({ kind: "eligible" })}\n`);
+  await writeFile(rollbackOutcomePath, `${JSON.stringify({ kind: "eligible" })}\n`);
   await writeFile(acknowledgementLossOutcomePath, `${JSON.stringify({ kind: "eligible" })}\n`);
   const runnerEnv = {
     ...commonGhEnv,
@@ -635,12 +637,17 @@ try {
       env: {
         ...runnerEnv,
         CLAWSWEEPER_REPOSITORY_POOL_COORDINATOR_ENABLED: "false",
+        CLAWSWEEPER_GITHUB_POST_EFFECT_OUTCOME_PATH: rollbackOutcomePath,
         GITHUB_RUN_ID: "9004",
       },
     },
   );
   assert.equal(rollback.code, 0);
   assert.equal(rollback.deferred, false);
+  assert.equal(
+    JSON.parse(await readFile(rollbackOutcomePath, "utf8")).postEffectsGithubAttempted,
+    true,
+  );
   const runnerTermination = await proveRunnerTermination();
 
   const finalState = await coordinatorState(worker.origin);
@@ -695,6 +702,7 @@ try {
       next_runner_avoided: true,
       target_app_independent: true,
       disabled_rollback_reaches_egress: true,
+      disabled_rollback_preserves_attempt_accounting: true,
       public_privacy_scan_passed: true,
     },
     request_summary: requestSummary,

@@ -646,6 +646,9 @@ test("batch workflow signs queue ownership, isolates item failures, and commits 
     source,
     /CLAWSWEEPER_GITHUB_POOL_CLASS=repository_actions \\\n\s+CLAWSWEEPER_GITHUB_STAGE=publication_router \\\n\s+node dist\/repair\/github-egress-pool-runner\.js -- gh "\$@"/,
   );
+  const repositoryPoolHelper = /repository_pool_gh\(\) \{([\s\S]*?)\n\s+\}/.exec(source)?.[1] ?? "";
+  assert.match(repositoryPoolHelper, /github-egress-pool-runner\.js -- gh/);
+  assert.doesNotMatch(repositoryPoolHelper, /\n\s+gh "\$@"/);
   assert.match(source, /github_apply_status" -eq 75/);
   assert.match(prepareSource, /result\.code === 75 && coordinated/);
   assert.match(prepareSource, /"github_rate_limit"[\s\S]*?attempted: false/);
