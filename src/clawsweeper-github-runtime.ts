@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
-import { appendFileSync, closeSync, openSync, readFileSync } from "node:fs";
+import { appendFileSync, closeSync, mkdtempSync, openSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { GitHubRuntimeBudget } from "./clawsweeper-types.js";
 import { codexEnv } from "./codex-env.js";
@@ -235,17 +236,64 @@ export function createGitHubRuntime(dependencies: CreateGitHubRuntimeDependencie
     args: readonly string[],
     scope: GitHubCredentialScope,
     preparedEnv: NodeJS.ProcessEnv | undefined,
-  ): { command: string; args: string[]; env: NodeJS.ProcessEnv | undefined; coordinated: boolean } {
+  ): {
+    command: string;
+    args: string[];
+    env: NodeJS.ProcessEnv | undefined;
+    coordinated: boolean;
+    outcomePath: string | null;
+    cleanup: () => void;
+  } {
     const env = coordinatedRepositoryPoolEnv(scope, preparedEnv);
     const coordinated = env?.CLAWSWEEPER_GITHUB_COORDINATOR_POOL_CLASS === "repository_actions";
-    return coordinated
-      ? {
-          command: process.execPath,
-          args: [join(ROOT, "dist/repair/github-egress-pool-runner.js"), "--", "gh", ...args],
-          env,
-          coordinated,
+    if (!coordinated) {
+      return {
+        command: "gh",
+        args: [...args],
+        env,
+        coordinated,
+        outcomePath: null,
+        cleanup: () => {},
+      };
+    }
+    let root: string;
+    try {
+      root = mkdtempSync(join(tmpdir(), "clawsweeper-github-runtime-coordinator-"));
+    } catch (error) {
+      // Without an invocation-private outcome, the parent cannot distinguish a
+      // header-classified throttle from an ordinary 403. Fail before egress so
+      // durable publication accounting remains unattempted.
+      throw repositoryPoolDeferredError(error);
+    }
+    const outcomePath = join(root, "outcome.json");
+    return {
+      command: process.execPath,
+      args: [join(ROOT, "dist/repair/github-egress-pool-runner.js"), "--", "gh", ...args],
+      env: {
+        ...env,
+        CLAWSWEEPER_GITHUB_COORDINATOR_OUTCOME_PATH: outcomePath,
+      },
+      coordinated,
+      outcomePath,
+      cleanup: () => {
+        try {
+          rmSync(root, { recursive: true, force: true });
+        } catch {
+          // Never replace the GitHub command result with temp cleanup failure.
+          // The bounded sidecar contains only attempted/rateLimited booleans.
         }
-      : { command: "gh", args: [...args], env, coordinated };
+      },
+    };
+  }
+
+  function coordinatorClassifiedThrottle(path: string | null): boolean {
+    if (!path) return false;
+    try {
+      const outcome = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+      return outcome.attempted === true && outcome.rateLimited === true;
+    } catch {
+      return false;
+    }
   }
 
   function coordinatorObservation(): {
@@ -472,11 +520,16 @@ export function createGitHubRuntime(dependencies: CreateGitHubRuntimeDependencie
       if (invocation.coordinated && commandExitStatus(error) === 75) {
         throw repositoryPoolDeferredError(error);
       }
+      if (invocation.coordinated && coordinatorClassifiedThrottle(invocation.outcomePath)) {
+        throw githubRateLimitError(error, resolvedArgs, env);
+      }
       const retryKind = ghRetryKind(error);
       if (retryKind !== "throttle") {
         recordGitHubRequest(resolvedArgs, scope, retryKind === "transient" ? "transient" : "error");
       }
       throw error;
+    } finally {
+      invocation.cleanup();
     }
   }
 
@@ -489,39 +542,50 @@ export function createGitHubRuntime(dependencies: CreateGitHubRuntimeDependencie
     const preparedEnv = preparedGitHubEnv(resolvedArgs);
     const scope = githubRequestScope(resolvedArgs);
     const invocation = coordinatedRepositoryPoolCommand(resolvedArgs, scope, preparedEnv);
-    const env = {
-      ...process.env,
-      GIT_OPTIONAL_LOCKS: "0",
-      ...invocation.env,
-    };
-    const command = resolveCommand(invocation.command, invocation.args, env);
-    const commandTimeoutMs = githubCommandTimeoutMs(timeoutMs) ?? timeoutMs;
-    const runtimeLimitedTimeout = commandTimeoutMs < timeoutMs;
-    const result = spawnSync(command.command, command.args, {
-      cwd: ROOT,
-      encoding: "utf8",
-      env,
-      maxBuffer: 8 * 1024 * 1024,
-      stdio: ["ignore", "pipe", "pipe"],
-      timeout: commandTimeoutMs,
-    });
-    if (result.error) {
-      if (runtimeLimitedTimeout && (result.error as NodeJS.ErrnoException).code === "ETIMEDOUT") {
-        throw githubRuntimeBudgetError("during GitHub operation");
+    try {
+      const commandEnv = {
+        ...process.env,
+        GIT_OPTIONAL_LOCKS: "0",
+        ...invocation.env,
+      };
+      const command = resolveCommand(invocation.command, invocation.args, commandEnv);
+      const commandTimeoutMs = githubCommandTimeoutMs(timeoutMs) ?? timeoutMs;
+      const runtimeLimitedTimeout = commandTimeoutMs < timeoutMs;
+      const result = spawnSync(command.command, command.args, {
+        cwd: ROOT,
+        encoding: "utf8",
+        env: commandEnv,
+        maxBuffer: 8 * 1024 * 1024,
+        stdio: ["ignore", "pipe", "pipe"],
+        timeout: commandTimeoutMs,
+      });
+      if (result.error) {
+        if (invocation.coordinated && coordinatorClassifiedThrottle(invocation.outcomePath)) {
+          throw githubRateLimitError(result.error, resolvedArgs);
+        }
+        if (runtimeLimitedTimeout && (result.error as NodeJS.ErrnoException).code === "ETIMEDOUT") {
+          throw githubRuntimeBudgetError("during GitHub operation");
+        }
+        throw result.error;
       }
-      throw result.error;
-    }
-    if (result.status !== 0) {
-      const stderr = typeof result.stderr === "string" ? result.stderr.trim() : "";
-      const error = new Error(
-        [`Command failed: gh ${resolvedArgs.join(" ")}`, stderr].filter(Boolean).join("\n"),
-      );
-      if (invocation.coordinated && result.status === 75) {
-        throw repositoryPoolDeferredError(Object.assign(error, { status: result.status, stderr }));
+      if (result.status !== 0) {
+        const stderr = typeof result.stderr === "string" ? result.stderr.trim() : "";
+        const error = new Error(
+          [`Command failed: gh ${resolvedArgs.join(" ")}`, stderr].filter(Boolean).join("\n"),
+        );
+        const commandError = Object.assign(error, { status: result.status, stderr });
+        if (invocation.coordinated && result.status === 75) {
+          throw repositoryPoolDeferredError(commandError);
+        }
+        if (invocation.coordinated && coordinatorClassifiedThrottle(invocation.outcomePath)) {
+          throw githubRateLimitError(commandError, resolvedArgs);
+        }
+        throw error;
       }
-      throw error;
+      return (result.stdout ?? "").trim();
+    } finally {
+      invocation.cleanup();
     }
-    return (result.stdout ?? "").trim();
   }
 
   function sleepMs(milliseconds: number): void {

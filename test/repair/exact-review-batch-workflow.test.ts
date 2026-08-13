@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { appendFileSync, readFileSync, rmSync } from "node:fs";
+import { appendFileSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -404,6 +404,7 @@ test("exact publication fences repository-token reads but leaves target-App muta
   );
   Object.assign(process.env, fixtureEnv);
   const calls: Array<{ command: string; args: string[]; env?: NodeJS.ProcessEnv }> = [];
+  const coordinatorOutcomePaths: string[] = [];
   let deferred = false;
   let attemptedThrottle = false;
   const run = (
@@ -413,7 +414,14 @@ test("exact publication fences repository-token reads but leaves target-App muta
   ) => {
     calls.push({ command, args, env: options?.env });
     if (attemptedThrottle) {
-      throw new Error("gh: API rate limit exceeded for repository token (HTTP 403)");
+      const outcomePath = options?.env?.CLAWSWEEPER_GITHUB_COORDINATOR_OUTCOME_PATH;
+      assert.ok(outcomePath, "coordinated invocation must have a private typed outcome path");
+      coordinatorOutcomePaths.push(outcomePath);
+      writeFileSync(outcomePath, `${JSON.stringify({ attempted: true, rateLimited: true })}\n`);
+      throw Object.assign(new Error("gh: synthetic forbidden (HTTP 403)"), {
+        status: 1,
+        stderr: Buffer.from("gh: synthetic forbidden (HTTP 403)\n"),
+      });
     }
     if (deferred) {
       throw Object.assign(new Error("ClawSweeper repository Actions pool deferred"), {
@@ -478,6 +486,22 @@ test("exact publication fences repository-token reads but leaves target-App muta
     );
     attemptedThrottle = false;
     assert.equal(calls.length, 3, "attempted repository throttle must not probe the target App");
+    assert.doesNotMatch(
+      String((calls[2]?.env?.CLAWSWEEPER_GITHUB_COORDINATOR_OUTCOME_PATH || "").toLowerCase()),
+      /openclaw|issues|123/,
+    );
+    assert.equal(
+      coordinatorOutcomePaths.every((path) => {
+        try {
+          readFileSync(path);
+          return false;
+        } catch {
+          return true;
+        }
+      }),
+      true,
+      "invocation-private throttle outcomes must be removed after classification",
+    );
 
     appendFileSync(
       observationPath,
