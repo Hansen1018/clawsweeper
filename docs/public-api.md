@@ -3,7 +3,7 @@
 - Status: active operator reference
 - Owner: ClawSweeper dashboard maintainers
 - Source of truth: `dashboard/worker.ts` request routing and its focused tests
-- Last verified: `openclaw/clawsweeper@a1795973a9e6bb00b73cd6adc21a4ea02ca78ced`
+- Last verified: `openclaw/clawsweeper@ac340908bf694c902f5a673374be1639ef9f220f`
 - Update when: a public observer route, method, query parameter, response source, or authentication boundary changes
 - Checked by: `pnpm run check:docs`
 
@@ -25,6 +25,7 @@ branch, not a promise that every method will remain supported.
 | `/api/exact-review-queue/reviews`        | `GET`  | Per-item review lookup used by observer surfaces.                                           |
 | `/api/review-observability`              | `GET`  | Review observability from the queue Durable Object; forwards query parameters.              |
 | `/api/github-egress-observability`        | `GET`  | Sanitized publication GitHub egress rollups for `hours=0.25`, `1`, `6`, or `24`.              |
+| `/api/github-egress-pool-coordinator`     | `GET`  | Sanitized repository Actions pool epoch, circuit, permit, probe, and recovery state.         |
 | `/api/review-coverage`                   | `GET`  | Review coverage from the queue Durable Object.                                              |
 | `/api/apply-observability`               | `GET`  | Apply-lane observability from `applyObservabilityJson`.                                     |
 | `/api/health-history`                    | `GET`  | Historical health from `healthHistoryJson`.                                                 |

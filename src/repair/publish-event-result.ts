@@ -123,7 +123,7 @@ try {
             rateLimitScope: error.scope,
             rateLimitProvenance: error.provenance,
             rateLimitAuthoritative: error.authoritative,
-            attempted: true,
+            attempted: error.attempted,
           }
         : {}),
     });

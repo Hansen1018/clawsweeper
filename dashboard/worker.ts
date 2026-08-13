@@ -86,6 +86,7 @@ export {
   exactReviewQueueCapacity,
   exactReviewQueueNextWakeAt,
 } from "./exact-review-queue.ts";
+export { GithubEgressPoolCoordinator } from "./github-egress-pool-coordinator.ts";
 
 const ACTIVE_RUN_STATUSES = new Set(["queued", "in_progress", "waiting", "requested", "pending"]);
 const QUEUED_RUN_STATUSES = new Set(["queued", "waiting", "requested", "pending"]);
@@ -946,6 +947,15 @@ export default {
       request.method === "POST"
     )
       return authenticatedExactReviewQueueRequest(request, env, "/github-egress-telemetry");
+    const githubEgressPoolOperation =
+      request.method === "POST"
+        ? /^\/internal\/github-egress-pool\/(acquire|start|finish|throttle)$/.exec(
+            url.pathname,
+          )?.[1]
+        : null;
+    if (githubEgressPoolOperation) {
+      return authenticatedGithubEgressPoolRequest(request, env, `/${githubEgressPoolOperation}`);
+    }
     if (url.pathname === "/internal/apply-observability" && request.method === "POST")
       return authenticatedApplyObservability(request, env);
     if (url.pathname === "/internal/exact-review/reconcile" && request.method === "POST")
@@ -974,6 +984,8 @@ export default {
         env,
         `/github-egress-observability?${url.searchParams.toString()}`,
       );
+    if (url.pathname === "/api/github-egress-pool-coordinator" && request.method === "GET")
+      return githubEgressPoolRequest(env, "/observability");
     if (url.pathname === "/api/review-coverage" && request.method === "GET")
       return exactReviewQueueRequest(env, "/review-coverage");
     if (url.pathname === "/api/apply-observability" && request.method === "GET")
@@ -2164,6 +2176,45 @@ function exactReviewQueueStub(env): DurableObjectStub | null {
   return namespace ? namespace.get(namespace.idFromName(EXACT_REVIEW_QUEUE_NAME)) : null;
 }
 
+function githubEgressPoolNamespace(env): DurableObjectNamespace | null {
+  const namespace = env.GITHUB_EGRESS_POOL_COORDINATOR as DurableObjectNamespace | undefined;
+  if (
+    !namespace ||
+    typeof namespace.idFromName !== "function" ||
+    typeof namespace.get !== "function"
+  ) {
+    return null;
+  }
+  return namespace;
+}
+
+function repositoryActionsPoolName(env): string | null {
+  const repository = String(env.CLAWSWEEPER_REPO || "")
+    .trim()
+    .toLowerCase();
+  return /^[a-z0-9_.-]+\/[a-z0-9_.-]+$/.test(repository)
+    ? `repository_actions:${repository}`
+    : null;
+}
+
+function githubEgressPoolStub(env): DurableObjectStub | null {
+  const namespace = githubEgressPoolNamespace(env);
+  const poolName = repositoryActionsPoolName(env);
+  return namespace && poolName ? namespace.get(namespace.idFromName(poolName)) : null;
+}
+
+function githubEgressPoolRequest(env, path: string, body?: string) {
+  const pool = githubEgressPoolStub(env);
+  if (!pool) return json({ error: "github_egress_pool_not_configured" }, 503);
+  return pool.fetch(
+    new Request(`https://clawsweeper-github-egress-pool${path}`, {
+      method: body === undefined ? "GET" : "POST",
+      headers: body === undefined ? undefined : { "content-type": "application/json" },
+      ...(body === undefined ? {} : { body }),
+    }),
+  );
+}
+
 async function recordLifecycleCommandAcknowledgement(env, completion) {
   const queue = exactReviewQueueStub(env);
   if (!queue) return { accepted: true, sourceDeliveryId: null };
@@ -2533,6 +2584,17 @@ async function authenticatedExactReviewQueueRequest(
   );
   if (onAuthenticatedResponse) await onAuthenticatedResponse(body, response);
   return response;
+}
+
+async function authenticatedGithubEgressPoolRequest(request, env, path: string) {
+  const secret = stringEnv(env.CLAWSWEEPER_WEBHOOK_SECRET);
+  if (!secret) return json({ error: "webhook_not_configured" }, 503);
+  const body = await request.text();
+  const signature = request.headers.get("x-clawsweeper-exact-review-signature") || "";
+  if (!(await verifyGithubWebhookSignature({ secret, signature, bodyText: body }))) {
+    return json({ error: "invalid_signature" }, 401);
+  }
+  return githubEgressPoolRequest(env, path, body);
 }
 
 async function authenticatedLifecycleCommandAcknowledgement(request, env, ctx) {

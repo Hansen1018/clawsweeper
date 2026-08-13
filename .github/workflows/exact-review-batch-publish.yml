@@ -49,6 +49,8 @@ jobs:
       # Scan the full queue window so owner filtering can still fill the 32-item lease cap.
       EXACT_REVIEW_BATCH_MAX_ITEMS: "50"
       EXACT_REVIEW_BATCH_PREPARE_CONCURRENCY: "1"
+      # Phase 1 is deployed dark until Phase 0 establishes safe pool budgets.
+      CLAWSWEEPER_REPOSITORY_POOL_COORDINATOR_ENABLED: ${{ vars.CLAWSWEEPER_REPOSITORY_POOL_COORDINATOR_ENABLED || 'false' }}
       CLAWSWEEPER_APP_CLIENT_ID: Iv23liOECG0slfuhz093
       CLAWSWEEPER_APP_PRIVATE_KEY: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
     steps:
@@ -184,6 +186,16 @@ jobs:
           pnpm run --silent repair:exact-review-batch commit
           test ! -f "$heartbeat_failed"
           receipt_path="$(dirname "$EXACT_REVIEW_BATCH_MANIFEST")/state-receipt.json"
+          repository_pool_gh() {
+            if [ "${CLAWSWEEPER_REPOSITORY_POOL_COORDINATOR_ENABLED,,}" = "true" ] || \
+              [ "$CLAWSWEEPER_REPOSITORY_POOL_COORDINATOR_ENABLED" = "1" ]; then
+              CLAWSWEEPER_GITHUB_POOL_CLASS=repository_actions \
+                CLAWSWEEPER_GITHUB_STAGE=publication_router \
+                node dist/repair/github-egress-pool-runner.js -- gh "$@"
+            else
+              gh "$@"
+            fi
+          }
           remaining_implementations="$MAX_DISPATCH"
           if [ -z "$remaining_implementations" ]; then
             if ! remaining_implementations="$(pnpm run --silent workflow -- limit issue_implementation.dispatches_per_sweep_default)"; then
@@ -271,8 +283,9 @@ jobs:
             elif [ "$source_action" = "failed_review_shard_recovery" ]; then
               lifecycle_router_outcome="not_required"
             elif jq -e '.disposition.routableSyncExpected == true' "$outcome_path" >/dev/null; then
+              export CLAWSWEEPER_GITHUB_POST_EFFECT_OUTCOME_PATH="$outcome_path"
               github_apply_error="$(mktemp)"
-              if gh workflow run repair-comment-router.yml \
+              if repository_pool_gh workflow run repair-comment-router.yml \
                 --repo "$GITHUB_REPOSITORY" \
                 --ref main \
                 -f execute=true \
@@ -288,9 +301,15 @@ jobs:
                 rm -f "$github_apply_error"
               else
                 github_apply_status=$?
-                if grep -Eqi 'rate limit|abuse detection|was submitted too quickly|HTTP 429' "$github_apply_error"; then
-                  EXACT_REVIEW_GITHUB_RATE_LIMIT_SCOPE=repository_actions \
-                    pnpm run --silent repair:exact-review-batch rate-limit || true
+                if [ "$github_apply_status" -eq 75 ]; then
+                  EXACT_REVIEW_BATCH_OBSERVATION=github_throttle \
+                    pnpm run --silent repair:exact-review-batch observe || true
+                elif grep -Eqi 'rate limit|abuse detection|was submitted too quickly|HTTP 429' "$github_apply_error"; then
+                  if [ "${CLAWSWEEPER_REPOSITORY_POOL_COORDINATOR_ENABLED,,}" != "true" ] && \
+                    [ "$CLAWSWEEPER_REPOSITORY_POOL_COORDINATOR_ENABLED" != "1" ]; then
+                    EXACT_REVIEW_GITHUB_RATE_LIMIT_SCOPE=repository_actions \
+                      pnpm run --silent repair:exact-review-batch rate-limit || true
+                  fi
                   EXACT_REVIEW_BATCH_OBSERVATION=github_throttle \
                     pnpm run --silent repair:exact-review-batch observe || true
                 else

@@ -12,6 +12,7 @@ type GitHubRateLimitOptions = {
   retryAt?: string | number;
   provenance?: GitHubRateLimitProvenance;
   authoritative?: boolean;
+  attempted?: boolean;
 };
 
 export class GitHubRateLimitError extends Error {
@@ -19,6 +20,7 @@ export class GitHubRateLimitError extends Error {
   readonly scope: GitHubCredentialScope;
   readonly provenance: GitHubRateLimitProvenance;
   readonly authoritative: boolean;
+  readonly attempted: boolean;
 
   constructor(cause: unknown, now = Date.now(), options: GitHubRateLimitOptions = {}) {
     const message = ghErrorText(cause);
@@ -27,6 +29,7 @@ export class GitHubRateLimitError extends Error {
     const propagated = message.match(/\brate limited until\s+(\d{4}-\d{2}-\d{2}T[\d:.]+Z)/i)?.[1];
     const propagatedScope = message.match(/\bcredential scope\s+([a-z_]+)\b/i)?.[1];
     const propagatedProvenance = message.match(/\breset source\s+([a-z_]+)\b/i)?.[1];
+    const propagatedAttempted = message.match(/\brequest attempted\s+(true|false)\b/i)?.[1];
     const carriedProvenance = [
       "retry_after",
       "rate_limit_reset",
@@ -53,16 +56,18 @@ export class GitHubRateLimitError extends Error {
       (propagatedScope === "repository_actions" || propagatedScope === "target_app"
         ? propagatedScope
         : "target_app");
-    const retryFloor = propagatedRetryAt > now ? now : now + 60_000;
+    const attempted = options.attempted ?? propagatedAttempted !== "false";
+    const retryFloor = attempted === false || propagatedRetryAt > now ? now : now + 60_000;
     const retryAt = new Date(Math.max(retryFloor, explicitRetryAt, hintedRetryAt)).toISOString();
     super(
-      `GitHub API rate limited until ${retryAt}; credential scope ${scope}; reset source ${provenance}: ${message}`,
+      `GitHub API rate limited until ${retryAt}; credential scope ${scope}; reset source ${provenance}; request attempted ${attempted}: ${message}`,
       { cause },
     );
     this.name = "GitHubRateLimitError";
     this.retryAt = retryAt;
     this.scope = scope;
     this.provenance = provenance;
+    this.attempted = attempted;
     this.authoritative =
       options.authoritative ??
       Boolean(

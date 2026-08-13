@@ -279,6 +279,31 @@ Actions token to the already-authorized target App token. That success does not
 close the Actions circuit, and mutations, private reads, and unsupported routes
 never use the repository token.
 
+The optional repository Actions egress coordinator adds a synchronous fence at
+the batch publisher's actual `gh` boundary. It is keyed by the configured
+ClawSweeper repository credential pool, not by item, target repository, or target
+owner. The first rate-limit response advances the shared epoch, so sibling
+operations that acquired but did not start are returned as unattempted quota
+deferrals. Calls already started remain a bounded on-wire remainder. Credible
+reset headers open one shared deadline; numeric deadlines beyond the two-hour
+credibility horizon are sanitized to absent, and headerless or unusable-deadline
+secondary limits use persisted bounded exponential backoff. Recovery permits one probe followed by `1, 2, 4,
+8` clean fixed permit cohorts; a cohort cannot replenish, any permit expiry
+reopens the pool, and it cannot advance until all of its admitted operations
+succeed. `CLAWSWEEPER_REPOSITORY_POOL_COORDINATOR_ENABLED` is
+default-disabled and is the immediate rollback switch; activation and initial
+limits require a separate quota-window decision.
+
+Ambiguous retries of rejected acquire/start calls reuse private request receipts,
+so avoided-operation counters are request-idempotent. Completed permit,
+operation, acknowledgement, and rejection receipts are retained for 24 hours.
+
+The fence is presently one external `gh` invocation per permit. Opaque artifact
+downloads may perform multiple internal HTTP requests, so Phase 0 wire-attempt
+telemetry—not coordinator permit counts—remains the request denominator. Deferred
+operations return to the existing durable queue; the coordinator does not own a
+separate fairness queue.
+
 `lanes.publication.github_request_metrics` measures the successful and failed
 request budget by redacted credential scope, endpoint category, public-read
 versus App-operation class, first versus repeated revision, and outcome. It

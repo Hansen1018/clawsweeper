@@ -3346,6 +3346,15 @@ test("GitHub rate-limit deferrals preserve available reset hints and safe defaul
   assert.equal(wrappedFallback.authoritative, false);
   assert.equal(fallback.retryAt, "2026-08-05T10:01:00.000Z");
   const wrappedExpiredFallback = new GitHubRateLimitError(fallback, now + 61_000);
+  const unattempted = new GitHubRateLimitError(new Error("coordinator deferred"), now, {
+    scope: "repository_actions",
+    retryAt: now + 30_000,
+    attempted: false,
+  });
+  const wrappedUnattempted = new GitHubRateLimitError(unattempted, now + 1_000);
+  assert.equal(wrappedUnattempted.scope, "repository_actions");
+  assert.equal(wrappedUnattempted.attempted, false);
+  assert.equal(wrappedUnattempted.retryAt, unattempted.retryAt);
   assert.equal(wrappedExpiredFallback.retryAt, "2026-08-05T10:02:01.000Z");
   assert.equal(wrappedExpiredFallback.provenance, "fallback");
   assert.equal(wrappedExpiredFallback.authoritative, false);

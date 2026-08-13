@@ -257,6 +257,7 @@ export type ExactReviewQueueItem = {
   dispatchFailureDetail?: ExactReviewDispatchFailureDetail;
   lastFailureReason?: ExactReviewPublicationReasonCode;
   firstFailureAt?: number;
+  publicationFailureAgePausedAt?: number;
   publicationFailureAttempts?: number;
   reviewFailureAttempts?: number;
   reviewRecoveryReason?: ExactReviewReviewRecoveryReason;
@@ -1480,6 +1481,7 @@ export class ExactReviewQueue {
               current.publicationFailureAttempts = 0;
               current.reviewFailureAttempts = 0;
               current.firstFailureAt = undefined;
+              current.publicationFailureAgePausedAt = undefined;
               current.lastFailureReason = undefined;
               clearExactReviewReviewRecovery(current);
             }
@@ -1898,6 +1900,13 @@ export class ExactReviewQueue {
       if (hasStructuredCompletion && !publicationCompletion) {
         return json({ error: "invalid_publication_completion" }, 400);
       }
+      const attempted = body.attempted === undefined ? undefined : body.attempted === true;
+      if (body.attempted !== undefined && typeof body.attempted !== "boolean") {
+        return json({ error: "invalid_attempted" }, 400);
+      }
+      if (publicationCompletion && attempted !== undefined) {
+        publicationCompletion.attempted = attempted;
+      }
       const completionSucceeds =
         publicationCompletion &&
         (publicationCompletion.kind === "published" ||
@@ -1943,6 +1952,12 @@ export class ExactReviewQueue {
       const requestedRetryAt = exactReviewCompletionRetryAt(body.retry_at, now);
       if (body.retry_at !== undefined && requestedRetryAt === null) {
         return json({ error: "invalid_retry_at" }, 400);
+      }
+      if (
+        attempted === false &&
+        (publicationCompletion?.reasonCode !== "github_rate_limit" || requestedRetryAt === null)
+      ) {
+        return json({ error: "invalid_unattempted_completion" }, 400);
       }
       const retryKind =
         body.retry_kind === undefined ? undefined : exactReviewRetryKind(body.retry_kind);
@@ -3912,6 +3927,7 @@ export class ExactReviewQueue {
           item.publicationFailureAttempts = 0;
           item.reviewFailureAttempts = 0;
           item.firstFailureAt = undefined;
+          item.publicationFailureAgePausedAt = undefined;
           item.lastFailureReason = undefined;
           clearExactReviewDispatchFailure(item);
           clearExactReviewReviewRecovery(item);
@@ -4479,6 +4495,7 @@ export class ExactReviewQueue {
         item.attempts = 0;
         item.publicationFailureAttempts = 0;
         item.firstFailureAt = undefined;
+        item.publicationFailureAgePausedAt = undefined;
         item.lastFailureReason = undefined;
         item.createdAt = now;
         item.updatedAt = now;
@@ -4922,6 +4939,7 @@ export class ExactReviewQueue {
         item.publicationFailureAttempts = 0;
         item.reviewFailureAttempts = 0;
         item.firstFailureAt = undefined;
+        item.publicationFailureAgePausedAt = undefined;
         item.lastFailureReason = undefined;
         clearExactReviewDispatchFailure(item);
         clearExactReviewReviewRecovery(item);
@@ -7415,6 +7433,7 @@ export class ExactReviewQueue {
     item.publicationFailureAttempts = 0;
     item.reviewFailureAttempts = 0;
     item.firstFailureAt = undefined;
+    item.publicationFailureAgePausedAt = undefined;
     item.lastFailureReason = undefined;
     clearExactReviewDispatchFailure(item);
     clearExactReviewReviewRecovery(item);
@@ -10968,6 +10987,7 @@ function finishExactReviewPublicationQueueItem({
     item.attempts = 0;
     item.publicationFailureAttempts = 0;
     item.firstFailureAt = undefined;
+    item.publicationFailureAgePausedAt = undefined;
     item.lastFailureReason = undefined;
     item.nextAttemptAt = Math.max(exactReviewQueueEnqueueAttemptAt(state, now), requestedRetryAt);
     item.backoffReason =
@@ -11014,6 +11034,9 @@ function finishExactReviewPublicationQueueItem({
     );
     item.backoffReason = "publication_retry";
     item.lastFailureReason = "github_rate_limit";
+    if (item.firstFailureAt !== undefined && item.publicationFailureAgePausedAt === undefined) {
+      item.publicationFailureAgePausedAt = now;
+    }
     item.updatedAt = now;
     return {
       requeued: true,
@@ -11027,7 +11050,15 @@ function finishExactReviewPublicationQueueItem({
   // handoff failure must not make the first deterministic artifact failure look
   // like its third confirmation attempt.
   const attempt = Number(item.publicationFailureAttempts || 0) + 1;
-  const firstFailureAt = item.firstFailureAt || now;
+  const pausedFailureAgeMs =
+    item.firstFailureAt !== undefined && item.publicationFailureAgePausedAt !== undefined
+      ? Math.max(0, now - item.publicationFailureAgePausedAt)
+      : 0;
+  const firstFailureAt =
+    item.firstFailureAt === undefined
+      ? now
+      : Math.min(now, item.firstFailureAt + pausedFailureAgeMs);
+  item.publicationFailureAgePausedAt = undefined;
   const artifactRefresh =
     completion.kind === "refresh_required" ||
     (completion.reasonCode === "artifact_unavailable" &&
@@ -11323,6 +11354,7 @@ function reclaimExpiredExactReviewLease(
     item.publicationFailureAttempts = 0;
     item.reviewFailureAttempts = 0;
     item.firstFailureAt = undefined;
+    item.publicationFailureAgePausedAt = undefined;
     item.lastFailureReason = undefined;
     clearExactReviewReviewRecovery(item);
   } else if (!exactReviewQueueIsPublication(item)) {
@@ -11451,6 +11483,7 @@ function refreshExactReviewPublicationItem(
     current.publicationFailureAttempts = 0;
     current.reviewFailureAttempts = 0;
     current.firstFailureAt = undefined;
+    current.publicationFailureAgePausedAt = undefined;
     current.lastFailureReason = undefined;
     clearExactReviewReviewRecovery(current);
     return;

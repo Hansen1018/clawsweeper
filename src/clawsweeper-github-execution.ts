@@ -52,6 +52,10 @@ export function createGitHubExecution(dependencies: CreateGitHubExecutionDepende
         );
       } catch (error) {
         if (error instanceof GitHubRuntimeBudgetError) throw error;
+        // A shared-pool rejection happened before this operation reached the
+        // wire. It is already classified and must not consume the App fallback
+        // or enter the ordinary GitHub retry loop.
+        if (error instanceof GitHubRateLimitError && error.attempted === false) throw error;
         lastError = error;
         const retryKind = ghRetryKind(error);
         // Preserve the exhausted credential observation even when the current

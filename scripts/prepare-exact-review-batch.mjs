@@ -53,6 +53,63 @@ export async function runBoundedPool(items, concurrency, worker) {
   return { results, peak };
 }
 
+export async function selectThrottleObservation({
+  coordinated,
+  existing,
+  resolveUncoordinated,
+  now = Date.now(),
+}) {
+  if (coordinated) {
+    return (
+      existing || {
+        scope: "repository_actions",
+        observed_at: new Date(now).toISOString(),
+        retry_at: new Date(now + 5 * 60_000).toISOString(),
+        provenance: "fallback",
+        authoritative: false,
+      }
+    );
+  }
+  return resolveUncoordinated();
+}
+
+export function recordPreparedGithubEgressMember({
+  outcomePath,
+  env,
+  sourceAction,
+  claimGeneration,
+  repeatRevision,
+  record = recordGithubEgressMember,
+}) {
+  let attempted = true;
+  try {
+    attempted = JSON.parse(readFileSync(outcomePath, "utf8"))?.attempted !== false;
+  } catch {
+    // Preserve the existing attempted classification when a worker does not
+    // produce a readable explicit pre-wire outcome.
+  }
+  record({
+    env,
+    poolClass: "repository_actions",
+    stage: "publication_prepare",
+    sourceAction,
+    claimGeneration,
+    repeatRevision,
+    attempted,
+    outcome: attempted ? "attempted" : "pre_wire_failure",
+  });
+  return attempted;
+}
+
+export function coordinatorClassifiedThrottle(path) {
+  try {
+    const outcome = JSON.parse(readFileSync(path, "utf8"));
+    return outcome?.attempted === true && outcome?.rateLimited === true;
+  } catch {
+    return false;
+  }
+}
+
 async function controller() {
   const startedAt = Date.now();
   const workspace = resolve(process.env.GITHUB_WORKSPACE || process.cwd());
@@ -151,16 +208,6 @@ async function controller() {
       return { kind: "not_admitted", durationMs: 0 };
     }
     admitted += 1;
-    recordGithubEgressMember({
-      env: { ...process.env, TARGET_REPO: String(item.decision?.targetRepo || "") },
-      poolClass: "repository_actions",
-      stage: "publication_prepare",
-      sourceAction: item.decision?.publication?.producerDecision?.sourceAction,
-      claimGeneration: item.claimGeneration,
-      repeatRevision: item.repeatRevision === true,
-      attempted: true,
-      outcome: "attempted",
-    });
     const identity = createHash("sha256")
       .update(`${item.itemKey}:${item.revision}:${item.claimGeneration}`)
       .digest("hex")
@@ -201,6 +248,13 @@ async function controller() {
         cleanupFailures += 1;
       }
     }
+    recordPreparedGithubEgressMember({
+      outcomePath,
+      env: { ...process.env, TARGET_REPO: String(item.decision?.targetRepo || "") },
+      sourceAction: item.decision?.publication?.producerDecision?.sourceAction,
+      claimGeneration: item.claimGeneration,
+      repeatRevision: item.repeatRevision === true,
+    });
     return { kind: timedOut ? "timeout" : "complete", durationMs: Date.now() - workerStartedAt };
   });
 
@@ -247,6 +301,7 @@ async function worker(itemPath, root, workspace) {
   const outcomePath = checkedOutcomePath(workspace, item.outcomePath);
   const bundleDir = join(root, "bundles", itemNumber);
   const eventArtifacts = join(root, "artifacts/event");
+  const coordinatorOutcomePath = join(root, "artifact-coordinator-outcome.json");
   mkdirSync(bundleDir, { recursive: true });
   mkdirSync(eventArtifacts, { recursive: true });
   mkdirSync(dirname(outcomePath), { recursive: true });
@@ -269,20 +324,31 @@ async function worker(itemPath, root, workspace) {
     CLAWSWEEPER_GITHUB_SOURCE_ACTION: String(producer.sourceAction || ""),
     CLAWSWEEPER_GITHUB_CLAIM_GENERATION: String(item.claimGeneration),
     CLAWSWEEPER_GITHUB_REQUEST_REPEAT: String(item.repeatRevision === true),
+    CLAWSWEEPER_GITHUB_COORDINATOR_OUTCOME_PATH: coordinatorOutcomePath,
   };
+  const artifactDownloadArgs = [
+    "run",
+    "download",
+    String(publication.producerRunId),
+    "--repo",
+    env("GITHUB_REPOSITORY"),
+    "--name",
+    String(publication.artifactName),
+    "--dir",
+    bundleDir,
+  ];
+  const coordinated = repositoryPoolCoordinatorEnabled();
+  rmSync(coordinatorOutcomePath, { force: true });
   let result = await run(
-    "gh",
-    [
-      "run",
-      "download",
-      String(publication.producerRunId),
-      "--repo",
-      env("GITHUB_REPOSITORY"),
-      "--name",
-      String(publication.artifactName),
-      "--dir",
-      bundleDir,
-    ],
+    coordinated ? process.execPath : "gh",
+    coordinated
+      ? [
+          join(workspace, "dist/repair/github-egress-pool-runner.js"),
+          "--",
+          "gh",
+          ...artifactDownloadArgs,
+        ]
+      : artifactDownloadArgs,
     {
       env: {
         ...process.env,
@@ -292,23 +358,50 @@ async function worker(itemPath, root, workspace) {
       capture: true,
     },
   );
+  const coordinatedObservation = coordinated
+    ? latestActiveRateLimitObservation(rateLimitObservationPath)
+    : null;
+  const classifiedThrottle =
+    result.code !== 0 &&
+    (githubThrottleText(result.stderr) || coordinatorClassifiedThrottle(coordinatorOutcomePath));
   appendRequestMetric(requestMetricsPath, {
     scope: "repository_actions",
     category: "artifact_download",
     mode: "read",
     outcome:
-      result.code === 0 ? "success" : githubThrottleText(result.stderr) ? "throttle" : "error",
+      result.code === 0
+        ? "success"
+        : result.code === 75 && coordinated
+          ? "skipped_by_circuit"
+          : classifiedThrottle
+            ? "throttle"
+            : "error",
     repeat_revision: item.repeatRevision === true,
     count: 1,
   });
-  if (result.code !== 0 && githubThrottleText(result.stderr)) {
-    const observation = await resolveRateLimitObservation(
-      repositoryToken,
-      requestMetricsPath,
-      rateLimitObservationPath,
-      itemEgressEnv,
-    );
-    appendJsonLine(rateLimitObservationPath, observation);
+  if (result.code === 75 && coordinated) {
+    const circuit = latestActiveRateLimitObservation(rateLimitObservationPath);
+    return writeFailure(outcomePath, "retryable_failure", "github_rate_limit", {
+      retryAt: circuit?.retry_at || new Date(Date.now() + 5 * 60_000).toISOString(),
+      rateLimitScope: "repository_actions",
+      rateLimitProvenance: circuit?.provenance || "fallback",
+      rateLimitAuthoritative: circuit?.authoritative === true,
+      attempted: false,
+    });
+  }
+  if (classifiedThrottle) {
+    const observation = await selectThrottleObservation({
+      coordinated,
+      existing: coordinatedObservation,
+      resolveUncoordinated: () =>
+        resolveRateLimitObservation(
+          repositoryToken,
+          requestMetricsPath,
+          rateLimitObservationPath,
+          itemEgressEnv,
+        ),
+    });
+    if (!coordinatedObservation) appendJsonLine(rateLimitObservationPath, observation);
     return writeFailure(outcomePath, "retryable_failure", "github_rate_limit", {
       retryAt: observation.retry_at,
       rateLimitScope: observation.scope,
@@ -412,6 +505,12 @@ function writeFailure(path, kind, reasonCode, details = {}) {
 function githubThrottleText(value) {
   return /api rate limit exceeded|secondary rate limit|abuse detection|http\s*429|rate limited|was submitted too quickly/i.test(
     String(value || ""),
+  );
+}
+
+function repositoryPoolCoordinatorEnabled() {
+  return ["1", "true"].includes(
+    String(process.env.CLAWSWEEPER_REPOSITORY_POOL_COORDINATOR_ENABLED || "").toLowerCase(),
   );
 }
 

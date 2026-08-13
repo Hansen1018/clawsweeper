@@ -141,13 +141,14 @@ reservations defer without another read or attempt charge, and reset recovery is
 bounded by the Durable Object alarm processor.
 
 Exact publication routes only classifier-approved public reads through the
-repository Actions token. If that pool is exhausted after the current member's
-artifact is already present, the member may use the ambient target App once;
-later members still stop because they require the blocked Actions pool. The
-workflow also records a typed repository-pool observation if its final comment
-router dispatch encounters quota pressure. All typed observations and request
-counters are acknowledged with the same fenced batch completion, so a delayed
-cleanup is idempotent and cannot duplicate accounting.
+repository Actions token. Those reads do not fall through to the target App
+after an attempted repository-token throttle or a pre-wire coordinator
+deferral: the durable publication is requeued against the same credential pool.
+Artifact downloads and direct, recovery, or batch comment-router dispatches that
+use the repository token share that fence. Target-App mutations remain on their
+independent owner pool. All typed observations and request counters are
+acknowledged with the same fenced completion, so delayed cleanup is idempotent
+and cannot duplicate accounting.
 
 ## Schedules
 

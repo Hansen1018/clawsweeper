@@ -428,6 +428,7 @@ async function publishCanonicalBatch(
 async function complete() {
   const manifest = readManifest();
   const receipt = readBatchReceipt(manifest, true)!;
+  const repositoryActionsCircuit = latestRateLimitObservation("repository_actions");
   const fetched = await client.fetch({
     batchId: manifest.batchId,
     leaseOwner: manifest.leaseOwner,
@@ -460,6 +461,22 @@ async function complete() {
       continue;
     }
     const publicationOutcome = receipt.outcomes.get(current.itemKey);
+    if (publicationOutcome?.outcome === "permanent") {
+      completions.push(publicationCompletion(current, publicationOutcome, outcome));
+      continue;
+    }
+    if (repositoryActionsCircuit && hasPendingPostEffects(outcome)) {
+      completions.push(
+        retryableCompletion(
+          current,
+          "github_rate_limit",
+          undefined,
+          repositoryActionsCircuit.retryAt,
+          postEffectsAttemptedValue(outcome),
+        ),
+      );
+      continue;
+    }
     if (publicationOutcome) {
       completions.push(publicationCompletion(current, publicationOutcome, outcome));
       continue;
@@ -496,6 +513,8 @@ async function complete() {
 async function release() {
   const manifest = readManifest();
   const receipt = readBatchReceipt(manifest, false);
+  const activeCircuit = latestRateLimitObservation();
+  const repositoryActionsCircuit = latestRateLimitObservation("repository_actions");
   // Cleanup must remain available when the queue fetch path is degraded. The
   // claimed manifest already contains the exact revision and generation fences
   // accepted by the complete route, so a fresh read adds availability risk but
@@ -509,6 +528,18 @@ async function release() {
       const failure = failureCompletion(member, outcome);
       if (failure) return failure;
       const publicationOutcome = receipt?.outcomes.get(member.itemKey);
+      if (publicationOutcome?.outcome === "permanent") {
+        return publicationCompletion(member, publicationOutcome, outcome);
+      }
+      if (repositoryActionsCircuit && hasPendingPostEffects(outcome)) {
+        return retryableCompletion(
+          member,
+          "github_rate_limit",
+          undefined,
+          repositoryActionsCircuit.retryAt,
+          postEffectsAttemptedValue(outcome),
+        );
+      }
       if (publicationOutcome) return publicationCompletion(member, publicationOutcome, outcome);
       // A receipt proves the state mutation committed. A member is safe to
       // acknowledge as published only after every required post-commit effect
@@ -521,9 +552,8 @@ async function release() {
         return { ...member, terminalOutcome: "published" };
       }
     }
-    const circuit = latestRateLimitObservation();
-    return circuit
-      ? retryableCompletion(member, "github_rate_limit", undefined, circuit.retryAt, false)
+    return activeCircuit
+      ? retryableCompletion(member, "github_rate_limit", undefined, activeCircuit.retryAt, false)
       : retryableCompletion(member, "workflow_cancelled");
   });
   const result = await acknowledge(
@@ -763,10 +793,15 @@ function readRateLimitObservations(
   return [...byPool.values()];
 }
 
-function latestRateLimitObservation(): ExactReviewGithubRateLimitObservation | null {
+function latestRateLimitObservation(
+  scope?: ExactReviewGithubRateLimitObservation["scope"],
+): ExactReviewGithubRateLimitObservation | null {
   return (
     readRateLimitObservations()
-      .filter((observation) => Date.parse(observation.retryAt) > Date.now())
+      .filter(
+        (observation) =>
+          Date.parse(observation.retryAt) > Date.now() && (!scope || observation.scope === scope),
+      )
       .sort((left, right) => Date.parse(right.retryAt) - Date.parse(left.retryAt))[0] ?? null
   );
 }
@@ -1046,6 +1081,10 @@ function hasPendingPostEffects(outcome: Record<string, unknown>): boolean {
     (requiresPostEffects || outcome.postEffectsRequired === true) &&
     outcome.postEffectsComplete !== true
   );
+}
+
+function postEffectsAttemptedValue(outcome: Record<string, unknown>): false | undefined {
+  return outcome.postEffectsGithubAttempted === true ? undefined : false;
 }
 
 function readManifest(): BatchManifest {

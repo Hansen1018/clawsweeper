@@ -22,6 +22,9 @@ class_name = "StatusStore"
 name = "EXACT_REVIEW_QUEUE"
 class_name = "ExactReviewQueue"
 
+[[durable_objects.bindings]]
+name = "GITHUB_EGRESS_POOL_COORDINATOR"
+class_name = "GithubEgressPoolCoordinator"
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["StatusStore"]
@@ -30,6 +33,9 @@ new_sqlite_classes = ["StatusStore"]
 tag = "v2"
 new_sqlite_classes = ["ExactReviewQueue"]
 
+[[migrations]]
+tag = "v3"
+new_sqlite_classes = ["GithubEgressPoolCoordinator"]
 [[routes]]
 pattern = "clawsweeper.openclaw.ai"
 custom_domain = true
@@ -89,5 +95,12 @@ EXACT_REVIEW_PUBLICATION_BATCH_WAIT_MS = "60000"
 # serialized batches despite dozens of ready publication records.
 EXACT_REVIEW_PUBLICATION_BATCH_DISPATCH_COOLDOWN_MS = "5000"
 EXACT_REVIEW_PUBLICATION_BATCH_DISPATCH_RESERVATION_MS = "600000"
+GITHUB_EGRESS_POOL_MAX_PERMITS = "8"
+GITHUB_EGRESS_POOL_ACQUIRED_PERMIT_TTL_MS = "15000"
+GITHUB_EGRESS_POOL_STARTED_PERMIT_TTL_MS = "600000"
+GITHUB_EGRESS_POOL_FALLBACK_BASE_MS = "300000"
+GITHUB_EGRESS_POOL_FALLBACK_MAX_MS = "3600000"
+GITHUB_EGRESS_POOL_FALLBACK_JITTER_RATIO = "0.2"
+GITHUB_EGRESS_POOL_RAMP_SUCCESS_MULTIPLIER = "1"
 REVIEW_OBSERVABILITY_REQUIRED = "0"
 REVIEW_RECOVERY_ENABLED = "0"

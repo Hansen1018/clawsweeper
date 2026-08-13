@@ -1417,6 +1417,7 @@ jobs:
         continue-on-error: true
         env:
           CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
+          CLAWSWEEPER_REPOSITORY_POOL_COORDINATOR_ENABLED: ${{ vars.CLAWSWEEPER_REPOSITORY_POOL_COORDINATOR_ENABLED || 'false' }}
           GH_TOKEN: ${{ steps.target-write-token.outputs.token }}
           CLAWSWEEPER_PUBLIC_GH_TOKEN: ${{ steps.target.outputs.target_repo == 'openclaw/openclaw' && github.token || '' }}
           REPO_TOKEN: ${{ github.token }}
@@ -1430,6 +1431,7 @@ jobs:
           EXACT_REVIEW_BATCH_REVISION: ${{ steps.claim-exact-review-queue.outputs.lease_revision }}
           EXACT_REVIEW_BATCH_CLAIM_GENERATION: ${{ steps.claim-exact-review-queue.outputs.claim_generation }}
           EXACT_REVIEW_BATCH_MUTATION_OUTPUT: .artifacts/direct-publication-outcome.json
+          EXACT_REVIEW_QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
         run: pnpm run --silent repair:publish-event-result
 
       - name: Post direct exact review publication result
@@ -1447,10 +1449,13 @@ jobs:
       - name: Finalize direct exact review lifecycle
         id: finalize-direct-exact-review-lifecycle
         if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.direct-exact-review-publication.outputs.accepted == 'true' }}
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
           CLAWSWEEPER_GITHUB_POOL_CLASS: repository_actions
           CLAWSWEEPER_GITHUB_STAGE: publication_router
+          CLAWSWEEPER_GITHUB_RATE_LIMIT_OBSERVATION_PATH: .artifacts/direct-publication/router-github-rate-limits.jsonl
+          CLAWSWEEPER_REPOSITORY_POOL_COORDINATOR_ENABLED: ${{ vars.CLAWSWEEPER_REPOSITORY_POOL_COORDINATOR_ENABLED || 'false' }}
           TARGET_REPO: ${{ steps.target.outputs.target_repo }}
           TARGET_BRANCH: ${{ steps.target.outputs.target_branch }}
           ITEM_NUMBER: ${{ steps.target.outputs.item_number }}
@@ -1459,12 +1464,42 @@ jobs:
           CLAIM_DECISION: ${{ steps.claim-exact-review-queue.outputs.decision }}
           DIRECT_PUBLICATION_SUPERSEDED: ${{ steps.direct-exact-review-publication.outputs.superseded }}
           DIRECT_OUTCOME: .artifacts/direct-publication-outcome.json
+          EXACT_REVIEW_QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
           QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
           CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           CLAWSWEEPER_COMMENT_LOOKBACK_MINUTES: ${{ vars.CLAWSWEEPER_COMMENT_LOOKBACK_MINUTES || '180' }}
           CLAWSWEEPER_COMMENT_MAX_COMMENTS: ${{ vars.CLAWSWEEPER_COMMENT_MAX_COMMENTS || '1000' }}
         run: |
           set -euo pipefail
+          repository_pool_coordinator_enabled() {
+            [ "${CLAWSWEEPER_REPOSITORY_POOL_COORDINATOR_ENABLED,,}" = "true" ] || \
+              [ "$CLAWSWEEPER_REPOSITORY_POOL_COORDINATOR_ENABLED" = "1" ]
+          }
+          repository_pool_gh() {
+            if repository_pool_coordinator_enabled; then
+              node dist/repair/github-egress-pool-runner.js -- gh "$@"
+            else
+              gh "$@"
+            fi
+          }
+          coordinator_observation_count() {
+            if test -s "$CLAWSWEEPER_GITHUB_RATE_LIMIT_OBSERVATION_PATH"; then
+              wc -l < "$CLAWSWEEPER_GITHUB_RATE_LIMIT_OBSERVATION_PATH"
+            else
+              echo 0
+            fi
+          }
+          coordinator_retry_at_since() {
+            local observation_count="$1"
+            local deferred="$2"
+            test -s "$CLAWSWEEPER_GITHUB_RATE_LIMIT_OBSERVATION_PATH"
+            tail -n "+$((observation_count + 1))" "$CLAWSWEEPER_GITHUB_RATE_LIMIT_OBSERVATION_PATH" | \
+              jq -sr --argjson deferred "$deferred" \
+                '[.[] | select(.scope == "repository_actions" and .coordinator_deferred == $deferred and (.retry_at | type == "string"))] | last | .retry_at // empty'
+          }
+          echo "coordinator_deferred=false" >> "$GITHUB_OUTPUT"
+          echo "rate_limited=false" >> "$GITHUB_OUTPUT"
+          echo "attempted=true" >> "$GITHUB_OUTPUT"
           test -s "$DIRECT_OUTCOME"
           jq -e '.kind == "eligible" and .disposition != null' "$DIRECT_OUTCOME" >/dev/null
           test -n "$CLAWSWEEPER_WEBHOOK_SECRET"
@@ -1489,7 +1524,9 @@ jobs:
             elif [ "$source_action" = "failed_review_shard_recovery" ]; then
               lifecycle_router_outcome="not_required"
             elif jq -e '.disposition.routableSyncExpected == true' "$DIRECT_OUTCOME" >/dev/null; then
-              gh workflow run repair-comment-router.yml \
+              observation_count="$(coordinator_observation_count)"
+              set +e
+              repository_pool_gh workflow run repair-comment-router.yml \
                 --repo "$GITHUB_REPOSITORY" \
                 --ref main \
                 -f execute=true \
@@ -1498,6 +1535,30 @@ jobs:
                 -f item_numbers="$ITEM_NUMBER" \
                 -f lookback_minutes="$CLAWSWEEPER_COMMENT_LOOKBACK_MINUTES" \
                 -f max_comments="$CLAWSWEEPER_COMMENT_MAX_COMMENTS"
+              router_status=$?
+              set -e
+              if [ "$router_status" -eq 75 ] && repository_pool_coordinator_enabled; then
+                retry_at="$(coordinator_retry_at_since "$observation_count" true)"
+                test -n "$retry_at"
+                {
+                  echo "coordinator_deferred=true"
+                  echo "attempted=false"
+                  echo "retry_at=$retry_at"
+                } >> "$GITHUB_OUTPUT"
+                exit 75
+              elif [ "$router_status" -ne 0 ]; then
+                retry_at=""
+                if repository_pool_coordinator_enabled; then
+                  retry_at="$(coordinator_retry_at_since "$observation_count" false)"
+                fi
+                if [ -n "$retry_at" ]; then
+                  {
+                    echo "rate_limited=true"
+                    echo "retry_at=$retry_at"
+                  } >> "$GITHUB_OUTPUT"
+                fi
+                exit "$router_status"
+              fi
               lifecycle_router_outcome="durable"
             elif jq -e '.disposition.deferredCloseCoverageExpected == true' "$DIRECT_OUTCOME" >/dev/null; then
               # The close proof remains a separate later concern. The durable
@@ -1744,6 +1805,9 @@ jobs:
           RETRY_AT: ${{ steps.live-item.outputs.retry_at || steps.reserve-exact-review-lease.outputs.retry_at || steps.review-exact-event-item.outputs.retry_at }}
           DIRECT_PUBLICATION_FAILURE_KIND: ${{ steps.prepare-direct-exact-review-publication.outputs.failure_kind }}
           DIRECT_PUBLICATION_RETRY_AT: ${{ steps.prepare-direct-exact-review-publication.outputs.retry_at }}
+          DIRECT_LIFECYCLE_COORDINATOR_DEFERRED: ${{ steps.finalize-direct-exact-review-lifecycle.outputs.coordinator_deferred || 'false' }}
+          DIRECT_LIFECYCLE_RATE_LIMITED: ${{ steps.finalize-direct-exact-review-lifecycle.outputs.rate_limited || 'false' }}
+          DIRECT_LIFECYCLE_COORDINATOR_RETRY_AT: ${{ steps.finalize-direct-exact-review-lifecycle.outputs.retry_at }}
           TARGET_ENABLED: ${{ steps.target.outputs.target_enabled }}
           LIVE_OUTCOME: ${{ steps.live-item.outcome }}
           SCHEDULED_SEMANTIC_NOOP: ${{ steps.live-item.outputs.scheduled_semantic_noop || 'false' }}
@@ -1760,7 +1824,17 @@ jobs:
           requeue_latest=false
           retry_kind="$RETRY_KIND"
           retry_at="$RETRY_AT"
-          if [ "$DIRECT_PUBLICATION_FAILURE_KIND" = "github_rate_limit" ] && [ "$PUBLICATION_QUEUE_OUTCOME" != "success" ]; then
+          if [ "$DIRECT_LIFECYCLE_COORDINATOR_DEFERRED" = "true" ]; then
+            test "$PUBLICATION_QUEUE_OUTCOME" = "success"
+            test -n "$DIRECT_LIFECYCLE_COORDINATOR_RETRY_AT"
+            retry_kind=throttle
+            retry_at="$DIRECT_LIFECYCLE_COORDINATOR_RETRY_AT"
+          elif [ "$DIRECT_LIFECYCLE_RATE_LIMITED" = "true" ]; then
+            test "$PUBLICATION_QUEUE_OUTCOME" = "success"
+            test -n "$DIRECT_LIFECYCLE_COORDINATOR_RETRY_AT"
+            retry_kind=throttle
+            retry_at="$DIRECT_LIFECYCLE_COORDINATOR_RETRY_AT"
+          elif [ "$DIRECT_PUBLICATION_FAILURE_KIND" = "github_rate_limit" ] && [ "$PUBLICATION_QUEUE_OUTCOME" != "success" ]; then
             test -n "$DIRECT_PUBLICATION_RETRY_AT"
             retry_kind=throttle
             retry_at="$DIRECT_PUBLICATION_RETRY_AT"
@@ -2152,14 +2226,33 @@ jobs:
           done
           exit 1
 
+      - uses: actions/checkout@v7
+        if: ${{ steps.publication-context.outputs.claimed == 'true' && steps.publication-context.outputs.direct_lifecycle_recovery == 'true' }}
+        with:
+          ref: main
+          filter: blob:none
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-pnpm
+        if: ${{ steps.publication-context.outputs.claimed == 'true' && steps.publication-context.outputs.direct_lifecycle_recovery == 'true' }}
+        id: setup-direct-lifecycle-pnpm
+        with:
+          build-script: build:repair
+
       - name: Replay committed direct lifecycle handoff
         id: replay-direct-lifecycle
         # A direct receipt already owns the GitHub effect. Its persisted plan is
         # the only safe source for post-effect recovery; old receipts fall back
         # to the artifact path above rather than being inferred here.
         if: ${{ steps.publication-context.outputs.claimed == 'true' && steps.publication-context.outputs.direct_lifecycle_recovery == 'true' }}
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
+          CLAWSWEEPER_GITHUB_POOL_CLASS: repository_actions
+          CLAWSWEEPER_GITHUB_STAGE: publication_router
+          CLAWSWEEPER_GITHUB_RATE_LIMIT_OBSERVATION_PATH: .artifacts/direct-lifecycle-recovery/router-github-rate-limits.jsonl
+          CLAWSWEEPER_REPOSITORY_POOL_COORDINATOR_ENABLED: ${{ vars.CLAWSWEEPER_REPOSITORY_POOL_COORDINATOR_ENABLED || 'false' }}
           TARGET_REPO: ${{ steps.publication-context.outputs.target_repo }}
           TARGET_BRANCH: ${{ steps.publication-context.outputs.target_branch }}
           ITEM_NUMBER: ${{ steps.publication-context.outputs.item_number }}
@@ -2168,12 +2261,42 @@ jobs:
           CLAIM_DECISION: ${{ steps.publication-context.outputs.decision }}
           DIRECT_LIFECYCLE_PLAN: ${{ steps.publication-context.outputs.direct_lifecycle_plan }}
           DIRECT_LIFECYCLE_RECEIPT_OUTCOME: ${{ steps.publication-context.outputs.direct_lifecycle_receipt_outcome }}
+          EXACT_REVIEW_QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
           QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
           CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           CLAWSWEEPER_COMMENT_LOOKBACK_MINUTES: ${{ vars.CLAWSWEEPER_COMMENT_LOOKBACK_MINUTES || '180' }}
           CLAWSWEEPER_COMMENT_MAX_COMMENTS: ${{ vars.CLAWSWEEPER_COMMENT_MAX_COMMENTS || '1000' }}
         run: |
           set -euo pipefail
+          repository_pool_coordinator_enabled() {
+            [ "${CLAWSWEEPER_REPOSITORY_POOL_COORDINATOR_ENABLED,,}" = "true" ] || \
+              [ "$CLAWSWEEPER_REPOSITORY_POOL_COORDINATOR_ENABLED" = "1" ]
+          }
+          repository_pool_gh() {
+            if repository_pool_coordinator_enabled; then
+              node dist/repair/github-egress-pool-runner.js -- gh "$@"
+            else
+              gh "$@"
+            fi
+          }
+          coordinator_observation_count() {
+            if test -s "$CLAWSWEEPER_GITHUB_RATE_LIMIT_OBSERVATION_PATH"; then
+              wc -l < "$CLAWSWEEPER_GITHUB_RATE_LIMIT_OBSERVATION_PATH"
+            else
+              echo 0
+            fi
+          }
+          coordinator_retry_at_since() {
+            local observation_count="$1"
+            local deferred="$2"
+            test -s "$CLAWSWEEPER_GITHUB_RATE_LIMIT_OBSERVATION_PATH"
+            tail -n "+$((observation_count + 1))" "$CLAWSWEEPER_GITHUB_RATE_LIMIT_OBSERVATION_PATH" | \
+              jq -sr --argjson deferred "$deferred" \
+                '[.[] | select(.scope == "repository_actions" and .coordinator_deferred == $deferred and (.retry_at | type == "string"))] | last | .retry_at // empty'
+          }
+          echo "coordinator_deferred=false" >> "$GITHUB_OUTPUT"
+          echo "rate_limited=false" >> "$GITHUB_OUTPUT"
+          echo "attempted=true" >> "$GITHUB_OUTPUT"
           test -n "$CLAWSWEEPER_WEBHOOK_SECRET"
           queue_url="${QUEUE_URL%/}"
           lifecycle_kind="$(DIRECT_LIFECYCLE_PLAN="$DIRECT_LIFECYCLE_PLAN" node -e '
@@ -2251,7 +2374,9 @@ jobs:
           else
             case "$lifecycle_kind" in
               router)
-                gh workflow run repair-comment-router.yml \
+                observation_count="$(coordinator_observation_count)"
+                set +e
+                repository_pool_gh workflow run repair-comment-router.yml \
                   --repo "$GITHUB_REPOSITORY" \
                   --ref main \
                   -f execute=true \
@@ -2260,6 +2385,30 @@ jobs:
                   -f item_numbers="$ITEM_NUMBER" \
                   -f lookback_minutes="$CLAWSWEEPER_COMMENT_LOOKBACK_MINUTES" \
                   -f max_comments="$CLAWSWEEPER_COMMENT_MAX_COMMENTS"
+                router_status=$?
+                set -e
+                if [ "$router_status" -eq 75 ] && repository_pool_coordinator_enabled; then
+                  retry_at="$(coordinator_retry_at_since "$observation_count" true)"
+                  test -n "$retry_at"
+                  {
+                    echo "coordinator_deferred=true"
+                    echo "attempted=false"
+                    echo "retry_at=$retry_at"
+                  } >> "$GITHUB_OUTPUT"
+                  exit 75
+                elif [ "$router_status" -ne 0 ]; then
+                  retry_at=""
+                  if repository_pool_coordinator_enabled; then
+                    retry_at="$(coordinator_retry_at_since "$observation_count" false)"
+                  fi
+                  if [ -n "$retry_at" ]; then
+                    {
+                      echo "rate_limited=true"
+                      echo "retry_at=$retry_at"
+                    } >> "$GITHUB_OUTPUT"
+                  fi
+                  exit "$router_status"
+                fi
                 post_router_receipt durable false
                 ;;
               router_deferred_coverage)
@@ -2334,21 +2483,77 @@ jobs:
         if: ${{ steps.publication-context.outputs.claimed == 'true' && steps.publication-context.outputs.direct_lifecycle_recovery != 'true' }}
         id: download-exact-review-bundle
         continue-on-error: true
-        uses: actions/download-artifact@v8
-        with:
-          name: ${{ steps.publication-context.outputs.artifact_name }}
-          run-id: ${{ steps.publication-context.outputs.producer_run_id }}
-          github-token: ${{ github.token }}
-          repository: ${{ github.repository }}
-          path: .artifacts/exact-review-bundle
-
-      - name: Record artifact download transport boundary
-        if: ${{ always() && steps.publication-context.outputs.claimed == 'true' && steps.publication-context.outputs.direct_lifecycle_recovery != 'true' && steps.artifact-github-egress-observer.outcome == 'success' && steps.download-exact-review-bundle.outcome != 'skipped' }}
-        continue-on-error: true
         env:
+          GH_TOKEN: ${{ github.token }}
           CLAWSWEEPER_GITHUB_POOL_CLASS: repository_actions
           CLAWSWEEPER_GITHUB_STAGE: publication_prepare
-        run: node dist/github-egress-observer-cli.js record-unobserved -- run download
+          CLAWSWEEPER_GITHUB_RATE_LIMIT_OBSERVATION_PATH: .artifacts/artifact-publication/download-github-rate-limits.jsonl
+          CLAWSWEEPER_REPOSITORY_POOL_COORDINATOR_ENABLED: ${{ vars.CLAWSWEEPER_REPOSITORY_POOL_COORDINATOR_ENABLED || 'false' }}
+          ARTIFACT_NAME: ${{ steps.publication-context.outputs.artifact_name }}
+          PRODUCER_RUN_ID: ${{ steps.publication-context.outputs.producer_run_id }}
+          EXACT_REVIEW_QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
+          CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
+        run: |
+          set -euo pipefail
+          repository_pool_coordinator_enabled() {
+            [ "${CLAWSWEEPER_REPOSITORY_POOL_COORDINATOR_ENABLED,,}" = "true" ] || \
+              [ "$CLAWSWEEPER_REPOSITORY_POOL_COORDINATOR_ENABLED" = "1" ]
+          }
+          repository_pool_gh() {
+            if repository_pool_coordinator_enabled; then
+              node dist/repair/github-egress-pool-runner.js -- gh "$@"
+            else
+              gh "$@"
+            fi
+          }
+          coordinator_observation_count() {
+            if test -s "$CLAWSWEEPER_GITHUB_RATE_LIMIT_OBSERVATION_PATH"; then
+              wc -l < "$CLAWSWEEPER_GITHUB_RATE_LIMIT_OBSERVATION_PATH"
+            else
+              echo 0
+            fi
+          }
+          coordinator_retry_at_since() {
+            local observation_count="$1"
+            local deferred="$2"
+            test -s "$CLAWSWEEPER_GITHUB_RATE_LIMIT_OBSERVATION_PATH"
+            tail -n "+$((observation_count + 1))" "$CLAWSWEEPER_GITHUB_RATE_LIMIT_OBSERVATION_PATH" | \
+              jq -sr --argjson deferred "$deferred" \
+                '[.[] | select(.scope == "repository_actions" and .coordinator_deferred == $deferred and (.retry_at | type == "string"))] | last | .retry_at // empty'
+          }
+          echo "coordinator_deferred=false" >> "$GITHUB_OUTPUT"
+          echo "rate_limited=false" >> "$GITHUB_OUTPUT"
+          echo "attempted=true" >> "$GITHUB_OUTPUT"
+          observation_count="$(coordinator_observation_count)"
+          set +e
+          repository_pool_gh run download "$PRODUCER_RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name "$ARTIFACT_NAME" \
+            --dir .artifacts/exact-review-bundle
+          download_status=$?
+          set -e
+          if [ "$download_status" -eq 75 ] && repository_pool_coordinator_enabled; then
+            retry_at="$(coordinator_retry_at_since "$observation_count" true)"
+            test -n "$retry_at"
+            {
+              echo "coordinator_deferred=true"
+              echo "attempted=false"
+              echo "retry_at=$retry_at"
+            } >> "$GITHUB_OUTPUT"
+            exit 75
+          elif [ "$download_status" -ne 0 ]; then
+            retry_at=""
+            if repository_pool_coordinator_enabled; then
+              retry_at="$(coordinator_retry_at_since "$observation_count" false)"
+            fi
+            if [ -n "$retry_at" ]; then
+              {
+                echo "rate_limited=true"
+                echo "retry_at=$retry_at"
+              } >> "$GITHUB_OUTPUT"
+            fi
+            exit "$download_status"
+          fi
 
       - name: Validate exact review artifact bundle
         if: ${{ steps.publication-context.outputs.claimed == 'true' && steps.publication-context.outputs.direct_lifecycle_recovery != 'true' && steps.download-exact-review-bundle.outcome == 'success' }}
@@ -2445,6 +2650,7 @@ jobs:
         id: publish-event-result
         env:
           CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
+          CLAWSWEEPER_REPOSITORY_POOL_COORDINATOR_ENABLED: ${{ vars.CLAWSWEEPER_REPOSITORY_POOL_COORDINATOR_ENABLED || 'false' }}
           GH_TOKEN: ${{ steps.target-write-token.outputs.token }}
           CLAWSWEEPER_PUBLIC_GH_TOKEN: ${{ steps.publication-context.outputs.target_repo == 'openclaw/openclaw' && github.token || '' }}
           REPO_TOKEN: ${{ github.token }}
@@ -2620,21 +2826,57 @@ jobs:
       - name: Queue deferred exact verdict router
         id: queue-deferred-verdict-router
         if: ${{ steps.publication-context.outputs.claimed == 'true' && steps.publication-context.outputs.direct_lifecycle_recovery != 'true' && fromJSON(steps.publication-context.outputs.decision).sourceAction != 'failed_review_shard_recovery' && steps.publish-event-result.outcome == 'success' && steps.publish-event-result.outputs.remote_tuple_verified == 'true' && steps.publish-event-result.outputs.routing_deferred == 'true' }}
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
           CLAWSWEEPER_GITHUB_POOL_CLASS: repository_actions
           CLAWSWEEPER_GITHUB_STAGE: publication_router
+          CLAWSWEEPER_GITHUB_RATE_LIMIT_OBSERVATION_PATH: .artifacts/artifact-publication/router-github-rate-limits.jsonl
+          CLAWSWEEPER_REPOSITORY_POOL_COORDINATOR_ENABLED: ${{ vars.CLAWSWEEPER_REPOSITORY_POOL_COORDINATOR_ENABLED || 'false' }}
           TARGET_REPO: ${{ steps.publication-context.outputs.target_repo }}
           TARGET_BRANCH: ${{ steps.publication-context.outputs.target_branch }}
           ITEM_NUMBER: ${{ steps.publication-context.outputs.item_number }}
           FENCE_KEY: ${{ steps.publication-context.outputs.publisher_item_key }}
           REVISION: ${{ steps.publication-context.outputs.publisher_lease_revision }}
+          EXACT_REVIEW_QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
           QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
           CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           CLAWSWEEPER_COMMENT_LOOKBACK_MINUTES: ${{ vars.CLAWSWEEPER_COMMENT_LOOKBACK_MINUTES || '180' }}
           CLAWSWEEPER_COMMENT_MAX_COMMENTS: ${{ vars.CLAWSWEEPER_COMMENT_MAX_COMMENTS || '1000' }}
         run: |
-          gh workflow run repair-comment-router.yml \
+          set -euo pipefail
+          repository_pool_coordinator_enabled() {
+            [ "${CLAWSWEEPER_REPOSITORY_POOL_COORDINATOR_ENABLED,,}" = "true" ] || \
+              [ "$CLAWSWEEPER_REPOSITORY_POOL_COORDINATOR_ENABLED" = "1" ]
+          }
+          repository_pool_gh() {
+            if repository_pool_coordinator_enabled; then
+              node dist/repair/github-egress-pool-runner.js -- gh "$@"
+            else
+              gh "$@"
+            fi
+          }
+          coordinator_observation_count() {
+            if test -s "$CLAWSWEEPER_GITHUB_RATE_LIMIT_OBSERVATION_PATH"; then
+              wc -l < "$CLAWSWEEPER_GITHUB_RATE_LIMIT_OBSERVATION_PATH"
+            else
+              echo 0
+            fi
+          }
+          coordinator_retry_at_since() {
+            local observation_count="$1"
+            local deferred="$2"
+            test -s "$CLAWSWEEPER_GITHUB_RATE_LIMIT_OBSERVATION_PATH"
+            tail -n "+$((observation_count + 1))" "$CLAWSWEEPER_GITHUB_RATE_LIMIT_OBSERVATION_PATH" | \
+              jq -sr --argjson deferred "$deferred" \
+                '[.[] | select(.scope == "repository_actions" and .coordinator_deferred == $deferred and (.retry_at | type == "string"))] | last | .retry_at // empty'
+          }
+          echo "coordinator_deferred=false" >> "$GITHUB_OUTPUT"
+          echo "rate_limited=false" >> "$GITHUB_OUTPUT"
+          echo "attempted=true" >> "$GITHUB_OUTPUT"
+          observation_count="$(coordinator_observation_count)"
+          set +e
+          repository_pool_gh workflow run repair-comment-router.yml \
             --repo "$GITHUB_REPOSITORY" \
             --ref main \
             -f execute=true \
@@ -2643,6 +2885,30 @@ jobs:
             -f item_numbers="$ITEM_NUMBER" \
             -f lookback_minutes="$CLAWSWEEPER_COMMENT_LOOKBACK_MINUTES" \
             -f max_comments="$CLAWSWEEPER_COMMENT_MAX_COMMENTS"
+          router_status=$?
+          set -e
+          if [ "$router_status" -eq 75 ] && repository_pool_coordinator_enabled; then
+            retry_at="$(coordinator_retry_at_since "$observation_count" true)"
+            test -n "$retry_at"
+            {
+              echo "coordinator_deferred=true"
+              echo "attempted=false"
+              echo "retry_at=$retry_at"
+            } >> "$GITHUB_OUTPUT"
+            exit 75
+          elif [ "$router_status" -ne 0 ]; then
+            retry_at=""
+            if repository_pool_coordinator_enabled; then
+              retry_at="$(coordinator_retry_at_since "$observation_count" false)"
+            fi
+            if [ -n "$retry_at" ]; then
+              {
+                echo "rate_limited=true"
+                echo "retry_at=$retry_at"
+              } >> "$GITHUB_OUTPUT"
+            fi
+            exit "$router_status"
+          fi
 
           payload="$(node -e '
             const revision = Number(process.env.REVISION);
@@ -2884,6 +3150,9 @@ jobs:
           DEFERRED_ROUTE_OUTCOME: ${{ steps.queue-deferred-verdict-router.outcome }}
           FAILURE_KIND: ${{ steps.publish-event-result.outputs.failure_kind }}
           DOWNLOAD_OUTCOME: ${{ steps.download-exact-review-bundle.outcome }}
+          DOWNLOAD_COORDINATOR_DEFERRED: ${{ steps.download-exact-review-bundle.outputs.coordinator_deferred || 'false' }}
+          DOWNLOAD_RATE_LIMITED: ${{ steps.download-exact-review-bundle.outputs.rate_limited || 'false' }}
+          DOWNLOAD_RETRY_AT: ${{ steps.download-exact-review-bundle.outputs.retry_at }}
           VALIDATE_OUTCOME: ${{ steps.validate-exact-review-bundle.outcome }}
           PUBLISH_COMPLETION_KIND: ${{ steps.publish-event-result.outputs.completion_kind }}
           PUBLISH_REASON_CODE: ${{ steps.publish-event-result.outputs.reason_code }}
@@ -2895,6 +3164,12 @@ jobs:
           DIRECT_RECOVERY_REASON_CODE: ${{ steps.replay-direct-lifecycle.outputs.reason_code }}
           DIRECT_RECOVERY_REQUEUE_LATEST: ${{ steps.replay-direct-lifecycle.outputs.requeue_latest }}
           DIRECT_RECOVERY_DIRECT_REQUEUE: ${{ steps.replay-direct-lifecycle.outputs.direct_requeue }}
+          DIRECT_RECOVERY_COORDINATOR_DEFERRED: ${{ steps.replay-direct-lifecycle.outputs.coordinator_deferred || 'false' }}
+          DIRECT_RECOVERY_RATE_LIMITED: ${{ steps.replay-direct-lifecycle.outputs.rate_limited || 'false' }}
+          DIRECT_RECOVERY_COORDINATOR_RETRY_AT: ${{ steps.replay-direct-lifecycle.outputs.retry_at }}
+          DEFERRED_ROUTE_COORDINATOR_DEFERRED: ${{ steps.queue-deferred-verdict-router.outputs.coordinator_deferred || 'false' }}
+          DEFERRED_ROUTE_RATE_LIMITED: ${{ steps.queue-deferred-verdict-router.outputs.rate_limited || 'false' }}
+          DEFERRED_ROUTE_COORDINATOR_RETRY_AT: ${{ steps.queue-deferred-verdict-router.outputs.retry_at }}
           REVIEW_ONLY: ${{ fromJSON(steps.publication-context.outputs.decision).sourceAction == 'failed_review_shard_recovery' && 'true' || 'false' }}
         run: |
           set -euo pipefail
@@ -2904,7 +3179,37 @@ jobs:
           retry_at=
           requeue_latest="$REQUEUE_LATEST"
           direct_requeue=false
-          if [ "$DIRECT_RECOVERY_OUTCOME" = "success" ]; then
+          attempted=true
+          failure_kind="$FAILURE_KIND"
+          if [ "$DOWNLOAD_COORDINATOR_DEFERRED" = "true" ] || [ "$DIRECT_RECOVERY_COORDINATOR_DEFERRED" = "true" ] || [ "$DEFERRED_ROUTE_COORDINATOR_DEFERRED" = "true" ]; then
+            if [ "$DOWNLOAD_COORDINATOR_DEFERRED" = "true" ]; then
+              retry_at="$DOWNLOAD_RETRY_AT"
+            elif [ "$DIRECT_RECOVERY_COORDINATOR_DEFERRED" = "true" ]; then
+              retry_at="$DIRECT_RECOVERY_COORDINATOR_RETRY_AT"
+            else
+              retry_at="$DEFERRED_ROUTE_COORDINATOR_RETRY_AT"
+            fi
+            test -n "$retry_at"
+            outcome=failure
+            completion_kind=retryable_failure
+            reason_code=github_rate_limit
+            failure_kind=github_rate_limit
+            attempted=false
+          elif [ "$DOWNLOAD_RATE_LIMITED" = "true" ] || [ "$DIRECT_RECOVERY_RATE_LIMITED" = "true" ] || [ "$DEFERRED_ROUTE_RATE_LIMITED" = "true" ]; then
+            if [ "$DOWNLOAD_RATE_LIMITED" = "true" ]; then
+              retry_at="$DOWNLOAD_RETRY_AT"
+            elif [ "$DIRECT_RECOVERY_RATE_LIMITED" = "true" ]; then
+              retry_at="$DIRECT_RECOVERY_COORDINATOR_RETRY_AT"
+            else
+              retry_at="$DEFERRED_ROUTE_COORDINATOR_RETRY_AT"
+            fi
+            test -n "$retry_at"
+            outcome=failure
+            completion_kind=retryable_failure
+            reason_code=github_rate_limit
+            failure_kind=github_rate_limit
+            attempted=true
+          elif [ "$DIRECT_RECOVERY_OUTCOME" = "success" ]; then
             case "$DIRECT_RECOVERY_COMPLETION_KIND:$DIRECT_RECOVERY_REASON_CODE" in
               published:publication_applied|superseded:remote_newer_tuple) ;;
               *) exit 1 ;;
@@ -2968,10 +3273,12 @@ jobs:
               completion_kind=superseded
               reason_code=live_terminal
             fi
-          elif [ "$outcome" != "success" ] && { [ "$FAILURE_KIND" = "github_rate_limit" ] || [ "$FAILURE_KIND" = "github_transient" ]; }; then
+          elif [ "$attempted" != "false" ] && [ "$outcome" != "success" ] && { [ "$failure_kind" = "github_rate_limit" ] || [ "$failure_kind" = "github_transient" ]; }; then
             completion_kind=retryable_failure
-            reason_code="$FAILURE_KIND"
-            retry_at="$PUBLISH_RETRY_AT"
+            reason_code="$failure_kind"
+            if [ -z "$retry_at" ]; then
+              retry_at="$PUBLISH_RETRY_AT"
+            fi
           elif [ "$outcome" != "success" ] && [ "$DOWNLOAD_OUTCOME" = "failure" ]; then
             completion_kind=retryable_failure
             reason_code=artifact_unavailable
@@ -2990,14 +3297,15 @@ jobs:
           echo "reason_code=$reason_code" >> "$GITHUB_OUTPUT"
           echo "requeue_latest=$requeue_latest" >> "$GITHUB_OUTPUT"
           echo "direct_requeue=$direct_requeue" >> "$GITHUB_OUTPUT"
+          echo "attempted=$attempted" >> "$GITHUB_OUTPUT"
           if [ -n "$ERROR_FINGERPRINT" ]; then
             echo "error_fingerprint=$ERROR_FINGERPRINT" >> "$GITHUB_OUTPUT"
           fi
           if [ -n "$retry_at" ]; then
             echo "retry_at=$retry_at" >> "$GITHUB_OUTPUT"
           fi
-          if [ "$outcome" = "failure" ] && { [ "$FAILURE_KIND" = "github_rate_limit" ] || [ "$FAILURE_KIND" = "github_transient" ]; }; then
-            echo "failure_kind=$FAILURE_KIND" >> "$GITHUB_OUTPUT"
+          if [ "$outcome" = "failure" ] && { [ "$failure_kind" = "github_rate_limit" ] || [ "$failure_kind" = "github_transient" ]; }; then
+            echo "failure_kind=$failure_kind" >> "$GITHUB_OUTPUT"
           fi
           if [ -n "$STATE_WRITER_JSON" ]; then
             echo "state_writer_json=$STATE_WRITER_JSON" >> "$GITHUB_OUTPUT"
@@ -3017,6 +3325,7 @@ jobs:
           REASON_CODE: ${{ steps.exact-review-publication-result.outputs.reason_code }}
           ERROR_FINGERPRINT: ${{ steps.exact-review-publication-result.outputs.error_fingerprint }}
           RETRY_AT: ${{ steps.exact-review-publication-result.outputs.retry_at }}
+          ATTEMPTED: ${{ steps.exact-review-publication-result.outputs.attempted }}
           STATE_WRITER_JSON: ${{ steps.exact-review-publication-result.outputs.state_writer_json }}
           PUBLISH_COMPLETION_KIND: ${{ steps.publish-event-result.outputs.completion_kind }}
           PUBLISH_REASON_CODE: ${{ steps.publish-event-result.outputs.reason_code }}
@@ -3059,6 +3368,8 @@ jobs:
               : undefined;
             const retryAt = String(process.env.RETRY_AT || "").trim();
             if (retryAt && !Number.isFinite(Date.parse(retryAt))) process.exit(1);
+            const attempted = process.env.ATTEMPTED === "false" ? false : undefined;
+            if (attempted === false && (reasonCode !== "github_rate_limit" || !retryAt)) process.exit(1);
             if (!completionKind || !reasonCode) process.exit(1);
             const directLifecycleRequeue = process.env.DIRECT_LIFECYCLE_REQUEUE === "true";
             const lifecycleTerminal =
@@ -3098,6 +3409,7 @@ jobs:
               reason_code: reasonCode,
               ...(errorFingerprint ? { error_fingerprint: errorFingerprint } : {}),
               ...(retryAt ? { retry_at: retryAt } : {}),
+              ...(attempted === false ? { attempted: false } : {}),
               ...(outcome === "failure" && failureKind ? { failure_kind: failureKind } : {}),
               ...(directLifecycleRequeue ? { direct_lifecycle_requeue: true } : {}),
               ...(lifecycleTerminal ? { lifecycle_terminal_disposition: lifecycleTerminal } : {}),
@@ -3147,7 +3459,7 @@ jobs:
         run: pnpm run --silent repair:github-egress-telemetry submit
 
       - name: Fail unsuccessful exact review publication
-        if: ${{ always() && steps.publication-context.outputs.claimed == 'true' && (steps.exact-review-publication-result.outputs.outcome != 'success' || steps.complete-exact-review-publication.outcome != 'success') }}
+        if: ${{ always() && steps.publication-context.outputs.claimed == 'true' && ((steps.exact-review-publication-result.outputs.outcome != 'success' && steps.exact-review-publication-result.outputs.attempted != 'false') || steps.complete-exact-review-publication.outcome != 'success') }}
         run: exit 1
   event-review-terminal-finalization:
     name: Finalize exact-review command acknowledgement

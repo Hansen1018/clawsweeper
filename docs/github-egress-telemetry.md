@@ -4,17 +4,20 @@
 - Owner: ClawSweeper publication and dashboard maintainers
 - Source of truth: `src/github-egress-observer.ts`,
   `src/github-egress-telemetry-contract.ts`,
-  `dashboard/github-egress-telemetry.ts`, and the publication workflows
-- Last verified: `openclaw/clawsweeper@a1795973a9e6bb00b73cd6adc21a4ea02ca78ced`
+  `dashboard/github-egress-telemetry.ts`,
+  `dashboard/github-egress-pool-coordinator.ts`, and the publication workflows
+- Last verified: `openclaw/clawsweeper@ac340908bf694c902f5a673374be1639ef9f220f`
 - Update when: a publication request path, credential selection rule, telemetry
   dimension, retention limit, or public response changes
 - Checked by: focused telemetry tests plus `pnpm run check:docs`
 
 ClawSweeper records bounded observations of GitHub requests made while publishing
-exact reviews. The observer is diagnostic only: it does not admit, defer, retry,
-cancel, or reprioritize work, and it does not open or close a credential circuit.
-Existing version-1 request and circuit metrics continue in parallel during the
-version-2 observation period.
+exact reviews. The version-2 observer is diagnostic only: it does not admit,
+defer, retry, cancel, or reprioritize work, and it does not open or close a
+credential circuit. A separate, default-disabled repository Actions pool
+coordinator can enforce publication egress permits without changing this
+observation contract. Existing version-1 request and circuit metrics continue in
+parallel.
 
 ## Read the six-hour view
 
@@ -190,8 +193,10 @@ to detect that case.
 
 Known incomplete boundaries are explicit:
 
-- `gh run download` and `actions/download-artifact` remain opaque because debug
-  output can include redirected archive bytes;
+- coordinator-admitted `gh run download` reports one bounded incomplete
+  invocation, but its archive request/pages remain wire-opaque because debug
+  output can include redirected archive bytes; `actions/download-artifact`
+  boundaries elsewhere remain opaque for the same reason;
 - direct-lifecycle replay performed before the repaired implementation checkout
   is not observed;
 - calls outside the direct, artifact, and batch publication paths are outside
@@ -225,14 +230,124 @@ The 15-minute view does not raise or bypass the public row cap. A collector
 must preserve `rows_truncated` and `query_complete` and record a gap if even the
 smaller view exceeds the bound.
 
-## Rollback and Phase 1 boundary
+## Phase 0 rollback boundary
 
 Rollback removes the workflow setup and upload steps and the public route. The
 version-2 tables are additive and may remain dormant; version-1 metrics and
 publication behavior continue unchanged. No queue drain, schedule change,
 credential change, or state migration is required.
 
-Phase 1 may use this denominator to justify a shared credential-pool
-coordinator. Epochs, permits, blocked-until decisions, probes, ramps, shared
-backoff, enforcement kill switches, and coordinator-derived avoided requests
-are deliberately absent here.
+## Repository Actions pool coordinator
+
+`CLAWSWEEPER_REPOSITORY_POOL_COORDINATOR_ENABLED` is the workflow kill switch.
+It defaults to `false`; deploying the code and Durable Object migration does not
+activate publication enforcement. When enabled, every publication-path `gh`
+invocation that actually uses the repository Actions credential obtains a short
+permit and marks the operation started immediately before invoking `gh`. This
+includes artifact downloads, classifier-approved public reads, and direct,
+recovery, or batch comment-router dispatches. `public_read_fallback` remains the
+logical telemetry class for a public target read, but when credential selection
+places that read on the repository Actions token it joins the same coordinated
+pool. Calls that actually use a target-owner App installation bypass this
+coordinator and retain their independent owner-correct circuits.
+
+The Worker derives the Durable Object shard from its configured ClawSweeper
+repository identity. Callers cannot choose a pool name, item shard, owner shard,
+or global singleton. Mutating coordinator calls use the existing signed internal
+request boundary. The public
+`GET /api/github-egress-pool-coordinator` response contains only the pool class,
+state, epoch, reset provenance, blocked-until time, in-flight and avoided counts,
+probe/ramp state, bounded configuration, and a completeness flag.
+
+The coordinator enforces these transitions:
+
+1. `acquire` creates a short, caller-deduplicated permit for one declared egress
+   operation; `start` fences it to the current epoch before the command can run.
+   The runner retries each idempotent boundary once if its response is lost, so
+   an ambiguous post-commit response cannot strand the only probe permit.
+   Rejected acquire/start responses also have bounded private deduplication
+   receipts: replaying a lost rejection returns the original sanitized result
+   without incrementing `rejected_before_start` or `avoided_operations` again.
+2. The first classified 403/429 atomically advances the epoch and opens the pool.
+   Acquired siblings become stale and are rejected before `gh`; already-started
+   commands may finish and are counted separately.
+3. `Retry-After` and credible `X-RateLimit-Reset` values remain authoritative.
+   Numeric deadlines outside the two-hour credibility horizon are treated as
+   absent rather than invalidating the classified throttle. A headerless or
+   unusable-deadline throttle uses one persisted exponential backoff with bounded
+   jitter instead of a per-process one-minute reopen loop. Fresh headerless
+   evidence from an already-on-wire stale sibling extends that same shared
+   fallback boundary; duplicate receipts remain idempotent.
+4. At the boundary, exactly one half-open probe is admitted. A completed
+   non-throttled command proves that the pool can serve egress even if the
+   requested GitHub operation fails for an application reason. A classified
+   `/throttle` observation reopens the rate-limit circuit, while an explicit
+   `unexecuted_failure` (for example, an attempt-receipt or command-launch
+   failure after permit start) reopens conservatively without claiming that
+   GitHub was reached. Recovery admits deterministic `1 -> 2 -> 4 -> 8` fixed
+   permit cohorts before returning to closed. A cohort cannot replenish freed
+   slots after reaching its admission target, and the pool advances or closes
+   only after every admitted operation completes without a throttle. Any
+   recovery permit that expires reopens the pool; an expired unstarted permit
+   is not replaced within the same cohort.
+5. Coordinator-deferred batch, direct, and recovery publication operations exit
+   through the durable `github_rate_limit`, `attempted=false` path, so they do not
+   consume publication failure, retry, dead-letter, or mutation budgets. A
+   previously started publication failure-age window is paused while the item is
+   coordinator-deferred and resumes on the next genuinely attempted completion,
+   so a long shared-pool outage cannot exhaust the 24-hour retry age by itself. A
+   coordinated command also writes one private per-invocation throttle bit for
+   its caller. Batch preparation uses that bit to retain a header-classified 403
+   even when the unchanged `gh` stderr does not contain a throttle phrase; the
+   sidecar contains no repository, item, token, URL, header, or request identity.
+   A lifecycle-router operation records an atomic local attempt receipt after
+   `start` succeeds and immediately before `gh` is invoked. An already-on-wire
+   operation therefore retains normal attempted failure accounting, while
+   siblings without that receipt remain unattempted. A canonical permanent
+   publication receipt always wins over a later pool deferral.
+
+Permit, receipt, rejection, epoch, backoff, and ramp state live in SQLite-backed
+Durable Object storage and survive Worker restarts. Finish/throttle receipt IDs
+and acquire/start request identities make acknowledgements idempotent. Completed
+permit rows, operation rows, acknowledgement receipts, and private rejection
+receipts have a 24-hour TTL. The configured permit TTL bounds abandoned acquires
+and started commands; expiry of an unacknowledged started command marks operator
+telemetry incomplete. An expired started probe or any expired recovery-ramp
+permit also reopens the pool with shared fallback backoff, so unknown or
+unclaimed outcomes cannot increase recovery capacity. Already-started work from an obsolete epoch remains visible
+for late-completion and late-throttle accounting, but it does not consume the
+current epoch's single-probe or recovery-ramp capacity. Private receipts contain
+only bounded digests, permit-local identifiers, enums, epochs, and timestamps;
+they are never returned by the public endpoint.
+
+The coordinator does not introduce a second waiting queue. Capacity, circuit,
+probe, and stale-epoch deferrals return to the existing durable publication
+queue, which retains its established owner/freshness ordering and retry jitter.
+One permit currently fences one external `gh` invocation. For opaque artifact
+downloads that invocation can contain more than one HTTP request; Phase 0 remains
+the authoritative wire denominator. Consequently, `permits_in_flight_at_open`,
+`already_on_wire_completions`, and `avoided_operations` describe coordinator
+operation boundaries, not a fabricated exact count of hidden artifact requests.
+Each coordinated command writes its sanitized Phase 0 rate-limit details to a
+private temporary sink. The runner classifies only that command's observations,
+then appends the unchanged records to the shared Phase 0 stream and removes the
+temporary sink. Parallel publication commands therefore cannot classify a
+sibling's 403/429 as their own; if isolation cannot be established, the runner
+falls back to its own stderr signal and leaves shared detail completeness to the
+existing Phase 0 contract. If a throttled coordinated command cannot acknowledge
+the coordinator, batch preparation records a local five-minute fallback and
+defers; it never performs an unpermitted `gh api rate_limit` lookup after the
+throttle. The coordinator-disabled legacy path retains its existing bounded
+status lookup.
+
+## Rollback and activation boundary
+
+Turning `CLAWSWEEPER_REPOSITORY_POOL_COORDINATOR_ENABLED` back to `false`
+immediately restores the pre-coordinator command path. Persisted coordinator
+state may remain dormant and does not affect disabled workflows. No queue drain,
+schedule change, credential change, or Durable Object data deletion is required.
+The observer remains active and fail-open in either mode.
+
+Production activation requires separately reviewed Phase 0 quota-window evidence
+and a canary decision. The initial deployment must not infer safe permit or ramp
+settings from repository defaults alone.

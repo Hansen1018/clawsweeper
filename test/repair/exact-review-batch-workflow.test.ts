@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { readFileSync, rmSync } from "node:fs";
+import { appendFileSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -43,6 +43,10 @@ test("batch publisher is event-driven and queue-bounded instead of workflow-seri
   ]);
   assert.equal(workflow.jobs.publish!.env.EXACT_REVIEW_BATCH_MAX_ITEMS, "50");
   assert.equal(workflow.jobs.publish!.env.EXACT_REVIEW_BATCH_PREPARE_CONCURRENCY, "1");
+  assert.match(
+    workflow.jobs.publish!.env.CLAWSWEEPER_REPOSITORY_POOL_COORDINATOR_ENABLED,
+    /vars\.CLAWSWEEPER_REPOSITORY_POOL_COORDINATOR_ENABLED.*false/,
+  );
   assert.equal(workflow.jobs.publish!.env.CLAWSWEEPER_APP_CLIENT_ID, "Iv23liOECG0slfuhz093");
   assert.equal(workflow.concurrency, undefined);
   assert.deepEqual(workflow.permissions, { actions: "write", contents: "read" });
@@ -59,6 +63,7 @@ test("batch publication bounds shared GitHub retries without dropping failed art
   );
   assert.match(cliSource, /const failure = failureCompletion\(current, outcome\)/);
   assert.match(cliSource, /completions\.push\(failure\)/);
+  assert.match(source, /export CLAWSWEEPER_GITHUB_POST_EFFECT_OUTCOME_PATH="\$outcome_path"/);
 });
 
 test("transient retries stay bounded while GitHub throttles defer immediately", () => {
@@ -376,6 +381,138 @@ test("exact publication records the Actions reset before one bounded App fallbac
   }
 });
 
+test("exact publication fences repository-token reads but leaves target-App mutations independent", () => {
+  const observationPath = join(
+    tmpdir(),
+    `clawsweeper-coordinated-runtime-${process.pid}-${Date.now()}.jsonl`,
+  );
+  const metricsPath = join(
+    tmpdir(),
+    `clawsweeper-coordinated-runtime-metrics-${process.pid}-${Date.now()}.jsonl`,
+  );
+  const retryAt = new Date(Date.now() + 90_000).toISOString();
+  const fixtureEnv = {
+    EXACT_EVENT_PUBLICATION: "true",
+    GH_TOKEN: "target-app-token",
+    REPO_TOKEN: "workflow-repository-token",
+    CLAWSWEEPER_REPOSITORY_POOL_COORDINATOR_ENABLED: "true",
+    CLAWSWEEPER_GITHUB_EGRESS_METRICS_PATH: metricsPath,
+    CLAWSWEEPER_GITHUB_RATE_LIMIT_OBSERVATION_PATH: observationPath,
+  };
+  const previous = Object.fromEntries(
+    Object.keys(fixtureEnv).map((key) => [key, process.env[key]]),
+  );
+  Object.assign(process.env, fixtureEnv);
+  const calls: Array<{ command: string; args: string[]; env?: NodeJS.ProcessEnv }> = [];
+  let deferred = false;
+  let attemptedThrottle = false;
+  const run = (
+    command: string,
+    args: string[],
+    options?: { cwd?: string; env?: NodeJS.ProcessEnv; timeoutMs?: number },
+  ) => {
+    calls.push({ command, args, env: options?.env });
+    if (attemptedThrottle) {
+      throw new Error("gh: API rate limit exceeded for repository token (HTTP 403)");
+    }
+    if (deferred) {
+      throw Object.assign(new Error("ClawSweeper repository Actions pool deferred"), {
+        status: 75,
+        stderr: Buffer.from("ClawSweeper repository Actions pool deferred before GitHub egress\n"),
+      });
+    }
+    return JSON.stringify({ token: options?.env?.GH_TOKEN ?? process.env.GH_TOKEN });
+  };
+  const runtime = createGitHubRuntime({
+    ROOT: process.cwd(),
+    run,
+    targetRepo: () => "openclaw/openclaw",
+  });
+  const execution = createGitHubExecution({
+    ROOT: process.cwd(),
+    gitHubRuntime: runtime,
+    labelAlreadyExistsError: () => false,
+  });
+  const publicRead = ["api", "repos/openclaw/openclaw/issues/123/comments"];
+  const targetMutation = [
+    "api",
+    "repos/openclaw/openclaw/issues/123",
+    "--method",
+    "PATCH",
+    "-f",
+    "state=closed",
+  ];
+
+  try {
+    assert.equal(JSON.parse(execution.ghWithRetry(publicRead)).token, fixtureEnv.REPO_TOKEN);
+    assert.equal(calls[0]?.command, process.execPath);
+    assert.match(calls[0]?.args[0] ?? "", /dist[\\/]repair[\\/]github-egress-pool-runner\.js$/);
+    assert.deepEqual(calls[0]?.args.slice(1), ["--", "gh", ...publicRead]);
+    assert.equal(calls[0]?.env?.CLAWSWEEPER_GITHUB_COORDINATOR_POOL_CLASS, "repository_actions");
+    assert.equal(calls[0]?.env?.CLAWSWEEPER_GITHUB_POOL_CLASS, "public_read_fallback");
+
+    assert.equal(JSON.parse(execution.ghWithRetry(targetMutation)).token, fixtureEnv.GH_TOKEN);
+    assert.equal(calls[1]?.command, "gh");
+    assert.equal(calls[1]?.env?.CLAWSWEEPER_GITHUB_COORDINATOR_POOL_CLASS, undefined);
+
+    appendFileSync(
+      observationPath,
+      `${JSON.stringify({
+        scope: "repository_actions",
+        observed_at: new Date().toISOString(),
+        retry_at: retryAt,
+        provenance: "retry_after",
+        authoritative: true,
+        coordinator_deferred: false,
+      })}\n`,
+    );
+    attemptedThrottle = true;
+    assert.throws(
+      () => execution.ghWithRetry(publicRead),
+      (error: unknown) => {
+        assert.equal((error as { name?: string }).name, "GitHubRateLimitError");
+        assert.equal((error as { scope?: string }).scope, "repository_actions");
+        assert.equal((error as { attempted?: boolean }).attempted, true);
+        return true;
+      },
+    );
+    attemptedThrottle = false;
+    assert.equal(calls.length, 3, "attempted repository throttle must not probe the target App");
+
+    appendFileSync(
+      observationPath,
+      `${JSON.stringify({
+        scope: "repository_actions",
+        observed_at: new Date().toISOString(),
+        retry_at: retryAt,
+        provenance: "retry_after",
+        authoritative: true,
+        coordinator_deferred: true,
+      })}\n`,
+    );
+    deferred = true;
+    assert.throws(
+      () => execution.ghWithRetry(publicRead),
+      (error: unknown) => {
+        assert.equal((error as { name?: string }).name, "GitHubRateLimitError");
+        assert.equal((error as { scope?: string }).scope, "repository_actions");
+        assert.equal((error as { retryAt?: string }).retryAt, retryAt);
+        assert.equal((error as { authoritative?: boolean }).authoritative, true);
+        assert.equal((error as { attempted?: boolean }).attempted, false);
+        return true;
+      },
+    );
+    assert.equal(calls.length, 4, "pre-wire deferral must not fall back to the target App");
+  } finally {
+    rmSync(observationPath, { force: true });
+    rmSync(metricsPath, { force: true });
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
 test("inherited GitHub Actions credentials open the repository quota circuit", () => {
   const observationPath = join(
     tmpdir(),
@@ -480,6 +617,15 @@ test("batch workflow signs queue ownership, isolates item failures, and commits 
   );
   assert.match(prepareSource, /was submitted too quickly/);
   assert.match(source, /gh workflow run repair-comment-router\.yml/);
+  assert.match(source, /dist\/repair\/github-egress-pool-runner\.js -- gh/);
+  assert.match(
+    source,
+    /CLAWSWEEPER_GITHUB_POOL_CLASS=repository_actions \\\n\s+CLAWSWEEPER_GITHUB_STAGE=publication_router \\\n\s+node dist\/repair\/github-egress-pool-runner\.js -- gh "\$@"/,
+  );
+  assert.match(source, /github_apply_status" -eq 75/);
+  assert.match(prepareSource, /result\.code === 75 && coordinated/);
+  assert.match(prepareSource, /"github_rate_limit"[\s\S]*?attempted: false/);
+  assert.match(cliSource, /latestRateLimitObservation\("repository_actions"\)/);
   assert.match(source, /EXACT_REVIEW_GITHUB_REQUEST_REPEAT="\$repeat_revision"/);
   assert.match(
     source,
@@ -622,6 +768,20 @@ test("exact-review producer uses direct publication with bounded legacy fallback
   );
   assert.match(sweepSource, /internal\/exact-review\/enqueue/);
   assert.match(source, /name: Claim one durable publication batch/);
+  const publisherSteps = [
+    /name: Deliver GitHub effects and prepare direct state mutation([\s\S]*?)\n\s+- name:/,
+    /name: Publish event result and apply safe close([\s\S]*?)\n\s+- name:/,
+  ].map((pattern) => pattern.exec(sweepSource)?.[1] ?? "");
+  for (const publisherStep of publisherSteps) {
+    assert.match(
+      publisherStep,
+      /CLAWSWEEPER_REPOSITORY_POOL_COORDINATOR_ENABLED: \$\{\{ vars\.CLAWSWEEPER_REPOSITORY_POOL_COORDINATOR_ENABLED \|\| 'false' \}\}/,
+    );
+    assert.match(
+      publisherStep,
+      /EXACT_REVIEW_QUEUE_URL: \$\{\{ vars\.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL \|\| 'https:\/\/clawsweeper\.openclaw\.ai' \}\}/,
+    );
+  }
 });
 
 test("batch workflow uses owner-scoped mutation credentials and canonical Worker hydration", () => {

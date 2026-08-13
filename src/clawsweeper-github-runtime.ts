@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
-import { appendFileSync, closeSync, openSync } from "node:fs";
+import { appendFileSync, closeSync, openSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import type { GitHubRuntimeBudget } from "./clawsweeper-types.js";
 import { codexEnv } from "./codex-env.js";
 import { resolveCommand } from "./command.js";
@@ -209,6 +210,96 @@ export function createGitHubRuntime(dependencies: CreateGitHubRuntimeDependencie
     return process.env.CLAWSWEEPER_GITHUB_REQUEST_METRICS_PATH?.trim() || null;
   }
 
+  function repositoryPoolCoordinatorEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+    const effective = env === process.env ? env : { ...process.env, ...env };
+    return ["1", "true"].includes(
+      String(effective.CLAWSWEEPER_REPOSITORY_POOL_COORDINATOR_ENABLED || "").toLowerCase(),
+    );
+  }
+
+  function coordinatedRepositoryPoolEnv(
+    scope: GitHubCredentialScope,
+    preparedEnv: NodeJS.ProcessEnv | undefined,
+  ): NodeJS.ProcessEnv | undefined {
+    const env = { ...process.env, ...preparedEnv };
+    if (scope !== "repository_actions" || !repositoryPoolCoordinatorEnabled(env)) {
+      return preparedEnv;
+    }
+    return {
+      ...preparedEnv,
+      CLAWSWEEPER_GITHUB_COORDINATOR_POOL_CLASS: "repository_actions",
+    };
+  }
+
+  function coordinatedRepositoryPoolCommand(
+    args: readonly string[],
+    scope: GitHubCredentialScope,
+    preparedEnv: NodeJS.ProcessEnv | undefined,
+  ): { command: string; args: string[]; env: NodeJS.ProcessEnv | undefined; coordinated: boolean } {
+    const env = coordinatedRepositoryPoolEnv(scope, preparedEnv);
+    const coordinated = env?.CLAWSWEEPER_GITHUB_COORDINATOR_POOL_CLASS === "repository_actions";
+    return coordinated
+      ? {
+          command: process.execPath,
+          args: [join(ROOT, "dist/repair/github-egress-pool-runner.js"), "--", "gh", ...args],
+          env,
+          coordinated,
+        }
+      : { command: "gh", args: [...args], env, coordinated };
+  }
+
+  function coordinatorObservation(): {
+    retryAt: string;
+    provenance: "retry_after" | "rate_limit_reset" | "rate_limit_status" | "fallback";
+    authoritative: boolean;
+  } | null {
+    const path = rateLimitObservationPath();
+    if (!path) return null;
+    try {
+      const lines = readFileSync(path, "utf8").trim().split(/\r?\n/).reverse();
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        const item = JSON.parse(line) as Record<string, unknown>;
+        if (item.scope !== "repository_actions" || typeof item.coordinator_deferred !== "boolean") {
+          continue;
+        }
+        if (typeof item.retry_at !== "string") continue;
+        const retryAt = item.retry_at;
+        if (!Number.isFinite(Date.parse(retryAt)) || Date.parse(retryAt) <= Date.now()) continue;
+        const rawProvenance = typeof item.provenance === "string" ? item.provenance : "fallback";
+        const provenance = [
+          "retry_after",
+          "rate_limit_reset",
+          "rate_limit_status",
+          "fallback",
+        ].includes(rawProvenance)
+          ? (rawProvenance as "retry_after" | "rate_limit_reset" | "rate_limit_status" | "fallback")
+          : "fallback";
+        return { retryAt, provenance, authoritative: item.authoritative === true };
+      }
+    } catch {
+      // The coordinator remains authoritative when the compatibility record is unavailable.
+    }
+    return null;
+  }
+
+  function commandExitStatus(error: unknown): number | null {
+    if (!error || typeof error !== "object" || !("status" in error)) return null;
+    const status = Number((error as Record<string, unknown>).status);
+    return Number.isSafeInteger(status) ? status : null;
+  }
+
+  function repositoryPoolDeferredError(error: unknown): GitHubRateLimitError {
+    const observed = coordinatorObservation();
+    return new GitHubRateLimitError(error, Date.now(), {
+      scope: "repository_actions",
+      retryAt: observed?.retryAt ?? Date.now() + 5 * 60_000,
+      provenance: observed?.provenance ?? "fallback",
+      authoritative: observed?.authoritative ?? false,
+      attempted: false,
+    });
+  }
+
   function appendJsonLine(path: string | null, value: Record<string, unknown>): void {
     if (!path) return;
     appendFileSync(path, `${JSON.stringify(value)}\n`, "utf8");
@@ -297,15 +388,31 @@ export function createGitHubRuntime(dependencies: CreateGitHubRuntimeDependencie
       process.env.GITHUB_TOKEN?.trim() ||
       "";
     const hinted = new GitHubRateLimitError(cause, Date.now(), { scope });
-    const statusRetryAt = hinted.authoritative ? null : rateLimitStatusRetryAt(scope, token);
-    const error = statusRetryAt
+    const coordinatedObservation =
+      scope === "repository_actions" && repositoryPoolCoordinatorEnabled(prepared)
+        ? coordinatorObservation()
+        : null;
+    const statusRetryAt =
+      hinted.authoritative ||
+      coordinatedObservation ||
+      (scope === "repository_actions" && repositoryPoolCoordinatorEnabled(prepared))
+        ? null
+        : rateLimitStatusRetryAt(scope, token);
+    const error = coordinatedObservation
       ? new GitHubRateLimitError(cause, Date.now(), {
           scope,
-          retryAt: statusRetryAt,
-          provenance: "rate_limit_status",
-          authoritative: true,
+          retryAt: coordinatedObservation.retryAt,
+          provenance: coordinatedObservation.provenance,
+          authoritative: coordinatedObservation.authoritative,
         })
-      : hinted;
+      : statusRetryAt
+        ? new GitHubRateLimitError(cause, Date.now(), {
+            scope,
+            retryAt: statusRetryAt,
+            provenance: "rate_limit_status",
+            authoritative: true,
+          })
+        : hinted;
     appendJsonLine(rateLimitObservationPath(), {
       scope: error.scope,
       ...(error.scope === "target_app"
@@ -326,6 +433,7 @@ export function createGitHubRuntime(dependencies: CreateGitHubRuntimeDependencie
     const appToken = process.env.GH_TOKEN?.trim();
     if (
       !publicToken ||
+      repositoryPoolCoordinatorEnabled() ||
       !appToken ||
       publicToken === appToken ||
       claimedPublicReadFallbackTokens.has(appToken)
@@ -352,14 +460,18 @@ export function createGitHubRuntime(dependencies: CreateGitHubRuntimeDependencie
     const resolvedArgs = args[0] === "api" ? args : ["--repo", targetRepo(), ...args];
     const preparedEnv = preparedGitHubEnv(resolvedArgs, env);
     const scope = githubRequestScope(resolvedArgs, env);
+    const invocation = coordinatedRepositoryPoolCommand(resolvedArgs, scope, preparedEnv);
     try {
-      const result = run("gh", resolvedArgs, {
+      const result = run(invocation.command, invocation.args, {
         timeoutMs,
-        ...(preparedEnv ? { env: preparedEnv } : {}),
+        ...(invocation.env ? { env: invocation.env } : {}),
       });
       recordGitHubRequest(resolvedArgs, scope, "success");
       return result;
     } catch (error) {
+      if (invocation.coordinated && commandExitStatus(error) === 75) {
+        throw repositoryPoolDeferredError(error);
+      }
       const retryKind = ghRetryKind(error);
       if (retryKind !== "throttle") {
         recordGitHubRequest(resolvedArgs, scope, retryKind === "transient" ? "transient" : "error");
@@ -374,12 +486,15 @@ export function createGitHubRuntime(dependencies: CreateGitHubRuntimeDependencie
 
   function ghOnce(args: string[], timeoutMs: number): string {
     const resolvedArgs = args[0] === "api" ? args : ["--repo", targetRepo(), ...args];
+    const preparedEnv = preparedGitHubEnv(resolvedArgs);
+    const scope = githubRequestScope(resolvedArgs);
+    const invocation = coordinatedRepositoryPoolCommand(resolvedArgs, scope, preparedEnv);
     const env = {
       ...process.env,
       GIT_OPTIONAL_LOCKS: "0",
-      ...preparedGitHubEnv(resolvedArgs),
+      ...invocation.env,
     };
-    const command = resolveCommand("gh", resolvedArgs, env);
+    const command = resolveCommand(invocation.command, invocation.args, env);
     const commandTimeoutMs = githubCommandTimeoutMs(timeoutMs) ?? timeoutMs;
     const runtimeLimitedTimeout = commandTimeoutMs < timeoutMs;
     const result = spawnSync(command.command, command.args, {
@@ -398,9 +513,13 @@ export function createGitHubRuntime(dependencies: CreateGitHubRuntimeDependencie
     }
     if (result.status !== 0) {
       const stderr = typeof result.stderr === "string" ? result.stderr.trim() : "";
-      throw new Error(
+      const error = new Error(
         [`Command failed: gh ${resolvedArgs.join(" ")}`, stderr].filter(Boolean).join("\n"),
       );
+      if (invocation.coordinated && result.status === 75) {
+        throw repositoryPoolDeferredError(Object.assign(error, { status: result.status, stderr }));
+      }
+      throw error;
     }
     return (result.stdout ?? "").trim();
   }

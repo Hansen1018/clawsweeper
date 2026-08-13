@@ -768,6 +768,164 @@ test("non-batch publication completions record durable terminal outcomes without
   );
 });
 
+test("non-batch coordinator deferral requeues without consuming publication failure attempts", async () => {
+  const storage = new MemoryDurableStorage();
+  const deferred = leasedExactReviewPublicationItem(724, "7240");
+  deferred.attempts = 3;
+  deferred.publicationFailureAttempts = 2;
+  await storage.put("exact-review-queue", {
+    deliveries: {},
+    items: { [deferred.key]: deferred },
+  });
+  const queue = new ExactReviewQueue({ storage }, {});
+  const completion = (overrides: Record<string, unknown> = {}) =>
+    new Request("https://clawsweeper-exact-review-queue/complete", {
+      method: "POST",
+      body: JSON.stringify({
+        lease_id: deferred.leaseId,
+        item_key: deferred.key,
+        lease_revision: deferred.leaseRevision,
+        claim_generation: deferred.claimGeneration,
+        run_id: deferred.claimedRunId,
+        run_attempt: deferred.claimedRunAttempt,
+        outcome: "failure",
+        completion_kind: "retryable_failure",
+        reason_code: "github_rate_limit",
+        attempted: false,
+        ...overrides,
+      }),
+    });
+
+  const missingRetry = await queue.fetch(completion());
+  assert.equal(missingRetry.status, 400);
+  assert.deepEqual(await missingRetry.json(), { error: "invalid_unattempted_completion" });
+  const invalidAttempted = await queue.fetch(
+    completion({ attempted: "false", retry_at: new Date(Date.now() + 120_000).toISOString() }),
+  );
+  assert.equal(invalidAttempted.status, 400);
+  assert.deepEqual(await invalidAttempted.json(), { error: "invalid_attempted" });
+
+  const retryAt = Date.now() + 120_000;
+  const accepted = await queue.fetch(completion({ retry_at: new Date(retryAt).toISOString() }));
+  assert.equal(accepted.status, 200);
+  assert.deepEqual(await accepted.json(), { ok: true, requeued: true });
+
+  const state = (await storage.get("exact-review-queue")) as {
+    items: Record<
+      string,
+      {
+        attempts: number;
+        publicationFailureAttempts?: number;
+        state: string;
+        leaseId?: string;
+        nextAttemptAt: number;
+        backoffReason?: string;
+      }
+    >;
+  };
+  assert.equal(state.items[deferred.key]?.state, "pending");
+  assert.equal(state.items[deferred.key]?.leaseId, undefined);
+  assert.equal(state.items[deferred.key]?.attempts, 3);
+  assert.equal(state.items[deferred.key]?.publicationFailureAttempts, 2);
+  assert.equal(state.items[deferred.key]?.backoffReason, "publication_retry");
+  assert.ok((state.items[deferred.key]?.nextAttemptAt || 0) >= retryAt);
+});
+
+test("coordinator deferral pauses durable publication failure age across restart", async () => {
+  const originalNow = Date.now;
+  let now = Date.parse("2026-08-13T08:00:00.000Z");
+  Date.now = () => now;
+  try {
+    const storage = new MemoryDurableStorage();
+    const deferred = leasedExactReviewPublicationItem(725, "7250");
+    const firstFailureAt = now - (24 * 60 * 60_000 - 60_000);
+    deferred.attempts = 2;
+    deferred.publicationFailureAttempts = 2;
+    deferred.firstFailureAt = firstFailureAt;
+    await storage.put("exact-review-queue", {
+      deliveries: {},
+      items: { [deferred.key]: deferred },
+    });
+
+    const completion = (overrides: Record<string, unknown>) =>
+      new Request("https://clawsweeper-exact-review-queue/complete", {
+        method: "POST",
+        body: JSON.stringify({
+          lease_id: overrides.lease_id ?? deferred.leaseId,
+          item_key: deferred.key,
+          lease_revision: deferred.leaseRevision,
+          claim_generation: overrides.claim_generation ?? deferred.claimGeneration,
+          run_id: overrides.run_id ?? deferred.claimedRunId,
+          run_attempt: deferred.claimedRunAttempt,
+          outcome: "failure",
+          completion_kind: "retryable_failure",
+          reason_code: overrides.reason_code ?? "github_rate_limit",
+          ...overrides,
+        }),
+      });
+
+    const queue = new ExactReviewQueue({ storage }, {});
+    const deferredResponse = await queue.fetch(
+      completion({
+        attempted: false,
+        retry_at: new Date(now + 120_000).toISOString(),
+      }),
+    );
+    assert.deepEqual(await deferredResponse.json(), { ok: true, requeued: true });
+
+    let state = (await storage.get("exact-review-queue")) as {
+      items: Record<
+        string,
+        ExactReviewQueueItem & {
+          publicationFailureAgePausedAt?: number;
+        }
+      >;
+    };
+    const pauseStartedAt = now;
+    assert.equal(state.items[deferred.key].firstFailureAt, firstFailureAt);
+    assert.equal(state.items[deferred.key].publicationFailureAgePausedAt, pauseStartedAt);
+    assert.equal(state.items[deferred.key].publicationFailureAttempts, 2);
+
+    now = state.items[deferred.key].nextAttemptAt;
+    Object.assign(state.items[deferred.key], {
+      state: "leased",
+      leaseId: "lease-725-reclaimed",
+      leaseRevision: 1,
+      leaseExpiresAt: now + 60_000,
+      claimedRunId: "7251",
+      claimedRunAttempt: 1,
+      claimGeneration: 2,
+      claimProtocolVersion: 2,
+    });
+    await storage.put("exact-review-queue", state);
+
+    const restartedQueue = new ExactReviewQueue({ storage }, {});
+    const attemptedResponse = await restartedQueue.fetch(
+      completion({
+        lease_id: "lease-725-reclaimed",
+        claim_generation: 2,
+        run_id: "7251",
+        attempted: true,
+        reason_code: "github_transient",
+      }),
+    );
+    assert.deepEqual(await attemptedResponse.json(), { ok: true, requeued: true });
+
+    state = (await storage.get("exact-review-queue")) as typeof state;
+    const resumed = state.items[deferred.key];
+    assert.equal(resumed.state, "pending");
+    assert.equal(resumed.publicationFailureAttempts, 3);
+    assert.equal(resumed.publicationFailureAgePausedAt, undefined);
+    assert.equal(resumed.firstFailureAt, firstFailureAt + (now - pauseStartedAt));
+    const stats = await (
+      await restartedQueue.fetch(new Request("https://clawsweeper-exact-review-queue/stats"))
+    ).json();
+    assert.equal(stats.lanes.publication.dead_letters.open, 0);
+  } finally {
+    Date.now = originalNow;
+  }
+});
+
 test("direct lifecycle requeue becomes a fresh fenced source-drift revision", async () => {
   const storage = new MemoryDurableStorage();
   const leased = leasedExactReviewQueueItem(703, "7030");

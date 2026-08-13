@@ -349,7 +349,6 @@ test("publication workflows retain v1 metrics while wiring bounded v2 observatio
     "./.github/actions/setup-github-egress-observer",
     "Record artifact-publication member",
     "Download exact review artifact bundle",
-    "Record artifact download transport boundary",
     "Publish event result and apply safe close",
     "Queue deferred exact verdict router",
     "Submit artifact-publication GitHub egress telemetry",
