@@ -74,6 +74,7 @@ import {
 import { recentDurablePublicationEvents } from "./recent-durable-publication-events.ts";
 import { sanitizedServerError } from "./error-safety.ts";
 import { GithubEtagResponseStore } from "./github-etag-cache.ts";
+import { GithubWebhookReadModelStore } from "./github-webhook-read-model.ts";
 import { githubEtagCacheKeyFromValue } from "../src/github-etag-cache-contract.ts";
 import {
   ExactReviewArtifactReceiptStore,
@@ -668,6 +669,7 @@ export class ExactReviewQueue {
   private commandIntakeStore;
   private artifactReceiptStore;
   private githubEtagResponseStore;
+  private githubWebhookReadModelStore;
   private readonly random: () => number;
   private readonly baselines = new WeakMap<ExactReviewQueueState, ExactReviewQueueBaseline>();
   private reviewCoverageCache: { at: number; summary: ReviewCoverageSummary } | null = null;
@@ -698,6 +700,7 @@ export class ExactReviewQueue {
       env.STATE_SNAPSHOTS,
     );
     this.githubEtagResponseStore = new GithubEtagResponseStore(this.storage);
+    this.githubWebhookReadModelStore = new GithubWebhookReadModelStore(this.storage);
     // Direct in-process users retain the established eager setup behavior.
     // A real Durable Object has blockConcurrencyWhile; defer that setup until a
     // non-Bay request so constructing it for the public pure reader cannot
@@ -3044,6 +3047,146 @@ export class ExactReviewQueue {
       const result = this.githubEtagResponseStore.confirm304(body, Date.now());
       if (!result.ok) return json({ error: result.error }, result.status);
       return json(result);
+    }
+
+    if (request.method === "POST" && url.pathname === "/github-read-model/ingest") {
+      try {
+        return json(
+          this.githubWebhookReadModelStore.ingest(await request.json().catch(() => null)),
+          202,
+        );
+      } catch (error) {
+        return json({ error: sanitizedServerError(error) }, 400);
+      }
+    }
+
+    if (request.method === "POST" && url.pathname === "/github-read-model/lease-item") {
+      const body = objectValue(await request.json().catch(() => null));
+      const itemKey = String(body.item_key || "").trim();
+      const leaseId = String(body.lease_id || "").trim();
+      const leaseRevision = Number(body.lease_revision);
+      const claimGeneration = Number(body.claim_generation);
+      const runId = String(body.run_id || "").trim();
+      const runAttempt = exactReviewRunAttempt(body.run_attempt);
+      const sourceHeadSha = String(body.source_head_sha || "")
+        .trim()
+        .toLowerCase();
+      const repository = String(body.repository || "")
+        .trim()
+        .toLowerCase();
+      const number = Number(body.number);
+      if (
+        !itemKey ||
+        !leaseId ||
+        !/^\d+$/.test(runId) ||
+        !Number.isInteger(leaseRevision) ||
+        leaseRevision < 1 ||
+        !Number.isInteger(claimGeneration) ||
+        claimGeneration < 1 ||
+        runAttempt === null ||
+        !/^[a-z0-9_.-]+\/[a-z0-9_.-]+$/.test(repository) ||
+        !Number.isSafeInteger(number) ||
+        number < 1 ||
+        (sourceHeadSha && !/^[0-9a-f]{40}$/.test(sourceHeadSha))
+      ) {
+        return json({ error: "invalid_lease_read_tuple" }, 400);
+      }
+      const item = this.readStateSync().items[itemKey];
+      const now = Date.now();
+      if (
+        !item ||
+        item.state !== "leased" ||
+        item.leaseId !== leaseId ||
+        item.leaseRevision !== leaseRevision ||
+        exactReviewClaimGeneration(item.claimGeneration) !== claimGeneration ||
+        item.claimedRunId !== runId ||
+        item.claimedRunAttempt !== runAttempt ||
+        item.decision.targetRepo.toLowerCase() !== repository ||
+        item.decision.itemNumber !== number ||
+        (item.leaseDecision?.sourceHeadSha &&
+          item.leaseDecision.sourceHeadSha.toLowerCase() !== sourceHeadSha) ||
+        !isLiveExactReviewLease(
+          item,
+          now,
+          exactReviewPublicationDispatchLeaseMs(this.env),
+          exactReviewHeartbeatGraceMs(this.env),
+        )
+      ) {
+        return json({ error: "lease_not_active" }, 409);
+      }
+      return json({
+        ...(await this.githubWebhookReadModelStore.readItem({ repository, number }, now)),
+        lease_authorized: true,
+      });
+    }
+
+    if (request.method === "POST" && url.pathname === "/github-read-model/repair") {
+      try {
+        return json(
+          this.githubWebhookReadModelStore.repair(await request.json().catch(() => null)),
+          202,
+        );
+      } catch (error) {
+        return json({ error: sanitizedServerError(error) }, 400);
+      }
+    }
+
+    if (request.method === "POST" && url.pathname === "/github-read-model/item") {
+      try {
+        return json(
+          await this.githubWebhookReadModelStore.readItem(await request.json().catch(() => null)),
+        );
+      } catch (error) {
+        return json({ error: sanitizedServerError(error) }, 400);
+      }
+    }
+
+    if (request.method === "POST" && url.pathname === "/github-read-model/comments") {
+      try {
+        return json(
+          await this.githubWebhookReadModelStore.readComments(
+            await request.json().catch(() => null),
+          ),
+        );
+      } catch (error) {
+        return json({ error: sanitizedServerError(error) }, 400);
+      }
+    }
+
+    if (request.method === "POST" && url.pathname === "/github-read-model/activity") {
+      try {
+        return json(
+          await this.githubWebhookReadModelStore.readActivity(
+            await request.json().catch(() => null),
+          ),
+        );
+      } catch (error) {
+        return json({ error: sanitizedServerError(error) }, 400);
+      }
+    }
+
+    if (request.method === "POST" && url.pathname === "/github-read-model/workflows") {
+      try {
+        return json(
+          await this.githubWebhookReadModelStore.readWorkflows(
+            await request.json().catch(() => null),
+          ),
+        );
+      } catch (error) {
+        return json({ error: sanitizedServerError(error) }, 400);
+      }
+    }
+
+    if (request.method === "POST" && url.pathname === "/github-read-model/placeholders") {
+      try {
+        return json(
+          await this.githubWebhookReadModelStore.readPlaceholders(
+            await request.json().catch(() => null),
+          ),
+        );
+      } catch (error) {
+        return json({ error: sanitizedServerError(error) }, 400);
+      }
     }
 
     if (request.method === "POST" && url.pathname === "/artifact-cache/receipt/store") {
@@ -7602,6 +7745,7 @@ export class ExactReviewQueue {
     this.githubEgressTelemetryStore.ensureSchemaSync();
     this.artifactReceiptStore.ensureSchemaSync();
     this.githubEtagResponseStore.ensureSchemaSync();
+    this.githubWebhookReadModelStore.ensureSchemaSync();
     let meta = this.readStorageMetaSync();
     let migratedLegacy = false;
     const legacy = this.storage.kv.get(EXACT_REVIEW_QUEUE_STATE_KEY) as
