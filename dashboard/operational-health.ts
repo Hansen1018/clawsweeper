@@ -3,6 +3,11 @@ export const OPERATIONAL_QUEUE_ZOMBIE_MS = 24 * 60 * 60 * 1000;
 export const OPERATIONAL_RUNNING_STALLED_MS = 150 * 60 * 1000;
 export const HEALTH_HISTORY_SAMPLE_MS = 5 * 60 * 1000;
 export const HEALTH_HISTORY_RETENTION_DAYS = 7;
+const HEALTH_HISTORY_MAX_COUNT = 10_000_000;
+const HEALTH_HISTORY_TIMESTAMP_PATTERN =
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|[+-]\d{2}:\d{2})$/;
+const HEALTH_HISTORY_TIMESTAMP_MIN_MS = Date.UTC(2020, 0, 1);
+const HEALTH_HISTORY_TIMESTAMP_MAX_MS = Date.UTC(2100, 0, 1);
 
 // "waiting" runs sit behind a deployment approval gate: a human decision, not
 // runner congestion. A forgotten approval would otherwise pin
@@ -155,8 +160,8 @@ export function summarizeOperationalHealth(
 export function normalizeHealthHistorySample(value: unknown): HealthHistorySample | null {
   if (!value || typeof value !== "object") return null;
   const sample = value as Record<string, unknown>;
-  const at = String(sample.at || "");
-  if (!Number.isFinite(Date.parse(at))) return null;
+  const at = canonicalHistoryTimestamp(sample.at);
+  if (!at) return null;
   const countFields = [
     "queued",
     "queued_over_30m",
@@ -235,9 +240,7 @@ export function stateWriterHistorySample(value: unknown): StateWriterHistorySamp
     wait_ms: historyPercentiles(window.wait_ms),
     hold_ms: historyPercentiles(window.hold_ms),
     last_successful_materialization_at:
-      typeof writer.last_successful_materialization_at === "string"
-        ? writer.last_successful_materialization_at
-        : null,
+      canonicalHistoryTimestamp(writer.last_successful_materialization_at) ?? null,
   };
 }
 
@@ -335,10 +338,12 @@ function normalizeStateWriterHistorySample(value: unknown): StateWriterHistorySa
   if (!wait || !hold) return null;
   const lastSuccessfulMaterialization =
     sample.last_successful_materialization_at === null ||
-    (typeof sample.last_successful_materialization_at === "string" &&
-      Number.isFinite(Date.parse(sample.last_successful_materialization_at)))
-      ? (sample.last_successful_materialization_at as string | null)
-      : null;
+    sample.last_successful_materialization_at === undefined
+      ? null
+      : canonicalHistoryTimestamp(sample.last_successful_materialization_at);
+  if (lastSuccessfulMaterialization === null && sample.last_successful_materialization_at != null) {
+    return null;
+  }
   return {
     collection_ok: true,
     terminal_collection_ok:
@@ -414,18 +419,23 @@ export function mergeHealthHistorySample(
   current: unknown,
   sample: HealthHistorySample,
 ): HealthHistorySample[] {
-  const slot = historySlot(sample.at);
   const entries = Array.isArray(current) ? current : [];
   const normalized = entries
     .map((entry) => normalizeHealthHistorySample(entry))
     .filter((entry): entry is HealthHistorySample => Boolean(entry));
+  const normalizedSample = normalizeHealthHistorySample(sample);
+  if (!normalizedSample)
+    return normalized.sort((left, right) => Date.parse(left.at) - Date.parse(right.at));
+  const slot = historySlot(normalizedSample.at);
   const latestInSlot = normalized
     .filter((entry) => historySlot(entry.at) === slot)
     .sort((left, right) => Date.parse(right.at) - Date.parse(left.at))[0];
   // Cron retries may finish out of order. Slot deduplication must not let an
   // older observation erase a newer health transition that already landed.
   const winner =
-    latestInSlot && Date.parse(latestInSlot.at) > Date.parse(sample.at) ? latestInSlot : sample;
+    latestInSlot && Date.parse(latestInSlot.at) > Date.parse(normalizedSample.at)
+      ? latestInSlot
+      : normalizedSample;
   return [...normalized.filter((entry) => historySlot(entry.at) !== slot), winner].sort(
     (left, right) => Date.parse(left.at) - Date.parse(right.at),
   );
@@ -441,12 +451,26 @@ function ageMs(value: string | undefined, now: number) {
 }
 
 function nonNegativeInteger(value: unknown) {
-  const number = Number(value);
-  return Number.isFinite(number) ? Math.max(0, Math.round(number)) : null;
+  return typeof value === "number" &&
+    Number.isSafeInteger(value) &&
+    value >= 0 &&
+    value <= HEALTH_HISTORY_MAX_COUNT
+    ? value
+    : null;
 }
 
 function optionalNonNegativeInteger(value: unknown) {
   return value === undefined ? undefined : nonNegativeInteger(value);
+}
+
+function canonicalHistoryTimestamp(value: unknown) {
+  if (typeof value !== "string" || !HEALTH_HISTORY_TIMESTAMP_PATTERN.test(value)) return null;
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) &&
+    timestamp >= HEALTH_HISTORY_TIMESTAMP_MIN_MS &&
+    timestamp < HEALTH_HISTORY_TIMESTAMP_MAX_MS
+    ? new Date(timestamp).toISOString()
+    : null;
 }
 
 function objectValue(value: unknown): Record<string, unknown> {

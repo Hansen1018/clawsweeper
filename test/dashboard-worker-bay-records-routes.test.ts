@@ -2294,7 +2294,11 @@ test("exact-review queue admits and wakes up to 24 publishers", () => {
     state: "pending",
     nextAttemptAt: now,
     leaseExpiresAt: undefined,
-    decision: { sourceAction: "exact_review_artifact_publish" },
+    decision: {
+      sourceAction: "exact_review_artifact_publish",
+      targetRepo: "openclaw/openclaw",
+      itemNumber: number,
+    },
   });
   const state = {
     items: Object.fromEntries(
@@ -2455,6 +2459,7 @@ test("dashboard status reads the exact-review handoff model from the durable que
   assert.equal(status.pressure.active, status.lanes.review.active);
   assert.equal(status.pressure.pending, status.lanes.review.pending);
   assert.equal(status.pressure.capacity, status.lanes.review.capacity);
+  assert.equal(status.bay_projection.complete, true);
   assert.deepEqual(status.bay_projection.stages, {
     arriving: 2,
     "setting-up": 1,
@@ -2596,7 +2601,7 @@ test("Bay queue projection sends parked review and publication work to Repair Co
   );
 });
 
-test("Bay queue projection applies its public sample cap across all stages", async () => {
+test("Bay queue projection caps its sample and validates its full durable census", async () => {
   const storage = new MemoryDurableStorage();
   const queue = new ExactReviewQueue({ storage }, { EXACT_REVIEW_DISPATCH_DEBOUNCE_MS: "0" });
   for (let index = 0; index < 9; index += 1) {
@@ -2617,15 +2622,32 @@ test("Bay queue projection applies its public sample cap across all stages", asy
   const state = (await storage.get("exact-review-queue")) as {
     items: Record<
       string,
-      { state: "pending" | "dispatching" | "leased"; leaseId?: string; leaseExpiresAt?: number }
+      {
+        state: unknown;
+        leaseId?: string;
+        leaseExpiresAt?: number;
+        key: string;
+        decision?: { targetRepo: unknown; itemNumber: unknown } | null;
+        createdAt: unknown;
+        updatedAt: unknown;
+        nextAttemptAt: unknown;
+      }
     >;
   };
   for (let index = 0; index < 9; index += 1) {
     const item = state.items[`openclaw/gogcli#${20_000 + index}`];
     item.state = "leased";
     item.leaseId = `bay-setting-lease-${index}`;
-    item.leaseExpiresAt = Date.now() + 60_000;
+    item.leaseExpiresAt = Date.now() + 10 * 60_000;
   }
+  const caseSource = state.items["openclaw/gogcli#30008"];
+  assert.ok(caseSource.decision);
+  caseSource.decision.targetRepo = "OpenClaw/GogCli";
+  const caseVariant = structuredClone(state.items["openclaw/gogcli#30008"]);
+  caseVariant.key = "openclaw/gogcli#30008@legacy-case";
+  assert.ok(caseVariant.decision);
+  caseVariant.decision.targetRepo = "openclaw/gogcli";
+  state.items[caseVariant.key] = caseVariant;
   await storage.put("exact-review-queue", state);
 
   const status = await exactReviewQueueStatusSnapshot({
@@ -2633,6 +2655,7 @@ test("Bay queue projection applies its public sample cap across all stages", asy
   });
 
   assert.ok(status);
+  assert.equal(status.bay_projection.complete, true);
   assert.equal(status.bay_projection.sample_limit, 24);
   assert.deepEqual(status.bay_projection.stages, {
     arriving: 9,
@@ -2653,10 +2676,45 @@ test("Bay queue projection applies its public sample cap across all stages", asy
     ),
     { arriving: 8, "setting-up": 8, repairing: 8 },
   );
+  assert.deepEqual(status.bay_projection.active_overlaps, {
+    arriving: 0,
+    "setting-up": 0,
+    reviewing: 0,
+    publishing: 0,
+    applying: 0,
+    repairing: 0,
+  });
+
+  const correlatedOutsideSample = await exactReviewQueueStatusSnapshot(
+    { EXACT_REVIEW_QUEUE: new MemoryDurableNamespace(queue) },
+    {
+      bayActiveKeys: [
+        "OPENCLAW/GOGCLI#20008",
+        "OpenClaw/GogCli#30008",
+        "openclaw/gogcli#30008",
+        "not-a-valid-target",
+      ],
+    },
+  );
+  assert.ok(correlatedOutsideSample);
+  assert.deepEqual(correlatedOutsideSample.bay_projection.active_overlaps, {
+    arriving: 0,
+    "setting-up": 1,
+    reviewing: 0,
+    publishing: 0,
+    applying: 0,
+    repairing: 1,
+  });
+  assert.equal(
+    correlatedOutsideSample.bay_projection.items.some(
+      (item) => item.item_key === "openclaw/gogcli#30008",
+    ),
+    false,
+  );
 
   const prioritized = await exactReviewQueueStatusSnapshot(
     { EXACT_REVIEW_QUEUE: new MemoryDurableNamespace(queue) },
-    { bayPriorityKeys: ["openclaw/gogcli#30008"] },
+    { bayPriorityKeys: ["OPENCLAW/GOGCLI#30008"] },
   );
   assert.ok(prioritized);
   assert.equal(prioritized.bay_projection.items.length, 24);
@@ -2693,6 +2751,95 @@ test("Bay queue projection applies its public sample cap across all stages", asy
     matchingPriorityAfterStaleCards.bay_projection.items[0].item_key,
     "openclaw/gogcli#30008",
   );
+
+  assert.equal(
+    status.bay_projection.items.some((item) => item.item_key === "openclaw/gogcli#10008"),
+    false,
+  );
+  const cleanState = structuredClone(state);
+  const malformedMarker = "malformed-legacy-value";
+  const corruptions: Array<{
+    mutate: (item: (typeof state.items)[string]) => void;
+    retained: (item: (typeof state.items)[string]) => boolean;
+  }> = [
+    {
+      mutate: (item) => {
+        item.decision = null;
+      },
+      retained: (item) => item.decision === null,
+    },
+    {
+      mutate: (item) => {
+        delete item.decision;
+      },
+      retained: (item) => !Object.prototype.hasOwnProperty.call(item, "decision"),
+    },
+    {
+      mutate: (item) => {
+        assert.ok(item.decision);
+        item.decision.targetRepo = { category: malformedMarker };
+      },
+      retained: (item) => JSON.stringify(item.decision?.targetRepo).includes(malformedMarker),
+    },
+    {
+      mutate: (item) => {
+        assert.ok(item.decision);
+        item.decision.itemNumber = malformedMarker;
+      },
+      retained: (item) => item.decision?.itemNumber === malformedMarker,
+    },
+    {
+      mutate: (item) => {
+        item.state = malformedMarker;
+      },
+      retained: (item) => item.state === malformedMarker,
+    },
+    {
+      mutate: (item) => {
+        item.createdAt = malformedMarker;
+      },
+      retained: (item) => item.createdAt === malformedMarker,
+    },
+    {
+      mutate: (item) => {
+        item.updatedAt = malformedMarker;
+      },
+      retained: (item) => item.updatedAt === malformedMarker,
+    },
+    {
+      mutate: (item) => {
+        item.nextAttemptAt = malformedMarker;
+      },
+      retained: (item) => item.nextAttemptAt === malformedMarker,
+    },
+  ];
+  for (const corruption of corruptions) {
+    const corruptState = structuredClone(cleanState);
+    corruption.mutate(corruptState.items["openclaw/gogcli#10008"]);
+    await storage.put("exact-review-queue", corruptState);
+    const restartedQueue = new ExactReviewQueue(
+      { storage },
+      { EXACT_REVIEW_DISPATCH_DEBOUNCE_MS: "0" },
+    );
+    const malformed = await exactReviewQueueStatusSnapshot({
+      EXACT_REVIEW_QUEUE: new MemoryDurableNamespace(restartedQueue),
+    });
+    assert.ok(malformed);
+    assert.match(malformed.generated_at, /^\d{4}-\d{2}-\d{2}T/);
+    assert.equal(Number.isSafeInteger(malformed.lanes.review.pending), true);
+    assert.deepEqual(malformed.bay_projection, {
+      complete: false,
+      sample_limit: 24,
+      total: null,
+      stages: null,
+      active_overlaps: null,
+      items: [],
+    });
+    assert.equal(JSON.stringify(malformed.bay_projection).includes(malformedMarker), false);
+    const retainedState = (await storage.get("exact-review-queue")) as typeof state;
+    assert.equal(corruption.retained(retainedState.items["openclaw/gogcli#10008"]), true);
+  }
+  await storage.put("exact-review-queue", cleanState);
 });
 
 test("triage routing groups classify impact labels without forcing one primary group", () => {
@@ -2719,7 +2866,7 @@ test("triage routing groups classify impact labels without forcing one primary g
   assert.equal(TRIAGE_ROUTING_GROUPS.at(-1)?.id, "unclassified");
 });
 
-test("issue triage exposes impact-group controls without changing PR proof triage", async () => {
+test("public triage pages expose aggregate counts without identity controls", async () => {
   const issuePage = await worker.fetch(new Request("https://clawsweeper.openclaw.ai/triage"), {});
   const proofPage = await worker.fetch(
     new Request("https://clawsweeper.openclaw.ai/pr-proof-triage"),
@@ -2728,12 +2875,285 @@ test("issue triage exposes impact-group controls without changing PR proof triag
   const overviewPage = await worker.fetch(new Request("https://clawsweeper.openclaw.ai/"), {});
   const issueHtml = await issuePage.text();
   const proofHtml = await proofPage.text();
-  assert.match(issueHtml, /id="routing-group"/);
-  assert.match(issueHtml, /Impact group/);
-  assert.match(issueHtml, /href="\/bay">OpenClaw Bay/);
-  assert.match(proofHtml, /href="\/bay">OpenClaw Bay/);
+  for (const html of [issueHtml, proofHtml]) {
+    assert.match(html, /Privacy-safe aggregate triage counts/);
+    assert.match(html, /bounded category counts only/);
+    assert.match(html, /id="metrics"/);
+    assert.match(html, /id="tabs"/);
+    assert.match(html, /id="view-count"/);
+    assert.match(html, /id="snapshot-health"/);
+    assert.match(html, /Aggregate snapshot is temporarily unavailable/);
+    assert.match(html, /collection errors were withheld/);
+    assert.match(html, /function publicSnapshot\(value\)/);
+    assert.match(html, /function renderMetrics\(\)/);
+    assert.match(html, /function renderTabs\(\)/);
+    assert.match(html, /href="\/bay">OpenClaw Bay/);
+    assert.doesNotMatch(html, /id="issue-filter"/);
+    assert.doesNotMatch(html, /id="issue-sort"/);
+    assert.doesNotMatch(html, /id="routing-group"/);
+    assert.doesNotMatch(html, /id="github-query"/);
+    assert.doesNotMatch(html, /id="visible-count"/);
+    assert.doesNotMatch(html, /id="table"/);
+    assert.doesNotMatch(html, /<table[ >]/);
+    assert.doesNotMatch(html, /rowCellHtml|renderRows|searchableText|routingGroupGithubUrl/);
+    assert.doesNotMatch(html, /data-filter-value|linkedPullRequestPills/);
+    assert.doesNotMatch(html, /diagnostics(?:\?\.)?\.errors|target_repositories/);
+    assert.doesNotMatch(html, /href="https:\/\/github\.com\/issues/);
+  }
+  assert.match(issueHtml, /Ready candidates/);
+  assert.match(issueHtml, /Queueable fixes without a no-new-fix-pr blocker/);
+  assert.match(proofHtml, /Needs proof review/);
+  assert.match(proofHtml, /Proof is requested but not yet marked sufficient or overridden/);
   assert.match(await overviewPage.text(), /href="\/bay">OpenClaw Bay/);
-  assert.doesNotMatch(proofHtml, /id="routing-group"/);
+});
+
+async function renderPublicTriageApplication(
+  html: string,
+  pathname: string,
+  fetchResponse: () => Promise<unknown>,
+) {
+  const applicationScript = publicTriageApplicationScript(html);
+  const elements = new Map(
+    [
+      "metrics",
+      "tabs",
+      "view-name",
+      "view-description",
+      "view-count",
+      "snapshot-health",
+      "updated",
+    ].map((id) => [id, { id, innerHTML: "", textContent: "", dataset: {} }]),
+  );
+  const context = createContext({
+    console,
+    Date,
+    Intl,
+    Number,
+    Object,
+    Array,
+    Map,
+    String,
+    encodeURIComponent,
+    window: {
+      matchMedia: () => ({ matches: false, addEventListener: () => undefined }),
+      localStorage: { getItem: () => null, setItem: () => undefined },
+    },
+    document: {
+      documentElement: { dataset: {} },
+      getElementById: (id: string) => elements.get(id),
+      querySelectorAll: () => [],
+      querySelector: () => null,
+    },
+    location: { hash: "", pathname },
+    history: { replaceState: () => undefined },
+    fetch: fetchResponse,
+    setInterval: () => 0,
+  });
+  new Script(applicationScript).runInContext(context);
+  await new Promise((resolve) => setImmediate(resolve));
+  return elements;
+}
+
+function publicTriageApplicationScript(html: string) {
+  const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/gi)];
+  return scripts.at(-1)?.[1] || "";
+}
+
+test("public triage application script extraction is case-insensitive", () => {
+  assert.equal(
+    publicTriageApplicationScript("<SCRIPT>safeApplication()</SCRIPT>"),
+    "safeApplication()",
+  );
+});
+
+test("public triage UI renders only closed aggregate definitions and bounded counts", async () => {
+  const response = await worker.fetch(new Request("https://clawsweeper.openclaw.ai/triage"), {});
+  const html = await response.text();
+  const marker = "synthetic-ui-identity-marker";
+  const viewIds = [
+    "clawsweeper",
+    "ready-candidates",
+    "queueable-blocked",
+    "already-has-pr",
+    "needs-info",
+    "needs-maintainer-review",
+    "product-security",
+    "needs-live-repro",
+  ];
+  const elements = await renderPublicTriageApplication(html, "/triage", async () => ({
+    ok: true,
+    json: async () => ({
+      schema_version: 2,
+      generated_at: "2026-08-15T12:00:00.000Z",
+      complete: true,
+      error_count: 0,
+      views: viewIds.map((id, index) => ({
+        id,
+        title: marker,
+        description: marker,
+        total_count: index + 11,
+        items: [{ title: marker, url: marker }],
+      })),
+    }),
+  }));
+
+  assert.match(String(elements.get("metrics")?.innerHTML), /ClawSweeper issues/);
+  assert.match(String(elements.get("metrics")?.innerHTML), />11</);
+  assert.match(String(elements.get("tabs")?.innerHTML), /Ready candidates/);
+  assert.equal(elements.get("view-name")?.textContent, "ClawSweeper");
+  assert.equal(
+    elements.get("view-description")?.textContent,
+    "Open issues carrying any ClawSweeper label.",
+  );
+  assert.equal(elements.get("view-count")?.textContent, "11");
+  assert.match(String(elements.get("snapshot-health")?.textContent), /Complete aggregate snapshot/);
+  assert.doesNotMatch(
+    [...elements.values()]
+      .map((element) => `${element.innerHTML} ${element.textContent}`)
+      .join(" "),
+    new RegExp(marker, "i"),
+  );
+});
+
+test("public triage UI fails closed for malformed and unavailable snapshots", async () => {
+  const marker = "synthetic-ui-malformed-marker";
+  const pages = [
+    {
+      pathname: "/triage",
+      viewIds: [
+        "clawsweeper",
+        "ready-candidates",
+        "queueable-blocked",
+        "already-has-pr",
+        "needs-info",
+        "needs-maintainer-review",
+        "product-security",
+        "needs-live-repro",
+      ],
+    },
+    {
+      pathname: "/pr-proof-triage",
+      viewIds: [
+        "proof-triage",
+        "needs-proof",
+        "missing-proof",
+        "sufficient-proof",
+        "mock-only-proof",
+        "telegram-proof",
+        "sufficient-with-need-label",
+      ],
+    },
+  ];
+  const renderedText = (elements: Map<string, { innerHTML: string; textContent: string }>) =>
+    [...elements.values()]
+      .map((element) => `${element.innerHTML} ${element.textContent}`)
+      .join(" ");
+
+  for (const page of pages) {
+    const response = await worker.fetch(
+      new Request(`https://clawsweeper.openclaw.ai${page.pathname}`),
+      {},
+    );
+    const html = await response.text();
+    const valid = {
+      schema_version: 2,
+      generated_at: "2026-08-15T12:00:00.000Z",
+      complete: true,
+      error_count: 0,
+      views: page.viewIds.map((id, index) => ({
+        id,
+        total_count: index + 1,
+        title: marker,
+        items: [{ url: marker }],
+      })),
+    };
+
+    const partial = {
+      ...valid,
+      complete: false,
+      error_count: 2,
+      diagnostics: { errors: [marker, marker] },
+    };
+    const partialElements = await renderPublicTriageApplication(html, page.pathname, async () => ({
+      ok: true,
+      json: async () => partial,
+    }));
+    assert.notEqual(partialElements.get("view-count")?.textContent, "Not available");
+    assert.match(
+      String(partialElements.get("snapshot-health")?.textContent),
+      /2 collection errors were withheld/,
+    );
+    assert.doesNotMatch(renderedText(partialElements), new RegExp(marker, "i"));
+
+    const missingView = { ...valid, views: valid.views.slice(0, -1) };
+    const duplicateView = {
+      ...valid,
+      views: [...valid.views.slice(0, -1), { ...valid.views[0] }],
+    };
+    const unknownView = {
+      ...valid,
+      views: [
+        ...valid.views.slice(0, -1),
+        { ...valid.views.at(-1), id: "unexpected-view", title: marker },
+      ],
+    };
+    const overCapCount = {
+      ...valid,
+      views: valid.views.map((view, index) =>
+        index === 0 ? { ...view, total_count: 1_000_001 } : view,
+      ),
+    };
+    const nonIntegerCount = {
+      ...valid,
+      views: valid.views.map((view, index) => (index === 0 ? { ...view, total_count: 1.5 } : view)),
+    };
+    const invalidTimestamp = { ...valid, generated_at: marker };
+    const numericTimestamp = { ...valid, generated_at: "1171" };
+    const urlTimestamp = {
+      ...valid,
+      generated_at: `https://invalid.example/${marker}?timestamp=1`,
+    };
+    const overCapErrorCount = { ...valid, error_count: 21, complete: false };
+    const completenessMismatch = { ...valid, error_count: 1, complete: true };
+    for (const malformed of [
+      missingView,
+      duplicateView,
+      unknownView,
+      overCapCount,
+      nonIntegerCount,
+      invalidTimestamp,
+      numericTimestamp,
+      urlTimestamp,
+      overCapErrorCount,
+      completenessMismatch,
+    ]) {
+      const elements = await renderPublicTriageApplication(html, page.pathname, async () => ({
+        ok: true,
+        json: async () => malformed,
+      }));
+      assert.equal(elements.get("view-count")?.textContent, "Not available");
+      assert.match(String(elements.get("snapshot-health")?.textContent), /temporarily unavailable/);
+      assert.doesNotMatch(renderedText(elements), new RegExp(marker, "i"));
+    }
+
+    for (const unavailableFetch of [
+      async () => ({ ok: false, json: async () => ({ marker }) }),
+      async () => ({
+        ok: true,
+        json: async () => {
+          throw new Error(marker);
+        },
+      }),
+      async () => {
+        throw new Error(marker);
+      },
+    ]) {
+      const elements = await renderPublicTriageApplication(html, page.pathname, unavailableFetch);
+      assert.equal(elements.get("view-count")?.textContent, "Not available");
+      assert.match(String(elements.get("snapshot-health")?.textContent), /temporarily unavailable/);
+      assert.doesNotMatch(renderedText(elements), new RegExp(marker, "i"));
+    }
+  }
 });
 
 test("dashboard health identifies the deployed revision", async () => {
@@ -2766,19 +3186,18 @@ test("OpenClaw Bay is a public, indexable, hardened canonical route", async () =
   assert.doesNotMatch(body, /<meta name="robots"/);
   assert.doesNotMatch(body, /Experimental demo/);
   assert.match(body, /href="\/bay" aria-current="page"/);
-  assert.match(body, /Where's my crustacean\?/);
-  assert.match(body, /20 distinct terminal items per tide/);
+  assert.match(body, /Aggregate-only shoreline/);
+  assert.doesNotMatch(body, /id="finder"|id="finder-input"|id="drawer"|id="queue-sample-drawer"/);
+  assert.match(body, /Aggregate terminal outcomes per tide/);
   assert.match(body, /Master Sweeper/);
   assert.match(body, /id="bay-control-board"/);
   assert.match(body, /Review admission/);
   assert.match(body, /Result publication/);
-  assert.match(body, /renderBayPublicationQuotaContext/);
-  assert.match(body, /credential_circuits/);
-  assert.match(body, /github_request_metrics/);
-  assert.match(body, /credential-blocked/);
+  assert.doesNotMatch(body, /renderBayPublicationQuotaContext/);
+  assert.doesNotMatch(body, /credential_circuits|github_request_metrics|credential-blocked/);
   assert.match(body, /State writer/);
   assert.match(body, /Queue handoff/);
-  assert.match(body, /recovery_reasons/);
+  assert.match(body, /HANDOFF_RECOVERY_REASONS/);
   assert.match(body, /recovering after/);
   assert.doesNotMatch(body, /Recent durable events/);
   assert.doesNotMatch(body, /function bayRecentPublicationEvents/);
@@ -2791,19 +3210,137 @@ test("OpenClaw Bay is a public, indexable, hardened canonical route", async () =
   assert.match(body, /fetch\("\/api\/durable-lifecycle-bay"/);
   assert.match(body, /durableLifecycleLoading/);
   assert.match(body, /if\(state\.durableLifecycleLoading\)return/);
-  assert.match(body, /fixed 24-card newest round-robin public sample; no cursor is available/);
+  assert.match(body, /Aggregate counts from the exact-review lifecycle projection/);
+  assert.match(body, /Individual references are intentionally omitted/);
   assert.match(body, /Empty complete lifecycle snapshot/);
   assert.match(
     body,
-    /No counts or cards are shown until a complete, fresh projection is available/,
+    /No aggregate counts are shown until a complete, fresh projection is available/,
   );
-  const durableScriptStart = body.indexOf("function durableSnapshot");
+  assert.doesNotMatch(body, /function durableCard|class="durable-card"|public sample card/);
+  const durableScriptStart = body.indexOf("function durableUnknown");
   const durableScriptEnd = body.indexOf("function hash", durableScriptStart);
   assert.ok(durableScriptStart > 0 && durableScriptEnd > durableScriptStart);
   const durableScript = body.slice(durableScriptStart, durableScriptEnd);
   assert.doesNotMatch(durableScript, /\/api\/status|workers|current_step|stageFor/);
-  assert.match(body, /function durableNoSensitiveFields/);
-  assert.doesNotMatch(durableScript, /JSON\.stringify\(card\|\|\{\}\)/);
+  assert.match(durableScript, /sample\.limit!==0/);
+  assert.doesNotMatch(durableScript, /target\.repository|target\.number|target\.url/);
+  const durableTarget = { innerHTML: "" };
+  const durableProvenance = { textContent: "" };
+  const durableState = { durableLifecycle: null as unknown };
+  const durableRuntime = new Script(
+    `${durableScript};({durableSnapshot,renderDurableLifecycle})`,
+  ).runInNewContext({
+    Array,
+    Date,
+    Math,
+    Number,
+    Object,
+    String,
+    DURABLE_LANES: [
+      "pending",
+      "acknowledgement_pending",
+      "completed",
+      "superseded",
+      "requeued",
+      "terminal_attention",
+    ],
+    DURABLE_LANE_LABELS: {
+      pending: "Pending",
+      acknowledgement_pending: "Acknowledgement pending",
+      completed: "Completed",
+      superseded: "Superseded",
+      requeued: "Requeued",
+      terminal_attention: "Terminal attention",
+    },
+    state: durableState,
+    esc: (value: unknown) => String(value),
+    document: {
+      getElementById: (id: string) =>
+        id === "durable-lifecycle-kanban" ? durableTarget : durableProvenance,
+    },
+  });
+  const generatedAt = new Date().toISOString();
+  const lifecyclePayload = {
+    durable_lifecycle_bay: {
+      version: 1,
+      source: "exact-review-lifecycle-projection-v1",
+      generated_at: generatedAt,
+      freshness: { maximum_age_ms: 60_000 },
+      collection: { state: "complete" },
+      inventory: {
+        lifecycle_records: 6,
+        target_revisions: 6,
+        unique_targets: 4,
+        nested_private_marker: "must-not-surface",
+      },
+      lanes: {
+        pending: 1,
+        acknowledgement_pending: 1,
+        completed: 1,
+        superseded: 1,
+        requeued: 1,
+        terminal_attention: 1,
+        private_lane_marker: 99,
+      },
+      sample: { limit: 0, returned: 0, omitted: 6, cards: [] },
+      private_projection_marker: {
+        repository: "private-owner/private-project",
+        item: 77,
+        url: "https://example.invalid/private?marker=1",
+      },
+    },
+  };
+  const closedLifecycle = durableRuntime.durableSnapshot(lifecyclePayload);
+  assert.equal(closedLifecycle.collection.state, "complete");
+  assert.deepEqual(JSON.parse(JSON.stringify(closedLifecycle.inventory)), {
+    lifecycle_records: 6,
+    target_revisions: 6,
+    unique_targets: 4,
+  });
+  assert.deepEqual(JSON.parse(JSON.stringify(closedLifecycle.sample)), {
+    limit: 0,
+    returned: 0,
+    omitted: 6,
+    cards: [],
+  });
+  assert.doesNotMatch(
+    JSON.stringify(closedLifecycle),
+    /private_projection_marker|nested_private_marker|private_lane_marker|private-owner|example\.invalid/,
+  );
+  durableState.durableLifecycle = closedLifecycle;
+  durableRuntime.renderDurableLifecycle();
+  assert.match(durableTarget.innerHTML, /Aggregate inventory: 6 lifecycle records/);
+  assert.match(durableTarget.innerHTML, /Pending<span>1<\/span>/);
+  assert.match(durableTarget.innerHTML, /Terminal attention<span>1<\/span>/);
+  assert.doesNotMatch(
+    durableTarget.innerHTML,
+    /private-owner|example\.invalid|href=|target revision card/,
+  );
+  for (const malformed of [
+    {
+      ...lifecyclePayload.durable_lifecycle_bay,
+      inventory: { ...lifecyclePayload.durable_lifecycle_bay.inventory, lifecycle_records: 513 },
+    },
+    {
+      ...lifecyclePayload.durable_lifecycle_bay,
+      lanes: { ...lifecyclePayload.durable_lifecycle_bay.lanes, pending: { nested: 1 } },
+    },
+    {
+      ...lifecyclePayload.durable_lifecycle_bay,
+      sample: {
+        limit: 1,
+        returned: 1,
+        omitted: 5,
+        cards: [{ private_marker: "must-not-surface" }],
+      },
+    },
+  ]) {
+    const rejected = durableRuntime.durableSnapshot({ durable_lifecycle_bay: malformed });
+    assert.equal(rejected.collection.state, "unknown");
+    assert.equal(rejected.collection.reason, "malformed");
+    assert.doesNotMatch(JSON.stringify(rejected), /nested|private_marker|must-not-surface/);
+  }
   assert.match(body, /function loadBayHistory/);
   assert.match(body, /function bayRateSparkline/);
   assert.match(body, /function bayStateWriterCard/);
@@ -2818,21 +3355,167 @@ test("OpenClaw Bay is a public, indexable, hardened canonical route", async () =
   assert.match(body, /bay-handoff-line pending/);
   assert.match(body, /Pending, dispatching, and leased queue handoffs/);
   assert.match(body, /oldest pending/);
-  assert.match(body, /handoff\.message\|\|handoff\.reason/);
+  assert.doesNotMatch(body, /handoff\.message|handoff\.detail/);
+  assert.match(body, /Handoffs are current/);
   assert.match(body, /Handoff telemetry is unavailable in this snapshot/);
-  assert.match(body, /\["pending","dispatching","leased"\]\.every/);
+  assert.match(body, /indexPhases=\["pending","dispatching","leased"\]/);
   assert.match(body, /api\/health-history\?range="\+encodeURIComponent\(range\)/);
+  assert.match(body, /function bayHealthHistorySnapshot/);
+  assert.doesNotMatch(body, /var pending=Number\(value\.pending\)/);
+  const bayStrictStart = body.indexOf("var MAX_BAY_COUNT");
+  const bayStrictEnd = body.indexOf("function strictBayStageCounts", bayStrictStart);
+  const bayHistoryStart = body.indexOf("var BAY_HEALTH_RANGE_MS");
+  const bayHistoryEnd = body.indexOf("function bayFormatTime", bayHistoryStart);
+  const bayHandoffStart = body.indexOf("function bayHandoffHistory");
+  const bayHandoffEnd = body.indexOf("function bayHandoffSparkline", bayHandoffStart);
+  const bayLoadStart = body.indexOf("async function loadBayHistory");
+  const bayLoadEnd = body.indexOf("function reconcileConfirmingOutcomes", bayLoadStart);
+  const bayWriterStart = body.indexOf("function bayFiniteCount");
+  const bayWriterEnd = body.indexOf("function bayStateWriterCard", bayWriterStart);
+  for (const boundary of [
+    bayStrictStart,
+    bayStrictEnd,
+    bayHistoryStart,
+    bayHistoryEnd,
+    bayHandoffStart,
+    bayHandoffEnd,
+    bayLoadStart,
+    bayLoadEnd,
+    bayWriterStart,
+    bayWriterEnd,
+  ]) {
+    assert.ok(boundary > 0);
+  }
+  const bayHistoryState = {
+    healthRange: "6h",
+    healthHistory: [] as unknown[],
+    healthHistoryByRange: {} as Record<string, unknown[]>,
+    healthHistoryLoadedAt: {} as Record<string, number>,
+    healthHistoryLoading: {} as Record<string, boolean>,
+    previewSource: false,
+  };
+  let bayPayload: unknown = null;
+  let bayRendered = "";
+  const bayHistoryRuntime = new Script(
+    [
+      body.slice(bayStrictStart, bayStrictEnd),
+      body.slice(bayHistoryStart, bayHistoryEnd),
+      body.slice(bayHandoffStart, bayHandoffEnd),
+      body.slice(bayLoadStart, bayLoadEnd),
+      body.slice(bayWriterStart, bayWriterEnd),
+      ";({bayHealthHistorySnapshot,bayHistory,bayHandoffHistory,bayStateWriterHistory,loadBayHistory})",
+    ].join("\n"),
+  ).runInNewContext({
+    state: bayHistoryState,
+    fetch: async () => ({ ok: true, json: async () => structuredClone(bayPayload) }),
+    renderBayControl: () => {
+      bayRendered = JSON.stringify(bayHistoryState.healthHistory);
+    },
+    encodeURIComponent,
+  });
+  const bayAt = Math.floor((Date.now() - 15 * 60_000) / (5 * 60_000)) * (5 * 60_000);
+  const validBayHistory = {
+    schema_version: 1,
+    range: "6h",
+    retention_days: 7,
+    samples: [
+      {
+        at: new Date(bayAt).toISOString(),
+        exact_review: {
+          collection_ok: true,
+          review: { pending: 4, enqueued_total: 20, completed_total: 16, shed_total: 1 },
+          publication: { pending: 2, enqueued_total: 18, completed_total: 16 },
+          handoff: { status: "healthy", pending: 4, dispatching: 1, leased: 2 },
+        },
+        state_writer: {
+          collection_ok: true,
+          terminal_collection_ok: true,
+          mode: "batch",
+          tracked_holding: 1,
+          tracked_waiting: 2,
+          tracked_releasing: 0,
+          accepted_operations_total: 16,
+          state_commits_total: 8,
+          materialized_items_total: 16,
+          contention_timeouts_total: 0,
+          wait_ms: { p50: 10, p95: 20, samples: 2 },
+          hold_ms: { p50: 30, p95: 40, samples: 2 },
+          last_successful_materialization_at: new Date(bayAt - 60_000).toISOString(),
+        },
+      },
+    ],
+  };
+  bayPayload = validBayHistory;
+  await bayHistoryRuntime.loadBayHistory();
+  assert.equal(bayHistoryRuntime.bayHistory("review")[0].pending, 4);
+  assert.equal(bayHistoryRuntime.bayHandoffHistory()[0].dispatching, 1);
+  assert.equal(bayHistoryRuntime.bayStateWriterHistory()[0].pending, 2);
+  const projectedBayHistory = bayHistoryRuntime.bayHealthHistorySnapshot(validBayHistory, "6h");
+  assert.equal(
+    JSON.stringify(projectedBayHistory),
+    JSON.stringify(bayHistoryRuntime.bayHealthHistorySnapshot(projectedBayHistory, "6h")),
+  );
+
+  const bayMarker = "synthetic-bay-history-marker";
+  const bayMarkerUrl =
+    "https://invalid.example/" + bayMarker + "?repo=" + bayMarker + "&token=" + bayMarker;
+  const invalidBayHistory = {
+    ...validBayHistory,
+    samples: validBayHistory.samples.map((sample) => ({
+      ...sample,
+      state_writer: {
+        ...sample.state_writer,
+        wait_ms: { p50: bayMarkerUrl, p95: 20, samples: 2 },
+        nested: { identity: bayMarker },
+      },
+    })),
+  };
+  for (const malformed of [
+    { samples: validBayHistory.samples },
+    { ...validBayHistory, range: bayMarker },
+    { ...validBayHistory, retention_days: "7" },
+    invalidBayHistory,
+    {
+      ...validBayHistory,
+      samples: validBayHistory.samples.map((sample) => ({
+        ...sample,
+        exact_review: {
+          ...sample.exact_review,
+          review: { ...sample.exact_review.review, pending: "4" },
+        },
+      })),
+    },
+    {
+      ...validBayHistory,
+      samples: validBayHistory.samples.map((sample) => ({ ...sample, at: bayMarkerUrl })),
+    },
+    { ...validBayHistory, samples: [validBayHistory.samples[0], validBayHistory.samples[0]] },
+    {
+      ...validBayHistory,
+      samples: Array.from({ length: 74 }, (_, index) => ({
+        ...validBayHistory.samples[0],
+        at: new Date(bayAt - index * 5 * 60_000).toISOString(),
+      })).reverse(),
+    },
+  ]) {
+    assert.equal(bayHistoryRuntime.bayHealthHistorySnapshot(malformed, "6h"), null);
+  }
+  bayHistoryState.healthHistoryLoadedAt["6h"] = 0;
+  bayPayload = { ...invalidBayHistory, error: bayMarker };
+  await bayHistoryRuntime.loadBayHistory();
+  assert.equal(bayHistoryState.healthHistory.length, 0);
+  assert.equal(bayHistoryRuntime.bayHistory("review").length, 0);
+  assert.equal(bayHistoryRuntime.bayHandoffHistory().length, 0);
+  assert.equal(bayHistoryRuntime.bayStateWriterHistory().length, 0);
+  assert.doesNotMatch(bayRendered, new RegExp(bayMarker, "i"));
+  assert.doesNotMatch(bayRendered, /invalid\.example|repo=|token=/i);
   assert.match(body, /function expandQueue/);
-  assert.match(body, /function queueProjectionStage/);
   assert.match(body, /Repair cove/);
   assert.match(body, /"publishing":"Publishing"/);
-  assert.match(body, /Waiting to publish the final review/);
+  assert.match(body, /Waiting to publish final reviews/);
   assert.match(body, /bounded result-publication queue/);
-  assert.match(
-    body,
-    /var hasPublishing=Object\.prototype\.hasOwnProperty\.call\(stages,"publishing"\)/,
-  );
-  assert.match(body, /if\(stage==="applying"&&!hasPublishing\)reported=0/);
+  assert.match(body, /activity&&activity\.complete===true/);
+  assert.match(body, /function liveStageCount/);
   assert.match(body, /id="tunnel-layer"/);
   assert.match(body, /function startTunnelJourney/);
   assert.doesNotMatch(body, /function drawTunnels/);
@@ -2854,11 +3537,9 @@ test("OpenClaw Bay is a public, indexable, hardened canonical route", async () =
   assert.match(body, /Typical trigger → final review/);
   assert.match(body, /median; mean is shown for context/);
   assert.match(body, /Awaiting a completed journey/);
-  assert.match(body, /id="queue-sample-drawer"/);
-  assert.match(body, /-reference public sample/);
-  assert.match(body, /does not fetch or invent that missing list/);
-  assert.match(body, /var known=rows;/);
-  assert.match(body, /data-overflow-stage/);
+  assert.doesNotMatch(body, /id="queue-sample-drawer"|function openQueueSampleDrawer/);
+  assert.match(body, /aggregate work unit/);
+  assert.doesNotMatch(body, /data-overflow-stage|var known=rows/);
   assert.match(body, /function laneHelp/);
   assert.match(body, /lane-nudge/);
   assert.match(body, /id="overall-average"/);
@@ -2884,13 +3565,13 @@ test("OpenClaw Bay is a public, indexable, hardened canonical route", async () =
   assert.match(body, /loadInFlight/);
   assert.match(body, /replaceChildren\(journey\)/);
   assert.match(body, /master\.getAnimations\(\)/);
-  assert.match(body, /Let the current beach movement finish first/);
+  assert.doesNotMatch(body, /Let the current beach movement finish first/);
   assert.match(body, /function visualTransitionKey/);
   assert.match(body, /pendingItems/);
   assert.match(body, /OUTCOME_CONFIRM_MS=150000/);
   assert.match(body, /function reconcileConfirmingOutcomes/);
   assert.match(body, /confirming-flag/);
-  assert.match(body, /confirming outcome/);
+  assert.match(body, /Aggregate terminal outcome/);
   assert.match(body, /data-key=/);
   assert.match(body, /aria-pressed=/);
   assert.match(body, /function laneChatCopy/);
@@ -2917,71 +3598,178 @@ test("OpenClaw Bay is a public, indexable, hardened canonical route", async () =
   assert.ok(new Set(chatContext.copies.map((copy) => copy.question)).size > 1);
   assert.ok(new Set(chatContext.copies.map((copy) => copy.answer)).size > 1);
   assert.ok(chatContext.copies.every((copy) => copy.answer.includes("7m")));
+  const terminalRowsStart = body.indexOf("function terminalRows(");
+  const terminalRowsEnd = body.indexOf("function runChanged(", terminalRowsStart);
+  assert.ok(terminalRowsStart > 0 && terminalRowsEnd > terminalRowsStart);
+  const aggregateTerminalRows = new Script(
+    `${body.slice(terminalRowsStart, terminalRowsEnd)};terminalRows`,
+  ).runInNewContext({
+    Array,
+    Math,
+    Number,
+    String,
+    BAY_OUTCOMES: ["success", "failure", "cancelled"],
+    bayObject: (value: unknown) =>
+      value && typeof value === "object" && !Array.isArray(value) ? value : null,
+  });
+  const terminalRows = JSON.parse(
+    JSON.stringify(
+      aggregateTerminalRows(
+        {
+          bay: {
+            terminal_buffer: [
+              {
+                outcome: "success",
+                workflow_title: "synthetic private workflow title",
+                item_url: "https://example.invalid/private?token=synthetic",
+              },
+              { outcome: "failure" },
+              { terminal_outcome: "cancelled" },
+              { outcome: "unrecognized" },
+            ],
+            recently_washed: [{ outcome: "success" }],
+          },
+        },
+        {},
+        true,
+      ),
+    ),
+  );
+  assert.deepEqual(
+    terminalRows.map((row: { stage: string; status: string; outcome: string }) => ({
+      stage: row.stage,
+      status: row.status,
+      outcome: row.outcome,
+    })),
+    [
+      { stage: "completed", status: "success", outcome: "success" },
+      { stage: "completed", status: "success", outcome: "success" },
+      { stage: "failed", status: "failure", outcome: "failure" },
+    ],
+  );
+  assert.ok(
+    terminalRows.every(
+      (row: Record<string, unknown>) =>
+        !Object.hasOwn(row, "repository") &&
+        !Object.hasOwn(row, "number") &&
+        !Object.hasOwn(row, "item_url") &&
+        !Object.hasOwn(row, "source"),
+    ),
+  );
+  assert.equal(JSON.stringify(terminalRows).includes("synthetic private workflow title"), false);
+  assert.equal(JSON.stringify(terminalRows).includes("example.invalid"), false);
+  assert.equal(
+    aggregateTerminalRows(
+      {
+        bay: {
+          terminal_count: 12,
+          terminal_buffer: [null, {}, { outcome: { nested: "failure" } }],
+          recently_washed: [{ outcome: "success" }],
+        },
+      },
+      {},
+      false,
+    ).length,
+    0,
+  );
+  const cappedTerminalRows = aggregateTerminalRows(
+    {
+      bay: {
+        terminal_buffer: [
+          ...Array.from({ length: 10 }, () => ({ outcome: "unknown" })),
+          ...Array.from({ length: 30 }, () => ({ outcome: "success" })),
+        ],
+      },
+    },
+    {},
+    false,
+  );
+  assert.equal(cappedTerminalRows.length, 24);
+  assert.ok(cappedTerminalRows.every((row: { outcome: string }) => row.outcome === "success"));
+  const tideRows = aggregateTerminalRows(
+    {
+      bay: {
+        recently_washed: Array.from({ length: 20 }, () => ({ outcome: "failure" })),
+        terminal_buffer: Array.from({ length: 5 }, () => ({ outcome: "success" })),
+      },
+    },
+    {},
+    true,
+  );
+  assert.equal(tideRows.length, 24);
+  assert.deepEqual(
+    tideRows.map((row: { outcome: string }) => row.outcome),
+    [...Array.from({ length: 20 }, () => "failure"), ...Array.from({ length: 4 }, () => "success")],
+  );
   const runChangedSource = body.match(/function runChanged\([^}]+\}/)?.[0];
-  const stageForSource = body.match(/function stageFor\([^]*?return "arriving";\}/)?.[0];
-  const queueProjectionStageSource = body.match(
-    /function queueProjectionStage\([^]*?return STAGES\.indexOf\(stage\)>=0\?stage:"arriving";\}/,
-  )?.[0];
   const transitionKindSource = body.match(
     /function transitionKind\([^]*?return oldIndex>=0&&nextIndex>oldIndex\?"forward":null;\}/,
   )?.[0];
   assert.ok(runChangedSource);
-  assert.ok(stageForSource);
-  assert.ok(queueProjectionStageSource);
   assert.ok(transitionKindSource);
-  const normalizeQueueStage = new Script(
-    `${queueProjectionStageSource};queueProjectionStage`,
+  const aggregateRowsStart = body.indexOf("function boundedBayCount(");
+  const aggregateRowsEnd = body.indexOf("function terminalRows(", aggregateRowsStart);
+  assert.ok(aggregateRowsStart > 0 && aggregateRowsEnd > aggregateRowsStart);
+  const aggregateRows = new Script(
+    `${body.slice(aggregateRowsStart, aggregateRowsEnd)};({expandActive,queueStageCount,liveStageCount})`,
   ).runInNewContext({
+    Array,
+    Math,
+    Number,
+    Object,
+    String,
     STAGES: ["arriving", "setting-up", "reviewing", "publishing", "applying", "repairing"],
+    queueStageLabel: () => "aggregate queue stage",
   });
-  assert.equal(normalizeQueueStage("applying", false), "applying");
-  assert.equal(normalizeQueueStage("applying", true), "publishing");
-  assert.equal(normalizeQueueStage("publishing"), "publishing");
-  const classifyBayStage = new Script(`${stageForSource};stageFor`).runInNewContext({
-    STAGES: ["arriving", "setting-up", "reviewing", "publishing", "applying", "repairing"],
+  const closedStages = {
+    arriving: 0,
+    "setting-up": 0,
+    reviewing: 0,
+    publishing: 0,
+    applying: 0,
+    repairing: 0,
+  };
+  const aggregateData = {
+    workers: [
+      {
+        repository: "synthetic-owner/synthetic-repository",
+        item_number: 77,
+        workflow_title: "synthetic private workflow title",
+      },
+    ],
+    exact_review_queue: {
+      bay_projection: {
+        stages: { ...closedStages, arriving: 3 },
+        activity: {
+          complete: true,
+          queue_stages: { ...closedStages, arriving: 2 },
+          live_stages: { ...closedStages, reviewing: 1 },
+          total: 3,
+        },
+      },
+    },
+  };
+  const renderedAggregateRows = aggregateRows.expandActive(aggregateData);
+  assert.deepEqual(
+    renderedAggregateRows.reduce((counts, row) => {
+      counts[row.stage] = (counts[row.stage] || 0) + 1;
+      return counts;
+    }, {}),
+    { reviewing: 1, arriving: 2 },
+  );
+  assert.equal(JSON.stringify(renderedAggregateRows).includes("synthetic private"), false);
+  const incompleteRows = aggregateRows.expandActive({
+    ...aggregateData,
+    bay: { active_stages: { ...closedStages, reviewing: 1 } },
+    exact_review_queue: {
+      bay_projection: {
+        stages: { ...closedStages, arriving: 3 },
+        activity: { complete: false, queue_stages: null, live_stages: null, total: null },
+      },
+    },
   });
-  const publicationSteps = [{ name: "Apply review artifacts" }];
-  assert.equal(
-    classifyBayStage({
-      status: "in_progress",
-      current_step: "Validate exact review artifact bundle",
-      steps: publicationSteps,
-    }),
-    "publishing",
-  );
-  assert.equal(
-    classifyBayStage({
-      status: "queued",
-      current_step: "Waiting for runner",
-      steps: publicationSteps,
-    }),
-    "publishing",
-  );
-  assert.equal(
-    classifyBayStage({
-      name: "Publish review artifacts",
-      status: "queued",
-      current_step: "Waiting for runner",
-      steps: [],
-    }),
-    "publishing",
-  );
-  assert.equal(
-    classifyBayStage({
-      status: "in_progress",
-      current_step: "Publish review artifact action ledger",
-      steps: publicationSteps,
-    }),
-    "publishing",
-  );
-  assert.equal(
-    classifyBayStage({
-      status: "in_progress",
-      current_step: "Sync selected review comments",
-      steps: publicationSteps,
-    }),
-    "applying",
-  );
+  assert.equal(incompleteRows.filter((row) => !row.queue_item).length, 0);
+  assert.equal(incompleteRows.filter((row) => row.queue_item).length, 0);
   const classifyTransition = new Script(
     `${runChangedSource};(${transitionKindSource})`,
   ).runInNewContext({
@@ -3014,17 +3802,17 @@ test("OpenClaw Bay is a public, indexable, hardened canonical route", async () =
     ),
     "forward",
   );
-  assert.match(body, /hasBaySchema\(live\.bay\)\?live\.bay:previewBay/);
-  assert.match(body, /state\.previewSource=false/);
-  assert.match(body, /record\.outcome==="failure"\?"failed"/);
+  assert.match(body, /return publicBayStatus\(await response\.json\(\)\)/);
+  assert.doesNotMatch(body, /function previewBay|function hasBaySchema|previewSource=true/);
+  assert.match(body, /outcome==="failure"\?"failed"/);
   assert.match(body, /master\.classList\.add\("resting"\)/);
   assert.match(body, /fetch\("\/api\/status"/);
-  assert.match(body, /exact_review_queue=live\.exact_review_queue/);
+  assert.doesNotMatch(body, /exact_review_queue=live\.exact_review_queue|recent=live\.recent/);
   assert.match(body, /setInterval\(load,20000\)/);
   assert.doesNotMatch(body, /api\.github\.com|fetch\("\/repos\//);
   assert.match(body, /Disappearing workers remain CHECKING/);
-  assert.match(body, /renderRepos\(state\.filter\)/);
-  assert.match(body, /replacement\.focus\(\{preventScroll:true\}\)/);
+  assert.match(body, /renderRepos\(\)/);
+  assert.doesNotMatch(body, /replacement\.focus|history\.replaceState/);
   const script = [...body.matchAll(/<script>\n([\s\S]*?)\n<\/script>/g)].at(-1)?.[1];
   assert.ok(script);
   assert.doesNotThrow(() => new Script(script));
@@ -3033,15 +3821,12 @@ test("OpenClaw Bay is a public, indexable, hardened canonical route", async () =
   assert.ok(confirmingStart > 0 && confirmingEnd > confirmingStart);
   const confirmingSource = script.slice(confirmingStart, confirmingEnd);
   const activeVisual = {
-    id: "active:1:97722",
-    key: "openclaw/openclaw#97722",
-    number: 97722,
-    repository: "openclaw/openclaw",
+    id: "active:reviewing:0",
+    key: "active:reviewing:0",
     stage: "reviewing",
-    status: "in_progress",
+    status: "active",
     outcome: null,
-    run_id: 1,
-    current_step: "Review exact event item",
+    queue_item: false,
   };
   const confirmingContext = createContext({
     state: { items: [activeVisual], confirmingOutcomes: {} },
@@ -3057,7 +3842,7 @@ test("OpenClaw Bay is a public, indexable, hardened canonical route", async () =
   assert.equal(confirmingContext.result.length, 1);
   assert.equal(confirmingContext.result[0].confirming, true);
   assert.equal(confirmingContext.result[0].stage, "reviewing");
-  assert.equal(confirmingContext.result[0].current_step, "Confirming terminal outcome");
+  assert.equal(Object.hasOwn(confirmingContext.result[0], "current_step"), false);
 
   confirmingContext.state.items = confirmingContext.result;
   confirmingContext.nextItems = [
@@ -3075,14 +3860,13 @@ test("OpenClaw Bay is a public, indexable, hardened canonical route", async () =
   assert.equal(Object.keys(confirmingContext.state.confirmingOutcomes).length, 0);
 
   const legacy = await worker.fetch(
-    new Request("https://clawsweeper.openclaw.ai/bay-demo?repo=openclaw%2Fopenclaw&q=review"),
+    new Request(
+      "https://clawsweeper.openclaw.ai/bay-demo?source=synthetic-marker#private-fragment",
+    ),
     {},
   );
   assert.equal(legacy.status, 308);
-  assert.equal(
-    legacy.headers.get("location"),
-    "https://clawsweeper.openclaw.ai/bay?repo=openclaw%2Fopenclaw&q=review",
-  );
+  assert.equal(legacy.headers.get("location"), "https://clawsweeper.openclaw.ai/bay");
 
   for (const path of ["/bay.html", "/bay-demo.html", "/not-a-dashboard-route"]) {
     const missing = await worker.fetch(new Request(`https://clawsweeper.openclaw.ai${path}`), {});
@@ -3094,6 +3878,183 @@ test("OpenClaw Bay is a public, indexable, hardened canonical route", async () =
     const pageBody = await page.text();
     assert.match(pageBody, /href="\/bay">OpenClaw Bay/);
     if (path === "/") assert.match(pageBody, /setInterval\(load, 15000\)/);
+  }
+});
+
+test("OpenClaw Bay reprojects status into a closed aggregate client model", async () => {
+  const marker = "synthetic-private-marker";
+  const response = await worker.fetch(
+    new Request(
+      `https://clawsweeper.openclaw.ai/bay?source=${encodeURIComponent(marker)}#${marker}`,
+    ),
+    {},
+  );
+  const body = await response.text();
+  assert.doesNotMatch(
+    body,
+    /history\.replaceState|URLSearchParams|location\.search|item_url|run_url|workflow_title|failure_key/,
+  );
+  assert.doesNotMatch(body, new RegExp(marker, "i"));
+
+  const projectionStart = body.indexOf("var MAX_BAY_COUNT");
+  const projectionEnd = body.indexOf("function hash", projectionStart);
+  assert.ok(projectionStart > 0 && projectionEnd > projectionStart);
+  const projectionSource = body.slice(projectionStart, projectionEnd);
+  const runtime = new Script(
+    `${projectionSource};({publicBayStatus,unavailableBayStatus})`,
+  ).runInNewContext({
+    Array,
+    Date,
+    Math,
+    Number,
+    Object,
+    String,
+    STAGES: ["arriving", "setting-up", "reviewing", "publishing", "applying", "repairing"],
+  });
+  const emptyStages = {
+    arriving: 0,
+    "setting-up": 0,
+    reviewing: 0,
+    publishing: 0,
+    applying: 0,
+    repairing: 0,
+  };
+  const valid = {
+    public_projection_complete: true,
+    workers: [{ title: marker, run_url: `https://example.invalid/run?token=${marker}` }],
+    recent: { events: [{ query: marker, nested: { repository: marker } }] },
+    exact_review_queue: {
+      collection: { state: "complete" },
+      bay_projection: {
+        complete: true,
+        sample_limit: 24,
+        total: 2,
+        stages: { ...emptyStages, arriving: 2 },
+        activity: {
+          complete: true,
+          queue_stages: { ...emptyStages, arriving: 2 },
+          live_stages: { ...emptyStages, reviewing: 1 },
+          total: 3,
+          nested: { key: marker },
+        },
+      },
+      lanes: {
+        review: {
+          pending: 2,
+          capacity: 24,
+          active: 1,
+          ready: 1,
+          backoff: 0,
+          dispatching: 1,
+          leased: 1,
+          enqueued_total: 10,
+          completed_total: 8,
+          title: marker,
+        },
+        publication: {
+          pending: 0,
+          capacity: 24,
+          active: 0,
+          ready: 0,
+          backoff: 0,
+          dispatching: 0,
+          leased: 0,
+          enqueued_total: 5,
+          completed_total: 5,
+          failure_key: marker,
+        },
+      },
+      handoff_health: {
+        status: "healthy",
+        reason: "handoff_current",
+        message: marker,
+        phases: {
+          pending: { count: 2, oldest_age_seconds: 5, item: marker },
+          dispatching: { count: 1, oldest_age_seconds: 3 },
+          leased: { count: 1, oldest_age_seconds: null },
+        },
+        recovery_reasons: {
+          claim_timeout: 0,
+          execution_timeout: 0,
+          workflow_cancelled: 0,
+          workflow_failed: 0,
+        },
+      },
+    },
+    bay: {
+      tide_generation: 4,
+      tide_threshold: 20,
+      terminal_count: 3,
+      terminal_buffer: [
+        { outcome: "success", title: marker },
+        { outcome: "failure", url: `https://example.invalid/item?query=${marker}` },
+        { outcome: "cancelled", nested: { token: marker } },
+      ],
+      recently_washed: [],
+      timings: {
+        window_minutes: 60,
+        overall: { samples: 2, average_ms: 1200, median_ms: 1000, detail: marker },
+      },
+      last_tide_at: null,
+      washed_at: null,
+    },
+    health: { sampled_runs: 2, failures: [{ title: marker }] },
+    diagnostics: { error_count: 0, errors: [marker] },
+  };
+  const projected = runtime.publicBayStatus(valid);
+  assert.equal(projected.privacy.state, "complete");
+  assert.equal(projected.exact_review_queue.bay_projection.activity.total, 3);
+  assert.deepEqual(JSON.parse(JSON.stringify(projected.bay.terminal_buffer)), [
+    { outcome: "success" },
+    { outcome: "failure" },
+    { outcome: "cancelled" },
+  ]);
+  const serialized = JSON.stringify(projected);
+  assert.doesNotMatch(serialized, new RegExp(marker, "i"));
+  assert.doesNotMatch(
+    serialized,
+    /example\.invalid|"workers"|"recent"|"message"|"title"|"url"|"query"|"token"/,
+  );
+
+  for (const malformed of [
+    null,
+    [],
+    { ...valid, public_projection_complete: false },
+    {
+      ...valid,
+      exact_review_queue: {
+        ...valid.exact_review_queue,
+        bay_projection: {
+          ...valid.exact_review_queue.bay_projection,
+          activity: {
+            ...valid.exact_review_queue.bay_projection.activity,
+            live_stages: { ...emptyStages, reviewing: { nested: marker } },
+          },
+        },
+      },
+    },
+    {
+      ...valid,
+      bay: {
+        ...valid.bay,
+        terminal_count: 1,
+        terminal_buffer: [{ outcome: { nested: marker } }],
+      },
+    },
+    { ...valid, bay: { ...valid.bay, last_tide_at: "1171" } },
+    {
+      ...valid,
+      bay: {
+        ...valid.bay,
+        washed_at: `https://example.invalid/${marker}?timestamp=1`,
+      },
+    },
+  ]) {
+    const rejected = runtime.publicBayStatus(malformed);
+    assert.equal(rejected.privacy.state, "unknown");
+    assert.equal(rejected.exact_review_queue.bay_projection.complete, false);
+    assert.equal(rejected.bay.terminal_count, 0);
+    assert.doesNotMatch(JSON.stringify(rejected), new RegExp(marker, "i"));
   }
 });
 

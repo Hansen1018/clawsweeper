@@ -524,8 +524,16 @@ export function exactReviewPublicationRevision(decision: ExactReviewDecision): {
   targetKey: string;
   sourceRevision: number;
 } | null {
+  if (!decision || typeof decision !== "object" || Array.isArray(decision)) return null;
   const publication = decision.publication;
-  if (!publication || publication.protocolVersion !== 2 || publication.leaseRevision === null) {
+  if (
+    !publication ||
+    typeof publication !== "object" ||
+    Array.isArray(publication) ||
+    publication.protocolVersion !== 2 ||
+    publication.leaseRevision === null ||
+    typeof publication.itemKey !== "string"
+  ) {
     return null;
   }
   return {
@@ -870,7 +878,13 @@ export function isLowPriorityExactReviewDecision(decision: ExactReviewDecision) 
 }
 
 export function exactReviewQueueIsPublication(item: Pick<ExactReviewQueueItem, "decision">) {
-  return item.decision.sourceAction === EXACT_REVIEW_ARTIFACT_PUBLISH_SOURCE_ACTION;
+  const decision = item?.decision;
+  return (
+    Boolean(decision) &&
+    typeof decision === "object" &&
+    !Array.isArray(decision) &&
+    decision.sourceAction === EXACT_REVIEW_ARTIFACT_PUBLISH_SOURCE_ACTION
+  );
 }
 
 export function exactReviewQueueIsBatchablePublication(

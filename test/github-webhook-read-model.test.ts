@@ -232,6 +232,33 @@ test("signed webhook loopback covers lifecycle, comments, reviews, checks, runs,
     repository: "openclaw/openclaw",
   });
   assert.equal(partialWorkflows.usable, false, "webhook rows alone are not a complete census");
+  for (const invalidCoverage of [
+    {},
+    { repair_kind: "items", workflow_job_census_version: 2 },
+    { workflow_job_census_version: "2" },
+    { workflow_job_census_version: 2, complete_workflow_job_runs: ["901"] },
+    { workflow_job_census_version: 2, workflow_job_census_started_at: null },
+    { workflow_job_census_version: 2, workflow_job_census_started_at: "1171" },
+    { workflow_job_census_version: 2, complete_workflow_job_runs: [901, 901] },
+  ]) {
+    await queue.fetch(
+      new Request("https://queue/github-read-model/repair", {
+        method: "POST",
+        body: JSON.stringify({
+          repository: "openclaw/openclaw",
+          repair_kind: "workflows",
+          complete_workflow_job_runs: [901],
+          workflow_job_census_started_at: now,
+          objects: [],
+          ...invalidCoverage,
+        }),
+      }),
+    );
+  }
+  const legacyCoverage = await signedRead(env, "workflows", {
+    repository: "openclaw/openclaw",
+  });
+  assert.deepEqual(legacyCoverage.job_coverage_run_ids, []);
   await queue.fetch(
     new Request("https://queue/github-read-model/repair", {
       method: "POST",
@@ -242,6 +269,7 @@ test("signed webhook loopback covers lifecycle, comments, reviews, checks, runs,
         workflow_run_census_started_at: now,
         complete_workflow_job_runs: [901],
         workflow_job_census_started_at: now,
+        workflow_job_census_version: 2,
         objects: [
           workflowObject("workflow_run", 901, 901, now, {
             id: 901,
@@ -325,6 +353,7 @@ test("dashboard workflow snapshot preserves health decisions while removing run 
       workflow_run_census_started_at: now,
       complete_workflow_job_runs: [9901],
       workflow_job_census_started_at: now,
+      workflow_job_census_version: 2,
       objects: [
         workflowObject("workflow_run", 9901, 9901, now, run),
         workflowObject("workflow_job", 9902, 9901, now, job),
