@@ -254,8 +254,17 @@ function dashboardHealthHistoryFixture(range = "6h") {
         at: new Date(at).toISOString(),
         exact_review: {
           collection_ok: true,
-          review: { pending: 4, enqueued_total: 20, completed_total: 16, shed_total: 1 },
-          publication: { pending: 2, enqueued_total: 18, completed_total: 16 },
+          review: {
+            pending: 4,
+            enqueued_total: 10_000_020,
+            completed_total: 10_000_016,
+            shed_total: 1,
+          },
+          publication: {
+            pending: 2,
+            enqueued_total: 10_000_018,
+            completed_total: 10_000_016,
+          },
           handoff: { status: "healthy", pending: 4, dispatching: 1, leased: 2 },
         },
         state_writer: {
@@ -602,6 +611,8 @@ test("dashboard HTML preserves UTF-8 emoji labels", async () => {
   assert.equal(response.headers.get("content-type"), "text/html; charset=utf-8");
   const html = await response.text();
   assert.match(html, /<title>🦞 ClawSweeper Live<\/title>/);
+  assert.match(html, /if \(!Number\.isFinite\(timestamp\)\) return "";/);
+  assert.match(html, /Individual close details are unavailable; aggregate counts remain above\./);
   assert.match(html, /content: "🦞"/);
   assert.match(html, /Codex Workers/);
   assert.doesNotMatch(html, /Active Sweeps/);
@@ -1385,7 +1396,20 @@ test("dashboard hero treats apply and exact-review handoff health as attention",
   assert.equal(elementFor("hero-dot").className, "hero-dot amber");
   assert.match(elementFor("hero-headline").textContent, /^Needs attention/);
   assert.match(elementFor("apply-health").innerHTML, /Pruning sweep blocked/);
+  status.recent.closed_items = {};
+  assert.doesNotThrow(() => context.renderDashboard(status, ""));
+  assert.match(
+    elementFor("closed").innerHTML,
+    /Individual close details are unavailable; aggregate counts remain above\./,
+  );
+  status.recent.closed_items = [];
   assert.match(elementFor("exact-review-handoff").innerHTML, /Dispatching/);
+  assert.match(elementFor("exact-review-handoff").innerHTML, /Pending<\/span><strong>4<\/strong>/);
+  assert.match(
+    elementFor("exact-review-handoff").innerHTML,
+    /Dispatching<\/span><strong>2<\/strong>/,
+  );
+  assert.match(elementFor("exact-review-handoff").innerHTML, /Leased<\/span><strong>24<\/strong>/);
   assert.match(elementFor("exact-review-handoff").innerHTML, /2 of 28 exact-review slots open/);
   assert.match(elementFor("exact-review-handoff").innerHTML, /health-badge healthy/);
   assert.match(elementFor("exact-review-handoff").innerHTML, /pressure congested/);
@@ -1741,14 +1765,14 @@ test("dashboard hero treats apply and exact-review handoff health as attention",
       collection_ok: true,
       review: {
         pending: 100 + index,
-        enqueued_total: index * 8,
-        completed_total: index * 5,
+        enqueued_total: 10_000_000 + index * 8,
+        completed_total: 10_000_000 + index * 5,
         shed_total: 0,
       },
       publication: {
         pending: 200 - index,
-        enqueued_total: index * 4,
-        completed_total: index * 10,
+        enqueued_total: 10_000_000 + index * 4,
+        completed_total: 10_000_000 + index * 10,
       },
     },
   }));
@@ -4410,16 +4434,7 @@ test("dashboard exposes ClawSweeper-owned recent closes and 24h stats", async ()
       },
     );
     const status = await response.json();
-    assert.equal(status.recent.closed_items.length, 3);
-    assert.ok(
-      status.recent.closed_items.every(
-        (item: { type?: string; number?: number; closed_by?: string; title?: string }) =>
-          item.type === undefined &&
-          item.number === undefined &&
-          item.closed_by === undefined &&
-          item.title === undefined,
-      ),
-    );
+    assert.deepEqual(status.recent.closed_items, []);
     assert.equal(status.recent.events.length, 4);
     assert.ok(
       status.recent.events.every(
