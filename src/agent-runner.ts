@@ -10,6 +10,8 @@ import {
 } from "./codex-process.js";
 import { runOpenclawProcess } from "./openclaw-process.js";
 
+const MAX_CHECKOUT_INDEX_BYTES = 8 * 1024 * 1024;
+
 export type AgentRunner = "codex" | "openclaw";
 
 export interface RunAgentProcessOptions {
@@ -87,8 +89,22 @@ export function runAgentCheckoutInspection(options: {
     cwd: options.cwd,
     encoding: "utf8",
     env,
+    // Large target repositories can exceed Node's 1 MiB subprocess default.
+    // Keep discovery bounded so attestation still fails closed on an unreasonable index.
+    maxBuffer: MAX_CHECKOUT_INDEX_BYTES,
     timeout: options.timeoutMs,
   });
+  const listingError = trackedFiles.error as NodeJS.ErrnoException | undefined;
+  if (listingError?.code === "ENOBUFS") {
+    return failedCheckoutInspection(
+      Object.assign(
+        new Error("Checkout inspection tracked-file index exceeded the 8 MiB limit.", {
+          cause: listingError,
+        }),
+        { code: listingError.code },
+      ),
+    );
+  }
   if (trackedFiles.error || trackedFiles.status !== 0) return spawnResult(trackedFiles);
   const candidates = (trackedFiles.stdout ?? "").split("\0").flatMap((entry) => {
     const separator = entry.indexOf("\t");
