@@ -1283,6 +1283,31 @@ test("dashboard hero treats apply and exact-review handoff health as attention",
               title: "SYNTHETIC_OVERVIEW_PRIVATE_TITLE",
               url: "https://invalid.example/SYNTHETIC_OVERVIEW_PRIVATE_URL?token=1",
               failure_key: "SYNTHETIC_OVERVIEW_PRIVATE_FAILURE",
+              action: {
+                repository: "openclaw/clawsweeper",
+                run_id: 7001,
+                job_id: 8001,
+                status: "in_progress",
+                started_at: "2026-07-05T11:20:00.000Z",
+                steps_complete: true,
+                steps: [
+                  {
+                    sequence: 1,
+                    kind: "setup",
+                    status: "completed",
+                    conclusion: "success",
+                    name: "SYNTHETIC_OVERVIEW_PRIVATE_STEP",
+                  },
+                  {
+                    sequence: 2,
+                    kind: "review",
+                    status: "in_progress",
+                    conclusion: null,
+                    name: "SYNTHETIC_OVERVIEW_PRIVATE_CURRENT_STEP",
+                  },
+                ],
+                run_url: "https://invalid.example/SYNTHETIC_OVERVIEW_PRIVATE_ACTION?token=1",
+              },
             },
             {
               repository: "openclaw/clawhub",
@@ -1469,6 +1494,18 @@ test("dashboard hero treats apply and exact-review handoff health as attention",
       title: "SYNTHETIC_OVERVIEW_PRIVATE_BLADE",
       item_url: "https://invalid.example/private?token=SYNTHETIC_OVERVIEW_PRIVATE_BLADE",
       failure_key: "SYNTHETIC_OVERVIEW_PRIVATE_BLADE",
+      action: {
+        repository: "openclaw/clawsweeper",
+        run_id: 7001,
+        job_id: 8001,
+        status: "in_progress",
+        started_at: "2026-07-05T11:20:00.000Z",
+        steps_complete: true,
+        steps: [
+          { sequence: 1, kind: "setup", status: "completed", conclusion: "success" },
+          { sequence: 2, kind: "review", status: "in_progress", conclusion: null },
+        ],
+      },
     },
     "openclaw/openclaw#123",
   );
@@ -1479,6 +1516,18 @@ test("dashboard hero treats apply and exact-review handoff health as attention",
   assert.match(publicReferenceBlade, /Bounded queue sample/);
   assert.match(publicReferenceBlade, /https:\/\/github\.com\/openclaw\/openclaw\/issues\/123/);
   assert.match(publicReferenceBlade, /https:\/\/github\.com\/openclaw\/openclaw/);
+  assert.match(
+    publicReferenceBlade,
+    /https:\/\/github\.com\/openclaw\/clawsweeper\/actions\/runs\/7001\/job\/8001/,
+  );
+  assert.match(
+    publicReferenceBlade,
+    /https:\/\/github\.com\/openclaw\/clawsweeper\/actions\/runs\/7001/,
+  );
+  assert.match(publicReferenceBlade, /Set up job/);
+  assert.match(publicReferenceBlade, /Run review/);
+  assert.match(publicReferenceBlade, /class="step-row in_progress"/);
+  assert.match(publicReferenceBlade, /2 steps/);
   assert.doesNotMatch(
     publicReferenceBlade,
     /SYNTHETIC_OVERVIEW_PRIVATE_BLADE|invalid\.example|token=/i,
@@ -1495,6 +1544,18 @@ test("dashboard hero treats apply and exact-review handoff health as attention",
         item_number: 123,
         stage: "reviewing",
         source: "queue",
+        action: {
+          repository: "openclaw/clawsweeper",
+          run_id: 7001,
+          job_id: 8001,
+          status: "in_progress",
+          started_at: "2026-07-05T11:20:00.000Z",
+          steps_complete: true,
+          steps: [
+            { sequence: 1, kind: "setup", status: "completed", conclusion: "success" },
+            { sequence: 2, kind: "review", status: "in_progress", conclusion: null },
+          ],
+        },
       },
       {
         repository: "openclaw/clawhub",
@@ -2478,6 +2539,7 @@ test("dashboard exposes active worker jobs and their current steps", async () =>
       {
         CLAWSWEEPER_REPO: "openclaw/clawsweeper",
         TARGET_REPOS: "openclaw/openclaw",
+        PUBLIC_BAY_REPOS: "openclaw/openclaw,openclaw/clawsweeper",
         CACHE_TTL_SECONDS: "0",
         GITHUB_TOKEN: "test-token",
         EXACT_REVIEW_QUEUE: exactReviewQueueNamespace,
@@ -2493,16 +2555,16 @@ test("dashboard exposes active worker jobs and their current steps", async () =>
       "failure_key",
       "run_url",
       "job_url",
-      "repository",
-      "item_number",
       "item_numbers",
       "target_items",
       "name",
-      "id",
     ]) {
       assert.equal(serializedStatus.includes(`"${privateField}"`), false);
     }
     assert.equal(status.workers[0].status, "in_progress");
+    assert.equal("repository" in status.workers[0], false);
+    assert.equal("item_number" in status.workers[0], false);
+    assert.equal("id" in status.workers[0], false);
     assert.deepEqual(status.workers[0].progress, { completed: 2, total: 3 });
     assert.equal(status.fleet.active_codex_jobs, 2);
     assert.equal(status.fleet.worker_detail_runs, 3);
@@ -2517,7 +2579,9 @@ test("dashboard exposes active worker jobs and their current steps", async () =>
     assert.equal(status.workers[0].steps[2].status, "in_progress");
     assert.equal(status.workers[1].is_codex_worker, false);
     assert.equal(status.workers[3].source, "workflow-fallback");
-    assert.deepEqual(status.exact_review_queue.bay_projection.activity, {
+    const activity = status.exact_review_queue.bay_projection.activity;
+    const { items: publicItems, ...activityCounts } = activity;
+    assert.deepEqual(activityCounts, {
       complete: true,
       queue_stages: {
         arriving: 0,
@@ -2537,13 +2601,78 @@ test("dashboard exposes active worker jobs and their current steps", async () =>
       },
       total: 3,
     });
+    assert.deepEqual(
+      publicItems.map((item) => ({
+        repository: item.repository,
+        item_number: item.item_number,
+        stage: item.stage,
+        source: item.source,
+        action_repository: item.action?.repository,
+        run_id: item.action?.run_id,
+        job_id: item.action?.job_id,
+        status: item.action?.status,
+        step_kinds: item.action?.steps.map((step) => step.kind),
+        step_statuses: item.action?.steps.map((step) => step.status),
+      })),
+      [
+        {
+          repository: "openclaw/openclaw",
+          item_number: 92521,
+          stage: "applying",
+          source: "live",
+          action_repository: "openclaw/clawsweeper",
+          run_id: 42,
+          job_id: 4203,
+          status: "in_progress",
+          step_kinds: ["lease", "finalize"],
+          step_statuses: ["completed", "in_progress"],
+        },
+        {
+          repository: "openclaw/openclaw",
+          item_number: 92522,
+          stage: "reviewing",
+          source: "live",
+          action_repository: "openclaw/clawsweeper",
+          run_id: 42,
+          job_id: 4201,
+          status: "in_progress",
+          step_kinds: ["setup", "review", "review"],
+          step_statuses: ["completed", "completed", "in_progress"],
+        },
+        {
+          repository: "openclaw/openclaw",
+          item_number: 92523,
+          stage: "arriving",
+          source: "live",
+          action_repository: "openclaw/clawsweeper",
+          run_id: 43,
+          job_id: undefined,
+          status: "queued",
+          step_kinds: [],
+          step_statuses: [],
+        },
+      ],
+    );
+    assert.equal(
+      publicItems.every((item) => typeof item.action?.started_at === "string"),
+      true,
+    );
+    assert.equal(serializedStatus.includes("Review shard"), false);
+    assert.equal(serializedStatus.includes("setup-codex"), false);
     assert.equal("active_overlaps" in status.exact_review_queue.bay_projection, false);
-    assert.equal("items" in status.exact_review_queue.bay_projection, false);
+    assert.equal(Array.isArray(status.exact_review_queue.bay_projection.items), true);
+    assert.equal(
+      JSON.stringify(status.exact_review_queue.bay_projection.items).includes(
+        "aggregate-bay-overlap",
+      ),
+      false,
+    );
     const privacyCachedResponse = await worker.fetch(
       new Request("https://clawsweeper.openclaw.ai/api/status"),
       {
         CLAWSWEEPER_REPO: "openclaw/clawsweeper",
         TARGET_REPOS: "openclaw/openclaw",
+        PUBLIC_BAY_REPOS: "openclaw/openclaw,openclaw/clawsweeper",
         CACHE_TTL_SECONDS: "0",
         GITHUB_TOKEN: "test-token",
         EXACT_REVIEW_QUEUE: exactReviewQueueNamespace,
@@ -2917,24 +3046,34 @@ test("dashboard reports worker error and recovery rates from completed job steps
             }`,
             started_at: jobStartedAt,
             completed_at: run?.updated_at,
-            steps: [
-              {
-                number: 1,
-                name: "Run ./clawsweeper/.github/actions/setup-codex",
-                status: "completed",
-                conclusion: "success",
-                started_at: jobStartedAt,
-                completed_at: reviewStartedAt,
-              },
-              {
-                number: 2,
-                name: "Review shard",
-                status: "completed",
-                conclusion: failed ? "failure" : "success",
-                started_at: reviewStartedAt,
-                completed_at: run?.updated_at,
-              },
-            ],
+            steps:
+              runId === 4
+                ? Array.from({ length: 101 }, (_, index) => ({
+                    number: index + 1,
+                    name: `Review shard ${index + 1}`,
+                    status: "completed",
+                    conclusion: "success",
+                    started_at: jobStartedAt,
+                    completed_at: run?.updated_at,
+                  }))
+                : [
+                    {
+                      number: 1,
+                      name: "Run ./clawsweeper/.github/actions/setup-codex",
+                      status: "completed",
+                      conclusion: "success",
+                      started_at: jobStartedAt,
+                      completed_at: reviewStartedAt,
+                    },
+                    {
+                      number: 2,
+                      name: "Review shard",
+                      status: "completed",
+                      conclusion: failed ? "failure" : "success",
+                      started_at: reviewStartedAt,
+                      completed_at: run?.updated_at,
+                    },
+                  ],
           },
         ],
       });
@@ -2954,6 +3093,7 @@ test("dashboard reports worker error and recovery rates from completed job steps
     const env = {
       CLAWSWEEPER_REPO: "openclaw/clawsweeper",
       TARGET_REPOS: "openclaw/openclaw",
+      PUBLIC_BAY_REPOS: "openclaw/openclaw,openclaw/clawsweeper",
       CACHE_TTL_SECONDS: "0",
       STATUS_STORE: new MemoryKv(),
     };
@@ -2980,11 +3120,82 @@ test("dashboard reports worker error and recovery rates from completed job steps
       samples: 0,
     });
     assert.equal(status.bay.terminal_buffer.length, 3);
+    const overLimitTimeline = status.bay.terminal_buffer.find((item) => item.item_number === 300);
+    assert.ok(overLimitTimeline);
+    assert.equal(overLimitTimeline.action.run_id, 4);
+    assert.equal(overLimitTimeline.action.job_id, 40);
+    assert.equal(overLimitTimeline.action.steps_complete, false);
+    assert.deepEqual(overLimitTimeline.action.steps, []);
     assert.equal(status.health.recent_attempts, undefined);
     assert.equal(status.health.failures.length, 2);
     assert.equal(status.health.failures[0].recovered, false);
     assert.equal(status.health.failures[1].recovered, true);
     assert.equal(jobRequests, 4);
+  } finally {
+    globalThis.fetch = originalFetch;
+    Object.defineProperty(globalThis, "caches", { configurable: true, value: originalCaches });
+  }
+});
+
+test("dashboard cold-cache status bounds a stalled forty-run worker-health refresh", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalCaches = globalThis.caches;
+  Object.defineProperty(globalThis, "caches", {
+    configurable: true,
+    value: { default: new MemoryCache() },
+  });
+  const runs = Array.from({ length: 40 }, (_, index) =>
+    completedReviewRun(index + 1, 50_000 + index, "success", (index + 1) * 1_000),
+  );
+  let stalledJobRequests = 0;
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/repos/openclaw/clawsweeper/actions/runs") {
+      return jsonResponse({
+        workflow_runs:
+          url.searchParams.get("status") === "completed"
+            ? runs
+            : url.searchParams.has("status")
+              ? []
+              : runs,
+      });
+    }
+    if (/^\/repos\/openclaw\/clawsweeper\/actions\/runs\/\d+\/jobs$/.test(url.pathname)) {
+      stalledJobRequests += 1;
+      return new Promise<Response>(() => undefined);
+    }
+    if (
+      url.pathname ===
+      "/repos/openclaw/clawsweeper/actions/workflows/repair-cluster-intake.yml/runs"
+    ) {
+      return jsonResponse({ workflow_runs: [] });
+    }
+    if (url.pathname === "/search/issues") return jsonResponse({ items: [] });
+    if (url.pathname === "/repos/openclaw/openclaw/issues") return jsonResponse([]);
+    throw new Error(`unexpected fetch ${url}`);
+  };
+
+  try {
+    const startedAt = Date.now();
+    const response = await worker.fetch(
+      new Request("https://clawsweeper.openclaw.ai/api/status"),
+      {
+        CLAWSWEEPER_REPO: "openclaw/clawsweeper",
+        TARGET_REPOS: "openclaw/openclaw",
+        CACHE_TTL_SECONDS: "0",
+        WORKER_HEALTH_FETCH_CONCURRENCY: "40",
+        WORKER_HEALTH_SECTION_TIMEOUT_MS: "25",
+      },
+      { waitUntil: () => undefined },
+    );
+    const elapsedMs = Date.now() - startedAt;
+    const status = await response.json();
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("x-clawsweeper-cache"), "miss");
+    assert.equal(status.health.sampled_runs, 0);
+    assert.equal(status.bay.tide_threshold, 20);
+    assert.equal(stalledJobRequests, 20, "only one bounded concurrency wave may start");
+    assert.ok(elapsedMs < 1_000, `cold status exceeded its bounded test budget: ${elapsedMs}ms`);
   } finally {
     globalThis.fetch = originalFetch;
     Object.defineProperty(globalThis, "caches", { configurable: true, value: originalCaches });
