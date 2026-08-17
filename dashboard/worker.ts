@@ -6312,11 +6312,54 @@ async function attachExactReviewQueueStatus(snapshot, env) {
   ]);
   if (queueResult.status === "fulfilled") exactReviewQueue = queueResult.value;
   if (eventsResult.status === "fulfilled") recentDurablePublicationEvents = eventsResult.value;
-  const priorExactReviewQueue = objectValue(snapshot.exact_review_queue);
-  const priorProjection = objectValue(priorExactReviewQueue.bay_projection);
+  const staleStatusSnapshot =
+    queueResult.status === "rejected"
+      ? await readCachedSnapshot(
+          env,
+          numberFrom(env.STALE_CACHE_TTL_SECONDS, STALE_CACHE_TTL_SECONDS),
+        )
+      : null;
+  const priorExactReviewQueue = objectValue(
+    snapshot.exact_review_queue || staleStatusSnapshot?.exact_review_queue,
+  );
   const allowedRepositories = verifiedPublicBayRepositories(env);
+  const projectedPriorExactReviewQueue = publicExactReviewQueueProjection(
+    priorExactReviewQueue,
+    allowedRepositories,
+  );
+  const priorQueueGeneratedAt = Date.parse(
+    String(projectedPriorExactReviewQueue.generated_at || ""),
+  );
+  const priorQueueAgeMs = Date.now() - priorQueueGeneratedAt;
+  const priorQueueIsFresh =
+    Number.isFinite(priorQueueAgeMs) &&
+    priorQueueAgeMs >= 0 &&
+    priorQueueAgeMs <= numberFrom(env.STALE_CACHE_TTL_SECONDS, STALE_CACHE_TTL_SECONDS) * 1000;
+  const priorProjection = objectValue(priorExactReviewQueue.bay_projection);
   const priorActivity = publicBayActivity(priorProjection.activity, allowedRepositories);
-  if (!activeTargets.complete && priorActivity.complete) {
+  const retainedPriorExactReviewQueue =
+    queueResult.status === "rejected" &&
+    priorQueueIsFresh &&
+    projectedPriorExactReviewQueue.collection.state === "complete" &&
+    projectedPriorExactReviewQueue.bay_projection.complete === true;
+  if (retainedPriorExactReviewQueue) {
+    // The optional queue probe can fail while its direct endpoint and the review
+    // pipeline remain healthy. Retain the last internally consistent, public-only
+    // queue document rather than caching a null projection that empties the Bay.
+    // Live activity is generation-coupled to the failed probe, so never preserve
+    // a prior complete activity aggregate as current evidence.
+    exactReviewQueue = {
+      ...projectedPriorExactReviewQueue,
+      bay_projection: {
+        ...projectedPriorExactReviewQueue.bay_projection,
+        activity: publicBayActivity(null, allowedRepositories),
+      },
+    };
+  } else if (
+    queueResult.status === "fulfilled" &&
+    !activeTargets.complete &&
+    priorActivity.complete
+  ) {
     // A projected cache no longer has correlation keys. Keep its same-generation
     // queue/live aggregate intact instead of combining it with a newer queue census.
     exactReviewQueue = priorExactReviewQueue;
