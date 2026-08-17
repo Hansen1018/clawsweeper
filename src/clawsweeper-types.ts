@@ -579,6 +579,10 @@ export interface Decision {
   featureShowcase: FeatureShowcase;
   overallCorrectness: OverallCorrectness;
   overallConfidenceScore: number;
+  /** Runner-owned repository inspection result. Never populated from model output. */
+  localCheckoutAccess?: "verified" | "unverified";
+  /** Runner-owned failure classification for scheduled infrastructure retries. */
+  checkoutInspectionFailed?: boolean;
   codexTerminalFailure?: boolean;
   fixedRelease?: string | null;
   fixedSha?: string | null;

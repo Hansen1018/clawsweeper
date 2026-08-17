@@ -37,6 +37,27 @@ import {
   serializePrHydrationSnapshot,
 } from "./pr-hydration-snapshot.js";
 
+export function localCheckoutAccessForDecision(
+  decision: Pick<Decision, "localCheckoutAccess">,
+): "verified" | "unverified" {
+  return decision.localCheckoutAccess === "verified" ? "verified" : "unverified";
+}
+
+export function localCheckoutAccessSourceForDecision(
+  decision: Pick<Decision, "localCheckoutAccess">,
+): "runner_preflight_v1" | "unknown" {
+  return decision.localCheckoutAccess === undefined ? "unknown" : "runner_preflight_v1";
+}
+
+export function reviewStatusForDecision(
+  decision: Pick<Decision, "localCheckoutAccess" | "summary">,
+): "complete" | "failed" {
+  return localCheckoutAccessForDecision(decision) === "verified" &&
+    !decision.summary.startsWith("Codex review failed")
+    ? "complete"
+    : "failed";
+}
+
 export function createReportDocumentRendering(
   dependencies: CreateReportRenderingDependencies &
     ReturnType<typeof createReportContextRendering> &
@@ -623,9 +644,11 @@ review_additional_prompt_chars: ${reviewTelemetryNumber(options.runtime.addition
 review_context_elapsed_ms: ${reviewTelemetryNumber(options.runtime.contextElapsedMs)}
 review_codex_elapsed_ms: ${reviewTelemetryNumber(options.runtime.codexElapsedMs)}
 review_mode: ${options.reviewMode}
-review_status: ${options.decision.summary.startsWith("Codex review failed") ? "failed" : "complete"}
+review_status: ${reviewStatusForDecision(options.decision)}
 review_terminal_failure: ${options.decision.codexTerminalFailure === true}
-local_checkout_access: verified
+review_checkout_inspection_failed: ${options.decision.checkoutInspectionFailed === true}
+local_checkout_access: ${localCheckoutAccessForDecision(options.decision)}
+local_checkout_access_source: ${localCheckoutAccessSourceForDecision(options.decision)}
 item_snapshot_hash: ${options.snapshotHash}
 review_content_digest: ${options.contentDigest}
 last_full_review_at: ${reviewedAt}

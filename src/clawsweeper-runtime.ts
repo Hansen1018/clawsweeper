@@ -457,6 +457,7 @@ const recordMetadata = createRecordMetadata({
 });
 export const {
   applyDecisionPriority,
+  effectiveReviewStatus: effectiveReviewStatusForTest,
   exactEventReviewLeaseDispositionForTest,
   failedReviewRetryEligibilityForTest,
   isInfrastructureFailedReviewForTest,
@@ -577,7 +578,6 @@ const contextHydration = createContextHydration({
   reportUrl,
   reviewCommentBodyDigest,
   ROOT,
-  run,
   stringOrUndefined,
   targetRepo,
 });
