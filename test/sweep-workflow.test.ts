@@ -807,8 +807,13 @@ test("exact event review isolates live proof and trusted finalization", () => {
     /repair:publish-event-result/,
   );
   const complete = step(finalizer, "Complete exact-review queue lease").run ?? "";
-  assert.match(complete, /published \|\| applySucceeded/);
+  assert.match(complete, /published \|\| generationNoop/);
+  assert.match(complete, /APPLY_OUTCOME === "success" && !process\.env\.CORE_ARTIFACT_ID/);
   assert.match(complete, /internal\/exact-review\/complete/);
+  assert.match(
+    step(finalizer, "Fail exact review finalization that did not publish or requeue").if ?? "",
+    /core_artifact_id != '' && steps\.select-final-review\.outputs\.publish != 'true'/,
+  );
 });
 
 test("exact event publication derives lifecycle receipt and final command acknowledgement from the projection", () => {

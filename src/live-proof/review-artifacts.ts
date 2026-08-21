@@ -216,6 +216,11 @@ function executeReviewLiveProof(
     cleanupErrors.push({ operation: "remove_scratch", error });
   }
   if (cleanupErrors.length > 0) {
+    log(
+      `[live-proof] item=${item} cleanup=failed operations=${cleanupErrors
+        .map(({ operation }) => operation)
+        .join(",")}`,
+    );
     if (primaryError === undefined) {
       const cleanupRoot = join(resolve(options.outputRoot), ".cleanup-failures");
       mkdirSync(cleanupRoot, { recursive: true });
@@ -248,6 +253,7 @@ function executeReviewLiveProof(
         : "live proof and owned cleanup both failed",
     );
   }
+  log(`[live-proof] item=${item} cleanup=removed worktree,scratch`);
   if (primaryError !== undefined) throw primaryError;
 }
 

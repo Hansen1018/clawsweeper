@@ -2092,6 +2092,7 @@ jobs:
         env:
           APPLY_OUTCOME: ${{ needs.event-review-apply.outputs.generation_outcome }}
           CLAIM_GENERATION: ${{ needs.event-review-apply.outputs.claim_generation }}
+          CORE_ARTIFACT_ID: ${{ needs.event-review-apply.outputs.core_artifact_id }}
           ITEM_KEY: ${{ needs.event-review-apply.outputs.item_key }}
           PROTOCOL_VERSION: ${{ needs.event-review-apply.outputs.protocol_version }}
           QUEUE_LEASE_ID: ${{ needs.event-review-apply.outputs.lease_id }}
@@ -2117,8 +2118,9 @@ jobs:
             if (protocolVersion !== 1 && protocolVersion !== 2) process.exit(1);
             if (protocolVersion === 2 && (!process.env.ITEM_KEY || !Number.isInteger(leaseRevision) || leaseRevision < 1 || !Number.isInteger(claimGeneration) || claimGeneration < 1)) process.exit(1);
             const published = process.env.PUBLICATION_ACCEPTED === "true" && process.env.PUBLICATION_LIFECYCLE === "success";
-            const applySucceeded = process.env.APPLY_OUTCOME === "success";
-            const outcome = published || applySucceeded
+            const generationNoop =
+              process.env.APPLY_OUTCOME === "success" && !process.env.CORE_ARTIFACT_ID;
+            const outcome = published || generationNoop
               ? "success"
               : process.env.APPLY_OUTCOME === "cancelled"
                 ? "cancelled"
@@ -2218,7 +2220,7 @@ jobs:
             --run-url "$RUN_URL"
 
       - name: Fail exact review finalization that did not publish or requeue
-        if: ${{ always() && (steps.complete-final-exact-review.outcome != 'success' || (steps.select-final-review.outputs.publish == 'true' && steps.finalize-exact-review-lifecycle.outcome != 'success')) }}
+        if: ${{ always() && (steps.complete-final-exact-review.outcome != 'success' || (needs.event-review-apply.outputs.core_artifact_id != '' && steps.select-final-review.outputs.publish != 'true') || (steps.select-final-review.outputs.publish == 'true' && steps.finalize-exact-review-lifecycle.outcome != 'success')) }}
         run: |
           echo "::error::Exact review finalization did not reach a durable publication or queue completion."
           exit 1
