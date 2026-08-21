@@ -46,7 +46,7 @@ test("every state hydration uses the canonical Worker with an explicit git-state
     [
       ".github/workflows/exact-review-batch-publish.yml:publish",
       ".github/workflows/live-proof-maintenance.yml:retract",
-      ".github/workflows/sweep.yml:event-review-apply",
+      ".github/workflows/sweep.yml:event-review-finalize",
       ".github/workflows/sweep.yml:event-review-publish",
       ".github/workflows/sweep.yml:target-fanout",
     ],
@@ -78,7 +78,7 @@ test("per-target state hydration is slug-scoped while fleet lanes retain discove
       ".github/workflows/repair-issue-implementation-backfill.yml:backfill",
       ".github/workflows/repair-issue-implementation-intake.yml:intake",
       ".github/workflows/spam-scanner.yml:scan",
-      ".github/workflows/sweep.yml:event-review-apply",
+      ".github/workflows/sweep.yml:event-review-finalize",
       ".github/workflows/sweep.yml:event-review-publish",
       ".github/workflows/sweep.yml:plan",
       ".github/workflows/sweep.yml:publish",

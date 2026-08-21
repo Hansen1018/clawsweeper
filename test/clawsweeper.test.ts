@@ -2154,6 +2154,10 @@ test("sweep workflow executes only durable queue leases without runner-side admi
   );
   const eventReviewBlock = workflow.slice(
     workflow.indexOf("\n  event-review-apply:"),
+    workflow.indexOf("\n  event-review-live-proof:"),
+  );
+  const finalizerBlock = workflow.slice(
+    workflow.indexOf("\n  event-review-finalize:"),
     workflow.indexOf("\n  event-review-publish:"),
   );
   const claimIndex = eventReviewBlock.indexOf("- name: Claim exact-review queue lease");
@@ -2169,18 +2173,20 @@ test("sweep workflow executes only durable queue leases without runner-side admi
   const failReviewIndex = eventReviewBlock.indexOf(
     "- name: Fail unsuccessful exact review generation",
   );
-  const completeLeaseIndex = eventReviewBlock.indexOf("- name: Complete exact-review queue lease");
   const uploadBundleIndex = eventReviewBlock.indexOf("- name: Upload exact review artifact bundle");
+  const finalizerCompleteLeaseIndex = finalizerBlock.indexOf(
+    "- name: Complete exact-review queue lease",
+  );
   const claimStep = eventReviewBlock.slice(
     claimIndex,
     eventReviewBlock.indexOf("\n      - ", claimIndex + 1),
   );
-  const completeLeaseStep = eventReviewBlock.slice(
-    completeLeaseIndex,
-    eventReviewBlock.indexOf("\n      - ", completeLeaseIndex + 1),
-  );
-  const primaryResultStep = eventReviewBlock.slice(primaryResultIndex, completeLeaseIndex);
+  const primaryResultStep = eventReviewBlock.slice(primaryResultIndex, failReviewIndex);
   const failReviewStep = eventReviewBlock.slice(failReviewIndex);
+  const completeLeaseStep = finalizerBlock.slice(
+    finalizerCompleteLeaseIndex,
+    finalizerBlock.indexOf("\n      - ", finalizerCompleteLeaseIndex + 1),
+  );
   const exactReviewStep = eventReviewBlock.slice(
     exactReviewIndex,
     eventReviewBlock.indexOf("- name: Create exact review artifact bundle", exactReviewIndex),
@@ -2221,12 +2227,18 @@ test("sweep workflow executes only durable queue leases without runner-side admi
   );
   assert.ok(uploadBundleIndex > exactReviewIndex);
   assert.ok(primaryResultIndex > uploadBundleIndex);
-  assert.ok(completeLeaseIndex > primaryResultIndex);
-  assert.ok(failReviewIndex > completeLeaseIndex);
-  assert.match(eventReviewBlock, /\.github\/actions\/setup-state/);
-  assert.match(eventReviewBlock, /repair:exact-review-direct-publication/);
+  assert.ok(failReviewIndex > primaryResultIndex);
+  assert.doesNotMatch(eventReviewBlock, /\.github\/actions\/setup-state/);
+  assert.doesNotMatch(eventReviewBlock, /repair:exact-review-direct-publication/);
+  assert.match(finalizerBlock, /\.github\/actions\/setup-state/);
+  assert.match(finalizerBlock, /repair:exact-review-direct-publication/);
+  assert.match(finalizerBlock, /name: Complete exact-review queue lease/);
+  assert.match(
+    finalizerBlock,
+    /name: Fail exact review finalization that did not publish or requeue/,
+  );
   assert.match(eventReviewBlock, /\/internal\/exact-review\/claim/);
-  assert.match(eventReviewBlock, /\/internal\/exact-review\/complete/);
+  assert.match(finalizerBlock, /\/internal\/exact-review\/complete/);
   assert.match(claimStep, /RUN_ATTEMPT: \$\{\{ github\.run_attempt \}\}/);
   assert.match(
     claimStep,
@@ -2236,52 +2248,26 @@ test("sweep workflow executes only durable queue leases without runner-side admi
   assert.match(claimStep, /const legacyDecision = \{/);
   assert.match(claimStep, /run_attempt: runAttempt/);
   assert.match(failReviewStep, /exact-review-generation-result\.outputs\.outcome != 'success'/);
-  assert.match(failReviewStep, /complete-exact-review-queue\.outcome != 'success'/);
   assert.match(primaryResultStep, /REVIEW_OUTCOME:/);
-  assert.match(primaryResultStep, /PUBLICATION_QUEUE_OUTCOME:/);
   assert.match(primaryResultStep, /REVIEW_OUTCOME" = "cancelled"/);
-  assert.match(primaryResultStep, /echo "outcome=\$outcome" >> "\$GITHUB_OUTPUT"/);
-  assert.match(
-    completeLeaseStep,
-    /PRIMARY_OUTCOME: \$\{\{ steps\.exact-review-generation-result\.outputs\.outcome \|\| 'failure' \}\}/,
-  );
-  assert.doesNotMatch(completeLeaseStep, /JOB_STATUS:/);
-  assert.match(completeLeaseStep, /if: \$\{\{[^\n]*always\(\)[^\n]*\}\}/);
-  assert.match(completeLeaseStep, /steps\.claim-exact-review-queue\.outputs\.claimed == 'true'/);
+  assert.match(primaryResultStep, /echo "outcome=\$outcome"[\s\S]*\} >> "\$GITHUB_OUTPUT"/);
   assert.match(completeLeaseStep, /continue-on-error: true/);
   assert.match(completeLeaseStep, /RUN_ATTEMPT: \$\{\{ github\.run_attempt \}\}/);
   assert.match(
     completeLeaseStep,
-    /PROTOCOL_VERSION: \$\{\{ steps\.claim-exact-review-queue\.outputs\.protocol_version \}\}/,
+    /PROTOCOL_VERSION: \$\{\{ needs\.event-review-apply\.outputs\.protocol_version \}\}/,
   );
-  assert.match(completeLeaseStep, /const primaryOutcome = String\(process\.env\.PRIMARY_OUTCOME/);
-  assert.match(completeLeaseStep, /\["success", "cancelled", "failure"\]\.includes/);
+  assert.match(completeLeaseStep, /const published = process\.env\.PUBLICATION_ACCEPTED/);
+  assert.match(completeLeaseStep, /const generationNoop =/);
+  assert.match(completeLeaseStep, /const outcome = published \|\| generationNoop/);
   assert.match(completeLeaseStep, /claim_generation: claimGeneration/);
   assert.match(completeLeaseStep, /item_key: process\.env\.ITEM_KEY/);
   assert.match(completeLeaseStep, /lease_revision: leaseRevision/);
   assert.match(completeLeaseStep, /run_attempt: runAttempt/);
   assert.match(completeLeaseStep, /outcome,/);
-  // A completion callback is non-fatal only when the queue proves that this
-  // exact lease was superseded. Unknown conflicts and every other non-2xx
-  // status stay visible.
-  assert.doesNotMatch(completeLeaseStep, /curl --fail/);
-  assert.match(completeLeaseStep, /--write-out '%\{http_code\}'/);
-  assert.match(completeLeaseStep, /if \[\[ "\$status" == 2\* \]\]; then\s*\n\s*exit 0/);
-  // Completion accepts only its audited supersession response; claim-path
-  // conflicts and ambiguous ownership misses must keep failing the run.
-  assert.match(completeLeaseStep, /const safeConflicts = new Set\(\["lease_superseded"\]\);/);
-  assert.doesNotMatch(completeLeaseStep, /"lease_not_claimed"/);
-  assert.doesNotMatch(completeLeaseStep, /"lease_not_active"/);
-  assert.doesNotMatch(completeLeaseStep, /"lease_already_claimed"/);
-  assert.doesNotMatch(completeLeaseStep, /"stale_run_attempt"/);
-  assert.doesNotMatch(completeLeaseStep, /"lease_decision_unavailable"/);
-  assert.match(
-    completeLeaseStep,
-    /if \(!safeConflicts\.has\(response\.error\)\) process\.exit\(1\);/,
-  );
-  assert.match(completeLeaseStep, /Unexpected exact-review completion conflict/);
-  assert.match(completeLeaseStep, /Exact-review completion returned HTTP \$status/);
-  assert.match(completeLeaseStep, /if \[\[ "\$status" != 5\* \]\]; then\s*\n\s*exit 1/);
+  assert.match(completeLeaseStep, /curl --fail/);
+  assert.match(completeLeaseStep, /completion_kind:/);
+  assert.match(completeLeaseStep, /reason_code:/);
   assert.match(eventReviewBlock, /exact-review queue leased this run/);
   assert.doesNotMatch(eventReviewBlock, /repair:codex-capacity/);
   assert.doesNotMatch(eventReviewBlock, /capacity-requeue/);
@@ -2603,7 +2589,7 @@ test("sweep target write tokens retain merge and terminal acknowledgement scopes
     .slice(1)
     .map((block) => block.split("\n      - ")[0]);
 
-  assert.equal(targetWriteTokenBlocks.length, 5);
+  assert.equal(targetWriteTokenBlocks.length, 6);
   assert.equal(finalizationTokens.length, 1);
   const finalizationToken = finalizationTokens[0];
   assert.ok(finalizationToken);
@@ -2614,7 +2600,7 @@ test("sweep target write tokens retain merge and terminal acknowledgement scopes
   const contentWritingTokenBlocks = targetWriteTokenBlocks.filter(
     (block) => block !== finalizationToken,
   );
-  assert.equal(contentWritingTokenBlocks.length, 4);
+  assert.equal(contentWritingTokenBlocks.length, 5);
   const compositeAction = readText(".github/actions/create-target-write-token/action.yml");
   assert.match(compositeAction, /permission-contents: write/);
   assert.match(compositeAction, /permission-pull-requests: write/);

@@ -373,26 +373,26 @@ test("publication workflows retain v1 metrics while wiring bounded v2 observatio
     true,
   );
 
-  const direct = sweep.jobs["event-review-apply"]!.steps;
+  const direct = sweep.jobs["event-review-finalize"]!.steps;
   assertStepOrder(direct, [
     "./.github/actions/setup-github-egress-observer",
-    "Record direct-publication member",
-    "Deliver GitHub effects and prepare direct state mutation",
+    "Record final-publication member",
+    "Deliver exact review and prepare state mutation",
     "Finalize direct exact review lifecycle",
-    "Submit direct GitHub egress telemetry",
-    "Fail unsuccessful exact review generation",
+    "Submit final-publication GitHub egress telemetry",
+    "Fail exact review finalization that did not publish or requeue",
   ]);
   assert.equal(
-    direct.find((step) => step.id === "direct-github-egress-observer")?.["continue-on-error"],
+    direct.find((step) => step.id === "final-github-egress-observer")?.["continue-on-error"],
     true,
   );
   assert.equal(
-    direct.find((step) => step.name === "Record direct-publication member")?.["continue-on-error"],
+    direct.find((step) => step.name === "Record final-publication member")?.["continue-on-error"],
     true,
   );
   assert.equal(
-    direct.find((step) => step.name === "Record direct-publication member")?.env?.TARGET_REPO,
-    "${{ steps.target.outputs.target_repo }}",
+    direct.find((step) => step.name === "Record final-publication member")?.env?.TARGET_REPO,
+    "${{ needs.event-review-apply.outputs.target_repo }}",
   );
   const artifact = sweep.jobs["event-review-publish"]!.steps;
   assertStepOrder(artifact, [

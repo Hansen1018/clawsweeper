@@ -107,18 +107,32 @@ test("queued workflow remediation shares the guarded dead-letter cadence", () =>
   assert.equal(upload.with["if-no-files-found"], "ignore");
 });
 
-test("exact review generation enters finalization before state hydration", () => {
+test("exact review generation seals its core before trusted state hydration", () => {
   const workflow = parse(readFileSync(".github/workflows/sweep.yml", "utf8")) as Record<
     string,
     any
   >;
-  const steps = workflow.jobs["event-review-apply"].steps as Array<Record<string, unknown>>;
-  const review = steps.find((step) => step.name === "Review exact event item");
-  const setupStateIndex = steps.findIndex((step) => step.uses === "./.github/actions/setup-state");
-  const reviewIndex = steps.indexOf(review!);
+  const applySteps = workflow.jobs["event-review-apply"].steps as Array<Record<string, unknown>>;
+  const finalizeSteps = workflow.jobs["event-review-finalize"].steps as Array<
+    Record<string, unknown>
+  >;
+  const reviewIndex = applySteps.findIndex((step) => step.name === "Review exact event item");
+  const uploadIndex = applySteps.findIndex(
+    (step) => step.name === "Upload exact review artifact bundle",
+  );
+  const validateIndex = finalizeSteps.findIndex((step) => step.name === "Validate finalizer core");
+  const setupStateIndex = finalizeSteps.findIndex(
+    (step) => step.uses === "./.github/actions/setup-state",
+  );
+  const deliverIndex = finalizeSteps.findIndex(
+    (step) => step.name === "Deliver exact review and prepare state mutation",
+  );
 
-  assert.ok(review);
-  assert.ok(reviewIndex >= 0 && reviewIndex < setupStateIndex);
-  assert.match(String(review.run), /phase: "finalizing"/);
-  assert.match(String(review.run), /mark_finalizing \|\| review_exit_code=1/);
+  assert.ok(reviewIndex >= 0 && uploadIndex > reviewIndex);
+  assert.equal(
+    applySteps.some((step) => step.uses === "./.github/actions/setup-state"),
+    false,
+  );
+  assert.ok(validateIndex >= 0 && setupStateIndex > validateIndex);
+  assert.ok(deliverIndex > setupStateIndex);
 });

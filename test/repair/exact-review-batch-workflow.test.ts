@@ -600,25 +600,35 @@ test("batch publisher gives canonical supersession precedence over artifact term
   assert.ok(supersededTerminal > supersededReceipt && supersededTerminal < staleArtifactPlan);
 });
 
-test("exact-review producer uses direct publication with bounded legacy fallback", () => {
-  assert.match(sweepSource, /name: Deliver GitHub effects and prepare direct state mutation/);
-  assert.match(sweepSource, /records-item-number: \$\{\{ steps\.target\.outputs\.item_number \}\}/);
+test("exact-review producer seals core before trusted finalization with legacy recovery", () => {
+  const applyStart = sweepSource.indexOf("\n  event-review-apply:");
+  const liveProofStart = sweepSource.indexOf("\n  event-review-live-proof:", applyStart);
+  const finalizeStart = sweepSource.indexOf("\n  event-review-finalize:", liveProofStart);
+  const legacyPublishStart = sweepSource.indexOf("\n  event-review-publish:", finalizeStart);
+  const apply = sweepSource.slice(applyStart, liveProofStart);
+  const finalize = sweepSource.slice(finalizeStart, legacyPublishStart);
+
+  assert.doesNotMatch(apply, /repair:exact-review-direct-publication/);
+  assert.doesNotMatch(apply, /uses: \.\/\.github\/actions\/setup-state/);
+  assert.match(finalize, /name: Deliver exact review and prepare state mutation/);
   assert.match(
-    sweepSource,
-    /EXACT_REVIEW_BATCH_MUTATION_OUTPUT: \.artifacts\/direct-publication-outcome\.json/,
+    finalize,
+    /records-item-number: \$\{\{ needs\.event-review-apply\.outputs\.item_number \}\}/,
   );
-  assert.match(sweepSource, /repair:exact-review-direct-publication/);
   assert.match(
-    sweepSource,
-    /EXACT_REVIEW_DIRECT_PUBLICATION_ENABLED: \$\{\{ vars\.EXACT_REVIEW_DIRECT_PUBLICATION_ENABLED \|\| '1' \}\}/,
+    finalize,
+    /EXACT_REVIEW_BATCH_MUTATION_OUTPUT: \.artifacts\/final-publication-outcome\.json/,
   );
+  assert.match(finalize, /repair:exact-review-direct-publication/);
+  assert.match(finalize, /EXACT_REVIEW_DIRECT_PUBLICATION_ENABLED: "1"/);
   assert.match(
-    sweepSource,
-    /name: Upload exact review artifact bundle[\s\S]*?steps\.direct-exact-review-publication\.outputs\.accepted != 'true'/,
+    apply,
+    /name: Upload exact review artifact bundle[\s\S]*?name: Export exact review generation result/,
   );
+  assert.match(finalize, /name: Complete exact-review queue lease/);
   assert.match(
-    sweepSource,
-    /name: Queue durable exact review publication[\s\S]*?steps\.upload-exact-review-bundle\.outcome == 'success'/,
+    sweepSource.slice(legacyPublishStart),
+    /source_action == 'exact_review_artifact_publish'/,
   );
   assert.match(sweepSource, /internal\/exact-review\/enqueue/);
   assert.match(source, /name: Claim one durable publication batch/);
