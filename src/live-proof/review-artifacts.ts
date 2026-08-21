@@ -258,9 +258,8 @@ function executeReviewLiveProof(
 }
 
 function cleanupErrorCode(error: unknown): string {
-  const value =
-    error && typeof error === "object" && "code" in error
-      ? String((error as { code?: unknown }).code ?? "")
-      : "";
+  const raw =
+    error && typeof error === "object" && "code" in error ? (error as { code?: unknown }).code : "";
+  const value = typeof raw === "string" ? raw : "";
   return /^[A-Z0-9_]{1,40}$/.test(value) ? value : "UNKNOWN";
 }
