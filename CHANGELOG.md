@@ -21,7 +21,7 @@ checkpoint, and status-only commits are intentionally omitted.
 
 - Live verification now publishes a sanitized, capped dev-server log tail when browser startup fails, and detects a start command that exits before its URL becomes reachable without waiting for the readiness timeout.
 - Live verification now installs a missing target package manager on demand after execution is approved, publishes installer failures as verification results, and guides plans toward stable assertions the run can satisfy.
-- Live verification now runs immediately after review in the same job and exact reviewed checkout; review judgment gates execution, target children receive a denylist-and-heuristic-sanitized environment, package installs suppress lifecycle scripts unless a repository explicitly opts in, and review jobs default to `ubuntu-latest` without requiring Linux namespaces. Existing publication jobs still validate and upload media before publishing the normal record and comment.
+- Event live verification now runs in a separate secretless GitHub-hosted job bound to the immutable exact-head review artifact; a fresh trusted finalizer validates the core and proof augmentation, publishes valid PASS or FAIL evidence, and owns queue completion. Target children still receive a denylist-and-heuristic-sanitized environment, package installs suppress lifecycle scripts unless a repository explicitly opts in, and the live-proof job strips GitHub workflow command files before target execution.
 - Live verification comments now keep terminal captures but render browser proof as sanitized per-step outcomes with explicit failure reasons, never document-wide page text or empty assertion sections.
 - Live verification now runs real PR behavior by default, publishes bounded command output and assertion results even without video, and treats recordings as optional presentation.
 - Browser live proofs treat scroll-into-view as best effort so continuously animated targets stay clickable.
@@ -58,6 +58,7 @@ checkpoint, and status-only commits are intentionally omitted.
 
 ### Fixed
 
+- Live-proof scratch cleanup no longer changes permissions on target-created paths. Cleanup-only failures are sealed as bounded evidence for core-only finalization, while primary and cleanup failures are preserved together.
 - Replaced public Worker exception text with endpoint-owned error codes and bounded direct-publication rejection categories, preserving distinct operational fingerprints without exposing submitted values or stack traces.
 - Replaced terminal live proof's authenticated `xvfb-run` wrapper with a TCP-disabled local Xvfb display so readiness probes and recording can connect without X authorization failures.
 - Made terminal live-proof recording wait for Xvfb and ffmpeg readiness and clean finalization, with tmux pane diagnostics on failure.

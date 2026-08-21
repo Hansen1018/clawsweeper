@@ -11,10 +11,20 @@
 
 Live proof turns a review-time `liveProofPlan` into deterministic browser or
 terminal execution, with an optional recording when the behavior is worth
-watching. Classification and execution now happen in the same review job. The
-review first writes its decision artifact, then immediately executes the typed
-plan against the exact `pull_head_sha` recorded in that artifact. There is no
-separate dispatch, public PR-head lookup, second hydration, or live-head check.
+watching. Event reviews use three jobs in one workflow run:
+
+1. `event-review-apply` writes and uploads an immutable core review bundle.
+2. `event-review-live-proof` downloads that bundle by artifact ID, validates its
+   digest and exact `pull_head_sha`, fetches that public PR head anonymously,
+   executes the typed plan on hardcoded `ubuntu-latest`, and uploads a separate
+   augmentation.
+3. `event-review-finalize` validates both artifacts in a clean trusted job,
+   merges valid proof, and is the sole publisher and queue-completion owner.
+
+The live-proof job has only `actions: read` and `contents: read`; it receives no
+ClawSweeper or target-repository credentials. It also removes the four GitHub
+workflow command-file variables before target execution, so untrusted target
+code cannot mutate later workflow environment, output, path, or summary state.
 
 The planner gates execution in order: the repository must opt in with
 `live_test.enabled`, the item must be a pull request, and the plan must be
@@ -32,15 +42,18 @@ available before target setup. Installer failures become a failed
 path; they do not fail the review itself. Reviews that do not verify never probe
 or install a target package manager.
 
-## Review-job execution
+## Same-run isolated execution
 
-After the review command returns, the job inspects the produced reports before
-installing tools. tmux is installed only when a terminal candidate exists. The
-recording toolchain (`ffmpeg`, Xvfb, xterm, and related X11 tools) is installed
-only when at least one recommended plan has a non-`static_text` payoff. Review
-job timeouts include the target installation and deterministic drive. Review
-jobs default to `ubuntu-latest`; `CLAWSWEEPER_REVIEW_RUNNER` remains an optional
-runner override.
+After the review command returns, the apply job inspects the produced report and
+seals the report, queue tuple, target identity, exact PR head, and hashed file
+inventory into the core artifact. It does not execute target code. The
+`CLAWSWEEPER_REVIEW_RUNNER` override applies only to review generation; live
+proof always runs on GitHub-hosted `ubuntu-latest`.
+
+The secretless live-proof job reinspects the sealed report before installing
+tools. tmux is installed only when a terminal candidate exists. The recording
+toolchain (`ffmpeg`, Xvfb, xterm, and related X11 tools) is installed only when
+the recommended plan has a non-`static_text` payoff.
 
 For every candidate, trusted ClawSweeper code materializes the report's exact
 head SHA into a scratch worktree, then invokes the existing `live-proof`
@@ -64,12 +77,12 @@ three controls:
   diff. A repository may opt in only with the explicit
   `live_test.allow_install_scripts: true` flag. No current repository opts in.
 
-Untrusted target code therefore runs unsandboxed in a credentialed review job.
-Environment sanitization reduces what the direct child inherits, but it is not
-a kernel security boundary and does not make a suspicious plan safe. Linux
-user/mount/PID/network containment remains a future hardening step; it is not a
-runner requirement today. The repair lane's separate containment remains in use
-and is unaffected by this live-proof policy.
+Untrusted target code therefore runs unsandboxed in a disposable, secretless
+GitHub-hosted job. Environment sanitization is still not a kernel security
+boundary and does not make a suspicious plan safe. The separate trusted
+finalizer starts from a fresh checkout and only accepts a bounded augmentation
+whose workflow identity, core artifact ID and digest, core manifest digest,
+target, item, and exact PR head all match trusted job outputs.
 
 HOME, package-manager caches, and temporary files point into the scratch profile.
 
@@ -103,17 +116,24 @@ plan acted, and the recording passes the three-second floor. Eligible recordings
 are capped at 90 seconds and 50 MB, transcoded to H.264 MP4, probed, and paired
 with `poster.jpg` plus a metadata-only manifest.
 
-## Existing artifact and publication path
+## Artifacts and publication
 
-The review artifact contains its report plus `live-proof/<item>/` with the
-verification result and, when eligible, the manifest, MP4, and poster. The exact
-review bundle binds those files into its existing hashed inventory. No second
-live-proof artifact is uploaded.
+The immutable core artifact contains the review report and action ledger. The
+separate live-proof augmentation contains `live-proof/<item>/` with the
+verification result and, when eligible, the manifest, MP4, and poster. Both
+artifacts have bounded, sorted, digest-checked inventories and reject symlinks,
+unknown paths, duplicate paths, or unknown manifest fields.
 
-The existing publication jobs download and validate the review artifact. Before
-their normal record mutation, they fold each verification result into the review
-report. If media exists, publication re-probes it and uploads it with its own R2
-credentials to:
+The trusted finalizer publishes a valid PASS or FAIL verification. If live
+execution succeeds but owned scratch cleanup fails, or the fully sealed
+GitHub-hosted job later fails during runner post-job cleanup, the finalizer
+publishes the verified core report without attaching proof. Any missing,
+malformed, mismatched, or otherwise failed augmentation causes queue retry
+instead of publication.
+
+Before normal record mutation, the finalizer folds a valid verification result
+into the review report. If media exists, it re-probes the files and uploads them
+with its own R2 credentials to:
 
 ```text
 live-proof/<repo-slug>/<item>/<head-sha>/live-proof.mp4
@@ -125,6 +145,10 @@ data cannot supply a host. Publication validates the result against the report's
 repository, item, type, and `pull_head_sha`, but it does not query GitHub for a
 new head. The normal record publisher then writes the canonical record and the
 existing comment-sync path upserts the marker-backed review comment.
+
+Queued batch publication still executes live proof inside its existing job. It
+does not yet share the event-review three-job isolation contract; migrating that
+lane is the immediate follow-up.
 
 Browser comments contain sanitized per-step outcomes and a one-line failing-step
 reason, never page text. Terminal comments retain capped output and list

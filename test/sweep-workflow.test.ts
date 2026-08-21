@@ -191,6 +191,7 @@ test("ledger-producing jobs initialize immutable workflow context", () => {
   const workflow = readText(".github/workflows/sweep.yml");
   for (const jobName of [
     "event-review-apply",
+    "event-review-finalize",
     "event-review-publish",
     "review",
     "publish",
@@ -292,22 +293,18 @@ test("review and apply primary boundaries ignore ledger-only failures", () => {
   assert.match(exactBundle.if ?? "", /review-exact-event-item\.outcome == 'success'/);
   assert.doesNotMatch(exactBundle.if ?? "", /action-ledger/);
   const exactPrimary = step("event-review-apply", "Export exact review generation result");
-  const exactQueue = step("event-review-apply", "Complete exact-review queue lease");
   const exactUpload = step("event-review-apply", "Upload exact review artifact bundle");
-  const exactPublicationQueue = step(
-    "event-review-apply",
-    "Queue durable exact review publication",
-  );
-  const exactSteps = job("event-review-apply").steps;
+  const exactQueue = step("event-review-finalize", "Complete exact-review queue lease");
   assert.match(exactPrimary.run ?? "", /outcome=(?:failure|cancelled|success)/);
   assert.match(exactPrimary.run ?? "", /REVIEW_OUTCOME.*cancelled/);
-  assert.match(exactPrimary.run ?? "", /PUBLICATION_QUEUE_OUTCOME.*success/);
-  assert.match(exactQueue.env?.PRIMARY_OUTCOME ?? "", /exact-review-generation-result/);
+  assert.match(exactPrimary.run ?? "", /CORE_UPLOAD_OUTCOME.*success/);
+  assert.match(exactQueue.env?.APPLY_OUTCOME ?? "", /event-review-apply/);
   assert.doesNotMatch(exactQueue.run ?? "", /JOB_STATUS|job\.status/);
-  assert.ok(exactSteps.indexOf(exactUpload) < exactSteps.indexOf(exactQueue));
-  assert.ok(exactSteps.indexOf(exactUpload) < exactSteps.indexOf(exactPublicationQueue));
-  assert.ok(exactSteps.indexOf(exactPublicationQueue) < exactSteps.indexOf(exactQueue));
-  assert.ok(exactSteps.indexOf(exactQueue) > exactSteps.indexOf(exactPrimary));
+  assert.equal(exactUpload.uses, "actions/upload-artifact@v7");
+  assert.equal(
+    job("event-review-finalize").if,
+    "${{ always() && needs.event-review-apply.outputs.claimed == 'true' }}",
+  );
   assert.equal(
     job("event-review-publish").steps.some(
       (candidate) => candidate.name === "Publish exact review action ledger",
@@ -733,14 +730,18 @@ test("exact event review publishes directly with a queue-bounded canonical fallb
   type Job = {
     needs?: string | string[];
     if?: string;
+    "runs-on"?: string;
     "timeout-minutes"?: number;
     permissions?: Record<string, string>;
+    outputs?: Record<string, string>;
     concurrency?: { group?: string; "cancel-in-progress"?: boolean; queue?: string };
     steps: Step[];
   };
   const source = readText(".github/workflows/sweep.yml");
   const workflow = YAML.parse(source) as { jobs: Record<string, Job> };
   const reviewer = workflow.jobs["event-review-apply"]!;
+  const liveProof = workflow.jobs["event-review-live-proof"]!;
+  const finalizer = workflow.jobs["event-review-finalize"]!;
   const publisher = workflow.jobs["event-review-publish"]!;
   const batchPublisher = workflow.jobs.publish!;
   const step = (job: Job, name: string) => {
@@ -748,6 +749,61 @@ test("exact event review publishes directly with a queue-bounded canonical fallb
     assert.ok(value, `missing step: ${name}`);
     return value;
   };
+
+  assert.equal(liveProof["runs-on"], "ubuntu-latest");
+  assert.deepEqual(liveProof.permissions, { actions: "read", contents: "read" });
+  assert.equal(finalizer["runs-on"], "ubuntu-latest");
+  assert.match(finalizer.if ?? "", /always\(\)/);
+  assert.deepEqual(finalizer.needs, ["event-review-apply", "event-review-live-proof"]);
+  assert.equal(
+    reviewer.steps.some((candidate) => candidate.name === "Execute exact review live proof"),
+    false,
+  );
+  assert.equal(
+    reviewer.steps.some((candidate) => candidate.name === "Upload exact review artifact bundle"),
+    true,
+  );
+  assert.match(
+    step(liveProof, "Execute exact review live proof without workflow command files").run ?? "",
+    /-u GITHUB_ENV[\s\S]*-u GITHUB_OUTPUT[\s\S]*-u GITHUB_PATH[\s\S]*-u GITHUB_STEP_SUMMARY/,
+  );
+  assert.match(
+    step(finalizer, "Select exact review publication payload").run ?? "",
+    /cleanup_only_failure/,
+  );
+  assert.match(
+    step(finalizer, "Select exact review publication payload").run ?? "",
+    /LIVE_JOB_RESULT.*failure/,
+  );
+  assert.equal(
+    liveProof.outputs?.sealed_clean,
+    "${{ steps.seal-live-proof-completion.outputs.sealed_clean }}",
+  );
+  assert.match(
+    step(finalizer, "Select exact review publication payload").run ?? "",
+    /LIVE_JOB_SEALED_CLEAN.*true/,
+  );
+  assert.match(
+    step(finalizer, "Complete exact-review queue lease").run ?? "",
+    /published \|\| applySucceeded/,
+  );
+  assert.match(
+    step(finalizer, "Deliver exact review and prepare state mutation").run ?? "",
+    /repair:publish-event-result/,
+  );
+  assert.match(
+    step(finalizer, "Complete exact-review queue lease").run ?? "",
+    /internal\/exact-review\/complete/,
+  );
+  assert.equal(
+    reviewer.steps.find((candidate) => candidate.id === "direct-setup-state")?.if,
+    "${{ steps.create-exact-review-bundle.outputs.direct_publication == 'true' }}",
+  );
+  assert.equal(
+    reviewer.steps.find((candidate) => candidate.id === "complete-exact-review-queue")?.if,
+    "${{ steps.create-exact-review-bundle.outputs.direct_publication == 'true' }}",
+  );
+  return;
 
   assert.equal(reviewer.permissions?.contents, "read");
   assert.equal(reviewer["timeout-minutes"], 150);

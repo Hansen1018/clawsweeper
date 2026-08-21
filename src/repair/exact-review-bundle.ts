@@ -25,6 +25,7 @@ export interface ExactReviewBundleContext {
   decisionSha256: string;
   targetRepo: string;
   targetBranch: string;
+  pullHeadSha: string | null;
   itemNumber: number;
   itemKind: "issue" | "pull_request";
   itemKey: string;
@@ -62,6 +63,7 @@ export interface ExactReviewBundleManifest {
   target: {
     repo: string;
     branch: string;
+    pull_head_sha: string | null;
     item_number: number;
     item_kind: "issue" | "pull_request";
   };
@@ -105,6 +107,7 @@ export function createExactReviewBundle(
 
   let artifactPresent = false;
   if (options.reviewPath && fs.existsSync(options.reviewPath)) {
+    validateReviewIdentity(options.reviewPath, context);
     const reviewDestination = path.join(bundleDir, "review", `${context.itemNumber}.md`);
     copyRegularFile(options.reviewPath, reviewDestination);
     artifactPresent = true;
@@ -142,6 +145,7 @@ export function createExactReviewBundle(
     target: {
       repo: context.targetRepo,
       branch: context.targetBranch,
+      pull_head_sha: context.pullHeadSha,
       item_number: context.itemNumber,
       item_kind: context.itemKind,
     },
@@ -214,6 +218,7 @@ function assertExpectedManifest(
     decisionSha256: manifest.review.decision_sha256,
     targetRepo: manifest.target.repo,
     targetBranch: manifest.target.branch,
+    pullHeadSha: manifest.target.pull_head_sha,
     itemNumber: manifest.target.item_number,
     itemKind: manifest.target.item_kind,
     itemKey: manifest.queue.item_key,
@@ -244,6 +249,13 @@ function validateContext(value: ExactReviewBundleContext): ExactReviewBundleCont
   if (!REPO_PATTERN.test(value.targetRepo)) throw new Error("target repository is invalid");
   if (!BRANCH_PATTERN.test(value.targetBranch) || value.targetBranch.includes("..")) {
     throw new Error("target branch is invalid");
+  }
+  if (value.itemKind === "pull_request") {
+    if (!value.pullHeadSha || !SHA_PATTERN.test(value.pullHeadSha)) {
+      throw new Error("pull request head SHA is invalid");
+    }
+  } else if (value.pullHeadSha !== null) {
+    throw new Error("issue bundles must not record a pull request head SHA");
   }
   positiveInteger(value.itemNumber, "item number");
   if (value.itemKind !== "issue" && value.itemKind !== "pull_request") {
@@ -303,7 +315,7 @@ function validateManifest(value: unknown): ExactReviewBundleManifest {
   const queue = record(manifest.queue, "queue");
   exactKeys(queue, ["item_key", "protocol_version", "lease_revision", "claim_generation"]);
   const target = record(manifest.target, "target");
-  exactKeys(target, ["repo", "branch", "item_number", "item_kind"]);
+  exactKeys(target, ["repo", "branch", "pull_head_sha", "item_number", "item_kind"]);
   const review = record(manifest.review, "review");
   exactKeys(review, [
     "decision_sha256",
@@ -323,6 +335,10 @@ function validateManifest(value: unknown): ExactReviewBundleManifest {
     decisionSha256: stringValue(review.decision_sha256, "review.decision_sha256"),
     targetRepo: stringValue(target.repo, "target.repo"),
     targetBranch: stringValue(target.branch, "target.branch"),
+    pullHeadSha:
+      target.pull_head_sha === null
+        ? null
+        : stringValue(target.pull_head_sha, "target.pull_head_sha"),
     itemNumber: numberValue(target.item_number, "target.item_number"),
     itemKind: target.item_kind as "issue" | "pull_request",
     itemKey: stringValue(queue.item_key, "queue.item_key"),
@@ -388,6 +404,7 @@ function validateManifest(value: unknown): ExactReviewBundleManifest {
     target: {
       repo: context.targetRepo,
       branch: context.targetBranch,
+      pull_head_sha: context.pullHeadSha,
       item_number: context.itemNumber,
       item_kind: context.itemKind,
     },
@@ -499,6 +516,36 @@ function copyRegularFile(
   if (stat.size > maxBytes) throw new Error("bundle source is too large");
   fs.mkdirSync(path.dirname(destination), { recursive: true });
   fs.copyFileSync(source, destination, fs.constants.COPYFILE_EXCL);
+}
+
+function validateReviewIdentity(reviewPath: string, context: ExactReviewBundleContext): void {
+  const markdown = fs.readFileSync(reviewPath, "utf8");
+  const repository = frontMatterValue(markdown, "repository");
+  const itemNumber = Number(frontMatterValue(markdown, "number"));
+  const itemKind = frontMatterValue(markdown, "type");
+  const pullHeadSha =
+    context.itemKind === "pull_request"
+      ? (frontMatterValue(markdown, "pull_head_sha")?.toLowerCase() ?? null)
+      : null;
+  if (
+    repository !== context.targetRepo ||
+    itemNumber !== context.itemNumber ||
+    itemKind !== context.itemKind ||
+    pullHeadSha !== context.pullHeadSha
+  ) {
+    throw new Error("exact review artifact identity does not match the trusted workflow context");
+  }
+}
+
+function frontMatterValue(markdown: string, key: string): string | undefined {
+  const match = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(markdown);
+  if (!match) return undefined;
+  const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const values = [...(match[1] ?? "").matchAll(new RegExp(`^${escaped}:\\s*(.*)$`, "gm"))];
+  if (values.length !== 1) return undefined;
+  const value = values[0]?.[1]?.trim();
+  if (!value) return undefined;
+  return value.startsWith('"') && value.endsWith('"') ? value.slice(1, -1) : value;
 }
 
 function exactReviewBundleFileLimit(relativePath: string): number {

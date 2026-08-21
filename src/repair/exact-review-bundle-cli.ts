@@ -45,6 +45,7 @@ function contextFromEnv(env: NodeJS.ProcessEnv): ExactReviewBundleContext {
     decisionSha256: exactReviewDecisionSha256(requiredEnv(env, "EXACT_REVIEW_DECISION")),
     targetRepo: requiredEnv(env, "EXACT_REVIEW_TARGET_REPO"),
     targetBranch: requiredEnv(env, "EXACT_REVIEW_TARGET_BRANCH"),
+    pullHeadSha: optionalShaEnv(env, "EXACT_REVIEW_PULL_HEAD_SHA"),
     itemNumber: positiveIntegerEnv(env, "EXACT_REVIEW_ITEM_NUMBER"),
     itemKind: itemKindEnv(env),
     itemKey: requiredEnv(env, "EXACT_REVIEW_ITEM_KEY"),
@@ -79,6 +80,13 @@ function optionalPositiveIntegerEnv(env: NodeJS.ProcessEnv, name: string): numbe
   if (!raw) return null;
   const value = Number(raw);
   if (!Number.isInteger(value) || value < 1) throw new Error(`${name} must be a positive integer`);
+  return value;
+}
+
+function optionalShaEnv(env: NodeJS.ProcessEnv, name: string): string | null {
+  const value = optionalEnv(env, name).toLowerCase();
+  if (!value) return null;
+  if (!/^[0-9a-f]{40}$/.test(value)) throw new Error(`${name} must be a full commit SHA`);
   return value;
 }
 

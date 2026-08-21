@@ -1567,14 +1567,43 @@ test("live proof executes in review jobs and publishes through existing artifact
   assertOrdered(exactReviewSteps, [
     "Review exact event item",
     "Inspect exact review live proof",
-    "Execute exact review live proof",
     "Create exact review artifact bundle",
     "Upload exact review artifact bundle",
   ]);
-  const directSetup = exactReviewSteps.find((step) => step.id === "direct-setup-state");
-  assert.match(directSetup?.if ?? "", /execute-exact-live-proof\.outputs\.produced != 'true'/);
+  assert.equal(
+    exactReviewSteps.some((step) => step.name === "Execute exact review live proof"),
+    false,
+  );
   assert.doesNotMatch(JSON.stringify(exactReviewSteps), /CLAWSWEEPER_LIVE_PROOF_AWS/);
   assert.doesNotMatch(JSON.stringify(exactReviewSteps), /containment|unshare/);
+
+  const exactLiveProofSteps = sweepWorkflow.jobs["event-review-live-proof"]?.steps ?? [];
+  assertOrdered(exactLiveProofSteps, [
+    "Download immutable exact review core",
+    "Validate immutable exact review core",
+    "Execute exact review live proof without workflow command files",
+    "Create exact-head live-proof augmentation",
+    "Upload exact-head live-proof augmentation",
+  ]);
+  assert.match(
+    exactLiveProofSteps.find(
+      (step) => step.name === "Execute exact review live proof without workflow command files",
+    )?.run ?? "",
+    /-u GITHUB_ENV[\s\S]*-u GITHUB_OUTPUT[\s\S]*-u GITHUB_PATH[\s\S]*-u GITHUB_STEP_SUMMARY/,
+  );
+  assert.doesNotMatch(JSON.stringify(exactLiveProofSteps), /CLAWSWEEPER_LIVE_PROOF_AWS/);
+
+  const exactFinalizeSteps = sweepWorkflow.jobs["event-review-finalize"]?.steps ?? [];
+  assertOrdered(exactFinalizeSteps, [
+    "Validate finalizer core",
+    "Validate exact-head live-proof augmentation",
+    "Select exact review publication payload",
+    "Merge validated live-proof augmentation",
+    "Fold exact live proof into the review artifact",
+    "Deliver exact review and prepare state mutation",
+    "Complete exact-review queue lease",
+  ]);
+  assert.match(JSON.stringify(exactFinalizeSteps), /CLAWSWEEPER_LIVE_PROOF_AWS/);
 
   const shardSteps = sweepWorkflow.jobs.review?.steps ?? [];
   assertOrdered(shardSteps, [

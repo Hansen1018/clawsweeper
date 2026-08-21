@@ -1,5 +1,13 @@
 import { spawnSync } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import {
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -18,6 +26,7 @@ const PUBLIC_BUNDLE_FILES = [
   "live-proof.mp4",
   "poster.jpg",
 ] as const;
+export const REVIEW_LIVE_PROOF_CLEANUP_SCHEMA_VERSION = 1 as const;
 
 export interface ReviewLiveProofInspection {
   candidates: number[];
@@ -104,6 +113,7 @@ function executeReviewLiveProof(
   mkdirSync(profile, { recursive: true });
   mkdirSync(temporaryBundle, { recursive: true });
   copyFileSync(recordPath, copiedRecordPath);
+  let primaryError: unknown;
   try {
     if (
       !materializePullRequestReviewTree({
@@ -186,11 +196,65 @@ function executeReviewLiveProof(
     }
     log(assertion);
     log(`[live-proof] item=${item} head=${headSha} execution=unsandboxed credentials=0`);
-  } finally {
+  } catch (error) {
+    primaryError = error;
+  }
+
+  const cleanupErrors: Array<{ operation: "remove_worktree" | "remove_scratch"; error: unknown }> =
+    [];
+  try {
     removePullRequestReviewTree({
       targetDir: resolve(options.checkoutPath),
       worktreeDir: worktree,
     });
-    rmSync(scratch, { force: true, recursive: true });
+  } catch (error) {
+    cleanupErrors.push({ operation: "remove_worktree", error });
   }
+  try {
+    rmSync(scratch, { force: true, recursive: true });
+  } catch (error) {
+    cleanupErrors.push({ operation: "remove_scratch", error });
+  }
+  if (cleanupErrors.length > 0) {
+    if (primaryError === undefined) {
+      const cleanupRoot = join(resolve(options.outputRoot), ".cleanup-failures");
+      mkdirSync(cleanupRoot, { recursive: true });
+      writeFileSync(
+        join(cleanupRoot, `${item}.json`),
+        `${JSON.stringify(
+          {
+            schema_version: REVIEW_LIVE_PROOF_CLEANUP_SCHEMA_VERSION,
+            item,
+            head_sha: headSha,
+            proof_output_present: existsSync(join(publishedBundle, "live-verification.json")),
+            failures: cleanupErrors.map(({ operation, error }) => ({
+              operation,
+              error_code: cleanupErrorCode(error),
+            })),
+          },
+          null,
+          2,
+        )}\n`,
+        "utf8",
+      );
+    }
+    throw new AggregateError(
+      [
+        ...(primaryError === undefined ? [] : [primaryError]),
+        ...cleanupErrors.map(({ error }) => error),
+      ],
+      primaryError === undefined
+        ? "live proof succeeded but owned cleanup failed"
+        : "live proof and owned cleanup both failed",
+    );
+  }
+  if (primaryError !== undefined) throw primaryError;
+}
+
+function cleanupErrorCode(error: unknown): string {
+  const value =
+    error && typeof error === "object" && "code" in error
+      ? String((error as { code?: unknown }).code ?? "")
+      : "";
+  return /^[A-Z0-9_]{1,40}$/.test(value) ? value : "UNKNOWN";
 }

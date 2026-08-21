@@ -131,10 +131,18 @@ test("review jobs execute live proof before their existing artifact upload", () 
   const workflow = parse(fs.readFileSync(".github/workflows/sweep.yml", "utf8")) as {
     jobs?: Record<string, { steps?: { name?: unknown; run?: unknown; uses?: unknown }[] }>;
   };
-  for (const jobName of ["event-review-apply", "review"]) {
+  for (const jobName of ["event-review-live-proof", "review"]) {
     const steps = workflow.jobs?.[jobName]?.steps ?? [];
-    const review = steps.findIndex((step) => String(step.name ?? "").startsWith("Review "));
-    const execute = steps.findIndex((step) => String(step.run ?? "").includes("live-proof-review"));
+    const review = steps.findIndex((step) =>
+      jobName === "event-review-live-proof"
+        ? step.name === "Reinspect exact live-proof plan"
+        : String(step.name ?? "").startsWith("Review "),
+    );
+    const execute = steps.findIndex((step) =>
+      jobName === "event-review-live-proof"
+        ? step.name === "Execute exact review live proof without workflow command files"
+        : String(step.run ?? "").includes("live-proof-review"),
+    );
     const upload = steps.findIndex(
       (step, index) =>
         index > execute && String(step.uses ?? "").startsWith("actions/upload-artifact@"),
@@ -172,7 +180,7 @@ test("every durable review-record publication lane preserves the merged live-pro
         const directSetup = steps.find((step) => step.id === "direct-setup-state");
         assert.match(
           String(directSetup?.if ?? ""),
-          /execute-exact-live-proof\.outputs\.produced != 'true'/,
+          /create-exact-review-bundle\.outputs\.direct_publication == 'true'/,
           site,
         );
         continue;
@@ -193,7 +201,7 @@ test("every durable review-record publication lane preserves the merged live-pro
       assert.ok(fold >= 0 && publish > fold, `${site} must fold live proof before publication`);
     }
   }
-  assert.equal(publicationSites.length, 4, JSON.stringify(publicationSites));
+  assert.equal(publicationSites.length, 5, JSON.stringify(publicationSites));
 });
 
 test("state-hydrating sparse repair workflows keep hydration dependencies", () => {

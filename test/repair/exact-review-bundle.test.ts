@@ -21,7 +21,20 @@ function fixture() {
     ledgerRoot,
     "ledger/v1/events/2026/07/15/openclaw/openclaw/events.jsonl",
   );
-  fs.writeFileSync(report, "# Review\n\nVerified.\n");
+  fs.writeFileSync(
+    report,
+    `---
+number: 42
+repository: openclaw/openclaw
+type: pull_request
+pull_head_sha: ${"b".repeat(40)}
+---
+
+# Review
+
+Verified.
+`,
+  );
   fs.mkdirSync(liveProofDir);
   fs.writeFileSync(path.join(liveProofDir, "live-verification.json"), '{"schema_version":1}\n');
   fs.mkdirSync(path.dirname(ledger), { recursive: true });
@@ -37,13 +50,14 @@ function fixture() {
         targetRepo: "openclaw/openclaw",
         targetBranch: "main",
         itemNumber: 42,
-        itemKind: "issue",
+        itemKind: "pull_request",
       }),
     ),
     targetRepo: "openclaw/openclaw",
     targetBranch: "main",
+    pullHeadSha: "b".repeat(40),
     itemNumber: 42,
-    itemKind: "issue",
+    itemKind: "pull_request",
     itemKey: "openclaw/openclaw#42",
     protocolVersion: 2,
     leaseRevision: 7,
@@ -103,6 +117,21 @@ test("exact review bundle rejects redirected and modified publication", () => {
   assert.throws(
     () => validateExactReviewBundle(value.bundleDir, value.context),
     /file inventory does not match/,
+  );
+});
+
+test("exact review bundle rejects a report for a different pull request head", () => {
+  const value = fixture();
+  value.context.pullHeadSha = "c".repeat(40);
+  assert.throws(
+    () =>
+      createExactReviewBundle({
+        bundleDir: value.bundleDir,
+        reviewPath: value.report,
+        createdAt: "2026-07-15T12:00:00Z",
+        context: value.context,
+      }),
+    /artifact identity/,
   );
 });
 
@@ -178,6 +207,7 @@ test("bundle validation uses the producer workflow identity across runs", () => 
         EXACT_REVIEW_ITEM_KIND: value.context.itemKind,
         EXACT_REVIEW_ITEM_NUMBER: String(value.context.itemNumber),
         EXACT_REVIEW_LEASE_REVISION: String(value.context.leaseRevision),
+        EXACT_REVIEW_PULL_HEAD_SHA: String(value.context.pullHeadSha),
         EXACT_REVIEW_LIVE_GUARDED_OPEN: String(value.context.liveGuardedOpen),
         EXACT_REVIEW_LIVE_PROCEEDED: String(value.context.liveProceeded),
         EXACT_REVIEW_LIVE_TERMINAL_MISSING: String(value.context.liveTerminalMissing),
