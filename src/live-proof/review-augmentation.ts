@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { inflateRawSync } from "node:zlib";
 
 import { parseLiveProofManifest } from "./manifest.js";
 import { REVIEW_LIVE_PROOF_CLEANUP_SCHEMA_VERSION } from "./review-artifacts.js";
@@ -16,6 +17,21 @@ const FILE_PATTERN =
   /^live-proof\/[1-9]\d*\/(?:live-verification\.json|live-proof-manifest\.json|live-proof\.mp4|poster\.jpg)$/;
 const MAX_FILES = 4;
 const MAX_TOTAL_BYTES = 64 * 1024 * 1024;
+const MAX_ARCHIVE_BYTES = MAX_TOTAL_BYTES + 1024 * 1024;
+const ZIP_END_SIGNATURE = 0x06054b50;
+const ZIP_CENTRAL_SIGNATURE = 0x02014b50;
+const ZIP_LOCAL_SIGNATURE = 0x04034b50;
+const ZIP_DESCRIPTOR_SIGNATURE = 0x08074b50;
+const ZIP_FLAG_DATA_DESCRIPTOR = 1 << 3;
+const ZIP_FLAG_UTF8 = 1 << 11;
+const ZIP_ALLOWED_FLAGS = ZIP_FLAG_DATA_DESCRIPTOR | ZIP_FLAG_UTF8;
+const ZIP_UNIX_REGULAR_FILE = 0o100000;
+const ZIP_UNIX_TYPE_MASK = 0o170000;
+
+interface ValidatedZipEntry {
+  name: string;
+  data: Buffer;
+}
 
 export interface ReviewLiveProofAugmentationContext {
   repository: string;
@@ -62,6 +78,41 @@ export interface ReviewLiveProofAugmentationManifest {
     | { kind: "proof"; overall_pass: boolean }
     | { kind: "cleanup_only_failure"; proof_output_present: true };
   files: ReviewLiveProofAugmentationFile[];
+}
+
+export function materializeReviewLiveProofAugmentationArchive(options: {
+  archivePath: string;
+  destinationDir: string;
+  itemNumber: number;
+}): void {
+  if (!Number.isInteger(options.itemNumber) || options.itemNumber < 1) {
+    throw new Error("live-proof augmentation item number is invalid");
+  }
+  const archive = readBoundedArchive(options.archivePath);
+  const allowedEntries = new Set([
+    "manifest.json",
+    `live-proof/${options.itemNumber}/live-verification.json`,
+    `live-proof/${options.itemNumber}/live-proof-manifest.json`,
+    `live-proof/${options.itemNumber}/live-proof.mp4`,
+    `live-proof/${options.itemNumber}/poster.jpg`,
+  ]);
+  const entries = validateZipArchive(archive, allowedEntries);
+  const destinationDir = path.resolve(options.destinationDir);
+  const parentDir = path.dirname(destinationDir);
+  fs.mkdirSync(parentDir, { recursive: true });
+  const temporaryDir = fs.mkdtempSync(path.join(parentDir, ".live-proof-augmentation-"));
+  try {
+    for (const entry of entries) {
+      const destination = path.join(temporaryDir, entry.name);
+      fs.mkdirSync(path.dirname(destination), { recursive: true });
+      fs.writeFileSync(destination, entry.data, { flag: "wx", mode: 0o600 });
+    }
+    fs.rmSync(destinationDir, { force: true, recursive: true });
+    fs.renameSync(temporaryDir, destinationDir);
+  } catch (error) {
+    fs.rmSync(temporaryDir, { force: true, recursive: true });
+    throw error;
+  }
 }
 
 export function createReviewLiveProofAugmentation(options: {
@@ -464,6 +515,267 @@ function collectFiles(root: string): ReviewLiveProofAugmentationFile[] {
   };
   visit(root);
   return files.sort((left, right) => left.path.localeCompare(right.path));
+}
+
+function readBoundedArchive(file: string): Buffer {
+  const stat = fs.lstatSync(file);
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.size < 22 || stat.size > MAX_ARCHIVE_BYTES) {
+    throw new Error("live-proof augmentation archive must be a bounded regular file");
+  }
+  return fs.readFileSync(file);
+}
+
+function validateZipArchive(
+  archive: Buffer,
+  allowedEntries: ReadonlySet<string>,
+): ValidatedZipEntry[] {
+  const endOffset = findZipEnd(archive);
+  const diskNumber = archive.readUInt16LE(endOffset + 4);
+  const centralDisk = archive.readUInt16LE(endOffset + 6);
+  const diskEntries = archive.readUInt16LE(endOffset + 8);
+  const totalEntries = archive.readUInt16LE(endOffset + 10);
+  const centralSize = archive.readUInt32LE(endOffset + 12);
+  const centralOffset = archive.readUInt32LE(endOffset + 16);
+  const commentLength = archive.readUInt16LE(endOffset + 20);
+  if (
+    diskNumber !== 0 ||
+    centralDisk !== 0 ||
+    diskEntries !== totalEntries ||
+    totalEntries < 1 ||
+    totalEntries > allowedEntries.size ||
+    centralOffset === 0xffffffff ||
+    centralSize === 0xffffffff ||
+    commentLength !== 0 ||
+    endOffset + 22 !== archive.length ||
+    centralOffset + centralSize !== endOffset
+  ) {
+    throw new Error("live-proof augmentation archive layout is invalid");
+  }
+
+  const entries: Array<{
+    name: string;
+    flags: number;
+    method: number;
+    crc32: number;
+    compressedSize: number;
+    uncompressedSize: number;
+    localOffset: number;
+  }> = [];
+  const names = new Set<string>();
+  let declaredTotalBytes = 0;
+  let cursor = centralOffset;
+  for (let index = 0; index < totalEntries; index += 1) {
+    ensureBufferRange(archive, cursor, 46);
+    if (archive.readUInt32LE(cursor) !== ZIP_CENTRAL_SIGNATURE) {
+      throw new Error("live-proof augmentation archive central directory is invalid");
+    }
+    const versionMadeBy = archive.readUInt16LE(cursor + 4);
+    const flags = archive.readUInt16LE(cursor + 8);
+    const method = archive.readUInt16LE(cursor + 10);
+    const crc32 = archive.readUInt32LE(cursor + 16);
+    const compressedSize = archive.readUInt32LE(cursor + 20);
+    const uncompressedSize = archive.readUInt32LE(cursor + 24);
+    const nameLength = archive.readUInt16LE(cursor + 28);
+    const extraLength = archive.readUInt16LE(cursor + 30);
+    const entryCommentLength = archive.readUInt16LE(cursor + 32);
+    const diskStart = archive.readUInt16LE(cursor + 34);
+    const externalAttributes = archive.readUInt32LE(cursor + 38);
+    const localOffset = archive.readUInt32LE(cursor + 42);
+    ensureBufferRange(archive, cursor + 46, nameLength + extraLength + entryCommentLength);
+    const nameBytes = archive.subarray(cursor + 46, cursor + 46 + nameLength);
+    const name = nameBytes.toString("utf8");
+    const madeBySystem = versionMadeBy >>> 8;
+    const unixMode = externalAttributes >>> 16;
+    if (
+      nameLength < 1 ||
+      Buffer.compare(nameBytes, Buffer.from(name, "utf8")) !== 0 ||
+      name.includes("\0") ||
+      name.includes("\\") ||
+      path.posix.isAbsolute(name) ||
+      name.split("/").includes("..") ||
+      !allowedEntries.has(name)
+    ) {
+      throw new Error(`live-proof augmentation archive contains an unexpected path: ${name}`);
+    }
+    if (names.has(name)) {
+      throw new Error("live-proof augmentation archive contains duplicate entries");
+    }
+    if (
+      madeBySystem !== 3 ||
+      (unixMode & ZIP_UNIX_TYPE_MASK) !== ZIP_UNIX_REGULAR_FILE ||
+      diskStart !== 0 ||
+      extraLength !== 0 ||
+      entryCommentLength !== 0
+    ) {
+      throw new Error("live-proof augmentation archive entries must be plain regular files");
+    }
+    if (
+      (flags & ~ZIP_ALLOWED_FLAGS) !== 0 ||
+      (method !== 0 && method !== 8) ||
+      compressedSize === 0xffffffff ||
+      uncompressedSize === 0xffffffff ||
+      uncompressedSize > MAX_TOTAL_BYTES ||
+      localOffset === 0xffffffff
+    ) {
+      throw new Error("live-proof augmentation archive entry encoding is invalid");
+    }
+    declaredTotalBytes += uncompressedSize;
+    if (declaredTotalBytes > MAX_TOTAL_BYTES) {
+      throw new Error("live-proof augmentation archive exceeds its byte limit");
+    }
+    names.add(name);
+    entries.push({
+      name,
+      flags,
+      method,
+      crc32,
+      compressedSize,
+      uncompressedSize,
+      localOffset,
+    });
+    cursor += 46 + nameLength + extraLength + entryCommentLength;
+  }
+  if (cursor !== endOffset) {
+    throw new Error("live-proof augmentation archive central directory is invalid");
+  }
+
+  const byOffset = [...entries].sort((left, right) => left.localOffset - right.localOffset);
+  if (byOffset[0]?.localOffset !== 0) {
+    throw new Error("live-proof augmentation archive contains unexpected leading data");
+  }
+  let totalBytes = 0;
+  const materialized = new Map<string, Buffer>();
+  for (let index = 0; index < byOffset.length; index += 1) {
+    const entry = byOffset[index]!;
+    const nextOffset = byOffset[index + 1]?.localOffset ?? centralOffset;
+    ensureBufferRange(archive, entry.localOffset, 30);
+    if (archive.readUInt32LE(entry.localOffset) !== ZIP_LOCAL_SIGNATURE) {
+      throw new Error("live-proof augmentation archive local header is invalid");
+    }
+    const localFlags = archive.readUInt16LE(entry.localOffset + 6);
+    const localMethod = archive.readUInt16LE(entry.localOffset + 8);
+    const localCrc32 = archive.readUInt32LE(entry.localOffset + 14);
+    const localCompressedSize = archive.readUInt32LE(entry.localOffset + 18);
+    const localUncompressedSize = archive.readUInt32LE(entry.localOffset + 22);
+    const localNameLength = archive.readUInt16LE(entry.localOffset + 26);
+    const localExtraLength = archive.readUInt16LE(entry.localOffset + 28);
+    ensureBufferRange(
+      archive,
+      entry.localOffset + 30,
+      localNameLength + localExtraLength + entry.compressedSize,
+    );
+    const localNameStart = entry.localOffset + 30;
+    const localName = archive
+      .subarray(localNameStart, localNameStart + localNameLength)
+      .toString("utf8");
+    if (
+      localFlags !== entry.flags ||
+      localMethod !== entry.method ||
+      localName !== entry.name ||
+      localExtraLength !== 0
+    ) {
+      throw new Error("live-proof augmentation archive local header does not match");
+    }
+    if (
+      (entry.flags & ZIP_FLAG_DATA_DESCRIPTOR) === 0 &&
+      (localCrc32 !== entry.crc32 ||
+        localCompressedSize !== entry.compressedSize ||
+        localUncompressedSize !== entry.uncompressedSize)
+    ) {
+      throw new Error("live-proof augmentation archive local sizes do not match");
+    }
+    const dataStart = localNameStart + localNameLength;
+    const dataEnd = dataStart + entry.compressedSize;
+    validateZipDescriptor(archive, entry, dataEnd, nextOffset);
+    const compressed = archive.subarray(dataStart, dataEnd);
+    const data =
+      entry.method === 0
+        ? Buffer.from(compressed)
+        : inflateRawSync(compressed, { maxOutputLength: Math.max(1, entry.uncompressedSize) });
+    if (data.length !== entry.uncompressedSize || crc32(data) !== entry.crc32) {
+      throw new Error("live-proof augmentation archive file integrity check failed");
+    }
+    totalBytes += data.length;
+    if (totalBytes > MAX_TOTAL_BYTES) {
+      throw new Error("live-proof augmentation archive exceeds its byte limit");
+    }
+    materialized.set(entry.name, data);
+  }
+  return entries.map((entry) => ({ name: entry.name, data: materialized.get(entry.name)! }));
+}
+
+function findZipEnd(archive: Buffer): number {
+  const firstPossible = Math.max(0, archive.length - 22 - 0xffff);
+  for (let offset = archive.length - 22; offset >= firstPossible; offset -= 1) {
+    if (archive.readUInt32LE(offset) === ZIP_END_SIGNATURE) return offset;
+  }
+  throw new Error("live-proof augmentation archive end record is missing");
+}
+
+function validateZipDescriptor(
+  archive: Buffer,
+  entry: {
+    flags: number;
+    crc32: number;
+    compressedSize: number;
+    uncompressedSize: number;
+  },
+  dataEnd: number,
+  nextOffset: number,
+): void {
+  if (nextOffset < dataEnd) {
+    throw new Error("live-proof augmentation archive entries overlap");
+  }
+  const descriptorBytes = nextOffset - dataEnd;
+  if ((entry.flags & ZIP_FLAG_DATA_DESCRIPTOR) === 0) {
+    if (descriptorBytes !== 0) {
+      throw new Error("live-proof augmentation archive contains unexpected entry data");
+    }
+    return;
+  }
+  if (descriptorBytes !== 12 && descriptorBytes !== 16) {
+    throw new Error("live-proof augmentation archive data descriptor is invalid");
+  }
+  let cursor = dataEnd;
+  if (descriptorBytes === 16) {
+    if (archive.readUInt32LE(cursor) !== ZIP_DESCRIPTOR_SIGNATURE) {
+      throw new Error("live-proof augmentation archive data descriptor is invalid");
+    }
+    cursor += 4;
+  }
+  if (
+    archive.readUInt32LE(cursor) !== entry.crc32 ||
+    archive.readUInt32LE(cursor + 4) !== entry.compressedSize ||
+    archive.readUInt32LE(cursor + 8) !== entry.uncompressedSize
+  ) {
+    throw new Error("live-proof augmentation archive data descriptor does not match");
+  }
+}
+
+function ensureBufferRange(buffer: Buffer, offset: number, length: number): void {
+  if (
+    !Number.isSafeInteger(offset) ||
+    !Number.isSafeInteger(length) ||
+    offset < 0 ||
+    length < 0 ||
+    offset + length > buffer.length
+  ) {
+    throw new Error("live-proof augmentation archive is truncated");
+  }
+}
+
+const CRC32_TABLE = Array.from({ length: 256 }, (_, value) => {
+  let crc = value;
+  for (let bit = 0; bit < 8; bit += 1) {
+    crc = (crc & 1) !== 0 ? 0xedb88320 ^ (crc >>> 1) : crc >>> 1;
+  }
+  return crc >>> 0;
+});
+
+function crc32(buffer: Buffer): number {
+  let crc = 0xffffffff;
+  for (const byte of buffer) crc = CRC32_TABLE[(crc ^ byte) & 0xff]! ^ (crc >>> 8);
+  return (crc ^ 0xffffffff) >>> 0;
 }
 
 function readRegularFile(file: string, maxBytes: number): string {

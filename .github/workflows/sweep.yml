@@ -1818,12 +1818,14 @@ jobs:
           skip-decompress: true
           digest-mismatch: error
 
-      - name: Verify and extract live-proof augmentation
+      - name: Verify and materialize live-proof augmentation
         if: ${{ steps.download-live-proof-augmentation.outcome == 'success' }}
         id: verify-live-proof-augmentation
         continue-on-error: true
         env:
           EXPECTED_DIGEST: ${{ needs.event-review-live-proof.outputs.augmentation_artifact_digest }}
+          REVIEW_LIVE_PROOF_AUGMENTATION_DIR: .artifacts/live-proof-augmentation
+          REVIEW_LIVE_PROOF_ITEM_NUMBER: ${{ needs.event-review-apply.outputs.item_number }}
         run: |
           set -euo pipefail
           archive="$(find .artifacts/live-proof-augmentation-download -maxdepth 1 -type f -print)"
@@ -1831,8 +1833,8 @@ jobs:
           test "$(printf '%s\n' "$archive" | wc -l | tr -d ' ')" = "1"
           actual_digest="sha256:$(sha256sum "$archive" | awk '{print $1}')"
           test "$actual_digest" = "$EXPECTED_DIGEST"
-          mkdir -p .artifacts/live-proof-augmentation
-          unzip -q "$archive" -d .artifacts/live-proof-augmentation
+          export REVIEW_LIVE_PROOF_ARCHIVE="$archive"
+          pnpm run --silent repair:review-live-proof-augmentation materialize
 
       - name: Validate exact-head live-proof augmentation
         if: ${{ steps.verify-live-proof-augmentation.outcome == 'success' }}

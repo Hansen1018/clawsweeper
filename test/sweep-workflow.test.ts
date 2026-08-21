@@ -798,6 +798,9 @@ test("exact event review isolates live proof and trusted finalization", () => {
   assert.equal(finalizer["runs-on"], "ubuntu-latest");
   assert.match(finalizer.if ?? "", /always\(\)/);
   assert.deepEqual(finalizer.needs, ["event-review-apply", "event-review-live-proof"]);
+  const materialize = step(finalizer, "Verify and materialize live-proof augmentation");
+  assert.match(materialize.run ?? "", /repair:review-live-proof-augmentation materialize/);
+  assert.doesNotMatch(materialize.run ?? "", /\bunzip\b/);
   assert.match(
     step(finalizer, "Select exact review publication payload").run ?? "",
     /cleanup_only_failure[\s\S]*LIVE_JOB_SEALED_CLEAN/,

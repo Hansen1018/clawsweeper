@@ -1,41 +1,64 @@
 #!/usr/bin/env node
 import {
   createReviewLiveProofAugmentation,
+  materializeReviewLiveProofAugmentationArchive,
   mergeReviewLiveProofAugmentation,
   validateReviewLiveProofAugmentation,
   type ReviewLiveProofAugmentationContext,
 } from "./review-augmentation.js";
 
-const [command] = process.argv.slice(2);
-if (command !== "create" && command !== "validate" && command !== "merge") {
-  throw new Error("usage: review-augmentation-cli.ts <create|validate|merge>");
+function main(): void {
+  const [command] = process.argv.slice(2);
+  if (
+    command !== "create" &&
+    command !== "materialize" &&
+    command !== "validate" &&
+    command !== "merge"
+  ) {
+    throw new Error("usage: review-augmentation-cli.ts <create|materialize|validate|merge>");
+  }
+
+  const env = process.env;
+  if (command === "materialize") {
+    materializeReviewLiveProofAugmentationArchive({
+      archivePath: requiredEnv(env, "REVIEW_LIVE_PROOF_ARCHIVE"),
+      destinationDir: requiredEnv(env, "REVIEW_LIVE_PROOF_AUGMENTATION_DIR"),
+      itemNumber: positiveIntegerEnv(env, "REVIEW_LIVE_PROOF_ITEM_NUMBER"),
+    });
+    process.stdout.write('{"materialized":true}\n');
+    return;
+  }
+  const context = contextFromEnv(env);
+  const augmentationDir = requiredEnv(env, "REVIEW_LIVE_PROOF_AUGMENTATION_DIR");
+  const coreManifestPath = requiredEnv(env, "REVIEW_LIVE_PROOF_CORE_MANIFEST");
+  if (command === "create") {
+    const manifest = createReviewLiveProofAugmentation({
+      augmentationDir,
+      cleanupFailurePath: optionalEnv(env, "REVIEW_LIVE_PROOF_CLEANUP_FAILURE"),
+      coreManifestPath,
+      proofDir: requiredEnv(env, "REVIEW_LIVE_PROOF_PROOF_DIR"),
+      createdAt: new Date().toISOString(),
+      context,
+    });
+    process.stdout.write(`${JSON.stringify(manifest)}\n`);
+  } else {
+    const manifest = validateReviewLiveProofAugmentation(
+      augmentationDir,
+      coreManifestPath,
+      context,
+    );
+    if (command === "merge") {
+      mergeReviewLiveProofAugmentation(
+        augmentationDir,
+        requiredEnv(env, "REVIEW_LIVE_PROOF_DESTINATION_DIR"),
+        manifest,
+      );
+    }
+    process.stdout.write(`${JSON.stringify(manifest)}\n`);
+  }
 }
 
-const env = process.env;
-const context = contextFromEnv(env);
-const augmentationDir = requiredEnv(env, "REVIEW_LIVE_PROOF_AUGMENTATION_DIR");
-const coreManifestPath = requiredEnv(env, "REVIEW_LIVE_PROOF_CORE_MANIFEST");
-if (command === "create") {
-  const manifest = createReviewLiveProofAugmentation({
-    augmentationDir,
-    cleanupFailurePath: optionalEnv(env, "REVIEW_LIVE_PROOF_CLEANUP_FAILURE"),
-    coreManifestPath,
-    proofDir: requiredEnv(env, "REVIEW_LIVE_PROOF_PROOF_DIR"),
-    createdAt: new Date().toISOString(),
-    context,
-  });
-  process.stdout.write(`${JSON.stringify(manifest)}\n`);
-} else {
-  const manifest = validateReviewLiveProofAugmentation(augmentationDir, coreManifestPath, context);
-  if (command === "merge") {
-    mergeReviewLiveProofAugmentation(
-      augmentationDir,
-      requiredEnv(env, "REVIEW_LIVE_PROOF_DESTINATION_DIR"),
-      manifest,
-    );
-  }
-  process.stdout.write(`${JSON.stringify(manifest)}\n`);
-}
+main();
 
 function contextFromEnv(env: NodeJS.ProcessEnv): ReviewLiveProofAugmentationContext {
   return {

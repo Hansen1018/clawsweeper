@@ -1,11 +1,14 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { deflateRawSync } from "node:zlib";
 
 import {
   createReviewLiveProofAugmentation,
+  materializeReviewLiveProofAugmentationArchive,
   mergeReviewLiveProofAugmentation,
   validateReviewLiveProofAugmentation,
   type ReviewLiveProofAugmentationContext,
@@ -235,3 +238,154 @@ test("augmentation rejects unknown and duplicate manifest inventory fields", () 
     /duplicate file paths/,
   );
 });
+
+test("augmentation archive materialization accepts only fixed regular entries", () => {
+  const value = fixture();
+  const archivePath = path.join(value.root, "augmentation.zip");
+  const destination = path.join(value.root, "materialized");
+  writeZipArchive(archivePath, [
+    { name: "manifest.json", data: Buffer.from('{"schema_version":1}\n') },
+    {
+      name: "live-proof/173/live-verification.json",
+      data: Buffer.from('{"schema_version":1}\n'),
+    },
+  ]);
+
+  const result = spawnSync(
+    process.execPath,
+    ["dist/live-proof/review-augmentation-cli.js", "materialize"],
+    {
+      cwd: process.cwd(),
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        REVIEW_LIVE_PROOF_ARCHIVE: archivePath,
+        REVIEW_LIVE_PROOF_AUGMENTATION_DIR: destination,
+        REVIEW_LIVE_PROOF_ITEM_NUMBER: "173",
+      },
+    },
+  );
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(JSON.parse(result.stdout), { materialized: true });
+
+  assert.equal(
+    fs.readFileSync(path.join(destination, "manifest.json"), "utf8"),
+    '{"schema_version":1}\n',
+  );
+  assert.equal(
+    fs.readFileSync(path.join(destination, "live-proof/173/live-verification.json"), "utf8"),
+    '{"schema_version":1}\n',
+  );
+});
+
+test("augmentation archive rejects unsafe entry paths and types before writing", () => {
+  const value = fixture();
+  const outside = path.join(value.root, "outside.txt");
+  fs.writeFileSync(outside, "sentinel\n");
+
+  for (const [name, entries] of [
+    ["absolute", [{ name: "/manifest.json", data: Buffer.from("invalid\n") }]],
+    ["traversal", [{ name: "../outside.txt", data: Buffer.from("replaced\n"), mode: 0o100644 }]],
+    [
+      "duplicate",
+      [
+        { name: "manifest.json", data: Buffer.from("first\n") },
+        { name: "manifest.json", data: Buffer.from("second\n") },
+      ],
+    ],
+    ["symlink", [{ name: "manifest.json", data: Buffer.from("../outside.txt"), mode: 0o120777 }]],
+    [
+      "hardlink-metadata",
+      [
+        {
+          name: "manifest.json",
+          data: Buffer.from("outside.txt"),
+          extra: Buffer.from([0x0d, 0, 0, 0]),
+        },
+      ],
+    ],
+    ["device", [{ name: "manifest.json", data: Buffer.from("device\n"), mode: 0o020666 }]],
+  ] as const) {
+    const archivePath = path.join(value.root, `${name}.zip`);
+    const destination = path.join(value.root, `${name}-materialized`);
+    writeZipArchive(archivePath, entries);
+    assert.throws(
+      () =>
+        materializeReviewLiveProofAugmentationArchive({
+          archivePath,
+          destinationDir: destination,
+          itemNumber: 173,
+        }),
+      /unexpected path|duplicate entries|plain regular files/,
+    );
+    assert.equal(fs.existsSync(destination), false);
+    assert.equal(fs.readFileSync(outside, "utf8"), "sentinel\n");
+  }
+});
+
+function writeZipArchive(
+  archivePath: string,
+  entries: ReadonlyArray<{ name: string; data: Buffer; mode?: number; extra?: Buffer }>,
+): void {
+  const localParts: Buffer[] = [];
+  const centralParts: Buffer[] = [];
+  let localOffset = 0;
+  for (const entry of entries) {
+    const name = Buffer.from(entry.name);
+    const extra = entry.extra ?? Buffer.alloc(0);
+    const checksum = crc32(entry.data);
+    const compressed = deflateRawSync(entry.data);
+    const local = Buffer.alloc(30);
+    local.writeUInt32LE(0x04034b50, 0);
+    local.writeUInt16LE(20, 4);
+    local.writeUInt16LE((1 << 11) | (1 << 3), 6);
+    local.writeUInt16LE(8, 8);
+    local.writeUInt16LE(name.length, 26);
+    local.writeUInt16LE(extra.length, 28);
+    const descriptor = Buffer.alloc(16);
+    descriptor.writeUInt32LE(0x08074b50, 0);
+    descriptor.writeUInt32LE(checksum, 4);
+    descriptor.writeUInt32LE(compressed.length, 8);
+    descriptor.writeUInt32LE(entry.data.length, 12);
+    localParts.push(local, name, extra, compressed, descriptor);
+
+    const central = Buffer.alloc(46);
+    central.writeUInt32LE(0x02014b50, 0);
+    central.writeUInt16LE((3 << 8) | 20, 4);
+    central.writeUInt16LE(20, 6);
+    central.writeUInt16LE((1 << 11) | (1 << 3), 8);
+    central.writeUInt16LE(8, 10);
+    central.writeUInt32LE(checksum, 16);
+    central.writeUInt32LE(compressed.length, 20);
+    central.writeUInt32LE(entry.data.length, 24);
+    central.writeUInt16LE(name.length, 28);
+    central.writeUInt16LE(extra.length, 30);
+    central.writeUInt32LE(((entry.mode ?? 0o100644) << 16) >>> 0, 38);
+    central.writeUInt32LE(localOffset, 42);
+    centralParts.push(central, name, extra);
+    localOffset +=
+      local.length + name.length + extra.length + compressed.length + descriptor.length;
+  }
+  const centralDirectory = Buffer.concat(centralParts);
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0);
+  end.writeUInt16LE(entries.length, 8);
+  end.writeUInt16LE(entries.length, 10);
+  end.writeUInt32LE(centralDirectory.length, 12);
+  end.writeUInt32LE(localOffset, 16);
+  fs.writeFileSync(archivePath, Buffer.concat([...localParts, centralDirectory, end]));
+}
+
+const CRC32_TABLE = Array.from({ length: 256 }, (_, value) => {
+  let crc = value;
+  for (let bit = 0; bit < 8; bit += 1) {
+    crc = (crc & 1) !== 0 ? 0xedb88320 ^ (crc >>> 1) : crc >>> 1;
+  }
+  return crc >>> 0;
+});
+
+function crc32(buffer: Buffer): number {
+  let crc = 0xffffffff;
+  for (const byte of buffer) crc = CRC32_TABLE[(crc ^ byte) & 0xff]! ^ (crc >>> 8);
+  return (crc ^ 0xffffffff) >>> 0;
+}
