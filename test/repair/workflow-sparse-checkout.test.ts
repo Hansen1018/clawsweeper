@@ -201,7 +201,7 @@ test("every durable review-record publication lane preserves the merged live-pro
       assert.ok(fold >= 0 && publish > fold, `${site} must fold live proof before publication`);
     }
   }
-  assert.equal(publicationSites.length, 5, JSON.stringify(publicationSites));
+  assert.equal(publicationSites.length, 4, JSON.stringify(publicationSites));
 });
 
 test("state-hydrating sparse repair workflows keep hydration dependencies", () => {
