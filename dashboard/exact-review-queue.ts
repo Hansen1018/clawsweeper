@@ -3847,6 +3847,7 @@ export class ExactReviewQueue {
       new Set(snapshotBatchOwnership.itemKeys),
       snapshotBatchOwnership.activeBatches,
       this.freshPublicationItemKeysSync(snapshot, startedAt),
+      this.supersededPublicationItemKeysSync(snapshot),
     );
     let snapshotBatchCandidates = snapshotBatchDeparture?.due
       ? this.publicationBatchCandidates(
@@ -3912,6 +3913,7 @@ export class ExactReviewQueue {
         new Set(snapshotBatchOwnership.itemKeys),
         snapshotBatchOwnership.activeBatches,
         this.freshPublicationItemKeysSync(snapshot, recheckedAt),
+        this.supersededPublicationItemKeysSync(snapshot),
       );
       snapshotBatchCandidates = snapshotBatchDeparture?.due
         ? this.publicationBatchCandidates(
@@ -5929,7 +5931,10 @@ export class ExactReviewQueue {
     // shared helper counts candidate rows, so widen only its scan window by
     // requestedSize; passing +1 here would silently collapse every batch to one.
     const activePublishers = exactReviewQueueActivePublicationCount(state);
-    const excludedItemKeys = new Set<string>(batchOwnership.itemKeys);
+    const excludedItemKeys = new Set<string>([
+      ...batchOwnership.itemKeys,
+      ...this.supersededPublicationItemKeysSync(state),
+    ]);
     for (const item of Object.values(state.items)) {
       // Direct receipts and terminal acknowledgement drivers must remain on
       // the normal publisher. Exclude them before admission so they cannot
@@ -5940,14 +5945,8 @@ export class ExactReviewQueue {
       if (exactReviewGithubCircuitBlocksItem(state, item, now)) {
         excludedItemKeys.add(item.key);
       }
-      const revision = exactReviewPublicationRevision(item.decision);
-      if (
-        revision &&
-        revision.sourceRevision < this.publicationHeadRevisionSync(revision.targetKey)
-      ) {
-        excludedItemKeys.add(item.key);
-      }
     }
+    const freshItemKeys = this.freshPublicationItemKeysSync(state, now);
     const readyCandidates =
       activePublishers >= publicationCapacity
         ? []
@@ -5960,28 +5959,25 @@ export class ExactReviewQueue {
             excludedItemKeys,
             false, // batching replaces legacy publication blocking at this admission point
             true, // one durable item path per commit; later events remain FIFO candidates
-            this.freshPublicationItemKeysSync(state, now),
+            freshItemKeys,
             exactReviewPublicationFreshLaneMaxItems(this.env),
           )
             // A direct receipt has already committed its GitHub effect. Its
             // immutable lifecycle plan must return through the fenced legacy
             // publisher, which is the only path that replays that plan.
             .filter(exactReviewQueueIsBatchablePublication)
-            .filter((item) => !item.terminalFinalization)
-            .filter((item) => {
-              const revision = exactReviewPublicationRevision(item.decision);
-              return (
-                !revision ||
-                revision.sourceRevision >= this.publicationHeadRevisionSync(revision.targetKey)
-              );
-            });
-    const firstOwner = readyCandidates[0]?.decision.targetRepo.split("/", 1)[0]?.toLowerCase();
+            .filter((item) => !item.terminalFinalization);
+    const selection = exactReviewPublicationBatchSelection(
+      readyCandidates,
+      freshItemKeys,
+      exactReviewPublicationBatchSize(this.env),
+      exactReviewPublicationBatchWaitMs(this.env),
+      now,
+    );
     // One GitHub App installation token is scoped to one owner. Keeping a batch
     // owner-homogeneous lets the workflow retain least privilege without serially
     // minting and exporting a different credential for every item.
-    return readyCandidates
-      .filter((item) => item.decision.targetRepo.split("/", 1)[0]?.toLowerCase() === firstOwner)
-      .slice(0, leaseSize);
+    return selection?.candidates.slice(0, leaseSize) ?? [];
   }
 
   private async claimPublicationBatch(value: unknown) {
@@ -7851,6 +7847,20 @@ export class ExactReviewQueue {
       ),
     )[0] as { source_revision?: number } | undefined;
     return Number(row?.source_revision || 0);
+  }
+
+  private supersededPublicationItemKeysSync(state: ExactReviewQueueState) {
+    // Active batch ownership can preserve an older row after a newer head lands.
+    // Departure and claim must exclude that same row when ownership expires.
+    return new Set(
+      Object.values(state.items).flatMap((item) => {
+        const revision = exactReviewPublicationRevision(item.decision);
+        return revision &&
+          revision.sourceRevision < this.publicationHeadRevisionSync(revision.targetKey)
+          ? [item.key]
+          : [];
+      }),
+    );
   }
 
   private nextExactReviewItemRevisionSync(itemKey: string, minimumRevision = 1): number {
@@ -10854,6 +10864,7 @@ export class ExactReviewQueue {
       new Set(batchOwnership.itemKeys),
       batchOwnership.activeBatches,
       this.freshPublicationItemKeysSync(state, now),
+      this.supersededPublicationItemKeysSync(state),
     );
     const sourceAuthorityNext = await this.nextSourceAuthorityVerificationAt();
     const commandIntakeNext = this.commandIntakeStore.nextAttemptAt();
@@ -12959,6 +12970,7 @@ function exactReviewPublicationBatchDeparture(
   ownedItemKeys: ReadonlySet<string>,
   activeBatchCount: number,
   freshItemKeys: ReadonlySet<string> = new Set(),
+  supersededItemKeys: ReadonlySet<string> = new Set(),
 ) {
   if (
     !exactReviewPublicationBatchingEnabled(env) ||
@@ -12974,6 +12986,7 @@ function exactReviewPublicationBatchDeparture(
           item.state === "pending" &&
           !item.terminalFinalization &&
           !ownedItemKeys.has(item.key) &&
+          !supersededItemKeys.has(item.key) &&
           !exactReviewGithubCircuitBlocksItem(state, item, now),
       )
       .sort((left, right) => left.createdAt - right.createdAt || left.key.localeCompare(right.key)),
@@ -12981,40 +12994,27 @@ function exactReviewPublicationBatchDeparture(
     exactReviewPublicationFreshLaneMaxItems(env),
   );
   const maxItems = exactReviewPublicationBatchSize(env);
+  const waitMs = exactReviewPublicationBatchWaitMs(env);
   const nextEligibilityAt = pending.reduce(
     (earliest, item) =>
       item.nextAttemptAt > now ? Math.min(earliest, item.nextAttemptAt) : earliest,
     Number.POSITIVE_INFINITY,
   );
   const candidates = pending.filter((item) => item.nextAttemptAt <= now);
-  const freshOwner = candidates
-    .find((item) => freshItemKeys.has(item.key))
-    ?.decision.targetRepo.split("/", 1)[0]
-    ?.toLowerCase();
-  const owner = freshOwner ?? candidates[0]?.decision.targetRepo.split("/", 1)[0]?.toLowerCase();
-  if (!owner) {
+  const selection = exactReviewPublicationBatchSelection(
+    candidates,
+    freshItemKeys,
+    maxItems,
+    waitMs,
+    now,
+  );
+  if (!selection) {
     return Number.isFinite(nextEligibilityAt)
       ? { candidateCount: 0, maxItems, dueAt: nextEligibilityAt, due: false }
       : null;
   }
-  const candidatesByOwner = new Map<string, ExactReviewQueueItem[]>();
-  for (const item of candidates) {
-    const candidateOwner = item.decision.targetRepo.split("/", 1)[0]?.toLowerCase();
-    if (!candidateOwner) continue;
-    const group = candidatesByOwner.get(candidateOwner) ?? [];
-    group.push(item);
-    candidatesByOwner.set(candidateOwner, group);
-  }
-  // Keep a fresh owner's bounded service even when another owner could fill a
-  // historical batch. Without fresh work, retain the existing full-owner choice.
-  const selectedOwner =
-    freshOwner ??
-    [...candidatesByOwner].find(([, group]) => group.length >= maxItems)?.[0] ??
-    owner;
-  const ownerCandidates = candidatesByOwner.get(selectedOwner)!;
-  const oldestAt = ownerCandidates[0]!.createdAt;
-  const fullAt = ownerCandidates.length >= maxItems ? now : Number.POSITIVE_INFINITY;
-  const ageAt = oldestAt + exactReviewPublicationBatchWaitMs(env);
+  const fullAt = selection.candidates.length >= maxItems ? now : Number.POSITIVE_INFINITY;
+  const ageAt = selection.oldestAt + waitMs;
   const lastAttemptAt = Number(state.dispatcher?.publicationBatchDispatchedAt || 0);
   const dispatchRetryMs = state.dispatcher?.publicationBatchDispatchSucceeded
     ? exactReviewPublicationBatchDispatchCooldownMs(env)
@@ -13028,10 +13028,60 @@ function exactReviewPublicationBatchDeparture(
   // so they must retain their own wake-up even when today's partial batch is older.
   const dueAt = Math.min(dispatchDueAt, nextEligibilityAt);
   return {
-    candidateCount: ownerCandidates.length,
+    candidateCount: selection.candidates.length,
     maxItems,
     dueAt,
     due: dueAt <= now,
+  };
+}
+
+function exactReviewPublicationBatchSelection(
+  candidates: ExactReviewQueueItem[],
+  freshItemKeys: ReadonlySet<string>,
+  maxItems: number,
+  waitMs: number,
+  now: number,
+) {
+  const candidatesByOwner = new Map<string, ExactReviewQueueItem[]>();
+  let oldest: ExactReviewQueueItem | undefined;
+  let oldestAged: ExactReviewQueueItem | undefined;
+  for (const item of candidates) {
+    const owner = item.decision.targetRepo.split("/", 1)[0]?.toLowerCase();
+    if (!owner) continue;
+    const group = candidatesByOwner.get(owner) ?? [];
+    group.push(item);
+    candidatesByOwner.set(owner, group);
+    if (
+      !oldest ||
+      item.createdAt < oldest.createdAt ||
+      (item.createdAt === oldest.createdAt && item.key.localeCompare(oldest.key) < 0)
+    ) {
+      oldest = item;
+    }
+    if (
+      item.createdAt + waitMs <= now &&
+      (!oldestAged ||
+        item.createdAt < oldestAged.createdAt ||
+        (item.createdAt === oldestAged.createdAt && item.key.localeCompare(oldestAged.key) < 0))
+    ) {
+      oldestAged = item;
+    }
+  }
+  const ownerFor = (item: ExactReviewQueueItem | undefined) =>
+    item?.decision.targetRepo.split("/", 1)[0]?.toLowerCase();
+  // Departure and claim must choose the same installation owner. Once an
+  // owner's oldest work has waited a full batch window, cross-owner fresh/full
+  // optimization yields to that owner; ordering within the owner stays intact.
+  const selectedOwner =
+    ownerFor(oldestAged) ??
+    ownerFor(candidates.find((item) => freshItemKeys.has(item.key))) ??
+    [...candidatesByOwner].find(([, group]) => group.length >= maxItems)?.[0] ??
+    ownerFor(oldest);
+  const selected = selectedOwner ? candidatesByOwner.get(selectedOwner) : undefined;
+  if (!selected?.length) return null;
+  return {
+    candidates: selected,
+    oldestAt: oldest!.createdAt,
   };
 }
 
