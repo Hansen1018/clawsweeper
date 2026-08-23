@@ -1233,10 +1233,11 @@ export default {
 
 async function statusJson(request, env, ctx) {
   const cache = caches.default;
-  const cached = await cache.match(statusCacheRequest(request, "fresh"));
+  const publicBayScope = publicBayRepositoryScope(verifiedPublicBayRepositories(env));
+  const cached = await cache.match(statusCacheRequest(request, "fresh", publicBayScope));
   if (cached) return cachedStatusResponse(cached, "fresh", env);
 
-  const stale = await cache.match(statusCacheRequest(request, "stale"));
+  const stale = await cache.match(statusCacheRequest(request, "stale", publicBayScope));
   if (stale && ctx?.waitUntil) {
     ctx.waitUntil(refreshStatus(request, env).catch(() => undefined));
     return cachedStatusResponse(stale, "stale", env);
@@ -1454,7 +1455,9 @@ const PUBLIC_STATUS_TEXT_VALUES = new Set([
   "congested",
   "commit-review",
   "completed",
+  "completed_exact_review_lifecycles",
   "completed_review_journeys",
+  "durable_exact_review_lifecycles",
   "degraded",
   "exact-review",
   "6h",
@@ -1505,6 +1508,7 @@ const PUBLIC_STATUS_TEXT_VALUES = new Set([
   "unresolved",
   "unknown",
   "waiting",
+  "warming",
   "workflow",
   "workflow-fallback",
   "malformed",
@@ -1536,6 +1540,7 @@ const PUBLIC_STATUS_TEXT_FIELDS = new Set([
   "stage",
   "state",
   "status",
+  "metrics_state",
   "terminal_outcome",
   "work_kind",
 ]);
@@ -1554,6 +1559,7 @@ const PUBLIC_STATUS_TIME_FIELDS = new Set([
   "next_attempt_at",
   "next_wake_at",
   "last_tide_at",
+  "timing_coverage_started_at",
   "received_at",
   "since",
   "started_at",
@@ -1828,6 +1834,7 @@ const PUBLIC_STATUS_BOOLEAN_FIELDS = new Set([
   "public_projection_complete",
   "recovered",
   "telemetry_complete",
+  "timing_coverage_complete",
   "workflow_run_census_complete",
   "durable_server_observed",
 ]);
@@ -2586,6 +2593,10 @@ function verifiedPublicBayRepositories(env) {
   return new Set<string>(repositories);
 }
 
+function publicBayRepositoryScope(allowedRepositories: ReadonlySet<string>) {
+  return Array.from(allowedRepositories).sort().join(",");
+}
+
 export function publicStatusProjection(
   snapshot,
   allowedRepositories: ReadonlySet<string> = new Set(),
@@ -2826,13 +2837,15 @@ function refreshStatus(request, env) {
 async function refreshStatusCaches(request, env) {
   const ttl = numberFrom(env.CACHE_TTL_SECONDS, 60);
   const staleTtl = numberFrom(env.STALE_CACHE_TTL_SECONDS, STALE_CACHE_TTL_SECONDS);
+  const allowedRepositories = verifiedPublicBayRepositories(env);
+  const publicBayScope = publicBayRepositoryScope(allowedRepositories);
   const baseSnapshot = await statusSnapshot(env);
   // Queue stats and the GitHub-backed global lease are operational observations, not
   // request-specific data. Cache the composed document so a cache hit never waits on
   // those remote probes; the existing stale-while-revalidate path refreshes them safely.
   const snapshot = publicStatusProjection(
     await attachExactReviewQueueStatus(baseSnapshot, env),
-    verifiedPublicBayRepositories(env),
+    allowedRepositories,
   );
   const body = JSON.stringify(snapshot, null, 2);
   const hasErrors = Number(snapshot.diagnostics?.error_count || 0) > 0;
@@ -2842,12 +2855,12 @@ async function refreshStatusCaches(request, env) {
       Number(snapshot.fleet?.active_workflow_runs || 0) === 0 &&
       hasErrors);
   if (snapshot.public_projection_complete !== true && env.STATUS_STORE) {
-    await writeStatusStoreText(env.STATUS_STORE, "snapshot", body);
+    await writeCachedStatusSnapshot(env.STATUS_STORE, body, publicBayScope);
   }
   if (!looksEmpty) {
     const writes = [
       caches.default.put(
-        statusCacheRequest(request, "fresh"),
+        statusCacheRequest(request, "fresh", publicBayScope),
         new Response(body, {
           headers: {
             "content-type": "application/json; charset=utf-8",
@@ -2856,7 +2869,7 @@ async function refreshStatusCaches(request, env) {
         }),
       ),
       caches.default.put(
-        statusCacheRequest(request, "stale"),
+        statusCacheRequest(request, "stale", publicBayScope),
         new Response(body, {
           headers: {
             "content-type": "application/json; charset=utf-8",
@@ -2865,14 +2878,17 @@ async function refreshStatusCaches(request, env) {
         }),
       ),
     ];
-    if (env.STATUS_STORE) writes.push(writeStatusStoreText(env.STATUS_STORE, "snapshot", body));
+    if (env.STATUS_STORE) {
+      writes.push(writeCachedStatusSnapshot(env.STATUS_STORE, body, publicBayScope));
+    }
     await Promise.allSettled(writes);
   }
   return { snapshot, body, looksEmpty };
 }
 
-function statusCacheRequest(request, bucket) {
-  return new Request(new URL(`/api/status-cache/v4/${bucket}`, request.url).toString(), {
+function statusCacheRequest(request, bucket, publicBayScope) {
+  const scope = publicBayScope ? encodeURIComponent(publicBayScope) : "_";
+  return new Request(new URL(`/api/status-cache/v6/${scope}/${bucket}`, request.url).toString(), {
     method: "GET",
   });
 }
@@ -5181,6 +5197,105 @@ export async function exactReviewQueueStatusSnapshot(
   return body;
 }
 
+async function exactReviewBayLifecycleMetricsSnapshot(env) {
+  if (!exactReviewQueueStub(env)) return null;
+  const allowedRepositories = verifiedPublicBayRepositories(env);
+  const query = new URLSearchParams();
+  for (const repository of [...allowedRepositories].sort()) query.append("public_repo", repository);
+  if (allowedRepositories.size === 0) query.append("public_repo", "");
+  const response = await exactReviewQueueRequest(env, `/bay-lifecycle-metrics?${query.toString()}`);
+  const body = objectValue(await response.json().catch(() => null));
+  if (!response.ok) return null;
+  const source = objectValue(body.bay_lifecycle_metrics);
+  const collection = objectValue(source.collection);
+  if (source.version !== 1 || collection.state !== "complete") return null;
+  const coverage = objectValue(source.coverage);
+  const timings = objectValue(source.timings);
+  const terminal = objectValue(source.terminal);
+  const startedAt = publicQueueTimestamp(coverage.started_at);
+  const timingComplete = coverage.timing_complete;
+  const sampleKind = String(timings.sample_kind || "");
+  const windowMinutes = publicQueueCount(timings.window_minutes, 24 * 60);
+  const sampleLimit = publicQueueCount(timings.sample_limit, 100_000);
+  const overall = objectValue(timings.overall);
+  const samples = publicQueueCount(overall.samples, 100_000);
+  const average =
+    overall.average_ms === null
+      ? null
+      : publicQueueCount(overall.average_ms, 31 * 24 * 60 * 60 * 1000);
+  const median =
+    overall.median_ms === null
+      ? null
+      : publicQueueCount(overall.median_ms, 31 * 24 * 60 * 60 * 1000);
+  const invalidTimingAggregate =
+    samples === null ||
+    (samples === 0 ? average !== null || median !== null : average === null || median === null);
+  const terminalCount = publicQueueCount(terminal.terminal_count, 20);
+  const tideThreshold = publicQueueCount(terminal.tide_threshold, 100);
+  const tideGeneration = publicQueueCount(terminal.tide_generation, 1_000_000);
+  const lastTideAt =
+    terminal.last_tide_at === null ? null : publicQueueTimestamp(terminal.last_tide_at);
+  const terminalBuffer = bayLifecycleTerminalRows(terminal.terminal_buffer);
+  const recentlyWashed = bayLifecycleTerminalRows(terminal.recently_washed);
+  if (
+    !startedAt ||
+    typeof timingComplete !== "boolean" ||
+    sampleKind !== "completed_exact_review_lifecycles" ||
+    windowMinutes !== 60 ||
+    sampleLimit === null ||
+    invalidTimingAggregate ||
+    terminalCount === null ||
+    tideThreshold !== 20 ||
+    tideGeneration === null ||
+    (terminal.last_tide_at !== null && !lastTideAt) ||
+    !terminalBuffer ||
+    !recentlyWashed ||
+    terminalBuffer.length !== terminalCount
+  ) {
+    return null;
+  }
+  return {
+    timing_coverage_started_at: startedAt,
+    timing_coverage_complete: timingComplete,
+    metrics_state: timingComplete ? "complete" : "warming",
+    timings: {
+      window_minutes: windowMinutes,
+      // `sample_kind` is a v1 public enum. Preserve its established spelling for
+      // strict clients, and expose the durable replacement provenance additively.
+      sample_kind: "completed_review_journeys",
+      source: "durable_exact_review_lifecycles",
+      sample_limit: sampleLimit,
+      overall: { average_ms: average, median_ms: median, samples },
+    },
+    terminal_count: terminalCount,
+    tide_threshold: tideThreshold,
+    tide_generation: tideGeneration,
+    last_tide_at: lastTideAt,
+    terminal_buffer: terminalBuffer,
+    recently_washed: recentlyWashed,
+  };
+}
+
+function bayLifecycleTerminalRows(value) {
+  if (!Array.isArray(value) || value.length > 20) return null;
+  const rows = [];
+  for (const entry of value) {
+    const row = objectValue(entry);
+    const itemKey = String(row.item_key || "").toLowerCase();
+    const outcome = String(row.outcome || "");
+    const completedAt = publicQueueTimestamp(row.completed_at);
+    if (
+      !/^[a-z0-9_.-]+\/[a-z0-9_.-]+#[1-9]\d*$/.test(itemKey) ||
+      !["success", "failure", "cancelled"].includes(outcome) ||
+      !completedAt
+    ) {
+      return null;
+    }
+    rows.push({ item_key: itemKey, outcome, completed_at: completedAt });
+  }
+  return rows;
+}
+
 async function authenticatedExactReviewEnqueue(request, env) {
   const secret = stringEnv(env.CLAWSWEEPER_WEBHOOK_SECRET);
   if (!secret) return json({ error: "webhook_not_configured" }, 503);
@@ -6018,9 +6133,25 @@ function constantTimeEqual(left, right) {
 
 async function statusSnapshot(env) {
   const ttl = numberFrom(env.CACHE_TTL_SECONDS, 20);
-  const cached = await readCachedSnapshot(env, ttl);
-  if (cached?.bay?.timings?.sample_kind === "completed_review_journeys") {
-    return publicStatusProjection(cached, verifiedPublicBayRepositories(env));
+  const allowedRepositories = verifiedPublicBayRepositories(env);
+  const publicBayScope = publicBayRepositoryScope(allowedRepositories);
+  const scopedCached = await readCachedSnapshot(env, ttl, publicBayScope);
+  // A legacy cache entry without scope provenance can still describe a
+  // malformed document. Keep that fail-closed path, but never reuse it as a
+  // complete durable lifecycle snapshot.
+  const cached = scopedCached || (await readCachedSnapshot(env, ttl));
+  const cachedTimings = objectValue(cached?.bay?.timings);
+  const cachedProjection = cached ? publicStatusProjection(cached, allowedRepositories) : null;
+  // A malformed durable document should fail closed without triggering a
+  // costly background collection. A complete legacy document, however, must
+  // be rebuilt before it can be copied into the current cache generation.
+  if (cachedProjection?.public_projection_complete === false) return cachedProjection;
+  if (
+    cachedTimings.sample_kind === "completed_review_journeys" &&
+    cachedTimings.source === "durable_exact_review_lifecycles" &&
+    scopedCached === cached
+  ) {
+    return cachedProjection;
   }
 
   const github = createGithubJsonCache(env);
@@ -6224,29 +6355,30 @@ async function statusSnapshot(env) {
   ]);
   errors.push(...activeJobs.errors);
   errors.push(...workerHealth.errors);
-  const journeyBay = await readBayJourneyState(env).catch((error) => {
-    errors.push(`OpenClaw Bay journey state: ${error instanceof Error ? error.message : error}`);
-    return { journeys: [] };
-  });
-  const completedReviews = completedBayReviews(journeyBay.journeys);
-  const terminalBay = await updateBayTerminalState(
-    env,
-    workerHealth.recent_attempts,
-    closed.items,
-    generatedAt,
-    activeBayItemKeys(activeJobs.workers),
-    completedReviews,
-    completedReviews.length > 0,
-    activeJobs.complete,
+  const authoritativeBay = await withTimeout(
+    exactReviewBayLifecycleMetricsSnapshot(env),
+    OPTIONAL_SECTION_TIMEOUT_MS,
+    "Bay lifecycle metrics",
   ).catch((error) => {
-    errors.push(`OpenClaw Bay terminal state: ${error instanceof Error ? error.message : error}`);
-    return emptyBayTerminalState(generatedAt);
+    errors.push(error.message);
+    return null;
   });
-  const bay = {
-    ...terminalBay,
-    active_census_complete: activeJobs.complete,
-    timings: summarizeBayJourneyTimings(journeyBay.journeys, generatedAt),
-  };
+  const bay = authoritativeBay
+    ? { ...authoritativeBay, active_census_complete: activeJobs.complete }
+    : {
+        ...emptyBayTerminalState(generatedAt),
+        active_census_complete: activeJobs.complete,
+        metrics_state: "unavailable",
+        timing_coverage_complete: false,
+        timing_coverage_started_at: null,
+        timings: {
+          window_minutes: BAY_TIMING_WINDOW_MS / 60_000,
+          sample_kind: "completed_review_journeys",
+          source: "durable_exact_review_lifecycles",
+          sample_limit: 0,
+          overall: { average_ms: null, median_ms: null, samples: 0 },
+        },
+      };
   const { recent_attempts: _recentAttempts, ...publicWorkerHealth } = workerHealth;
 
   const snapshot = {
@@ -6332,17 +6464,18 @@ async function attachExactReviewQueueStatus(snapshot, env) {
   ]);
   if (queueResult.status === "fulfilled") exactReviewQueue = queueResult.value;
   if (eventsResult.status === "fulfilled") recentDurablePublicationEvents = eventsResult.value;
+  const allowedRepositories = verifiedPublicBayRepositories(env);
   const staleStatusSnapshot =
     queueResult.status === "rejected"
       ? await readCachedSnapshot(
           env,
           numberFrom(env.STALE_CACHE_TTL_SECONDS, STALE_CACHE_TTL_SECONDS),
+          publicBayRepositoryScope(allowedRepositories),
         )
       : null;
   const priorExactReviewQueue = objectValue(
     snapshot.exact_review_queue || staleStatusSnapshot?.exact_review_queue,
   );
-  const allowedRepositories = verifiedPublicBayRepositories(env);
   const projectedPriorExactReviewQueue = publicExactReviewQueueProjection(
     priorExactReviewQueue,
     allowedRepositories,
@@ -7972,11 +8105,6 @@ async function updateBayJourneyState(env, triggers, completions, generatedAt) {
   return publicBayJourneyState(next);
 }
 
-async function readBayJourneyState(env) {
-  if (!env.STATUS_STORE) return { journeys: [] };
-  return publicBayJourneyState(await readStoredJson(env, BAY_JOURNEY_STATE_KEY));
-}
-
 function workerHealthAttempt(run, job) {
   if (String(job?.status || "") !== "completed") return null;
   const runItem = classifyRun(run);
@@ -8121,54 +8249,6 @@ export function completedBayReviews(journeys) {
       },
     ];
   });
-}
-
-async function updateBayTerminalState(
-  env,
-  attempts,
-  closedItems,
-  generatedAt,
-  activeItemKeys,
-  completedReviews = [],
-  completedReviewsAuthoritative = false,
-  activeItemKeysAuthoritative = true,
-) {
-  if (isDurableStatusStore(env.STATUS_STORE)) {
-    const response = await durableStatusStoreStub(env.STATUS_STORE).fetch(
-      statusStoreRequest(BAY_TERMINAL_STATE_KEY, "POST"),
-      {
-        method: "POST",
-        body: JSON.stringify({
-          attempts,
-          closed_items: closedItems,
-          generated_at: generatedAt,
-          ttl_seconds: EVENT_STORE_TTL_SECONDS,
-          active_item_keys: activeItemKeys,
-          completed_reviews: completedReviews,
-          completed_reviews_authoritative: completedReviewsAuthoritative,
-          active_item_keys_authoritative: activeItemKeysAuthoritative,
-        }),
-      },
-    );
-    if (!response.ok) throw new Error(`status store Bay merge failed: ${response.status}`);
-    return publicBayTerminalState(await response.json());
-  }
-  const stored = await readStoredJson(env, BAY_TERMINAL_STATE_KEY);
-  const next = mergeBayTerminalState(
-    stored,
-    attempts,
-    closedItems,
-    generatedAt,
-    activeItemKeys,
-    completedReviews,
-    completedReviewsAuthoritative,
-    activeItemKeysAuthoritative,
-  );
-  if (!stored || bayTerminalStateSignature(stored) !== bayTerminalStateSignature(next)) {
-    await writeStoredJson(env, BAY_TERMINAL_STATE_KEY, next, EVENT_STORE_TTL_SECONDS);
-    return publicBayTerminalState(next);
-  }
-  return publicBayTerminalState(stored);
 }
 
 export function mergeBayTerminalState(
@@ -8623,20 +8703,6 @@ function bayTerminalCandidates(attempts, closedItems, completedReviews = []) {
   return candidates.sort(
     (left, right) => Date.parse(left.completed_at) - Date.parse(right.completed_at),
   );
-}
-
-function publicBayTerminalState(state) {
-  return {
-    schema_version: 1,
-    tide_threshold: state.tide_threshold,
-    tide_generation: state.tide_generation,
-    last_tide_at: state.last_tide_at,
-    terminal_count: state.terminal_count,
-    terminal_buffer: state.terminal_buffer,
-    washed_at: state.washed_at,
-    recently_washed: state.recently_washed,
-    updated_at: state.updated_at,
-  };
 }
 
 function emptyBayTerminalState(generatedAt) {
@@ -10380,9 +10446,26 @@ function automergeCommentTime(comment) {
   return Number.isFinite(timestamp) ? timestamp : Number.MAX_SAFE_INTEGER;
 }
 
-export async function readCachedSnapshot(env, ttlSeconds) {
+const STATUS_SNAPSHOT_KEY = "snapshot";
+const STATUS_SNAPSHOT_BAY_SCOPE_KEY_PREFIX = "snapshot:bay-scope:v1:";
+
+function cachedStatusSnapshotKey(publicBayScope) {
+  return `${STATUS_SNAPSHOT_BAY_SCOPE_KEY_PREFIX}${
+    publicBayScope ? encodeURIComponent(publicBayScope) : "_"
+  }`;
+}
+
+async function writeCachedStatusSnapshot(store, body, publicBayScope) {
+  await writeStatusStoreText(store, cachedStatusSnapshotKey(publicBayScope), body);
+}
+
+export async function readCachedSnapshot(env, ttlSeconds, expectedBayScope?: string) {
   if (!env.STATUS_STORE) return null;
-  const text = await readStatusStoreText(env.STATUS_STORE, "snapshot");
+  const key =
+    expectedBayScope === undefined
+      ? STATUS_SNAPSHOT_KEY
+      : cachedStatusSnapshotKey(expectedBayScope);
+  const text = await readStatusStoreText(env.STATUS_STORE, key);
   if (!text) return null;
   let snapshot;
   try {
