@@ -165,7 +165,7 @@ const logPath = ${JSON.stringify(logPath)};
 const rawArgs = process.argv.slice(2);
 const args = rawArgs[0] === "--repo" ? rawArgs.slice(2) : rawArgs;
 appendFileSync(logPath, JSON.stringify(args) + "\\n");
-const path = args[1] || "";
+const path = args[1] === "-i" ? args[2] || "" : args[1] || "";
 if (args[0] === "api" && /\\/issues\\/321\\/comments(?:\\?|$)/.test(path)) {
   console.log(JSON.stringify([[]]));
 } else if (args[0] === "api" && /\\/issues\\/321$/.test(path)) {
@@ -571,7 +571,7 @@ const updatedAt = { 321: "2026-05-01T00:00:00Z", 322: "2026-05-02T00:00:00Z" };
 const rawArgs = process.argv.slice(2);
 const args = rawArgs[0] === "--repo" ? rawArgs.slice(2) : rawArgs;
 appendFileSync(logPath, JSON.stringify(args) + "\\n");
-const path = args[1] || "";
+const path = args[1] === "-i" ? args[2] || "" : args[1] || "";
 const commentMatch = path.match(/\\/issues\\/(\\d+)\\/comments(?:\\?|$)/);
 const issueMatch = path.match(/\\/issues\\/(\\d+)$/);
 if (args[0] === "api" && commentMatch) {
@@ -732,7 +732,7 @@ const comments = ${JSON.stringify({ 321: first.comment, 322: second.comment })};
 const rawArgs = process.argv.slice(2);
 const args = rawArgs[0] === "--repo" ? rawArgs.slice(2) : rawArgs;
 appendFileSync(logPath, JSON.stringify(args) + "\\n");
-const path = args[1] || "";
+const path = args[1] === "-i" ? args[2] || "" : args[1] || "";
 const commentMatch = path.match(/\\/issues\\/(\\d+)\\/comments(?:\\?|$)/);
 const issueMatch = path.match(/\\/issues\\/(\\d+)$/);
 if (args[0] === "api" && /\\/issues\\/comments\\/\\d+$/.test(path)) {
@@ -740,6 +740,8 @@ if (args[0] === "api" && /\\/issues\\/comments\\/\\d+$/.test(path)) {
   const body = JSON.parse(readFileSync(inputPath, "utf8")).body;
   appendFileSync(logPath, JSON.stringify(["comment-patch", body]) + "\\n");
   console.log(JSON.stringify({ id: 9000 + 321, html_url: "https://github.com/openclaw/clawsweeper/issues/321#issuecomment-9321", updated_at: "2026-05-01T01:02:00Z", body }));
+} else if (args[0] === "api" && /\\/issues\\/\\d+\\/timeline(?:\\?|$)/.test(path)) {
+  console.log("HTTP/2 200\\n\\n[]");
 } else if (args[0] === "api" && commentMatch) {
   const number = Number(commentMatch[1]);
   const body = comments[number];
@@ -837,7 +839,7 @@ if (args[0] === "api" && /\\/issues\\/comments\\/\\d+$/.test(path)) {
           (args[1] ?? "").includes("/issues/321/comments") &&
           args.includes("--paginate"),
       );
-    assert.equal(postMutationReviewCommentFetches.length, 0);
+    assert.equal(postMutationReviewCommentFetches.length, 1);
     assert.deepEqual(JSON.parse(readFileSync(reportPath, "utf8")), [
       {
         number: 321,

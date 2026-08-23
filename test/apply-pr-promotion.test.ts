@@ -508,6 +508,7 @@ test("apply-decisions promotes old F-rated stale PRs with low-signal close seman
     mkdirSync(itemsDir, { recursive: true });
     mkdirSync(plansDir, { recursive: true });
     const staleReport = stalePullRequestReport({
+      pull_head_sha: "head-sha",
       work_cluster_refs: JSON.stringify(["Related discussion in #400"]),
     }).replace(
       "## Summary\n\nThe dashboard has queue_fix_pr candidates but no generated coding plan.",
@@ -587,6 +588,9 @@ test("apply-decisions promotes old F-rated stale PRs with low-signal close seman
     assert.doesNotMatch(promoted, /## Summary\n\nKeep open:/);
     const closeAppliedBody = readFileSync(closeAppliedBodyLogPath, "utf8");
     assert.match(closeAppliedBody, /Close reason: low-signal unmergeable PR\./);
+    assert.match(closeAppliedBody, /recorded closeout evidence/);
+    assert.match(closeAppliedBody, /Review evidence: \[durable ClawSweeper review\]/);
+    assert.doesNotMatch(closeAppliedBody, /Implementation evidence:/);
     assert.doesNotMatch(closeAppliedBody, /Keep open:/);
   } finally {
     rmSync(root, { recursive: true, force: true });
