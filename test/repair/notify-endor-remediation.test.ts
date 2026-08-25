@@ -386,7 +386,7 @@ test("delivery requeues the live PR head instead of notifying a stale reviewed h
     env: hermitEnv(),
     log: () => undefined,
     fetch: async (input, init) => {
-      if (String(input).includes("api.github.com")) {
+      if (new URL(String(input)).hostname === "api.github.com") {
         return jsonResponse({
           head: { sha: NEXT_HEAD },
           user: {
@@ -422,7 +422,7 @@ test("transient delivery-time GitHub failures remain retryable without notifying
     env: hermitEnv(),
     log: () => undefined,
     fetch: async (input, init) => {
-      if (String(input).includes("api.github.com")) {
+      if (new URL(String(input)).hostname === "api.github.com") {
         return new Response("temporarily unavailable", { status: 503 });
       }
       if (init?.method === "POST") hookRequests += 1;
@@ -702,9 +702,12 @@ function deliveryFixtureFetch({
   onHook: (input: URL | RequestInfo, init?: RequestInit) => Promise<Response>;
 }): typeof fetch {
   return async (input, init) => {
-    const url = String(input);
-    if (url.includes("api.github.com")) onGithub(input, init);
-    if (/api\.github\.com\/repos\/[^/]+\/[^/]+\/pulls\/\d+$/.test(url)) {
+    const url = new URL(String(input));
+    if (url.hostname === "api.github.com") onGithub(input, init);
+    if (
+      url.hostname === "api.github.com" &&
+      /^\/repos\/[^/]+\/[^/]+\/pulls\/\d+$/.test(url.pathname)
+    ) {
       return jsonResponse({
         head: { sha: head() },
         user: {
@@ -721,7 +724,7 @@ function deliveryFixtureFetch({
         updated_at: "2026-08-24T00:03:00Z",
       });
     }
-    if (url.includes("/check-runs")) {
+    if (url.pathname.endsWith("/check-runs")) {
       return jsonResponse({
         check_runs: [
           { name: "build", status: "completed", conclusion: "success" },
@@ -729,7 +732,9 @@ function deliveryFixtureFetch({
         ],
       });
     }
-    if (url.endsWith("/status?per_page=100")) return jsonResponse({ statuses: [] });
+    if (url.pathname.endsWith("/status") && url.searchParams.get("per_page") === "100") {
+      return jsonResponse({ statuses: [] });
+    }
     return onHook(input, init);
   };
 }
