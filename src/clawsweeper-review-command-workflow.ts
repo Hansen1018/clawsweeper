@@ -43,6 +43,7 @@ import { reviewContentCacheHit } from "./scheduler-policy.js";
 import type { CreateReviewCommandWorkflowDependencies } from "./clawsweeper-review-command-dependencies.js";
 import { prepareReviewCommand } from "./clawsweeper-review-preparation.js";
 import { parsePrHydrationSnapshot } from "./pr-hydration-snapshot.js";
+import { materializeRequestedReviewSource } from "./review-source-checkout.js";
 
 function reviewStartLeaseCommentUpdatedAt(
   comment: Record<string, unknown> | undefined,
@@ -1502,6 +1503,12 @@ export function createReviewCommandWorkflow(dependencies: CreateReviewCommandWor
         const codexStartedAt = Date.now();
         try {
           if (pullRequestReviewTreeFailure) throw pullRequestReviewTreeFailure;
+          materializeRequestedReviewSource({
+            targetRepo: item.repo,
+            targetDir: reviewOpenclawDir,
+            additionalPrompt,
+            allowFetch: !localRange,
+          });
           if (humanLocalReview) {
             console.error("");
             console.error("Running Codex review");
