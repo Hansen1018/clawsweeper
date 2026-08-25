@@ -13,7 +13,7 @@ import {
   reviewPromptTemplate,
 } from "../dist/clawsweeper.js";
 import { parseArgs as parseClawsweeperArgs } from "../dist/clawsweeper-args.js";
-import { repositoryProfileFor } from "../dist/repository-profiles.js";
+import { REPOSITORY_PROFILES, repositoryProfileFor } from "../dist/repository-profiles.js";
 import { git, item } from "./helpers.ts";
 import type { PrimaryBodyContext } from "../dist/clawsweeper-primary-body.js";
 import {
@@ -133,6 +133,29 @@ test("assembled review prompt retires executable live-proof guidance", () => {
   assert.match(prompt, /Do not recommend or plan proof execution/);
   assert.doesNotMatch(prompt, /Keep `entry` and\s+every terminal `run\.command` on one line/);
   assert.doesNotMatch(prompt, /## Maintainer Request/);
+});
+
+test("review preparation uses an explicitly configured external-owner profile", () => {
+  const profile = {
+    ...REPOSITORY_PROFILES[0]!,
+    targetRepo: "partner/configured-repo",
+    slug: "partner-configured-repo",
+    displayName: "Configured partner",
+    checkoutDir: "configured-repo",
+    promptNote: "Use the configured partner repository policy.",
+  };
+  REPOSITORY_PROFILES.push(profile);
+  try {
+    const prompt = reviewPromptForTest(
+      item({ repo: profile.targetRepo, kind: "pull_request" }),
+      {},
+      git,
+    );
+    assert.match(prompt, /- Target repo: partner\/configured-repo/);
+    assert.match(prompt, /- Repository policy: Use the configured partner repository policy\./);
+  } finally {
+    REPOSITORY_PROFILES.splice(REPOSITORY_PROFILES.indexOf(profile), 1);
+  }
 });
 
 for (const [repo, core] of [

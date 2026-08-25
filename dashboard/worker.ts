@@ -43,18 +43,27 @@ import { TRIAGE_ROUTING_GROUPS, triageRoutingGroupsForLabels } from "./triage-ro
 import {
   EXACT_REVIEW_QUEUE_NAME,
   EXACT_REVIEW_RECONCILE_CONCURRENCY,
+  HOSTED_TARGET_ELIGIBILITY_HEADER,
   exactReviewActionsReadToken,
   exactReviewClaimedRuns,
+  exactReviewRepositoryToken,
   exactReviewRequestedRuns,
   exactReviewTerminalRun,
   exactReviewTerminalRuns,
   exactReviewTerminalRunsFromBatch,
+  hostedTargetProbeResponse,
+  hostedTargetRetryableAdmission,
+  normalizeHostedTargetAdmission,
   type DurableObjectNamespace,
   type DurableObjectStub,
   type ExactReviewClaimedRun,
   type ExactReviewCompletionOutcome,
   type ExactReviewDecision,
   type ExactReviewIngress,
+  type HostedTargetAdmission,
+  type HostedTargetEligibility,
+  probeHostedPublicTarget,
+  resolveHostedTargetEligibility,
 } from "./exact-review-queue.ts";
 import {
   AUTOMERGE_METRICS_EVENT_TYPE,
@@ -214,10 +223,11 @@ type GithubWebhookPayload = GithubIssueCommentWebhookPayload &
 type GithubWebhookClassifierRuntimeInput = {
   readonly event: string;
   readonly payload: GithubWebhookPayload;
+  readonly hostedTargetEligible?: boolean;
 };
 
 export type GithubWebhookClassifierInput<Event extends string = string> =
-  Event extends "issue_comment"
+  (Event extends "issue_comment"
     ? { readonly event: Event; readonly payload: GithubIssueCommentWebhookPayload }
     : Event extends "issues"
       ? { readonly event: Event; readonly payload: GithubIssueWebhookPayload }
@@ -238,7 +248,9 @@ export type GithubWebhookClassifierInput<Event extends string = string> =
                   ? { readonly event: Event; readonly payload: GithubCheckRunWebhookPayload }
                   : Event extends "check_suite"
                     ? { readonly event: Event; readonly payload: GithubCheckSuiteWebhookPayload }
-                    : { readonly event: Event; readonly payload: GithubWebhookBasePayload };
+                    : { readonly event: Event; readonly payload: GithubWebhookBasePayload }) & {
+    readonly hostedTargetEligible?: boolean;
+  };
 
 type GithubWebhookRejectedClassification = {
   readonly accepted: false;
@@ -932,13 +944,13 @@ export default {
     if (url.pathname === "/github/webhook" && request.method === "POST")
       return githubWebhook(request, env, ctx);
     if (url.pathname === "/internal/exact-review/command-intake" && request.method === "POST")
-      return authenticatedExactReviewQueueRequest(request, env, "/command-intake");
+      return authenticatedHostedTargetQueueRequest(request, env, "/command-intake");
     if (url.pathname === "/internal/exact-review/enqueue" && request.method === "POST")
-      return authenticatedExactReviewEnqueue(request, env);
+      return authenticatedHostedTargetQueueRequest(request, env, "/enqueue");
     if (url.pathname === "/internal/exact-review/branch-authority" && request.method === "POST")
-      return authenticatedExactReviewQueueRequest(request, env, "/branch-authority");
+      return authenticatedHostedTargetQueueRequest(request, env, "/branch-authority");
     if (url.pathname === "/internal/exact-review/source-authority" && request.method === "POST")
-      return authenticatedExactReviewQueueRequest(request, env, "/source-authority");
+      return authenticatedHostedTargetQueueRequest(request, env, "/source-authority");
     if (url.pathname === "/internal/review-coverage/inventory" && request.method === "POST")
       return authenticatedExactReviewQueueRequest(request, env, "/review-coverage/inventory");
     const operationalCursorPath =
@@ -3505,9 +3517,69 @@ async function githubWebhook(request, env, ctx) {
     );
   }
 
-  const decision = classifyGithubWebhook({ event, payload });
+  const targetRepo = String(objectValue(payload.repository).full_name || "");
+  const eligibility = await workerHostedTargetEligibility(env, targetRepo);
+  if (eligibility.outcome === "terminal") {
+    return json({ ok: true, accepted: false, reason: "target not eligible" }, 202);
+  }
+  if (eligibility.outcome === "retryable") {
+    return hostedTargetProbeResponse({
+      outcome: "retryable",
+      ...(eligibility.retryAt ? { retryAt: eligibility.retryAt } : {}),
+    });
+  }
+
+  const decision = classifyGithubWebhook({ event, payload, hostedTargetEligible: true });
+  if (decision.accepted === false) {
+    return json({ ok: true, accepted: false, reason: decision.reason }, 202);
+  }
+
+  const admission = await workerHostedTargetVisibilityAdmission(env, targetRepo);
+  if (admission.outcome === "terminal") {
+    return json({ ok: true, accepted: false, reason: "private target unsupported" }, 202);
+  }
+  if (admission.outcome === "retryable") {
+    return hostedTargetProbeResponse(admission);
+  }
+
+  const completion = bayJourneyCompletionFromGithubWebhook({
+    event,
+    payload,
+    env,
+    hostedTargetEligible: true,
+  });
+  const acknowledgement =
+    completion ??
+    lifecycleCommandAcknowledgementFromGithubWebhook({
+      event,
+      payload,
+      env,
+      hostedTargetEligible: true,
+    });
+  if (acknowledgement) {
+    const acknowledgementResult = await recordLifecycleCommandAcknowledgement(env, acknowledgement);
+    if ("admission" in acknowledgementResult) {
+      return acknowledgementResult.admission.outcome === "terminal"
+        ? json({ ok: true, accepted: false, reason: "private target unsupported" }, 202)
+        : hostedTargetProbeResponse(acknowledgementResult.admission);
+    }
+    if (!acknowledgementResult.accepted) {
+      return json(
+        { ok: true, accepted: false, reason: "unmatched lifecycle acknowledgement" },
+        202,
+      );
+    }
+    return recordedLifecycleAcknowledgementResponse({
+      env,
+      ctx,
+      completion,
+      acknowledgement,
+      acknowledgementResult,
+    });
+  }
+
   let readModelMaterialized = false;
-  if (decision.accepted === true && deliveryHeaders.deliveryId) {
+  if (deliveryHeaders.deliveryId) {
     const delivery = githubWebhookReadModelDeliveryFromWebhook({
       event,
       deliveryId: deliveryHeaders.deliveryId,
@@ -3529,46 +3601,6 @@ async function githubWebhook(request, env, ctx) {
     }
   }
 
-  const completion = bayJourneyCompletionFromGithubWebhook({ event, payload, env });
-  if (completion) {
-    const acknowledgement = await recordLifecycleCommandAcknowledgement(env, completion);
-    if (!acknowledgement.accepted) {
-      return json(
-        { ok: true, accepted: false, reason: "unmatched lifecycle acknowledgement" },
-        202,
-      );
-    }
-    await recordBayJourneyTelemetry(
-      env,
-      ctx,
-      [],
-      [
-        acknowledgement.bayJourneyDeliveryId || acknowledgement.sourceDeliveryId
-          ? {
-              ...completion,
-              source_delivery_id:
-                acknowledgement.bayJourneyDeliveryId ?? acknowledgement.sourceDeliveryId,
-            }
-          : completion,
-      ],
-    );
-    return json({ ok: true, accepted: false, reason: "recorded Bay journey completion" }, 202);
-  }
-  const acknowledgement = lifecycleCommandAcknowledgementFromGithubWebhook({ event, payload, env });
-  if (acknowledgement) {
-    if (!(await recordLifecycleCommandAcknowledgement(env, acknowledgement)).accepted) {
-      return json(
-        { ok: true, accepted: false, reason: "unmatched lifecycle acknowledgement" },
-        202,
-      );
-    }
-    return json({ ok: true, accepted: false, reason: "recorded lifecycle acknowledgement" }, 202);
-  }
-
-  if (decision.accepted === false) {
-    return json({ ok: true, accepted: false, reason: decision.reason }, 202);
-  }
-
   if (decision.type === "activity") {
     return json(
       {
@@ -3585,12 +3617,6 @@ async function githubWebhook(request, env, ctx) {
   if ("type" in decision && decision.type === "item") {
     const deliveryId = deliveryHeaders.deliveryId || "";
     let itemDecision: ExactReviewDecision & { installationId: number } = decision;
-    if (itemDecision.itemKind === "pull_request") {
-      await acknowledgePullRequestReceipt({ env, ctx, decision: itemDecision }).catch(() => {
-        console.error("ClawSweeper pull request fast ack failed");
-        return undefined;
-      });
-    }
     itemDecision = await withPullRequestEditContentRevision({
       event,
       payload,
@@ -3617,6 +3643,12 @@ async function githubWebhook(request, env, ctx) {
         ok: true,
         deduped: true,
         item_key: `${itemDecision.targetRepo}#${itemDecision.itemNumber}`,
+      });
+    }
+    if (itemDecision.itemKind === "pull_request") {
+      await acknowledgePullRequestReceipt({ env, ctx, decision: itemDecision }).catch(() => {
+        console.error("ClawSweeper pull request fast ack failed");
+        return undefined;
       });
     }
     const sourceAuthoritySeq =
@@ -3730,6 +3762,7 @@ async function githubWebhook(request, env, ctx) {
 
   const credentials = githubAppCredentials(env);
   if (!credentials) return json({ error: "github_app_not_configured" }, 503);
+
   const appJwt = await signGithubAppJwt(credentials.issuer, credentials.privateKey);
   const dispatchToken = await createGithubAppTokenFor({
     env,
@@ -3782,6 +3815,72 @@ async function githubWebhook(request, env, ctx) {
     waitUntil: ctx?.waitUntil?.bind(ctx),
   });
   return json({ ok: true, status_comment_id: statusCommentId }, 202);
+}
+
+async function workerHostedTargetEligibility(
+  env: DashboardEnv,
+  targetRepo: string,
+): Promise<HostedTargetEligibility> {
+  const configuredRepositories = Array.isArray(env.hostedTargetConfiguredRepositories)
+    ? env.hostedTargetConfiguredRepositories.filter(
+        (value): value is string => typeof value === "string",
+      )
+    : undefined;
+  return resolveHostedTargetEligibility(targetRepo, fetch, {
+    ...(configuredRepositories ? { configuredRepositories } : {}),
+    ...(typeof env.hostedTargetPredicate === "function"
+      ? {
+          predicate: env.hostedTargetPredicate as (
+            targetRepo: string,
+          ) => boolean | Promise<boolean>,
+        }
+      : {}),
+  });
+}
+
+async function workerHostedTargetVisibilityAdmission(
+  env: DashboardEnv,
+  targetRepo: string,
+): Promise<HostedTargetAdmission> {
+  const injected = env.hostedPublicTargetProbe;
+  if (typeof injected === "function") {
+    return normalizeHostedTargetAdmission(await injected(targetRepo));
+  }
+  try {
+    const token = await exactReviewRepositoryToken(env, { metadata: "read" });
+    return probeHostedPublicTarget(targetRepo, token, fetch, {
+      apiUrl: (path) => githubApiUrl(env, path),
+    });
+  } catch (error) {
+    return hostedTargetRetryableAdmission(error);
+  }
+}
+
+async function recordedLifecycleAcknowledgementResponse({
+  env,
+  ctx,
+  completion,
+  acknowledgement,
+  acknowledgementResult,
+}) {
+  if (!completion) {
+    return json({ ok: true, accepted: false, reason: "recorded lifecycle acknowledgement" }, 202);
+  }
+  await recordBayJourneyTelemetry(
+    env,
+    ctx,
+    [],
+    [
+      acknowledgementResult.bayJourneyDeliveryId || acknowledgementResult.sourceDeliveryId
+        ? {
+            ...acknowledgement,
+            source_delivery_id:
+              acknowledgementResult.bayJourneyDeliveryId ?? acknowledgementResult.sourceDeliveryId,
+          }
+        : acknowledgement,
+    ],
+  );
+  return json({ ok: true, accepted: false, reason: "recorded Bay journey completion" }, 202);
 }
 
 async function recordBayJourneyTelemetry(env, ctx, triggers, completions) {
@@ -4074,21 +4173,36 @@ function bayJourneyTriggerFromGithubWebhook({
   };
 }
 
-function bayJourneyCompletionFromGithubWebhook({ event, payload, env }) {
-  const completion = lifecycleCommandAcknowledgementFromGithubWebhook({ event, payload, env });
+function bayJourneyCompletionFromGithubWebhook({
+  event,
+  payload,
+  env,
+  hostedTargetEligible = false,
+}) {
+  const completion = lifecycleCommandAcknowledgementFromGithubWebhook({
+    event,
+    payload,
+    env,
+    hostedTargetEligible,
+  });
   return completion?.status_marker &&
     /<!--\s*clawsweeper-command-status:\d+:(review|re_review):/i.test(completion.status_marker)
     ? completion
     : null;
 }
 
-function lifecycleCommandAcknowledgementFromGithubWebhook({ event, payload, env }) {
-  if (event !== "issue_comment") return null;
+function lifecycleCommandAcknowledgementFromGithubWebhook({
+  event,
+  payload,
+  env,
+  hostedTargetEligible = false,
+}) {
+  if (event !== "issue_comment" || String(payload?.action || "") !== "edited") return null;
   const comment = objectValue(payload?.comment);
   if (!clawsweeperBotLogins(env).has(normalizedLogin(objectValue(comment.user).login))) return null;
   const issue = objectValue(payload?.issue);
   const repo = objectValue(payload?.repository);
-  if (!isEligibleGithubWebhookRepository(repo)) return null;
+  if (!isEligibleGithubWebhookRepository(repo, hostedTargetEligible)) return null;
   const canonicalRepository = String(repo.full_name || "");
   const repository = canonicalRepository.toLowerCase();
   const number = Number(issue.number);
@@ -4154,11 +4268,12 @@ function classifyGithubWebhook<const Event extends string>(
 function classifyGithubWebhook({
   event,
   payload,
+  hostedTargetEligible,
 }: GithubWebhookClassifierRuntimeInput): GithubWebhookClassification {
-  const comment = classifyGithubIssueCommentWebhook({ event, payload });
+  const comment = classifyGithubIssueCommentWebhook({ event, payload, hostedTargetEligible });
   if (comment.accepted === true) return comment;
   if (comment.reason !== "not issue_comment") return comment;
-  const item = classifyGithubItemWebhook({ event, payload });
+  const item = classifyGithubItemWebhook({ event, payload, hostedTargetEligible });
   if (item.accepted === true || item.reason !== "unsupported event") return item;
   if (
     new Set([
@@ -4169,7 +4284,7 @@ function classifyGithubWebhook({
       "check_run",
       "check_suite",
     ]).has(event) &&
-    isEligibleGithubWebhookRepository(objectValue(payload.repository)) &&
+    isEligibleGithubWebhookRepository(objectValue(payload.repository), hostedTargetEligible) &&
     String(payload.action || "")
   ) {
     return {
@@ -4186,6 +4301,7 @@ export type GithubWebhookClassifier = typeof classifyGithubWebhook;
 function classifyGithubIssueCommentWebhook({
   event,
   payload,
+  hostedTargetEligible,
 }: GithubWebhookClassifierRuntimeInput):
   | GithubWebhookRejectedClassification
   | GithubWebhookIssueCommentClassification
@@ -4197,7 +4313,7 @@ function classifyGithubIssueCommentWebhook({
   const comment = objectValue(payload.comment);
   const issue = objectValue(payload.issue);
   const repo = objectValue(payload.repository);
-  if (!isEligibleGithubWebhookRepository(repo)) {
+  if (!isEligibleGithubWebhookRepository(repo, hostedTargetEligible)) {
     return { accepted: false, reason: "repository not eligible" };
   }
   const itemNumber = Number(issue.number);
@@ -4298,6 +4414,7 @@ async function withPullRequestEditContentRevision({
 function classifyGithubItemWebhook({
   event,
   payload,
+  hostedTargetEligible,
 }: GithubWebhookClassifierRuntimeInput):
   | GithubWebhookRejectedClassification
   | GithubWebhookIssueClassification
@@ -4305,7 +4422,7 @@ function classifyGithubItemWebhook({
   | GithubWebhookActivityClassification {
   const action = String(payload.action || "");
   const repo = objectValue(payload.repository);
-  if (!isEligibleGithubWebhookRepository(repo)) {
+  if (!isEligibleGithubWebhookRepository(repo, hostedTargetEligible)) {
     return { accepted: false, reason: "repository not eligible" };
   }
   const targetRepo = String(repo.full_name || "");
@@ -4492,12 +4609,13 @@ function isCloseGuardLabel(value) {
   return isExactReviewCloseGuardLabel(label);
 }
 
-function isEligibleGithubWebhookRepository(repo) {
+function isEligibleGithubWebhookRepository(repo, hostedTargetEligible = false) {
   const targetRepo = String(repo.full_name || "").toLowerCase();
   if (!/^[a-z0-9_.-]+\/[a-z0-9_.-]+$/.test(targetRepo)) return false;
   if (Boolean(repo.private) || Boolean(repo.archived) || Boolean(repo.fork)) return false;
   if (repo.has_issues === false) return false;
   if (CLAWSWEEPER_WEBHOOK_DENY_REPOS.has(targetRepo)) return false;
+  if (hostedTargetEligible) return true;
   const [owner] = targetRepo.split("/");
   return owner === "openclaw" || owner === "steipete";
 }
@@ -4540,12 +4658,16 @@ async function recordLifecycleCommandAcknowledgement(env, completion) {
   const queue = exactReviewQueueStub(env);
   if (!queue) return { accepted: true, sourceDeliveryId: null, bayJourneyDeliveryId: null };
   const observedAt = Date.parse(String(completion.completed_at || ""));
+  const targetRepo = String(completion.canonical_repository ?? completion.repository);
   const response = await queue.fetch(
     new Request("https://clawsweeper-exact-review-queue/lifecycle/command-ack/observed", {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: {
+        "content-type": "application/json",
+        [HOSTED_TARGET_ELIGIBILITY_HEADER]: targetRepo,
+      },
       body: JSON.stringify({
-        canonical_target_key: `${completion.canonical_repository ?? completion.repository}#${completion.number}`,
+        canonical_target_key: `${targetRepo}#${completion.number}`,
         status_marker: completion.status_marker,
         command_comment_id: completion.source_comment_id,
         completion_comment_id: completion.completion_comment_id,
@@ -4555,6 +4677,20 @@ async function recordLifecycleCommandAcknowledgement(env, completion) {
       }),
     }),
   );
+  if (response.status === 422) {
+    return { admission: { outcome: "terminal" as const } };
+  }
+  if (response.status === 503) {
+    const retryAfterSeconds = Number(response.headers.get("retry-after"));
+    return {
+      admission: {
+        outcome: "retryable" as const,
+        ...(Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0
+          ? { retryAt: Date.now() + retryAfterSeconds * 1_000 }
+          : {}),
+      },
+    };
+  }
   if (!response.ok) throw new Error("lifecycle acknowledgement receipt unavailable");
   const result = objectValue(await response.json());
   return {
@@ -4631,11 +4767,19 @@ async function exactReviewQueueRequest(env, path, request?: Request) {
   const queue = exactReviewQueueStub(env);
   if (!queue) return json({ error: "exact_review_queue_not_configured" }, 503);
   const body = request ? await request.text() : undefined;
+  const preparedHostedTarget = request?.headers.get(HOSTED_TARGET_ELIGIBILITY_HEADER);
   try {
     const response = await queue.fetch(
       new Request(`https://clawsweeper-exact-review-queue${path}`, {
         method: request?.method || "GET",
-        headers: body ? { "content-type": "application/json" } : undefined,
+        headers: body
+          ? {
+              "content-type": "application/json",
+              ...(preparedHostedTarget
+                ? { [HOSTED_TARGET_ELIGIBILITY_HEADER]: preparedHostedTarget }
+                : {}),
+            }
+          : undefined,
         ...(body ? { body } : {}),
       }),
     );
@@ -5607,25 +5751,6 @@ function bayLifecycleTimingHistory(value) {
   return { bucket_minutes: 5, points: result };
 }
 
-async function authenticatedExactReviewEnqueue(request, env) {
-  const secret = stringEnv(env.CLAWSWEEPER_WEBHOOK_SECRET);
-  if (!secret) return json({ error: "webhook_not_configured" }, 503);
-  const body = await request.text();
-  const signature = request.headers.get("x-clawsweeper-exact-review-signature") || "";
-  if (!(await verifyGithubWebhookSignature({ secret, signature, bodyText: body }))) {
-    return json({ error: "invalid_signature" }, 401);
-  }
-  return exactReviewQueueRequest(
-    env,
-    "/enqueue",
-    new Request("https://clawsweeper-exact-review-queue/enqueue", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body,
-    }),
-  );
-}
-
 async function authenticatedExactReviewQueueRequest(
   request,
   env,
@@ -5650,6 +5775,43 @@ async function authenticatedExactReviewQueueRequest(
   );
   if (onAuthenticatedResponse) await onAuthenticatedResponse(body, response);
   return response;
+}
+
+async function authenticatedHostedTargetQueueRequest(request, env, path: string) {
+  const secret = stringEnv(env.CLAWSWEEPER_WEBHOOK_SECRET);
+  if (!secret) return json({ error: "webhook_not_configured" }, 503);
+  const body = await request.text();
+  const signature = request.headers.get("x-clawsweeper-exact-review-signature") || "";
+  if (!(await verifyGithubWebhookSignature({ secret, signature, bodyText: body }))) {
+    return json({ error: "invalid_signature" }, 401);
+  }
+  const targetRepo = String(
+    objectValue(objectValue(parseJsonObject(body)).decision).targetRepo || "",
+  );
+  if (/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(targetRepo)) {
+    const eligibility = await workerHostedTargetEligibility(env, targetRepo);
+    if (eligibility.outcome === "terminal") {
+      return hostedTargetProbeResponse({ outcome: "terminal" });
+    }
+    if (eligibility.outcome === "retryable") {
+      return hostedTargetProbeResponse({
+        outcome: "retryable",
+        ...(eligibility.retryAt ? { retryAt: eligibility.retryAt } : {}),
+      });
+    }
+  }
+  return exactReviewQueueRequest(
+    env,
+    path,
+    new Request(`https://clawsweeper-exact-review-queue${path}`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        [HOSTED_TARGET_ELIGIBILITY_HEADER]: targetRepo,
+      },
+      body,
+    }),
+  );
 }
 
 async function authenticatedLifecycleCommandAcknowledgement(request, env, ctx) {

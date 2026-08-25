@@ -2553,6 +2553,7 @@ test("comment router durably claims dispatch commands and recovers exact workflo
   assert.match(source, /\/runs\?per_page=100&page=\$\{page\}/);
   assert.match(source, /status:\s*"recovered"/);
   assert.match(source, /`item_numbers=\$\{dispatchKey\}`/);
+  assert.match(source, /"item_count=1"/);
   assert.match(source, /event:\s*"workflow_dispatch"/);
   assert.match(source, /workflow_dispatch=\$\{fallback\.stderr \|\| fallback\.stdout\}/);
   assert.match(sweepWorkflow, /Review event item \{0\}#\{1\} \[\{2\}\]/);
