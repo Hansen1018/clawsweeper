@@ -1603,7 +1603,7 @@ jobs:
           echo "route=$route" >> "$GITHUB_OUTPUT"
 
       - name: Post direct exact review publication result
-        if: ${{ steps.direct-publication-route.outputs.route == 'direct' }}
+        if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.prepare-direct-exact-review-publication.outcome == 'success' && steps.direct-publication-route.outputs.route == 'direct' }}
         id: direct-exact-review-publication
         env:
           EXACT_REVIEW_DIRECT_PUBLICATION_ENABLED: ${{ vars.EXACT_REVIEW_DIRECT_PUBLICATION_ENABLED || '1' }}
@@ -2935,7 +2935,7 @@ jobs:
 
       - name: Create Endor remediation state token
         id: endor-state-token
-        if: ${{ steps.prepare-endor-review.outcome == 'success' && steps.prepare-endor-review.outputs.eligible == 'true' }}
+        if: ${{ steps.publication-context.outputs.claimed == 'true' && steps.prepare-endor-review.outcome == 'success' && steps.prepare-endor-review.outputs.eligible == 'true' }}
         continue-on-error: true
         uses: ./.github/actions/create-state-token
         with:
@@ -2944,7 +2944,7 @@ jobs:
 
       - uses: ./.github/actions/setup-state
         id: setup-endor-state
-        if: ${{ steps.prepare-endor-review.outcome == 'success' && steps.prepare-endor-review.outputs.eligible == 'true' && steps.endor-state-token.outcome == 'success' }}
+        if: ${{ steps.publication-context.outputs.claimed == 'true' && steps.prepare-endor-review.outcome == 'success' && steps.prepare-endor-review.outputs.eligible == 'true' && steps.endor-state-token.outcome == 'success' }}
         continue-on-error: true
         with:
           token: ${{ steps.endor-state-token.outputs.token }}
@@ -2958,7 +2958,7 @@ jobs:
 
       - name: Advance Endor review-until-clean state
         id: advance-endor-review
-        if: ${{ steps.setup-endor-state.outcome == 'success' }}
+        if: ${{ steps.publication-context.outputs.claimed == 'true' && steps.setup-endor-state.outcome == 'success' }}
         continue-on-error: true
         run: |
           pnpm run --silent repair:notify-endor-remediation -- advance \
@@ -2967,7 +2967,7 @@ jobs:
 
       - name: Publish Endor review progress
         id: publish-endor-review-progress
-        if: ${{ steps.advance-endor-review.outcome == 'success' && steps.advance-endor-review.outputs.action == 'requeue' }}
+        if: ${{ steps.publication-context.outputs.claimed == 'true' && steps.advance-endor-review.outcome == 'success' && steps.advance-endor-review.outputs.action == 'requeue' }}
         continue-on-error: true
         env:
           CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
@@ -2981,7 +2981,7 @@ jobs:
 
       - name: Queue next Endor exact-head review
         id: queue-next-endor-review
-        if: ${{ steps.publish-endor-review-progress.outcome == 'success' }}
+        if: ${{ steps.publication-context.outputs.claimed == 'true' && steps.publish-endor-review-progress.outcome == 'success' }}
         continue-on-error: true
         env:
           CLAIM_DECISION: ${{ steps.publication-context.outputs.decision }}
@@ -3013,7 +3013,7 @@ jobs:
 
       - name: Publish Endor terminal review state
         id: publish-endor-terminal-state
-        if: ${{ steps.advance-endor-review.outcome == 'success' && steps.advance-endor-review.outputs.action == 'notify' }}
+        if: ${{ steps.publication-context.outputs.claimed == 'true' && steps.advance-endor-review.outcome == 'success' && steps.advance-endor-review.outputs.action == 'notify' }}
         continue-on-error: true
         env:
           CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
@@ -3027,7 +3027,7 @@ jobs:
 
       - name: Deliver Endor remediation notification
         id: deliver-endor-notification
-        if: ${{ steps.publish-endor-terminal-state.outcome == 'success' }}
+        if: ${{ steps.publication-context.outputs.claimed == 'true' && steps.publish-endor-terminal-state.outcome == 'success' }}
         continue-on-error: true
         env:
           GH_TOKEN: ${{ steps.target-write-token.outputs.token }}
@@ -3037,7 +3037,7 @@ jobs:
 
       - name: Queue current Endor head after delivery drift
         id: queue-current-endor-head
-        if: ${{ steps.deliver-endor-notification.outcome == 'success' && steps.deliver-endor-notification.outputs.action == 'requeue' }}
+        if: ${{ steps.publication-context.outputs.claimed == 'true' && steps.deliver-endor-notification.outcome == 'success' && steps.deliver-endor-notification.outputs.action == 'requeue' }}
         continue-on-error: true
         env:
           CLAIM_DECISION: ${{ steps.publication-context.outputs.decision }}
@@ -3083,7 +3083,7 @@ jobs:
 
       - name: Publish Endor notification receipt
         id: publish-endor-notification-receipt
-        if: ${{ steps.deliver-endor-notification.outcome == 'success' && steps.deliver-endor-notification.outputs.action == 'notify' }}
+        if: ${{ steps.publication-context.outputs.claimed == 'true' && steps.deliver-endor-notification.outcome == 'success' && steps.deliver-endor-notification.outputs.action == 'notify' }}
         continue-on-error: true
         env:
           CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
