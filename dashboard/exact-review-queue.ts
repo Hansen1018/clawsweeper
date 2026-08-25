@@ -317,6 +317,7 @@ type ExactReviewPublicationReasonCode =
   | "live_terminal"
   | "github_rate_limit"
   | "github_transient"
+  | "hermit_transient"
   | "state_contention"
   | "review_lease_active"
   | "workflow_cancelled"
@@ -11211,6 +11212,7 @@ function exactReviewPublicationReasonCode(value): ExactReviewPublicationReasonCo
     "live_terminal",
     "github_rate_limit",
     "github_transient",
+    "hermit_transient",
     "state_contention",
     "review_lease_active",
     "workflow_cancelled",
@@ -11247,6 +11249,7 @@ function exactReviewPublicationCompletion(
     retryable_failure: new Set([
       "github_rate_limit",
       "github_transient",
+      "hermit_transient",
       "state_contention",
       "review_lease_active",
       "workflow_cancelled",
@@ -11934,7 +11937,9 @@ function exactReviewPublicationRecoveryCause(
   if (completion.reasonCode === "github_rate_limit" && completion.attempted === false) {
     return "credential_circuit";
   }
-  if (["github_rate_limit", "github_transient"].includes(completion.reasonCode)) {
+  if (
+    ["github_rate_limit", "github_transient", "hermit_transient"].includes(completion.reasonCode)
+  ) {
     return "transient_retry";
   }
   if (completion.reasonCode === "state_contention") return "state_retry";

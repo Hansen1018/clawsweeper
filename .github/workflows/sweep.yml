@@ -1569,8 +1569,41 @@ jobs:
           EXACT_REVIEW_BATCH_MUTATION_OUTPUT: .artifacts/direct-publication-outcome.json
         run: pnpm run --silent repair:publish-event-result
 
-      - name: Post direct exact review publication result
+      - name: Detect Endor review for durable publication
+        id: detect-direct-endor-review
+        if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.prepare-direct-exact-review-publication.outcome == 'success' && fromJSON(steps.claim-exact-review-queue.outputs.decision).itemKind == 'pull_request' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.target-write-token.outputs.token }}
+          TARGET_REPO: ${{ steps.target.outputs.target_repo }}
+          ITEM_NUMBER: ${{ steps.target.outputs.item_number }}
+          REVIEW_GENERATION: ${{ format('{0}:{1}', steps.claim-exact-review-queue.outputs.lease_id, steps.claim-exact-review-queue.outputs.lease_revision) }}
+          RECORD_PATH: artifacts/event/${{ steps.target.outputs.item_number }}.md
+          EVIDENCE_PATH: .artifacts/endor-remediation/direct-route-evidence.json
+        run: |
+          pnpm run --silent repair:notify-endor-remediation -- prepare \
+            --repo "$TARGET_REPO" \
+            --item-number "$ITEM_NUMBER" \
+            --review-generation "$REVIEW_GENERATION" \
+            --record-path "$RECORD_PATH" \
+            --evidence-path "$EVIDENCE_PATH"
+
+      - name: Resolve direct exact review publication route
+        id: direct-publication-route
         if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.prepare-direct-exact-review-publication.outcome == 'success' }}
+        env:
+          ITEM_KIND: ${{ fromJSON(steps.claim-exact-review-queue.outputs.decision).itemKind }}
+          DETECTION_OUTCOME: ${{ steps.detect-direct-endor-review.outcome }}
+          ENDOR_ELIGIBLE: ${{ steps.detect-direct-endor-review.outputs.eligible }}
+        run: |
+          route=direct
+          if [ "$ITEM_KIND" = "pull_request" ] && { [ "$DETECTION_OUTCOME" != "success" ] || [ "$ENDOR_ELIGIBLE" = "true" ]; }; then
+            route=durable_publication
+          fi
+          echo "route=$route" >> "$GITHUB_OUTPUT"
+
+      - name: Post direct exact review publication result
+        if: ${{ steps.direct-publication-route.outputs.route == 'direct' }}
         id: direct-exact-review-publication
         env:
           EXACT_REVIEW_DIRECT_PUBLICATION_ENABLED: ${{ vars.EXACT_REVIEW_DIRECT_PUBLICATION_ENABLED || '1' }}
@@ -2880,6 +2913,234 @@ jobs:
             --data "$payload" \
             "$queue_url/internal/exact-review/lifecycle/router-receipt" >/dev/null
 
+      - name: Prepare Endor exact-head review
+        id: prepare-endor-review
+        if: ${{ steps.publication-context.outputs.claimed == 'true' && steps.publication-context.outputs.direct_lifecycle_recovery != 'true' && steps.publication-context.outputs.item_kind == 'pull_request' && steps.publish-event-result.outcome == 'success' && steps.publish-event-result.outputs.remote_tuple_verified == 'true' && steps.publish-event-result.outputs.requeue_latest != 'true' && steps.record-fallback-canonical-lifecycle-receipt.outcome == 'success' && (steps.publish-event-result.outputs.routing_deferred != 'true' || steps.queue-deferred-verdict-router.outcome == 'success') }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.target-write-token.outputs.token }}
+          TARGET_REPO: ${{ steps.publication-context.outputs.target_repo }}
+          ITEM_NUMBER: ${{ steps.publication-context.outputs.item_number }}
+          PUBLISHER_LEASE_ID: ${{ steps.publication-context.outputs.publisher_lease_id }}
+          PUBLISHER_LEASE_REVISION: ${{ steps.publication-context.outputs.publisher_lease_revision }}
+          RECORD_PATH: artifacts/event/${{ steps.publication-context.outputs.item_number }}.md
+          EVIDENCE_PATH: .artifacts/endor-remediation/evidence.json
+        run: |
+          pnpm run --silent repair:notify-endor-remediation -- prepare \
+            --repo "$TARGET_REPO" \
+            --item-number "$ITEM_NUMBER" \
+            --review-generation "$PUBLISHER_LEASE_ID:$PUBLISHER_LEASE_REVISION" \
+            --record-path "$RECORD_PATH" \
+            --evidence-path "$EVIDENCE_PATH"
+
+      - name: Create Endor remediation state token
+        id: endor-state-token
+        if: ${{ steps.prepare-endor-review.outcome == 'success' && steps.prepare-endor-review.outputs.eligible == 'true' }}
+        continue-on-error: true
+        uses: ./.github/actions/create-state-token
+        with:
+          client-id: ${{ env.CLAWSWEEPER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
+
+      - uses: ./.github/actions/setup-state
+        id: setup-endor-state
+        if: ${{ steps.prepare-endor-review.outcome == 'success' && steps.prepare-endor-review.outputs.eligible == 'true' && steps.endor-state-token.outcome == 'success' }}
+        continue-on-error: true
+        with:
+          token: ${{ steps.endor-state-token.outputs.token }}
+          coordinator-url: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
+          records-url: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
+          records-secret: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
+          records-repo-slugs: ${{ steps.publication-context.outputs.target_slug }}
+          records-item-number: ${{ steps.publication-context.outputs.item_number }}
+          hydrate-git-state: "true"
+          hydrate-state-blobs: "false"
+
+      - name: Advance Endor review-until-clean state
+        id: advance-endor-review
+        if: ${{ steps.setup-endor-state.outcome == 'success' }}
+        continue-on-error: true
+        run: |
+          pnpm run --silent repair:notify-endor-remediation -- advance \
+            --evidence-path .artifacts/endor-remediation/evidence.json \
+            --event-path .artifacts/endor-remediation/event.json
+
+      - name: Publish Endor review progress
+        id: publish-endor-review-progress
+        if: ${{ steps.advance-endor-review.outcome == 'success' && steps.advance-endor-review.outputs.action == 'requeue' }}
+        continue-on-error: true
+        env:
+          CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
+          GH_TOKEN: ${{ steps.endor-state-token.outputs.token }}
+        run: |
+          pnpm run --silent repair:publish-main -- \
+            --message "chore: advance Endor exact-head review" \
+            --path "${{ steps.advance-endor-review.outputs.state_path }}" \
+            --max-attempts 12 \
+            --push-attempts 4
+
+      - name: Queue next Endor exact-head review
+        id: queue-next-endor-review
+        if: ${{ steps.publish-endor-review-progress.outcome == 'success' }}
+        continue-on-error: true
+        env:
+          CLAIM_DECISION: ${{ steps.publication-context.outputs.decision }}
+          REQUEUE_KEY: ${{ steps.advance-endor-review.outputs.requeue_key }}
+          QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
+          CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
+        run: |
+          set -euo pipefail
+          payload="$(node <<'NODE'
+          const decision = JSON.parse(process.env.CLAIM_DECISION || "{}");
+          process.stdout.write(JSON.stringify({
+            delivery_id: process.env.REQUEUE_KEY,
+            decision: {
+              ...decision,
+              sourceAction: "endor_until_clean_rereview",
+              supersedesInProgress: false,
+            },
+          }));
+          NODE
+          )"
+          signature="$(PAYLOAD="$payload" node -e 'const crypto=require("node:crypto"); process.stdout.write(`sha256=${crypto.createHmac("sha256", process.env.CLAWSWEEPER_WEBHOOK_SECRET).update(process.env.PAYLOAD).digest("hex")}`)')"
+          response="$(curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
+            --request POST \
+            --header "content-type: application/json" \
+            --header "x-clawsweeper-exact-review-signature: $signature" \
+            --data "$payload" \
+            "${QUEUE_URL%/}/internal/exact-review/enqueue")"
+          jq -e '.ok == true and (.queued == true or .deduped == true)' <<< "$response" >/dev/null
+
+      - name: Publish Endor terminal review state
+        id: publish-endor-terminal-state
+        if: ${{ steps.advance-endor-review.outcome == 'success' && steps.advance-endor-review.outputs.action == 'notify' }}
+        continue-on-error: true
+        env:
+          CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
+          GH_TOKEN: ${{ steps.endor-state-token.outputs.token }}
+        run: |
+          pnpm run --silent repair:publish-main -- \
+            --message "chore: publish Endor terminal review state" \
+            --path "${{ steps.advance-endor-review.outputs.state_path }}" \
+            --max-attempts 12 \
+            --push-attempts 4
+
+      - name: Deliver Endor remediation notification
+        id: deliver-endor-notification
+        if: ${{ steps.publish-endor-terminal-state.outcome == 'success' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.target-write-token.outputs.token }}
+          CLAWSWEEPER_HERMIT_URL: ${{ vars.CLAWSWEEPER_HERMIT_URL }}
+          CLAWSWEEPER_HERMIT_TOKEN: ${{ secrets.CLAWSWEEPER_HERMIT_TOKEN }}
+        run: pnpm run --silent repair:notify-endor-remediation -- deliver --event-path .artifacts/endor-remediation/event.json
+
+      - name: Queue current Endor head after delivery drift
+        id: queue-current-endor-head
+        if: ${{ steps.deliver-endor-notification.outcome == 'success' && steps.deliver-endor-notification.outputs.action == 'requeue' }}
+        continue-on-error: true
+        env:
+          CLAIM_DECISION: ${{ steps.publication-context.outputs.decision }}
+          CURRENT_HEAD_SHA: ${{ steps.deliver-endor-notification.outputs.requeue_head_sha }}
+          CURRENT_UPDATED_AT: ${{ steps.deliver-endor-notification.outputs.requeue_updated_at }}
+          REQUEUE_KEY: ${{ steps.deliver-endor-notification.outputs.requeue_key }}
+          QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
+          CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
+        run: |
+          set -euo pipefail
+          payload="$(node <<'NODE'
+          const original = JSON.parse(process.env.CLAIM_DECISION || "{}");
+          const {
+            sourceContentRevision: _sourceContentRevision,
+            sourceDeliveryId: _sourceDeliveryId,
+            sourceUpdatedAt: _sourceUpdatedAt,
+            ...decision
+          } = original;
+          if (!/^[0-9a-f]{40}$/.test(process.env.CURRENT_HEAD_SHA || "")) process.exit(1);
+          process.stdout.write(JSON.stringify({
+            delivery_id: process.env.REQUEUE_KEY,
+            decision: {
+              ...decision,
+              sourceAction: "endor_delivery_drift_rereview",
+              supersedesInProgress: true,
+              sourceHeadSha: process.env.CURRENT_HEAD_SHA,
+              sourceHeadVerified: true,
+              ...(process.env.CURRENT_UPDATED_AT
+                ? { sourceUpdatedAt: process.env.CURRENT_UPDATED_AT }
+                : {}),
+            },
+          }));
+          NODE
+          )"
+          signature="$(PAYLOAD="$payload" node -e 'const crypto=require("node:crypto"); process.stdout.write(`sha256=${crypto.createHmac("sha256", process.env.CLAWSWEEPER_WEBHOOK_SECRET).update(process.env.PAYLOAD).digest("hex")}`)')"
+          response="$(curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
+            --request POST \
+            --header "content-type: application/json" \
+            --header "x-clawsweeper-exact-review-signature: $signature" \
+            --data "$payload" \
+            "${QUEUE_URL%/}/internal/exact-review/enqueue")"
+          jq -e '.ok == true and (.queued == true or .deduped == true)' <<< "$response" >/dev/null
+
+      - name: Publish Endor notification receipt
+        id: publish-endor-notification-receipt
+        if: ${{ steps.deliver-endor-notification.outcome == 'success' && steps.deliver-endor-notification.outputs.action == 'notify' }}
+        continue-on-error: true
+        env:
+          CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
+          GH_TOKEN: ${{ steps.endor-state-token.outputs.token }}
+        run: |
+          pnpm run --silent repair:publish-main -- \
+            --message "chore: publish Endor remediation notification" \
+            --path "${{ steps.deliver-endor-notification.outputs.ledger_path }}" \
+            --path "${{ steps.deliver-endor-notification.outputs.report_path }}" \
+            --max-attempts 12 \
+            --push-attempts 4
+
+      - name: Resolve Endor finalization readiness
+        id: endor-finalization-readiness
+        if: ${{ always() && steps.publication-context.outputs.claimed == 'true' }}
+        env:
+          PREPARE_OUTCOME: ${{ steps.prepare-endor-review.outcome }}
+          ELIGIBLE: ${{ steps.prepare-endor-review.outputs.eligible }}
+          ADVANCE_OUTCOME: ${{ steps.advance-endor-review.outcome }}
+          ACTION: ${{ steps.advance-endor-review.outputs.action }}
+          PROGRESS_PUBLICATION_OUTCOME: ${{ steps.publish-endor-review-progress.outcome }}
+          REQUEUE_OUTCOME: ${{ steps.queue-next-endor-review.outcome }}
+          TERMINAL_STATE_PUBLICATION_OUTCOME: ${{ steps.publish-endor-terminal-state.outcome }}
+          DELIVERY_OUTCOME: ${{ steps.deliver-endor-notification.outcome }}
+          DELIVERY_ACTION: ${{ steps.deliver-endor-notification.outputs.action }}
+          DELIVERY_REQUEUE_OUTCOME: ${{ steps.queue-current-endor-head.outcome }}
+          RECEIPT_PUBLICATION_OUTCOME: ${{ steps.publish-endor-notification-receipt.outcome }}
+        run: |
+          ready=false
+          if [ "$PREPARE_OUTCOME" = "skipped" ]; then
+            ready=true
+          elif [ "$PREPARE_OUTCOME" = "success" ] && [ "$ELIGIBLE" != "true" ]; then
+            ready=true
+          elif [ "$PREPARE_OUTCOME" = "success" ] && [ "$ELIGIBLE" = "true" ] && \
+            [ "$ADVANCE_OUTCOME" = "success" ] && [ "$ACTION" = "requeue" ] && \
+            [ "$PROGRESS_PUBLICATION_OUTCOME" = "success" ] && [ "$REQUEUE_OUTCOME" = "success" ]; then
+            ready=true
+          elif [ "$PREPARE_OUTCOME" = "success" ] && [ "$ELIGIBLE" = "true" ] && \
+            [ "$ADVANCE_OUTCOME" = "success" ] && [ "$ACTION" = "notify" ] && \
+            [ "$TERMINAL_STATE_PUBLICATION_OUTCOME" = "success" ] && \
+            [ "$DELIVERY_OUTCOME" = "success" ] && [ "$DELIVERY_ACTION" = "requeue" ] && \
+            [ "$DELIVERY_REQUEUE_OUTCOME" = "success" ]; then
+            ready=true
+          elif [ "$PREPARE_OUTCOME" = "success" ] && [ "$ELIGIBLE" = "true" ] && \
+            [ "$ADVANCE_OUTCOME" = "success" ] && [ "$ACTION" = "notify" ] && \
+            [ "$TERMINAL_STATE_PUBLICATION_OUTCOME" = "success" ] && \
+            [ "$DELIVERY_OUTCOME" = "success" ] && [ "$DELIVERY_ACTION" = "complete" ]; then
+            ready=true
+          elif [ "$PREPARE_OUTCOME" = "success" ] && [ "$ELIGIBLE" = "true" ] && \
+            [ "$ADVANCE_OUTCOME" = "success" ] && [ "$ACTION" = "notify" ] && \
+            [ "$TERMINAL_STATE_PUBLICATION_OUTCOME" = "success" ] && \
+            [ "$DELIVERY_OUTCOME" = "success" ] && [ "$DELIVERY_ACTION" = "notify" ] && \
+            [ "$RECEIPT_PUBLICATION_OUTCOME" = "success" ]; then
+            ready=true
+          fi
+          echo "ready=$ready" >> "$GITHUB_OUTPUT"
+
       - name: Dispatch deferred high-confidence bug implementation
         if: ${{ steps.publication-context.outputs.claimed == 'true' && steps.publication-context.outputs.direct_lifecycle_recovery != 'true' && steps.publish-event-result.outcome == 'success' && steps.publish-event-result.outputs.remote_tuple_verified == 'true' && steps.record-fallback-canonical-lifecycle-receipt.outcome == 'success' && vars.CLAWSWEEPER_AUTO_IMPLEMENT_ISSUES == '1' && steps.publication-context.outputs.target_repo == 'openclaw/openclaw' && fromJSON(steps.publication-context.outputs.decision).itemKind == 'issue' && ((fromJSON(steps.publication-context.outputs.decision).sourceAction == 'failed_review_shard_recovery' && steps.record-no-router-lifecycle-receipt.outcome == 'success') || (fromJSON(steps.publication-context.outputs.decision).sourceAction != 'failed_review_shard_recovery' && (steps.publish-event-result.outputs.routing_deferred != 'true' || steps.queue-deferred-verdict-router.outcome == 'success'))) }}
         continue-on-error: true
@@ -3043,6 +3304,13 @@ jobs:
           PUBLISH_RETRY_AT: ${{ steps.publish-event-result.outputs.retry_at }}
           ERROR_FINGERPRINT: ${{ steps.publish-event-result.outputs.error_fingerprint }}
           STATE_WRITER_JSON: ${{ steps.publish-event-result.outputs.state_writer_json }}
+          ENDOR_FINALIZATION_READY: ${{ steps.endor-finalization-readiness.outputs.ready }}
+          ENDOR_PREPARE_OUTCOME: ${{ steps.prepare-endor-review.outcome }}
+          ENDOR_PREPARE_FAILURE_KIND: ${{ steps.prepare-endor-review.outputs.failure_kind }}
+          ENDOR_PREPARE_RETRY_AT: ${{ steps.prepare-endor-review.outputs.retry_at }}
+          ENDOR_DELIVERY_OUTCOME: ${{ steps.deliver-endor-notification.outcome }}
+          ENDOR_DELIVERY_FAILURE_KIND: ${{ steps.deliver-endor-notification.outputs.failure_kind }}
+          ENDOR_DELIVERY_RETRY_AT: ${{ steps.deliver-endor-notification.outputs.retry_at }}
           DIRECT_RECOVERY_OUTCOME: ${{ steps.replay-direct-lifecycle.outputs.outcome }}
           DIRECT_RECOVERY_COMPLETION_KIND: ${{ steps.replay-direct-lifecycle.outputs.completion_kind }}
           DIRECT_RECOVERY_REASON_CODE: ${{ steps.replay-direct-lifecycle.outputs.reason_code }}
@@ -3057,7 +3325,9 @@ jobs:
           retry_at=
           requeue_latest="$REQUEUE_LATEST"
           direct_requeue=false
-          if [ "$DIRECT_RECOVERY_OUTCOME" = "success" ]; then
+          if [ "$ENDOR_FINALIZATION_READY" != "true" ]; then
+            :
+          elif [ "$DIRECT_RECOVERY_OUTCOME" = "success" ]; then
             case "$DIRECT_RECOVERY_COMPLETION_KIND:$DIRECT_RECOVERY_REASON_CODE" in
               published:publication_applied|superseded:remote_newer_tuple) ;;
               *) exit 1 ;;
@@ -3113,6 +3383,15 @@ jobs:
               outcome=success
             fi
           fi
+          endor_failure_kind=
+          endor_retry_at=
+          if [ "$ENDOR_PREPARE_OUTCOME" = "failure" ]; then
+            endor_failure_kind="$ENDOR_PREPARE_FAILURE_KIND"
+            endor_retry_at="$ENDOR_PREPARE_RETRY_AT"
+          elif [ "$ENDOR_DELIVERY_OUTCOME" = "failure" ]; then
+            endor_failure_kind="$ENDOR_DELIVERY_FAILURE_KIND"
+            endor_retry_at="$ENDOR_DELIVERY_RETRY_AT"
+          fi
           if [ "$outcome" = "success" ] && [ "$completion_kind" != "superseded" ] && [ "$completion_kind" != "deferred" ] && [ "$completion_kind" != "refresh_required" ] && [ "$completion_kind" != "retryable_failure" ]; then
             if [ "$PUBLISH_COMPLETION_KIND" = "published" ] && [ "$PUBLISH_REASON_CODE" = "publication_applied" ]; then
               completion_kind=published
@@ -3121,6 +3400,10 @@ jobs:
               completion_kind=superseded
               reason_code=live_terminal
             fi
+          elif [ "$outcome" != "success" ] && { [ "$endor_failure_kind" = "github_rate_limit" ] || [ "$endor_failure_kind" = "github_transient" ] || [ "$endor_failure_kind" = "hermit_transient" ]; }; then
+            completion_kind=retryable_failure
+            reason_code="$endor_failure_kind"
+            retry_at="$endor_retry_at"
           elif [ "$outcome" != "success" ] && { [ "$FAILURE_KIND" = "github_rate_limit" ] || [ "$FAILURE_KIND" = "github_transient" ]; }; then
             completion_kind=retryable_failure
             reason_code="$FAILURE_KIND"
@@ -3149,8 +3432,8 @@ jobs:
           if [ -n "$retry_at" ]; then
             echo "retry_at=$retry_at" >> "$GITHUB_OUTPUT"
           fi
-          if [ "$outcome" = "failure" ] && { [ "$FAILURE_KIND" = "github_rate_limit" ] || [ "$FAILURE_KIND" = "github_transient" ]; }; then
-            echo "failure_kind=$FAILURE_KIND" >> "$GITHUB_OUTPUT"
+          if [ "$outcome" = "failure" ] && { [ "$reason_code" = "github_rate_limit" ] || [ "$reason_code" = "github_transient" ]; }; then
+            echo "failure_kind=$reason_code" >> "$GITHUB_OUTPUT"
           fi
           if [ -n "$STATE_WRITER_JSON" ]; then
             echo "state_writer_json=$STATE_WRITER_JSON" >> "$GITHUB_OUTPUT"
@@ -3178,7 +3461,7 @@ jobs:
           TERMINAL_CLOSED: ${{ steps.publish-event-result.outputs.terminal_closed }}
           GUARDED_OPEN: ${{ steps.publish-event-result.outputs.guarded_open }}
           POLICY_NOOP: ${{ steps.publish-event-result.outputs.policy_noop }}
-          REQUEUE_LATEST: ${{ steps.publish-event-result.outputs.requeue_latest }}
+          REQUEUE_LATEST: ${{ steps.exact-review-publication-result.outputs.requeue_latest }}
           DIRECT_LIFECYCLE_REQUEUE: ${{ steps.exact-review-publication-result.outputs.direct_requeue }}
           LEGACY_TUPLELESS: ${{ steps.legacy-exact-artifact.outputs.legacy_tupleless }}
           QUEUE_LEASE_ID: ${{ steps.publication-context.outputs.publisher_lease_id }}
@@ -3204,7 +3487,7 @@ jobs:
             const completionKind = ["published", "superseded", "deferred", "retryable_failure", "refresh_required", "permanent_failure"].includes(process.env.COMPLETION_KIND)
               ? process.env.COMPLETION_KIND
               : undefined;
-            const reasonCode = ["publication_applied", "remote_newer_tuple", "remote_closed", "live_terminal", "github_rate_limit", "github_transient", "state_contention", "review_lease_active", "workflow_cancelled", "artifact_unavailable", "artifact_expired", "close_coverage_retry", "close_coverage_deferred", "invalid_artifact", "missing_record_tuple", "tuple_protocol_invalid", "policy_invariant", "unknown_failure", "retry_exhausted"].includes(process.env.REASON_CODE)
+            const reasonCode = ["publication_applied", "remote_newer_tuple", "remote_closed", "live_terminal", "github_rate_limit", "github_transient", "hermit_transient", "state_contention", "review_lease_active", "workflow_cancelled", "artifact_unavailable", "artifact_expired", "close_coverage_retry", "close_coverage_deferred", "invalid_artifact", "missing_record_tuple", "tuple_protocol_invalid", "policy_invariant", "unknown_failure", "retry_exhausted"].includes(process.env.REASON_CODE)
               ? process.env.REASON_CODE
               : undefined;
             const errorFingerprint = /^[A-Za-z0-9:._-]{1,200}$/.test(process.env.ERROR_FINGERPRINT || "")

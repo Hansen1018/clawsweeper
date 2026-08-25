@@ -31,7 +31,7 @@ test("every state hydration uses the canonical Worker with an explicit git-state
     }
   }
 
-  assert.equal(setups.length, 21, "setup-state site count is an audited invariant");
+  assert.equal(setups.length, 22, "setup-state site count is an audited invariant");
   for (const { site, step } of setups) {
     assert.equal(step.with?.["records-url"], workerUrl, site);
     assert.equal(step.with?.["records-secret"], workerSecret, site);
@@ -79,6 +79,7 @@ test("per-target state hydration is slug-scoped while fleet lanes retain discove
       ".github/workflows/repair-issue-implementation-intake.yml:intake",
       ".github/workflows/spam-scanner.yml:scan",
       ".github/workflows/sweep.yml:event-review-apply",
+      ".github/workflows/sweep.yml:event-review-publish",
       ".github/workflows/sweep.yml:event-review-publish",
       ".github/workflows/sweep.yml:plan",
       ".github/workflows/sweep.yml:publish",
@@ -172,7 +173,7 @@ test("all remaining git publishers join setup-state and receive a step-scoped co
       }
     }
   }
-  assert.equal(publishers, 21, "git publisher count is an audited invariant");
+  assert.equal(publishers, 24, "git publisher count is an audited invariant");
 });
 
 test("post-side-effect git bookkeeping is non-fatal while durability fences stay strict", () => {

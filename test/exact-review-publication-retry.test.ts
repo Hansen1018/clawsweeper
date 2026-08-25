@@ -8,7 +8,12 @@ import {
 const itemKey = "openclaw/openclaw#112030@publish:30795752045:1";
 
 test("ordinary publication failures retry within six minutes even after repeated failures", () => {
-  for (const reasonCode of ["github_transient", "state_contention", "unknown_failure"]) {
+  for (const reasonCode of [
+    "github_transient",
+    "hermit_transient",
+    "state_contention",
+    "unknown_failure",
+  ]) {
     for (const kind of ["retryable_failure", "permanent_failure"]) {
       for (const attempt of [1, 2, 3, 4, 8, 12]) {
         const delay = exactReviewPublicationRetryDelayMs(itemKey, { kind, reasonCode }, attempt);
@@ -63,6 +68,15 @@ test("publication retry exhaustion preserves transient, permanent, and unknown b
       now,
     ),
     true,
+  );
+  assert.equal(
+    exactReviewPublicationRetryExhausted(
+      { kind: "retryable_failure", reasonCode: "hermit_transient" },
+      47,
+      now,
+      now,
+    ),
+    false,
   );
   assert.equal(
     exactReviewPublicationRetryExhausted(
@@ -128,4 +142,5 @@ test("faster retries preserve the previous unknown and transient outage horizons
 
   assert.ok(elapsedUntilExhausted("unknown_failure") >= 50 * 60_000);
   assert.ok(elapsedUntilExhausted("github_transient") >= 210 * 60_000);
+  assert.ok(elapsedUntilExhausted("hermit_transient") >= 210 * 60_000);
 });

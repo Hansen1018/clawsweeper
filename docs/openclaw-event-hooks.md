@@ -178,6 +178,52 @@ These events use `deliver: true`, so OpenClaw can post the final answer to the
 Discord target. The prompt still permits `NO_REPLY` for an event that is clearly
 routine or not useful.
 
+## Endor Remediation Reviews
+
+Endor remediation reviews use the strict event class
+`clawsweeper.endor_remediation_reviewed`. After each durable exact-head review,
+ClawSweeper verifies the production `endor-labs-pro[bot]` App identity, the
+current 40-character PR head, and the published review-comment digest. Title,
+branch, and comment text alone cannot enter this path.
+
+The review state is stored in per-PR files under
+`notifications/endor-remediation/<owner>/<repo>/pulls/<number>/`. Delivery
+receipts are further separated by full reviewed head and normalized outcome, so
+concurrent PR publishers cannot replace each other's convergence or deduplication
+state. Three consecutive fresh clean reviews are required on one unchanged head.
+A finding or new head resets the clean count, ambiguous results never count, and
+the loop stops after six review cycles. ClawSweeper acknowledges the current
+publication only after the next exact review is durably queued or the terminal
+notification and receipt are durably published.
+
+The default direct exact-review path detects eligible Endor reviews after the
+durable GitHub comment is synchronized and diverts them to the publication job
+that owns convergence, state persistence, successor queueing, and notification.
+Non-Endor items retain direct publication.
+
+For a terminal review, ClawSweeper publishes the per-PR terminal state before
+calling Hermit, then checkpoints Hermit's Discord message receipt before completing
+the exact-review publication. Exhausted transient delivery attempts retain a
+dedicated retryable finalization reason, so they use the full transient recovery
+window and never create a receipt before acceptance.
+
+Immediately before delivery, ClawSweeper reads the PR head, checks, and merge
+state again. Head or readiness drift suppresses the stale notification and
+queues a fresh exact-head review; a closed or merged PR completes without a
+notification or another review, and transient GitHub failures remain retryable.
+
+Configure `CLAWSWEEPER_HERMIT_URL` and the shared
+`CLAWSWEEPER_HERMIT_TOKEN`. ClawSweeper sends the structured terminal event to
+Hermit; it cannot select a Discord target. Hermit validates the event, renders
+the ready, needs-attention, or unknown notification, and sends it only to its
+configured `CLAWSWEEPER_ENDOR_DISCORD_CHANNEL_ID`. Hermit combines a durable D1
+receipt with Discord's enforced nonce to deduplicate retries. The message directs
+maintainers to GitHub to comment `@clawsweeper automerge`.
+
+Hermit's Discord message receipt is the automated delivery boundary. OpenClaw Bay is unaffected:
+this internal security notification adds no public status, telemetry, navigation,
+data contract, or mutation control.
+
 ## GitHub Activity Stream
 
 The `github activity to openclaw` workflow feeds broader GitHub activity to the
