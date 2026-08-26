@@ -32,6 +32,8 @@ const GUARDED_OPEN_ACTIONS = new Set([
 ]);
 
 const LEGACY_TUPLELESS_REVIEW_LEASE_REASON = "local report has no durable lease identity";
+const NEWER_DURABLE_REVIEW_TUPLE_REASON =
+  /^live durable review tuple is newer than the local report: comment lease=([1-9][0-9]*), report lease=([1-9][0-9]*)$/;
 // The durable queue rejects retry deadlines beyond two hours. Leave a small
 // margin for worker/queue clock skew; a still-active long lease is sampled
 // again at this bounded deadline instead of rejecting the completion.
@@ -91,6 +93,7 @@ export function exactEventRoutingDeferred({
 
 export type ExactEventApplyDisposition =
   | "applied"
+  | "superseded"
   | "terminal_policy_noop"
   | "source_drift"
   | "close_coverage_deferred"
@@ -138,6 +141,9 @@ export function exactEventApplyProof(
     (entry) => entry.action === "skipped_changed_since_review",
   );
   const hasSourceDrift = sourceDriftActions.length > 0;
+  const hasStaleReviewTuple = exactActions.some(
+    (entry) => entry.action === "skipped_stale_review_comment_sync",
+  );
   const sourceDrift =
     hasSourceDrift &&
     sourceDriftActions.every((entry) => entry.sourceDriftVerified) &&
@@ -160,6 +166,10 @@ export function exactEventApplyProof(
     soleExactAction === "kept_open" && soleExactResult?.activeReviewLeaseVerified === true
       ? normalizedReviewLeaseRetryAt(soleExactResult.activeReviewLeaseExpiresAt)
       : null;
+  const supersededByNewerDurableReviewTuple =
+    soleExactAction === "skipped_stale_review_comment_sync" &&
+    soleExactResult !== null &&
+    hasStrictlyNewerDurableReviewTuple(soleExactResult.reason);
   return {
     exactActions,
     syncedCount,
@@ -182,14 +192,30 @@ export function exactEventApplyProof(
       ? sourceDrift
         ? "source_drift"
         : "unproven"
-      : closeCoverageDeferred
-        ? "close_coverage_deferred"
-        : terminalPolicyNoop
-          ? "terminal_policy_noop"
-          : syncedCount + terminalCount > 0
-            ? "applied"
-            : "unproven",
+      : hasStaleReviewTuple
+        ? supersededByNewerDurableReviewTuple
+          ? "superseded"
+          : "unproven"
+        : closeCoverageDeferred
+          ? "close_coverage_deferred"
+          : terminalPolicyNoop
+            ? "terminal_policy_noop"
+            : syncedCount + terminalCount > 0
+              ? "applied"
+              : "unproven",
   };
+}
+
+function hasStrictlyNewerDurableReviewTuple(reason: string): boolean {
+  const match = NEWER_DURABLE_REVIEW_TUPLE_REASON.exec(reason);
+  if (!match) return false;
+  const liveLeaseCommentId = Number(match[1]);
+  const reportLeaseCommentId = Number(match[2]);
+  return (
+    Number.isSafeInteger(liveLeaseCommentId) &&
+    Number.isSafeInteger(reportLeaseCommentId) &&
+    liveLeaseCommentId > reportLeaseCommentId
+  );
 }
 
 function normalizedReviewLeaseRetryAt(value: string): string | null {

@@ -385,6 +385,7 @@ test("exact event proof completes live-shaped deterministic guarded-open results
     );
 
     assert.equal(proof.guardedOpenAction, action);
+    assert.equal(proof.disposition, "unproven");
     assert.equal(proof.latestRevisionRequeueRequired, false);
   }
 });
@@ -402,7 +403,7 @@ test("exact event proof keeps changed-since-review on the latest-revision requeu
   assert.equal(proof.latestRevisionRequeueRequired, true);
 });
 
-test("exact event proof requeues only the guarded legacy tuple-less artifact path", () => {
+test("exact event proof supersedes only a verified strictly newer durable tuple", () => {
   const legacy = exactEventApplyProof(
     [
       eventApplyAction({
@@ -419,7 +420,8 @@ test("exact event proof requeues only the guarded legacy tuple-less artifact pat
       eventApplyAction({
         number: 42,
         action: "skipped_stale_review_comment_sync",
-        reason: "live durable review comment is newer than the local report",
+        reason:
+          "live durable review tuple is newer than the local report: comment lease=9200, report lease=9100",
       }),
     ],
     42,
@@ -427,6 +429,7 @@ test("exact event proof requeues only the guarded legacy tuple-less artifact pat
 
   assert.equal(legacy.legacyTuplelessReviewLease, true);
   assert.equal(newerVerdict.legacyTuplelessReviewLease, false);
+  assert.equal(newerVerdict.disposition, "superseded");
   assert.equal(
     eventApplyRequeueLatestExpected({
       disposition: legacy.disposition,
@@ -443,6 +446,47 @@ test("exact event proof requeues only the guarded legacy tuple-less artifact pat
     }),
     false,
   );
+});
+
+test("exact event proof fails closed for ambiguous newer-tuple claims", () => {
+  const reasons = [
+    "live durable review tuple is newer than the local report: comment lease=9100, report lease=9100",
+    "live durable review tuple is newer than the local report: comment lease=9000, report lease=9100",
+    "live durable review tuple is newer than the local report: comment lease=invalid, report lease=9100",
+    "live durable review tuple is newer than the local report: comment lease=9007199254740992, report lease=9100",
+    "live durable review comment is newer than the local report",
+  ];
+  for (const reason of reasons) {
+    const proof = exactEventApplyProof(
+      [
+        eventApplyAction({
+          number: 42,
+          action: "skipped_stale_review_comment_sync",
+          reason,
+        }),
+      ],
+      42,
+    );
+    assert.equal(proof.disposition, "unproven", reason);
+  }
+
+  const mixed = exactEventApplyProof(
+    [
+      eventApplyAction({
+        number: 42,
+        action: "skipped_stale_review_comment_sync",
+        reason:
+          "live durable review tuple is newer than the local report: comment lease=9200, report lease=9100",
+      }),
+      eventApplyAction({
+        number: 42,
+        action: "review_comment_synced",
+        durableReviewSynced: true,
+      }),
+    ],
+    42,
+  );
+  assert.equal(mixed.disposition, "unproven");
 });
 
 test("guarded-open proof rejects mismatches, extra results, and transient skips", () => {

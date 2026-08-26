@@ -229,6 +229,15 @@ async function publishEventResult(options: EventOptions): Promise<void> {
     exactEventPublication: options.exactEventPublication,
     legacyTuplelessReviewLease,
   });
+  const summary = () =>
+    writeSummary({
+      targetRepo: options.targetRepo,
+      itemNumber: options.itemNumber,
+      syncedCount,
+      closedCount,
+      missingCount,
+      closeReasons: options.closeReasons,
+    });
   const rateLimitYield = exactActions.find(
     (action) =>
       action.action === "skipped_runtime_budget" &&
@@ -241,6 +250,17 @@ async function publishEventResult(options: EventOptions): Promise<void> {
     console.log(
       `Requeueing ${options.targetRepo}#${options.itemNumber}: legacy exact artifact lacks its durable review lease tuple`,
     );
+  }
+  if (applyDisposition === "superseded") {
+    console.log(
+      `Completing ${options.targetRepo}#${options.itemNumber} as superseded: a newer durable review tuple is already live`,
+    );
+    if (options.batchMutationOutput) {
+      writeBatchMutationResult(options.batchMutationOutput, { kind: "superseded" });
+    }
+    writePublicationCompletionOutputs("superseded", "remote_newer_tuple");
+    summary();
+    return;
   }
   const deferredCloseCoverageExpected = applyDisposition === "close_coverage_deferred";
   if (activeReviewLeaseRetryAt !== null) {
@@ -266,10 +286,11 @@ async function publishEventResult(options: EventOptions): Promise<void> {
     }
   }
   if (
-    syncedCount + closedCount + missingCount === 0 &&
-    guardedOpenAction === null &&
-    !requeueLatestExpected &&
-    !deferredCloseCoverageExpected
+    (applyDisposition === "unproven" && guardedOpenAction === null && !requeueLatestExpected) ||
+    (syncedCount + closedCount + missingCount === 0 &&
+      guardedOpenAction === null &&
+      !requeueLatestExpected &&
+      !deferredCloseCoverageExpected)
   ) {
     const observed =
       exactActions
@@ -280,15 +301,6 @@ async function publishEventResult(options: EventOptions): Promise<void> {
       `Event review for ${options.targetRepo}#${options.itemNumber} was not applied; actions: ${observed}`,
     );
   }
-  const summary = () =>
-    writeSummary({
-      targetRepo: options.targetRepo,
-      itemNumber: options.itemNumber,
-      syncedCount,
-      closedCount,
-      missingCount,
-      closeReasons: options.closeReasons,
-    });
   const routableSyncExpected =
     syncedCount > 0 &&
     closedCount === 0 &&

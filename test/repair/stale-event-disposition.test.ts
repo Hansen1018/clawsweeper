@@ -56,3 +56,26 @@ test("publish-event-result exits terminally on a stale preflight instead of thro
   );
   assert.ok(!preflightBlock.includes("throw new Error"));
 });
+
+test("publish-event-result terminalizes a verified newer live durable tuple", () => {
+  const source = readFileSync("src/repair/publish-event-result.ts", "utf8");
+  const start = source.indexOf('if (applyDisposition === "superseded")');
+  const end = source.indexOf(
+    'const deferredCloseCoverageExpected = applyDisposition === "close_coverage_deferred"',
+    start,
+  );
+  assert.ok(start >= 0 && end > start);
+  const block = source.slice(start, end);
+  assert.match(
+    block,
+    /writeBatchMutationResult\(options\.batchMutationOutput, \{\s*kind: "superseded"/,
+  );
+  assert.match(block, /writePublicationCompletionOutputs\("superseded", "remote_newer_tuple"\)/);
+  assert.match(block, /summary\(\)/);
+  assert.match(block, /return/);
+  assert.doesNotMatch(block, /publishSnapshot|prepareBatchMutation|runApplyDecisions/);
+  assert.match(
+    source,
+    /applyDisposition === "unproven" &&\s*guardedOpenAction === null &&\s*!requeueLatestExpected/,
+  );
+});
