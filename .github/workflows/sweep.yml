@@ -1347,9 +1347,107 @@ jobs:
           echo "$summary"
           {
             echo "candidate_count=$(jq -r '.candidates | length' <<< "$summary")"
+            echo "candidates=$(jq -c '.candidates' <<< "$summary")"
             echo "record_media=$(jq -r '.recordMedia' <<< "$summary")"
             echo "requires_terminal=$(jq -r '.requiresTerminal' <<< "$summary")"
           } >> "$GITHUB_OUTPUT"
+
+      - name: Resolve exact live-proof Go version
+        id: resolve-exact-live-proof-go
+        if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.inspect-exact-live-proof.outputs.candidate_count != '0' && steps.inspect-exact-live-proof.outcome == 'success' }}
+        env:
+          CANDIDATES: ${{ steps.inspect-exact-live-proof.outputs.candidates }}
+          RECORDS_DIR: artifacts/event
+          TARGET_CHECKOUT: ${{ steps.target.outputs.target_checkout_dir }}
+          VERSION_FILE: .artifacts/exact-live-proof-go/.go-version
+        run: |
+          set -euo pipefail
+          versions_file="$(mktemp)"
+          trap 'rm -f "$versions_file"' EXIT
+          requires_automatic_toolchain=false
+          while read -r item; do
+            record="$RECORDS_DIR/$item.md"
+            head_sha="$(sed -n 's/^pull_head_sha:[[:space:]]*//p' "$record" | head -n 1)"
+            printf '%s' "$head_sha" | grep -Eq '^[0-9a-f]{40}$'
+            if ! go_mod="$(git -C "$TARGET_CHECKOUT" show "$head_sha:go.mod" 2>/dev/null)"; then
+              requires_automatic_toolchain=true
+              continue
+            fi
+            if go_work="$(git -C "$TARGET_CHECKOUT" show "$head_sha:go.work" 2>/dev/null)"; then
+              go_config="$go_work"
+              default_go_version=1.18
+            else
+              go_config="$go_mod"
+              default_go_version=1.16
+            fi
+            while IFS= read -r -d '' path; do
+              case "$path" in
+                */go.mod | */go.work)
+                  requires_automatic_toolchain=true
+                  ;;
+              esac
+            done < <(git -C "$TARGET_CHECKOUT" ls-tree -rz --name-only "$head_sha")
+            go_version="$(awk '$1 == "go" { print $2; exit }' <<< "$go_config")"
+            toolchain_version="$(awk '$1 == "toolchain" && $2 ~ /^go/ { sub(/^go/, "", $2); print $2; exit }' <<< "$go_config")"
+            printf '%s\n' "${go_version:-$default_go_version}" >> "$versions_file"
+            if [ -n "$toolchain_version" ]; then
+              printf '%s\n' "$toolchain_version" >> "$versions_file"
+            fi
+          done < <(jq -r '.[]' <<< "$CANDIDATES")
+          echo "automatic=$requires_automatic_toolchain" >> "$GITHUB_OUTPUT"
+          if [ ! -s "$versions_file" ]; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          minimum_go_version=1.14.0
+          if [ "$requires_automatic_toolchain" = "true" ]; then
+            minimum_go_version=1.21.0
+          fi
+          version="$(node - "$versions_file" "$minimum_go_version" <<'NODE'
+          const fs = require("node:fs");
+          const path = process.argv[2];
+          const minimum = process.argv[3];
+          const versions = fs
+            .readFileSync(path, "utf8")
+            .trim()
+            .split(/\s+/)
+            .map((version) => version.replace(/-.+$/, ""));
+          const key = (version) => {
+            const match = /^1\.(\d+)(?:(beta|rc)(\d+)|\.(\d+))?$/.exec(version);
+            if (!match) throw new Error(`unsupported Go version ${version}`);
+            const minor = Number(match[1]);
+            if (match[2] === "beta") return [minor, 0, Number(match[3])];
+            if (match[2] === "rc") return [minor, 1, Number(match[3])];
+            if (match[4] !== undefined) return [minor, 2, Number(match[4])];
+            return [minor, minor < 21 ? 2 : -1, 0];
+          };
+          const compare = (left, right) => {
+            const a = key(left);
+            const b = key(right);
+            return a[0] - b[0] || a[1] - b[1] || a[2] - b[2];
+          };
+          versions.sort(compare);
+          process.stdout.write(compare(versions.at(-1), minimum) < 0 ? minimum : versions.at(-1));
+          NODE
+          )"
+          mkdir -p "$(dirname "$VERSION_FILE")"
+          printf '%s\n' "$version" > "$VERSION_FILE"
+          {
+            echo "available=true"
+            echo "path=$VERSION_FILE"
+            echo "version=$version"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up exact live-proof Go toolchain
+        if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.resolve-exact-live-proof-go.outputs.available == 'true' && hashFiles(steps.resolve-exact-live-proof-go.outputs.path) != '' }}
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: ${{ steps.resolve-exact-live-proof-go.outputs.path }}
+          cache: "false"
+
+      - name: Enable exact live-proof automatic Go fallback
+        if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.resolve-exact-live-proof-go.outputs.automatic == 'true' }}
+        run: echo "GOTOOLCHAIN=auto" >> "$GITHUB_ENV"
 
       - name: Install exact live-proof terminal tools
         if: ${{ steps.claim-exact-review-queue.outputs.claimed == 'true' && steps.inspect-exact-live-proof.outputs.requires_terminal == 'true' }}
@@ -4509,9 +4607,113 @@ jobs:
           echo "$summary"
           {
             echo "candidate_count=$(jq -r '.candidates | length' <<< "$summary")"
+            echo "candidates=$(jq -c '.candidates' <<< "$summary")"
             echo "record_media=$(jq -r '.recordMedia' <<< "$summary")"
             echo "requires_terminal=$(jq -r '.requiresTerminal' <<< "$summary")"
           } >> "$GITHUB_OUTPUT"
+
+      - name: Resolve review-shard live-proof Go version
+        id: resolve-shard-live-proof-go
+        if: ${{ steps.inspect-shard-live-proofs.outputs.candidate_count != '0' && steps.inspect-shard-live-proofs.outcome == 'success' }}
+        env:
+          CANDIDATES: ${{ steps.inspect-shard-live-proofs.outputs.candidates }}
+          RECORDS_DIR: review-artifacts/shard-${{ matrix.shard }}
+          TARGET_CHECKOUT: ${{ needs.plan.outputs.target_checkout_dir }}
+          VERSION_FILE: review-artifacts/shard-${{ matrix.shard }}/live-proof-toolchain/.go-version
+        run: |
+          set -euo pipefail
+          versions_file="$(mktemp)"
+          trap 'rm -f "$versions_file"' EXIT
+          candidate_count="$(jq -r 'length' <<< "$CANDIDATES")"
+          root_module_count=0
+          requires_automatic_toolchain=false
+          while read -r item; do
+            record="$RECORDS_DIR/$item.md"
+            head_sha="$(sed -n 's/^pull_head_sha:[[:space:]]*//p' "$record" | head -n 1)"
+            printf '%s' "$head_sha" | grep -Eq '^[0-9a-f]{40}$'
+            if ! go_mod="$(git -C "$TARGET_CHECKOUT" show "$head_sha:go.mod" 2>/dev/null)"; then
+              requires_automatic_toolchain=true
+              continue
+            fi
+            root_module_count=$((root_module_count + 1))
+            if go_work="$(git -C "$TARGET_CHECKOUT" show "$head_sha:go.work" 2>/dev/null)"; then
+              go_config="$go_work"
+              default_go_version=1.18
+            else
+              go_config="$go_mod"
+              default_go_version=1.16
+            fi
+            while IFS= read -r -d '' path; do
+              case "$path" in
+                */go.mod | */go.work)
+                  requires_automatic_toolchain=true
+                  ;;
+              esac
+            done < <(git -C "$TARGET_CHECKOUT" ls-tree -rz --name-only "$head_sha")
+            go_version="$(awk '$1 == "go" { print $2; exit }' <<< "$go_config")"
+            toolchain_version="$(awk '$1 == "toolchain" && $2 ~ /^go/ { sub(/^go/, "", $2); print $2; exit }' <<< "$go_config")"
+            printf '%s\n' "${go_version:-$default_go_version}" >> "$versions_file"
+            if [ -n "$toolchain_version" ]; then
+              printf '%s\n' "$toolchain_version" >> "$versions_file"
+            fi
+          done < <(jq -r '.[]' <<< "$CANDIDATES")
+          if [ "$root_module_count" -ne "$candidate_count" ]; then
+            requires_automatic_toolchain=true
+          fi
+          echo "automatic=$requires_automatic_toolchain" >> "$GITHUB_OUTPUT"
+          if [ ! -s "$versions_file" ]; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          minimum_go_version=1.14.0
+          if [ "$requires_automatic_toolchain" = "true" ]; then
+            minimum_go_version=1.21.0
+          fi
+          version="$(node - "$versions_file" "$minimum_go_version" <<'NODE'
+          const fs = require("node:fs");
+          const path = process.argv[2];
+          const minimum = process.argv[3];
+          const versions = fs
+            .readFileSync(path, "utf8")
+            .trim()
+            .split(/\s+/)
+            .map((version) => version.replace(/-.+$/, ""));
+          const key = (version) => {
+            const match = /^1\.(\d+)(?:(beta|rc)(\d+)|\.(\d+))?$/.exec(version);
+            if (!match) throw new Error(`unsupported Go version ${version}`);
+            const minor = Number(match[1]);
+            if (match[2] === "beta") return [minor, 0, Number(match[3])];
+            if (match[2] === "rc") return [minor, 1, Number(match[3])];
+            if (match[4] !== undefined) return [minor, 2, Number(match[4])];
+            return [minor, minor < 21 ? 2 : -1, 0];
+          };
+          const compare = (left, right) => {
+            const a = key(left);
+            const b = key(right);
+            return a[0] - b[0] || a[1] - b[1] || a[2] - b[2];
+          };
+          versions.sort(compare);
+          process.stdout.write(compare(versions.at(-1), minimum) < 0 ? minimum : versions.at(-1));
+          NODE
+          )"
+          mkdir -p "$(dirname "$VERSION_FILE")"
+          printf '%s\n' "$version" > "$VERSION_FILE"
+          {
+            echo "available=true"
+            echo "path=$VERSION_FILE"
+            echo "version=$version"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up review-shard live-proof Go toolchain
+        if: ${{ steps.resolve-shard-live-proof-go.outputs.available == 'true' && hashFiles(steps.resolve-shard-live-proof-go.outputs.path) != '' }}
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: ${{ steps.resolve-shard-live-proof-go.outputs.path }}
+          cache: "false"
+
+      - name: Enable review-shard live-proof automatic Go fallback
+        if: ${{ steps.resolve-shard-live-proof-go.outputs.automatic == 'true' }}
+        run: echo "GOTOOLCHAIN=auto" >> "$GITHUB_ENV"
 
       - name: Install review-shard terminal tools
         if: ${{ steps.inspect-shard-live-proofs.outputs.requires_terminal == 'true' }}
