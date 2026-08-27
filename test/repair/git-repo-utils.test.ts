@@ -113,6 +113,9 @@ for (const pruneConfig of ["fetch.prune", "remote.origin.prune"]) {
       const newBase = run("git", ["rev-parse", "HEAD"], { cwd: work });
       run("git", ["push", "origin", "main"], { cwd: work });
       run("git", ["update-ref", "refs/remotes/origin/main", originalBase], { cwd: work });
+      if (pruneConfig === "remote.origin.prune") {
+        run("git", ["config", "fetch.prune", "false"], { cwd: work });
+      }
       run("git", ["config", pruneConfig, "true"], { cwd: work });
 
       assert.equal(ensureMergeBaseAvailable({ targetDir: work, baseBranch: "main" }), newBase);
@@ -129,6 +132,9 @@ for (const pruneConfig of ["fetch.prune", "remote.origin.prune"]) {
       run("git", ["fetch", "origin", "refs/heads/main:refs/remotes/origin/main", "--depth=1"], {
         cwd: shallow,
       });
+      if (pruneConfig === "remote.origin.prune") {
+        run("git", ["config", "fetch.prune", "false"], { cwd: shallow });
+      }
       run("git", ["config", pruneConfig, "true"], { cwd: shallow });
       assert.notEqual(
         spawnSync("git", ["merge-base", "origin/main", "HEAD"], { cwd: shallow }).status,

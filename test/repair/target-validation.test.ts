@@ -6349,6 +6349,9 @@ for (const pruneConfig of ["fetch.prune", "remote.origin.prune"]) {
       attachOrigin(cwd);
       origin = git(cwd, "remote", "get-url", "origin");
       const baseSha = git(cwd, "rev-parse", "HEAD");
+      if (pruneConfig === "remote.origin.prune") {
+        git(cwd, "config", "fetch.prune", "false");
+      }
       git(cwd, "config", pruneConfig, "true");
 
       assert.deepEqual(
