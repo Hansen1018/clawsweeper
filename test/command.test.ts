@@ -956,6 +956,7 @@ test("local exact review explains when GitHub item is not open", () => {
     execFileSync("git", ["branch", "-M", "main"], { cwd: targetDir });
     execFileSync("git", ["remote", "add", "origin", origin], { cwd: targetDir });
     execFileSync("git", ["push", "origin", "main"], { cwd: targetDir, stdio: "ignore" });
+    execFileSync("git", ["config", "fetch.prune", "true"], { cwd: targetDir });
     mkdirSync(binDir);
     const ghPath = join(binDir, "gh.js");
     writeFileSync(
@@ -1024,6 +1025,13 @@ process.exit(1);
     assert.match(result.stderr, /GitHub reports this PR is closed/);
     assert.doesNotMatch(result.stderr, /selected=0/);
     assert.doesNotMatch(result.stderr, /\n\s+at /);
+    assert.equal(
+      execFileSync("git", ["rev-parse", "refs/remotes/origin/main"], {
+        cwd: targetDir,
+        encoding: "utf8",
+      }),
+      execFileSync("git", ["rev-parse", "HEAD"], { cwd: targetDir, encoding: "utf8" }),
+    );
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -1050,6 +1058,8 @@ test("local exact review selects PATH Codex instead of the Desktop app binary", 
     execFileSync("git", ["branch", "-M", "main"], { cwd: targetDir });
     execFileSync("git", ["remote", "add", "origin", origin], { cwd: targetDir });
     execFileSync("git", ["push", "origin", "main"], { cwd: targetDir, stdio: "ignore" });
+    execFileSync("git", ["config", "fetch.prune", "false"], { cwd: targetDir });
+    execFileSync("git", ["config", "remote.origin.prune", "true"], { cwd: targetDir });
     const reviewHeadSha = execFileSync("git", ["rev-parse", "HEAD"], {
       cwd: targetDir,
       encoding: "utf8",

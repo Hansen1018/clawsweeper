@@ -2107,7 +2107,7 @@ test("pinned-base validation reproduction proves the same base failure", () => {
   git(cwd, "add", "src/repair.ts");
   git(cwd, "commit", "-m", "repair change");
 
-  const profiles = withPinnedBasePnpm(() =>
+  const profiles = withPackageScriptPnpm(() =>
     Array.from({ length: 2 }, () => {
       const baseError = reproduceValidationFailureAtPinnedBase({
         commands: ["pnpm check:changed"],
@@ -2181,7 +2181,7 @@ test("pinned-base reproduction avoids fetching unrelated missing partial-clone h
   assert.match(missingObjects, new RegExp(`^\\?${omittedHistoricalBlob}$`, "m"));
   git(target, "remote", "set-url", "origin", "https://invalid.invalid/offline.git");
 
-  const baseError = withPinnedBasePnpm(() =>
+  const baseError = withPackageScriptPnpm(() =>
     reproduceValidationFailureAtPinnedBase({
       commands: ["pnpm check:changed"],
       targetDir: target,
@@ -2226,7 +2226,7 @@ test("pinned-base reproduction preserves the source comparison branch for change
   git(cwd, "update-ref", "refs/remotes/origin/main", pinnedBaseRef);
   assert.notEqual(sourceMainSha, pinnedBaseRef);
 
-  const baseError = withPinnedBasePnpm(() =>
+  const baseError = withPackageScriptPnpm(() =>
     reproduceValidationFailureAtPinnedBase({
       commands: ["pnpm check:changed"],
       targetDir: cwd,
@@ -2279,7 +2279,7 @@ test("pinned-base reproduction hydrates blobs required by the older pinned snaps
     new RegExp(`^\\?${requiredBlob}$`, "m"),
   );
 
-  const baseError = withPinnedBasePnpm(() =>
+  const baseError = withPackageScriptPnpm(() =>
     reproduceValidationFailureAtPinnedBase({
       commands: ["pnpm check:changed"],
       targetDir: target,
@@ -2310,7 +2310,7 @@ test("pinned-base reproduction preserves the source SHA-256 object format", () =
   const pinnedBaseRef = git(cwd, "rev-parse", "HEAD");
   assert.equal(pinnedBaseRef.length, 64);
 
-  const baseError = withPinnedBasePnpm(() =>
+  const baseError = withPackageScriptPnpm(() =>
     reproduceValidationFailureAtPinnedBase({
       commands: ["pnpm check:changed"],
       targetDir: cwd,
@@ -2361,7 +2361,7 @@ test("pinned-base reproduction does not inherit target-controlled checkout hooks
   });
   git(cwd, "config", "core.hooksPath", hooks);
 
-  const baseError = withPinnedBasePnpm(() =>
+  const baseError = withPackageScriptPnpm(() =>
     reproduceValidationFailureAtPinnedBase({
       commands: ["pnpm check:changed"],
       targetDir: cwd,
@@ -6334,6 +6334,42 @@ fs.writeFileSync("source.txt", "mutated\\n");
   );
 });
 
+for (const pruneConfig of ["fetch.prune", "remote.origin.prune"]) {
+  test(`target validation preserves its base ref with ${pruneConfig}=true`, () => {
+    const cwd = gitPackageFixture({});
+    let origin: string | undefined;
+    try {
+      fs.mkdirSync(path.join(cwd, "scripts"));
+      fs.writeFileSync(
+        path.join(cwd, "scripts/verify.mjs"),
+        "console.log('validation reached');\n",
+      );
+      git(cwd, "add", ".");
+      git(cwd, "commit", "-m", "initial");
+      attachOrigin(cwd);
+      origin = git(cwd, "remote", "get-url", "origin");
+      const baseSha = git(cwd, "rev-parse", "HEAD");
+      git(cwd, "config", pruneConfig, "true");
+
+      assert.deepEqual(
+        runAllowedValidationCommands(
+          ["node scripts/verify.mjs", "git diff --check"],
+          cwd,
+          validationOptions("steipete/example", {
+            toolchain: { packageManager: "pnpm", baseValidationCommands: [], changedGate: null },
+          }),
+        ),
+        ["node scripts/verify.mjs", "git diff --check"],
+      );
+      assert.equal(git(cwd, "rev-parse", "refs/remotes/origin/main"), baseSha);
+      assert.equal(git(cwd, "status", "--porcelain"), "");
+    } finally {
+      fs.rmSync(cwd, { recursive: true, force: true });
+      if (origin) fs.rmSync(origin, { recursive: true, force: true });
+    }
+  });
+}
+
 test("validation rejects scripts that mutate the checkout", () => {
   const cwd = gitPackageFixture({ verify: "node mutate.js" });
   fs.writeFileSync(
@@ -8136,7 +8172,7 @@ fs.writeFileSync("pnpm-lock.yaml", "lockfileVersion: '9.0'\\n");
   );
 });
 
-test("target setup shares one deadline across probes and installs", () => {
+test("target setup shares one deadline across probes and installs", (t) => {
   const cwd = gitPackageFixture({ check: "node check.js" });
   fs.writeFileSync(path.join(cwd, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\n");
   git(cwd, "add", ".");
@@ -8145,17 +8181,12 @@ test("target setup shares one deadline across probes and installs", () => {
   const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-setup-deadline-"));
   const corepackPath = path.join(binDir, "corepack.js");
   const pnpmPath = path.join(binDir, "pnpm.js");
-  const corepackCountPath = path.join(binDir, "corepack-count");
+  const corepackPhasesPath = path.join(binDir, "corepack-phases");
   const pnpmMarkerPath = path.join(binDir, "pnpm-ran");
   fs.writeFileSync(
     corepackPath,
     `const fs = require("node:fs");
-const count = fs.existsSync(${JSON.stringify(corepackCountPath)})
-  ? Number(fs.readFileSync(${JSON.stringify(corepackCountPath)}, "utf8"))
-  : 0;
-fs.writeFileSync(${JSON.stringify(corepackCountPath)}, String(count + 1));
-const delay = process.argv[2] === "enable" ? 100 : 2000;
-Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delay);
+fs.appendFileSync(${JSON.stringify(corepackPhasesPath)}, process.argv[2] + "\\n");
 `,
   );
   fs.writeFileSync(
@@ -8163,28 +8194,42 @@ Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delay);
     `require("node:fs").writeFileSync(${JSON.stringify(pnpmMarkerPath)}, "ran");\n`,
   );
 
-  assert.throws(
-    () =>
-      withMockCommand("corepack", corepackPath, () =>
-        withMockCommand("pnpm", pnpmPath, () =>
-          prepareTargetToolchain(cwd, {
-            ...validationOptions("steipete/example", {
-              toolchain: {
-                packageManager: "pnpm",
-                baseValidationCommands: ["pnpm check"],
-                changedGate: null,
-              },
+  const startedAt = Date.now();
+  // Charge each completed Corepack phase 600ms; Git/probe scheduling consumes no fake time.
+  const clock = t.mock.method(Date, "now", () => {
+    const phases = fs.existsSync(corepackPhasesPath)
+      ? fs.readFileSync(corepackPhasesPath, "utf8").trim().split("\n").length
+      : 0;
+    return startedAt + phases * 600;
+  });
+  try {
+    assert.throws(
+      () =>
+        withMockCommand("corepack", corepackPath, () =>
+          withMockCommand("pnpm", pnpmPath, () =>
+            prepareTargetToolchain(cwd, {
+              ...validationOptions("steipete/example", {
+                toolchain: {
+                  packageManager: "pnpm",
+                  baseValidationCommands: ["pnpm check"],
+                  changedGate: null,
+                },
+              }),
+              installTargetDeps: true,
+              installTimeoutMs: 1200,
+              setupTimeoutMs: 1200,
             }),
-            installTargetDeps: true,
-            installTimeoutMs: 1200,
-            setupTimeoutMs: 1200,
-          }),
+          ),
         ),
-      ),
-    /command timed out after \d+ms: corepack prepare/,
-  );
-  assert.equal(fs.readFileSync(corepackCountPath, "utf8"), "2");
-  assert.equal(fs.existsSync(pnpmMarkerPath), false);
+      /target dependency setup deadline exhausted during pnpm install/,
+    );
+    assert.equal(fs.readFileSync(corepackPhasesPath, "utf8"), "enable\nprepare\n");
+    assert.equal(fs.existsSync(pnpmMarkerPath), false);
+  } finally {
+    clock.mock.restore();
+    fs.rmSync(binDir, { recursive: true, force: true });
+    fs.rmSync(cwd, { recursive: true, force: true });
+  }
 });
 
 test("bun-based target repos still report unrelated missing scripts as blocked", () => {
@@ -8332,33 +8377,28 @@ test("resolveTargetRepoToolchain stays total when the config file is malformed J
 });
 
 test("changed validation retries one transient check:changed failure", () => {
-  const marker = path.join(
-    os.tmpdir(),
-    `clawsweeper-validation-attempt-${process.pid}-${Date.now()}.txt`,
-  );
+  const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-validation-retry-"));
+  const marker = path.join(fixture, "attempts");
   const cwd = gitPackageFixture({ "check:changed": "node check.js" });
   fs.writeFileSync(
     path.join(cwd, "check.js"),
-    [
-      "const fs = require('node:fs');",
-      "const file = process.env.CLAWSWEEPER_TEST_ATTEMPT_FILE;",
-      "const count = fs.existsSync(file) ? Number(fs.readFileSync(file, 'utf8')) : 0;",
-      "fs.writeFileSync(file, String(count + 1));",
-      "if (count === 0) { console.error('transient changed gate failure'); process.exit(1); }",
-      "",
-    ].join("\n"),
+    `const fs = require("node:fs");
+const file = ${JSON.stringify(marker)};
+const count = fs.existsSync(file) ? Number(fs.readFileSync(file, "utf8")) : 0;
+fs.writeFileSync(file, String(count + 1));
+if (count === 0) { console.error("transient changed gate failure"); process.exit(1); }
+`,
   );
   git(cwd, "add", ".");
   git(cwd, "commit", "-m", "initial");
   attachOrigin(cwd);
+  const origin = git(cwd, "remote", "get-url", "origin");
 
   const previous = process.env.CLAWSWEEPER_VALIDATION_RETRIES;
-  const previousMarker = process.env.CLAWSWEEPER_TEST_ATTEMPT_FILE;
   process.env.CLAWSWEEPER_VALIDATION_RETRIES = "1";
-  process.env.CLAWSWEEPER_TEST_ATTEMPT_FILE = marker;
   try {
     assert.deepEqual(
-      withPinnedBasePnpm(() =>
+      withPackageScriptPnpm(() =>
         runAllowedValidationCommands(
           ["pnpm check:changed"],
           cwd,
@@ -8368,91 +8408,135 @@ test("changed validation retries one transient check:changed failure", () => {
       ["pnpm check:changed"],
     );
     assert.equal(fs.readFileSync(marker, "utf8"), "2");
+    assert.equal(git(cwd, "status", "--porcelain"), "");
   } finally {
     restoreEnv("CLAWSWEEPER_VALIDATION_RETRIES", previous);
-    restoreEnv("CLAWSWEEPER_TEST_ATTEMPT_FILE", previousMarker);
-    fs.rmSync(marker, { force: true });
+    fs.rmSync(fixture, { recursive: true, force: true });
+    fs.rmSync(cwd, { recursive: true, force: true });
+    fs.rmSync(origin, { recursive: true, force: true });
   }
 });
 
-test("changed validation shares one timeout with checkout identity proof", () => {
-  const marker = path.join(
-    os.tmpdir(),
-    `clawsweeper-validation-budget-${process.pid}-${Date.now()}.txt`,
-  );
+test("changed validation shares one timeout with checkout identity proof", (t) => {
+  const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-validation-budget-"));
+  const marker = path.join(fixture, "attempts");
   const cwd = gitPackageFixture({ "check:changed": "node check.js" });
-  git(cwd, "add", ".");
-  git(cwd, "commit", "-m", "initial");
-  attachOrigin(cwd);
-
-  const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-pnpm-budget-"));
-  const pnpmPath = path.join(binDir, "pnpm.js");
   fs.writeFileSync(
-    pnpmPath,
+    path.join(cwd, "check.js"),
     `const fs = require("node:fs");
 const count = fs.existsSync(${JSON.stringify(marker)})
   ? Number(fs.readFileSync(${JSON.stringify(marker)}, "utf8"))
   : 0;
 fs.writeFileSync(${JSON.stringify(marker)}, String(count + 1));
-setTimeout(() => {}, 5000);
+console.error("transient changed gate failure");
+process.exit(1);
 `,
+  );
+  git(cwd, "add", ".");
+  git(cwd, "commit", "-m", "initial");
+  attachOrigin(cwd);
+  const origin = git(cwd, "remote", "get-url", "origin");
+  const validationTimeoutMs = 4_000;
+  const startedAt = Date.now();
+  // Exhaust the shared budget only after the real command runs, not during Git setup.
+  const clock = t.mock.method(
+    Date,
+    "now",
+    () => startedAt + (fs.existsSync(marker) ? validationTimeoutMs : 0),
   );
   const previousRetries = process.env.CLAWSWEEPER_VALIDATION_RETRIES;
   process.env.CLAWSWEEPER_VALIDATION_RETRIES = "1";
   try {
     assert.throws(
       () =>
-        withMockCommand("pnpm", pnpmPath, () =>
+        withPackageScriptPnpm(() =>
           runAllowedValidationCommands(
             ["pnpm check:changed"],
             cwd,
-            validationOptions("openclaw/openclaw", { validationTimeoutMs: 250 }),
+            validationOptions("openclaw/openclaw", { validationTimeoutMs }),
           ),
         ),
-      /validation command runtime budget exhausted|unsafe validation command checkout identity could not be verified/,
+      (error: Error) => {
+        assert.equal(
+          error.message,
+          "validation command failed (pnpm check:changed): validation command runtime budget exhausted",
+        );
+        assert.match(String(error.cause), /transient changed gate failure/);
+        return true;
+      },
     );
     assert.equal(fs.readFileSync(marker, "utf8"), "1");
+    assert.equal(git(cwd, "status", "--porcelain"), "");
   } finally {
+    clock.mock.restore();
     restoreEnv("CLAWSWEEPER_VALIDATION_RETRIES", previousRetries);
-    fs.rmSync(marker, { force: true });
+    fs.rmSync(fixture, { recursive: true, force: true });
+    fs.rmSync(cwd, { recursive: true, force: true });
+    fs.rmSync(origin, { recursive: true, force: true });
   }
 });
 
-test("validation reserves deadline to prove checkout mutation after command timeout", () => {
+test("validation reserves deadline to prove checkout mutation after command timeout", (t) => {
+  const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-validation-timeout-"));
+  const marker = path.join(fixture, "phases");
   const cwd = gitPackageFixture({ verify: "node verify.js" });
   fs.writeFileSync(path.join(cwd, "source.txt"), "original\n");
+  fs.writeFileSync(
+    path.join(cwd, "verify.js"),
+    `const fs = require("node:fs");
+process.on("SIGTERM", () => {
+  fs.appendFileSync(${JSON.stringify(marker)}, "terminated\\n");
+  process.exit(0);
+});
+fs.writeFileSync("source.txt", "mutated\\n");
+fs.appendFileSync(${JSON.stringify(marker)}, "mutated\\n");
+setInterval(() => {}, 1000);
+`,
+  );
   git(cwd, "add", ".");
   git(cwd, "commit", "-m", "initial");
   attachOrigin(cwd);
-
-  const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-pnpm-timeout-mutation-"));
-  const pnpmPath = path.join(binDir, "pnpm.js");
-  fs.writeFileSync(
-    pnpmPath,
-    `const fs = require("node:fs");
-fs.writeFileSync("source.txt", "mutated\\n");
-setTimeout(() => {}, 5000);
-`,
+  const origin = git(cwd, "remote", "get-url", "origin");
+  const validationTimeoutMs = 4_000;
+  const startedAt = Date.now();
+  // Leave command startup real, then require identity proof after the shared budget expires.
+  const clock = t.mock.method(
+    Date,
+    "now",
+    () => startedAt + (fs.existsSync(marker) ? validationTimeoutMs : 0),
   );
-
-  assert.throws(
-    () =>
-      withMockCommand("pnpm", pnpmPath, () =>
-        runAllowedValidationCommands(
-          ["pnpm verify"],
-          cwd,
-          validationOptions("steipete/example", {
-            toolchain: {
-              packageManager: "pnpm",
-              baseValidationCommands: [],
-              changedGate: null,
-            },
-            validationTimeoutMs: 800,
-          }),
+  try {
+    assert.throws(
+      () =>
+        withPackageScriptPnpm(
+          () =>
+            runAllowedValidationCommands(
+              ["pnpm verify"],
+              cwd,
+              validationOptions("steipete/example", {
+                toolchain: {
+                  packageManager: "pnpm",
+                  baseValidationCommands: [],
+                  changedGate: null,
+                },
+                validationTimeoutMs,
+              }),
+            ),
+          { name: "verify", file: "verify.js" },
         ),
-      ),
-    /unsafe validation command mutated checkout identity/,
-  );
+      /unsafe validation command mutated checkout identity/,
+    );
+    assert.equal(fs.readFileSync(path.join(cwd, "source.txt"), "utf8"), "mutated\n");
+    assert.equal(
+      fs.readFileSync(marker, "utf8"),
+      process.platform === "win32" ? "mutated\n" : "mutated\nterminated\n",
+    );
+  } finally {
+    clock.mock.restore();
+    fs.rmSync(fixture, { recursive: true, force: true });
+    fs.rmSync(cwd, { recursive: true, force: true });
+    fs.rmSync(origin, { recursive: true, force: true });
+  }
 });
 
 test(
@@ -8939,9 +9023,9 @@ function linuxValidationContainmentAvailable() {
   return probe.status === 0;
 }
 
-function withPinnedBasePnpm(callback) {
-  // Dependency-free fixtures skip setup and must not resolve host pnpm.
-  const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-pinned-base-pnpm-"));
+function withPackageScriptPnpm(callback, { name = "check:changed", file = "check.js" } = {}) {
+  // Dependency-free fixtures execute their real package script without resolving host pnpm.
+  const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-package-script-pnpm-"));
   const pnpmPath = path.join(binDir, "pnpm.cjs");
   fs.writeFileSync(
     pnpmPath,
@@ -8952,9 +9036,9 @@ const args = process.argv.slice(2).filter(arg => ![
   "--config.verify-deps-before-run=false",
   "--config.enable-pre-post-scripts=false",
 ].includes(arg));
-assert.deepEqual(args, ["check:changed"]);
-assert.equal(JSON.parse(fs.readFileSync("package.json", "utf8")).scripts["check:changed"], "node check.js");
-const child = spawnSync(process.execPath, ["check.js"], { stdio: "inherit" });
+assert.deepEqual(args, [${JSON.stringify(name)}]);
+assert.equal(JSON.parse(fs.readFileSync("package.json", "utf8")).scripts[${JSON.stringify(name)}], ${JSON.stringify(`node ${file}`)});
+const child = spawnSync(process.execPath, [${JSON.stringify(file)}], { stdio: "inherit" });
 if (child.error) throw child.error;
 if (child.signal) process.kill(process.pid, child.signal);
 else process.exit(child.status ?? 1);

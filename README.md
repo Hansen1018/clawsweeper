@@ -540,6 +540,10 @@ its final month). The local, GitHub-isolated review engine survives as
 
 ### Safety Model
 
+- Review and repair base fetches use fully qualified branch refspecs so inherited
+  `fetch.prune` or `remote.origin.prune` settings do not delete the requested
+  tracking ref. Validation uses the same repair fetch helper; no host Git
+  configuration changes are required.
 - Maintainer-authored items are excluded from automated closes unless the close
   reason is verified `implemented_on_main`.
 - Protected labels block close proposals.
