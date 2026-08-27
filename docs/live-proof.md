@@ -149,13 +149,18 @@ existing comment-sync path upserts the marker-backed review comment.
 
 Browser comments contain sanitized per-step outcomes and a one-line failing-step
 reason, never page text. Terminal comments retain capped output and list
-assertions only when present. A terminal command with a confirmed successful exit
-still passes when its expected marker is absent from the captured pane; the
-assertion remains a completed, non-gating schema-v1 step, is explicitly labeled
-`NOT OBSERVED`, and cannot qualify a recording. Private command files and runner
-paths never enter published terminal output. Each entry or `run` action executes
-as a separately supervised Bash process in the same checkout, so plans should
-share state through files or one command rather than shell-local mutations.
+assertions only when present. Each command runs in a real PTY, and terminal
+assertions inspect tmux-rendered history observed by the controller. Capture
+keeps a rolling 1 MiB diagnostic tail, but that target-writable artifact is not
+assertion authority. Once the controller observes an assertion, later history
+eviction does not erase that fact. Sealing proves the capture helper consumed the
+stream before completion. Successful runs publish the final visible 50-row
+terminal viewport, and long-running proofs publish their current viewport.
+Failed runs publish each command's bounded combined diagnostics under one label.
+Private supervisor files and runner paths never enter published terminal output.
+Each entry or `run` action executes as a separately supervised Bash process in
+the same checkout, so plans should share state through files or one command
+rather than shell-local mutations.
 The terminal `entry` executes automatically before all typed steps. Every `run`
 executes independently, including a first `run` identical to `entry` or a later
 repeated command; the parser and driver do not deduplicate commands. Intentional
@@ -171,7 +176,37 @@ one run so the expected output appears after the action; otherwise use
 the original output to accommodate an accidental replay.
 
 Nonzero exits, signals, command timeouts, and missing markers for still-running
-commands remain failures.
+commands remain failures. Terminal plans declare `terminalCompletion:
+exit_zero` when the final command must finish successfully, or
+`terminalCompletion: ready_while_running` when the final command must remain
+live after satisfying an output expectation. Non-recorded long-running proofs
+must remain live through a three-second stability hold before publication.
+Every earlier command must exit zero. The supervisor exits with the command's
+status, and tmux's pane lifecycle records whether that supervisor is still
+running or how it exited. Each proof uses a private tmux socket directory. The
+controller binds the exact pane PID and controlling terminal before opening the
+start gate. The pane process validates that tuple and opens a private lease file
+on reserved descriptor 9, inherited by the held target and its descendants.
+Before opening a second execution gate, the controller starts a cleanup watchdog
+outside the pane process tree through the private tmux server and requires an
+exact atomic armed receipt bound to the pane PID, terminal, nonce, and lease
+inode.
+
+After capture and the final viewport are sealed, controller cleanup requests the
+already-armed watchdog. Pane death triggers the same watchdog independently. It
+TERM-sweeps, then repeatedly KILL-sweeps processes still holding the lease plus
+bound-terminal members only while the original pane still owns both its lease
+and bound terminal. Lease-holder discovery remains active after pane death.
+Darwin finds lease holders with the stock `lsof`; Linux inspects `/proc` for
+reserved inherited descriptor 9. Cleanup succeeds only when an exact
+zero-survivor receipt matches the bound identity and the original pane is dead.
+Missing, malformed, stale, replaced, surviving-process, or timeout evidence
+fails visibly. Target commands do not inherit `TMUX`, `TMUX_PANE`, or
+`TMUX_TMPDIR`.
+
+The lease is lifecycle cleanup, not hostile same-UID isolation. A target that
+deliberately closes inherited descriptors or attacks same-user controller
+processes requires container, VM, namespace, or separate-user containment.
 All untrusted fields are bounded and neutralized against Markdown fences, HTML,
 and ClawSweeper marker spoofing. OpenClaw Bay is unaffected because schema v1
 and the existing lifecycle and publication contracts do not change.
