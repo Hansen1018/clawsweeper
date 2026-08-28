@@ -45,9 +45,13 @@ function proofMediaUrlsFromContext(context: ItemContext): string[] {
     semanticPullFiles: _,
     pullCommitsRevision: __,
     prHydrationSnapshot: ___,
+    pullFiles: ____,
     ...proofContext
   } = context;
-  const text = JSON.stringify(proofContext);
+  // PR patches and supplemental body excerpts are reviewer text, never host download inputs.
+  const text = JSON.stringify(proofContext, (key, value) =>
+    key === "bodyCoverage" ? undefined : value,
+  );
   const matches = text.match(/https?:\/\/[^\s<>"'\\)]+/g) ?? [];
   const urls: string[] = [];
   const seen = new Set<string>();
