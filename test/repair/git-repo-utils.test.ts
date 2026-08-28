@@ -8,6 +8,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { pathToFileURL } from "node:url";
 
 import {
+  branchHasBaseDiff,
   completeRebaseIfResolved,
   ensureMergeBaseAvailable,
   rebaseOntoBase,
@@ -100,6 +101,56 @@ test("rebaseOntoBase rebases a repair branch onto latest origin main", () => {
   assert.equal(fs.readFileSync(path.join(work, "feature.txt"), "utf8"), "feature\n");
   assert.equal(fs.readFileSync(path.join(work, "main.txt"), "utf8"), "main\n");
 });
+
+for (const pruneConfig of ["fetch.prune", "remote.origin.prune"]) {
+  test(`base fetch updates its requested ref with ${pruneConfig}=true`, () => {
+    const { root, remote, work } = fixtureRepo();
+    try {
+      const originalBase = run("git", ["rev-parse", "HEAD"], { cwd: work });
+      fs.writeFileSync(path.join(work, "main.txt"), "new base\n");
+      run("git", ["add", "main.txt"], { cwd: work });
+      run("git", ["commit", "-m", "advance main"], { cwd: work });
+      const newBase = run("git", ["rev-parse", "HEAD"], { cwd: work });
+      run("git", ["push", "origin", "main"], { cwd: work });
+      run("git", ["update-ref", "refs/remotes/origin/main", originalBase], { cwd: work });
+      if (pruneConfig === "remote.origin.prune") {
+        run("git", ["config", "fetch.prune", "false"], { cwd: work });
+      }
+      run("git", ["config", pruneConfig, "true"], { cwd: work });
+
+      assert.equal(ensureMergeBaseAvailable({ targetDir: work, baseBranch: "main" }), newBase);
+      assert.equal(run("git", ["rev-parse", "origin/main"], { cwd: work }), newBase);
+
+      // A shallow feature checkout needs the deeper-history fallback before diffing.
+      run("git", ["checkout", "-b", "feature", originalBase], { cwd: work });
+      fs.writeFileSync(path.join(work, "feature.txt"), "feature\n");
+      run("git", ["add", "feature.txt"], { cwd: work });
+      run("git", ["commit", "-m", "feature"], { cwd: work });
+      run("git", ["push", "origin", "feature"], { cwd: work });
+      const shallow = path.join(root, "shallow");
+      run("git", ["clone", "--no-local", "--depth=1", "--branch=feature", remote, shallow]);
+      run("git", ["fetch", "origin", "refs/heads/main:refs/remotes/origin/main", "--depth=1"], {
+        cwd: shallow,
+      });
+      if (pruneConfig === "remote.origin.prune") {
+        run("git", ["config", "fetch.prune", "false"], { cwd: shallow });
+      }
+      run("git", ["config", pruneConfig, "true"], { cwd: shallow });
+      assert.notEqual(
+        spawnSync("git", ["merge-base", "origin/main", "HEAD"], { cwd: shallow }).status,
+        0,
+      );
+      assert.equal(branchHasBaseDiff({ targetDir: shallow, baseBranch: "main" }), true);
+      assert.equal(run("git", ["rev-parse", "origin/main"], { cwd: shallow }), newBase);
+      assert.equal(
+        run("git", ["merge-base", "origin/main", "HEAD"], { cwd: shallow }),
+        originalBase,
+      );
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+}
 
 test("rebaseOntoBase leaves conflicts for Codex repair instead of aborting", () => {
   const { work } = fixtureRepo();
