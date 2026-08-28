@@ -285,59 +285,73 @@ test("concurrent apply invocations do not leak a runtime budget", async () => {
   }
 });
 
-test("apply-decisions yields instead of starting a GitHub retry that cannot fit", () => {
-  const fixture = runtimeBudgetFixture(722);
-  const maxRuntimeMs = 2_500;
-  try {
-    const startedAt = Date.now();
-    withMockGh(fixture.root, 'console.error("service unavailable"); process.exit(1);', () => {
-      runApplyDecisionsForTest({
-        ...fixture,
-        extraArgs: [
-          "--max-runtime-ms",
-          String(maxRuntimeMs),
-          "--cursor-trace",
-          fixture.cursorTracePath,
-        ],
-      });
-    });
+for (const { name, number, response } of [
+  {
+    name: "apply-decisions yields instead of starting a GitHub retry that cannot fit",
+    number: 722,
+    response: 'console.error("service unavailable"); process.exit(1);',
+  },
+  {
+    name: "apply-decisions yields instead of retrying malformed GitHub JSON past the deadline",
+    number: 726,
+    response: 'process.stdout.write("{");',
+  },
+]) {
+  test(name, () => {
+    const fixture = runtimeBudgetFixture(number);
+    const maxRuntimeMs = 2_500;
+    const invocationLog = join(fixture.root, "gh-invocations.log");
+    const sleepTracePath = join(fixture.root, "sleep-trace.jsonl");
+    const clockHookPath = join(fixture.root, "runtime-clock.cjs");
+    const itemPath = join(fixture.itemsDir, `${number}.md`);
+    const originalMarkdown = readFileSync(itemPath, "utf8");
+    const originalNodeOptions = process.env.NODE_OPTIONS;
+    try {
+      // The 2s retry cannot fit after the 1s flush reserve, even before any
+      // elapsed command time. Host startup must not choose a different yield path.
+      writeFileSync(
+        clockHookPath,
+        `Date.now = () => ${Date.now()};\n${applySleepObserverPreload(sleepTracePath)}`,
+        "utf8",
+      );
+      process.env.NODE_OPTIONS = [originalNodeOptions, `--require=${JSON.stringify(clockHookPath)}`]
+        .filter(Boolean)
+        .join(" ");
+      withMockGh(
+        fixture.root,
+        `require("node:fs").appendFileSync(${JSON.stringify(invocationLog)}, JSON.stringify(process.argv.slice(2)) + "\\n");\n${response}`,
+        () => {
+          runApplyDecisionsForTest({
+            ...fixture,
+            extraArgs: [
+              "--max-runtime-ms",
+              String(maxRuntimeMs),
+              "--cursor-trace",
+              fixture.cursorTracePath,
+            ],
+          });
+        },
+      );
 
-    assert.ok(
-      Date.now() - startedAt < maxRuntimeMs + 500,
-      "GitHub retry sleep ignored the remaining runtime",
-    );
-    assertRuntimeYield(fixture, maxRuntimeMs);
-  } finally {
-    rmSync(fixture.root, { recursive: true, force: true });
-  }
-});
-
-test("apply-decisions yields instead of retrying malformed GitHub JSON past the deadline", () => {
-  const fixture = runtimeBudgetFixture(726);
-  const maxRuntimeMs = 2_500;
-  try {
-    const startedAt = Date.now();
-    withMockGh(fixture.root, 'process.stdout.write("{");', () => {
-      runApplyDecisionsForTest({
-        ...fixture,
-        extraArgs: [
-          "--max-runtime-ms",
-          String(maxRuntimeMs),
-          "--cursor-trace",
-          fixture.cursorTracePath,
-        ],
-      });
-    });
-
-    assert.ok(
-      Date.now() - startedAt < maxRuntimeMs + 500,
-      "malformed JSON retry ignored the runtime bound",
-    );
-    assertRuntimeYield(fixture, maxRuntimeMs);
-  } finally {
-    rmSync(fixture.root, { recursive: true, force: true });
-  }
-});
+      assert.equal(readFileSync(sleepTracePath, "utf8"), '{"event":"armed"}\n');
+      assert.equal(
+        readFileSync(invocationLog, "utf8"),
+        `${JSON.stringify(["api", `repos/openclaw/clawsweeper/issues/${number}`])}\n`,
+        "apply must attempt the item fetch exactly once, without retrying",
+      );
+      assertRuntimeYield(fixture, maxRuntimeMs);
+      const report = JSON.parse(readFileSync(fixture.reportPath, "utf8"));
+      assert.equal(report[0]?.number, number);
+      assert.equal(report[0]?.reason, "max runtime 2500ms reached before GitHub retry");
+      assert.equal(readFileSync(itemPath, "utf8"), originalMarkdown);
+      assert.equal(existsSync(join(fixture.closedDir, `${number}.md`)), false);
+    } finally {
+      if (originalNodeOptions === undefined) delete process.env.NODE_OPTIONS;
+      else process.env.NODE_OPTIONS = originalNodeOptions;
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  });
+}
 
 test("apply-decisions preserves a runtime yield through post-proof freshness handling", () => {
   const fixture = runtimeBudgetFixture(723);
