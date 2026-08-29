@@ -2,9 +2,11 @@ import assert from "node:assert/strict";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
 import {
+  closeSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readFileSync,
   readdirSync,
   rmSync,
@@ -928,23 +930,28 @@ test(
       ].join("\n"),
     );
     const checkout = root;
-    const helper = spawn(
-      "/bin/bash",
-      [
-        "--noprofile",
-        "--norc",
-        "-c",
-        'exec 9<"$1" || exit 125\nexec "$2" "$3"',
-        "clawsweeper-directory-holder",
-        checkout,
-        process.execPath,
-        helperPath,
-      ],
-      {
-        detached: true,
-        stdio: ["ignore", "pipe", "pipe"],
-      },
-    );
+    const helper = (() => {
+      const checkoutFd = openSync(checkout, "r");
+      try {
+        return spawn(process.execPath, [helperPath], {
+          detached: true,
+          stdio: [
+            "ignore",
+            "pipe",
+            "pipe",
+            "ignore",
+            "ignore",
+            "ignore",
+            "ignore",
+            "ignore",
+            "ignore",
+            checkoutFd,
+          ],
+        });
+      } finally {
+        closeSync(checkoutFd);
+      }
+    })();
     try {
       const ready = new Promise<string>((resolveReady, rejectReady) => {
         const timeout = setTimeout(
