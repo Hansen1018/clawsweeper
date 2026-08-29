@@ -11,7 +11,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { delimiter, join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import test from "node:test";
 
 import {
@@ -21,6 +21,7 @@ import {
   runCodexForTest,
 } from "../dist/clawsweeper.js";
 import { closeDecision, item, tmpPrefix } from "./helpers.ts";
+import { writeFakeScanner } from "./agent-input-scan-helpers.ts";
 
 const trackedCheckoutContent = "tracked checkout content\n";
 const trackedCheckoutFingerprint = "8b9382c9009cdc46cb69d59eb0078522d45023b2";
@@ -32,6 +33,7 @@ const fakeCodexSandboxPass = `if (process.argv[2] === "sandbox") {
 require("node:fs").readFileSync(0, "utf8");`;
 
 function initTrackedRepo(dir: string, trackedPath = "tracked.txt"): void {
+  writeFakeScanner(join(dirname(dir), "bin"));
   execFileSync("git", ["init"], { cwd: dir, stdio: "ignore" });
   writeFileSync(join(dir, trackedPath), trackedCheckoutContent);
   execFileSync("git", ["add", trackedPath], { cwd: dir, stdio: "ignore" });
@@ -40,6 +42,72 @@ function initTrackedRepo(dir: string, trackedPath = "tracked.txt"): void {
     ["-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init"],
     { cwd: dir, stdio: "ignore" },
   );
+}
+
+for (const scanner of ["missing", "error", "finding", "unexpected-output"]) {
+  test(`review scan ${scanner} refuses before any provider call and retires stale artifacts`, () => {
+    const root = mkdtempSync(tmpPrefix);
+    const openclawDir = join(root, "target");
+    const workDir = join(root, "work");
+    const binDir = join(root, "bin");
+    const calls = join(root, "calls");
+    for (const dir of [openclawDir, workDir, binDir]) mkdirSync(dir);
+    initTrackedRepo(openclawDir);
+    const outputPath = join(workDir, "42.json");
+    const promptPath = join(workDir, "42.prompt.md");
+    writeFileSync(outputPath, JSON.stringify(closeDecision()));
+    writeFileSync(promptPath, "stale-unscanned-prompt");
+    writeFileSync(
+      join(binDir, "codex"),
+      `#!${process.execPath}
+const fs = require('node:fs');
+fs.appendFileSync(${JSON.stringify(calls)}, 'called\\n');
+${fakeCodexSandboxPass}
+fs.writeFileSync(process.argv[process.argv.indexOf('--output-last-message') + 1], ${JSON.stringify(JSON.stringify(closeDecision()))});
+`,
+      { mode: 0o755 },
+    );
+    // A broken executable also proves lookup cannot fall through to a host installation.
+    writeFileSync(
+      join(binDir, "trufflehog"),
+      scanner === "missing"
+        ? "#!/missing/scanner\n"
+        : `#!${process.execPath}\nprocess.stdout.write(${JSON.stringify(scanner === "error" ? "" : '{"Raw":"fixture-sensitive-value"}')} ); process.stderr.write('fixture-sensitive-value'); process.exit(${scanner === "error" ? 2 : scanner === "finding" ? 183 : 0});\n`,
+      { mode: 0o755 },
+    );
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${binDir}${delimiter}${originalPath ?? ""}`;
+    try {
+      assert.throws(
+        () =>
+          runCodexForTest({
+            item: item({ number: 42 }),
+            context: { issue: {}, comments: [], timeline: [] },
+            git: { mainSha: "abc123", latestRelease: null },
+            model: "model-test",
+            openclawDir,
+            reasoningEffort: "high",
+            sandboxMode: "read-only",
+            serviceTier: "",
+            timeoutMs: 10_000,
+            workDir,
+            prompt: "Return a review decision.\nfixture-sensitive-value\nsecond line",
+          }),
+        (error: Error) => {
+          assert.match(error.message, /Agent input scan refused/);
+          assert.doesNotMatch(error.message, /fixture-sensitive-value/);
+          return true;
+        },
+      );
+      assert.equal(existsSync(calls), false);
+      assert.equal(existsSync(outputPath), false);
+      assert.equal(existsSync(promptPath), false, "refused prompt must not survive admission");
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 }
 
 test("Codex decision schema avoids unsupported strict-output keywords recursively", () => {
@@ -137,6 +205,9 @@ process.exit(1);
     assert.equal(decision.decision, "keep_open");
     assert.equal(decision.summary, "Keep open for maintainer follow-up.");
     assert.equal(decision.localCheckoutAccess, "verified");
+    const promptPath = join(workDir, "83393.prompt.md");
+    assert.equal(readFileSync(promptPath, "utf8"), "Return a review decision.");
+    assert.equal(statSync(promptPath).mode & 0o777, 0o600);
   } finally {
     if (originalPath === undefined) delete process.env.PATH;
     else process.env.PATH = originalPath;
@@ -200,6 +271,7 @@ process.exit(0);
       "--",
       "git",
       "hash-object",
+      "--no-filters",
       "--",
       "tracked.txt",
     ]);
@@ -486,12 +558,14 @@ process.stdout.write(JSON.stringify({ payloads: [{ text }], meta: { stopReason: 
   );
   chmodSync(openclawPath, 0o755);
   const previous = {
+    PATH: process.env.PATH,
     CLAWSWEEPER_RUNNER: process.env.CLAWSWEEPER_RUNNER,
     CLAWSWEEPER_OPENCLAW_BIN: process.env.CLAWSWEEPER_OPENCLAW_BIN,
     CLAWSWEEPER_OPENCLAW_MODEL: process.env.CLAWSWEEPER_OPENCLAW_MODEL,
     CODEX_BIN: process.env.CODEX_BIN,
     OPENCLAW_TEST_INVOCATIONS_PATH: process.env.OPENCLAW_TEST_INVOCATIONS_PATH,
   };
+  process.env.PATH = `${join(root, "bin")}${delimiter}${process.env.PATH ?? ""}`;
   process.env.CLAWSWEEPER_RUNNER = "openclaw";
   process.env.CLAWSWEEPER_OPENCLAW_BIN = openclawPath;
   process.env.CLAWSWEEPER_OPENCLAW_MODEL = "openai/gpt-5";
@@ -567,12 +641,14 @@ if (count > 0) {
   );
   chmodSync(openclawPath, 0o755);
   const previous = {
+    PATH: process.env.PATH,
     CLAWSWEEPER_RUNNER: process.env.CLAWSWEEPER_RUNNER,
     CLAWSWEEPER_OPENCLAW_BIN: process.env.CLAWSWEEPER_OPENCLAW_BIN,
     CLAWSWEEPER_OPENCLAW_MODEL: process.env.CLAWSWEEPER_OPENCLAW_MODEL,
     CODEX_BIN: process.env.CODEX_BIN,
     OPENCLAW_TEST_INVOCATIONS_PATH: process.env.OPENCLAW_TEST_INVOCATIONS_PATH,
   };
+  process.env.PATH = `${join(root, "bin")}${delimiter}${process.env.PATH ?? ""}`;
   process.env.CLAWSWEEPER_RUNNER = "openclaw";
   process.env.CLAWSWEEPER_OPENCLAW_BIN = openclawPath;
   process.env.CLAWSWEEPER_OPENCLAW_MODEL = "openai/gpt-5";

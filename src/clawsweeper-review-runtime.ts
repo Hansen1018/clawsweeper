@@ -4,12 +4,14 @@ import {
   existsSync,
   readFileSync,
   readdirSync,
+  rmSync,
   statSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 import { runAgentCheckoutInspection, runAgentProcess } from "./agent-runner.js";
+import { AgentInputScanError, type AgentScanSource } from "./agent-input-scan.js";
 import { stringArg, type Args } from "./clawsweeper-args.js";
 import {
   mediaProofRuntimeHints,
@@ -845,6 +847,7 @@ ${extra}
   }
 
   function codexReviewFailureRetryable(error: unknown): boolean {
+    if (error instanceof AgentInputScanError) return false;
     return error instanceof CodexReviewError ? error.retryable : true;
   }
 
@@ -953,6 +956,8 @@ ${extra}
     openclawDir: string;
     preserveCodexAuth?: boolean;
     timeoutMs: number;
+    scanSource: AgentScanSource;
+    initialPrompt: string;
   }): CodexProcessResult {
     const dirtyBefore = openclawDirtyStatus(options.openclawDir);
     if (dirtyBefore) {
@@ -967,12 +972,15 @@ ${extra}
       };
     }
     return runAgentCheckoutInspection({
+      schemaPath: CLAWSWEEPER_DECISION_SCHEMA_PATH,
+      scanSource: options.scanSource,
+      initialPrompt: options.initialPrompt,
       cwd: options.openclawDir,
       env: untrustedCodexEnv({
         ghToken: process.env.CLAWSWEEPER_PROOF_INSPECTION_TOKEN,
         preserveCodexAuth: options.preserveCodexAuth,
       }),
-      timeoutMs: Math.min(options.timeoutMs, 30_000),
+      timeoutMs: options.timeoutMs,
     });
   }
 
@@ -995,7 +1003,10 @@ ${extra}
     quietLogs?: boolean;
     extraCodexConfig?: string[];
   }): Decision {
+    const startedAt = Date.now();
     ensureDir(options.workDir);
+    const promptPath = join(options.workDir, `${options.item.number}.prompt.md`);
+    rmSync(promptPath, { force: true });
     const proofScratchDir =
       options.proofScratchDir ??
       join(options.workDir, "proof-scratch", String(options.item.number));
@@ -1004,24 +1015,33 @@ ${extra}
     const preparedMediaProof = options.prompt
       ? { manifestPath: null, summaryPath: null, artifacts: [] }
       : prepareMediaProofArtifacts(options.context, proofScratchDir);
-    const promptPath = join(options.workDir, `${options.item.number}.prompt.md`);
     const outputPath = join(options.workDir, `${options.item.number}.json`);
+    if (existsSync(outputPath)) unlinkSync(outputPath);
     const prompt =
       options.prompt ??
       buildReviewPrompt(options.item, options.context, options.git, options.additionalPrompt, {
         ...mediaProofRuntimeHints(proofScratchDir, preparedMediaProof),
         targetDir: options.openclawDir,
       }).text;
-    writeFileSync(promptPath, prompt, "utf8");
     const codexEnv = untrustedCodexEnv({
       ghToken: process.env.CLAWSWEEPER_PROOF_INSPECTION_TOKEN,
       preserveCodexAuth: options.preserveCodexAuth,
     });
-    const startedAt = Date.now();
+    const pull = asRecord(options.context.pullRequest);
+    const scanSource: AgentScanSource =
+      options.item.kind === "pull_request"
+        ? {
+            kind: "committed",
+            baseSha: stringOrUndefined(asRecord(pull.base).sha) ?? "",
+            headSha: stringOrUndefined(asRecord(pull.head).sha) ?? "",
+          }
+        : { kind: "prompt" };
     const checkoutInspection = runReviewCheckoutInspection({
+      scanSource,
+      initialPrompt: prompt,
       itemNumber: options.item.number,
       openclawDir: options.openclawDir,
-      timeoutMs: options.timeoutMs,
+      timeoutMs: options.timeoutMs - (Date.now() - startedAt),
       ...(options.preserveCodexAuth === undefined
         ? {}
         : { preserveCodexAuth: options.preserveCodexAuth }),
@@ -1064,6 +1084,8 @@ ${extra}
           });
         }
         const result = runAgentProcess({
+          scanSource,
+          diagnosticPromptPath: promptPath,
           label: `review-${options.item.number}-attempt-${attempt}`,
           prompt,
           model: options.model,
