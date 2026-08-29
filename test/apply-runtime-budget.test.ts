@@ -9,7 +9,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 
 import { createGitHubRuntime } from "../dist/clawsweeper-github-runtime.js";
@@ -62,20 +62,27 @@ function assertRuntimeYield(
   assert.deepEqual(cursorTrace, { schema_version: 1, examined_item_numbers: [] });
 }
 
-function applySleepObserverPreload(tracePath: string): string {
-  // Observe sleep intent in the CLI, excluding real subprocess startup time and mock children.
-  return `
+const applyRuntimeClockPreload = `
+const { appendFileSync, existsSync, readFileSync } = require("node:fs");
+const { join, resolve } = require("node:path");
+const state = JSON.parse(readFileSync(join(__dirname, "runtime-clock.json"), "utf8"));
 if (process.argv[2] === "apply-decisions" &&
-    require("node:path").resolve(process.argv[1] || "") === ${JSON.stringify(join(process.cwd(), "dist", "clawsweeper.js"))}) {
-  const { appendFileSync } = require("node:fs");
-  const tracePath = ${JSON.stringify(tracePath)};
+    resolve(process.argv[1] || "") === state.entrypoint) {
+  Date.now = () => state.afterCloseMs !== undefined && existsSync(state.closeCommandLogPath)
+    ? state.afterCloseMs
+    : state.startedAtMs;
   Atomics.wait = (_array, _index, _value, milliseconds) => {
-    appendFileSync(tracePath, JSON.stringify({ event: "wait", milliseconds }) + "\\n");
+    appendFileSync(state.sleepTracePath, JSON.stringify({ event: "wait", milliseconds }) + "\\n");
     throw new Error("apply attempted an unnecessary synchronous wait");
   };
-  appendFileSync(tracePath, JSON.stringify({ event: "armed" }) + "\\n");
+  appendFileSync(state.sleepTracePath, JSON.stringify({ event: "armed" }) + "\\n");
 }
 `;
+
+function writeApplyRuntimeClock(clockHookPath: string, state: Record<string, string | number>) {
+  writeFileSync(clockHookPath, applyRuntimeClockPreload, "utf8");
+  const fixture = { entrypoint: join(process.cwd(), "dist", "clawsweeper.js"), ...state };
+  writeFileSync(join(dirname(clockHookPath), "runtime-clock.json"), JSON.stringify(fixture));
 }
 
 test("apply runtime budget uses the token deadline as an absolute wall clock", () => {
@@ -309,11 +316,10 @@ for (const { name, number, response } of [
     try {
       // The 2s retry cannot fit after the 1s flush reserve, even before any
       // elapsed command time. Host startup must not choose a different yield path.
-      writeFileSync(
-        clockHookPath,
-        `Date.now = () => ${Date.now()};\n${applySleepObserverPreload(sleepTracePath)}`,
-        "utf8",
-      );
+      writeApplyRuntimeClock(clockHookPath, {
+        startedAtMs: Date.now(),
+        sleepTracePath,
+      });
       process.env.NODE_OPTIONS = [originalNodeOptions, `--require=${JSON.stringify(clockHookPath)}`]
         .filter(Boolean)
         .join(" ");
@@ -509,11 +515,10 @@ test("apply-decisions yields before closing when its post-close delay cannot fit
     "duplicate_or_superseded",
   );
   writeFileSync(join(fixture.itemsDir, "725.md"), synced.report, "utf8");
-  writeFileSync(
-    clockHookPath,
-    `Date.now = () => ${Date.now()};\n${applySleepObserverPreload(sleepTracePath)}`,
-    "utf8",
-  );
+  writeApplyRuntimeClock(clockHookPath, {
+    startedAtMs: Date.now(),
+    sleepTracePath,
+  });
   process.env.NODE_OPTIONS = [originalNodeOptions, `--require=${JSON.stringify(clockHookPath)}`]
     .filter(Boolean)
     .join(" ");
@@ -612,16 +617,12 @@ test("apply-decisions records a successful close before yielding after it", () =
     "duplicate_or_superseded",
   );
   writeFileSync(join(fixture.itemsDir, "727.md"), synced.report, "utf8");
-  writeFileSync(
-    clockHookPath,
-    `const { existsSync } = require("node:fs");
-Date.now = () => existsSync(${JSON.stringify(closeCommandLogPath)})
-  ? ${startedAtMs + maxRuntimeMs - closeDelayMs}
-  : ${startedAtMs};
-${applySleepObserverPreload(sleepTracePath)}
-`,
-    "utf8",
-  );
+  writeApplyRuntimeClock(clockHookPath, {
+    startedAtMs,
+    afterCloseMs: startedAtMs + maxRuntimeMs - closeDelayMs,
+    closeCommandLogPath,
+    sleepTracePath,
+  });
   process.env.NODE_OPTIONS = [originalNodeOptions, `--require=${JSON.stringify(clockHookPath)}`]
     .filter(Boolean)
     .join(" ");
