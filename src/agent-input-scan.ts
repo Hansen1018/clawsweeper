@@ -21,7 +21,7 @@ import { fileURLToPath } from "node:url";
 import { readReviewGit, reviewMergeBase, type ReviewGitReadOptions } from "./pr-review-evidence.js";
 import {
   classifyReviewedFixtureScan,
-  REVIEWED_FIXTURE_SOURCE,
+  type ReviewedFixtureBlob,
 } from "./agent-input-scan-fixtures.js";
 
 export type AgentScanSource =
@@ -124,7 +124,7 @@ export function scanAgentInput(options: {
       throw new AgentInputScanError("unsafe_path");
     const inputDir = join(root, "input");
     mkdirSync(inputDir, { mode: 0o700 });
-    const reviewedFixtureBlobs = new Map<string, Buffer>();
+    const reviewedFixtureBlobs = new Map<string, ReviewedFixtureBlob>();
     let staged = 0;
     let ordinal = 0;
     const stage = (bytes: Buffer, name = String(ordinal++)) => {
@@ -337,8 +337,7 @@ export function scanAgentInput(options: {
         };
       }
       assertCurrent();
-      const blobs = new Set<string>();
-      const fixtureBlobs = new Set<string>();
+      const blobs = new Map<string, { source: string; mode: string }[]>();
       const endpoints =
         source.kind === "snapshot"
           ? [mergeBase.sha, source.headSha, source.indexTreeSha, source.treeSha]
@@ -383,8 +382,10 @@ export function scanAgentInput(options: {
             if (!["100644", "100755", "120000"].includes(mode!))
               throw new AgentInputScanError("unsupported_content");
             if (!OBJECT_ID.test(oid!)) throw new AgentInputScanError("incomplete_source");
-            blobs.add(oid!);
-            if (path === REVIEWED_FIXTURE_SOURCE && mode === "100644") fixtureBlobs.add(oid!);
+            // An OID identifies bytes, not each scanned endpoint's path/mode eligibility.
+            const references = blobs.get(oid!) ?? [];
+            references.push({ source: path, mode: mode! });
+            blobs.set(oid!, references);
           }
         }
         stage(git([...args, "--patch", "--binary", "--full-index", "--"]));
@@ -392,7 +393,7 @@ export function scanAgentInput(options: {
       // Only live committed checkouts need normalized raw files staged here;
       // snapshot objects were already captured and fenced before preparation.
       if (source.kind === "committed") assertCurrent();
-      for (const oid of blobs) {
+      for (const [oid, references] of blobs) {
         const size = Number(git(["cat-file", "-s", oid], 100).toString().trim());
         if (!Number.isSafeInteger(size) || size < 0)
           throw new AgentInputScanError("incomplete_source");
@@ -405,7 +406,7 @@ export function scanAgentInput(options: {
           throw new AgentInputScanError("unsupported_content");
         // OID names preserve multiline bytes and make symlinks ordinary scan files.
         stage(bytes, oid);
-        if (fixtureBlobs.has(oid)) reviewedFixtureBlobs.set(join(inputDir, oid), bytes);
+        reviewedFixtureBlobs.set(join(inputDir, oid), { bytes, references });
       }
     }
     const result = spawnSync(
@@ -466,12 +467,12 @@ export function scanAgentInput(options: {
   if (failure) throw failure;
   // Emit from the host after cleanup: successful callers can discard provider
   // stderr, but this classification must remain visible without exposing values.
-  if (classified)
+  for (const classification of classified ?? [])
     console.error(
       JSON.stringify({
         event: "agent_input_scan_classified",
         notice: "Reviewed synthetic fixture findings classified as non-sensitive.",
-        ...classified,
+        ...classification,
       }),
     );
 }
