@@ -58,6 +58,14 @@ export class AgentInputScanError extends Error {
   }
 }
 
+export const INCOMPLETE_AGENT_INPUT_SOURCE_EXIT_CODE = 78;
+
+export function agentInputScanFailureExitCode(error: unknown): number | null {
+  return error instanceof AgentInputScanError && error.reason === "incomplete_source"
+    ? INCOMPLETE_AGENT_INPUT_SOURCE_EXIT_CODE
+    : null;
+}
+
 const MAX_SCAN_BYTES = 256 * 1024 * 1024;
 const OBJECT_ID = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/;
 const hostRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");

@@ -899,6 +899,10 @@ test("exact event review publishes directly with a queue-bounded canonical fallb
   assert.match(step(reviewer, "Review exact event item").run ?? "", /source_head_sha/);
   assert.match(
     step(reviewer, "Review exact event item").run ?? "",
+    /review_exit_code.*-eq 78[\s\S]*failure_reason=incomplete_source/,
+  );
+  assert.match(
+    step(reviewer, "Review exact event item").run ?? "",
     /kill -TERM -- "-\$review_pgid"/,
   );
   assert.match(step(reviewer, "Review exact event item").run ?? "", /sleep 60/);
@@ -926,6 +930,7 @@ test("exact event review publishes directly with a queue-bounded canonical fallb
   const deferHeldReview = step(reviewer, "Defer exact review while same-head lease is held");
   const failGeneration = step(reviewer, "Fail unsuccessful exact review generation");
   const releaseGeneration = step(reviewer, "Release unsuccessful workflow-owned review lease");
+  const markUnsuccessful = step(reviewer, "Mark unsuccessful re-review");
   assert.match(create.if ?? "", /review-exact-event-item\.outcome == 'success'/);
   assert.match(create.if ?? "", /review-exact-event-item\.outputs\.retry_at == ''/);
   assert.match(create.if ?? "", /review-exact-event-item\.outputs\.superseded != 'true'/);
@@ -1134,7 +1139,12 @@ test("exact event review publishes directly with a queue-bounded canonical fallb
     complete.env?.RETRY_KIND,
     "${{ steps.exact-review-generation-result.outputs.retry_kind }}",
   );
+  assert.equal(
+    complete.env?.REVIEW_FAILURE_REASON,
+    "${{ steps.review-exact-event-item.outputs.failure_reason || '' }}",
+  );
   assert.match(complete.run ?? "", /retry_kind: retryKind/);
+  assert.match(complete.run ?? "", /review_failure_reason: process\.env\.REVIEW_FAILURE_REASON/);
   assert.match(complete.run ?? "", /requeue_latest: true/);
   assert.match(deferHeldReview.if ?? "", /reserve-exact-review-lease\.outputs\.status == 'held'/);
   assert.match(deferHeldReview.run ?? "", /retry deferred/);
@@ -1145,6 +1155,14 @@ test("exact event review publishes directly with a queue-bounded canonical fallb
   );
   assert.match(failGeneration.if ?? "", /review-exact-event-item\.outputs\.superseded != 'true'/);
   assert.match(failGeneration.if ?? "", /complete-exact-review-queue\.outcome != 'success'/);
+  assert.equal(
+    markUnsuccessful.env?.REVIEW_FAILURE_REASON,
+    "${{ steps.review-exact-event-item.outputs.failure_reason || '' }}",
+  );
+  assert.match(
+    markUnsuccessful.run ?? "",
+    /incomplete_source[\s\S]*will not retry this unchanged revision/,
+  );
   assert.match(
     failGeneration.if ?? "",
     /exact-review-generation-result\.outputs\.retry_kind == ''/,

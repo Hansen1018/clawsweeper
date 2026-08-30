@@ -17,13 +17,27 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { runAgentProcess, runAgentCheckoutInspection } from "../dist/agent-runner.js";
-import { AgentInputScanError, scanAgentInput } from "../dist/agent-input-scan.js";
+import {
+  AgentInputScanError,
+  INCOMPLETE_AGENT_INPUT_SOURCE_EXIT_CODE,
+  agentInputScanFailureExitCode,
+  scanAgentInput,
+} from "../dist/agent-input-scan.js";
 import { reviewedFixtureForSource } from "../dist/agent-input-scan-fixtures.js";
 import {
   captureTargetCheckoutBinding,
   withTargetReviewSnapshot,
 } from "../dist/repair/target-validation.js";
 import { useFakeScanner } from "./agent-input-scan-helpers.ts";
+
+test("only incomplete source scan failures receive the terminal review exit code", () => {
+  assert.equal(
+    agentInputScanFailureExitCode(new AgentInputScanError("incomplete_source")),
+    INCOMPLETE_AGENT_INPUT_SOURCE_EXIT_CODE,
+  );
+  assert.equal(agentInputScanFailureExitCode(new AgentInputScanError("scanner_failed")), null);
+  assert.equal(agentInputScanFailureExitCode(new Error("review failed")), null);
+});
 
 function fixture(t: test.TestContext, prompt = "Review the change.") {
   const root = mkdtempSync(join(tmpdir(), "clawsweeper-input-test-"));

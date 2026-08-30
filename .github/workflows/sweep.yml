@@ -1300,6 +1300,11 @@ jobs:
           fi
           set -e
           echo "exit_code=$review_exit_code" >> "$GITHUB_OUTPUT"
+          # Keep 78 aligned with INCOMPLETE_AGENT_INPUT_SOURCE_EXIT_CODE. This
+          # unchanged source tuple is terminal, while the workflow stays red.
+          if [ "$review_exit_code" -eq 78 ]; then
+            echo "failure_reason=incomplete_source" >> "$GITHUB_OUTPUT"
+          fi
           if [ "$review_exit_code" -ne 0 ]; then
             exit "$review_exit_code"
           fi
@@ -1713,11 +1718,14 @@ jobs:
           REVIEW_SUPERSEDED: ${{ steps.review-exact-event-item.outputs.superseded || 'false' }}
           RESERVATION_STATUS: ${{ steps.reserve-exact-review-lease.outputs.status }}
           RETRY_AT: ${{ steps.reserve-exact-review-lease.outputs.retry_at || steps.review-exact-event-item.outputs.retry_at }}
+          REVIEW_FAILURE_REASON: ${{ steps.review-exact-event-item.outputs.failure_reason || '' }}
           CLAWSWEEPER_ACTION_LEDGER_DISABLED: "1"
         run: |
           state="Failed"
           detail="The exact review did not produce a publishable artifact. The durable queue will retry it."
-          if [ "$RESERVATION_STATUS" = "superseded" ] || [ "$REVIEW_SUPERSEDED" = "true" ]; then
+          if [ "$REVIEW_FAILURE_REASON" = "incomplete_source" ]; then
+            detail="The exact review could not verify the complete source. The durable queue will not retry this unchanged revision."
+          elif [ "$RESERVATION_STATUS" = "superseded" ] || [ "$REVIEW_SUPERSEDED" = "true" ]; then
             state="Waiting"
             detail="A newer exact-review queue owner superseded this run. This run completed as a no-op."
           elif [ "$RESERVATION_STATUS" = "held" ]; then
@@ -1804,6 +1812,7 @@ jobs:
           REQUEUE_LATEST: ${{ steps.exact-review-generation-result.outputs.requeue_latest }}
           RETRY_KIND: ${{ steps.exact-review-generation-result.outputs.retry_kind }}
           RETRY_AT: ${{ steps.exact-review-generation-result.outputs.retry_at }}
+          REVIEW_FAILURE_REASON: ${{ steps.review-exact-event-item.outputs.failure_reason || '' }}
           DIRECT_PUBLICATION_ACCEPTED: ${{ steps.direct-exact-review-publication.outputs.accepted }}
           DIRECT_PUBLICATION_SUPERSEDED: ${{ steps.direct-exact-review-publication.outputs.superseded }}
           DIRECT_LIFECYCLE_OUTCOME: ${{ steps.finalize-direct-exact-review-lifecycle.outcome }}
@@ -1866,6 +1875,9 @@ jobs:
                 : {}),
               ...(directLifecycleRequeue ? { direct_lifecycle_requeue: true } : {}),
               ...(retryAt ? { retry_at: retryAt } : {}),
+              ...(process.env.REVIEW_FAILURE_REASON
+                ? { review_failure_reason: process.env.REVIEW_FAILURE_REASON }
+                : {}),
             }));
           ')"
           response_file="$(mktemp)"
