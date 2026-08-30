@@ -9358,6 +9358,40 @@ for (const retryKind of ["coordination", "throttle"] as const) {
   });
 }
 
+test("exact-review queue terminalizes deterministic incomplete-source refusals", async () => {
+  const storage = new MemoryDurableStorage();
+  await storage.put("exact-review-queue", {
+    deliveries: {},
+    items: {
+      "openclaw/openclaw#711": leasedExactReviewQueueItem(711, "7110"),
+    },
+  });
+  const queue = new ExactReviewQueue({ storage }, {});
+
+  const response = await queue.fetch(
+    new Request("https://clawsweeper-exact-review-queue/complete", {
+      method: "POST",
+      body: JSON.stringify({
+        lease_id: "lease-711",
+        item_key: "openclaw/openclaw#711",
+        lease_revision: 1,
+        claim_generation: 1,
+        run_id: "7110",
+        run_attempt: 1,
+        outcome: "failure",
+        terminal_failure_reason: "incomplete_source",
+      }),
+    }),
+  );
+
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { ok: true, requeued: false });
+  const state = (await storage.get("exact-review-queue")) as {
+    items: Record<string, unknown>;
+  };
+  assert.equal(state.items["openclaw/openclaw#711"], undefined);
+});
+
 test("exact-review queue spends review attempts for an untyped retry deadline", async () => {
   const storage = new MemoryDurableStorage();
   const retryAt = Date.now() + 45 * 60_000;

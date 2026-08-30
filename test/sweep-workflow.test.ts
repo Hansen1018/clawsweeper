@@ -494,6 +494,8 @@ test("review workflow gives Codex a read-only inspection token", () => {
   assert.match(exactReviewStep, /coordination-held\.json/);
   assert.match(exactReviewStep, /echo "retry_kind=coordination" >> "\$GITHUB_OUTPUT"/);
   assert.match(exactReviewStep, /echo "retry_at=\$retry_at" >> "\$GITHUB_OUTPUT"/);
+  assert.match(exactReviewStep, /terminal-review-failure\.json/);
+  assert.match(exactReviewStep, /terminal_failure_reason=\$terminal_failure_reason/);
   assert.match(exactReviewStep, /Exact review produced no artifact for open item/);
   assert.match(reviewJob, /uses: \.\/clawsweeper\/\.github\/actions\/setup-codex/);
   assert.doesNotMatch(reviewJob, /uses: \.\/\.github\/actions\/setup-codex/);
@@ -1019,6 +1021,10 @@ test("exact event review publishes directly with a queue-bounded canonical fallb
   assert.match(generationResult.run ?? "", /requeue_latest=true/);
   assert.match(generationResult.run ?? "", /echo "retry_kind=\$retry_kind"/);
   assert.match(generationResult.run ?? "", /echo "retry_at=\$retry_at"/);
+  assert.equal(
+    generationResult.env?.TERMINAL_FAILURE_REASON,
+    "${{ steps.review-exact-event-item.outputs.terminal_failure_reason }}",
+  );
   const runGenerationResult = (overrides: Record<string, string>) => {
     const root = mkdtempSync(`${tmpPrefix}exact-review-generation-result-`);
     const outputPath = join(root, "github-output");
@@ -1029,6 +1035,7 @@ test("exact event review publishes directly with a queue-bounded canonical fallb
           ADMISSION_RETRY: "false",
           RETRY_KIND: "",
           RETRY_AT: "",
+          TERMINAL_FAILURE_REASON: "",
           DIRECT_PUBLICATION_FAILURE_KIND: "",
           DIRECT_PUBLICATION_RETRY_AT: "",
           TARGET_ENABLED: "true",
@@ -1071,6 +1078,7 @@ test("exact event review publishes directly with a queue-bounded canonical fallb
       direct_lifecycle_requeue: "false",
       retry_kind: "",
       retry_at: "",
+      terminal_failure_reason: "",
     },
   );
   assert.deepEqual(
@@ -1085,6 +1093,7 @@ test("exact event review publishes directly with a queue-bounded canonical fallb
       direct_lifecycle_requeue: "false",
       retry_kind: "throttle",
       retry_at: directRetryAt,
+      terminal_failure_reason: "",
     },
   );
   assert.equal(
@@ -1134,6 +1143,11 @@ test("exact event review publishes directly with a queue-bounded canonical fallb
     complete.env?.RETRY_KIND,
     "${{ steps.exact-review-generation-result.outputs.retry_kind }}",
   );
+  assert.equal(
+    complete.env?.TERMINAL_FAILURE_REASON,
+    "${{ steps.exact-review-generation-result.outputs.terminal_failure_reason }}",
+  );
+  assert.match(complete.run ?? "", /terminal_failure_reason/);
   assert.match(complete.run ?? "", /retry_kind: retryKind/);
   assert.match(complete.run ?? "", /requeue_latest: true/);
   assert.match(deferHeldReview.if ?? "", /reserve-exact-review-lease\.outputs\.status == 'held'/);

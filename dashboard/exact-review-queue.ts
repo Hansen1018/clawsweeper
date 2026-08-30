@@ -287,6 +287,7 @@ export type ExactReviewReviewRecoveryReason =
   | "workflow_cancelled"
   | "workflow_failed";
 type ExactReviewRetryKind = "coordination" | "throttle";
+type ExactReviewTerminalFailureReason = "incomplete_source";
 type ExactReviewPublicationFailureKind = "github_rate_limit" | "github_transient";
 type ExactReviewDispatchFailureClass =
   | "permanent_rejection"
@@ -2128,6 +2129,16 @@ export class ExactReviewQueue {
       if (retryKind && requestedRetryAt === null) {
         return json({ error: "retry_kind_without_retry_at" }, 400);
       }
+      const terminalFailureReason =
+        body.terminal_failure_reason === undefined
+          ? undefined
+          : exactReviewTerminalFailureReason(body.terminal_failure_reason);
+      if (body.terminal_failure_reason !== undefined && !terminalFailureReason) {
+        return json({ error: "invalid_terminal_failure_reason" }, 400);
+      }
+      if (terminalFailureReason && outcome !== "failure") {
+        return json({ error: "terminal_failure_reason_without_failure" }, 400);
+      }
       const state = this.readStateSync();
       const item = tupleCompletion ? state.items[itemKey] : exactReviewItemForLease(state, leaseId);
       if (
@@ -2181,6 +2192,9 @@ export class ExactReviewQueue {
       }
       if (retryKind && publicationItem) {
         return json({ error: "retry_kind_outside_regular_review" }, 400);
+      }
+      if (terminalFailureReason && publicationItem) {
+        return json({ error: "terminal_failure_reason_outside_regular_review" }, 400);
       }
       const leasedDirectLifecycle = item.leaseDecision?.publication?.directLifecycle;
       const directLifecycleLeasePublication =
@@ -2294,6 +2308,7 @@ export class ExactReviewQueue {
                 requeueLatest,
                 retryKind,
                 this.random,
+                terminalFailureReason,
               ),
               retried: outcome !== "success",
               refreshed: false,
@@ -12051,6 +12066,7 @@ function finishExactReviewQueueItem(
   requeueLatest = false,
   retryKind?: ExactReviewRetryKind,
   random: () => number = Math.random,
+  terminalFailureReason?: ExactReviewTerminalFailureReason,
 ) {
   const retryingFailure = outcome !== "success";
   const hasNewerRevision = item.revision > Number(item.leaseRevision || 0);
@@ -12070,8 +12086,13 @@ function finishExactReviewQueueItem(
   // the queue, so only a newer source revision may supersede that recovery.
   const oneShotRecovery =
     item.leaseDecision?.sourceAction === FAILED_REVIEW_SHARD_RECOVERY_SOURCE_ACTION;
+  const deterministicTerminal =
+    terminalFailureReason !== undefined && !hasNewerRevision && !requeueLatest;
   const requeued =
-    typedDeferral || (!oneShotRecovery && retryingFailure) || hasNewerRevision || requeueLatest;
+    typedDeferral ||
+    (!deterministicTerminal && !oneShotRecovery && retryingFailure) ||
+    hasNewerRevision ||
+    requeueLatest;
   if (!requeued) {
     delete state.items[item.key];
     return { requeued: false, parked: false };
@@ -12134,6 +12155,10 @@ function exactReviewCompletionRetryAt(value, now: number): number | null {
 function exactReviewRetryKind(value): ExactReviewRetryKind | null {
   const normalized = String(value || "");
   return normalized === "coordination" || normalized === "throttle" ? normalized : null;
+}
+
+function exactReviewTerminalFailureReason(value): ExactReviewTerminalFailureReason | null {
+  return String(value || "") === "incomplete_source" ? "incomplete_source" : null;
 }
 
 function clearExactReviewLease(item: ExactReviewQueueItem) {

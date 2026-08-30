@@ -5,6 +5,8 @@ import { reviewMergeBase } from "./pr-review-evidence.js";
 const MAX_REVIEW_FILES = 80;
 const MAX_GIT_OUTPUT_BYTES = 4 * 1024 * 1024;
 const MAX_REVIEW_BLOB_BYTES = 4 * 1024 * 1024;
+const REVIEW_HISTORY_DEEPEN_STEPS = [256, 512, 1024, 2048, 4096] as const;
+const MAX_REVIEW_HISTORY_HYDRATION_MS = 90_000;
 const GIT_OBJECT_ID = /^[0-9a-f]{40,64}$/i;
 
 type ReviewBlobFile = {
@@ -26,6 +28,15 @@ function gitCommitExists(targetDir: string, sha: string): boolean {
       stdio: "ignore",
     }).status === 0
   );
+}
+
+function isShallowRepository(targetDir: string): boolean {
+  const result = spawnSync("git", ["rev-parse", "--is-shallow-repository"], {
+    cwd: targetDir,
+    encoding: "utf8",
+    env: { ...process.env, GIT_NO_LAZY_FETCH: "1", GIT_OPTIONAL_LOCKS: "0" },
+  });
+  return !result.error && result.status === 0 && result.stdout.trim() === "true";
 }
 
 export function ensureReviewTreeCommit({
@@ -109,28 +120,38 @@ export function hydratePullRequestReviewHistory(options: {
   )
     return null;
   if (reviewMergeBase(targetDir, baseSha, headSha).status === "unavailable") {
-    // Existing tree hydration may have fetched only the PR tip. Bound history, not
-    // the reviewed identity; failure remains explicit in the local evidence reader.
-    spawnSync(
-      "git",
-      [
-        "fetch",
-        "--filter=blob:none",
-        "--no-tags",
-        "--no-write-fetch-head",
-        "--recurse-submodules=no",
-        "--depth=256",
-        "origin",
-        baseSha,
-        headSha,
-      ],
-      {
-        cwd: targetDir,
-        env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" },
-        stdio: "ignore",
-        timeout: 30_000,
-      },
-    );
+    // --depth rewrites shallow boundaries and can truncate ancestry that a complete
+    // checkout already has. Deepen only an existing shallow boundary, checking the
+    // pinned pair after every bounded increment.
+    const deadline = Date.now() + MAX_REVIEW_HISTORY_HYDRATION_MS;
+    for (const deepen of REVIEW_HISTORY_DEEPEN_STEPS) {
+      if (!isShallowRepository(targetDir)) break;
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) break;
+      const fetched = spawnSync(
+        "git",
+        [
+          "fetch",
+          "--filter=blob:none",
+          "--no-tags",
+          "--no-write-fetch-head",
+          "--recurse-submodules=no",
+          `--deepen=${deepen}`,
+          "origin",
+          baseSha,
+          headSha,
+        ],
+        {
+          cwd: targetDir,
+          env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" },
+          stdio: "ignore",
+          timeout: Math.min(30_000, remainingMs),
+        },
+      );
+      if (fetched.error || fetched.status !== 0) break;
+      const mergeBase = reviewMergeBase(targetDir, baseSha, headSha);
+      if (mergeBase.status === "verified") break;
+    }
   }
   if (testMergeSha && GIT_OBJECT_ID.test(testMergeSha)) {
     ensureReviewTreeCommit({

@@ -252,6 +252,7 @@ test("production history hydration recovers a shallow PR tip and fetches only th
     );
     git(clone, "fetch", "-q", "--depth=1", "origin", "refs/pull/1/head:refs/pr-head");
     git(clone, "checkout", "-q", "--detach", f.H);
+    assert.equal(git(clone, "rev-parse", "--is-shallow-repository"), "true");
     assert.throws(() =>
       git(clone, "-c", "protocol.allow=never", "cat-file", "-e", `${f.T}^{commit}`),
     );
@@ -268,6 +269,67 @@ test("production history hydration recovers a shallow PR tip and fetches only th
     assert.equal(evidence.testMerge.status, "verified");
     assert.equal(evidence.checkoutSha, f.H);
     assert.equal(git(clone, "status", "--porcelain"), "");
+  } finally {
+    rmSync(f.root, { recursive: true, force: true });
+    rmSync(clone, { recursive: true, force: true });
+  }
+});
+
+test("history hydration deepens a shallow PR tip without truncating complete base ancestry", () => {
+  const f = fixture();
+  const clone = mkdtempSync(join(tmpdir(), "clawsweeper-provenance-deep-clone-"));
+  try {
+    const chain = (start: string, label: string) => {
+      let current = start;
+      for (let index = 0; index < 270; index += 1) {
+        current = git(
+          f.root,
+          "commit-tree",
+          `${current}^{tree}`,
+          "-p",
+          current,
+          "-m",
+          `${label} ${index}`,
+        );
+      }
+      return current;
+    };
+    const baseSha = chain(f.B, "main");
+    const headSha = chain(f.B, "pull");
+    git(f.root, "config", "uploadpack.allowFilter", "true");
+    git(f.root, "update-ref", "refs/heads/main", baseSha);
+    git(f.root, "update-ref", "refs/pull/1/head", headSha);
+    git(
+      clone,
+      "clone",
+      "-q",
+      "--no-checkout",
+      "--single-branch",
+      "--branch",
+      "main",
+      "--filter=blob:none",
+      `file://${f.root}`,
+      ".",
+    );
+    const baseCountBefore = git(clone, "rev-list", "--count", baseSha);
+    git(clone, "fetch", "-q", "--depth=1", "origin", "refs/pull/1/head:refs/pr-head");
+    git(clone, "checkout", "-q", "--detach", headSha);
+    assert.equal(
+      promptEvidence({ ...f, root: clone, M: baseSha, H: headSha }).evidence.mergeBase.status,
+      "unavailable",
+    );
+
+    assert.equal(
+      hydratePullRequestReviewHistory({
+        targetDir: clone,
+        baseSha,
+        headSha,
+        itemNumber: 1,
+      }),
+      f.B,
+    );
+    assert.equal(git(clone, "rev-list", "--count", baseSha), baseCountBefore);
+    assert.equal(git(clone, "merge-base", baseSha, headSha), f.B);
   } finally {
     rmSync(f.root, { recursive: true, force: true });
     rmSync(clone, { recursive: true, force: true });

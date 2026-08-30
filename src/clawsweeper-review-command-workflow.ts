@@ -1811,6 +1811,13 @@ export function createReviewCommandWorkflow(dependencies: CreateReviewCommandWor
         cacheHits,
       });
     } catch (error) {
+      if (error instanceof AgentInputScanError && error.reason === "incomplete_source") {
+        writeFileSync(
+          join(artifactDir, "terminal-review-failure.json"),
+          JSON.stringify({ reason: error.reason }, null, 2) + "\n",
+          "utf8",
+        );
+      }
       if (reviewLedger) {
         for (const acquired of acquiredReviewLeases) {
           const state = [...reviewLedger.items.values()].find(

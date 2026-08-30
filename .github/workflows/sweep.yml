@@ -1300,6 +1300,16 @@ jobs:
           fi
           set -e
           echo "exit_code=$review_exit_code" >> "$GITHUB_OUTPUT"
+          terminal_failure_path="artifacts/event/terminal-review-failure.json"
+          if [ -f "$terminal_failure_path" ]; then
+            terminal_failure_reason="$(node -e '
+              const data = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"));
+              if (data.reason !== "incomplete_source") process.exit(1);
+              process.stdout.write(data.reason);
+            ' "$terminal_failure_path")"
+            echo "terminal_failure_reason=$terminal_failure_reason" >> "$GITHUB_OUTPUT"
+            echo "::error::Exact review stopped with terminal reason $terminal_failure_reason; the unchanged revision will not be retried."
+          fi
           if [ "$review_exit_code" -ne 0 ]; then
             exit "$review_exit_code"
           fi
@@ -1713,11 +1723,14 @@ jobs:
           REVIEW_SUPERSEDED: ${{ steps.review-exact-event-item.outputs.superseded || 'false' }}
           RESERVATION_STATUS: ${{ steps.reserve-exact-review-lease.outputs.status }}
           RETRY_AT: ${{ steps.reserve-exact-review-lease.outputs.retry_at || steps.review-exact-event-item.outputs.retry_at }}
+          TERMINAL_FAILURE_REASON: ${{ steps.review-exact-event-item.outputs.terminal_failure_reason }}
           CLAWSWEEPER_ACTION_LEDGER_DISABLED: "1"
         run: |
           state="Failed"
           detail="The exact review did not produce a publishable artifact. The durable queue will retry it."
-          if [ "$RESERVATION_STATUS" = "superseded" ] || [ "$REVIEW_SUPERSEDED" = "true" ]; then
+          if [ "$TERMINAL_FAILURE_REASON" = "incomplete_source" ]; then
+            detail="The exact review stopped because the pinned source history could not be verified after bounded hydration. This revision will not be retried unless the source changes."
+          elif [ "$RESERVATION_STATUS" = "superseded" ] || [ "$REVIEW_SUPERSEDED" = "true" ]; then
             state="Waiting"
             detail="A newer exact-review queue owner superseded this run. This run completed as a no-op."
           elif [ "$RESERVATION_STATUS" = "held" ]; then
@@ -1743,6 +1756,7 @@ jobs:
           ADMISSION_RETRY: ${{ steps.live-item.outputs.admission_retry }}
           RETRY_KIND: ${{ steps.live-item.outputs.retry_kind || steps.reserve-exact-review-lease.outputs.retry_kind || steps.review-exact-event-item.outputs.retry_kind }}
           RETRY_AT: ${{ steps.live-item.outputs.retry_at || steps.reserve-exact-review-lease.outputs.retry_at || steps.review-exact-event-item.outputs.retry_at }}
+          TERMINAL_FAILURE_REASON: ${{ steps.review-exact-event-item.outputs.terminal_failure_reason }}
           DIRECT_PUBLICATION_FAILURE_KIND: ${{ steps.prepare-direct-exact-review-publication.outputs.failure_kind }}
           DIRECT_PUBLICATION_RETRY_AT: ${{ steps.prepare-direct-exact-review-publication.outputs.retry_at }}
           TARGET_ENABLED: ${{ steps.target.outputs.target_enabled }}
@@ -1788,6 +1802,7 @@ jobs:
           echo "direct_lifecycle_requeue=$DIRECT_LIFECYCLE_REQUEUE" >> "$GITHUB_OUTPUT"
           echo "retry_kind=$retry_kind" >> "$GITHUB_OUTPUT"
           echo "retry_at=$retry_at" >> "$GITHUB_OUTPUT"
+          echo "terminal_failure_reason=$TERMINAL_FAILURE_REASON" >> "$GITHUB_OUTPUT"
 
       - name: Complete exact-review queue lease
         id: complete-exact-review-queue
@@ -1804,6 +1819,7 @@ jobs:
           REQUEUE_LATEST: ${{ steps.exact-review-generation-result.outputs.requeue_latest }}
           RETRY_KIND: ${{ steps.exact-review-generation-result.outputs.retry_kind }}
           RETRY_AT: ${{ steps.exact-review-generation-result.outputs.retry_at }}
+          TERMINAL_FAILURE_REASON: ${{ steps.exact-review-generation-result.outputs.terminal_failure_reason }}
           DIRECT_PUBLICATION_ACCEPTED: ${{ steps.direct-exact-review-publication.outputs.accepted }}
           DIRECT_PUBLICATION_SUPERSEDED: ${{ steps.direct-exact-review-publication.outputs.superseded }}
           DIRECT_LIFECYCLE_OUTCOME: ${{ steps.finalize-direct-exact-review-lifecycle.outcome }}
@@ -1857,6 +1873,9 @@ jobs:
               run_id: process.env.GITHUB_RUN_ID,
               run_attempt: runAttempt,
               outcome,
+              ...(process.env.TERMINAL_FAILURE_REASON
+                ? { terminal_failure_reason: process.env.TERMINAL_FAILURE_REASON }
+                : {}),
               ...(requeueLatest ? { requeue_latest: true } : {}),
               ...(retryKind ? { retry_kind: retryKind } : {}),
               ...(directPublicationCompleted
