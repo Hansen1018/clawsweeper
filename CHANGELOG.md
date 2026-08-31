@@ -70,6 +70,8 @@ checkpoint, and status-only commits are intentionally omitted.
 
 ### Fixed
 
+- Completed obsolete exact-review publications when apply verifies a strictly newer durable review for the same revision, preserving retry behavior for unproven results. Thanks @vincentkoc. (#1249)
+
 - Preserved owed source-drift reviews when completion callbacks are lost, and distinguished queue-completion failures from review failures. Thanks @yetval. (#1251)
 
 - Stopped retrying unchanged PR revisions after an incomplete-source scan refusal while preserving newer queued revisions. Thanks @sallyom. (#1311)

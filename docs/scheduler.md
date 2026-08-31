@@ -109,6 +109,12 @@ GitHub throttle deferrals use the same per-item jitter band when the queue turns
 the reported cooldown into its next-attempt timestamp, preventing a parked
 cohort from becoming eligible in lockstep; coordination and ordinary failure
 retries keep their existing timing.
+Exact publishers complete as superseded when apply verifies one trusted, complete,
+strictly newer durable review tuple for the same revision. The verified result
+travels as structured apply evidence; reason text is diagnostic only. Ambiguous
+or mixed results cannot terminalize the artifact, and legacy tupleless artifacts
+retain the existing fresh-review path.
+
 Review publication and apply/comment sync use separate non-dropping queues.
 Apply treats a typed GitHub installation or abuse-rate-limit response as a
 bounded yield, not a failed scan. It checkpoints completed item work, records
@@ -681,12 +687,10 @@ If another publisher updates the same tuple first, its newer tuple wins and
 reconciliation defers that item instead of rebuilding stale report or sidecar
 content.
 
-Broad normal review publishes records first, then dispatches durable review
-comment sync into the separate apply/comment-sync lane. This includes scheduled
-runs and workflow-dispatch continuations, so slow GitHub comment writes do not
-hold the planner concurrency group or delay the next 89-shard backfill
-wave. Exact issue/PR reviews and repository-dispatch item runs still sync their
-selected comments inline before finishing.
+Batch review publishers hydrate only the item tuples present in their artifacts,
+publish those records, and synchronize the selected durable review comments in
+the same job. Exact issue/PR reviews likewise synchronize their selected comments
+before completing. Neither path dispatches a second broad comment scan.
 
 Automatic apply may close up to 40 items per run. Long apply runs commit
 checkpoints every 40 fresh closes and dispatch a
