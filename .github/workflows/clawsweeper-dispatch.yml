@@ -34,7 +34,7 @@ jobs:
         with:
           app-id: '4777819'
           private-key: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
-          owner: openclaw
+          owner: Hansen1018
           repositories: clawsweeper
           permission-contents: write
 
