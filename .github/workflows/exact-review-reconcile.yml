@@ -239,7 +239,7 @@ jobs:
           REVIEW_PLACEHOLDER_MAX_RECOVERIES: ${{ vars.REVIEW_PLACEHOLDER_MAX_RECOVERIES || '5' }}
           REVIEW_PLACEHOLDER_MIN_AGE_HOURS: ${{ vars.REVIEW_PLACEHOLDER_MIN_AGE_HOURS || '2' }}
           TARGET_BRANCH: main
-          TARGET_REPO: openclaw/openclaw
+          TARGET_REPO: Hansen1018/hugo-theme-lumenveil
         run: node dist/review-placeholder-recovery.js
 
       - name: Report remaining state repository size
