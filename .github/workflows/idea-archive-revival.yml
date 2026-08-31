@@ -8,14 +8,14 @@ on:
       target_repo:
         description: "Target repository"
         required: true
-        default: "openclaw/openclaw"
+        default: "Hansen1018/hugo-theme-lumenveil"
         type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: idea-archive-revival-${{ github.event.inputs.target_repo || 'openclaw/openclaw' }}
+  group: idea-archive-revival-${{ github.event.inputs.target_repo || 'Hansen1018/hugo-theme-lumenveil' }}
   cancel-in-progress: false
 
 env:
@@ -37,7 +37,7 @@ jobs:
       - name: Resolve target repository
         id: target
         env:
-          TARGET_REPO: ${{ github.event.inputs.target_repo || 'openclaw/openclaw' }}
+          TARGET_REPO: ${{ github.event.inputs.target_repo || 'Hansen1018/hugo-theme-lumenveil' }}
         run: |
           set -euo pipefail
           case "$TARGET_REPO" in
