@@ -1,6 +1,6 @@
 name: ClawSweeper assist
 
-run-name: ${{ github.event.client_payload.dispatch_key && format('Assist {0}#{1} [{2}]', github.event.client_payload.target_repo || 'openclaw/openclaw', github.event.client_payload.item_number || '?', github.event.client_payload.dispatch_key) || format('Assist {0}#{1}', github.event.client_payload.target_repo || 'openclaw/openclaw', github.event.client_payload.item_number || '?') }}
+run-name: ${{ github.event.client_payload.dispatch_key && format('Assist {0}#{1} [{2}]', github.event.client_payload.target_repo || 'Hansen1018/hugo-theme-lumenveil', github.event.client_payload.item_number || '?', github.event.client_payload.dispatch_key) || format('Assist {0}#{1}', github.event.client_payload.target_repo || 'Hansen1018/hugo-theme-lumenveil', github.event.client_payload.item_number || '?') }}
 
 on:
   repository_dispatch:
@@ -10,7 +10,7 @@ on:
       target_repo:
         description: "Repository containing the issue or PR"
         required: true
-        default: openclaw/openclaw
+        default: Hansen1018/hugo-theme-lumenveil
         type: string
       item_number:
         description: "Issue or PR number"
@@ -66,7 +66,7 @@ env:
   OPENROUTER_API_KEY: ${{ vars.CLAWSWEEPER_RUNNER == 'openclaw' && secrets.OPENROUTER_API_KEY || '' }}
 
 concurrency:
-  group: ${{ format('clawsweeper-assist-{0}-{1}-{2}', github.event.client_payload.target_repo || inputs.target_repo || 'openclaw/openclaw', github.event.client_payload.item_number || inputs.item_number || 'unknown', github.event.client_payload.comment_id || inputs.comment_id || 'manual') }}
+  group: ${{ format('clawsweeper-assist-{0}-{1}-{2}', github.event.client_payload.target_repo || inputs.target_repo || 'Hansen1018/hugo-theme-lumenveil', github.event.client_payload.item_number || inputs.item_number || 'unknown', github.event.client_payload.comment_id || inputs.comment_id || 'manual') }}
   cancel-in-progress: false
 
 jobs:
@@ -86,7 +86,7 @@ jobs:
         env:
           DISPATCH_KEY: ${{ github.event.client_payload.dispatch_key || '' }}
           ITEM_NUMBER: ${{ github.event.client_payload.item_number || '?' }}
-          TARGET_REPO: ${{ github.event.client_payload.target_repo || 'openclaw/openclaw' }}
+          TARGET_REPO: ${{ github.event.client_payload.target_repo || 'Hansen1018/hugo-theme-lumenveil' }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
