@@ -19,6 +19,8 @@ checkpoint, and status-only commits are intentionally omitted.
 
 ### Changed
 
+- Retain only Cloudflare failure flags in queue transport logs so backend faults can be diagnosed without exposing exception details.
+
 - Hydrate review blobs from cached PR snapshots that store an absent previous filename as `null`, preventing repeat reviews from refusing otherwise available source.
 
 - Preserve Codex keep-open verdicts during publication instead of treating related PR links as independent supersession decisions.
@@ -70,6 +72,8 @@ checkpoint, and status-only commits are intentionally omitted.
 
 ### Fixed
 
+- Bound shared repair GitHub CLI calls with native process deadlines and honor per-call timeout settings. Thanks @SebTardif.
+- Bound standalone webhook GitHub requests to 15 seconds, including response bodies, so stalled calls return a retryable response. Thanks @SebTardif.
 - Completed obsolete exact-review publications when apply verifies a strictly newer durable review for the same revision, preserving retry behavior for unproven results. Thanks @vincentkoc. (#1249)
 
 - Preserved owed source-drift reviews when completion callbacks are lost, and distinguished queue-completion failures from review failures. Thanks @yetval. (#1251)
