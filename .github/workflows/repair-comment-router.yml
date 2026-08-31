@@ -23,7 +23,7 @@ on:
       target_repo:
         description: "Repository to scan for ClawSweeper commands"
         required: true
-        default: openclaw/openclaw
+        default: Hansen1018/hugo-theme-lumenveil
         type: string
       target_branch:
         description: "Optional target repository branch for exact review dispatches"
@@ -83,7 +83,7 @@ env:
 concurrency:
   # GitHub retains only one pending run per concurrency group. Exact-item verdict
   # handoffs need their own group so unrelated router traffic cannot replace them.
-  group: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.comment_id && format('repair-comment-router-{0}-comment-{1}', github.event.client_payload.target_repo || 'openclaw/openclaw', github.event.client_payload.comment_id) || github.event_name == 'workflow_dispatch' && github.event.inputs.item_numbers != '' && format('repair-comment-router-{0}-items-{1}', github.event.inputs.target_repo || 'openclaw/openclaw', github.event.inputs.item_numbers) || format('repair-comment-router-{0}', github.event.inputs.target_repo || github.event.client_payload.target_repo || 'openclaw/openclaw') }}
+  group: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.comment_id && format('repair-comment-router-{0}-comment-{1}', github.event.client_payload.target_repo || 'Hansen1018/hugo-theme-lumenveil', github.event.client_payload.comment_id) || github.event_name == 'workflow_dispatch' && github.event.inputs.item_numbers != '' && format('repair-comment-router-{0}-items-{1}', github.event.inputs.target_repo || 'Hansen1018/hugo-theme-lumenveil', github.event.inputs.item_numbers) || format('repair-comment-router-{0}', github.event.inputs.target_repo || github.event.client_payload.target_repo || 'Hansen1018/hugo-theme-lumenveil') }}
   cancel-in-progress: false
 
 jobs:
@@ -119,11 +119,11 @@ jobs:
       - name: Resolve target repository
         id: target
         env:
-          TARGET_REPO: ${{ github.event_name == 'workflow_dispatch' && inputs.target_repo || github.event_name == 'repository_dispatch' && github.event.client_payload.target_repo || vars.CLAWSWEEPER_TARGET_REPO || 'openclaw/openclaw' }}
+          TARGET_REPO: ${{ github.event_name == 'workflow_dispatch' && inputs.target_repo || github.event_name == 'repository_dispatch' && github.event.client_payload.target_repo || vars.CLAWSWEEPER_TARGET_REPO || 'Hansen1018/hugo-theme-lumenveil' }}
           ITEM_NUMBERS: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.item_number || github.event_name == 'workflow_dispatch' && inputs.item_numbers || '' }}
         run: |
           set -euo pipefail
-          target_repo="${TARGET_REPO:-openclaw/openclaw}"
+          target_repo="${TARGET_REPO:-Hansen1018/hugo-theme-lumenveil}"
           if ! printf '%s' "$target_repo" | grep -Eq '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'; then
             echo "Invalid target_repo: $target_repo" >&2
             exit 1
@@ -210,7 +210,7 @@ jobs:
           QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
         run: |
           set -euo pipefail
-          target_repo="${{ github.event_name == 'workflow_dispatch' && inputs.target_repo || vars.CLAWSWEEPER_TARGET_REPO || 'openclaw/openclaw' }}"
+          target_repo="${{ github.event_name == 'workflow_dispatch' && inputs.target_repo || vars.CLAWSWEEPER_TARGET_REPO || 'Hansen1018/hugo-theme-lumenveil' }}"
           target_branch="${{ github.event_name == 'workflow_dispatch' && inputs.target_branch || '' }}"
           lookback_minutes="${{ github.event_name == 'workflow_dispatch' && inputs.lookback_minutes || vars.CLAWSWEEPER_COMMENT_LOOKBACK_MINUTES || '180' }}"
           since="${{ github.event_name == 'workflow_dispatch' && inputs.since || '' }}"
@@ -222,7 +222,7 @@ jobs:
           force_reprocess="${{ github.event_name == 'workflow_dispatch' && inputs.force_reprocess || 'false' }}"
           attempt_id="${{ github.event_name == 'workflow_dispatch' && inputs.attempt_id || '' }}"
           if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
-            target_repo="${{ github.event.client_payload.target_repo || 'openclaw/openclaw' }}"
+            target_repo="${{ github.event.client_payload.target_repo || 'Hansen1018/hugo-theme-lumenveil' }}"
             target_branch="${{ github.event.client_payload.target_branch || '' }}"
             lookback_minutes="${{ github.event.client_payload.lookback_minutes || vars.CLAWSWEEPER_COMMENT_LOOKBACK_MINUTES || '180' }}"
             since=""
@@ -375,7 +375,7 @@ jobs:
           QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
         run: |
           set -euo pipefail
-          target_repo="${{ github.event_name == 'workflow_dispatch' && inputs.target_repo || vars.CLAWSWEEPER_TARGET_REPO || 'openclaw/openclaw' }}"
+          target_repo="${{ github.event_name == 'workflow_dispatch' && inputs.target_repo || vars.CLAWSWEEPER_TARGET_REPO || 'Hansen1018/hugo-theme-lumenveil' }}"
           target_branch="${{ github.event_name == 'workflow_dispatch' && inputs.target_branch || '' }}"
           lookback_minutes="${{ github.event_name == 'workflow_dispatch' && inputs.lookback_minutes || vars.CLAWSWEEPER_COMMENT_LOOKBACK_MINUTES || '180' }}"
           since="${{ github.event_name == 'workflow_dispatch' && inputs.since || '' }}"
@@ -387,7 +387,7 @@ jobs:
           force_reprocess="${{ github.event_name == 'workflow_dispatch' && inputs.force_reprocess || 'false' }}"
           attempt_id="${{ github.event_name == 'workflow_dispatch' && inputs.attempt_id || '' }}"
           if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
-            target_repo="${{ github.event.client_payload.target_repo || 'openclaw/openclaw' }}"
+            target_repo="${{ github.event.client_payload.target_repo || 'Hansen1018/hugo-theme-lumenveil' }}"
             target_branch="${{ github.event.client_payload.target_branch || '' }}"
             lookback_minutes="${{ github.event.client_payload.lookback_minutes || vars.CLAWSWEEPER_COMMENT_LOOKBACK_MINUTES || '180' }}"
             since=""
