@@ -7,28 +7,47 @@
       "checkout_dir": "lumenveil",
       "prompt_note": "Use the hugo-theme-lumenveil source tree and current main branch. This is a Hugo theme repo: layouts/, assets/, static/, theme.toml, hugo.toml, and README files. Hugo --minify is the canonical validation (the exampleSite/ builds the theme as a consumer site). Review CSS/JS/layout changes for accessibility (color contrast, focus visibility, keyboard navigation, screen-reader semantics), responsive behavior (≥1024px desktop, ≤480px mobile, light + dark mode both), and breakages to existing glassmorphism / aurora surfaces. Honor the PR template checkboxes (Type of Change, Affected Area, Testing Done, Accessibility Impact, Pre-submit Checklist). Propose auto-close only for issues and pull requests that are certainly implemented on main; for pull requests only, also allow age-gated mostly implemented on main. Keep everything else open for maintainer triage.",
       "apply_close_rules": {
-        "issue": ["implemented_on_main"],
-        "pull_request": ["implemented_on_main", "mostly_implemented_on_main"]
+        "issue": [
+          "implemented_on_main"
+        ],
+        "pull_request": [
+          "implemented_on_main",
+          "mostly_implemented_on_main"
+        ]
       },
       "package_manager": "none",
-      "validation_commands": ["cd exampleSite && hugo --minify"],
+      "validation_commands": [
+        "cd exampleSite && hugo --minify"
+      ],
       "changed_gate": null,
       "live_test": {
         "enabled": false
       }
     },
     {
-      "target_repo": "Hansen1018/openclaw-backup",
-      "display_name": "OpenClaw Backup",
-      "checkout_dir": "openclaw-backup",
-      "prompt_note": "Use the openclaw-backup source tree and current main branch. This is a config-of-record backup repo for an OpenClaw host: openclaw.json, devices/paired.json, exec-approvals.json, skills-lock.json, cron/, tasks/, flows/, skills/, agents/, memory/, wiki/, security-reports/, workspace-attestations/, npm/, telegram/, discord/, openclaw-auto-backup.sh. Treat every change as sensitive. Validate JSON syntax (jq empty on every touched .json, plus jq empty openclaw.json overall), shell-script syntax (bash -n openclaw-auto-backup.sh if touched), and baseline hash check (sha256sum -c .config-baseline.sha256 when config is touched). Flag any plaintext secret / API key / token in the diff. Flag any new outbound network destination, new shell exec / eval / dynamic-code construct, new auto-start (cron / systemd / LaunchAgent), or new privilege escalation (sudo, setuid, capability grants). Confirm touched files are inside the openclaw-auto-backup.sh allowlist (or that justification is provided). Confirm diff does NOT include *.last-good, *.clobbered.*, *.pre-update, *.postpatch.*, or *.migrated artifacts. Propose auto-close only for issues and pull requests that are certainly implemented on main; default open and conservative.",
+      "target_repo": "Hansen1018/hansen-web",
+      "display_name": "Hansen Web",
+      "checkout_dir": "hansen-web",
+      "prompt_note": "Use the hansen-web source tree and current main branch. This is a Next.js 14 App Router + React + TypeScript personal site with static export: src/, public/, scripts/, deploy.sh, next.config.mjs, package.json. Validate TypeScript (tsc), vitest tests (vitest.config.ts), and next build. Review changes for: hydration safety, RSC vs client component boundaries, image/font optimization, glassmorphism + aurora consistency with hugo-theme-lumenveil, accessibility accessibility (contrast, keyboard nav, screen reader), and integration with the live Hugo blog feed (scripts/). Treat deploy.sh as sensitive (it runs in CI). Propose auto-close only for issues and pull requests that are certainly implemented on main; default open and conservative.",
       "apply_close_rules": {
-        "issue": [],
-        "pull_request": []
+        "issue": [
+          "implemented_on_main"
+        ],
+        "pull_request": [
+          "implemented_on_main",
+          "mostly_implemented_on_main"
+        ]
       },
-      "package_manager": "none",
-      "validation_commands": ["jq empty openclaw.json"],
-      "changed_gate": null,
+      "package_manager": "npm",
+      "validation_commands": [
+        "npm run build",
+        "npx tsc --noEmit",
+        "npx vitest run"
+      ],
+      "changed_gate": {
+        "command": "npx vitest run --changed",
+        "required_script": "test"
+      },
       "live_test": {
         "enabled": false
       }
@@ -37,13 +56,20 @@
   "core_target_overrides": {
     "Hansen1018/hugo-theme-lumenveil": {
       "package_manager": "none",
-      "validation_commands": ["cd exampleSite && hugo --minify"],
+      "validation_commands": [
+        "cd exampleSite && hugo --minify"
+      ],
       "changed_gate": null
     }
   },
   "target_inventory": {
-    "owners": ["Hansen1018"],
-    "deny_repositories": ["Hansen1018/clawsweeper", "Hansen1018/clawsweeper-state"],
+    "owners": [
+      "Hansen1018"
+    ],
+    "deny_repositories": [
+      "Hansen1018/clawsweeper",
+      "Hansen1018/clawsweeper-state"
+    ],
     "include_private": false,
     "include_archived": false,
     "include_forks": false,
@@ -52,7 +78,10 @@
   "generic_fallbacks": [
     {
       "owner": "Hansen1018",
-      "deny_repositories": ["Hansen1018/clawsweeper", "Hansen1018/clawsweeper-state"],
+      "deny_repositories": [
+        "Hansen1018/clawsweeper",
+        "Hansen1018/clawsweeper-state"
+      ],
       "allow_repo_name_pattern": "^[A-Za-z0-9_.-]+$",
       "prompt_note": "Use the {target_repo} source tree and current default branch. This repository is using the generic personal-repository onboarding profile, so review conservatively and do not auto-close issues or pull requests unless a repository-specific profile later enables that policy. Apply the standard OpenClaw Backup safety checks when the repo looks like a config-of-record / backup repo (jq empty on touched .json, bash -n on touched shell scripts, no plaintext secrets, no new exec/eval/cron/systemd, deny *.last-good / *.clobbered.* / *.pre-update / *.postpatch.* artifacts in diffs).",
       "apply_close_rules": {
