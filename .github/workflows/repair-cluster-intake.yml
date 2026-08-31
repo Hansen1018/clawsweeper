@@ -11,7 +11,7 @@ on:
       target_repo:
         description: "Target repository"
         required: true
-        default: "openclaw/openclaw"
+        default: "Hansen1018/hugo-theme-lumenveil"
         type: string
       limit:
         description: "Number of unprocessed clusters offered to the selector model"
@@ -39,7 +39,7 @@ on:
         default: false
         type: boolean
   schedule:
-    # gitcrawl-store refreshes openclaw/openclaw every 15 minutes. This intake
+    # gitcrawl-store refreshes Hansen1018/hugo-theme-lumenveil every 15 minutes. This intake
     # runs daily and records the processed portable DB SHA so a
     # delayed or duplicate tick does not enqueue work from the same store twice.
     - cron: "8 8 * * *"
@@ -56,7 +56,7 @@ env:
   CLAWSWEEPER_GIT_USER_EMAIL: ${{ vars.CLAWSWEEPER_GIT_USER_EMAIL || '274271284+clawsweeper[bot]@users.noreply.github.com' }}
 
 concurrency:
-  group: cluster-repair-intake-${{ github.event.inputs.target_repo || vars.CLAWSWEEPER_CLUSTER_REPAIR_TARGET_REPO || 'openclaw/openclaw' }}
+  group: cluster-repair-intake-${{ github.event.inputs.target_repo || vars.CLAWSWEEPER_CLUSTER_REPAIR_TARGET_REPO || 'Hansen1018/hugo-theme-lumenveil' }}
   cancel-in-progress: false
 
 jobs:
@@ -89,7 +89,7 @@ jobs:
       - name: Resolve target repository
         id: target
         env:
-          TARGET_REPO: ${{ github.event.inputs.target_repo || vars.CLAWSWEEPER_CLUSTER_REPAIR_TARGET_REPO || 'openclaw/openclaw' }}
+          TARGET_REPO: ${{ github.event.inputs.target_repo || vars.CLAWSWEEPER_CLUSTER_REPAIR_TARGET_REPO || 'Hansen1018/hugo-theme-lumenveil' }}
           ALLOWED_OWNER: ${{ vars.CLAWSWEEPER_ALLOWED_OWNER || 'openclaw' }}
         run: |
           set -euo pipefail
