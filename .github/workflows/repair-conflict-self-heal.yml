@@ -11,7 +11,7 @@ on:
       target_repo:
         description: "Repository to scan"
         required: true
-        default: openclaw/openclaw
+        default: Hansen1018/hugo-theme-lumenveil
         type: string
       max_prs:
         description: "Maximum PRs to dispatch"
@@ -42,7 +42,7 @@ env:
   CLAWSWEEPER_APP_CLIENT_ID: Iv23liOECG0slfuhz093
 
 concurrency:
-  group: clawsweeper-conflict-self-heal-${{ github.event_name == 'workflow_dispatch' && inputs.target_repo || vars.CLAWSWEEPER_TARGET_REPO || 'openclaw/openclaw' }}
+  group: clawsweeper-conflict-self-heal-${{ github.event_name == 'workflow_dispatch' && inputs.target_repo || vars.CLAWSWEEPER_TARGET_REPO || 'Hansen1018/hugo-theme-lumenveil' }}
   cancel-in-progress: false
 
 jobs:
@@ -71,7 +71,7 @@ jobs:
       - name: Resolve target repository
         id: target
         env:
-          TARGET_REPO: ${{ github.event_name == 'workflow_dispatch' && inputs.target_repo || vars.CLAWSWEEPER_TARGET_REPO || 'openclaw/openclaw' }}
+          TARGET_REPO: ${{ github.event_name == 'workflow_dispatch' && inputs.target_repo || vars.CLAWSWEEPER_TARGET_REPO || 'Hansen1018/hugo-theme-lumenveil' }}
         run: |
           set -euo pipefail
           if ! printf '%s' "$TARGET_REPO" | grep -Eq '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'; then
@@ -109,7 +109,7 @@ jobs:
           CLAWSWEEPER_ALLOW_FIX_PR: ${{ vars.CLAWSWEEPER_ALLOW_FIX_PR || '0' }}
         run: |
           execute="false"
-          target_repo="${{ github.event_name == 'workflow_dispatch' && inputs.target_repo || vars.CLAWSWEEPER_TARGET_REPO || 'openclaw/openclaw' }}"
+          target_repo="${{ github.event_name == 'workflow_dispatch' && inputs.target_repo || vars.CLAWSWEEPER_TARGET_REPO || 'Hansen1018/hugo-theme-lumenveil' }}"
           max_prs="${{ github.event_name == 'workflow_dispatch' && inputs.max_prs || vars.CLAWSWEEPER_CONFLICT_SELF_HEAL_MAX_PRS || '5' }}"
           runner="${{ github.event_name == 'workflow_dispatch' && inputs.runner || vars.CLAWSWEEPER_WORKER_RUNNER || 'blacksmith-4vcpu-ubuntu-2404' }}"
           execution_runner="${{ github.event_name == 'workflow_dispatch' && inputs.execution_runner || vars.CLAWSWEEPER_EXECUTION_RUNNER || 'blacksmith-16vcpu-ubuntu-2404' }}"
