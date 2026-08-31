@@ -13,7 +13,7 @@ on:
       target_repo:
         description: "Target repository"
         required: true
-        default: "openclaw/openclaw"
+        default: "Hansen1018/hugo-theme-lumenveil"
         type: string
       item_number:
         description: "Issue number approved for implementation"
@@ -65,7 +65,7 @@ env:
   CLAWSWEEPER_GIT_USER_EMAIL: ${{ vars.CLAWSWEEPER_GIT_USER_EMAIL || '274271284+clawsweeper[bot]@users.noreply.github.com' }}
 
 concurrency:
-  group: issue-implementation-${{ github.event.inputs.target_repo || github.event.client_payload.target_repo || 'openclaw/openclaw' }}-${{ github.event.inputs.item_number || github.event.client_payload.item_number || github.run_id }}
+  group: issue-implementation-${{ github.event.inputs.target_repo || github.event.client_payload.target_repo || 'Hansen1018/hugo-theme-lumenveil' }}-${{ github.event.inputs.item_number || github.event.client_payload.item_number || github.run_id }}
   cancel-in-progress: false
 
 jobs:
@@ -85,7 +85,7 @@ jobs:
       - name: Resolve target repository
         id: target
         env:
-          TARGET_REPO: ${{ github.event.inputs.target_repo || github.event.client_payload.target_repo || 'openclaw/openclaw' }}
+          TARGET_REPO: ${{ github.event.inputs.target_repo || github.event.client_payload.target_repo || 'Hansen1018/hugo-theme-lumenveil' }}
         run: |
           set -euo pipefail
           case "$TARGET_REPO" in
@@ -174,7 +174,7 @@ jobs:
           GH_TOKEN: ${{ steps.target-token.outputs.token }}
           CLAWSWEEPER_ISSUE_IMPLEMENTATION_WORKFLOW_TOKEN: ${{ steps.dispatch-token.outputs.token }}
           ENABLED: ${{ github.event.inputs.enabled || github.event.client_payload.enabled || vars.CLAWSWEEPER_AUTO_IMPLEMENT_ISSUES || 'false' }}
-          TARGET_REPO: ${{ github.event.inputs.target_repo || github.event.client_payload.target_repo || 'openclaw/openclaw' }}
+          TARGET_REPO: ${{ github.event.inputs.target_repo || github.event.client_payload.target_repo || 'Hansen1018/hugo-theme-lumenveil' }}
           ITEM_NUMBER: ${{ github.event.inputs.item_number || github.event.client_payload.item_number }}
           CANDIDATE_KIND: ${{ github.event.inputs.candidate_kind || github.event.client_payload.candidate_kind || 'strict_bug' }}
           REPORT_REPO: ${{ github.event.inputs.report_repo || github.event.client_payload.report_repo || 'openclaw/clawsweeper-state' }}
