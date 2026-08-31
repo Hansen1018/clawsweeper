@@ -928,3 +928,4 @@ Target repository setup:
 - install the issue/PR dispatcher from
   [docs/target-dispatcher.md](docs/target-dispatcher.md) for exact item event
   reviews
+<!-- post-owner-fix test: 2026-08-31T09:07:29Z -->
