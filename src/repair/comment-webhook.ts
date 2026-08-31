@@ -21,6 +21,7 @@ import { directReReviewIntake } from "./direct-re-review-admission.js";
 import { postExactReviewCommandIntake } from "./exact-review-command-queue.js";
 
 const DEFAULT_PORT = 8787;
+export const WEBHOOK_MAX_BODY_BYTES = 2 * 1024 * 1024;
 const GITHUB_FETCH_TIMEOUT_MS = 15_000;
 const REVIEW_REPO = "openclaw/clawsweeper";
 const COMMAND_PATTERN =
@@ -118,6 +119,7 @@ async function handleRequest(request: http.IncomingMessage, response: http.Serve
     const retryable = /command intake failed \(HTTP (?:429|5\d\d)\)|aborted|timed out/i.test(
       message,
     );
+    if (!request.readableEnded) response.setHeader("connection", "close");
     response.writeHead(retryable ? 503 : 400, { "content-type": "application/json" });
     response.end(
       `${JSON.stringify(retryable ? { ok: false, retryable: true } : { ok: false, error: message })}\n`,
@@ -910,9 +912,21 @@ async function githubFetch({
   return text ? (JSON.parse(text) as LooseRecord) : {};
 }
 
-async function readBody(request: http.IncomingMessage) {
+export async function readBody(request: http.IncomingMessage) {
+  if (Number(request.headers["content-length"]) > WEBHOOK_MAX_BODY_BYTES) {
+    throw new Error(`request body exceeds ${WEBHOOK_MAX_BODY_BYTES} bytes`);
+  }
   const chunks: Buffer[] = [];
-  for await (const chunk of request) chunks.push(Buffer.from(chunk));
+  let received = 0;
+  // Let the HTTP response finish before Node closes an oversized request's connection.
+  for await (const chunk of request.iterator({ destroyOnReturn: false })) {
+    const next = Buffer.from(chunk);
+    received += next.length;
+    if (received > WEBHOOK_MAX_BODY_BYTES) {
+      throw new Error(`request body exceeds ${WEBHOOK_MAX_BODY_BYTES} bytes`);
+    }
+    chunks.push(next);
+  }
   return Buffer.concat(chunks).toString("utf8");
 }
 

@@ -356,7 +356,12 @@ The target workflow remains a compatibility fallback when the webhook service
 is down or not installed for a repository; its direct event is bridged into the
 same queue.
 
-The standalone `repair:comment-webhook` listener limits each GitHub REST request,
+The standalone `repair:comment-webhook` listener bounds incoming bodies to 2 MiB
+before signature verification. It accepts declared-length and chunked bodies,
+rejects oversized declarations before reading, and checks streamed bytes as they
+arrive. An oversized body receives HTTP 400 before the connection closes.
+
+The listener limits each GitHub REST request,
 including reading its response body, to 15 seconds. A stalled request returns
 HTTP 503 with `retryable: true`; successful requests keep the existing response.
 This per-request deadline does not bound the total duration of a command that
