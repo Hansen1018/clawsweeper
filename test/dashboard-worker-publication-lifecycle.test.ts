@@ -7,6 +7,8 @@ import {
   ExactReviewQueue,
   mergeBayJourneyState,
   ExactReviewPublicationBatchStore,
+  ExactReviewDirectPublicationStore,
+  validateDirectPublicationPlan,
   commandAcknowledgementState,
   ExactReviewLifecycleProjectionStore,
   lifecycleState,
@@ -968,6 +970,149 @@ test("direct lifecycle requeue becomes a fresh fenced source-drift revision", as
     "requeue",
   );
 });
+
+for (const scenario of [
+  { receipt: "accepted", lifecycle: "requeue", requeued: true },
+  { receipt: "deduped", lifecycle: "requeue", requeued: true },
+  { receipt: "superseded", lifecycle: "requeue", requeued: false },
+  { receipt: "accepted", lifecycle: undefined, requeued: false },
+] as const) {
+  test(`lost completion reconciles ${scenario.receipt} receipt with ${scenario.lifecycle ?? "no"} plan`, async () => {
+    const storage = new MemoryDurableStorage();
+    const leased = leasedExactReviewQueueItem(705, "7050");
+    leased.revision = 4;
+    leased.leaseRevision = 4;
+    leased.claimGeneration = 2;
+    await storage.put("exact-review-queue", { deliveries: {}, items: { [leased.key]: leased } });
+    const queue = new ExactReviewQueue({ storage }, {});
+    const env = {
+      CLAWSWEEPER_WEBHOOK_SECRET: "test-secret",
+      EXACT_REVIEW_QUEUE: new MemoryDurableNamespace(queue),
+    };
+    const post = (route: string, value: unknown) => {
+      const body = JSON.stringify(value);
+      return worker.fetch(
+        new Request(`https://clawsweeper.openclaw.ai/internal/exact-review/${route}`, {
+          method: "POST",
+          headers: {
+            "x-clawsweeper-exact-review-signature": `sha256=${createHmac("sha256", "test-secret").update(body).digest("hex")}`,
+          },
+          body,
+        }),
+        env,
+      );
+    };
+    const publication = {
+      canonicalTargetKey: leased.key,
+      fenceKey: leased.key,
+      revision: 4,
+      sourceSha: "e".repeat(40),
+      identity: {
+        canonicalTargetKey: leased.key,
+        fenceKey: leased.key,
+        revision: 4,
+        claimGeneration: 2,
+      },
+      operations: [
+        {
+          path: "records/openclaw-openclaw/items/705.md",
+          deleted: false,
+          mode: "100644",
+          bytes: 1,
+          contentBase64: "eA==",
+        },
+      ],
+      totalBytes: 1,
+      ...(scenario.lifecycle ? { lifecycle: { kind: scenario.lifecycle } } : {}),
+    };
+    if (scenario.receipt === "superseded") {
+      const newerPublisher = new ExactReviewDirectPublicationStore(storage);
+      newerPublisher.ensureSchemaSync();
+      const newer = await validateDirectPublicationPlan({
+        ...publication,
+        revision: 5,
+        identity: { ...publication.identity, revision: 5 },
+        lifecycle: { kind: "policy_noop" },
+      });
+      assert.equal(newerPublisher.accept(newer, Date.now()).outcome, "accepted");
+    }
+    if (scenario.receipt === "deduped") {
+      const first = await post("publication-results", publication);
+      assert.equal(first.status, 202);
+      assert.equal((await first.json()).accepted, true);
+    }
+    const receipt = await post("publication-results", publication);
+    assert.equal(receipt.status, 202);
+    assert.equal((await receipt.json())[scenario.receipt], true);
+    const readState = async () =>
+      (await storage.get("exact-review-queue")) as {
+        items: Record<
+          string,
+          {
+            state: string;
+            revision: number;
+            leaseId?: string;
+            admissionDeliveryId?: string;
+            decision: {
+              sourceAction: string;
+              publication?: {
+                directLifecycle?: { plan: { kind: string }; receiptOutcome: string };
+              };
+            };
+          }
+        >;
+      };
+    if (scenario.lifecycle) {
+      assert.deepEqual(
+        (await readState()).items[leased.key]?.decision.publication?.directLifecycle,
+        {
+          plan: { kind: scenario.lifecycle },
+          receiptOutcome: scenario.receipt === "deduped" ? "accepted" : scenario.receipt,
+        },
+      );
+    }
+    const terminalRun = {
+      terminal_runs: [
+        {
+          run_id: leased.claimedRunId,
+          run_attempt: leased.claimedRunAttempt,
+          claimed_run_attempt: leased.claimedRunAttempt,
+          claim_generation: 2,
+          outcome: "success",
+        },
+      ],
+    };
+    const reconciled = await post("reconcile", terminalRun);
+    assert.equal(reconciled.status, 200);
+    assert.deepEqual(await reconciled.json(), {
+      ok: true,
+      reconciled: 1,
+      requeued: Number(scenario.requeued),
+      completed: Number(!scenario.requeued),
+    });
+    const item = (await readState()).items[leased.key];
+    if (scenario.requeued) {
+      assert.equal(item?.state, "pending");
+      assert.equal(item?.revision, 5);
+      assert.equal(item?.leaseId, undefined);
+      assert.equal(item?.decision.sourceAction, "source_drift_requeue");
+      assert.equal(item?.decision.publication, undefined);
+      assert.equal(item?.admissionDeliveryId, `direct-lifecycle-requeue:${leased.key}:4`);
+    } else {
+      assert.equal(item, undefined);
+    }
+    if (scenario.lifecycle) {
+      assert.equal(
+        new ExactReviewLifecycleProjectionStore(storage).read(leased.key, leased.key, 4)
+          ?.terminalDisposition?.kind,
+        scenario.requeued ? "requeue" : "superseded",
+      );
+    }
+    const repeated = await post("reconcile", terminalRun);
+    assert.deepEqual(await repeated.json(), { ok: true, reconciled: 0, requeued: 0, completed: 0 });
+    assert.deepEqual((await readState()).items[leased.key], item);
+  });
+}
 
 test("direct lifecycle requeue preserves a newer command follow-up revision", async () => {
   const storage = new MemoryDurableStorage();

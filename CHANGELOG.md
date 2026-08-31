@@ -70,6 +70,8 @@ checkpoint, and status-only commits are intentionally omitted.
 
 ### Fixed
 
+- Preserved owed source-drift reviews when completion callbacks are lost, and distinguished queue-completion failures from review failures. Thanks @yetval. (#1251)
+
 - Stopped retrying unchanged PR revisions after an incomplete-source scan refusal while preserving newer queued revisions. Thanks @sallyom. (#1311)
 - Stopped stored-data and SQLite warnings for colocated test-support files while preserving production persistence, rename, and incomplete-evidence warnings.
 - Aligned PR proof comments and status labels with the existing host requirement when a reviewer records proof as not applicable, while preserving recorded assessments and merge gates.

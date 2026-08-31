@@ -1237,6 +1237,55 @@ test("exact event review publishes directly with a queue-bounded canonical fallb
       failureGateCase.name,
     );
   }
+  const evaluateClassification = (values: Record<string, string>): string => {
+    const expression = (failGeneration.env?.CLASSIFICATION ?? "")
+      .replace(/^\s*\$\{\{\s*|\s*\}\}\s*$/g, "")
+      .replace(
+        /steps\.([a-z0-9-]+)\.(outputs\.([a-z0-9_]+)|outcome)/g,
+        (_match, stepId: string, access: string, outputName?: string) =>
+          JSON.stringify(values[`${stepId}.${outputName ?? access}`] ?? ""),
+      );
+    return String(Function(`"use strict"; return (${expression});`)());
+  };
+  const classificationCases = [
+    {
+      name: "completion failure after a successful review",
+      values: {
+        "complete-exact-review-queue.outcome": "failure",
+        "reserve-exact-review-lease.status": "posted",
+        "exact-review-generation-result.outcome": "success",
+        "exact-review-generation-result.retry_kind": "",
+      },
+      expected: "queue_completion_failure",
+    },
+    {
+      name: "completion failure after a held deferral",
+      values: {
+        "complete-exact-review-queue.outcome": "failure",
+        "reserve-exact-review-lease.status": "held",
+        "exact-review-generation-result.outcome": "failure",
+        "exact-review-generation-result.retry_kind": "coordination",
+      },
+      expected: "queue_completion_failure",
+    },
+    {
+      name: "review lane failure after a durable completion",
+      values: {
+        "complete-exact-review-queue.outcome": "success",
+        "reserve-exact-review-lease.status": "posted",
+        "exact-review-generation-result.outcome": "failure",
+        "exact-review-generation-result.retry_kind": "",
+      },
+      expected: "codex_or_content_failure",
+    },
+  ] as const;
+  for (const classificationCase of classificationCases) {
+    assert.equal(
+      evaluateClassification(classificationCase.values),
+      classificationCase.expected,
+      classificationCase.name,
+    );
+  }
   assert.match(releaseGeneration.if ?? "", /reserve-exact-review-lease\.outputs\.status != 'held'/);
   assert.match(releaseGeneration.run ?? "", /content == "eyes"/);
   for (const cleanup of [releaseGeneration, step(reviewer, "Mark unsuccessful re-review")]) {
