@@ -2,192 +2,69 @@
   "schema_version": 2,
   "repositories": [
     {
-      "target_repo": "openclaw/clawhub",
-      "display_name": "ClawHub",
-      "checkout_dir": "clawhub",
-      "community_url": "https://clawhub.ai/",
-      "prompt_note": "Use the ClawHub source tree and current main branch. Review every issue and PR with the same evidence standard. Propose auto-close for issues and pull requests that are certainly implemented on main; for pull requests only, also allow age-gated mostly implemented on main. Keep everything else open.",
+      "target_repo": "Hansen1018/hugo-theme-lumenveil",
+      "display_name": "Lumenveil",
+      "checkout_dir": "lumenveil",
+      "prompt_note": "Use the hugo-theme-lumenveil source tree and current main branch. This is a Hugo theme repo: layouts/, assets/, static/, theme.toml, hugo.toml, and README files. Hugo --minify is the canonical validation (the exampleSite/ builds the theme as a consumer site). Review CSS/JS/layout changes for accessibility (color contrast, focus visibility, keyboard navigation, screen-reader semantics), responsive behavior (≥1024px desktop, ≤480px mobile, light + dark mode both), and breakages to existing glassmorphism / aurora surfaces. Honor the PR template checkboxes (Type of Change, Affected Area, Testing Done, Accessibility Impact, Pre-submit Checklist). Propose auto-close only for issues and pull requests that are certainly implemented on main; for pull requests only, also allow age-gated mostly implemented on main. Keep everything else open for maintainer triage.",
       "apply_close_rules": {
         "issue": ["implemented_on_main"],
         "pull_request": ["implemented_on_main", "mostly_implemented_on_main"]
       },
-      "package_manager": "bun",
-      "validation_commands": ["bun run check"],
+      "package_manager": "none",
+      "validation_commands": ["cd exampleSite && hugo --minify"],
       "changed_gate": null,
       "live_test": {
-        "enabled": true,
-        "surface_default": "browser",
-        "setup": ["bun install"],
-        "start": "bun run dev",
-        "url": "http://127.0.0.1:3000",
-        "ready_timeout_seconds": 240,
-        "max_recording_seconds": 90
+        "enabled": false
       }
     },
     {
-      "target_repo": "openclaw/clawsweeper",
-      "display_name": "ClawSweeper",
-      "checkout_dir": "clawsweeper",
-      "prompt_note": "Use the ClawSweeper source tree and current main branch. Review bot automation, workflow, and documentation changes conservatively. Propose auto-close for issues and pull requests that are certainly implemented on main; for pull requests only, also allow age-gated mostly implemented on main. Keep everything else open for maintainer triage.",
-      "apply_close_rules": {
-        "issue": ["implemented_on_main"],
-        "pull_request": ["implemented_on_main", "mostly_implemented_on_main"]
-      },
-      "package_manager": "pnpm",
-      "validation_commands": [],
-      "changed_gate": {
-        "command": "pnpm check:changed",
-        "required_script": "check:changed"
-      },
-      "live_test": {
-        "enabled": true,
-        "surface_default": "browser",
-        "setup": ["pnpm install --frozen-lockfile"],
-        "start": "./scripts/live-proof/bay-demo/start.sh",
-        "url": "http://127.0.0.1:8787",
-        "ready_timeout_seconds": 240,
-        "max_recording_seconds": 90
-      }
-    },
-    {
-      "target_repo": "openclaw/openclaw-facetime",
-      "display_name": "OpenClaw FaceTime",
-      "checkout_dir": "openclaw-facetime",
-      "prompt_note": "Use the openclaw-facetime source tree and current main branch. This is a macOS-native project: reviews touch SIP constraints, helper-process injection, Core Audio, and realtime capture paths, so weigh platform-specific evidence carefully and never assume Linux-runner reproduction proves or disproves macOS behavior. Propose auto-close only for issues and pull requests that are certainly implemented on main; keep anything platform-uncertain open for maintainer triage.",
-      "apply_close_rules": {
-        "issue": ["implemented_on_main"],
-        "pull_request": ["implemented_on_main"]
-      },
-      "package_manager": "pnpm",
-      "validation_commands": ["pnpm typecheck", "pnpm test", "pnpm build"],
-      "changed_gate": null,
-      "live_test": {
-        "enabled": true,
-        "surface_default": "terminal",
-        "setup": ["pnpm install --frozen-lockfile"],
-        "ready_timeout_seconds": 240,
-        "max_recording_seconds": 90
-      }
-    },
-    {
-      "target_repo": "openclaw/fs-safe",
-      "display_name": "fs-safe",
-      "checkout_dir": "fs-safe",
-      "prompt_note": "Use the fs-safe source tree and current main branch. Review filesystem-safety, path-handling, and package changes conservatively. Propose auto-close for issues and pull requests that are certainly implemented on main; for pull requests only, also allow age-gated mostly implemented on main. Keep everything else open for maintainer triage.",
-      "apply_close_rules": {
-        "issue": ["implemented_on_main"],
-        "pull_request": ["implemented_on_main", "mostly_implemented_on_main"]
-      },
-      "package_manager": "pnpm",
-      "validation_commands": [],
-      "changed_gate": null,
-      "live_test": {
-        "enabled": true,
-        "surface_default": "terminal",
-        "setup": ["pnpm install --frozen-lockfile"],
-        "ready_timeout_seconds": 240,
-        "max_recording_seconds": 90
-      }
-    },
-    {
-      "target_repo": "openclaw/crabbox",
-      "display_name": "Crabbox",
-      "checkout_dir": "crabbox",
-      "prompt_note": "Use the Crabbox source tree and current default branch. Review its Go CLI, portable Node/PostgreSQL coordinator, Cloudflare coordinator, and documentation using target-native tooling and evidence. Propose auto-close for issues and pull requests that are certainly implemented on main; for pull requests only, also allow age-gated mostly implemented on main. Keep everything else open for maintainer triage.",
-      "apply_close_rules": {
-        "issue": ["implemented_on_main"],
-        "pull_request": ["implemented_on_main", "mostly_implemented_on_main"]
-      },
-      "package_manager": "npm",
-      "validation_commands": [],
-      "changed_gate": null,
-      "live_test": {
-        "enabled": true,
-        "surface_default": "terminal",
-        "setup": ["npm ci --prefix worker"],
-        "ready_timeout_seconds": 240,
-        "max_recording_seconds": 90
-      }
-    },
-    {
-      "target_repo": "steipete/camsnap",
-      "display_name": "camsnap",
-      "checkout_dir": "camsnap",
-      "prompt_note": "Use the camsnap source tree and current main branch. Review camera discovery, RTSP/ONVIF behavior, Go changes, and cross-platform build behavior conservatively. Keep issues and pull requests open for maintainer triage.",
+      "target_repo": "Hansen1018/openclaw-backup",
+      "display_name": "OpenClaw Backup",
+      "checkout_dir": "openclaw-backup",
+      "prompt_note": "Use the openclaw-backup source tree and current main branch. This is a config-of-record backup repo for an OpenClaw host: openclaw.json, devices/paired.json, exec-approvals.json, skills-lock.json, cron/, tasks/, flows/, skills/, agents/, memory/, wiki/, security-reports/, workspace-attestations/, npm/, telegram/, discord/, openclaw-auto-backup.sh. Treat every change as sensitive. Validate JSON syntax (jq empty on every touched .json, plus jq empty openclaw.json overall), shell-script syntax (bash -n openclaw-auto-backup.sh if touched), and baseline hash check (sha256sum -c .config-baseline.sha256 when config is touched). Flag any plaintext secret / API key / token in the diff. Flag any new outbound network destination, new shell exec / eval / dynamic-code construct, new auto-start (cron / systemd / LaunchAgent), or new privilege escalation (sudo, setuid, capability grants). Confirm touched files are inside the openclaw-auto-backup.sh allowlist (or that justification is provided). Confirm diff does NOT include *.last-good, *.clobbered.*, *.pre-update, *.postpatch.*, or *.migrated artifacts. Propose auto-close only for issues and pull requests that are certainly implemented on main; default open and conservative.",
       "apply_close_rules": {
         "issue": [],
         "pull_request": []
       },
-      "package_manager": "npm",
-      "validation_commands": [],
+      "package_manager": "none",
+      "validation_commands": ["jq empty openclaw.json"],
       "changed_gate": null,
       "live_test": {
-        "enabled": true,
-        "surface_default": "terminal",
-        "setup": [],
-        "ready_timeout_seconds": 240,
-        "max_recording_seconds": 90
-      }
-    }
-  ],
-  "generic_fallbacks": [
-    {
-      "owner": "openclaw",
-      "deny_repositories": ["openclaw/clawsweeper-state", "openclaw/.github"],
-      "allow_repo_name_pattern": "^[A-Za-z0-9_.-]+$",
-      "prompt_note": "Use the {target_repo} source tree and current default branch. This repository is using the generic OpenClaw onboarding profile, so keep review conservative: issues and pull requests may be auto-closed only when the exact change is certainly already implemented on the default branch; pull requests may also be age-gated mostly implemented there.",
-      "apply_close_rules": {
-        "issue": ["implemented_on_main"],
-        "pull_request": ["implemented_on_main", "mostly_implemented_on_main"]
-      },
-      "package_manager": "pnpm",
-      "validation_commands": [],
-      "changed_gate": null,
-      "live_test": {
-        "enabled": true,
-        "surface_default": "terminal",
-        "setup": ["pnpm install --frozen-lockfile"],
-        "ready_timeout_seconds": 240,
-        "max_recording_seconds": 90
-      }
-    },
-    {
-      "owner": "steipete",
-      "deny_repositories": [],
-      "allow_repo_name_pattern": "^[A-Za-z0-9_.-]+$",
-      "prompt_note": "Use the {target_repo} source tree and current default branch. This repository is using the generic personal-repository onboarding profile, so review conservatively and do not auto-close issues or pull requests unless a repository-specific profile later enables that policy.",
-      "apply_close_rules": {
-        "issue": [],
-        "pull_request": []
-      },
-      "package_manager": "pnpm",
-      "validation_commands": [],
-      "changed_gate": null,
-      "live_test": {
-        "enabled": true,
-        "surface_default": "terminal",
-        "setup": ["pnpm install --frozen-lockfile"],
-        "ready_timeout_seconds": 240,
-        "max_recording_seconds": 90
+        "enabled": false
       }
     }
   ],
   "core_target_overrides": {
-    "openclaw/openclaw": {
-      "package_manager": "pnpm",
-      "validation_commands": [],
-      "changed_gate": {
-        "command": "pnpm check:changed",
-        "required_script": "check:changed"
-      }
+    "Hansen1018/hugo-theme-lumenveil": {
+      "package_manager": "none",
+      "validation_commands": ["cd exampleSite && hugo --minify"],
+      "changed_gate": null
     }
   },
   "target_inventory": {
-    "owners": ["openclaw", "steipete"],
-    "deny_repositories": ["openclaw/clawsweeper-state", "openclaw/.github"],
+    "owners": ["Hansen1018"],
+    "deny_repositories": ["Hansen1018/clawsweeper", "Hansen1018/clawsweeper-state"],
     "include_private": false,
     "include_archived": false,
     "include_forks": false,
     "require_issues": true
-  }
+  },
+  "generic_fallbacks": [
+    {
+      "owner": "Hansen1018",
+      "deny_repositories": ["Hansen1018/clawsweeper", "Hansen1018/clawsweeper-state"],
+      "allow_repo_name_pattern": "^[A-Za-z0-9_.-]+$",
+      "prompt_note": "Use the {target_repo} source tree and current default branch. This repository is using the generic personal-repository onboarding profile, so review conservatively and do not auto-close issues or pull requests unless a repository-specific profile later enables that policy. Apply the standard OpenClaw Backup safety checks when the repo looks like a config-of-record / backup repo (jq empty on touched .json, bash -n on touched shell scripts, no plaintext secrets, no new exec/eval/cron/systemd, deny *.last-good / *.clobbered.* / *.pre-update / *.postpatch.* artifacts in diffs).",
+      "apply_close_rules": {
+        "issue": [],
+        "pull_request": []
+      },
+      "package_manager": "pnpm",
+      "validation_commands": [],
+      "changed_gate": null,
+      "live_test": {
+        "enabled": false
+      }
+    }
+  ]
 }
