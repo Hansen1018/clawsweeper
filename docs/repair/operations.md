@@ -356,6 +356,14 @@ The target workflow remains a compatibility fallback when the webhook service
 is down or not installed for a repository; its direct event is bridged into the
 same queue.
 
+The standalone `repair:comment-webhook` listener limits each GitHub REST request,
+including reading its response body, to 15 seconds. A stalled request returns
+HTTP 503 with `retryable: true`; successful requests keep the existing response.
+This per-request deadline does not bound the total duration of a command that
+makes several GitHub requests. GitHub does not automatically redeliver failed
+webhooks; its delivery response window is 10 seconds, so this deadline bounds
+listener resources rather than guaranteeing delivery acknowledgment.
+
 Supported triggers:
 
 ```text

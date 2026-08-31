@@ -21,6 +21,7 @@ import { directReReviewIntake } from "./direct-re-review-admission.js";
 import { postExactReviewCommandIntake } from "./exact-review-command-queue.js";
 
 const DEFAULT_PORT = 8787;
+const GITHUB_FETCH_TIMEOUT_MS = 15_000;
 const REVIEW_REPO = "openclaw/clawsweeper";
 const COMMAND_PATTERN =
   /(^|[ \t\r\n])@(?:clawsweeper|openclaw-clawsweeper)\b(?:\[bot\])?|(^|[ \t\r\n])\/(?:clawsweeper|review|re-review|rerun[ -]?review|status|explain|fix|build|implement|create[ -]?pr|fix[ -]?issue|autofix|auto[ -]?fix|automerge|auto[ -]?merge|approve|stop|autoclose)\b/i;
@@ -899,6 +900,7 @@ async function githubFetch({
       "user-agent": "clawsweeper-comment-webhook",
       "x-github-api-version": "2022-11-28",
     },
+    signal: AbortSignal.timeout(GITHUB_FETCH_TIMEOUT_MS),
   };
   if (body !== undefined) init.body = JSON.stringify(body);
   const response = await fetch(`https://api.github.com${path}`, init);
